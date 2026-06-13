@@ -1,0 +1,1217 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "hort-server values schema",
+  "description": "Install-time validation for the hort-server chart. Enforces strict-schema lint: `additionalProperties: false` on the top-level object and EVERY nested object block the chart owns the shape of, so a mistyped / retired / unknown key (e.g. the pre-078 top-level `apiBindAddr`, `worker.scanner.osvScanner`, or a typo like `worker.scanner.osvv`) FAILS `helm install`/`helm template` instead of being silently accepted and ignored. Free-form passthrough blocks the operator owns the shape of (`resources`, `probes.*`, `affinity`, `nodeSelector`, `*SecurityContext`, `gitopsConfig`, and the verbatim k8s array entries) intentionally stay permissive — the strict lint is for the chart's OWN config keys, not for arbitrary Kubernetes pod-spec content.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "publicBaseUrl",
+    "auth",
+    "postgres",
+    "storage",
+    "ephemeralStore",
+    "replicaCount"
+  ],
+  "properties": {
+    "publicBaseUrl": {
+      "description": "Rule 1: non-empty string matching ^https?://.+",
+      "type": "string",
+      "pattern": "^https?://.+"
+    },
+    "replicaCount": {
+      "description": "Rule 7: integer >= 1.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": {
+        "provider": {
+          "description": "Rule 2: enum oidc | disabled. The `basic` provider is retired; values from a prior chart release with provider=basic must migrate to provider=disabled + nativeTokens.enabled=true.",
+          "type": "string",
+          "enum": ["oidc", "disabled"]
+        },
+        "oidc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "issuerUrl": {"type": "string"},
+            "audience": {"type": "string"},
+            "groupsClaim": {"type": "string"},
+            "jwksCacheTtlSeconds": {"type": "integer", "minimum": 1}
+          }
+        },
+        "tokenExchange": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "cliClientId": {"type": "string"}
+          }
+        },
+        "nativeTokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "signingKey": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {"type": "string"},
+                "secretKey": {"type": "string"},
+                "prevExistingSecret": {"type": "string"},
+                "prevSecretKey": {"type": "string"}
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "description": "Rule 2 cont'd: if provider == oidc, oidc.issuerUrl + oidc.audience must be non-empty.",
+          "if": {
+            "properties": {"provider": {"const": "oidc"}},
+            "required": ["provider"]
+          },
+          "then": {
+            "required": ["oidc"],
+            "properties": {
+              "oidc": {
+                "type": "object",
+                "required": ["issuerUrl", "audience"],
+                "properties": {
+                  "issuerUrl": {"type": "string", "minLength": 1},
+                  "audience": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "If tokenExchange.enabled, provider must be oidc AND cliClientId must be non-empty. Mirrors the binary's boot-time fail-closed check at the chart level so operators get a clear error before deploy.",
+          "if": {
+            "properties": {
+              "tokenExchange": {
+                "type": "object",
+                "properties": {"enabled": {"const": true}},
+                "required": ["enabled"]
+              }
+            },
+            "required": ["tokenExchange"]
+          },
+          "then": {
+            "properties": {
+              "provider": {"const": "oidc"},
+              "tokenExchange": {
+                "type": "object",
+                "required": ["cliClientId"],
+                "properties": {
+                  "cliClientId": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "If tokenExchange.enabled, nativeTokens.enabled MUST be true and signingKey.existingSecret MUST be non-empty. The exchange endpoint mints hort_cli_* (PAT-shape) tokens; the validator that recognises them only wires when native tokens are on. The binary boot-fails on this misconfig (ConfigError::TokenExchangeRequiresNativeTokens); the chart-level rule surfaces the error at install time instead of at server-startup time.",
+          "if": {
+            "properties": {
+              "tokenExchange": {
+                "type": "object",
+                "properties": {"enabled": {"const": true}},
+                "required": ["enabled"]
+              }
+            },
+            "required": ["tokenExchange"]
+          },
+          "then": {
+            "required": ["nativeTokens"],
+            "properties": {
+              "nativeTokens": {
+                "type": "object",
+                "required": ["enabled", "signingKey"],
+                "properties": {
+                  "enabled": {"const": true},
+                  "signingKey": {
+                    "type": "object",
+                    "required": ["existingSecret", "secretKey"],
+                    "properties": {
+                      "existingSecret": {"type": "string", "minLength": 1},
+                      "secretKey": {"type": "string", "minLength": 1}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "postgres": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app", "admin"],
+      "properties": {
+        "app": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["existingSecret"],
+          "properties": {
+            "existingSecret": {
+              "description": "Rule 5: postgres.app.existingSecret non-empty.",
+              "type": "string",
+              "minLength": 1
+            },
+            "secretKey": {"type": "string", "minLength": 1}
+          }
+        },
+        "admin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["existingSecret"],
+          "properties": {
+            "existingSecret": {
+              "description": "Rule 6: postgres.admin.existingSecret non-empty.",
+              "type": "string",
+              "minLength": 1
+            },
+            "secretKey": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend"],
+      "properties": {
+        "backend": {
+          "description": "Rule 3: enum filesystem | s3.",
+          "type": "string",
+          "enum": ["filesystem", "s3"]
+        },
+        "filesystem": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pvc": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "size": {"type": "string"},
+                "storageClassName": {"type": "string"},
+                "accessMode": {"type": "string"}
+              }
+            }
+          }
+        },
+        "s3": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": {"type": "string"},
+            "region": {"type": "string"},
+            "bucket": {"type": "string"},
+            "pathStyle": {"type": "boolean"},
+            "allowHttp": {
+              "type": "boolean",
+              "description": "Opt in to plain HTTP S3 endpoints. Required for in-cluster Garage/MinIO without TLS. The binary's validator rejects this flag on https:// endpoints and on real AWS S3."
+            },
+            "sseMode": {
+              "type": "string",
+              "enum": ["", "bucket-default", "sse256", "sse-kms"],
+              "description": "Server-side-encryption mode. \"\" (unset) sends no opinion and falls back to bucket-default. \"bucket-default\" suppresses the non-AWS WARN. \"sse256\" requests SSE-S3 (AES256). \"sse-kms\" requests SSE-KMS and requires sseKmsKeyArn."
+            },
+            "sseKmsKeyArn": {
+              "type": "string",
+              "description": "Full KMS key ARN. Required when sseMode == \"sse-kms\"; ignored otherwise."
+            },
+            "existingSecret": {"type": "string"}
+          },
+          "allOf": [
+            {
+              "description": "sseMode == \"sse-kms\" requires a non-empty sseKmsKeyArn.",
+              "if": {
+                "properties": {"sseMode": {"const": "sse-kms"}},
+                "required": ["sseMode"]
+              },
+              "then": {
+                "required": ["sseKmsKeyArn"],
+                "properties": {
+                  "sseKmsKeyArn": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "description": "Rule 3 cont'd: if backend == s3, s3.endpoint + s3.bucket + s3.existingSecret non-empty.",
+          "if": {
+            "properties": {"backend": {"const": "s3"}},
+            "required": ["backend"]
+          },
+          "then": {
+            "required": ["s3"],
+            "properties": {
+              "s3": {
+                "type": "object",
+                "required": ["endpoint", "bucket", "existingSecret"],
+                "properties": {
+                  "endpoint": {"type": "string", "minLength": 1},
+                  "bucket": {"type": "string", "minLength": 1},
+                  "existingSecret": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ephemeralStore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend"],
+      "properties": {
+        "backend": {
+          "description": "Rule 4: enum memory | redis.",
+          "type": "string",
+          "enum": ["memory", "redis"]
+        },
+        "memory": {"type": "object", "additionalProperties": false},
+        "redis": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {"type": "string"},
+            "existingSecret": {"type": "string"},
+            "secretKey": {"type": "string"},
+            "evictableUrl": {
+              "description": "HORT_REDIS_URL_EVICTABLE override for the evictable class. Empty → falls back to redis.url. Mutually exclusive with evictableExistingSecret (Rule 4b).",
+              "type": "string"
+            },
+            "evictableExistingSecret": {
+              "description": "K8s Secret name for the evictable-class URL. Mutually exclusive with evictableUrl (Rule 4b).",
+              "type": "string"
+            },
+            "evictableSecretKey": {
+              "description": "Key inside evictableExistingSecret holding the HORT_REDIS_URL_EVICTABLE value.",
+              "type": "string"
+            },
+            "durableUrl": {
+              "description": "HORT_REDIS_URL_DURABLE override for the durable class. Empty → falls back to redis.url. Mutually exclusive with durableExistingSecret (Rule 4c).",
+              "type": "string"
+            },
+            "durableExistingSecret": {
+              "description": "K8s Secret name for the durable-class URL. Mutually exclusive with durableUrl (Rule 4c).",
+              "type": "string"
+            },
+            "durableSecretKey": {
+              "description": "Key inside durableExistingSecret holding the HORT_REDIS_URL_DURABLE value.",
+              "type": "string"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "description": "Rule 4 cont'd: if backend == redis, redis.url OR redis.existingSecret non-empty.",
+          "if": {
+            "properties": {"backend": {"const": "redis"}},
+            "required": ["backend"]
+          },
+          "then": {
+            "required": ["redis"],
+            "properties": {
+              "redis": {
+                "type": "object",
+                "oneOf": [
+                  {
+                    "required": ["url"],
+                    "properties": {
+                      "url": {"type": "string", "minLength": 1}
+                    }
+                  },
+                  {
+                    "required": ["existingSecret"],
+                    "properties": {
+                      "existingSecret": {"type": "string", "minLength": 1}
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "description": "Rule 4b: per-class evictable exclusivity — when at least one of redis.evictableUrl / redis.evictableExistingSecret is non-empty, exactly one of the two must be non-empty. Operators who do not use the per-class override pay no constraint.",
+          "if": {
+            "properties": {"backend": {"const": "redis"}},
+            "required": ["backend"]
+          },
+          "then": {
+            "properties": {
+              "redis": {
+                "type": "object",
+                "allOf": [
+                  {
+                    "if": {
+                      "anyOf": [
+                        {
+                          "properties": {"evictableUrl": {"type": "string", "minLength": 1}},
+                          "required": ["evictableUrl"]
+                        },
+                        {
+                          "properties": {"evictableExistingSecret": {"type": "string", "minLength": 1}},
+                          "required": ["evictableExistingSecret"]
+                        }
+                      ]
+                    },
+                    "then": {
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "evictableUrl": {"type": "string", "minLength": 1},
+                            "evictableExistingSecret": {
+                              "anyOf": [
+                                {"type": "string", "maxLength": 0},
+                                {"not": {"required": ["evictableExistingSecret"]}}
+                              ]
+                            }
+                          },
+                          "required": ["evictableUrl"]
+                        },
+                        {
+                          "properties": {
+                            "evictableExistingSecret": {"type": "string", "minLength": 1},
+                            "evictableUrl": {
+                              "anyOf": [
+                                {"type": "string", "maxLength": 0},
+                                {"not": {"required": ["evictableUrl"]}}
+                              ]
+                            }
+                          },
+                          "required": ["evictableExistingSecret"]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "description": "Rule 4c: per-class durable exclusivity — when at least one of redis.durableUrl / redis.durableExistingSecret is non-empty, exactly one of the two must be non-empty.",
+          "if": {
+            "properties": {"backend": {"const": "redis"}},
+            "required": ["backend"]
+          },
+          "then": {
+            "properties": {
+              "redis": {
+                "type": "object",
+                "allOf": [
+                  {
+                    "if": {
+                      "anyOf": [
+                        {
+                          "properties": {"durableUrl": {"type": "string", "minLength": 1}},
+                          "required": ["durableUrl"]
+                        },
+                        {
+                          "properties": {"durableExistingSecret": {"type": "string", "minLength": 1}},
+                          "required": ["durableExistingSecret"]
+                        }
+                      ]
+                    },
+                    "then": {
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "durableUrl": {"type": "string", "minLength": 1},
+                            "durableExistingSecret": {
+                              "anyOf": [
+                                {"type": "string", "maxLength": 0},
+                                {"not": {"required": ["durableExistingSecret"]}}
+                              ]
+                            }
+                          },
+                          "required": ["durableUrl"]
+                        },
+                        {
+                          "properties": {
+                            "durableExistingSecret": {"type": "string", "minLength": 1},
+                            "durableUrl": {
+                              "anyOf": [
+                                {"type": "string", "maxLength": 0},
+                                {"not": {"required": ["durableUrl"]}}
+                              ]
+                            }
+                          },
+                          "required": ["durableExistingSecret"]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "description": "Rule 4d: broken-fallback install-block — when backend == redis AND main redis.url AND redis.existingSecret are BOTH empty AND any per-class override (evictableUrl / evictableExistingSecret / durableUrl / durableExistingSecret) is non-empty, the absent class would have no URL to fall back to. Reject at chart-render time with a clear error rather than at runtime.",
+          "if": {
+            "allOf": [
+              {
+                "properties": {"backend": {"const": "redis"}},
+                "required": ["backend"]
+              },
+              {
+                "properties": {
+                  "redis": {
+                    "type": "object",
+                    "allOf": [
+                      {
+                        "anyOf": [
+                          {
+                            "properties": {"url": {"type": "string", "maxLength": 0}}
+                          },
+                          {"not": {"required": ["url"]}}
+                        ]
+                      },
+                      {
+                        "anyOf": [
+                          {
+                            "properties": {"existingSecret": {"type": "string", "maxLength": 0}}
+                          },
+                          {"not": {"required": ["existingSecret"]}}
+                        ]
+                      },
+                      {
+                        "anyOf": [
+                          {
+                            "properties": {"evictableUrl": {"type": "string", "minLength": 1}},
+                            "required": ["evictableUrl"]
+                          },
+                          {
+                            "properties": {"evictableExistingSecret": {"type": "string", "minLength": 1}},
+                            "required": ["evictableExistingSecret"]
+                          },
+                          {
+                            "properties": {"durableUrl": {"type": "string", "minLength": 1}},
+                            "required": ["durableUrl"]
+                          },
+                          {
+                            "properties": {"durableExistingSecret": {"type": "string", "minLength": 1}},
+                            "required": ["durableExistingSecret"]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "required": ["redis"]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "redis": {
+                "description": "ephemeralStore.redis: per-class override set but the main fallback (redis.url or redis.existingSecret) is empty — the absent class would have no URL to fall back to. Set redis.url or redis.existingSecret, OR set both per-class overrides explicitly.",
+                "type": "object",
+                "not": {}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "image": {
+      "description": "Container image for the hort-server binary. Image-signature enforcement is the operator's policy controller's job (`cosign.publicKey` is the PEM the controller verifies against; the chart does not enforce it).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]},
+        "pullSecrets": {"type": "array"},
+        "cosign": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "publicKey": {"type": "string"}
+          }
+        }
+      }
+    },
+    "publicBaseUrlComment": {"type": "string"},
+    "api": {
+      "description": "Backlog 078 Item 10 — main API listener. `bindAddr` (HORT_API_BIND) follows the `<subsystem>.bindAddr` shape shared by `metrics.bindAddr` and `control.bindAddr`; the pre-078 top-level `apiBindAddr` is retired (HARD rename, no alias).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindAddr": {
+          "description": "Bind address for the main API listener (HORT_API_BIND). Non-empty string; e.g. '0.0.0.0:8080' (default), '127.0.0.1:8080', or a non-default port like '0.0.0.0:9080'.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "requireHttps": {"type": "boolean"},
+    "trustedProxyCidrs": {"type": "array", "items": {"type": "string"}},
+    "http": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requestTimeoutSeconds": {"type": "integer", "minimum": 1},
+        "headerReadTimeoutSeconds": {"type": "integer", "minimum": 1},
+        "maxInflight": {"type": "integer", "minimum": 0},
+        "maxInflightPerIp": {"type": "integer", "minimum": 0},
+        "publishBodyMaxSize": {
+          "description": "HORT_PUBLISH_BODY_MAX_SIZE (Backlog 078 Item 4) — per-publish body-size ceiling as a human-readable size string (e.g. \"300Mi\", \"1Gi\", or a bare byte integer). Empty leaves the env var unset (binary default, 300 MiB); an explicit \"0\" is the refuse-all-publishes kill-switch.",
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?)?$"
+        }
+      }
+    },
+    "upstream": {
+      "description": "Storage backstops on the streaming upstream fetch path. Human-readable size strings (e.g. \"64Mi\", \"1Gi\", \"64M\", or a bare byte integer); the binary enforces a 1024-byte floor.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metadataCacheMaxSize": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?$"},
+        "manifestCacheMaxSize": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?$"},
+        "projectorVersionObjectMaxSize": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?$"},
+        "userAgent": {"type": "string", "pattern": "^[^\\x00-\\x08\\x0a-\\x1f\\x7f]*$", "description": "HORT_UPSTREAM_USER_AGENT — outbound User-Agent for upstream pull-through fetches (hort-server + worker). Empty → the binary built-in hort/<version>; crates.io requires a non-empty UA. Must be a valid HTTP header value: no control characters (the pattern rejects C0 controls except TAB, plus DEL — matching what the binary accepts); the same value is offline-validatable via `hort-server validate-config`."}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindAddr": {"type": "string"},
+        "allowUnspecifiedBind": {"type": "boolean"},
+        "requireAuth": {"type": "boolean"},
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "interval": {"type": "string"},
+            "scrapeTimeout": {"type": "string"},
+            "namespace": {"type": "string"}
+          }
+        }
+      }
+    },
+    "control": {
+      "description": "Internal-only control-plane listener (HORT_CONTROL_BIND). Empty bindAddr ⇒ control routes stay on the main listener.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindAddr": {"type": "string"},
+        "allowUnspecifiedBind": {"type": "boolean"}
+      }
+    },
+    "oci": {
+      "description": "OCI Distribution surfaces. Backlog 078 Item 10 grouped the OCI upload timeout here (HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS) as `uploadTimeoutSeconds`; the pre-078 `http.ociUploadTimeoutSeconds` key is retired (HARD rename, no alias).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "uploadTimeoutSeconds": {
+          "description": "HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS — OCI long-tail upload window in seconds. Default 3600 (60 min).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "legacyCatalogEnabled": {
+          "description": "HORT_OCI_LEGACY_CATALOG_ENABLED — opt-in to the aggregating /v2/_catalog endpoint. Default false.",
+          "type": "boolean"
+        },
+        "maxSessionsPerPrincipal": {
+          "description": "HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL — max concurrent OCI upload sessions per principal. 0 ⇒ binary default (32).",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gracefulSeconds": {"type": "integer", "minimum": 1}
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fileRoot": {"type": "string", "minLength": 1},
+        "mounts": {"type": "array"}
+      }
+    },
+    "extraCaBundle": {
+      "description": "Additive HORT_EXTRA_CA_BUNDLE trust anchors. `path` is the in-container mount path. `configMapName` (Recipe A) and `secretName` (Recipe B) are mutually-exclusive auto-mount sources holding the PEM under key `ca.crt`; either one auto-mounts the bundle symmetrically on the server + worker + CronJobs and wires the env. Neither set = fully-manual extraVolumes recipe (chart mounts nothing and sets no env).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string"},
+        "configMapName": {"type": "string"},
+        "secretName": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "description": "Backlog 078 Item 7 / convention 9: configMapName and secretName are mutually exclusive — a pod can mount only one ca.crt at `path`. When at least one is non-empty, exactly one must be.",
+          "if": {
+            "anyOf": [
+              {"properties": {"configMapName": {"type": "string", "minLength": 1}}, "required": ["configMapName"]},
+              {"properties": {"secretName": {"type": "string", "minLength": 1}}, "required": ["secretName"]}
+            ]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {"configMapName": {"type": "string", "minLength": 1}},
+                "required": ["configMapName"],
+                "allOf": [{"not": {"properties": {"secretName": {"type": "string", "minLength": 1}}, "required": ["secretName"]}}]
+              },
+              {
+                "properties": {"secretName": {"type": "string", "minLength": 1}},
+                "required": ["secretName"],
+                "allOf": [{"not": {"properties": {"configMapName": {"type": "string", "minLength": 1}}, "required": ["configMapName"]}}]
+              }
+            ]
+          }
+        },
+        {
+          "description": "Backlog 078 Item 7: an auto-mount source requires a non-empty `path` (the mount path + the env value).",
+          "if": {
+            "anyOf": [
+              {"properties": {"configMapName": {"type": "string", "minLength": 1}}, "required": ["configMapName"]},
+              {"properties": {"secretName": {"type": "string", "minLength": 1}}, "required": ["secretName"]}
+            ]
+          },
+          "then": {
+            "properties": {"path": {"type": "string", "minLength": 1}},
+            "required": ["path"]
+          }
+        }
+      ]
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object"}
+      }
+    },
+    "podSecurityContext": {"type": "object"},
+    "containerSecurityContext": {"type": "object"},
+    "resources": {"type": "object"},
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "liveness": {"type": "object"},
+        "readiness": {"type": "object"},
+        "startup": {"type": "object"}
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "minAvailable": {
+          "anyOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "string"}
+          ]
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "ingress": {"type": "array"},
+        "egress": {"type": "array"}
+      }
+    },
+    "extraEnv": {"type": "array"},
+    "extraVolumes": {"type": "array"},
+    "extraVolumeMounts": {"type": "array"},
+    "nodeSelector": {"type": "object"},
+    "tolerations": {"type": "array"},
+    "affinity": {"type": "object"},
+    "topologySpreadConstraints": {"type": "array"},
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {"type": "string"},
+        "httpPort": {"type": "integer", "minimum": 1},
+        "metricsPort": {"type": "integer", "minimum": 1},
+        "controlPort": {"type": "integer", "minimum": 1},
+        "annotations": {"type": "object"}
+      }
+    },
+    "gitopsConfig": {"type": "object"},
+    "scheduledTasks": {
+      "description": "Backlog 078 Item 8 (chart N1) — unified scheduled-task tree. ALL periodic tasks live here regardless of execution path; each carries an `executionPath` attribute (dsn-direct | admin-task). `executionPath: dsn-direct` tasks run a `hort-server` subcommand with the runtime DSN only (no svc-token), gated solely by their own `enabled`. `executionPath: admin-task` tasks invoke `hort-cli admin task invoke <kind>` against the admin-task HTTP endpoint with the `<release>-svc-token` PAT, gated by BOTH `adminTasksEnabled` (the master toggle, which also gates the svc-token-bootstrap Job + RBAC) AND their own `enabled`. Replaces the pre-078 `cronJobs.*` block + the five top-level task keys.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adminTasksEnabled": {
+          "description": "Global master toggle for the `executionPath: admin-task` tasks + the service-account token bootstrap Job (+ its RBAC). Replaces the pre-078 `cronJobs.enabled`. Default: disabled. Does NOT gate the `executionPath: dsn-direct` tasks (those keep their own per-task `enabled`).",
+          "type": "boolean"
+        },
+        "svcTokenKubectlImage": {
+          "description": "kubectl image used by the svc-token-bootstrap Job's write-secret container. Replaces the pre-078 `cronJobs.kubectlImage`.",
+          "type": "string"
+        },
+        "rotateSvcToken": {
+          "description": "When true, force-rotate the cronjob-tasks svc-token on the next helm upgrade. Replaces the pre-078 `cronJobs.rotateSvcToken`. Default false.",
+          "type": "boolean"
+        },
+        "scrub": {
+          "description": "executionPath: dsn-direct. CAS integrity scrub CronJob. `actionOnMismatch` is also read by the main Deployment, so it is load-bearing even when disabled.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1},
+            "samplingRate": {
+              "anyOf": [
+                {"type": "string"},
+                {"type": "number", "minimum": 0, "maximum": 1}
+              ]
+            },
+            "concurrency": {
+              "anyOf": [
+                {"type": "string"},
+                {"type": "integer", "minimum": 1}
+              ]
+            },
+            "actionOnMismatch": {
+              "type": "string",
+              "enum": ["alert", "tombstone"]
+            }
+          }
+        },
+        "quarantineReleaseSweep": {
+          "description": "executionPath: dsn-direct. Periodic quarantine release-sweep CronJob. Inserts a `kind='quarantine-release-sweep'` row every tick using the runtime DSN; the worker dispatches to `QuarantineReleaseSweepHandler`, which feeds the candidacy query into the fail-closed `release_expired` check. Deliberately does NOT use the `adminTasksEnabled` umbrella or `svc-token-bootstrap` chain.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "prefetchTick": {
+          "description": "executionPath: dsn-direct. Periodic prefetch scheduled-tick CronJob. Inserts a `kind='prefetch-tick'` row every tick using the runtime DSN; the worker dispatches to `PrefetchTickHandler`, which walks every Scheduled-trigger repo + tracked-package pair, fetches the upstream catalog via `UpstreamProxy`, extracts the published version set via `FormatHandler::extract_upstream_versions`, and invokes the planner with the real upstream-vs-held divergence. Default-disabled (prefetch is opt-in per-repo via `Repository.prefetch_policy`). Deliberately does NOT use the `adminTasksEnabled` umbrella or `svc-token-bootstrap` chain.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "prefetchRowRetentionSweep": {
+          "description": "executionPath: dsn-direct. Periodic prefetch-row retention-sweep CronJob. Inserts a `kind='prefetch-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `PrefetchRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` rows older than a configurable horizon (default 7 days). Default-disabled (the cascade is opt-in per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`; if no repo opts in the table accumulates nothing). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "wheelMetadataBackfill": {
+          "description": "executionPath: dsn-direct. Periodic wheel-metadata-backfill CronJob. Inserts a `kind='wheel-metadata-backfill'` row every tick using the runtime DSN; the worker dispatches to `WheelMetadataBackfillHandler`, which walks PyPI wheel artifacts whose `content_references` row of kind `wheel_metadata` is absent, streams each wheel from CAS, invokes `FormatHandler::extract_wheel_metadata_bytes`, and on `Some(bytes)` persists the bytes to CAS + inserts the ContentReference row — retroactively enabling PEP 658 advertisement for pre-existing wheels. Default-disabled (one-shot retrofit for operators upgrading from an earlier release; a freshly-deployed operator's wheel inventory is empty and the tick is a no-op). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1},
+            "batchSize": {
+              "description": "How many wheel artifacts the worker walks per invocation. The handler caps at 1000 regardless of input; values above 1000 silently clamp. Omit (or set 0) to use the handler default (100).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            }
+          }
+        },
+        "noop": {
+          "description": "executionPath: admin-task. Diagnostic heartbeat task.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "stagingSweep": {
+          "description": "executionPath: admin-task. Staging-area upload expiry sweep.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "cronRescanTick": {
+          "description": "executionPath: admin-task. Cron-driven rescan tick.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "advisoryWatchTick": {
+          "description": "executionPath: admin-task. OSV advisory-watch tick.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "serviceAccountRotation": {
+          "description": "executionPath: admin-task. Service-account fallback PAT rotation CronJob. The `enabled` flag is the SINGLE source-of-truth toggle for fallback PAT rotation — it drives BOTH this CronJob AND the worker-side wiring (rotation env in worker-deployment.yaml + per-namespace RBAC). Worker-side parameters live under `worker.rotation.*` (targetNamespaces, publicRegistryHost). The top-level allOf rules require `adminTasksEnabled`, `worker.enabled`, and a non-empty `worker.rotation.publicRegistryHost` whenever this is true (fail-fast, no silent half-on).",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "eventstoreCheckpoint": {
+          "description": "executionPath: admin-task. Event-chain checkpoint emission CronJob. The worker side ALSO needs S3 storage + HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE / HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE provisioned, and the anchor bucket created with S3 Object Lock + a COMPLIANCE-mode default retention.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "replaySeenPrune": {
+          "description": "executionPath: admin-task. Replay-guard seen-set TTL cleanup — periodic DELETE FROM jwt_replay_seen WHERE expires_at < now(). DEFAULT-ENABLED: the only admin-task CronJob template that defaults to enabled, gated only by the `adminTasksEnabled` master toggle. No extra worker-side provisioning is needed. Cleanup degrades safe — disabling it only grows the table, replay protection never degrades.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "verifyEventChain": {
+          "description": "executionPath: admin-task (gating only — it actually runs the `hort-server` binary directly with the runtime DSN, no svc-token PAT). Event-chain tamper-evidence verifier CronJob. Runs `hort-server verify-event-chain --format json` DIRECTLY (an in-process reader using the runtime DML DSN + anchor object store, NOT a worker-dispatched task). Records a `kind='verify-event-chain'` liveness breadcrumb on each completed run; the boot-time `hort_event_chain_verify_overdue` gauge reads the newest one. DEFAULT-DISABLED. Keep the schedule consistent with HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS (default 86400 s = daily).",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "retentionEvaluate": {
+          "description": "executionPath: admin-task. Event-sourced retention-evaluate sweep: read active retention policies + keyset-paginated non-protected artifacts, append one ArtifactExpired per fresh match (deletes nothing). DEFAULT-DISABLED (retention is operator-opt-in). Enable this first, observe, then retentionPurge.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "retentionPurge": {
+          "description": "executionPath: admin-task. Destructive storage-GC walk: for every ArtifactExpired with no following ArtifactPurged, decrement content_references, delete the CAS blob iff the cross-kind refcount hit 0, append ArtifactPurged. Refuses to run until the worker boot refcount-reconcile sweep converged. DEFAULT-DISABLED — the most destructive retention task.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "eventstoreArchive": {
+          "description": "executionPath: admin-task. Audit-retention stream sweep: seal terminal / age-gated streams past the configured retention floor via the StreamSealed-tombstone chokepoint. Actual row removal needs the worker HORT_RETENTION_DATABASE_URL (hort_retention_role); unset → fail-safe no-op via the events_immutable trigger. DEFAULT-DISABLED. Weekly cadence.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "worker": {
+      "description": "Multi-kind worker Deployment (Trivy + osv-scanner + cron-rescan-tick + advisory-watch-tick + staging-sweep + noop). Default disabled; operators opt in by setting `enabled: true`.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "replicas": {"type": "integer", "minimum": 1},
+        "workerIdOverride": {"type": "string"},
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "tag": {"type": "string"},
+            "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+          }
+        },
+        "resources": {"type": "object"},
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "liveness": {"type": "object"},
+            "readiness": {"type": "object"}
+          }
+        },
+        "scanner": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pollIntervalSecs": {"type": "integer", "minimum": 1},
+            "batchSize": {"type": "integer", "minimum": 1},
+            "maxAttempts": {"type": "integer", "minimum": 1},
+            "lockDurationSecs": {"type": "integer", "minimum": 1},
+            "trivy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "binary": {"type": "string", "minLength": 1},
+                "dbDir": {"type": "string"}
+              }
+            },
+            "osv": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "binary": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        },
+        "advisory": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "osvUrl": {"type": "string", "minLength": 1}
+          }
+        },
+        "provenance": {
+          "description": "Sigstore/cosign provenance verification. `cosign.enabled` is LOAD-BEARING (gates ProvenancePort + provenance-verify handler registration, NOT cosmetic). When true the verifier loads a PINNED trusted_root.json from `cosign.trustedRootFile` at boot (the verify path is offline — no live TUF/Rekor/Fulcio fetch) and the worker refuses to boot if that file is missing.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cosign": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "trustedRootFile": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        },
+        "metrics": {
+          "description": "Worker /metrics Prometheus scrape endpoint. `enabled: true` sets HORT_WORKER_METRICS_BIND=0.0.0.0:<port>, exposes the container port, and (when networkPolicy.enabled) co-renders a worker NetworkPolicy adding a Prometheus-scoped Ingress allowance on <port>. The listener has NO per-request auth — the NetworkPolicy is the access control. The default-on server NetworkPolicy already DENIES this port; this knob adds the scrape allowance. `scrapeFrom` is a list of verbatim k8s NetworkPolicyPeer objects (the ingress `from[]`) and is REQUIRED (minItems 1) when enabled:true: declaring who may scrape is mandatory, because an empty `from` would mean ALL sources (fail-OPEN) per the k8s NetworkPolicy spec. The template renders `ingress: []` (genuine deny) when no scrapers are declared, but the schema rejects enabling the listener without them.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "scrapeFrom": {"type": "array"}
+          },
+          "if": {
+            "properties": {"enabled": {"const": true}},
+            "required": ["enabled"]
+          },
+          "then": {
+            "required": ["scrapeFrom"],
+            "properties": {"scrapeFrom": {"minItems": 1}}
+          }
+        },
+        "db": {
+          "description": "Worker Postgres pool knobs. The `lockTimeoutMs` defense-in-depth backstop is applied (via .after_connect) to BOTH worker pools (main + the optional hort_retention_role retention pool) and bounds only lock-acquisition wait, so it fires on the pathological 'blocked on a peer's uncommitted unique slot' case and never aborts a legitimately slow large-stream DELETE. It exists because eventstore-archive's seal_and_remove appends a StreamSealed tombstone with no internal wait bound — safe only under the single-flight precondition (CronJob concurrencyPolicy: Forbid + worker per-kind semaphore + per-UTC-day idempotency key).",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "lockTimeoutMs": {
+              "description": "HORT_WORKER_LOCK_TIMEOUT_MS — Postgres lock_timeout (milliseconds) for both worker pools. Default 120000 (2 min), generous on purpose: under §10.2-INV single-flight it must never fire in correct operation; a small value risks a false abort if single-flight is ever deliberately relaxed. 0 disables the backstop — only set 0 if you have an alternative single-flight enforcement; doing so re-opens the unbounded-block failure mode this backstop covers. Relaxing any single-flight layer requires F-2 co-review per §10.2-INV.",
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "serviceAccount": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": {"type": "boolean"},
+            "name": {"type": "string"},
+            "annotations": {"type": "object"}
+          }
+        },
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"},
+        "extraVolumes": {"type": "array"},
+        "extraVolumeMounts": {"type": "array"},
+        "extraEnv": {"type": "array"},
+        "rotation": {
+          "description": "Service-account PAT rotation worker-side PARAMETERS. These are NOT an on/off switch: rotation is enabled by the single source-of-truth toggle `scheduledTasks.serviceAccountRotation.enabled`, which drives both the CronJob and the worker-side wiring. `targetNamespaces` / `publicRegistryHost` here only configure what the worker writes. The cross-field couplings that must hold when rotation is on (umbrella, worker enabled, non-empty publicRegistryHost) are enforced by the top-level `allOf` rules.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "targetNamespaces": {
+              "type": "array",
+              "items": {
+                "description": "k8s namespace name — DNS-1123 label syntax (lowercase alphanumerics + hyphens, must start and end with an alphanumeric, max 63 chars).",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63,
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+              }
+            },
+            "publicRegistryHost": {"type": "string"}
+          }
+        }
+      }
+    },
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"}
+  },
+  "allOf": [
+    {
+      "description": "Rule 8a: if replicaCount > 1, ephemeralStore.backend MUST be redis (multi-node requires Redis for shared ephemeral state).",
+      "if": {
+        "properties": {"replicaCount": {"type": "integer", "minimum": 2}},
+        "required": ["replicaCount"]
+      },
+      "then": {
+        "properties": {
+          "ephemeralStore": {
+            "properties": {
+              "backend": {"const": "redis"}
+            },
+            "required": ["backend"]
+          }
+        },
+        "required": ["ephemeralStore"]
+      }
+    },
+    {
+      "description": "Rule 8b: if replicaCount > 1, storage.backend MUST be s3 (RWO PVC cannot multi-attach).",
+      "if": {
+        "properties": {"replicaCount": {"type": "integer", "minimum": 2}},
+        "required": ["replicaCount"]
+      },
+      "then": {
+        "properties": {
+          "storage": {
+            "properties": {
+              "backend": {"const": "s3"}
+            },
+            "required": ["backend"]
+          }
+        },
+        "required": ["storage"]
+      }
+    },
+    {
+      "description": "Backlog 078 Item 9 (chart S4), Rule 9a: fallback PAT rotation is enabled by the SINGLE toggle `scheduledTasks.serviceAccountRotation.enabled`. When it is true, the `scheduledTasks.adminTasksEnabled` master umbrella MUST also be true — the rotation CronJob is an `executionPath: admin-task` template that renders only under the umbrella, so without it the single toggle would silently render no CronJob (a half-on no-op). Mirrors the `replicaCount ⇒ ephemeralStore/storage` top-level couplings: fail fast at `helm install` rather than half-enabling at runtime.",
+      "if": {
+        "properties": {
+          "scheduledTasks": {
+            "type": "object",
+            "properties": {
+              "serviceAccountRotation": {
+                "type": "object",
+                "properties": {"enabled": {"const": true}},
+                "required": ["enabled"]
+              }
+            },
+            "required": ["serviceAccountRotation"]
+          }
+        },
+        "required": ["scheduledTasks"]
+      },
+      "then": {
+        "properties": {
+          "scheduledTasks": {
+            "type": "object",
+            "properties": {"adminTasksEnabled": {"const": true}},
+            "required": ["adminTasksEnabled"]
+          }
+        },
+        "required": ["scheduledTasks"]
+      }
+    },
+    {
+      "description": "Backlog 078 Item 9 (chart S4), Rule 9b: when `scheduledTasks.serviceAccountRotation.enabled` is true, `worker.enabled` MUST be true AND `worker.rotation.publicRegistryHost` MUST be non-empty. The single rotation toggle drives the worker-side wiring (the rotation env block in worker-deployment.yaml + the per-namespace RBAC), which is meaningless without the worker Deployment and has nowhere to point the `dockerconfigjson.auths` map without the registry host. Fail fast at install rather than producing a worker that cannot rotate. Mirrors the `replicaCount ⇒ …` couplings' shape.",
+      "if": {
+        "properties": {
+          "scheduledTasks": {
+            "type": "object",
+            "properties": {
+              "serviceAccountRotation": {
+                "type": "object",
+                "properties": {"enabled": {"const": true}},
+                "required": ["enabled"]
+              }
+            },
+            "required": ["serviceAccountRotation"]
+          }
+        },
+        "required": ["scheduledTasks"]
+      },
+      "then": {
+        "properties": {
+          "worker": {
+            "type": "object",
+            "required": ["enabled", "rotation"],
+            "properties": {
+              "enabled": {"const": true},
+              "rotation": {
+                "type": "object",
+                "required": ["publicRegistryHost"],
+                "properties": {
+                  "publicRegistryHost": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        },
+        "required": ["worker"]
+      }
+    }
+  ]
+}

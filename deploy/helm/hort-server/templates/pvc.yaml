@@ -1,0 +1,22 @@
+{{- if and (eq .Values.storage.backend "filesystem") .Values.storage.filesystem.pvc.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "hort-server.pvcName" . }}
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  # Keep the PVC across `helm uninstall` so artifact data survives a
+  # chart removal. Operators reclaim disk explicitly via
+  # `kubectl delete pvc <name>`.
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.storage.filesystem.pvc.accessMode | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.filesystem.pvc.size | quote }}
+  {{- with .Values.storage.filesystem.pvc.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end -}}

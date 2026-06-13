@@ -1,0 +1,30 @@
+# An external load balancer (cloud NLB, on-prem F5, hardware LB)
+# terminates TLS and forwards plain HTTP to the chart's Service
+# (typically NodePort or LoadBalancer-type Service). Use this when
+# TLS is owned by the network layer outside Kubernetes.
+
+# requireHttps stays FALSE because the chart's listener never sees
+# TLS evidence — the LB terminated it upstream. Setting requireHttps
+# to true here would either: (a) reject every request because the
+# X-Forwarded-Proto check fails, or (b) silently downgrade the HSTS
+# decision since RequestTrust.public_url would be the only positive
+# evidence and nothing else corroborates it. False is the safe call.
+requireHttps: false
+api:
+  bindAddr: "0.0.0.0:8080"
+
+# These CIDRs are the LB IPs that proxy traffic to the chart. The
+# chart will trust X-Forwarded-{For,Proto} ONLY from these sources.
+# Operators typically supply 2-4 LB node IPs.
+trustedProxyCidrs:
+  - 10.123.4.5/32   # replace with actual LB IPs
+  - 10.123.4.6/32
+
+# Chart Service gets exposed via NodePort or LoadBalancer-type Service
+# — the LB targets that. The chart's templates/service.yaml is
+# ClusterIP by default; the operator overrides via:
+#   service:
+#     type: NodePort
+#     nodePort: 30080  # optional; cluster picks one if omitted
+# OR by leaving the chart Service as ClusterIP and pointing the LB
+# at the headless pod IPs (less common, more brittle).

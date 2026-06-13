@@ -1,0 +1,25 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  # UpstreamMapping for the `repository_upstream_mappings` row that
+  # `crates/hort-http-npm/src/upstream_pull.rs::try_upstream_file_pull`
+  # resolves via `UpstreamResolver`. Without this envelope, the runtime
+  # has no upstream to fetch from and every pull-through fetch returns
+  # 404 — even though the `npm-public` `ArtifactRepository` declares
+  # `spec.type: proxy` with a `spec.proxy.upstreamUrl` (that field is
+  # validator-only; the runtime never reads it).
+  #
+  # npm uses a single catch-all upstream per repo (no path-prefix
+  # routing), mirroring Cargo and PyPI rather than OCI's multi-namespace
+  # split. The protocol handler builds the upstream URL by appending
+  # `/<pkg>/-/<pkg>-<version>.tgz` (or `/<pkg>` for packument fetches)
+  # to the resolved upstream root.
+  name: npm-public
+spec:
+  repository: npm-public
+  # Empty pathPrefix → catch-all single-upstream mapping. The npm
+  # orchestrator passes "" as the prefix on every resolve() call.
+  pathPrefix: ""
+  upstreamUrl: https://registry.npmjs.org
+  auth:
+    type: anonymous

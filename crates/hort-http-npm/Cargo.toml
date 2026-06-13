@@ -1,0 +1,65 @@
+[package]
+name = "hort-http-npm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for the npm registry"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-formats   = { path = "../hort-formats" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+bytes        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+url          = { workspace = true }
+metrics      = { workspace = true }
+thiserror    = { workspace = true }
+# The internal `IndexSource` trait
+# (`crates/hort-http-npm/src/index_source.rs`) is `pub(crate)` and
+# dispatched dynamically per `RepositoryType` in the unified serve
+# handler. `async-trait` is the lowest-friction way to ship an async
+# trait with dyn-dispatch; the workspace already pins it.
+async-trait  = { workspace = true }
+# npm packument tarballs carry `dist.integrity` as base64-encoded SRI
+# (Subresource Integrity) digests — see NpmFormatHandler's wire shape.
+base64       = "0.22"
+# sha1 is required to compute the `dist.shasum` field of a tarball
+# entry at packument-render time.
+sha1         = { workspace = true }
+# Streaming `_attachments[*].data` base64 decode spools into a
+# `NamedTempFile` so peak heap stays O(constant) regardless of tarball
+# size. The previous `body: Bytes` + `Vec<u8>` decode held ~525 MiB
+# per concurrent publish.
+tempfile     = { workspace = true }
+# Streaming body adapter — `StreamReader::new(...)` over the axum body's
+# data stream is reused across formats; npm now joins OCI in pulling
+# this in as a runtime dep (was already a workspace dep, just newly
+# referenced from the npm crate).
+futures      = { workspace = true }
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+metrics-util                = { workspace = true, features = ["debugging"] }
+regex                       = "1"
+sha2                        = { workspace = true }
+mime                        = "0.3"
+tower                       = { workspace = true }
+arc-swap                    = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+# Item 3: tracing-warn capture test for the stale-while-error branch;
+# mirrors the PyPI crate's adoption in 17.2 Item 6.
+tracing-subscriber          = { workspace = true }

@@ -1,0 +1,232 @@
+# syntax=docker/dockerfile:1.7
+#
+# hort-worker — image for the Init-32/33/34 worker (multi-kind job
+# dispatcher: scan, cron-rescan-tick, advisory-watch-tick,
+# staging-sweep, noop). Builds the `hort-worker` binary on top of
+# pinned Trivy + osv-scanner CLI binaries lifted from their official
+# GitHub releases.
+#
+# Multi-stage:
+#   1. builder         — rust:${RUST_VERSION}-slim; produces the
+#                        release-mode `hort-worker` binary. Matches
+#                        `docker/Dockerfile.hort-server`'s base; both
+#                        registries (Docker Hub and the platform's
+#                        internal pull-through proxy mirror)
+#                        carry the slim variant. The full `bookworm`
+#                        variant added no value here — the builder
+#                        stage installs no system packages, so slim's
+#                        toolchain (gcc + libc-dev included) is enough.
+#   2. trivy           — debian:trixie-slim + curl; downloads,
+#                        verifies, and installs the pinned Trivy tarball.
+#   3. osv             — debian:trixie-slim + curl; downloads and
+#                        installs the pinned osv-scanner static binary.
+#   4. tini            — debian:trixie-slim with `tini` pulled from
+#                        the OS package repository. Tini is the PID 1
+#                        reaper that handles SIGCHLD for the helper
+#                        subprocesses Trivy / osv-scanner fork during
+#                        scan invocations (see runtime stage).
+#   5. runtime         — gcr.io/distroless/cc-debian13:nonroot. Matches
+#                        `docker/Dockerfile.hort-server`'s base. CA roots
+#                        ship with the distroless image; the binaries
+#                        from stages 2-4 are COPY'd in. Runs as
+#                        UID 65532 (distroless `nonroot` convention,
+#                        aligning with the chart's pod-level
+#                        `securityContext.runAsUser`).
+#
+# Trivy + osv-scanner versions are pinned: scan output is part of the
+# operational contract (the smoke asserts a specific CVE id surfaces),
+# so a floating "latest" tag would silently change rejection behaviour
+# across rebuilds. Bump these `ARG`s deliberately when the operator
+# confirms the new scanner version's CVE feed still matches the
+# fixture set.
+#
+# Layout mirrors `deploy/compose/Dockerfile` (the hort-server dev image) so an
+# operator who has already understood that Dockerfile sees the same
+# shape here.
+
+ARG RUST_VERSION=1.94
+ARG TRIVY_VERSION=0.70.0
+ARG OSV_SCANNER_VERSION=2.3.8
+
+# SHA256 hashes of the upstream binaries we install. Init-17 (mandatory
+# upstream verification, docs/plans/028-initiative-17-upstream-verification.md)
+# requires every external download to be checksum-verified against a value
+# pinned at the call site — Trivy and osv-scanner are no exception. When the
+# `*_VERSION` ARG above is bumped, the matching `*_SHA256` ARG MUST be bumped
+# to the new release's published checksum. Find them at:
+#   Trivy:       https://github.com/aquasecurity/trivy/releases (look for
+#                trivy_${VERSION}_checksums.txt and grep for
+#                "trivy_${VERSION}_Linux-64bit.tar.gz").
+#   osv-scanner: https://github.com/google/osv-scanner/releases (look for
+#                osv-scanner_SHA256SUMS and grep for
+#                "osv-scanner_linux_amd64").
+#
+# A wrong/stale SHA256 here causes `sha256sum -c -` in stages 2 and 3 to
+# exit non-zero, which aborts the build. That is the desired behaviour — a
+# silently-substituted scanner binary changes scan output, which the
+# operator depends on as part of the rejection contract.
+ARG TRIVY_SHA256=8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+ARG OSV_SCANNER_SHA256=bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc
+
+# ---------- Stage 1: builder ----------
+FROM rust:${RUST_VERSION}-slim AS builder
+
+WORKDIR /src
+
+# Copy the workspace minimum needed for the worker build. The worker
+# binary lives in `crates/hort-worker`; it depends transitively
+# on `hort-domain`, `hort-app`, `hort-adapters-postgres`, etc. — so we copy
+# the entire `crates/` tree. The top-level `migrations/` directory is
+# required because `sqlx::migrate!("../../migrations")` (in the worker's
+# own `crates/hort-worker/src/composition.rs`) is a proc-macro that reads
+# the migration files at expansion time; the COPY destination must match
+# the macro path (resolves to /src/migrations).
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+
+# Same proc-macro-cache caveat the hort-server Dockerfile documents:
+# `sqlx::migrate!` only re-reads the migrations directory when its
+# host file is recompiled. Touching the worker's migrator host file
+# (composition.rs, which invokes the macro) forces a fresh expansion so
+# newly-added migrations land in the embedded set.
+RUN touch crates/hort-worker/src/composition.rs
+
+# Build the release binary. `--bin hort-worker` keeps the build
+# scoped (no need to compile hort-server here). Cargo + target dirs are
+# cached as docker buildx mounts so iterative rebuilds in CI stay fast.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --bin hort-worker && \
+    cp target/release/hort-worker /usr/local/bin/hort-worker
+
+# ---------- Stage 2: Trivy CLI ----------
+FROM debian:trixie-slim AS trivy
+
+ARG TRIVY_VERSION
+ARG TRIVY_SHA256
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Aqua Security publishes Linux-64bit tarballs under a stable URL
+# scheme. Extract just the `trivy` binary and install it; the rest of
+# the tarball (LICENSE, contrib/, etc.) is dropped to keep the runtime
+# image lean. `install` sets executable mode + 0755 in one shot.
+#
+# Init-17 doctrine: verify the tarball SHA256 against the value pinned
+# at the top of this file BEFORE extracting. `sha256sum -c -` exits
+# non-zero on mismatch, which fails the build under `set -e`.
+RUN set -eu && \
+    if [ -z "${TRIVY_SHA256}" ] || [ "${TRIVY_SHA256}" = "__REPLACE_ME__" ]; then \
+        echo "ERROR: TRIVY_SHA256 build-arg is unset or still set to __REPLACE_ME__." >&2; \
+        echo "       Look up the SHA256 in trivy_${TRIVY_VERSION}_checksums.txt and pass it via --build-arg." >&2; \
+        exit 1; \
+    fi && \
+    curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+        -o /tmp/trivy.tar.gz && \
+    echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/trivy.tar.gz -C /tmp trivy && \
+    install -m 0755 /tmp/trivy /usr/local/bin/trivy && \
+    rm -f /tmp/trivy.tar.gz /tmp/trivy
+
+# ---------- Stage 3: osv-scanner CLI ----------
+FROM debian:trixie-slim AS osv
+
+ARG OSV_SCANNER_VERSION
+ARG OSV_SCANNER_SHA256
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Google's osv-scanner releases ship as static x86_64 Linux binaries
+# under a stable URL pattern. No tarball — pull the binary directly
+# and chmod +x.
+#
+# Init-17 doctrine: verify the binary SHA256 against the value pinned
+# at the top of this file BEFORE chmod-ing. `sha256sum -c -` exits
+# non-zero on mismatch, which fails the build under `set -e`.
+RUN set -eu && \
+    if [ -z "${OSV_SCANNER_SHA256}" ] || [ "${OSV_SCANNER_SHA256}" = "__REPLACE_ME__" ]; then \
+        echo "ERROR: OSV_SCANNER_SHA256 build-arg is unset or still set to __REPLACE_ME__." >&2; \
+        echo "       Look up the SHA256 in osv-scanner_SHA256SUMS and pass it via --build-arg." >&2; \
+        exit 1; \
+    fi && \
+    curl -fsSL -o /tmp/osv-scanner \
+        "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" && \
+    echo "${OSV_SCANNER_SHA256}  /tmp/osv-scanner" | sha256sum -c - && \
+    install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner && \
+    rm -f /tmp/osv-scanner
+
+# ---------- Stage 4: tini ----------
+#
+# Tini is the PID 1 reaper. Sourced from `debian:trixie-slim`'s
+# `tini` package and copied as a single binary into the distroless
+# runtime stage so the runtime image stays free of `apt`. The version
+# is whatever trixie currently pins (Debian-stable backports
+# security fixes; we pin via the platform's pull-through proxy
+# image-tag policy rather than the Debian-package version itself).
+#
+# Why tini is still needed even with k8s: each container in a Pod has
+# its own PID namespace by default (`shareProcessNamespace=false`).
+# Without a reaper, helpers Trivy/osv-scanner fork during sandbox
+# teardown that survive their immediate parent reparent to PID 1
+# (the worker process). The worker's tokio runtime does not waitpid
+# on grandchildren; tini does.
+FROM debian:trixie-slim AS tini
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tini && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------- Stage 5: runtime ----------
+#
+# Distroless `cc-debian13:nonroot` matches the hort-server runtime base
+# (see `docker/Dockerfile.hort-server`). It ships:
+#   - `/etc/ssl/certs/ca-certificates.crt` (public CA roots — what
+#     osv-scanner and the Rust worker's reqwest both need),
+#   - `/lib/x86_64-linux-gnu/libc.so.6` and friends (glibc, matching
+#     the rust:slim builder's link target),
+#   - the `nonroot` user at UID 65532 / GID 65532 (default `USER`).
+# It does NOT ship: shell, package manager, `pgrep`, `ps`. Liveness
+# is therefore checked via the worker's own `healthcheck` subcommand
+# (Init-33 follow-up B) rather than `pgrep -f`.
+#
+# Operator-supplied trust roots: the chart's `extraCaBundle` mount
+# lands the operator's CA at `.Values.extraCaBundle.path` (default
+# `/etc/ssl/certs/extra/ca.crt`) and sets `HORT_EXTRA_CA_BUNDLE` so the
+# Rust binary's reqwest builds layer it on. Trivy / osv-scanner
+# subprocesses pick up the same bundle via `SSL_CERT_FILE` at
+# spawn-time; see Init-33 follow-up Phase C for the in-process merge.
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+
+# OCI Image Spec v1.1 labels. The two below are static; CI passes the
+# rest (`source`, `revision`, `version`, `created`) via `--label` on
+# the publish job (mirroring the hort-server Dockerfile).
+LABEL org.opencontainers.image.title="hort-worker"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Pull binaries in. Order is dependency-cascade (toolchain first,
+# scanners after, app last) to keep layer cache reads sequential.
+COPY --from=tini    /usr/bin/tini                   /usr/local/bin/tini
+COPY --from=trivy   /usr/local/bin/trivy            /usr/local/bin/trivy
+COPY --from=osv     /usr/local/bin/osv-scanner      /usr/local/bin/osv-scanner
+COPY --from=builder /usr/local/bin/hort-worker        /usr/local/bin/hort-worker
+
+# WORKDIR is owned by the `nonroot` user (UID 65532) per the
+# distroless base-image convention. The chart mounts CAS at
+# `/var/lib/hort-server/cas` as `readOnly:true` (the worker is a
+# CAS *consumer*, never a producer); fsGroup=65532 on the volume
+# matches the runtime user.
+WORKDIR /var/lib/hort-server
+
+# No HEALTHCHECK — k8s `livenessProbe.exec` runs `hort-worker healthcheck`
+# instead. The Dockerfile-level HEALTHCHECK only matters for plain
+# `docker run`; under k8s the kubelet ignores it.
+
+# tini reaps zombie scanner subprocesses; the worker is `exec`d as the
+# child PID 1 from tini's perspective. `--` separates tini's own args
+# from the worker's argv passthrough. The default (no subcommand)
+# starts the dispatcher; chart manifests pass no args.
+ENTRYPOINT ["/usr/local/bin/tini", "--", "/usr/local/bin/hort-worker"]

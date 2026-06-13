@@ -1,0 +1,47 @@
+# Backlog 078 Item 11 (chart S1) — strict-schema regression fixture.
+#
+# `values.schema.json` sets `additionalProperties: false` on the top-level
+# object AND every nested object block the chart owns the shape of, so a
+# mistyped / unknown / retired key fails `helm install`/`helm template`
+# instead of being silently accepted and ignored. This fixture is a
+# deliberately-broken negative case: each line below is an unknown key the
+# strict schema MUST reject. The harness asserts the render FAILS with an
+# `Additional property ... is not allowed` error.
+#
+# Covered typo classes:
+#   - top-level typo (`replicaCountt`)
+#   - retired pre-078 key (`apiBindAddr`, the pre-Item-10 top-level bind)
+#   - retired scanner key (`worker.scanner.osvScanner`, pre-Item-6) +
+#     a nested typo (`worker.scanner.osvv`)
+#   - retired grouped key (`http.ociUploadTimeoutSeconds`, pre-Item-10)
+#
+# A VALID counterpart (every key correct) is the default values.yaml +
+# the other test-values-*.yaml fixtures, all of which still render.
+publicBaseUrl: https://hort.example.com
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+storage:
+  backend: filesystem
+ephemeralStore:
+  backend: memory
+
+# --- the deliberate typos / retired keys the strict schema must reject ---
+replicaCountt: 1                       # top-level typo
+apiBindAddr: "0.0.0.0:8080"            # retired pre-078 key (now api.bindAddr)
+http:
+  ociUploadTimeoutSeconds: 3600        # retired pre-078 key (now oci.uploadTimeoutSeconds)
+worker:
+  enabled: true
+  scanner:
+    osvScanner:                        # retired pre-078 key (now worker.scanner.osv)
+      enabled: true
+    osvv:                              # nested typo of `osv`
+      enabled: true

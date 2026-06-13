@@ -1,0 +1,8 @@
+{
+  "request": { "method": "GET", "url": "/pypi/requests/2.31.0/json" },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "bodyFileName": "json/requests/2.31.0.json"
+  }
+}

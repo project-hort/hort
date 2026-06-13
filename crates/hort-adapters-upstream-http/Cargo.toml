@@ -1,0 +1,116 @@
+[package]
+name = "hort-adapters-upstream-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort outbound adapter — HTTP-based pull-through upstream proxy"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain      = { path = "../hort-domain" }
+hort-app         = { path = "../hort-app" }
+hort-config      = { path = "../hort-config" }
+# The `is_routable` routability classifier (SSRF defence — see
+# `docs/architecture/explanation/security.md`) lives in `hort-net-egress`
+# so the OIDC adapter can share the same predicate. The connect-time
+# `GuardedDnsResolver` and `build_egress_redirect_policy` builder are
+# retired; the routability classifier is the only export consumed here.
+hort-net-egress  = { path = "../hort-net-egress" }
+
+reqwest    = { workspace = true }
+tokio      = { workspace = true }
+futures    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+metrics    = { workspace = true }
+tracing    = { workspace = true }
+url        = { workspace = true }
+uuid       = { workspace = true }
+# Lock-free snapshot swap for `CachingResolver` (`resolver.rs`).
+# The resolver holds the upstream-mappings snapshot in an `ArcSwap`;
+# the request path reads through `.load()` and the background refresh
+# task swaps atomically. See `docs/architecture/how-to/oci-pull-through.md`.
+arc-swap   = { workspace = true }
+base64     = "0.22"
+thiserror  = { workspace = true }
+# Wrap every intermediate string in the Basic-auth header construction
+# in `Zeroizing<String>` to mirror the Bearer path's credential-hygiene
+# discipline (see `docs/architecture/explanation/security.md`).
+# Workspace-level dep with `alloc` so `Zeroizing<String>` and
+# `Zeroizing<Vec<u8>>` both type-check.
+zeroize    = { workspace = true }
+
+# Outbound mTLS / custom CA / cert-pinning support (ADR 0010 — see
+# `docs/architecture/how-to/deploy/extra-ca-bundle.md`).
+# `rustls` 0.23 is the version reqwest 0.12's `rustls-tls-native-roots`
+# feature already pulls in transitively; pinning to the same crate edition
+# keeps `use_preconfigured_tls(rustls::ClientConfig)` type-compatible.
+# `aws_lc_rs` is the workspace-standard crypto provider (FIPS-tracked,
+# aligns with `jsonwebtoken`'s `aws_lc_rs` feature).
+# `tls12` is required for the WebPkiServerVerifier builder to support our
+# mock test stack and real-world enterprise registries that have not yet
+# retired TLS 1.2.
+rustls          = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12", "logging"] }
+# PEM decoding for SecretPort-resolved CA bundles + concatenated mTLS
+# cert/key blobs. The `pem` module on `rustls-pki-types` is the
+# successor to the deprecated `rustls-pemfile` crate — it provides
+# `PemObject::pem_slice_iter` for cert chains and
+# `PrivateKeyDer::from_pem_slice` for keys via the same trust-anchor
+# parser, with no separate maintenance surface.
+rustls-pki-types = { version = "1", features = ["std"] }
+# OS native root CA store — same source reqwest's `rustls-tls-native-roots`
+# feature uses via this crate's transitive tree. Replacing `webpki-roots`
+# here makes the per-mapping rustls path consistent with the base reqwest
+# client: an operator who installs a corporate CA into the OS trust store
+# sees it work for both paths (ADR 0010).
+# Version 0.8 matches what reqwest already pulls transitively (verified via
+# `cargo tree`). Net dep delta is zero new transitive crates.
+rustls-native-certs = "0.8"
+# SHA-256 over leaf cert DER bytes for the cert-pinning verifier
+# (ADR 0010). The workspace already pulls in sha2 via
+# hort-app and the storage adapters; this is the explicit declaration so
+# the dep graph documents the use.
+sha2            = { workspace = true }
+
+# RFC 7231 §7.1.1.1 HTTP-date parser for the `Last-Modified` response
+# header on cargo `.crate` tarball and OCI config/layer blob fetches.
+# The header carries the upstream publish-time hint that threads into
+# `Artifact.upstream_published_at`. `httpdate` is the RFC-mandated
+# parser (handles all three legacy formats — IMF-fixdate, RFC 850,
+# asctime); pure Rust, no runtime, tiny surface area. Production parses
+# are best-effort: an absent or unparseable header yields `None`
+# without failing the fetch.
+httpdate        = "1"
+
+# `chrono` is used to bridge `httpdate`'s `SystemTime` output into
+# the workspace's `DateTime<Utc>` representation. Already in the
+# workspace; declared explicitly here for the Last-Modified parser.
+chrono          = { workspace = true }
+# Upstream bodies are streamed to a tempfile so `MetadataFetchOutcome`
+# / `ManifestFetchOutcome` can return a `CachedBodyHandle` with a real
+# on-disk path (ADR 0026). Superseded by `write_streaming` for the
+# hot path.
+tempfile        = { workspace = true }
+# `write_streaming` is generic over the `Stream<Item = Result<Bytes, …>>`
+# shape that `reqwest::Response::bytes_stream` produces (ADR 0026).
+# `bytes` is already pulled in transitively by reqwest; this explicit
+# dep documents the surface and lets the helper's signature compile
+# against the workspace-pinned version.
+bytes           = { workspace = true }
+
+[dev-dependencies]
+tokio        = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+metrics-util = { workspace = true, features = ["debugging"] }
+metrics-exporter-prometheus = { workspace = true }
+wiremock     = "0.6"
+# Generate self-signed certs in-process for CA / pinning tests (ADR 0010)
+# without committing PEM fixtures to the repo. `rcgen` is test-only;
+# production paths never construct certificates.
+rcgen        = "0.13"
+# `axum-server` provides `bind_rustls` for the in-process HTTPS test
+# servers that exercise the CA + pinning paths. wiremock does not speak
+# TLS, so we stand up a minimal TLS-aware listener for those tests only.
+axum-server  = { version = "0.7", features = ["tls-rustls"] }
+axum         = { workspace = true }

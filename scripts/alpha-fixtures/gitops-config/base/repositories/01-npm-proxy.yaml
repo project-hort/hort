@@ -1,0 +1,32 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: npm-proxy
+spec:
+  name: "npm Proxy"
+  description: "Pull-through cache for registry.npmjs.org (alpha)"
+  format: npm
+  type: proxy
+  storage:
+    backend: filesystem
+    path: npm-proxy
+  proxy:
+    upstreamUrl: "https://registry.npmjs.org"
+  isPublic: true
+  replicationPriority: local_only
+  # Proxy repos: keep never-ingested upstream versions in the served
+  # index so clients (npm/pip/cargo) can request them on demand. The
+  # default `released_only` drops never-ingested entries, which makes
+  # the proxy index appear empty until hort has cached a specific
+  # version — pip/npm can't bootstrap that way. See
+  # `docs/architecture/how-to/declare-gitops-config.md`.
+  indexMode: include_pending
+  # Pre-warming: the npm-proxy fires the `on_dist_tag_move` trigger
+  # whenever a client fetches a packument. `enabled: false` (the default)
+  # makes `fire_hot_path_trigger` short-circuit before parsing the
+  # body — no prefetch fires at all.
+  prefetchPolicy:
+    enabled: true
+    triggers: [on_dist_tag_move]
+    depth: 10
+    transitiveDepth: 5

@@ -1,0 +1,75 @@
+{
+  "results": [
+    {
+      "source": {"path": "/tmp/sbom.cdx.json", "type": "lockfile"},
+      "packages": [
+        {
+          "package": {
+            "name": "foo",
+            "ecosystem": "npm",
+            "version": "1.0.0"
+          },
+          "vulnerabilities": [
+            {
+              "id": "OSV-9999",
+              "aliases": [],
+              "summary": "Hypothetical vuln with many fixed versions",
+              "severity": [],
+              "affected": [
+                {
+                  "ranges": [
+                    {
+                      "events": [
+                        {"introduced": "0"},
+                        {"fixed": "v1"},
+                        {"fixed": "v1"},
+                        {"fixed": "v2"},
+                        {"fixed": "v3"},
+                        {"fixed": "v4"},
+                        {"fixed": "v5"},
+                        {"fixed": "v6"},
+                        {"fixed": "v7"},
+                        {"fixed": "v8"},
+                        {"fixed": "v9"},
+                        {"fixed": "v10"},
+                        {"fixed": "v11"},
+                        {"fixed": "v12"},
+                        {"fixed": "v13"},
+                        {"fixed": "v14"},
+                        {"fixed": "v15"},
+                        {"fixed": "v16"},
+                        {"fixed": "v17"},
+                        {"fixed": "v18"},
+                        {"fixed": "v19"},
+                        {"fixed": "v20"},
+                        {"fixed": "v21"},
+                        {"fixed": "v22"},
+                        {"fixed": "v23"},
+                        {"fixed": "v24"},
+                        {"fixed": "v25"},
+                        {"fixed": "v26"},
+                        {"fixed": "v27"},
+                        {"fixed": "v28"},
+                        {"fixed": "v29"},
+                        {"fixed": "v30"},
+                        {"fixed": "v31"},
+                        {"fixed": "v32"},
+                        {"fixed": "v33"},
+                        {"fixed": "v34"},
+                        {"fixed": "v35"}
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "references": []
+            }
+          ],
+          "groups": [
+            {"ids": ["OSV-9999"], "max_severity": "5.5"}
+          ]
+        }
+      ]
+    }
+  ]
+}

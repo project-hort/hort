@@ -1,0 +1,78 @@
+{{/*
+Noop task CronJob.
+
+Periodically invokes `hort-cli admin task invoke noop` against the server.
+Primary use-case: a smoke-test / heartbeat that confirms the admin-task
+framework is reachable and the service-account token is valid. Because the
+noop handler does nothing and always succeeds, a failed run indicates an
+infrastructure problem (network, secret rotation, server crash) rather than
+a task-logic bug.
+
+Gated by `scheduledTasks.noop.enabled` (default false). The parent toggle
+`scheduledTasks.adminTasksEnabled` must also be true for this template to render.
+
+The service-account token (`{{ release }}-svc-token`) is mounted from the
+k8s Secret written by the bootstrap Job (svc-token-bootstrap-job.yaml).
+
+Idempotency-Key: `hort-cli admin task invoke` is passed
+`--idempotency-key-window=minute`, which computes the key as
+`<UTC minute>:noop` (matches the legacy shell shape
+`date -u +%Y-%m-%dT%H:%M`). A double-fire from a controller restart
+short-circuits at the framework layer rather than double-counting in
+the audit trail and metrics.
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.noop.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-noop
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: noop
+spec:
+  schedule: {{ .Values.scheduledTasks.noop.schedule | quote }}
+  # Prevent concurrent runs. A noop is cheap but overlapping invocations
+  # would produce duplicate `TaskInvoked` audit events.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: noop
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Distroless runtime: invoke `hort-cli` directly and let it
+              # compute the idempotency key via `--idempotency-key-window`.
+              # See cronjob-service-account-rotation.yaml for context.
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - noop
+                - --idempotency-key-window
+                - minute
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

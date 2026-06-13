@@ -1,0 +1,137 @@
+name: Scheduled Container Scan
+
+on:
+  schedule:
+    # Every Monday at 6 AM UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  SERVER_IMAGE: ${{ github.repository }}-server
+
+jobs:
+  trivy-scan:
+    name: Weekly Trivy Scan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # NOTE: trivy binary extracted from official GHCR image because the
+      # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
+      - name: Install Trivy
+        run: |
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.3)
+          docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
+          docker rm "$CONTAINER_ID"
+          trivy --version
+
+      - name: Trivy scan - server
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:latest
+          format: 'sarif'
+          output: 'server-trivy.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '0'
+          skip-setup-trivy: true
+
+      - name: Upload server Trivy SARIF
+        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+        if: always()
+        with:
+          sarif_file: 'server-trivy.sarif'
+          category: 'trivy-server-scheduled'
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: trivy-weekly-reports
+          path: |
+            server-trivy.sarif
+          retention-days: 90
+
+      - name: Check for new findings and create issue
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+
+            let totalFindings = 0;
+            const summaries = [];
+
+            for (const [name, file] of [['Server', 'server-trivy.sarif']]) {
+              if (!fs.existsSync(file)) {
+                summaries.push(`- **${name}**: Scan skipped or failed`);
+                continue;
+              }
+              const sarif = JSON.parse(fs.readFileSync(file, 'utf8'));
+              const results = sarif.runs?.[0]?.results || [];
+              const count = results.length;
+              totalFindings += count;
+              summaries.push(`- **${name}**: ${count} finding(s)`);
+            }
+
+            console.log(`Total findings: ${totalFindings}`);
+            console.log(summaries.join('\n'));
+
+            if (totalFindings > 0) {
+              // Check if there's already an open issue for container findings
+              const existing = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'security',
+                per_page: 100
+              });
+
+              const hasExisting = existing.data.some(i =>
+                i.title.includes('Container scan findings')
+              );
+
+              if (!hasExisting) {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `Container scan findings detected (${new Date().toISOString().split('T')[0]})`,
+                  body: [
+                    '## Weekly Container Scan Results',
+                    '',
+                    `Trivy found **${totalFindings}** CRITICAL/HIGH finding(s) with available fixes:`,
+                    '',
+                    ...summaries,
+                    '',
+                    `[View scan run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+                    '',
+                    'SARIF reports have been uploaded to the Security tab and as workflow artifacts.',
+                  ].join('\n'),
+                  labels: ['security']
+                });
+              }
+            }
+
+      - name: Scan summary
+        if: always()
+        run: |
+          echo "## Weekly Container Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server**: $([ -f server-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "SARIF reports uploaded to Security tab and as workflow artifacts." >> $GITHUB_STEP_SUMMARY

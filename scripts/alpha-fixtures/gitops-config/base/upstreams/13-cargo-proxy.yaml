@@ -1,0 +1,15 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: cargo-proxy
+spec:
+  repository: cargo-proxy
+  # Cargo single-catch-all. The sparse-index host for crates.io is
+  # `index.crates.io`, NOT `crates.io` — requests to `crates.io` for
+  # sparse-index paths (e.g. /se/rd/serde) return 403. The crate
+  # tarball CDN is `static.crates.io/crates/<name>/<name>-<ver>.crate`;
+  # hort handles the index-vs-blob host split internally.
+  pathPrefix: ""
+  upstreamUrl: https://index.crates.io
+  auth:
+    type: anonymous

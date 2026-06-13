@@ -1,0 +1,11 @@
+# ClaimMapping: IdP group `test-developers` resolves to the `developer`
+# claim. The claim confers no power until an operator-declared
+# PermissionGrant requires it — none ship here, so a fresh deploy has
+# zero grants until the operator adds them.
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: developers
+spec:
+  idpGroup: test-developers
+  claim: developer

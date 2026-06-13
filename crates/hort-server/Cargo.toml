@@ -1,0 +1,261 @@
+[package]
+name = "hort-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort v2 service binary — env-driven composition root for the axum stack"
+
+[lints]
+workspace = true
+
+# Off-by-default opt-in for the
+# deliberate test-clock auth-bypass primitive (auth-catalog Entry 10).
+# This makes Entry 10's "double-gated `#[cfg(feature="test-clock")]`
+# + `HORT_TEST_CLOCK_ENABLED=true`" a *real* compile-time gate: a
+# release build never compiles test features, so
+# `cfg!(feature = "test-clock")` is the boot guard's "built without
+# the feature" signal. No code is gated behind it yet — the
+# `POST /test/clock/advance` primitive lives with the CLI-session
+# machinery; the feature exists so the startup hard-fail check is real.
+[features]
+test-clock = []
+
+[[bin]]
+name = "hort-server"
+path = "src/main.rs"
+
+[dependencies]
+hort-domain            = { path = "../hort-domain" }
+hort-http-core         = { path = "../hort-http-core" }
+# The per-format HTTP adapter crates (ADR 0008). Each one
+# depends only on hort-domain + hort-app + hort-formats + hort-http-core and
+# carries no adapter deps. hort-server is the only crate that lists all
+# four, because it is the only place that assembles the top-level
+# router (see `crate::http::build_router_with_oci_config`).
+hort-http-cargo        = { path = "../hort-http-cargo" }
+hort-http-npm          = { path = "../hort-http-npm" }
+hort-http-pypi         = { path = "../hort-http-pypi" }
+hort-http-oci          = { path = "../hort-http-oci" }
+# Admin security-score REST surface
+# (`/api/v1/repositories/:name/security-score` + `/api/v1/security-score`).
+# Same adapter-free invariant as the per-format crates above.
+hort-http-admin-security = { path = "../hort-http-admin-security" }
+# Admin-task REST surface
+# (`POST /api/v1/admin/tasks/{kind}`, `GET /api/v1/admin/tasks`,
+#  `GET /api/v1/admin/tasks/:id`). No hort-adapters-* in dep graph.
+hort-http-admin-tasks = { path = "../hort-http-admin-tasks" }
+# JWT-only discovery + self-service prefetch
+# REST surface. Composition wiring is the router mount +
+# UpstreamMetadataPort wire-up; the integration tests in
+# `tests/*_jwt_only.rs` fire requests against the inner router
+# fragment (the production mount lives in `crate::http`).
+hort-http-discovery   = { path = "../hort-http-discovery" }
+# Composition adapter implementing
+# `UpstreamMetadataPort` (the dispatch table over npm / pypi / cargo
+# `fetch_raw_with_cache` helpers + `FormatHandler::extract_upstream_versions`
+# parsers). Wired in `composition.rs` and threaded into
+# `DiscoveryUseCase` + `SelfServicePrefetchUseCase`. hort-server is the
+# ONLY production crate other than `hort-formats-upstream` itself that
+# imports multiple per-format inbound crates; the composition seam is
+# load-bearing.
+hort-formats-upstream = { path = "../hort-formats-upstream" }
+# Event-notification surfaces
+# (see `docs/architecture/explanation/event-notifications.md`).
+# `hort-http-subscriptions` mounts `/api/v1/subscriptions` +
+# `/api/v1/admin/subscriptions`; `hort-http-events` mounts
+# `/api/v1/events` pull-resync. Both crates are adapter-free.
+# The two notifier adapters (`hort-notifier-webhook`, `hort-notifier-nats`)
+# implement `EventNotifier`; composition wires them into the
+# dispatcher's notifier registry. hort-server is the only crate that
+# imports both inbound HTTP and outbound notifier types (anti-patterns
+# checklist — composition root has the entanglement license).
+hort-http-subscriptions = { path = "../hort-http-subscriptions" }
+hort-http-events       = { path = "../hort-http-events" }
+hort-notifier-webhook  = { path = "../hort-notifier-webhook" }
+hort-notifier-nats     = { path = "../hort-notifier-nats" }
+# Needed by `cli::admin::bootstrap` to call into
+# `UserUseCase::create_or_rotate_admin` — the CLI is an inbound adapter
+# over the application layer, never direct SQL.
+hort-app               = { path = "../hort-app" }
+hort-adapters-storage  = { path = "../hort-adapters-storage" }
+# The `verify-event-chain` subcommand (ADR 0002) composes
+# this CheckpointAnchorPort read adapter at the composition root. It
+# reuses `hort-adapters-storage`'s vetted object-store/TLS build path; no
+# new outbound TLS client is introduced here.
+hort-adapters-checkpoint-anchor = { path = "../hort-adapters-checkpoint-anchor" }
+# Composition root wires one of these two
+# `EphemeralStore` adapters into `AppContext.ephemeral` per
+# `HORT_EPHEMERAL_STORE_BACKEND`. The adapter-free guarantee on the
+# per-format HTTP crates (ADR 0008) still holds: those crates
+# depend on `EphemeralStore` via `hort-domain`, not on these adapters.
+hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
+hort-adapters-ephemeral-redis  = { path = "../hort-adapters-ephemeral-redis" }
+# Needed at the composition root to build the OIDC provider when
+# `HORT_AUTH_PROVIDER=oidc`. Only pulled in by the binary crate — library
+# crates stay free of a concrete IdP implementation.
+hort-adapters-oidc     = { path = "../hort-adapters-oidc" }
+# Needed at the composition root to build `PgRoleRepository` and hand it
+# to `build_app_context` for the RbacEvaluator snapshot.
+hort-adapters-postgres = { path = "../hort-adapters-postgres" }
+# Composition root wires `DispatchSecretPort` (env-var
+# + mounted-file adapters always wired together) onto the
+# `HttpUpstreamProxy`. Both sources are built unconditionally; the
+# `SecretRef::source` field selects per-resolve. No process-wide
+# HORT_SECRETS_PROVIDER selector — operators wire ESO/Vault Agent/CSI
+# to env vars or mounted files.
+hort-adapters-secrets = { path = "../hort-adapters-secrets" }
+# Fallback-PAT rotation reconciler's k8s
+# Secret writer (ADR 0018). Composition root constructs the impl when the
+# operator sets `HORT_K8S_SECRET_WRITER_ENABLED=true`; otherwise the
+# AppContext slot is `None` and the rotation handler refuses
+# to register. Adapter-free guarantee on the per-format crates still
+# holds — only this composition root depends on `hort-adapters-kubernetes`.
+hort-adapters-kubernetes = { path = "../hort-adapters-kubernetes" }
+# Composition root constructs
+# `HttpUpstreamProxy` and wires it onto `AppContext.upstream_proxy`.
+# The adapter lives in its own crate so `reqwest` does not leak into
+# the inbound-HTTP edge.
+hort-adapters-upstream-http = { path = "../hort-adapters-upstream-http" }
+# Needed by `cli::reconcile_groups` to wire the
+# three compiled-in FormatHandler instances (PyPI / cargo / npm) into
+# the reconciliation sweep's handler registry. No other hort-server
+# subcommand constructs format handlers today.
+hort-formats           = { path = "../hort-formats" }
+
+anyhow                       = { workspace = true }
+axum                         = { workspace = true }
+# Note: `serde` and `serde_yaml_ng` were dropped from this crate
+# alongside the legacy
+# `HORT_GROUP_MAPPINGS_PATH` loader. YAML parsing now lives entirely in
+# `hort-config`; hort-server only orchestrates the boot apply.
+sqlx                         = { workspace = true }
+# The `enqueue-quarantine-release-sweep` subcommand
+# constructs an empty `serde_json::Value` to pass to
+# `JobsRepository::enqueue_task` (the empty `params` jsonb). The
+# runtime composition root doesn't otherwise serialise JSON itself —
+# handlers in the http-* crates do — so the dep is small-surface.
+serde_json                   = { workspace = true }
+thiserror                    = { workspace = true }
+tokio                        = { workspace = true }
+tracing                      = { workspace = true }
+tracing-subscriber           = { workspace = true }
+metrics-exporter-prometheus  = { workspace = true }
+url                          = { workspace = true }
+# Parses `HORT_TRUSTED_PROXY_CIDRS` into `Vec<IpNet>` at startup.
+ipnet                        = { workspace = true }
+# CLI framework for the `hort-server` binary — top-level subcommand
+# dispatcher (`serve` / `migrate` / `scrub` / `admin`) lives in
+# `src/cli/`.
+clap                         = { workspace = true }
+# Password hashing for the `admin bootstrap` CLI path is Argon2id —
+# the `admin` adapter
+# delegates to `hort_app::argon2_hash::hash_password`, so this crate
+# pulls no bcrypt (banned — see the `no_bcrypt` guard test). The argon2
+# dep stays out of
+# this manifest because hashing is done via `hort-app`'s helper, not
+# directly here.
+uuid                         = { workspace = true }
+# `--since <RFC3339>` parsing on the
+# `reconcile-groups` CLI subcommand. Parses directly into
+# `DateTime<Utc>` via clap's `FromStr` integration; other subcommands
+# don't need chrono yet.
+chrono                       = { workspace = true }
+# `CancellationToken` for the shared shutdown
+# signal (axum serve + RBAC refresh task both listen on the same
+# token). The `io` feature is not needed here, but keeping the feature
+# set aligned with the workspace default avoids a second resolution
+# surface. The workspace entry already enables `io`; this crate only
+# uses `sync::CancellationToken`, a zero-feature type.
+tokio-util                   = { workspace = true }
+# Startup jitter on the RBAC refresh task's
+# first fire to desync replicas polling a shared Postgres.
+rand                         = { workspace = true }
+# Used in the RBAC refresh task to compare the
+# incoming snapshot against the current one before swapping.
+arc-swap                     = { workspace = true }
+# Short hash of the per-class Redis URL emitted
+# in the startup log line so operators can correlate "two log lines,
+# same url_hash" → single-Redis topology without leaking credentials.
+# `sha2` is already used elsewhere in the workspace (e.g. content-hash
+# computation on the storage edge); reusing it avoids adding a new
+# transitive dependency.
+sha2                         = { workspace = true }
+# Emission of `hort_rbac_snapshot_reloads_total`
+# on every poll outcome (success / unchanged / failed).
+metrics                      = { workspace = true }
+# Gitops boot apply. Reads
+# $HORT_CONFIG_DIR/**/*.yaml, builds DesiredState, runs
+# ApplyConfigUseCase before build_app_context.
+hort-config                    = { path = "../hort-config" }
+walkdir                      = { workspace = true }
+# `axum::serve` lacks `http1_header_read_timeout`
+# and HTTP/2 keep-alive knobs. We replace it with a hand-rolled accept loop
+# that calls `hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades`,
+# threading the per-connection timeouts into the http1/http2 builders.
+# The `server-graceful` feature gives us `GracefulShutdown` so the existing
+# CancellationToken propagates cleanly into in-flight connections.
+hyper                        = { workspace = true }
+hyper-util                   = { workspace = true }
+tower                        = { workspace = true }
+
+[dev-dependencies]
+temp-env = "0.3"
+# Captures `tracing` output so the
+# deprecation warning for `HORT_GROUP_MAPPINGS_PATH` can be asserted on
+# directly (env_var field + one-shot emission). This is the first
+# tracing-capture dep in the workspace; if more crates need it we can
+# promote to `[workspace.dev-dependencies]`.
+#
+# The `no-env-filter` feature is
+# required so the shutdown-deadline tests can capture warn lines
+# emitted with `target: "hort::shutdown"` (which doesn't match the
+# default crate-name-prefix env filter). The feature only affects the
+# test capture subscriber; production builds are untouched (this is a
+# dev-dep).
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# `gitops_boot::tests` builds a temp dir of
+# YAMLs to verify the directory walk skips hidden files/dirs and
+# is case-insensitive on the extension.
+tempfile = "3.10"
+# Capture/inspect `hort_rbac_snapshot_reloads_total`
+# in unit tests for the refresh task.
+metrics-util = { workspace = true, features = ["debugging"] }
+# The RBAC refresh task tests need chrono (for Role /
+# PermissionGrant fixture timestamps) and uuid at test-time. Both are
+# already pulled in transitively via `hort-domain`; listing them
+# explicitly under dev-deps keeps the test module's imports honest.
+chrono = { workspace = true }
+# `tests/task_use_case_enqueue_real_db.rs`
+# constructs `serde_json::Value` to feed `TaskUseCase::enqueue`. The
+# regular dep set excludes serde_json because the runtime composition
+# root never serialises JSON itself — handlers in the http-* crates
+# do. The integration test owns its own JSON value, so list it under
+# dev-deps only.
+serde_json = { workspace = true }
+# The `http` module's test harness drives the
+# real axum router via `tower::util::ServiceExt::oneshot` and uses
+# `metrics::with_local_recorder` for parallel-safe scrape assertions.
+# Both sit alongside the existing metrics-util debugging recorder.
+tower  = { workspace = true }
+# `hort-app`'s `test-support` feature exposes the
+# MockArtifactRepository / MockEventStore / MockIdentityProvider fixtures
+# the router integration tests build their AppContext from. Gated on the
+# dev-dep so production builds don't pull the mocks in.
+hort-app = { path = "../hort-app", features = ["test-support"] }
+# `hort-http-core`'s `test-support` feature exposes the
+# shared `test_support::build_mock_ctx` + `MockPorts` harness used by the
+# router integration tests. The feature transitively activates
+# `hort-app/test-support`, so enabling it here is sufficient.
+hort-http-core = { path = "../hort-http-core", features = ["test-support"] }
+# DB-backed `cli::verify_event_chain` tests connect to
+# the shared `DATABASE_URL` pool via their own `maybe_pool()` and write
+# to the `events` table — exactly the contract that `hort-adapters-postgres`
+# tests honour via the crate-wide `#[serial(hort_pg_db)]` key. Without the
+# same key here, `cargo test --workspace` races against the adapters'
+# tests on the shared DB. Honors the project's DB-test parallel-safety
+# contract (see CLAUDE.md → "DB-backed test isolation").
+serial_test = { workspace = true }
+# The `packument_cache_invalidated_on_reject` test
+# seeds + reads bytes on the production `EphemeralStore::{put,get}` surface
+# via the typed `bytes::Bytes` arg the trait requires.
+bytes = { workspace = true }

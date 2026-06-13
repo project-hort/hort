@@ -1,0 +1,68 @@
+[package]
+name = "hort-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort domain layer — pure Rust, zero I/O"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Value types and identifiers
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error types
+thiserror = { workspace = true }
+
+# Serialisation of domain events
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async trait definitions (AsyncRead) — io-util only, no runtime
+tokio = { workspace = true, features = ["io-util"] }
+
+# Async streams — `BoxStream` on the `StoragePort::list_all` return type.
+# Domain stays runtime-free: `futures` is a
+# zero-runtime utility crate (re-exports `Stream` + `BoxStream` types).
+futures = { workspace = true }
+
+# Opaque byte buffer on the `EphemeralStore` port.
+# `bytes::Bytes` is a zero-runtime reference-counted slice — fits the
+# domain's zero-I/O posture and matches the type used everywhere else
+# in the workspace to pass raw bytes across adapter boundaries.
+bytes = { workspace = true }
+
+# Memory zeroization for SecretValue. `Zeroizing<T>`
+# wraps the inner buffer so its bytes are scrubbed on drop; missing
+# Debug/Display/Serialize/Clone impls on `SecretValue` are the
+# compile-time guarantee against accidental log emission.
+zeroize = { workspace = true }
+
+# URL parsing for value-object scheme invariants
+# (`RepositoryUpstreamMapping::new` enforces the https-only rule on
+# `upstream_url` at construction time). `url` is pure Rust, no runtime,
+# already a workspace dep used by adapter crates.
+url = { workspace = true }
+
+# `TaskInvoked.params_digest` is a BLAKE3-256
+# hash of the JSON-serialised params. `blake3` is pure Rust, no unsafe
+# surface beyond what the underlying hashing primitives require, and
+# already a workspace dep added for this item.
+blake3 = { workspace = true }
+
+# The tamper-evident event-chain core
+# (`events::chain`) computes `event_hash = SHA-256(canonical_event_bytes)`.
+# SHA-256 is the mandated chain primitive; `sha2` is pure Rust,
+# no runtime, already a workspace dep. `hex` is used only in test/Display
+# helpers for human-readable hash rendering.
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+# Compile-time invariant checks. `assert_not_impl_any!` on
+# `ApiToken` enforces the no-`Deserialize` invariant at compile time
+# (the previous test was a no-op placeholder). Test-only — does not
+# affect the production dep graph.
+static_assertions = "1"

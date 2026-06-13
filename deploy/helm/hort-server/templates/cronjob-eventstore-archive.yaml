@@ -1,0 +1,73 @@
+{{/*
+Eventstore-archive CronJob.
+
+Periodically invokes `hort-cli admin task invoke eventstore-archive`.
+The handler runs the audit-retention stream sweep: seals terminal /
+age-gated streams whose minimum retention floor has elapsed, via the
+`seal_and_remove` `StreamSealed`-tombstone chokepoint. Whether a
+sealed stream's rows are actually removed depends on the worker's
+`HORT_RETENTION_DATABASE_URL`: when set, a dedicated
+`hort_retention_role` pool can DELETE; when unset, every delete_stream
+fails fail-safe via the still-active `events_immutable` trigger (the
+tombstone-first transaction rolls back, zero rows removed). Default
+WEEKLY cadence (Sunday) — the lowest-frequency retention task.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` (layer 1) +
+the worker per-kind semaphore concurrency=1 (layer 2).
+
+Idempotency-Key: `--idempotency-key-window=day` →
+`<UTC date>:eventstore-archive`.
+
+Gated by `scheduledTasks.eventstoreArchive.enabled` (default false).
+The parent `scheduledTasks.adminTasksEnabled` must also be true.
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.eventstoreArchive.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-eventstore-archive
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: eventstore-archive
+spec:
+  schedule: {{ .Values.scheduledTasks.eventstoreArchive.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: eventstore-archive
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - eventstore-archive
+                - --idempotency-key-window
+                - day
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

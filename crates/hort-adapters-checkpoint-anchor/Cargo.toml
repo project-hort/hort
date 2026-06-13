@@ -1,0 +1,51 @@
+[package]
+name = "hort-adapters-checkpoint-anchor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort CheckpointAnchorPort read adapter — S3 Object-Lock anchored, ed25519-signed event-chain checkpoints (ADR 0002)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The outbound port + the pure `Checkpoint` value type this adapter
+# produces (ADR 0002 + ADR 0004). Zero-I/O domain boundary.
+hort-domain = { path = "../hort-domain" }
+# NOTE: this crate is store-agnostic — it takes an injected
+# `Arc<dyn ObjectStore>` and depends only on `hort-domain` + crypto +
+# `object_store`. The composition root (`hort-server`'s `build_anchor`)
+# is what builds the concrete store via
+# `hort_adapters_storage::builders::build_s3_object_store` (ADR 0010
+# TLS / extra-CA posture) and injects it here, so this crate deliberately
+# does NOT depend on `hort-adapters-storage` or `hort-config`.
+
+# Object-store listing/fetching of the WORM checkpoint prefix.
+object_store = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+
+# Checkpoint wire DTO (JSON) → domain `Checkpoint`.
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+
+# Detached-signature verification with the operator-provisioned anchor
+# public key (spec §6.2 `signature`, §14 R2). Ed25519, PEM SPKI public
+# key — same primitive + parsing path as `hort-app::oci_token_signing`.
+ed25519-dalek = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# In-process Ed25519 keypair generation for the signature-verify tests
+# (no committed PEM fixtures — same pattern as the webhook adapter's
+# rcgen-in-process root).
+rand = { workspace = true }
+# Implementing a failing `ObjectStore` mock for the write-failure test:
+# the `object_store` trait is `#[async_trait]`-shaped, so the in-test
+# mock needs the same attribute macro.
+async-trait = { workspace = true }

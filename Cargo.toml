@@ -1,0 +1,457 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hort-domain",
+    "crates/hort-app",
+    "crates/hort-config",
+    "crates/hort-adapters-advisory-osv",
+    # CheckpointAnchorPort read adapter. Reads + signature-verifies
+    # S3-Object-Lock-anchored event-chain checkpoints for the
+    # `verify-event-chain` subcommand. Reuses `hort-adapters-storage`'s
+    # vetted object-store/TLS build path (no own reqwest client).
+    # Composition wires it only for that subcommand.
+    "crates/hort-adapters-checkpoint-anchor",
+    "crates/hort-adapters-ephemeral-memory",
+    "crates/hort-adapters-ephemeral-redis",
+    "crates/hort-adapters-oidc",
+    "crates/hort-adapters-postgres",
+    # Sigstore/cosign offline-bundle provenance verifier (`ProvenancePort`
+    # impl). OFFLINE bundle verification only (no live Rekor/Fulcio on the
+    # verify path); the sole live HTTP client is the periodic TUF
+    # trust-root refresh, built via the vendored
+    # `extra_ca::apply_to_reqwest_builder` (ADR 0010).
+    "crates/hort-adapters-provenance-sigstore",
+    "crates/hort-adapters-scanner-osv",
+    "crates/hort-adapters-scanner-trivy",
+    "crates/hort-adapters-secrets",
+    "crates/hort-adapters-storage",
+    # Kubernetes Secret writer adapter for the fallback PAT-rotation
+    # reconciler. Only consumer: the `ServiceAccountRotationHandler`
+    # TaskHandler. Crate exists in non-k8s deployments but the composition
+    # root only constructs the impl when the operator opts in via
+    # `HORT_K8S_SECRET_WRITER_ENABLED=true`.
+    "crates/hort-adapters-kubernetes",
+    "crates/hort-adapters-upstream-http",
+    "crates/hort-net-egress",
+    # NATS JetStream EventNotifier adapter. Single struct implementing
+    # `EventNotifier` for `SubscriptionTarget::NatsJetStream`. Composition
+    # wires `Arc<NatsNotifier>` once when `HORT_NATS_URL` is configured;
+    # the adapter is otherwise dormant. Same `hort-notifier-*` naming as
+    # the webhook adapter.
+    "crates/hort-notifier-nats",
+    # Webhook EventNotifier + WebhookTargetGuard adapter. Single struct
+    # implementing both ports; composition wires `Arc<WebhookNotifier>`
+    # once and exposes it as both `Arc<dyn EventNotifier>` and
+    # `Arc<dyn WebhookTargetGuard>`.
+    "crates/hort-notifier-webhook",
+    "crates/hort-http-core",
+    "crates/hort-http-cargo",
+    "crates/hort-http-npm",
+    "crates/hort-http-pypi",
+    "crates/hort-http-oci",
+    # Admin security-score REST surface.
+    "crates/hort-http-admin-security",
+    # Admin-task invoke + list + get REST surface.
+    "crates/hort-http-admin-tasks",
+    # /api/v1/subscriptions + /api/v1/admin/subscriptions CRUD HTTP surface.
+    # Per-format-HTTP-crate topology (ADR 0008): no `hort-adapters-*`,
+    # `sqlx`, or `reqwest` deps.
+    "crates/hort-http-subscriptions",
+    # JWT-only discovery + self-service prefetch REST surface
+    # (`GET /api/v1/repositories/:repo_key/discovery/versions/:package`
+    # + `POST /api/v1/repositories/:repo_key/prefetch`).
+    # Per-format-HTTP-crate topology (ADR 0008): no `hort-adapters-*`,
+    # `sqlx`, or `reqwest` deps.
+    "crates/hort-http-discovery",
+    # GET /api/v1/events pull-resync HTTP surface. Same per-format-HTTP-crate
+    # topology rule as `hort-http-subscriptions` (ADR 0008): no
+    # `hort-adapters-*`, `sqlx`, or `reqwest` deps.
+    "crates/hort-http-events",
+    "crates/hort-formats",
+    # `UpstreamMetadataPort` composition crate. Dispatches per-format
+    # `fetch_raw_with_cache` helpers + the
+    # `FormatHandler::extract_upstream_versions` parsers. ONLY non-server,
+    # non-test production crate that imports multiple per-format
+    # `hort-http-<format>` crates as a normal dep — see the crate's
+    # `Cargo.toml` for the dep-graph rationale.
+    "crates/hort-formats-upstream",
+    "crates/hort-server",
+    # Multi-kind worker binary. Standalone process that claims jobs from
+    # the shared `jobs` table and dispatches to the registered `TaskHandler`
+    # for each `kind` (scan, cron-rescan-tick, advisory-watch-tick,
+    # staging-sweep, noop). hort-server does NOT depend on this crate; the
+    # only shared surface is `hort-app` + `hort-adapters-postgres`.
+    "crates/hort-worker",
+    # CLI binary (pure HTTP client, no DSN, zero hort-domain / hort-app /
+    # hort-adapters-* deps). This member entry makes the crate visible to
+    # the workspace build and `cargo tree` dep-isolation checks.
+    "crates/hort-cli",
+]
+# tools/* hosts standalone, throwaway / one-off binaries (e.g.
+# `measurement-tools`). They are intentionally NOT workspace members: they
+# live outside the production dep graph, are not subject to the workspace
+# lint profile, and are exempt from the `Client::builder()` rule (ADR 0010)
+# because they have no production TLS surface. They build standalone via
+# `(cd tools/<name> && cargo build)`. The glob exclude keeps cargo from
+# auto-detecting their `Cargo.toml`s as members.
+exclude = ["tools/*"]
+
+[workspace.package]
+version = "1.0.0-rc.14"
+edition = "2021"
+# MSRV — kept in sync with `.clippy.toml` (`msrv = "1.94.0"`) and with
+# `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` default (asserted
+# by `scripts/check-rust-version.sh`). The `scripts/check-advisory-sync.sh`
+# CI gate does not check the pair against clippy.toml (it is scoped to
+# advisory-ignore-list parity); a clippy/Cargo divergence is caught by
+# clippy itself, since `.clippy.toml`'s `msrv` enforces the floor at lint
+# time.
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/project-hort/hort"
+
+[workspace.lints.clippy]
+# Correctness
+enum_glob_use = "warn"
+manual_let_else = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+# Maintainability
+large_types_passed_by_value = "warn"
+implicit_clone = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.50", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["multipart", "tokio"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "timeout"] }
+# Explicit hyper-util Builder for the `axum::serve` replacement. We need
+# `http1_header_read_timeout` (the slowloris defence) plus the HTTP/1+H2
+# auto-negotiation; the `server-graceful` feature gives us a
+# `GracefulShutdown` watcher we can wire to the existing shutdown
+# CancellationToken without holding a JoinSet of every in-flight connection
+# ourselves.
+hyper       = { version = "1.8", features = ["http1", "http2", "server"] }
+hyper-util  = { version = "0.1", features = ["http1", "http2", "server", "server-auto", "server-graceful", "tokio"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
+
+# Testing — serialises tests that share global DB state (the gitops
+# `permission_grants` partition full-replace). See the hort-adapters-postgres
+# permission_grant_repo `save_managed_*` tests.
+serial_test = "3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# YAML — active community fork of the archived `serde_yaml`. Swapped
+# `serde_yml` → `serde_yaml_ng` to drop the transitive `libyml` advisories
+# RUSTSEC-2025-0067 / RUSTSEC-2025-0068. Promoted to workspace level so
+# the `hort-config` crate shares a single resolved version.
+serde_yaml_ng = "0.10"
+
+# Authentication
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+# Argon2id replaces bcrypt for both password and PAT hashing. `bcrypt` is
+# removed from the workspace entirely; a CI grep gate (`no_bcrypt` guard)
+# keeps it out. `password-hash` ships with `argon2` and provides the PHC
+# string format encode/decode the helper module wraps.
+argon2 = { version = "0.5", features = ["std"] }
+password-hash = { version = "0.5", features = ["alloc"] }
+# Ed25519 keypair used to sign the OCI Distribution-Spec `/v2/auth` token
+# JWT. The `pkcs8` feature provides `from_pkcs8_der` / `from_pkcs8_pem` so
+# composition can load the secret from a Kubernetes-mounted file without a
+# separate PEM parser. `rand_core` enables generating a fresh keypair in
+# tests.
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "pem"] }
+
+# Checksums
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+# The webhook adapter uses `hex::encode` for the lowercase-hex form of
+# the HMAC-SHA256 signature (`X-Ak-Signature: sha256=<hex>`).
+# Workspace-pinned so future adapters that need hex (e.g. content-addressed
+# cache keys, signature verification helpers) share one resolved version.
+hex = "0.4"
+# params_digest on TaskInvoked uses BLAKE3-256. BLAKE3 is not
+# cryptographically weaker than SHA-256 for this use case
+# (content-addressing, not trust anchoring); it is faster and already
+# widely used in the Rust ecosystem.
+blake3 = "1"
+
+# S3 storage using Apache object_store crate (supports custom CA certs for TLS)
+object_store = { version = "0.13", features = ["aws"] }
+
+# HTTP types (used for presigned URL methods)
+http = "1"
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+metrics-util = "0.20"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Config
+dotenvy = "0.15"
+
+# UUID
+uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
+# ZIP archive parsing — the advisory-watch handler streams OSV
+# per-ecosystem `all.zip` bulk feeds. `default-features = false` +
+# `deflate` keeps the dep minimal (no AES/zstd we don't need); the OSV
+# archives use deflate exclusively.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# gzip (de)compression. `flate2`'s `GzDecoder` decompresses npm `.tgz` /
+# cargo `.crate` archives inside
+# `hort-formats::archive_bounds::read_tar_gz_entry`. `deny.toml:183-189`
+# already permits `flate2` in `hort-formats` (the `wrappers` exception);
+# `default-features` keeps the pure-Rust `miniz_oxide` backend (no system
+# zlib link). Workspace-pinned so any future gzip consumer shares one
+# resolved version.
+flate2 = "1"
+# tar archive parsing. `tar::Archive` iterates the decompressed gzip-tar
+# stream inside `hort-formats::archive_bounds::read_tar_gz_entry`.
+# `deny.toml:183-189` locks `tar` to `hort-formats` (the only sanctioned
+# archive-extraction home). Workspace-pinned for a single resolved version.
+tar = "0.4"
+# Human-friendly duration parsing. Consumers: `ScanPolicy.quarantineDuration`
+# and `Exclusion.maxArtifactAge` (parse via `humantime::parse_duration`).
+# Promoted to workspace deps so any future duration-string consumer (e.g.
+# event-sourced policy spec helpers) shares one resolved version.
+humantime = "2"
+
+# HTTP client (for proxy repos).
+#
+# Pinned to 0.12 to align with the transitive `reqwest` brought in by
+# `object_store`. As of 2026-Q1 the latest released
+# `object_store` (0.13.2) still depends on `reqwest ^0.12`; pulling in our
+# direct `reqwest = "0.13"` resulted in two `reqwest` versions in the binary
+# with two different TLS verifier paths (`rustls-platform-verifier` for 0.13
+# vs `rustls-native-certs` for the 0.12 transitive). That made TLS-trust
+# debugging materially harder and forced audit tooling to scan two
+# transitive trees. Re-bump to `0.13` once `object_store` releases a
+# `reqwest 0.13` line.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls-native-roots"] }
+
+# URL encoding
+serde_urlencoded = "0.7"
+
+# Async streams
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tokio-stream = "0.1"
+bytes = "1.5"
+
+# Binary serialisation for small, opaque structs stored in the
+# `EphemeralStore` (upload-session records, idempotency tokens).
+# JSON would work but adds parser overhead and wire-size noise for
+# fixed-shape adapter payloads. `postcard` is `serde`-driven, no_std,
+# and actively maintained — replaces `bincode 2.0`
+# (RUSTSEC-2025-0141 unmaintained). Migration
+# strategy is drain-via-TTL: the OCI session-key prefix is bumped to
+# `stateful_upload:oci_v2:`, so old bincode-encoded records never
+# meet the new postcard decoder; in-flight sessions die on the
+# 1-hour `OCI_SESSION_TTL` during the deploy window.
+# `default-features = false` + `alloc` keeps the dep lean — we
+# don't need the `experimental` schema, `heapless`, or `crc` extras.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+# Concurrent hash map for the in-memory `EphemeralStore` adapter. Keeps
+# per-key locking cheap — CAS acquires a short per-key
+# `tokio::sync::Mutex` guarding the compare-and-write window, so
+# concurrent writes on disjoint keys never contend.
+dashmap = "6.1"
+
+# Redis / Valkey client for the Redis-backed `EphemeralStore` adapter.
+# `i-hashes` gives HSET/HMGET; `i-keys` gives DEL/EXPIRE; `i-scripts`
+# gives EVAL for the CAS Lua script. Pinned against the last-known-good
+# 10.x stable; a future major bump should verify the Lua/script API still
+# matches the `compare_and_swap` contract.
+fred = { version = "10.1", default-features = false, features = ["transactions", "i-hashes", "i-keys", "i-scripts"] }
+
+# Async trait macro — used by port adapters whose real-world API
+# ergonomics demand `async fn` in traits (e.g. Redis adapter paths
+# that compose over `fred` futures). The domain-layer ports
+# themselves still use the `BoxFuture` type alias for zero-runtime
+# neutrality; this workspace dep covers adapter-crate usage.
+async-trait = "0.1"
+
+# Randomness (scrub sampling). Kept workspace-level because the scrubber is
+# the only current consumer; adding per-crate avoids a version skew when a
+# future feature needs the same source.
+rand = "0.8"
+
+# LRU cache for the PAT validation cache. `PatCache` wraps
+# `lru::LruCache<CacheKey, CachedEntry>` plus a `HashMap<Uuid, CacheKey>`
+# reverse index for `token_id → cache_key` lookups so `invalidate_token`
+# is O(1). Bounded at default 10k entries (`HORT_PAT_CACHE_SIZE`); on
+# overflow the oldest entry is evicted regardless of TTL. The 0.12.x line
+# is the latest as of 2026-Q2.
+lru = "0.12"
+
+# Lock-free atomic pointer swap for RBAC live-refresh. `ArcSwap` wraps the
+# `RbacEvaluator` snapshot so hot-path reads stay lock-free while the
+# background refresh task replaces the pointer on every cycle. Kept
+# workspace-level so any future use case (config hot-reload, feature
+# flags, …) can adopt the same primitive without a version skew.
+arc-swap = "1.7"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# URL parsing and resolution
+url = "2.5"
+
+# IP CIDR parsing (HORT_TRUSTED_PROXY_CIDRS allowlist)
+ipnet = "2.11"
+
+# XML Digital Signatures (SAML signature verification).
+# Pinned to 0.3.x: 0.4.0 pulls in `kryptering 0.1.0` (HSM/PKCS11 support),
+# which fails to cross-compile on Windows because it does u64.into() on
+# `cryptoki::types::Ulong`, but `Ulong: From<u32>` only on Windows targets
+# where CK_ULONG = u32. Unblock once kryptering ships a Windows-portable fix.
+bergshamra = "=0.3.1"
+
+# SMTP email delivery
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+# Recursive directory walk — gitops boot scans `$HORT_CONFIG_DIR/**/*.yaml`.
+# Promoted to workspace deps so any future caller shares the version pin.
+walkdir = "2"
+
+# Memory zeroization for SecretValue. `default-features = false` drops the
+# optional `derive` feature we don't need; we use the `Zeroizing<T>`
+# wrapper type directly. The explicit `alloc` feature re-adds
+# `Vec<u8>: Zeroize` (which the default feature set bundles into
+# `default`); without it `Zeroizing<Vec<u8>>` does not type-check.
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+
+# Temp-file spool for streaming uploads. Runtime consumer: npm
+# `_attachments[*].data` base64 stream-decode. Already in dev-deps for
+# several crates; promoted to workspace so any future spool-to-disk
+# consumer shares one resolved version. Drop-on-scope-exit semantics keep
+# /tmp clean even on aborted publishes.
+tempfile = "3"
+
+# TOML file parsing — hort-cli config file (~/.hort/config.toml) consumer.
+# `toml` parses via `serde::Deserialize`; the 1.x line is the stable
+# successor to the 0.5/0.7 lines.
+toml = "1"
+
+# Platform-native config/data/cache directory paths (XDG on Linux,
+# Application Support on macOS, APPDATA on Windows). Used by hort-cli
+# to locate ~/.hort/config.toml via `BaseDirs::new().config_dir()`.
+directories = "6"
+
+# HTTP mock server for hort-cli integration tests. `mockito` binds a
+# random port on 127.0.0.1, serves configured routes, and asserts
+# request expectations. Kept workspace-level so future crates that
+# need an HTTP mock server share the version pin.
+mockito = "1"
+
+# Kubernetes client for the fallback PAT-rotation reconciler's outbound
+# `KubernetesSecretWriter`. Only consumer is `hort-adapters-kubernetes`.
+#
+# Feature choices:
+#   - `default-features = false` + `client` + `rustls-tls` — strips the
+#     openssl-tls / native-tls paths (workspace-wide anti-pattern: rustls
+#     only). The `client` feature pulls in `Client::try_default`,
+#     `Api::<T>::namespaced`, `PatchParams::apply`, etc. — the surface this
+#     adapter touches. The default `runtime` (controller / watcher) feature
+#     is excluded because the CronJob + admin-task model was chosen over a
+#     controller-runtime reconciler.
+#   - `gzip` is excluded — kube-rs's optional gzip is for very large watch
+#     streams; we do single Secret reads + writes.
+# Pinned to the latest 3.x crates.io line (3.1.0 as of 2026-03).
+kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"] }
+#
+# `k8s-openapi` is the generated Kubernetes API type registry. The
+# `latest` feature selects the newest Kubernetes API version supported
+# by the chosen `k8s-openapi` release (currently `v1_34` — a Kubernetes
+# server >= 1.27 honours the `core/v1` Secret shape unchanged, so the
+# adapter does not bind us to a specific cluster minor). Pinned to
+# 0.27.x (the major used by kube 3.1.x).
+k8s-openapi = { version = "0.27", features = ["latest"] }
+
+# Masked terminal input for `hort-cli auth login`. Reads the token without
+# echoing it to the terminal (uses platform `termios` / `ReadConsole`
+# APIs). Falls back gracefully when stdin is not a TTY (CI / pipes) —
+# callers check `std::io::IsTerminal` first.
+rpassword = "7"
+
+# NATS JetStream client used by the `hort-notifier-nats` adapter. The
+# crate consumes only the `jetstream` feature (publish-with-ack);
+# composition wires a single `Client` per process. Workspace-pinned so a
+# future in-tree consumer (e.g. a JetStream-driven consumer-side replay
+# tool) shares one resolved version. `default-features = false` here is
+# required so individual consumers can opt back in via `features = [...]`;
+# the v1 consumer (`hort-notifier-nats`) selects `jetstream` +
+# `server_2_10` + `ring`.
+async-nats = { version = "0.48", default-features = false }
+
+# Integration-test container harness — used only as a dev-dep by
+# `hort-notifier-nats` to stand up `nats:latest` with JetStream enabled.
+# Workspace-pinned so future adapters that need real-broker fixtures
+# (e.g. a future Kafka relay) share the version.
+testcontainers = "0.27"
+
+# Strip release binaries to shrink the container image. The unstripped
+# `hort-server` binary carries debug symbols (~80 MB); stripping symbols
+# drops it to ~25 MB to meet the distroless image size budget. Backtraces
+# survive — `panic = "unwind"` (the Rust default) keeps panic frames;
+# `strip = "symbols"` removes only the symbol table, not the unwind tables.
+# Operators who want full debug info bundle a `debug` profile build
+# separately rather than re-enable on release.
+[profile.release]
+strip = "symbols"
+
+# `target/debug` was hitting 135 GB on this workspace because every
+# integration test crate produced a multi-hundred-MB binary with full
+# debug info, and dependency rlibs all carried full debuginfo too. Three
+# levers cut it to ~30 GB without changing what we can actually do
+# locally — backtraces still carry file:line, panic unwind tables are
+# preserved, and the only thing lost is debugger-side local-variable
+# inspection (we debug via `println!`/`tracing::debug!`/`dbg!` in this
+# project, not breakpoints).
+#
+# These also align local builds with the CI gate, which sets
+# `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and `CARGO_INCREMENTAL=0`
+# in `.gitlab-ci.yml` — having the same defaults in `Cargo.toml` means
+# a contributor running `cargo test` locally matches what CI runs
+# without needing the env vars.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+# Drop debuginfo from dependency crates entirely. We never set
+# breakpoints in tokio/sqlx/axum source — keeping their debug symbols
+# is pure disk-space tax. Workspace crates keep `line-tables-only`
+# from `[profile.dev]` above. If a future need arises to step through
+# a specific dep (debugging a hang in a dep, etc.), temporarily flip
+# this to `debug = "line-tables-only"` for that session and revert.
+[profile.dev.package."*"]
+debug = false

@@ -1,0 +1,83 @@
+[package]
+name = "hort-http-oci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for the OCI Distribution Spec v1.1"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-formats   = { path = "../hort-formats" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+bytes        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+url          = { workspace = true }
+metrics      = { workspace = true }
+thiserror    = { workspace = true }
+# OCI tag names legitimately contain `+`, `%`, and `/` which must percent-
+# encode to round-trip through clients' query-string parsers (used by
+# `tags.rs` for the `Link: rel=next` + `last=` cursor).
+urlencoding  = "2"
+# sha2 is used to parse + validate digest strings handed to
+# `GET /v2/<name>/blobs/<digest>`.
+sha2         = { workspace = true }
+# Stateful upload session records are stored in `EphemeralStore` as
+# postcard-encoded bytes. Small, fixed-shape payloads. The OCI session-
+# key prefix is `stateful_upload:oci_v2:` to keep old bincode-encoded
+# records out of the new decoder's path. Old keys expire via the
+# existing 1-hour `OCI_SESSION_TTL` — no dual-format read window.
+# `serde` is the codec driver; the workspace dep is already pulled in
+# for HTTP body deserialisation.
+postcard     = { workspace = true }
+# `TryStreamExt::map_err` on axum's body data stream for the
+# monolithic push path.  Body bytes stream into `IngestUseCase::ingest`
+# through a `tokio_util::io::StreamReader` so we never buffer the
+# whole payload (OCI blobs can be gigabytes).
+futures      = { workspace = true }
+# `oci_bearer_auth` middleware decodes `Authorization: Basic <base64>`
+# headers to recover the IdP JWT stored in the password slot
+# (legacy / twine-compatible flow).
+base64       = "0.22"
+# `CachingResolver` holds the
+# `HashMap<Uuid, Vec<RepositoryUpstreamMapping>>` snapshot in an
+# `ArcSwap` so the request-path read is lock-free and the background
+# refresh task can swap atomically without blocking readers.
+arc-swap     = { workspace = true }
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+metrics-util                = { workspace = true, features = ["debugging"] }
+tempfile                    = "3"
+regex                       = "1"
+tower                       = { workspace = true }
+arc-swap                    = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+# Challenge-middleware tests build a fresh Ed25519 keypair to drive
+# the verify-path (and assert the tampered-signature reject).
+# Production code does NOT use these directly; the OCI signing key
+# is owned by hort-app + composition.
+ed25519-dalek               = { workspace = true }
+rand                        = { workspace = true }
+# The `/v2/auth` end-to-end test in tests/v2_auth_e2e.rs needs a
+# live `EphemeralStore` to drive the `PatValidationUseCase`'s lockout
+# / cache plumbing. The in-memory adapter is the lightest
+# production-shape backend we can wire.
+hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
+hort-domain                   = { path = "../hort-domain" }
+chrono                      = { workspace = true }
+serde_json                  = { workspace = true }
+uuid                        = { workspace = true }

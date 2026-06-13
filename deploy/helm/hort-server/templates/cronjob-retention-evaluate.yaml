@@ -1,0 +1,79 @@
+{{/*
+Retention-evaluate CronJob.
+
+Periodically invokes `hort-cli admin task invoke retention-evaluate`.
+The handler reads every active retention policy from the
+`retention_policy_projections` projection, enumerates non-protected
+artifacts keyset-paginated, and runs the pure retention evaluator —
+appending one `ArtifactExpired` (RetentionScheduler actor) per fresh
+match. It deletes NO storage: that is the two-stage split's second
+stage (retention-purge below). Default daily cadence.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents the
+controller spawning a second pod while the previous tick runs.
+Execution-overlap protection is the worker's per-kind semaphore
+(concurrency=1). Together they cover the single-active invariant.
+
+Idempotency-Key: `--idempotency-key-window=day` computes the key as
+`<UTC date>:retention-evaluate`. A controller-restart double-fire
+short-circuits at the framework layer (EphemeralStore idempotency
+window).
+
+Gated by `scheduledTasks.retentionEvaluate.enabled` (default false;
+retention is operator-opt-in). The parent toggle
+`scheduledTasks.adminTasksEnabled` must also be true for this template
+to render.
+
+The service-account token (`{{ release }}-svc-token`) is mounted from
+the k8s Secret written by the bootstrap Job (svc-token-bootstrap-job.yaml).
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.retentionEvaluate.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-retention-evaluate
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: retention-evaluate
+spec:
+  schedule: {{ .Values.scheduledTasks.retentionEvaluate.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: retention-evaluate
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - retention-evaluate
+                - --idempotency-key-window
+                - day
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

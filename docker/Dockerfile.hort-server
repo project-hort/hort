@@ -1,0 +1,114 @@
+# syntax=docker/dockerfile:1.7
+#
+# hort-server — production runtime image (Initiative 21 Item 2).
+#
+# Sibling to `deploy/compose/Dockerfile` (the dev / E2E debug image, which
+# stays untouched) and to the prototype `docker/Dockerfile.backend*`
+# images (the v1 backend, which is read-only during the rewrite).
+#
+# Two stages:
+#   1. builder: rust:${RUST_VERSION}-slim — produces the stripped
+#      release binary. `[profile.release] strip = "symbols"` is set in
+#      the workspace `Cargo.toml` (Initiative 21 Item 1), so the
+#      `cargo build --release -p hort-server` invocation below does not
+#      need an explicit `--strip` flag. The `:slim` variant matches the
+#      tag the test pipeline already pulls (`RUST_IMAGE` in
+#      `.gitlab-ci.yml`); the originally-chosen `:bookworm` tag was not
+#      cached on the internal registry mirror and produced manifest-unknown
+#      errors on the first publish run.
+#   2. runtime: gcr.io/distroless/cc-debian13:nonroot — no shell, no
+#      package manager, ships glibc + libgcc + ca-certificates only.
+#      The base already declares `USER 65532:65532`, so this stage
+#      does not re-issue a `USER` directive (CIS-alignment via the
+#      base image, not via in-Dockerfile re-statement).
+#
+# OCI labels: only the non-CI-driven pair (`title`, `licenses`) is
+# baked in. `source`, `revision`, `version`, `created` are passed by
+# the CI publish job via `--label` on the build invocation, per
+# `docs/plans/031-initiative-21-deploy.md` §3.1.
+#
+# No HEALTHCHECK directive: Kubernetes liveness / readiness probes
+# call `/healthz` and `/readyz` directly (Item 1); compose / podman
+# users run `deploy/compose/docker-compose.yml`, not this image.
+#
+# No ENV defaults and no CMD: every env var lives in the chart's
+# `values.yaml` + Deployment template (design doc §3.4); operators
+# pass the subcommand explicitly (`serve`, `migrate`, `scrub`,
+# `admin`, `reconcile-groups`).
+
+ARG RUST_VERSION=1.94
+
+# ---------- Stage 1: builder ----------
+FROM rust:${RUST_VERSION}-slim AS builder
+
+WORKDIR /app
+
+# Workspace inputs.
+#
+# The top-level `migrations/` directory is REQUIRED at build time —
+# `sqlx::migrate!("../../migrations")` in `crates/hort-server/src/migrate.rs`
+# is a proc-macro that reads the migration files at compile time and embeds
+# them into the binary. The COPY destination must match the macro path
+# (resolves to /app/migrations under this stage's WORKDIR).
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY migrations/ ./migrations/
+
+# `sqlx::migrate!` re-scans the migrations directory only when its
+# host source file changes mtime. Touching the file invalidates the
+# cached proc-macro expansion inside the `/app/target` BuildKit cache
+# mount, so newly-added migrations always make it into the embedded
+# set. Cheap (forces a single recompile of `migrate.rs`) and safe
+# (no other crate watches that file's mtime). Mirrors the workaround
+# baked into `deploy/compose/Dockerfile`.
+RUN touch crates/hort-server/src/migrate.rs
+
+# Build the release binaries. Cache mounts:
+#   - /usr/local/cargo/registry: avoid re-downloading the dep index
+#     and source crates between iterative local builds.
+#   - /app/target: avoid re-compiling unchanged dependency crates.
+# Both caches are layer-internal — they don't end up in the published
+# image (binaries are `cp`'d out of the cache before the layer ends).
+#
+# `hort-cli` ships alongside `hort-server` because the chart's CronJob
+# templates (cronjob-noop, cronjob-staging-sweep, cronjob-cron-rescan-tick,
+# cronjob-advisory-watch-tick, cronjob-service-account-rotation) invoke
+# `/usr/local/bin/hort-cli admin task invoke <kind>` directly against this
+# image. Keeping both binaries in one image avoids a separate hort-cli image
+# (and its publish pipeline) for what is otherwise a thin HTTP client.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p hort-server -p hort-cli && \
+    cp target/release/hort-server /usr/local/bin/hort-server && \
+    cp target/release/hort-cli /usr/local/bin/hort-cli
+
+# ---------- Stage 2: runtime ----------
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+
+# OCI Image Spec v1.1 labels. The two below are static; CI passes the
+# rest (`source`, `revision`, `version`, `created`) via `--label` on
+# the publish job (design doc §3.1).
+LABEL org.opencontainers.image.title="hort"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# CAS staging dir + working directory. The chart mounts an emptyDir
+# (or a PVC for the filesystem-storage backend) over this path; the
+# image just needs the directory to exist and be writable by UID
+# 65532. Distroless `nonroot` is owned by 65532:65532 by base-image
+# convention.
+WORKDIR /var/lib/hort-server
+
+# Public listener (default 8080) + admin/metrics listener (default
+# 9090). Operators may rebind via `HORT_HTTP_PUBLIC_BIND` /
+# `HORT_HTTP_ADMIN_BIND`; the EXPOSE values reflect the documented
+# defaults from `docs/plans/031-initiative-21-deploy.md` §3.1.
+EXPOSE 8080 9090
+
+COPY --from=builder /usr/local/bin/hort-server /usr/local/bin/hort-server
+COPY --from=builder /usr/local/bin/hort-cli    /usr/local/bin/hort-cli
+
+# No CMD — operators pass the subcommand explicitly. `hort-server` with
+# no subcommand defaults to `serve` (preserved by clap for the
+# compose-stack invocation), but the chart's templates always pass an
+# explicit subcommand for clarity.
+ENTRYPOINT ["/usr/local/bin/hort-server"]

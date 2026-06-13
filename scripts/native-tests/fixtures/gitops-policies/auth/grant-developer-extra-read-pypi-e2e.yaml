@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: developer-extra-read-pypi-e2e
+spec:
+  # Plural-only schema. A one-permission, one-repo grant
+  # uses single-element arrays — there is no singular `permission` /
+  # `repository` form. See
+  # `deploy/compose/example-config/auth/developer-can-write-pypi-internal.yaml`
+  # for the canonical shape and how the Cartesian product expands.
+  role: developer-extra
+  permissions: [read]
+  repositories: [pypi-e2e]

@@ -1,0 +1,15 @@
+# PermissionGrant: a caller with BOTH `developer` AND `ci-pusher`
+# claims may write `pypi-e2e`. Satisfies the dev-user (group
+# test-developers) twine upload in scenarios/clients/pypi.sh. Per-repo scoped
+# and two-claim subject both required to pass the allowlist linter.
+# Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-write-pypi-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: pypi-e2e

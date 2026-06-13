@@ -1,0 +1,14 @@
+# PermissionGrant: [developer, ci-pusher] -> Prefetch on
+# pypi-proxy. Two-claim + per-repo (linter-clean). Paired with
+# `32-read-pypi-proxy.yaml`. See `34-prefetch-npm-proxy.yaml` for the
+# Read ∧ Prefetch + OCI-exclusion rationale.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: developers-prefetch-pypi-proxy
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: prefetch
+  repository: pypi-proxy

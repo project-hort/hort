@@ -1,0 +1,17 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: oci-proxy
+spec:
+  name: "OCI Proxy"
+  description: "Pull-through cache for docker.io/library (alpha)"
+  format: oci
+  type: proxy
+  storage:
+    backend: filesystem
+    path: oci-proxy
+  proxy:
+    upstreamUrl: "https://index.docker.io"
+  isPublic: true
+  replicationPriority: local_only
+  indexMode: include_pending

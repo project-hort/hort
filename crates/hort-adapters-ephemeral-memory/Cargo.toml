@@ -1,0 +1,27 @@
+[package]
+name = "hort-adapters-ephemeral-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-memory adapter for the EphemeralStore port — dashmap-backed, background TTL evictor"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+# `MeteredEphemeralStore::new` takes `EphemeralKeyspaceClass`
+# (defined in `hort-app::ephemeral_keyspace`) so every metric series
+# carries the `class={evictable|durable}` label. Pure data import —
+# no I/O brought in.
+hort-app    = { path = "../hort-app" }
+
+tokio       = { workspace = true, features = ["sync", "time", "rt"] }
+bytes       = { workspace = true }
+dashmap     = { workspace = true }
+metrics     = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio        = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+metrics-util = { workspace = true, features = ["debugging"] }

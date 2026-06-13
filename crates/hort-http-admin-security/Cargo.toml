@@ -1,0 +1,37 @@
+[package]
+name = "hort-http-admin-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for the admin security-score REST surface"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+metrics      = { workspace = true }
+thiserror    = { workspace = true }
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+metrics-util                = { workspace = true, features = ["debugging"] }
+# Inline test module drives routers through tower's ServiceExt::oneshot.
+tower                       = { workspace = true }
+# `AuthContext::Enabled` fixtures in the test harness wrap the RBAC
+# evaluator snapshot in Arc<ArcSwap<_>>.
+arc-swap                    = { workspace = true }
+# Tests scope a Prometheus recorder to verify metric emission paths fire.
+metrics-exporter-prometheus = { workspace = true }

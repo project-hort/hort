@@ -1,0 +1,52 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "/tmp/sbom.cdx.json",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "requests",
+            "ecosystem": "PyPI",
+            "version": "2.20.0"
+          },
+          "vulnerabilities": [
+            {
+              "id": "GHSA-9wx4-h78v-vm56",
+              "aliases": ["CVE-2018-18074"],
+              "summary": "Information disclosure in requests",
+              "severity": [
+                {
+                  "type": "CVSS_V3",
+                  "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N/8.1"
+                }
+              ],
+              "affected": [
+                {
+                  "ranges": [
+                    {
+                      "events": [
+                        {"introduced": "0"},
+                        {"fixed": "2.20.1"},
+                        {"fixed": "2.20.1"},
+                        {"fixed": "2.21.0"}
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "references": [
+                {"type": "ADVISORY", "url": "https://github.com/advisories/GHSA-9wx4-h78v-vm56"}
+              ]
+            }
+          ],
+          "groups": [
+            {"ids": ["GHSA-9wx4-h78v-vm56"], "max_severity": ""}
+          ]
+        }
+      ]
+    }
+  ]
+}

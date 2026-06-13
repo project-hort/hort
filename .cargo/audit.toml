@@ -1,0 +1,99 @@
+# Configuration for cargo-audit
+# See https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# **This file is the single source of truth for the RUSTSEC advisory
+# ignore list.** `deny.toml`'s `[advisories.ignore]` is kept in sync
+# with this file by `scripts/check-advisory-sync.sh`, run on every CI
+# push. When you add or remove an ID here, mirror the change in
+# `deny.toml` in the same commit.
+
+[advisories]
+# List of advisory IDs to ignore.
+#
+# An entry tagged with the marker `AUDIT-ONLY: RUSTSEC-YYYY-NNNN` on the
+# comment line immediately above the ID is intentionally **not** mirrored
+# in `deny.toml`. The two tools walk the dependency graph differently:
+# `cargo audit` walks the full `Cargo.lock`; `cargo deny` walks the
+# active build graph (excluding unused optional features). When an
+# advisory is reachable only via an unused feature, `cargo deny` does
+# not match the ignore and emits `advisory-not-detected` (which is a
+# hard failure). The marker tells `scripts/check-advisory-sync.sh` the
+# divergence is intentional.
+ignore = [
+    # AUDIT-ONLY: RUSTSEC-2026-0173
+    # proc-macro-error2 2.0.1 - unmaintained. Reachable ONLY through
+    # `sigstore`'s DISABLED `cosign` feature, so it is NEVER compiled into any
+    # hort binary:
+    #   sigstore 0.14 (cosign OFF) -> oci-client 0.17 -> oci-spec 0.9
+    #     -> getset 0.1.6 -> proc-macro-error2 2.0.1
+    # `cargo tree -i proc-macro-error2` is empty and `cargo deny` (active-graph
+    # scan) is clean; only `cargo audit --deny warnings` (full-`Cargo.lock`
+    # scan) escalates the unmaintained notice to an error. AUDIT-ONLY (not
+    # mirrored to deny.toml): mirroring would make cargo-deny emit
+    # `advisory-not-detected` for an advisory it correctly never sees.
+    # It is NOT excludable from the lockfile: `Cargo.lock` pins optional deps
+    # for any feature combination even when the activating feature (cosign) is
+    # off, and the parent manifests (sigstore/oci-client) are not ours to edit;
+    # `cargo update` re-locks the same versions. No patched version exists
+    # (unmaintained), no dependency bump removes it. Low risk: unmaintained
+    # != vulnerable, and not built. Re-evaluate if a future sigstore drops the
+    # oci-client/getset chain.
+    "RUSTSEC-2026-0173",
+
+    # rsa 0.9.10 - Marvin Attack: a timing sidechannel that can leak an
+    # RSA *private* key over the network (RUSTSEC-2023-0071). This
+    # enters the ACTIVE build graph via
+    # `sigstore 0.14 -> openidconnect 4.0 -> rsa`, reachable from
+    # hort-worker (`cargo tree -i rsa -e normal`). hort uses sigstore
+    # exclusively for OFFLINE bundle signature VERIFICATION — RS256/RSA
+    # *public-key* operations against the Fulcio leaf certificate; it
+    # never performs an RSA private-key operation and holds no RSA
+    # private key, so the private-key timing sidechannel is not reachable
+    # through our usage. No patched rsa release exists ("No safe upgrade
+    # is available"), and rsa is not droppable without dropping sigstore
+    # (the dual-file ignore fallback covers this).
+    # NOTE: this used to be AUDIT-ONLY (rsa was reachable only via the
+    # inactive `sqlx-mysql` feature, so cargo-deny's active-graph walk
+    # never saw it). Adding the sigstore provenance stack moved rsa into
+    # the active graph, so the ID is now MIRRORED in `deny.toml` — cargo-deny matches the ignore
+    # there too. Re-evaluate if a fixed rsa ships, or if any RSA signing
+    # (private-key) path is ever added.
+    "RUSTSEC-2023-0071",
+
+    # lru 0.12.5 - `IterMut` violates Stacked Borrows by invalidating an
+    # internal pointer (RUSTSEC-2026-0002, 2026-01-07). Patched upstream
+    # in newer 0.x releases via API churn; hort-app intentionally pins
+    # 0.12 for the `LruCache::push -> Option<(K, V)>` eviction-return
+    # shape used by `use_cases::pat_cache`. The unsoundness requires
+    # calling `LruCache::iter_mut()` and concurrently invalidating a
+    # held pointer; pat_cache uses only `get` / `put` / `push` and never
+    # constructs an `IterMut`. `grep -rn "iter_mut\|IterMut" crates/
+    # | grep -i lru` returns empty. Tracks for removal once the lru
+    # API stabilises and hort-app can absorb the upgrade in its own PR.
+    "RUSTSEC-2026-0002",
+
+    # rand 0.8.5 - Unsound with a custom log::Log impl calling rand's
+    # thread-local RNG (2026-04-09). Patched in 0.9.3 / 0.10.1 (both
+    # already bumped in Cargo.lock); no 0.8.x patch published. The 0.8.5
+    # path persists because sqlx and a handful of other transitive deps
+    # still pin rand 0.8. The unsoundness requires installing a custom
+    # `log::Log` implementation whose `log` method calls
+    # `rand::thread_rng()` / `rand::rng()`. Hort uses
+    # tracing-subscriber and installs no custom logger; the transitive
+    # consumers emit log records but do not install loggers themselves.
+    # Triggering condition therefore never holds. Tracks for removal once
+    # the upstream ecosystem rolls forward off rand 0.8.
+    "RUSTSEC-2026-0097",
+
+    # rustls-pemfile - Unmaintained; thin wrapper around the same code
+    # in rustls-pki-types since 1.9.0. The repo was archived 2025-08;
+    # there is no fix to apply. We migrated our own PEM parsing
+    # to `rustls_pki_types::pem::PemObject` —
+    # the only remaining path is **dev-only** through `axum-server`'s
+    # `tls-rustls` feature, which we use exclusively to stand up
+    # in-process HTTPS test servers for the mTLS / pinning unit tests.
+    # No production binary links rustls-pemfile. Tracks for removal
+    # once axum-server (or hyper-rustls) migrate to the same successor
+    # API.
+    "RUSTSEC-2025-0134",
+]

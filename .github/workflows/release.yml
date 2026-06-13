@@ -1,0 +1,305 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+  # id-token: write is required for keyless cosign signing (Sigstore /
+  # Fulcio OIDC challenge). Used by the `sbom` job's sign-blob step below; the
+  # build-binaries.yml reusable workflow requests it on its own calling job.
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # E2E GATE - Must pass before release proceeds
+  # ════════════════════════════════════════════════════════════════════════════
+
+  e2e-gate:
+    name: 🚦 E2E Gate
+    # e2e.yml runs the full native-tests compose suite (no input knobs); it is
+    # reusable via its `workflow_call:` trigger.
+    uses: ./.github/workflows/e2e.yml
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # BUILD BINARIES
+  # ════════════════════════════════════════════════════════════════════════════
+
+  build-binaries:
+    name: Build binaries
+    needs: [e2e-gate]
+    permissions:
+      contents: read
+      id-token: write   # keyless cosign signing inside the reusable workflow
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      publish: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VERIFY REQUIRED IMAGES PUBLISHED ON GHCR.IO
+  #
+  # Cross-repo image-publish gate. v1.1.8 shipped with no
+  # ghcr.io/.../hort-web:1.1.8 published, breaking every fresh
+  # helm install. This job polls ghcr.io for every image the chart
+  # references at the release version tag, and fails if any is missing
+  # after the docker-publish workflows have had time to complete.
+  #
+  # When this gate fails, the GitHub Release stays a draft (see Check
+  # gate status step in the release job below).
+  #
+  # Tracks Hardening Core issue
+  # https://github.com/project-hort/hort/issues/882
+  # ════════════════════════════════════════════════════════════════════════════
+
+  verify-images-published:
+    name: 🐳 Verify Required Images Published
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    needs: [build-binaries]
+    if: |
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build-binaries.result == 'success'
+    timeout-minutes: 35
+    steps:
+      - name: Wait for and verify required images on ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Verifying required images for version: ${VERSION}"
+          echo "Every image must be present on ghcr.io."
+
+          # Poll for up to 30 minutes per image. Multi-arch builds, cosign
+          # signing and provenance attestation routinely take 15-25 minutes,
+          # so we wait rather than fail-fast.
+          DEADLINE=$(($(date +%s) + 30*60))
+
+          # Required image set. Each entry is "<registry>|<name>:<tag>".
+          # docker-publish.yml publishes the server image to ghcr.io under the
+          # project-hort org (the docker.io mirror was retired).
+          IMAGES=(
+            "ghcr.io|project-hort/hort-server:${VERSION}"
+          )
+
+          # Common Accept headers cover OCI index, Docker manifest list,
+          # and Docker manifest v2 (different registries return different
+          # default media types).
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          probe_ghcr() {
+            local name="$1"; local tag="$2"
+            local token
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            # --proto =https refuses to follow HTTPS->HTTP redirects so the
+            # Bearer token can never leak over plaintext.
+            curl -sfL --proto =https -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${tag}"
+          }
+
+          probe() {
+            local registry="$1"; local img="$2"
+            local name="${img%:*}"; local tag="${img#*:}"
+            case "${registry}" in
+              ghcr.io)   probe_ghcr "${name}" "${tag}" ;;
+              *) echo "::error::unknown registry ${registry}"; return 2 ;;
+            esac
+          }
+
+          missing=()
+          for entry in "${IMAGES[@]}"; do
+            registry="${entry%%|*}"
+            img="${entry#*|}"
+            echo ""
+            echo "Polling ${registry}/${img}"
+            while true; do
+              if probe "${registry}" "${img}"; then
+                echo "  ✓ ${registry}/${img}"
+                break
+              fi
+              if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+                echo "::error::Required image missing on ${registry} after 30m: ${img}"
+                missing+=("${registry}/${img}")
+                break
+              fi
+              echo "  not yet present, waiting 30s..."
+              sleep 30
+            done
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo ""
+            echo "::error::One or more required images are missing on ghcr.io after the deadline. The GitHub Release will be marked DRAFT and will not promote to stable until every required image is published."
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo ""
+          echo "All required images present on ghcr.io for version ${VERSION}."
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SBOM (CycloneDX JSON)
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # CRA Annex I §2 mandates a maintained SBOM as part of delivery. We emit
+  # one CycloneDX JSON SBOM per workspace member via cargo-cyclonedx and
+  # attach the bundled tarball to the release. The SBOM job runs in parallel
+  # with `build-binaries` because it has no binary dependencies.
+
+  sbom:
+    name: 📜 Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [e2e-gate]
+    if: always() && needs.e2e-gate.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Generate CycloneDX SBOMs
+        env:
+          SQLX_OFFLINE: true
+        run: cargo cyclonedx --format json --override-filename sbom
+
+      - name: Bundle SBOMs
+        run: |
+          mkdir -p sbom-bundle
+          # Each workspace member emits `sbom.json` next to its Cargo.toml.
+          # Re-key by crate path so the bundle is unambiguous.
+          find . -name "sbom.json" -not -path "./target/*" -not -path "./.cargo/*" | while read -r p; do
+            rel=$(dirname "$p" | sed "s|^\./||")
+            crate=${rel//\//-}
+            crate=${crate:-root}
+            cp "$p" "sbom-bundle/sbom-${crate}.json"
+          done
+          ls -la sbom-bundle/
+          tar -czvf hort-sbom.tar.gz sbom-bundle/
+          sha256sum hort-sbom.tar.gz > hort-sbom.tar.gz.sha256
+
+      # cosign sign-blob the SBOM bundle. CRA Annex I §2(1) treats the
+      # SBOM as part of release delivery; signing it provides downstream
+      # provenance verification. Same keyless OIDC signing path as
+      # `build-binaries` and the container-image jobs in docker-publish.yml.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign SBOM with cosign sign-blob
+        run: |
+          cosign sign-blob --yes \
+            --bundle hort-sbom.tar.gz.bundle \
+            hort-sbom.tar.gz
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hort-sbom
+          path: |
+            hort-sbom.tar.gz
+            hort-sbom.tar.gz.sha256
+            hort-sbom.tar.gz.bundle
+          retention-days: 365
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CREATE RELEASE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, verify-images-published, sbom]
+    if: always() && needs.build-binaries.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          pattern: hort-*
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check gate status
+        id: gates
+        run: |
+          # The E2E gate (e2e.yml) is a hard prerequisite for build-binaries,
+          # so reaching this job already implies E2E passed. The remaining
+          # publish-vs-draft decision rests on the image-publish gate.
+          IMAGES_GATE="${{ needs.verify-images-published.result }}"
+          echo "images_gate=${IMAGES_GATE}" >> $GITHUB_OUTPUT
+
+          if [[ "$IMAGES_GATE" == "success" ]]; then
+            echo "all_passed=true" >> $GITHUB_OUTPUT
+            echo "Gates passed: images=$IMAGES_GATE"
+          else
+            echo "all_passed=false" >> $GITHUB_OUTPUT
+            echo "::warning::A required gate is not green: images=$IMAGES_GATE. Release will be created as DRAFT."
+          fi
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          # Binary tarballs + SBOM bundle (from the `sbom` job, also a
+          # `*.tar.gz` artifact) and Windows .exe pairs.
+          find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
+          find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Hort ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          draft: ${{ steps.gates.outputs.all_passed != 'true' }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # NOTE: Docker images are published by .github/workflows/docker-publish.yml,
+  # which already triggers on `tags: ['v*']`. We previously had a redundant
+  # `docker-release` job here that re-dispatched docker-publish via
+  # workflow_dispatch after the release was created. That second run
+  # (a) duplicated ~30 minutes of multi-arch build work, and (b) could only
+  # produce inferior tags because workflow_dispatch loses the tag context
+  # required by docker/metadata-action's `type=semver` patterns. Removing it
+  # leaves a single, deterministic publish path: tag push triggers
+  # docker-publish.yml, which now self-verifies the published semver tags
+  # before the run can succeed (see issue #905).
+  # ════════════════════════════════════════════════════════════════════════════

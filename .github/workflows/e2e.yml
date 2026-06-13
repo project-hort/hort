@@ -1,0 +1,45 @@
+name: E2E
+
+on:
+  # NOTE: no `tags: ['v*']` here on purpose. On a tag, release.yml's `e2e-gate`
+  # job runs this workflow via `workflow_call`; a standalone tag trigger would
+  # land in the same `concurrency: e2e-${{ github.ref }}` group and cancel the
+  # release's gate (or vice-versa). Branch/PR pushes still run E2E directly.
+  push:
+    branches: [main, develop, 'release/**']
+  pull_request:
+    branches: [main, develop, 'release/**']
+  workflow_dispatch: {}
+  # Reusable: release.yml calls this via `uses: ./.github/workflows/e2e.yml`
+  # as its release-tag E2E gate.
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-e2e:
+    name: native-tests E2E (compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner already has docker + compose. Every client toolchain
+      # (twine/build, cargo, npm, skopeo, psql, hort-cli) runs INSIDE the
+      # single test-client image the native-tests runner builds and spins up
+      # on the compose network — no host bootstrap needed.
+      - name: Check docker
+        run: |
+          docker version
+          docker compose version
+
+      # Builds the client image (incl. hort-cli), brings up deploy/compose,
+      # runs every available scenario in-network, tears down. Per-scenario
+      # PASS/FAIL/SKIP/QUARANTINED is in this step's log.
+      - name: Run native-tests E2E (compose)
+        run: ./scripts/native-tests/run.sh --hort=compose

@@ -1,0 +1,28 @@
+# Ephemeral-store fixture: per-class Redis URLs supplied INLINE.
+# Main `redis.url` set as fallback default + both per-class
+# overrides set inline. Valid configuration; renders all three env
+# vars (HORT_REDIS_URL, HORT_REDIS_URL_EVICTABLE, HORT_REDIS_URL_DURABLE)
+# with literal values.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: redis
+  redis:
+    url: "redis://main:pw@redis-main:6379/0"
+    evictableUrl: "redis://evict:pw@redis-evict:6379/0"
+    durableUrl: "redis://dur:pw@redis-dur:6379/0"

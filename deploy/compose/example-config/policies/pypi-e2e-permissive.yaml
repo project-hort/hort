@@ -1,0 +1,29 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: pypi-e2e-permissive
+spec:
+  # Per-repository operator opt-out of quarantine-by-default. The e2e
+  # harness (`scripts/native-tests/run.sh --hort=compose`) uploads a PyPI package via twine and
+  # then immediately resolves + downloads it via `pip install`. Under the
+  # default 86_400s quarantine window the download 503s with a 24h
+  # `Retry-After`. Setting `quarantineDuration: 0s` overrides the default
+  # to permissive for this repo while leaving the rest of the deployment
+  # quarantine-by-default.
+  #
+  # Scope is narrow on purpose: only this one e2e repo is permissive;
+  # the demo / docs / production-shaped repos still inherit the secure
+  # default.
+  scope:
+    repository: pypi-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  # Provenance off for permissive e2e (no per-ingest verify job).
+  provenanceMode: off
+  # Empty scanBackends list = "policy without scanning" — the e2e
+  # harness has no worker (`scripts/native-tests/scenarios/clients/pypi.sh` exercises
+  # the ingest + index serve, not the scan pipeline) and a non-empty
+  # `scanBackends` would be validated against the live `scanner_registry`.
+  scanBackends: []
+  licensePolicy: {}

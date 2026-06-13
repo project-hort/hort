@@ -1,0 +1,26 @@
+{{/*
+Gitops configuration ConfigMap. Mounted at HORT_CONFIG_DIR
+(/etc/hort-server/config) on both the runtime Deployment and the migrations
+Job pod. Operators populate `gitopsConfig` with one or more YAML files
+covering the gitops surface (auth/*.yaml, repos/*.yaml, upstreams/*.yaml,
+…) — see `docs/architecture/how-to/declare-gitops-config.md` and
+`docs/architecture/how-to/wire-secrets.md`.
+
+When `gitopsConfig` is empty (the default), the ConfigMap is rendered
+empty. `ApplyConfigUseCase` handles an empty config dir
+gracefully — the Deployment still mounts the volume so the binary's
+config-dir watcher has a valid mountpoint at startup.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hort-server.fullname" . }}-config
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+data:
+{{- with .Values.gitopsConfig }}
+  {{- range $path, $content := . }}
+  {{ $path }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}
+{{- end }}

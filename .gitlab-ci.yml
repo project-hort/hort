@@ -1,0 +1,885 @@
+# GitLab CI/CD pipeline for Hort.
+#
+# Scope: the hexagonal workspace in `crates/` (hort-domain, hort-app,
+# hort-adapters-*, hort-http-core, hort-http-<format>, hort-formats,
+# hort-server, hort-worker).
+#
+# Stages: lint, unit tests, coverage, integration, cargo audit / cargo-deny,
+# the SonarQube gate, container image builds (hort-server + hort-worker,
+# buildah + cosign), the Helm chart publish, and the release SBOM.
+
+stages:
+  - test
+  - security
+  - quality
+  - build-images
+  - helm
+  - release
+
+# ---------------------------------------------------------------------------
+# Pipeline scope
+# ---------------------------------------------------------------------------
+#
+# Run a pipeline for: MR events, tags, and any branch push (so feature
+# branches get CI before an MR is opened). When a branch has an open MR
+# we keep the MR pipeline and suppress the duplicate branch pipeline, so
+# a single push doesn't run CI twice.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+
+variables:
+  # OCI registry host for images AND Helm charts. REQUIRED for the
+  # build-images / helm-publish / sign jobs — no default (the former
+  # internal-mirror value only resolved on the original runner). Set as
+  # a CI/CD variable; to publish to this GitLab instance's own registry set
+  # REGISTRY=$CI_REGISTRY. See docs/ci/README.md.
+  REGISTRY: ""
+  # Image path namespace: images at ${REGISTRY}/${IMAGE_PREFIX}/hort-{server,worker},
+  # charts at ${REGISTRY}/${IMAGE_PREFIX}/charts. Portable default — override
+  # only to publish under a different namespace.
+  IMAGE_PREFIX: "hort"
+  # Registry credentials. Resolution precedence (see .resolve-registry-creds):
+  # explicit REGISTRY_USER / REGISTRY_PASSWORD CI vars → a /secrets/zot
+  # secret-file mount (if the runner provides one) → GitLab's built-in
+  # $CI_REGISTRY_USER / $CI_REGISTRY_PASSWORD. Set as masked CI/CD variables,
+  # or rely on the $CI_REGISTRY_* fallback.
+  #
+  # Internal-PKI CA trusted before any TLS call to the registry / Vault. Empty
+  # by default — public-CA registries need nothing. Set to the in-runner path of
+  # a mounted internal CA cert to enable the trust step; it no-ops if the file
+  # is absent.
+  PLATFORM_CA_PATH: ""
+  # Image / SBOM signing strategy — see docs/ci/README.md.
+  #   keyless (default): Sigstore/Fulcio/Rekor via the GitLab OIDC id_token —
+  #                      works on any GitLab with reach to public Sigstore.
+  #   vault-key:         offline cosign key fetched from Vault/OpenBao; requires
+  #                      the VAULT_* CI vars (no portable defaults).
+  #   none:              skip signing entirely.
+  SIGNING_MODE: "keyless"
+  # Project MSRV is 1.94.0 (see .clippy.toml); kept in lockstep with
+  # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` by
+  # `scripts/check-rust-version.sh`. GitLab pins the image explicitly so a
+  # silent toolchain bump can't break the gate.
+  RUST_IMAGE: "rust:1.94-slim"
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+  # Memory-budgeting for the Kubernetes runner. Unconstrained, rustc fans
+  # out to num_cpus parallel jobs and the workspace's heavy crates
+  # (axum/tokio/sqlx) push the build container's RSS past 8 GiB; with
+  # `request: 0` on the pod, the kubelet evicts it first under node
+  # memory pressure (the failure mode we hit). Two levers, both applied:
+  #   1. Cap Cargo concurrency so peak RSS is bounded.
+  #   2. Switch dev-profile debuginfo to line-tables-only — keeps useful
+  #      backtraces, drops the bulk of debug-symbol RAM/disk cost.
+  # Together these typically pull peak RSS from ~8 GiB to ~3–4 GiB.
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+  CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+  # Kubernetes pod resource requests/limits (consumed by the GitLab
+  # Kubernetes executor). The `request` is what the scheduler reserves;
+  # the `limit` caps runaway. Sized for `CARGO_BUILD_JOBS=2` with
+  # line-tables-only debug. Postgres + helper sidecars get small
+  # explicit budgets so the runner doesn't oversubscribe a borderline
+  # node.
+  KUBERNETES_CPU_REQUEST: "1"
+  KUBERNETES_CPU_LIMIT: "2"
+  KUBERNETES_MEMORY_REQUEST: "4Gi"
+  KUBERNETES_MEMORY_LIMIT: "6Gi"
+  KUBERNETES_SERVICE_CPU_REQUEST: "200m"
+  KUBERNETES_SERVICE_CPU_LIMIT: "500m"
+  KUBERNETES_SERVICE_MEMORY_REQUEST: "256Mi"
+  KUBERNETES_SERVICE_MEMORY_LIMIT: "512Mi"
+  KUBERNETES_HELPER_CPU_REQUEST: "100m"
+  KUBERNETES_HELPER_CPU_LIMIT: "200m"
+  KUBERNETES_HELPER_MEMORY_REQUEST: "128Mi"
+  KUBERNETES_HELPER_MEMORY_LIMIT: "256Mi"
+
+# ---------------------------------------------------------------------------
+# Reusable fragments
+# ---------------------------------------------------------------------------
+
+.rust-cache: &rust-cache
+  cache:
+    key: "rust-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cargo/bin
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - .cargo/git/db
+      - target/
+
+.rust-apt-deps: &rust-apt-deps
+  - apt-get update -qq
+  - apt-get install -y -qq --no-install-recommends
+      protobuf-compiler pkg-config libssl-dev ca-certificates curl git
+
+# Conditional internal-PKI CA trust. Two trust-store flavours: RHEL-family
+# (the buildah image) and Debian/Alpine (rust:slim, alpine/helm). Both are
+# no-ops when PLATFORM_CA_PATH is unset or the file is absent, so a public-CA
+# registry needs no platform CA at all.
+.platform-ca-rhel: &platform-ca-rhel
+  - |
+    if [ -n "${PLATFORM_CA_PATH:-}" ] && [ -f "${PLATFORM_CA_PATH}" ]; then
+      echo "[ca] trusting ${PLATFORM_CA_PATH} (RHEL trust store)"
+      cp "${PLATFORM_CA_PATH}" /etc/pki/ca-trust/source/anchors/platform-ca.crt
+      update-ca-trust
+    fi
+
+.platform-ca-deb: &platform-ca-deb
+  - |
+    if [ -n "${PLATFORM_CA_PATH:-}" ] && [ -f "${PLATFORM_CA_PATH}" ]; then
+      echo "[ca] trusting ${PLATFORM_CA_PATH} (Debian/Alpine trust store)"
+      cp "${PLATFORM_CA_PATH}" /usr/local/share/ca-certificates/platform-ca.crt
+      update-ca-certificates
+    fi
+
+# Resolve registry credentials without committing to a single source.
+# Precedence: explicit REGISTRY_USER/REGISTRY_PASSWORD → the /secrets/zot
+# secret-file mount (this deployment) → GitLab's built-in $CI_REGISTRY_*.
+# Exported so a sourced cosign-setup.sh sees the same values.
+.resolve-registry-creds: &resolve-registry-creds
+  - |
+    if [ -z "${REGISTRY_USER:-}" ] && [ -r /secrets/zot/username ]; then
+      REGISTRY_USER="$(cat /secrets/zot/username)"
+      REGISTRY_PASSWORD="$(cat /secrets/zot/password)"
+    fi
+    REGISTRY_USER="${REGISTRY_USER:-$CI_REGISTRY_USER}"
+    REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}"
+    export REGISTRY_USER REGISTRY_PASSWORD
+
+# Jobs without explicit rules inherit the workflow scope above, so fmt,
+# clippy, unit tests, coverage, cargo-audit, and the sonar gate run on
+# every pipeline (feature branch, MR, main, release, tag). Jobs that
+# should stay gated (integration tests) opt in to this anchor.
+.rules-main-only: &rules-main-only
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+    - if: $CI_COMMIT_TAG
+
+# ===========================================================================
+# Stage 1: test — fmt, clippy, unit tests, coverage, integration (reserved)
+# ===========================================================================
+
+# Test jobs in this stage run sequentially via `needs:` rather than in
+# parallel. Order: lint → unit → coverage → integration. This trades
+# wall-clock time for predictable resource use on the shared GitLab
+# runners (one Rust compile at a time per pipeline).
+
+# Parity with .github/workflows/ci.yml → lint-rust, but scoped to crates/.
+test:lint:
+  stage: test
+  image: ${RUST_IMAGE}
+  <<: *rust-cache
+  before_script:
+    - *rust-apt-deps
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+# Parity with test-backend-unit, scoped to the rewrite.
+test:unit:
+  stage: test
+  image: ${RUST_IMAGE}
+  <<: *rust-cache
+  needs:
+    - job: test:lint
+      artifacts: false
+  before_script:
+    - *rust-apt-deps
+  script:
+    - cargo test --workspace --lib --verbose
+
+# Parity with coverage. hort-domain/hort-app are pure Rust zero-I/O libraries
+# and the adapter crates use runtime sqlx (no query! macros), so no
+# Postgres service or migrations are needed to collect --lib coverage.
+test:coverage:
+  stage: test
+  image: ${RUST_IMAGE}
+  <<: *rust-cache
+  needs:
+    - job: test:unit
+      artifacts: false
+  variables:
+    # cargo-llvm-cov drives rustc directly; sccache or other wrappers break
+    # instrumentation.
+    RUSTC_WRAPPER: ""
+  before_script:
+    - *rust-apt-deps
+    - rustup component add llvm-tools-preview
+    - cargo install --locked cargo-llvm-cov || true
+  script:
+    - cargo llvm-cov --workspace --lib
+        --lcov --output-path lcov.info
+    - cargo llvm-cov report --summary-only
+    # Convert LCOV → SonarQube generic coverage XML. Kept alongside
+    # lcov.info so the scanner can consume either via
+    # sonar.rust.lcov.reportPaths or sonar.coverageReportPaths.
+    - |
+      awk '
+      BEGIN { print "<coverage version=\"1\">" }
+      /^SF:/ { file = substr($0, 4); printf "  <file path=\"%s\">\n", file }
+      /^DA:/ { split(substr($0, 4), a, ","); printf "    <lineToCover lineNumber=\"%s\" covered=\"%s\"/>\n", a[1], (a[2]+0 > 0 ? "true" : "false") }
+      /^end_of_record/ { print "  </file>" }
+      END { print "</coverage>" }
+      ' lcov.info > coverage-sonar.xml
+  artifacts:
+    when: always
+    paths:
+      - lcov.info
+      - coverage-sonar.xml
+    expire_in: 7 days
+
+# DB-backed integration tests (`crates/*/tests/` + the inline `--lib` tests
+# the unittest target builds). The Postgres service is wired so the
+# hort-adapters-postgres / hort-adapters-storage suites run against a real
+# database. Main / release / tags only, matching the GitHub CI gating.
+test:integration:
+  stage: test
+  image: ${RUST_IMAGE}
+  <<: *rust-cache
+  <<: *rules-main-only
+  needs:
+    - job: test:coverage
+      artifacts: false
+  services:
+    - name: postgres:17-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: "artifact_registry"
+    POSTGRES_USER: "registry"
+    POSTGRES_PASSWORD: "registry"
+    DATABASE_URL: "postgresql://registry:registry@postgres:5432/artifact_registry"
+  before_script:
+    - *rust-apt-deps
+    - apt-get install -y -qq --no-install-recommends postgresql-client
+    - for i in $(seq 1 30); do pg_isready -h postgres -U "${POSTGRES_USER}" && break; sleep 1; done
+  script:
+    - cargo test --workspace --tests --verbose
+
+# ===========================================================================
+# Stage 2: security — cargo audit (parity with GitHub security-audit)
+# ===========================================================================
+#
+# cargo audit reads the workspace Cargo.lock against the live RustSec
+# advisory DB, so a newly-published advisory against an already-pinned
+# crate flips this gate red with no dependency change.
+
+# `cargo audit --deny warnings` upgrades yanked/unmaintained/unsound from
+# advisory to error. `security:advisory-sync` enforces parity between
+# `.cargo/audit.toml` and `deny.toml`'s ignore lists.
+security:cargo-audit:
+  stage: security
+  image: ${RUST_IMAGE}
+  needs:
+    - job: test:unit
+      artifacts: false
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev
+    - cargo install --locked cargo-audit || true
+  script:
+    # Diagnostic JSON artefact captured first; failure-tolerant (||
+    # true) so a non-zero exit still produces the upload below.
+    - cargo audit --json > cargo-audit.json || true
+    # Blocking gate — `--deny warnings` upgrades yanked / unmaintained /
+    # unsound from advisory to error. The advisory-ignore list is the
+    # `.cargo/audit.toml` SSoT. No `--ignore`
+    # flags here: duplicating IDs in CI commands invited drift —
+    # someone adds an ID to the toml and forgets the workflow, the gate
+    # is still load-bearing but not self-documenting. The
+    # `scripts/check-advisory-sync.sh` job below enforces parity
+    # between `.cargo/audit.toml` and `deny.toml`'s `[advisories.ignore]`.
+    - cargo audit --deny warnings
+  artifacts:
+    when: always
+    paths:
+      - cargo-audit.json
+    expire_in: 7 days
+
+# Lightweight gate that runs on every push: confirms `.cargo/audit.toml`
+# and `deny.toml`'s `[advisories.ignore]` are byte-identical sets. The
+# single source of truth is `.cargo/audit.toml`; this gate prevents
+# accidental drift. Plain bash + grep, no extra image deps required.
+security:advisory-sync:
+  stage: security
+  image: ${RUST_IMAGE}
+  needs: []
+  script:
+    - bash scripts/check-advisory-sync.sh
+
+# Default-branch gate: `docs/plans/` is the branch-lifetime home for design
+# docs + backlogs. They are distilled into ADRs (`docs/adr/`) and the
+# Diátaxis set (`docs/architecture/`) and removed before merging. This gate
+# fails the pipeline if the folder survived a merge onto the default branch.
+# Plain bash, no image deps.
+quality:no-plans-on-default-branch:
+  stage: quality
+  image: ${RUST_IMAGE}
+  needs: []
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - |
+      if [ -d docs/plans ] && [ -n "$(ls -A docs/plans 2>/dev/null)" ]; then
+        echo "ERROR: docs/plans/ exists on the default branch ($CI_DEFAULT_BRANCH)."
+        echo "Branch-lifetime planning docs must be distilled into docs/adr/ +"
+        echo "docs/architecture/ and removed before merge. Offending entries:"
+        ls -A docs/plans
+        exit 1
+      fi
+      echo "OK: no docs/plans/ on the default branch."
+
+# cargo-deny gate. Runs the four sections in `deny.toml`: advisory floor,
+# license allowlist, banned crates (openssl-sys, native-tls, wasmtime*),
+# source pinning. The advisory ignore list is mirrored in
+# `.cargo/audit.toml` so the two gates stay in agreement (enforced by
+# `security:advisory-sync` above).
+security:cargo-deny:
+  stage: security
+  image: ${RUST_IMAGE}
+  needs:
+    - job: test:unit
+      artifacts: false
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev
+    - cargo install --locked cargo-deny || true
+  script:
+    - cargo deny --workspace check
+
+# ===========================================================================
+# Stage 3: quality — SonarQube/SonarCloud gate
+# ===========================================================================
+#
+# Enforces coverage on new code >= 85% and duplication on new code <= 1%
+# via the Sonar quality gate. The STATIC analysis config — source layout
+# (`crates/`), exclusions, coverage report paths, and the test-key
+# issue-ignore rules — lives in `sonar-project.properties` at the repo root
+# (sonar-scanner auto-reads it); the job below passes only the dynamic
+# host/token/projectKey + per-MR args. Configure SONAR_HOST_URL and
+# SONAR_TOKEN as masked CI/CD variables. Optional: set SONAR_PROJECT_KEY
+# (and SONAR_ORGANIZATION) to point at a different Sonar project on a
+# local GitLab-hosted SonarQube.
+
+quality:sonar:
+  stage: quality
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  rules:
+    # Runs only when a Sonar token is configured, so installations without a
+    # Sonar instance don't hard-fail the quality stage. Set SONAR_TOKEN (and
+    # SONAR_HOST_URL) as masked CI/CD variables to enable. See docs/ci/README.md.
+    - if: '$SONAR_TOKEN'
+  needs:
+    - job: test:coverage
+      artifacts: true
+    - job: security:cargo-audit
+      artifacts: true
+      optional: true
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: sonar-cache
+    paths:
+      - .sonar/cache
+  script:
+    - |
+      PR_ARGS=""
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
+        PR_ARGS="-Dsonar.pullrequest.key=${CI_MERGE_REQUEST_IID} \
+                 -Dsonar.pullrequest.branch=${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME} \
+                 -Dsonar.pullrequest.base=${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+      fi
+      # Static analysis config (sources, tests, exclusions, coverage report
+      # paths, and the test-key issue-ignores) lives in
+      # sonar-project.properties at the repo root and is auto-read by
+      # sonar-scanner. Only dynamic / secret args are passed here.
+      sonar-scanner \
+        -Dsonar.host.url=${SONAR_HOST_URL} \
+        -Dsonar.token=${SONAR_TOKEN} \
+        ${SONAR_PROJECT_KEY:+-Dsonar.projectKey=$SONAR_PROJECT_KEY} \
+        ${PR_ARGS}
+
+# Lint pin-sync between Cargo.toml MSRV / the hort-server Dockerfile rust
+# toolchain, and between the Helm chart values.yaml top-level keys / their
+# per-section comment blocks. Both scripts are pure bash and finish in well
+# under a second; they run on every pipeline (no rules / no needs:). Alpine
+# has bash, grep, and yq is not required — the scripts use only POSIX
+# awk/sed.
+quality:chart-and-rust-pin-sync:
+  stage: quality
+  image: alpine:3.20
+  needs: []
+  before_script:
+    - apk add --no-cache bash grep
+  script:
+    - bash scripts/check-rust-version.sh
+    - bash scripts/check-values-comments.sh
+
+# Machine-readable G1 release-predicate gate. Fails unless the
+# event-chain-verify and advisory-ingest telemetry rows are catalogued in
+# docs/metrics-catalog.md, the named regression tests are present, and any
+# published docs/compliance/ attestation stays at the tamper-EVIDENT bar.
+# Pure bash + grep, sub-second, runs on every pipeline (no rules /
+# no needs:) — same weight class as the pin-sync gate above.
+quality:g1-attestation-gate:
+  stage: quality
+  image: alpine:3.20
+  needs: []
+  before_script:
+    - apk add --no-cache bash grep findutils sed
+  script:
+    - bash scripts/check-g1-attestation-gate.sh
+
+# Chart-template render test. Mirrors .github/workflows/ci.yml's
+# chart-template-tests job so the canonical GitLab pipeline gates chart
+# regressions too (the harness previously ran only on the GitHub mirror
+# path). It renders every deploy/helm/hort-server/test-values-*.yaml
+# fixture via `helm template` and asserts the expected presence/absence of
+# feature-gated lines — including the strict-schema / coupling fixtures
+# that MUST fail to render. No chart dependencies, no registry, no image
+# build (needs: []) → fast feedback before the build stages, on every
+# pipeline (no rules — same scope as the pin-sync + g1 gates above). The
+# alpine/helm image (shared with helm:lint-and-publish) carries helm; the
+# harness needs bash + GNU grep/find (bash arrays + associative arrays,
+# `grep -E \b`, `find -print0`) which busybox lacks.
+quality:helm-template-test:
+  stage: quality
+  image: alpine/helm:3.17.1
+  needs: []
+  before_script:
+    - apk add --no-cache bash grep findutils sed
+  script:
+    - bash scripts/test-helm-templates.sh
+
+# ===========================================================================
+# Stage 4: build-images — buildah + cosign sign for hort-server
+# ===========================================================================
+#
+# Reusable buildah/cosign template. Each image-build job extends `.docker` and
+# inherits the buildah env, the OIDC id_tokens, the conditional platform-CA
+# trust step, the registry login (creds resolved via .resolve-registry-creds),
+# and the SIGNING_MODE-gated cosign-setup.sh sourcing. `after_script` always
+# wipes /tmp/cosign.key even if the build failed mid-step.
+
+.docker:
+  image: quay.io/buildah/stable:v1.39
+  variables:
+    STORAGE_DRIVER: vfs
+    BUILDAH_FORMAT: docker
+    BUILDAH_ISOLATION: chroot
+    BUILDAH_LAYERS: "true"
+  id_tokens:
+    # vault-key signing uses VAULT_ID_TOKEN (aud the Vault/OpenBao JWT backend
+    # accepts); keyless signing uses SIGSTORE_ID_TOKEN (Sigstore reads this env
+    # var GitLab injects). Both are minted; each mode uses only the one it
+    # needs. VAULT_ADDR is empty on keyless/none installs — that token is then
+    # simply unused.
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  before_script:
+    - *platform-ca-rhel
+    - mkdir -p ${CI_PROJECT_DIR}/build_info
+    - *resolve-registry-creds
+    - buildah login --username "$REGISTRY_USER" --password "$REGISTRY_PASSWORD" ${REGISTRY}
+    # Set up cosign for image signing: skipped when SIGNING_MODE=none; installs
+    # cosign for keyless; additionally fetches the Vault key for vault-key.
+    - if [ "${SIGNING_MODE:-keyless}" != "none" ]; then . ${CI_PROJECT_DIR}/.gitlab/ci/cosign-setup.sh; fi
+  after_script:
+    - rm -f /tmp/cosign.key
+
+# Single hort-server image. Tag policy:
+#   - SemVer tag (vX.Y.Z or vX.Y.Z-rc.N): push :${CI_COMMIT_TAG#v} only;
+#     stable releases additionally push :latest, RC tags do NOT.
+#   - main branch:                        push :${CI_COMMIT_SHORT_SHA} AND :latest.
+#   - release/* branch:                   push :${CI_COMMIT_SHORT_SHA} only;
+#     no :latest so a maintenance build can't clobber main's :latest.
+# OCI labels for source/revision/version/created are filled at build time;
+# title/license labels are baked into docker/Dockerfile.hort-server.
+build-images:hort-server:
+  extends: .docker
+  stage: build-images
+  variables:
+    # Override the global pod memory limits — buildah runs `cargo build
+    # --release` inside the Docker build, which is heavier than the
+    # debug-profile compiles in stage 1 (LTO + release codegen). The
+    # global `CARGO_BUILD_JOBS=2` env var does NOT propagate into the
+    # Docker build environment (no ARG/ENV pickup in the Dockerfile),
+    # so the inner cargo defaults to num_cpus parallelism. Headroom
+    # rather than memory-tuning the Dockerfile is the cheaper path; if
+    # this job starts to OOM, propagate CARGO_BUILD_JOBS via a
+    # `--build-arg` + `ARG`/`ENV` pair in `docker/Dockerfile.hort-server`.
+    KUBERNETES_MEMORY_REQUEST: "6Gi"
+    KUBERNETES_MEMORY_LIMIT: "10Gi"
+    KUBERNETES_CPU_REQUEST: "2"
+    KUBERNETES_CPU_LIMIT: "4"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+  script:
+    - |
+      set -euo pipefail
+      IMAGE="${REGISTRY}/${IMAGE_PREFIX}/hort-server"
+
+      # Resolve primary version tag and whether to also push :latest.
+      PUSH_LATEST="false"
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION_TAG="${CI_COMMIT_TAG#v}"
+        case "${VERSION_TAG}" in
+          *-rc.*) PUSH_LATEST="false" ;;
+          *)      PUSH_LATEST="true"  ;;
+        esac
+      elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
+        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
+        PUSH_LATEST="true"
+      else
+        # release/* branches: SHA tag only.
+        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
+        PUSH_LATEST="false"
+      fi
+
+      echo "=== build plan ==="
+      echo "  IMAGE=${IMAGE}"
+      echo "  VERSION_TAG=${VERSION_TAG}"
+      echo "  PUSH_LATEST=${PUSH_LATEST}"
+      echo "=================="
+
+      BUILDAH_TAGS="--tag ${IMAGE}:${VERSION_TAG}"
+      if [ "${PUSH_LATEST}" = "true" ]; then
+        BUILDAH_TAGS="${BUILDAH_TAGS} --tag ${IMAGE}:latest"
+      fi
+
+      # Dynamic OCI labels (title + license are baked into the Dockerfile).
+      buildah bud \
+        --storage-driver=$STORAGE_DRIVER \
+        --format=$BUILDAH_FORMAT \
+        --isolation=$BUILDAH_ISOLATION \
+        --cache-ttl=168h \
+        --layers \
+        --label "org.opencontainers.image.source=${CI_PROJECT_URL}" \
+        --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}" \
+        --label "org.opencontainers.image.version=${VERSION_TAG}" \
+        --label "org.opencontainers.image.created=${CI_JOB_STARTED_AT}" \
+        ${BUILDAH_TAGS} \
+        -f docker/Dockerfile.hort-server \
+        .
+
+      buildah push --digestfile /tmp/digest --storage-driver=$STORAGE_DRIVER "${IMAGE}:${VERSION_TAG}"
+      DIGEST=$(cat /tmp/digest)
+
+      if [ "${PUSH_LATEST}" = "true" ]; then
+        buildah push --storage-driver=$STORAGE_DRIVER "${IMAGE}:latest"
+      fi
+
+      sh ${CI_PROJECT_DIR}/.gitlab/ci/cosign-sign.sh "${IMAGE}" "${DIGEST}"
+
+      printf '%s\n' "${VERSION_TAG}" > ${CI_PROJECT_DIR}/build_info/image_tag
+      printf '%s\n' "${DIGEST}"      > ${CI_PROJECT_DIR}/build_info/image_digest
+
+      echo ""
+      echo "=== Pushed and signed ==="
+      echo "  ${IMAGE}:${VERSION_TAG}"
+      if [ "${PUSH_LATEST}" = "true" ]; then echo "  ${IMAGE}:latest"; fi
+      echo "  digest: ${DIGEST}"
+      echo "========================="
+  artifacts:
+    paths:
+      - build_info/
+    expire_in: 30 days
+
+# hort-worker image — mirrors the hort-server build job's tag policy, OCI
+# labels, and cosign signing. Built from `docker/Dockerfile.worker`,
+# pushed to `${REGISTRY}/${IMAGE_PREFIX}/hort-worker`. The worker carries
+# Trivy + osv-scanner CLI binaries on top of the standard Rust build stage
+# and runs the multi-kind TaskDispatcher (scan, cron-rescan-tick,
+# advisory-watch-tick, staging-sweep, noop). The Helm chart's
+# `worker.image.repository` default points here.
+#
+# Build artefact lands in `build_info/worker_image_tag` +
+# `build_info/worker_image_digest` — distinct filenames from
+# `build-images:hort-server`'s artefact so the Helm publish stage can
+# fan-in both digests if it ever needs them. Today the chart pins
+# only `Chart.appVersion`, so the digest files are informational.
+build-images:hort-worker:
+  extends: .docker
+  stage: build-images
+  variables:
+    KUBERNETES_MEMORY_REQUEST: "6Gi"
+    KUBERNETES_MEMORY_LIMIT: "10Gi"
+    KUBERNETES_CPU_REQUEST: "2"
+    KUBERNETES_CPU_LIMIT: "4"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+  script:
+    - |
+      set -euo pipefail
+      IMAGE="${REGISTRY}/${IMAGE_PREFIX}/hort-worker"
+
+      # Resolve primary version tag and whether to also push :latest.
+      PUSH_LATEST="false"
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION_TAG="${CI_COMMIT_TAG#v}"
+        case "${VERSION_TAG}" in
+          *-rc.*) PUSH_LATEST="false" ;;
+          *)      PUSH_LATEST="true"  ;;
+        esac
+      elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
+        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
+        PUSH_LATEST="true"
+      else
+        # release/* branches: SHA tag only.
+        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
+        PUSH_LATEST="false"
+      fi
+
+      echo "=== build plan ==="
+      echo "  IMAGE=${IMAGE}"
+      echo "  VERSION_TAG=${VERSION_TAG}"
+      echo "  PUSH_LATEST=${PUSH_LATEST}"
+      echo "=================="
+
+      BUILDAH_TAGS="--tag ${IMAGE}:${VERSION_TAG}"
+      if [ "${PUSH_LATEST}" = "true" ]; then
+        BUILDAH_TAGS="${BUILDAH_TAGS} --tag ${IMAGE}:latest"
+      fi
+
+      buildah bud \
+        --storage-driver=$STORAGE_DRIVER \
+        --format=$BUILDAH_FORMAT \
+        --isolation=$BUILDAH_ISOLATION \
+        --cache-ttl=168h \
+        --layers \
+        --label "org.opencontainers.image.source=${CI_PROJECT_URL}" \
+        --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}" \
+        --label "org.opencontainers.image.version=${VERSION_TAG}" \
+        --label "org.opencontainers.image.created=${CI_JOB_STARTED_AT}" \
+        ${BUILDAH_TAGS} \
+        -f docker/Dockerfile.worker \
+        .
+
+      buildah push --digestfile /tmp/digest --storage-driver=$STORAGE_DRIVER "${IMAGE}:${VERSION_TAG}"
+      DIGEST=$(cat /tmp/digest)
+
+      if [ "${PUSH_LATEST}" = "true" ]; then
+        buildah push --storage-driver=$STORAGE_DRIVER "${IMAGE}:latest"
+      fi
+
+      sh ${CI_PROJECT_DIR}/.gitlab/ci/cosign-sign.sh "${IMAGE}" "${DIGEST}"
+
+      printf '%s\n' "${VERSION_TAG}" > ${CI_PROJECT_DIR}/build_info/worker_image_tag
+      printf '%s\n' "${DIGEST}"      > ${CI_PROJECT_DIR}/build_info/worker_image_digest
+
+      echo ""
+      echo "=== Pushed and signed ==="
+      echo "  ${IMAGE}:${VERSION_TAG}"
+      if [ "${PUSH_LATEST}" = "true" ]; then echo "  ${IMAGE}:latest"; fi
+      echo "  digest: ${DIGEST}"
+      echo "========================="
+  artifacts:
+    paths:
+      - build_info/
+    expire_in: 30 days
+
+# ===========================================================================
+# Stage 5: helm — lint, package, push the hort-server chart
+# ===========================================================================
+#
+# Chart-version and app-version are coupled to the same SemVer string. On a
+# SemVer tag the version is the tag with the leading `v` stripped; on main /
+# release/* branches a snapshot version
+# `0.0.0-snapshot.${CI_PIPELINE_IID}` is used so every pipeline produces a
+# uniquely-named chart artefact for smoke testing without colliding with any
+# released version. `helm lint` is run with `test-values.yaml` because
+# values.yaml's defaults are intentionally invalid (publicBaseUrl empty,
+# etc.) so the schema fails on the bare values.
+
+helm:lint-and-publish:
+  stage: helm
+  image: alpine/helm:3.17.1
+  needs:
+    - job: build-images:hort-server
+      artifacts: true
+    - job: build-images:hort-worker
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+  before_script:
+    # Trust platform CA for registry (Alpine: install ca-certificates first)
+    - apk add --no-cache ca-certificates
+    - *platform-ca-deb
+    # Login to the chart registry
+    - *resolve-registry-creds
+    - helm registry login --username "$REGISTRY_USER" --password "$REGISTRY_PASSWORD" ${REGISTRY}
+  script:
+    - |
+      set -eu
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION="${CI_COMMIT_TAG#v}"
+      else
+        VERSION="0.0.0-snapshot.${CI_PIPELINE_IID}"
+      fi
+      echo "=== helm publish plan ==="
+      echo "  VERSION=${VERSION}"
+      echo "  REGISTRY=${REGISTRY}/${IMAGE_PREFIX}/charts"
+      echo "========================="
+
+      # §3.4 invariant lint — on a SemVer-tagged pipeline, the in-tree
+      # Chart.yaml must already declare the tag's version on both
+      # `version` and `appVersion` (chart and binary are versioned
+      # together). `helm package --version/--app-version` would override
+      # at publish time anyway, but a stale Chart.yaml drifts from §3.4
+      # for non-CI consumers (`helm install ./deploy/helm/hort-server`,
+      # `helm template`, source-tree docs). Skipped on main / release/*
+      # snapshot pipelines where VERSION is a pipeline-IID, not a tag.
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        chart_version=$(grep -E '^version:' deploy/helm/hort-server/Chart.yaml \
+          | sed -E 's/^version:[[:space:]]*//;s/^"//;s/"$//')
+        chart_app_version=$(grep -E '^appVersion:' deploy/helm/hort-server/Chart.yaml \
+          | sed -E 's/^appVersion:[[:space:]]*//;s/^"//;s/"$//')
+        if [ "${chart_version}" != "${VERSION}" ] || [ "${chart_app_version}" != "${VERSION}" ]; then
+          echo "ERROR: Chart.yaml drifted from tag ${CI_COMMIT_TAG} (§3.4 invariant)."
+          echo "  Chart.yaml version    = ${chart_version}"
+          echo "  Chart.yaml appVersion = ${chart_app_version}"
+          echo "  Expected (tag minus 'v') = ${VERSION}"
+          echo "Bump deploy/helm/hort-server/Chart.yaml and re-tag."
+          exit 1
+        fi
+        echo "§3.4 invariant ok: Chart.yaml version + appVersion = ${VERSION}"
+      fi
+
+      helm lint deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values.yaml
+      helm package deploy/helm/hort-server/ \
+        --app-version "${VERSION}" \
+        --version "${VERSION}"
+      helm push hort-server-*.tgz "oci://${REGISTRY}/${IMAGE_PREFIX}/charts"
+
+# ===========================================================================
+# Stage 6: release — CycloneDX SBOM artefact for tagged releases
+# ===========================================================================
+#
+# CRA Annex I §2 mandates a maintained SBOM as part of delivery.
+# cargo-cyclonedx writes one `bom.json` per workspace member next to its
+# Cargo.toml; we collect them under `sbom/` for upload.
+#
+# The job runs only on `v*.*.*` tags so feature-branch pipelines stay fast.
+# The artefact expires after one year; the GitHub Actions release workflow
+# attaches the matching SBOM to the published release directly.
+
+release:sbom:
+  stage: release
+  image: ${RUST_IMAGE}
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+/
+  # The SBOM bundle is cosign-signed with the existing image-signing key
+  # (Vault path
+  # `secret/data/platform/cosign/signing-key`, fetched via
+  # `cosign-setup.sh`). Mirrors the structure of the GitHub Actions
+  # `sbom` job (.github/workflows/release.yml) — both pipelines stay
+  # in lockstep on what gets signed; the secret-management surface
+  # differs between the two CI systems by necessity (GitHub Actions
+  # uses keyless OIDC against Sigstore Fulcio; GitLab pulls the
+  # private key from Vault). Verification recipe for downstream
+  # consumers: docs/architecture/how-to/release-verification.md.
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  before_script:
+    - *rust-apt-deps
+    # cosign-setup.sh's `apk add jq` / `dnf install jq` fallback does
+    # not cover debian-based images. The rust-apt-deps anchor above
+    # already pulls curl + ca-certificates; add jq explicitly so the
+    # Vault-token + key fetch in cosign-setup.sh succeeds.
+    - apt-get install -y -qq --no-install-recommends jq
+    - cargo install --locked cargo-cyclonedx || true
+    # Trust the platform CA (internal PKI) BEFORE cosign-setup.sh runs: in
+    # vault-key mode its HTTPS call to ${VAULT_ADDR} (OpenBao) must verify
+    # against an internal CA not in the public bundle. No-op when
+    # PLATFORM_CA_PATH is unset/absent (public-CA / keyless setups).
+    - *platform-ca-deb
+    # SOURCE cosign-setup.sh (leading `.`, NOT `bash`) so its COSIGN_PASSWORD
+    # export survives into THIS shell — a child process would discard it,
+    # leaving the `cosign sign-blob` key undecryptable. vault-key fetches the
+    # key into /tmp/cosign.key + exports COSIGN_PASSWORD; keyless only installs
+    # cosign; none skips signing and is not sourced. The `test -s` then fails
+    # closed (vault-key only) if the key was somehow not written.
+    - if [ "${SIGNING_MODE:-keyless}" != "none" ]; then . ${CI_PROJECT_DIR}/.gitlab/ci/cosign-setup.sh; fi
+    - if [ "${SIGNING_MODE:-keyless}" = "vault-key" ]; then test -s /tmp/cosign.key; fi
+  after_script:
+    - rm -f /tmp/cosign.key
+  script:
+    - cargo cyclonedx --format json --override-filename sbom
+    - mkdir -p sbom
+    - find . -name "sbom.json" -not -path "./target/*" -not -path "./.cargo/*" -exec sh -c '
+        rel=$(dirname "$1" | sed "s|^\./||");
+        crate=$(echo "$rel" | tr / -);
+        cp "$1" "sbom/sbom-${crate:-root}.json"
+      ' _ {} \;
+    - ls -la sbom/
+    # Bundle the SBOMs into a tarball matching the GitHub release
+    # workflow shape, so a single signed artefact ships per release
+    # and downstream consumers verify the same blob across pipelines.
+    - tar -czvf hort-sbom.tar.gz sbom/
+    - sha256sum hort-sbom.tar.gz > hort-sbom.tar.gz.sha256
+    # Sign the bundled tarball per SIGNING_MODE. vault-key: offline key, no
+    # Rekor (--use-signing-config=false selects the legacy key path where
+    # --key / --tlog-upload=false / --new-bundle-format=false are honored —
+    # cosign v3 otherwise defaults --use-signing-config=true and rejects
+    # --tlog-upload=false). keyless: Sigstore/Fulcio with Rekor upload (the
+    # public-good verification path). none: skip. Both signing modes still
+    # emit hort-sbom.tar.gz.sig so the artefact paths below stay valid.
+    - |
+      # Explicit arm per mode + fail-closed default, mirroring
+      # .gitlab/ci/cosign-sign.sh so an unknown/typo'd SIGNING_MODE errors
+      # clearly here too instead of silently falling through to the vault-key
+      # path (which would then die deep in `cosign sign-blob` on a key that was
+      # never fetched).
+      case "${SIGNING_MODE:-keyless}" in
+        none)
+          echo "SIGNING_MODE=none — skipping SBOM signature" ;;
+        keyless)
+          cosign sign-blob --yes \
+            --output-signature hort-sbom.tar.gz.sig hort-sbom.tar.gz ;;
+        vault-key)
+          cosign sign-blob --yes --key /tmp/cosign.key \
+            --new-bundle-format=false --use-signing-config=false \
+            --tlog-upload=false \
+            --output-signature hort-sbom.tar.gz.sig hort-sbom.tar.gz ;;
+        *)
+          echo "ERROR: unknown SIGNING_MODE=${SIGNING_MODE} (expected vault-key|keyless|none)" >&2
+          exit 1 ;;
+      esac
+  artifacts:
+    name: "hort-sbom-${CI_COMMIT_TAG}"
+    when: on_success
+    paths:
+      - sbom/
+      - hort-sbom.tar.gz
+      - hort-sbom.tar.gz.sha256
+      - hort-sbom.tar.gz.sig
+    expire_in: 1 year

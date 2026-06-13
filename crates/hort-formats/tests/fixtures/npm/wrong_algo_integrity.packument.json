@@ -1,0 +1,14 @@
+{
+  "name": "wrong-algo-pkg",
+  "versions": {
+    "1.0.0": {
+      "name": "wrong-algo-pkg",
+      "version": "1.0.0",
+      "dist": {
+        "integrity": "sha384-1EZh44y1Ul0pZkyoqC4b7IqskUE6BB5EMZXJQywIewrvbNvyNMdOSHKCAvQzv99h",
+        "shasum": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "tarball": "https://registry.npmjs.org/wrong-algo-pkg/-/wrong-algo-pkg-1.0.0.tgz"
+      }
+    }
+  }
+}

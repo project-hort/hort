@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: cargo-hosted
+spec:
+  name: "Cargo Hosted"
+  description: "Local-publish hosted Cargo repo (alpha)"
+  format: cargo
+  type: hosted
+  storage:
+    backend: filesystem
+    path: cargo-hosted
+  isPublic: true
+  replicationPriority: local_only

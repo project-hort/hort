@@ -1,0 +1,23 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  # Key matches the PYPI_REPO_KEY env default in
+  # scripts/native-tests/scenarios/upstream/pypi-upstream-verification.sh.
+  name: pypi-upstream-e2e
+spec:
+  name: "PyPI upstream pull-through smoke"
+  description: "Proxy PyPI repo used by scripts/native-tests/scenarios/upstream/pypi-upstream-verification.sh; upstream is the wiremock-pypi-upstream sidecar serving real pypi.org + files.pythonhosted.org fixtures (requests 2.31.0)."
+  format: pypi
+  type: proxy
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/pypi-upstream-e2e
+  proxy:
+    # Required by the gitops validator (crates/hort-config/src/repository.rs:325)
+    # for type=proxy. The standalone UpstreamMapping resource at
+    # deploy/compose/example-config/upstreams/pypi-upstream-e2e.yaml is what
+    # populates the repository_upstream_mappings table that
+    # try_upstream_file_pull's UpstreamResolver actually reads.
+    upstreamUrl: "http://wiremock-pypi-upstream:8080"
+  isPublic: true
+  replicationPriority: local_only

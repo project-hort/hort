@@ -1,0 +1,569 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, 'release/**']
+    tags: ['v*']
+    paths-ignore:
+      - 'site/**'
+      - '**/*.md'
+      - '.beads/**'
+      - 'LICENSE'
+      - 'CLAUDE.md'
+  pull_request:
+    branches: [main, develop, 'release/**']
+    paths-ignore:
+      - 'site/**'
+      - '**/*.md'
+      - '.beads/**'
+      - 'LICENSE'
+      - 'CLAUDE.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Concurrency: keyed by `event_name` + `ref` so push, pull_request, and
+# workflow_dispatch are isolated from each other. `cancel-in-progress` is
+# only true for auto-triggered runs (push / pull_request); a manual run
+# (`workflow_dispatch`) is never cancelled by a subsequent push.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SQLX_OFFLINE: "true"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 1: FAST CI (Every Push/PR) - Target: < 5 minutes
+  # ════════════════════════════════════════════════════════════════════════════
+
+  check-rust:
+    name: 🦀 Check Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Workspace-wide "no bcrypt" lint — enforces the Argon2id-not-bcrypt
+      # invariant: password hashing goes through `hort_app::argon2_hash`,
+      # never bcrypt. Comments / docstrings whose first non-whitespace token
+      # is `//` are excluded — the invariant is "no code references", not
+      # "no bytes anywhere".
+      #
+      # Mirrored by `crates/hort-app/tests/no_bcrypt.rs` so the same gate
+      # runs in every developer's local `cargo test --workspace --lib`.
+      # The CI step is the redundant belt — it catches bcrypt re-introduced
+      # via Cargo.toml even if no .rs file imports it yet.
+      - name: No bcrypt::* in source (Argon2id invariant)
+        run: |
+          set -uo pipefail
+          # Find any line that references `bcrypt::` (Rust path) or
+          # `bcrypt = ` (Cargo.toml dep). Strip lines whose code position
+          # is inside a Rust line comment.
+          # `|| true` on the leading grep absorbs its exit-1-on-no-match.
+          hits=$(grep -rnE --include='*.rs' --include='*.toml' \
+                  'bcrypt::|bcrypt = ' \
+                  crates/ Cargo.toml || true)
+          # 1. Exclude comment-only references — a line like
+          #      path/file.rs:123:    // bcrypt::hash was here
+          #    has `//` as the first non-prefix content; strip it.
+          # 2. Exclude the lint test itself — `crates/hort-app/tests/no_bcrypt.rs`
+          #    contains the literal substrings as documentation /
+          #    synthetic regression strings; it MUST keep them. The
+          #    in-process scanner has the same self-exclusion.
+          filtered=$(echo "$hits" \
+                  | grep -vE ':[0-9]+:[[:space:]]*//' \
+                  | grep -vF 'crates/hort-app/tests/no_bcrypt.rs' \
+                  || true)
+          if [ -n "$filtered" ]; then
+            echo "::error::Argon2id-not-bcrypt invariant: bcrypt:: references found in source. Migrate to hort_app::argon2_hash."
+            echo "$filtered"
+            exit 1
+          fi
+
+  test-backend-unit:
+    name: 🧪 Backend Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Run unit tests
+        env:
+          SQLX_OFFLINE: true
+        run: cargo test --workspace --lib --verbose
+
+  coverage:
+    name: 📊 Code Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        # Public Docker Hub official image. (The private GHCR mirror that
+        # previously fronted this isn't readable from the public mirror's CI;
+        # an anonymous pull of one small Postgres image per run is acceptable.)
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # Skip the expensive coverage build on PRs that touch no Rust source.
+      # Dependency bumps (Cargo.toml/Cargo.lock only), workflow edits, and
+      # docs-only changes cannot move coverage numbers, and the Backend Unit
+      # Tests job already validates the build. `rust_changed=true` for push
+      # events preserves the existing behavior on main.
+      - name: Detect Rust source changes
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          if git diff --name-only FETCH_HEAD -- '*.rs' | grep -q .; then
+            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust_changed=false" >> "$GITHUB_OUTPUT"
+            echo "### Coverage: skipped (no Rust source changes in this PR)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run database migrations
+        if: steps.detect.outputs.rust_changed == 'true'
+        run: sqlx migrate run --source migrations
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+
+      - name: Generate coverage report
+        if: steps.detect.outputs.rust_changed == 'true'
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          SQLX_OFFLINE: true
+          RUSTC_WRAPPER: ""
+        run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
+
+      - name: Coverage summary and gate
+        if: steps.detect.outputs.rust_changed == 'true'
+        run: |
+          # Total project coverage summary
+          echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo llvm-cov --workspace --lib --no-run --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # Total coverage floor (never let overall coverage drop below 50%)
+          cargo llvm-cov --workspace --lib --no-run --fail-under-lines 50
+
+      - name: New code coverage gate
+        if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
+        run: |
+          # Fetch base branch so we can diff against it (checkout is shallow by default)
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }}
+
+          # Check coverage on new/changed lines only (not the entire file).
+          # Uses unified diff to extract exact line numbers that were added or modified,
+          # then cross-references with lcov to measure coverage of those specific lines.
+          CHANGED_FILES=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null || true)
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No .rs files changed, skipping new code coverage check"
+            echo "### New Code Coverage: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Parse the unified diff to find which lines were added/changed in each file,
+          # then cross-reference with lcov.info to compute coverage on those lines only.
+          RESULT=$(python3 -c "
+          import subprocess, re
+
+          # Step 1: Parse unified diff to find added line numbers per file
+          diff = subprocess.run(
+              ['git', 'diff', '-U0', 'FETCH_HEAD', '--', '*.rs'],
+              capture_output=True, text=True
+          ).stdout
+
+          new_lines = {}  # filename -> set of added line numbers
+          current_file = None
+          for line in diff.split('\n'):
+              if line.startswith('+++ b/'):
+                  current_file = line[6:]
+              elif line.startswith('@@') and current_file:
+                  # Parse @@ -old,count +new,count @@ format
+                  m = re.search(r'\+(\d+)(?:,(\d+))?', line)
+                  if m:
+                      start = int(m.group(1))
+                      count = int(m.group(2)) if m.group(2) else 1
+                      if current_file not in new_lines:
+                          new_lines[current_file] = set()
+                      for i in range(start, start + count):
+                          new_lines[current_file].add(i)
+
+          if not new_lines:
+              print('none')
+          else:
+              # Step 2: Parse lcov.info and check coverage only for new lines
+              hit = miss = 0
+              lcov_file = None
+              lcov_match = None
+              for line in open('lcov.info'):
+                  line = line.strip()
+                  if line.startswith('SF:'):
+                      path = line[3:]
+                      lcov_match = None
+                      for f, lines in new_lines.items():
+                          if path.endswith(f):
+                              lcov_match = lines
+                              break
+                  elif line.startswith('DA:') and lcov_match is not None:
+                      parts = line[3:].split(',')
+                      lineno = int(parts[0])
+                      count = int(parts[1])
+                      if lineno in lcov_match:
+                          if count > 0:
+                              hit += 1
+                          else:
+                              miss += 1
+              total = hit + miss
+              if total == 0:
+                  print('none')
+              else:
+                  pct = (hit * 100) // total
+                  print(f'{pct} {hit} {total}')
+          ")
+
+          if [ "$RESULT" = "none" ]; then
+            echo "No instrumented lines in new code"
+            echo "### New Code Coverage: N/A (no instrumented new lines)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          PCT=$(echo "$RESULT" | awk '{print $1}')
+          HIT=$(echo "$RESULT" | awk '{print $2}')
+          TOTAL=$(echo "$RESULT" | awk '{print $3}')
+
+          echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} new lines)" >> $GITHUB_STEP_SUMMARY
+          echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} new lines)"
+
+          # Skip gate for very small changes (< 10 instrumented new lines) since
+          # the percentage is statistically noisy at that scale
+          if [ "$TOTAL" -lt 10 ]; then
+            echo "Too few new lines ($TOTAL) to enforce coverage gate, skipping"
+            echo "Skipped: fewer than 10 instrumented new lines" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          if [ "$PCT" -lt 70 ]; then
+            echo "::error::New code coverage is ${PCT}%, below 70% threshold"
+            echo "Coverage on new/changed lines is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Setup Node.js for jscpd
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Code duplication gate
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          # Install jscpd (copy-paste detector, same approach as SonarCloud's CPD engine)
+          npm install -g jscpd@4 --silent
+
+          # Get changed .rs files
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }} 2>/dev/null || true
+          CHANGED_RS=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
+
+          if [ -z "$CHANGED_RS" ]; then
+            echo "No .rs source files changed, skipping duplication check"
+            echo "### Code Duplication: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Write changed files to a list for jscpd
+          echo "$CHANGED_RS" > /tmp/changed-files.txt
+
+          # Run jscpd on changed files only (min 10 lines, threshold 3%)
+          RESULT=$(jscpd --min-lines 10 --threshold 3 --reporters json \
+            --format rust --output /tmp/jscpd-report \
+            $(echo "$CHANGED_RS" | tr '\n' ' ') 2>&1) || true
+
+          # Parse results
+          if [ -f /tmp/jscpd-report/jscpd-report.json ]; then
+            DUP_PCT=$(python3 -c "
+          import json
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          stats = data.get('statistics', {})
+          total = stats.get('total', {})
+          pct = total.get('percentage', 0)
+          dups = total.get('duplicatedLines', 0)
+          lines = total.get('lines', 0)
+          clones = len(data.get('duplicates', []))
+          print(f'{pct:.1f} {dups} {lines} {clones}')
+          " 2>/dev/null) || DUP_PCT="0.0 0 0 0"
+
+            PCT=$(echo "$DUP_PCT" | awk '{print $1}')
+            DUP_LINES=$(echo "$DUP_PCT" | awk '{print $2}')
+            TOTAL_LINES=$(echo "$DUP_PCT" | awk '{print $3}')
+            CLONES=$(echo "$DUP_PCT" | awk '{print $4}')
+
+            echo "### Code Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)" >> $GITHUB_STEP_SUMMARY
+            echo "Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)"
+
+            # Fail if duplication exceeds 3%
+            OVER=$(python3 -c "print('yes' if float('${PCT}') > 3.0 else 'no')")
+            if [ "$OVER" = "yes" ]; then
+              echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
+
+              # Show the duplicate blocks
+              python3 -c "
+          import json
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          for d in data.get('duplicates', []):
+              fa = d['firstFile']
+              sa = d['secondFile']
+              print(f\"  {fa['name']}:{fa['startLoc']['line']}-{fa['endLoc']['line']} <-> {sa['name']}:{sa['startLoc']['line']}-{sa['endLoc']['line']}\")
+          " 2>/dev/null || true
+
+              exit 1
+            fi
+          else
+            echo "### Code Duplication: 0% (no duplicates found)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload coverage artifact
+        if: always() && steps.detect.outputs.rust_changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: lcov-coverage
+          path: lcov.info
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 2: INTEGRATION (Main Branch Push Only)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  test-backend-integration:
+    name: 🔗 Backend Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    services:
+      postgres:
+        # Public Docker Hub official image (the private GHCR mirror isn't
+        # readable from the public mirror's CI).
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          SQLX_OFFLINE: true
+        run: cargo test --workspace --test '*' --verbose
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECURITY — blocking gates
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # `cargo audit` and `cargo-deny` are blocking gates; `security-audit-sync`
+  # enforces parity between `.cargo/audit.toml` and `deny.toml`'s ignore lists.
+
+  # Lightweight gate that runs on every push: confirms the advisory
+  # ignore list in `.cargo/audit.toml` matches `deny.toml`'s
+  # `[advisories.ignore]`. The single source of truth is
+  # `.cargo/audit.toml`; this gate prevents accidental drift.
+  security-audit-sync:
+    name: 🔁 Advisory ignore-list sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Verify .cargo/audit.toml ↔ deny.toml ignore-list parity
+        run: bash scripts/check-advisory-sync.sh
+
+  # Render every `test-values-*.yaml` fixture via `helm template` and assert
+  # the per-feature presence / absence of gated lines, so chart-template
+  # breakage is caught in CI rather than by manual re-render.
+  chart-template-tests:
+    name: ⛵ Helm chart template tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.16.2
+
+      - name: Render fixtures and assert expected/forbidden lines
+        run: bash scripts/test-helm-templates.sh
+
+  security-audit:
+    name: 🔒 Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Blocking gate. `--deny warnings` upgrades yanked / unmaintained /
+      # unsound from advisory to error. The advisory-ignore list lives only
+      # in `.cargo/audit.toml` (no `--ignore` flags here — duplicating IDs in
+      # CI commands invites drift). Parity between `.cargo/audit.toml` and
+      # `deny.toml`'s `[advisories.ignore]` is enforced by the
+      # `security-audit-sync` job (`scripts/check-advisory-sync.sh`).
+      - name: Audit Rust dependencies (blocking)
+        run: cargo audit --deny warnings
+
+  # cargo-deny gate. Enforces the four sections in `deny.toml`: advisory
+  # floor (mirrored with
+  # `.cargo/audit.toml`), license allowlist, banned crates
+  # (openssl-sys, native-tls, wasmtime*), and source pinning to
+  # crates.io. Mirrors the `security:cargo-deny` job in `.gitlab-ci.yml`.
+  cargo-deny:
+    name: 🚫 cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RELEASE-BINARY BUILD VERIFICATION (build-only, never releases)
+  # ════════════════════════════════════════════════════════════════════════════
+  # Runs the same cross-platform matrix release.yml ships, in verify mode
+  # (publish: false → build + package + upload, no signing, no release), so a PR
+  # confirms hort-cli / hort-server / hort-worker compile on every target.
+  build-binaries:
+    name: Build binaries (verify)
+    # PRs + manual runs only: the release path builds these on tags, and a
+    # post-merge main push needn't rebuild what the PR already verified.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      publish: false
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # FINAL STATUS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  ci-complete:
+    name: ✅ CI Complete
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [check-rust, test-backend-unit, coverage, test-backend-integration, security-audit-sync, security-audit, cargo-deny]
+    if: always()
+    steps:
+      - name: Check CI status
+        run: |
+          echo "## CI Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          tier1_pass=true
+
+          # Tier 1 jobs (required)
+          for job in check-rust test-backend-unit; do
+            result="${{ needs.check-rust.result }}"
+            [ "$job" = "test-backend-unit" ] && result="${{ needs.test-backend-unit.result }}"
+            if [[ "$result" == "success" ]]; then
+              echo "✅ $job" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ $job: $result" >> $GITHUB_STEP_SUMMARY
+              tier1_pass=false
+            fi
+          done
+
+          # Integration tests (main push only, skip check on PRs)
+          integ_result="${{ needs.test-backend-integration.result }}"
+          if [[ "$integ_result" == "success" ]]; then
+            echo "✅ integration-tests" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$integ_result" == "skipped" ]]; then
+            echo "⏭️ integration-tests (PR — skipped)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ integration-tests: $integ_result" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
+
+          # Coverage (non-blocking)
+          if [[ "${{ needs.coverage.result }}" == "success" ]]; then
+            echo "✅ coverage" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ coverage: ${{ needs.coverage.result }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Advisory ignore-list sync (blocking)
+          if [[ "${{ needs.security-audit-sync.result }}" == "success" ]]; then
+            echo "✅ security-audit-sync" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ security-audit-sync: ${{ needs.security-audit-sync.result }}" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
+
+          # Security audit (blocking)
+          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
+            echo "✅ security-audit" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ security-audit: ${{ needs.security-audit.result }}" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
+
+          # cargo-deny (blocking)
+          if [[ "${{ needs.cargo-deny.result }}" == "success" ]]; then
+            echo "✅ cargo-deny" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ cargo-deny: ${{ needs.cargo-deny.result }}" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$tier1_pass" != "true" ]]; then
+            echo "❌ **CI Failed**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo "✅ **CI Passed**" >> $GITHUB_STEP_SUMMARY

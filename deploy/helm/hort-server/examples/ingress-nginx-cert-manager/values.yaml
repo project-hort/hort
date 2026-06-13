@@ -1,0 +1,30 @@
+# hort-server is BEHIND ingress-nginx with TLS terminated at the ingress
+# layer (cert-manager-managed Certificate). The chart still requires
+# `publicBaseUrl` to be set in the operator's own values file so the
+# binary knows what scheme/host to render in self-referential URLs
+# (Cargo download links, OCI manifest digests, etc).
+
+requireHttps: true
+api:
+  bindAddr: "0.0.0.0:8080"   # kubelet HTTP probe needs to reach pod IP
+
+# The chart trusts X-Forwarded-{For,Proto} headers from these CIDRs.
+# ingress-nginx pods sit in the controller namespace; this is the
+# pod-CIDR range your CNI assigns (typical default below — operators
+# adjust to their cluster's actual pod subnet).
+trustedProxyCidrs:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+
+# The chart does NOT ship an Ingress resource. The operator applies
+# the YAML in this overlay's README alongside the chart.
+
+# OCI manifest list responses can grow large (multi-arch, lots of
+# layers). The default ingress-nginx proxy buffers will truncate.
+# The README documents the controller-level configmap / Ingress
+# annotation overrides — the chart cannot set these on a resource it
+# does not own.
+
+# Rate-limit / load-shed knobs deliberately omitted — operator's edge
+# is the right place to put per-source rate limits, not the chart.

@@ -1,0 +1,145 @@
+{{/*
+Quarantine release-sweep CronJob.
+
+Periodically invokes `hort-server enqueue-quarantine-release-sweep`,
+which inserts ONE `kind='quarantine-release-sweep'` row into
+`public.jobs` using the runtime DSN. The always-on worker (`hort-worker`)
+picks the row up and dispatches to `QuarantineReleaseSweepHandler`. The
+handler runs the candidacy query (one indexed range scan per distinct
+effective `ScanPolicy.quarantineDuration`) and hands the batch-limited
+candidate list to `QuarantineUseCase::release_expired`, which enforces the
+fail-closed release-authority predicate (`ScanSucceeded`/`ScanWaived`
+only — NEVER the window deadline alone) per artifact.
+
+Design rationale for the runtime-DSN delivery: a default-enabled sweep
+CronJob going through the `hort-cli` HTTP admin-task path would drag the
+whole `svc-token-bootstrap` Job chain + a standing `admin_task_invoke`
+token mount to default-on. The runtime DSN is least-privilege — it owns
+nothing identity-wise — and the `hort-http-admin-tasks` HTTP route stays
+available for manual operator invocation. So this CronJob:
+
+  - Uses `hort-server.runtimeEnv` (DSN + log/metric tunables only —
+    same env block the migrate Job uses, MinimalConfig discipline).
+  - Has NO `valueFrom.secretKeyRef` for any svc-token.
+  - Is gated by `quarantineReleaseSweep.enabled` (default true — the
+    sweep ships on by default; an operator who has not yet configured a
+    quarantine window sees a no-op sweep until they set
+    `ScanPolicy.quarantineDuration`, at which point the sweep is the
+    only path that releases those artifacts).
+  - Does NOT depend on `scheduledTasks.adminTasksEnabled` — that toggle
+    gates the svc-token chain this template deliberately avoids.
+
+Default schedule: every 5 minutes (design §2.4 finding 3).
+Operator-tunable via `quarantineReleaseSweep.schedule`.
+The 5-minute cadence bounds both window-gate latency and how fast a
+`quarantineDuration` change takes effect, on an hours-scale window.
+The 5-minute floor on the chart's CronJob ladder applies here too.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents
+the controller from spawning a second pod while the previous tick
+is still running. (The tick is just one INSERT; controller-restart
+double-fire is harmless — the worker drains both rows, and
+`release_expired` is idempotent per artifact via the per-stream
+optimistic-concurrency check.)
+
+Hex-onion discipline: `enqueue-quarantine-release-sweep` is an
+inbound CLI adapter (parses MinimalConfig, builds the PgPool, calls
+`JobsRepository::enqueue_task`) — no application logic in the
+binary surface.
+*/}}
+{{- if .Values.scheduledTasks.quarantineReleaseSweep.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-quarantine-release-sweep
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: quarantine-release-sweep
+spec:
+  schedule: {{ .Values.scheduledTasks.quarantineReleaseSweep.schedule | quote }}
+  # `Forbid` is the cron-conventional choice for "this job is
+  # idempotent but must not overlap itself." The enqueue is one row
+  # insert, so a missed tick is fine — the next 5-minute tick picks
+  # up the slack.
+  concurrencyPolicy: Forbid
+  # Bound the history Kubernetes retains so a long-running deployment
+  # does not accumulate hundreds of completed Job objects.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # Surface a missed-deadline (the previous run still active when
+  # the schedule fires under `Forbid`) as a non-fatal event in the
+  # controller log rather than a CronJob failure. 600s window is
+  # generous for an INSERT-only pod.
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: quarantine-release-sweep
+        spec:
+          serviceAccountName: {{ include "hort-server.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: enqueue-quarantine-release-sweep
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "enqueue-quarantine-release-sweep"
+              env:
+                # DB-only subcommand. The `hort-server.runtimeEnv` helper
+                # populates HORT_DATABASE_URL + log/metric tunables; we
+                # deliberately do NOT mount any svc-token secret here (see
+                # template docstring).
+                {{- include "hort-server.runtimeEnv" . | nindent 16 }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+                {{- /* Backlog 078 Item 7 — gate the mount on the
+                       auto-mount source (configMapName/secretName), NOT
+                       on `.path` alone: with `.path` set but no source the
+                       volume below never rendered, leaving a dangling
+                       volumeMount that fails pod admission. */}}
+                {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
+                {{- end }}
+                {{- with .Values.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,72 @@
+{{/*
+Retention-purge CronJob.
+
+Periodically invokes `hort-cli admin task invoke retention-purge`. The
+handler runs the destructive storage-GC walk: for every `ArtifactExpired`
+with no following `ArtifactPurged`, decrement `content_references`,
+delete the CAS blob iff the cross-`kind` refcount hit 0, append
+`ArtifactPurged` (RetentionScheduler actor). The use case REFUSES to
+run until the worker's boot refcount-reconcile sweep has converged
+(gate-false → the handler returns a retryable failure; the next worker
+boot flips the gate). Default daily cadence, after retention-evaluate.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` (layer 1) +
+the worker per-kind semaphore concurrency=1 (layer 2).
+
+Idempotency-Key: `--idempotency-key-window=day` → `<UTC date>:retention-purge`.
+
+Gated by `scheduledTasks.retentionPurge.enabled` (default false; this
+is the most destructive retention task, so opt-in is required for
+safety). The parent `scheduledTasks.adminTasksEnabled` must also be
+true.
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.retentionPurge.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-retention-purge
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: retention-purge
+spec:
+  schedule: {{ .Values.scheduledTasks.retentionPurge.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: retention-purge
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - retention-purge
+                - --idempotency-key-window
+                - day
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

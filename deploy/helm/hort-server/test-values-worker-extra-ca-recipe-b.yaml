@@ -1,0 +1,65 @@
+# Fully-manual worker CA recipe fixture (Backlog 078 Item 7).
+#
+# This exercises the MANUAL path: extraCaBundle.path set, but NEITHER
+# configMapName NOR secretName (no chart auto-mount). The operator wires
+# their own trust-anchor volume via worker.extraVolumes /
+# worker.extraVolumeMounts (here a Secret-backed volume; a CSI-projected
+# ClusterTrustBundle is the other common case) AND sets
+# HORT_EXTRA_CA_BUNDLE themselves via worker.extraEnv, pointed at `path`.
+#
+# Post-Item-7 the chart NEVER sets HORT_EXTRA_CA_BUNDLE for the manual
+# recipe (convention 9: no env pointing at a file the chart did not
+# mount). So for the manual recipe to work, the operator supplies the env
+# explicitly — that is what `worker.extraEnv` does below. If they had
+# instead set `secretName`, the chart would auto-mount + set the env on
+# both pods (see test-values-extra-ca-with-secret.yaml).
+#
+# The chart must:
+#   - NOT render a chart-managed HORT_EXTRA_CA_BUNDLE env (manual recipe)
+#   - NOT render the chart-managed `extra-ca-bundle` volume/mount
+#   - render the operator-supplied volume + mount + env verbatim
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory
+
+extraCaBundle:
+  path: /etc/hort-server/ca-bundle/ca.crt
+  configMapName: ""
+  secretName: ""
+
+worker:
+  enabled: true
+  # Manual recipe: the operator sets the env themselves — the chart does
+  # not (no auto-mount source ⇒ no chart-set env, convention 9).
+  extraEnv:
+    - name: HORT_EXTRA_CA_BUNDLE
+      value: /etc/hort-server/ca-bundle/ca.crt
+  extraVolumes:
+    - name: recipe-b-worker-ca
+      secret:
+        secretName: my-corporate-ca-secret
+        defaultMode: 0444
+        items:
+          - key: ca.crt
+            path: ca.crt
+  extraVolumeMounts:
+    - name: recipe-b-worker-ca
+      mountPath: /etc/hort-server/ca-bundle/ca.crt
+      subPath: ca.crt
+      readOnly: true

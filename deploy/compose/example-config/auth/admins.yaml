@@ -1,0 +1,9 @@
+# ClaimMapping: IdP group `hort-admins` resolves to the synthetic
+# `admin` claim (RbacEvaluator short-circuits on it).
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: admins
+spec:
+  idpGroup: hort-admins
+  claim: admin

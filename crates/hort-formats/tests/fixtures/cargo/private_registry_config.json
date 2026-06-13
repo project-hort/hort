@@ -1,0 +1,4 @@
+{
+  "dl": "https://artifacts.example.com/{prefix}/{lowerprefix}/{crate}-{version}.crate",
+  "api": "https://artifacts.example.com/api"
+}

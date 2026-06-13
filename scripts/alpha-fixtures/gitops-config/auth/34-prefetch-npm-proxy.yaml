@@ -1,0 +1,17 @@
+# PermissionGrant: [developer, ci-pusher] -> Prefetch on
+# npm-proxy. Two-claim + per-repo (linter-clean). Paired with
+# `31-read-npm-proxy.yaml` — Read ∧ Prefetch together satisfy the
+# self-service-prefetch requirement for `hort-cli prefetch npm-proxy <pkg>`.
+# OCI repositories are excluded at the use-case layer
+# (`oci_unsupported`), so no OCI prefetch grant is needed.
+# See `31-read-npm-proxy.yaml` for the full reshape rationale.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: developers-prefetch-npm-proxy
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: prefetch
+  repository: npm-proxy

@@ -1,0 +1,8 @@
+{
+  "request": { "method": "GET", "url": "/packages/requests-2.31.0-py3-none-any.whl" },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/octet-stream" },
+    "bodyFileName": "packages/requests-2.31.0-py3-none-any.whl"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "info": {
+    "name": "legacy",
+    "version": "1.0"
+  },
+  "releases": {},
+  "urls": [
+    {
+      "filename": "legacy-1.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/aa/bb/legacy-1.0-py3-none-any.whl",
+      "digests": {
+        "md5": "0123456789abcdef0123456789abcdef"
+      },
+      "packagetype": "bdist_wheel"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: alpha-default
+spec:
+  # Global scope — applies to every repository unless a per-repo
+  # ScanPolicy with the same scan-policy name overrides it.
+  scope: global
+  # Critical-only is the alpha default: the runbook §8.3 exercises a
+  # known-CVE artifact that scans at Critical (event-stream@3.3.6 —
+  # GHSA-mh6f-8j2x-4483). Lowering to High/Medium catches more in
+  # production but introduces noise during alpha walks.
+  severityThreshold: critical
+  # 60 s quarantine — long enough to verify the 503+Retry-After path
+  # against a quarantined download, short
+  # enough that the alpha tester doesn't wait minutes between
+  # publish and download. Production typically uses 24h–72h.
+  quarantineDuration: 60s
+  # No approval workflow in alpha. Manual-review surface is its own
+  # initiative (ApprovalRequested / ApprovalDecided events exist but
+  # the operator playbook is out of scope for this runbook).
+  requireApproval: false
+  # Sigstore/cosign provenance verification. `verify_if_present`
+  # (the fail-safe default) verifies a bundle when one is present but never
+  # gates release, so the alpha walk's unsigned artifacts ingest normally.
+  # Switch to `required` + provenanceIdentities to enforce signed releases.
+  provenanceMode: verify_if_present
+  # Both scanner backends. The worker dispatches per-artifact scan
+  # jobs to each in sequence; either flagging the artifact at
+  # severityThreshold or higher transitions it to Rejected.
+  scanBackends: [trivy, osv]
+  # No license restrictions for alpha.
+  licensePolicy: {}

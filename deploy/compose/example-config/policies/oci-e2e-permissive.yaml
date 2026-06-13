@@ -1,0 +1,23 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: oci-e2e-permissive
+spec:
+  # Per-repo operator opt-out of quarantine-by-default. See
+  # `pypi-e2e-permissive.yaml` for the full rationale — the OCI native
+  # test (`scripts/native-tests/scenarios/clients/oci.sh`) follows the same
+  # push-then-immediately-pull pattern via `skopeo copy`.
+  #
+  # OCI manifest fetch is by tag/digest rather than via an index, so
+  # the only mechanism that would block the immediate pull is the
+  # quarantine 503 (`Retry-After`). This opt-out is the correct shape
+  # for OCI just as it is for the body-format formats.
+  scope:
+    repository: oci-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  # Provenance off for permissive e2e (no per-ingest verify job).
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

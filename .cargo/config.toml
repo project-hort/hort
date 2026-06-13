@@ -1,0 +1,16 @@
+# Cargo aliases.
+#
+# The `cov-*` aliases wrap `cargo llvm-cov` with a workspace-level
+# `--ignore-filename-regex` that excludes test-only support modules
+# (`test_support.rs`) from the coverage report. Those files contain mock
+# implementations of outbound ports; their unused branches inflate the
+# uncovered-line count without indicating real product-code gaps.
+#
+# Use `cargo cov-summary` for a quick per-file roll-up, `cargo cov-html`
+# for a browsable report, or `cargo cov` for raw llvm-cov output.
+
+[alias]
+cov = "llvm-cov --workspace --lib --ignore-filename-regex=test_support\\.rs$"
+cov-summary = "llvm-cov --workspace --lib --summary-only --ignore-filename-regex=test_support\\.rs$"
+cov-html = "llvm-cov --workspace --lib --html --ignore-filename-regex=test_support\\.rs$"
+cov-lcov = "llvm-cov --workspace --lib --lcov --output-path lcov.info --ignore-filename-regex=test_support\\.rs$"

@@ -1,0 +1,22 @@
+# ClaimMapping (fan-out): the OIDC group `test-developers` ALSO
+# resolves to the `ci-pusher` scope claim, so a `test-developers`
+# member's resolved claim set is [developer, ci-pusher] — the two-claim
+# subject the PermissionGrants in this directory require to clear the
+# §8.1 `single-claim-grant` rule.
+#
+# Mirrors `deploy/compose/example-config/auth/ci-pushers.yaml`.
+#
+# TEST-HARNESS CONTRIVANCE: in production the role claim (`developer`)
+# and the push/amplification-scope claim (`ci-pusher`) come from two
+# DIFFERENT IdP groups, so no single group's administrator can
+# unilaterally confer the amplification surface (single-claim-grant
+# rationale). The alpha Keycloak realm defines only
+# one developer group, so both claims fan out from it; the
+# additive-claims grant shape is identical either way.
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: ci-pushers
+spec:
+  idpGroup: test-developers
+  claim: ci-pusher

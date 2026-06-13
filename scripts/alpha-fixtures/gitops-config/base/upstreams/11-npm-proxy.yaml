@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: npm-proxy
+spec:
+  repository: npm-proxy
+  # npm uses a single catch-all upstream per repo (no path-prefix
+  # routing). The empty pathPrefix is the catch-all marker — the
+  # orchestrator passes "" on every resolve() call.
+  pathPrefix: ""
+  upstreamUrl: https://registry.npmjs.org
+  auth:
+    type: anonymous

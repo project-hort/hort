@@ -1,0 +1,72 @@
+{{/*
+Schema migrations Job. Runs the hort-server `migrate` subcommand against
+the `postgres.admin.existingSecret` DSN — never the runtime app DSN.
+The two-role split keeps DDL privileges off the runtime Deployment.
+
+Helm hook: pre-install,pre-upgrade. Hook weight -5 ensures the Job
+runs before the Deployment is created. Delete-before-creation cleans up
+any prior failed Job from the previous install attempt.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "hort-server.fullname" . }}-migrate
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.selectorLabels" . | nindent 8 }}
+        hort-server.io/job: migrate
+    spec:
+      # Intentionally NOT pinned to the runtime ServiceAccount. As a
+      # Helm pre-install hook, this Job runs before non-hook manifests
+      # (the SA template included), so referencing the runtime SA here
+      # produces a `FailedCreate: serviceaccount "..." not found` loop
+      # on first install. The Job makes no Kubernetes API calls —
+      # `args: ["migrate"]` only opens an outbound TCP connection to
+      # Postgres via HORT_DATABASE_URL — so the namespace's `default` SA
+      # is sufficient.
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: OnFailure
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "hort-server.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate"]
+          # `hort-server migrate` parses MinimalConfig and needs only the
+          # DSN. HORT_STORAGE_FILESYSTEM_PATH / HORT_PUBLIC_BASE_URL /
+          # HORT_CONFIG_DIR are NOT required here. The runtime Deployment
+          # mounts them all — only the migrate path is slimmed.
+          # Backlog 078 Item 5 — canonical HORT_DATABASE_URL (sourced from the
+          # admin/migrate DDL secret, NOT the app role). The binary falls back
+          # to bare DATABASE_URL (sqlx-cli / Tier-2 / 12-factor) — the chart
+          # sets the canonical name. Only the env-var NAME changed; the secret
+          # reference (postgres.admin) is unchanged.
+          env:
+            - name: HORT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.admin.existingSecret | quote }}
+                  key: {{ .Values.postgres.admin.secretKey | quote }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

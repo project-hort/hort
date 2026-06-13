@@ -1,0 +1,8 @@
+{
+  "request": { "method": "GET", "url": "/simple/requests/" },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "text/html; charset=utf-8" },
+    "bodyFileName": "simple/requests/index.html"
+  }
+}

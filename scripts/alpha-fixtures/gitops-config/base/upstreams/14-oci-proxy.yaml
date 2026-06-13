@@ -1,0 +1,20 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: oci-proxy-library
+spec:
+  repository: oci-proxy
+  # OCI uses path-prefix routing — operators can declare multiple
+  # UpstreamMapping rows per OCI repo to mirror different upstream
+  # namespaces. The `upstream_name_prefix` field is OCI-effective only.
+  #
+  # This single fixture maps requests under /library/* on the proxy to
+  # docker.io/library/* upstream — sufficient for `alpine`, `busybox`,
+  # etc. (Docker Hub's "official images" namespace). For other
+  # upstreams (e.g. ghcr.io/<org>/<img>) declare additional mappings
+  # with distinct pathPrefix values.
+  pathPrefix: "library"
+  upstreamUrl: https://index.docker.io
+  upstreamNamePrefix: "library"
+  auth:
+    type: anonymous

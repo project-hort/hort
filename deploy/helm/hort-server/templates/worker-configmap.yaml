@@ -1,0 +1,52 @@
+{{- if and .Values.worker .Values.worker.enabled -}}
+{{/*
+ConfigMap for the worker Deployment.
+
+Carries the non-secret env vars the worker consumes (binaries, poll
+cadence, advisory URL, etc.). Postgres DSN, S3 credentials, and Redis
+URLs ride through Secret references in the Deployment env block; they
+are NOT placed here.
+
+The ConfigMap is rendered as flat keys so the Deployment can mount
+specific entries via `valueFrom.configMapKeyRef`, mirroring the way
+the server's main ConfigMap is consumed.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hort-server.fullname" . }}-worker-config
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+data:
+  {{- /* Backlog 078 Item 6 (chart S3) — load-bearing scanner enable   */}}
+  {{- /* flags. When false, the worker does NOT register that backend   */}}
+  {{- /* regardless of the binary `--version` probe (the flag is the    */}}
+  {{- /* gate; the probe is a secondary health check).                  */}}
+  HORT_SCANNER_TRIVY_ENABLED: {{ .Values.worker.scanner.trivy.enabled | quote }}
+  HORT_SCANNER_OSV_ENABLED: {{ .Values.worker.scanner.osv.enabled | quote }}
+  HORT_SCANNER_TRIVY_BIN: {{ .Values.worker.scanner.trivy.binary | quote }}
+  {{- if .Values.worker.scanner.trivy.dbDir }}
+  HORT_SCANNER_TRIVY_DB_DIR: {{ .Values.worker.scanner.trivy.dbDir | quote }}
+  {{- end }}
+  HORT_SCANNER_OSV_BIN: {{ .Values.worker.scanner.osv.binary | quote }}
+  {{- /* Load-bearing cosign provenance enable flag + the pinned         */}}
+  {{- /* trust-root path. When enabled is false the worker registers no  */}}
+  {{- /* ProvenancePort (provenance verification inert); when true the   */}}
+  {{- /* trust-root file is REQUIRED and the worker refuses to boot      */}}
+  {{- /* without it. Verify path is offline (no live TUF/Rekor/Fulcio   */}}
+  {{- /* fetch); rotate via the image/release pipeline.                  */}}
+  HORT_PROVENANCE_COSIGN_ENABLED: {{ .Values.worker.provenance.cosign.enabled | quote }}
+  {{- if .Values.worker.provenance.cosign.enabled }}
+  HORT_PROVENANCE_TRUSTED_ROOT_FILE: {{ required "worker.provenance.cosign.trustedRootFile is required when worker.provenance.cosign.enabled=true (a pinned trusted_root.json the worker loads at boot — the verify path does no live fetch)" .Values.worker.provenance.cosign.trustedRootFile | quote }}
+  {{- end }}
+  HORT_ADVISORY_OSV_API_URL: {{ .Values.worker.advisory.osvUrl | quote }}
+  HORT_SCANNER_POLL_INTERVAL_SECS: {{ .Values.worker.scanner.pollIntervalSecs | quote }}
+  HORT_SCANNER_BATCH_SIZE: {{ .Values.worker.scanner.batchSize | quote }}
+  HORT_SCANNER_MAX_ATTEMPTS: {{ .Values.worker.scanner.maxAttempts | quote }}
+  HORT_SCANNER_LOCK_DURATION_SECS: {{ .Values.worker.scanner.lockDurationSecs | quote }}
+  {{- /* Defense-in-depth seal-pool lock_timeout. 0 disables the         */}}
+  {{- /* backstop and re-opens the unbounded-block failure mode;         */}}
+  {{- /* default 120000 (2 min).                                         */}}
+  HORT_WORKER_LOCK_TIMEOUT_MS: {{ .Values.worker.db.lockTimeoutMs | quote }}
+{{- end -}}

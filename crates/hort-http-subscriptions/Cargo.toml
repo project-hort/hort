@@ -1,0 +1,32 @@
+[package]
+name = "hort-http-subscriptions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for the /api/v1/subscriptions CRUD surface"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+url          = { workspace = true }
+thiserror    = { workspace = true }
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+tower                       = { workspace = true }
+arc-swap                    = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }

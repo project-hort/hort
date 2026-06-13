@@ -1,0 +1,79 @@
+{{/*
+Cron-rescan-tick CronJob.
+
+Periodically invokes `hort-cli admin task invoke cron-rescan-tick`. The
+handler selects artifacts whose ScanPolicy.rescanIntervalHours has
+elapsed since their last completed scan and inserts `kind='scan'` jobs
+for them. The default 5-minute cadence keeps the freshness window tight
+without flooding the queue — the handler caps fan-out per tick.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents the
+controller from spawning a second pod while the previous tick is still
+running. Execution-overlap protection lives in the worker's per-kind
+semaphore.
+
+Idempotency-Key: `hort-cli admin task invoke` is passed
+`--idempotency-key-window=minute`, which computes the key as
+`<UTC minute>:cron-rescan-tick` (matches the legacy shell shape
+`date -u +%Y-%m-%dT%H:%M`). A controller-restart double-fire
+short-circuits at the framework layer.
+
+Gated by `scheduledTasks.cronRescanTick.enabled` (default false). The parent
+toggle `scheduledTasks.adminTasksEnabled` must also be true for this template to render.
+
+The service-account token (`{{ release }}-svc-token`) is mounted from the
+k8s Secret written by the bootstrap Job (svc-token-bootstrap-job.yaml).
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.cronRescanTick.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-cron-rescan-tick
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: cron-rescan-tick
+spec:
+  schedule: {{ .Values.scheduledTasks.cronRescanTick.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: cron-rescan-tick
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Distroless runtime: invoke `hort-cli` directly and let it
+              # compute the idempotency key via `--idempotency-key-window`.
+              # See cronjob-service-account-rotation.yaml for context.
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - cron-rescan-tick
+                - --idempotency-key-window
+                - minute
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

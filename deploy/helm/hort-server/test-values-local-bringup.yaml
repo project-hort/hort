@@ -1,0 +1,55 @@
+# Local-bring-up test values — `provider: disabled` + `nativeTokens.enabled: true`.
+#
+# Replaces the prior `test-values-basic.yaml` (provider=basic + admin
+# bootstrap CLI). Under this shape there is no
+# HTTP-Basic-against-local-admin-row identity path: the only inbound
+# auth surface is the native-token validator. Operators issue a
+# service-account token via `hort-server admin issue-svc-token` and
+# consume it with `hort-cli auth login --paste`. See:
+#   - values.yaml `auth.provider` doc-comment (minimal-setup recipe)
+#
+# Single replica, filesystem PVC, memory ephemeral store. requireHttps
+# explicitly false because the operator's edge in this scenario is
+# plaintext on a trusted LAN.
+publicBaseUrl: http://hort.internal.example
+requireHttps: false
+
+auth:
+  provider: disabled
+  nativeTokens:
+    enabled: true
+    signingKey:
+      # Operator creates this Secret out-of-band before `helm install`:
+      #   kubectl create secret generic hort-oci-signing-key \
+      #     --from-file=hort-oci-token-signing-key.pem=path/to/ed25519.pem
+      existingSecret: hort-oci-signing-key
+      secretKey: hort-oci-token-signing-key.pem
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory
+
+# Post-install service-account bootstrap recipe (run once after the
+# Deployment is Ready):
+#
+#   kubectl exec -it deploy/hort-server -- \
+#       hort-server admin issue-svc-token \
+#           --username admin \
+#           --role developer
+#
+# The command prints an `hort_svc_*` token to stdout (one-shot — not
+# stored anywhere recoverable). On the operator's workstation:
+#
+#   hort-cli auth login --paste
+#
+# and paste the token at the prompt. A future iteration may wrap this
+# step in a Helm post-install Job; the recipe is intentionally manual
+# in v1 so the token is never persisted to a controller's audit log.

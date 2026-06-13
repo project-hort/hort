@@ -1,0 +1,29 @@
+# Ephemeral-store fixture: broken-fallback combination — main URL and
+# main existingSecret are both empty, but a per-class override is
+# set. The absent class (durable here) would have no URL to fall
+# back to at runtime. Schema Rule 4d install-blocks this at chart-
+# render time. `helm template` against this fixture MUST FAIL with
+# a schema-validation error.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: redis
+  redis:
+    url: ""
+    existingSecret: ""
+    evictableUrl: "redis://e:e@host:6379/0"

@@ -1,0 +1,13 @@
+# PermissionGrant: [developer, ci-pusher] -> write npm-e2e
+# (dev-user `npm publish`, scenarios/clients/npm.sh). Per-repo + two-claim
+# subject passes the allowlist linter. Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-write-npm-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: npm-e2e

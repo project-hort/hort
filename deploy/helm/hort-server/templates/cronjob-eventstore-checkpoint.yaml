@@ -1,0 +1,108 @@
+{{/*
+Event-chain checkpoint CronJob.
+
+Periodically invokes `hort-cli admin task invoke eventstore-checkpoint`,
+which hits `POST /api/v1/admin/tasks/eventstore-checkpoint`. The
+endpoint enqueues a `kind='eventstore-checkpoint'` row that the
+worker's dispatcher hands to the `EventstoreCheckpointHandler`
+(registered in `hort-worker::composition` when storage is S3 AND the
+operator anchor key files are provisioned).
+
+The handler snapshots every live stream's chain head, builds the
+spec §6.2 signed checkpoint (Merkle root over the stream-id-sorted
+witness + monotonic checkpoint_seq + the §5 first-checkpoint
+backfill_baseline honesty caveat), Ed25519-signs the SignedBody with
+the operator-provisioned anchor signing key, and writes it to the
+S3-Object-Lock-WORM-anchored `<bucket>/hort-event-chain-checkpoints/`
+prefix. This closes the external-anchor half (I2) of F-2: the
+`hort-server verify-event-chain` reader can now attest external
+anchoring instead of resolving to `missing_checkpoint`.
+
+Architectural note: this CronJob is a *trigger* only. The actual
+sign + WORM-write happens in the worker pod via the
+`ObjectStoreCheckpointEmitter` adapter.
+The CronJob pod only calls the hort-server admin-task HTTP endpoint
+with a service-account PAT.
+
+Default schedule: **hourly** (spec §6.3 / §14 R6 — hourly bounds the
+worst-case undetected whole-stream-truncation/rollback window to
+≤ 1h, well inside NIS2 Art. 23 incident-reporting horizons).
+Operators with a tighter compliance window may shorten it.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents a
+second pod while the previous tick runs. Execution-overlap
+protection lives in the worker's per-kind semaphore (the handler is
+registered single-active — two concurrent ticks could both write the
+same `checkpoint_seq`).
+
+Idempotency-Key: `--idempotency-key-window=hour`
+computes `<UTC hour>:eventstore-checkpoint`, so a controller-restart
+double-fire within the same hour short-circuits at the framework
+layer rather than emitting two checkpoints for the same cut.
+
+Gated by `scheduledTasks.eventstoreCheckpoint.enabled` (default false). The
+parent toggle `scheduledTasks.adminTasksEnabled` must also be true. For emission to
+actually occur the worker side ALSO needs S3 storage +
+`HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE` /
+`HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE` provisioned, and the anchor
+bucket MUST be created with **S3 Object Lock enabled + a COMPLIANCE-mode
+default retention** (object_store 0.13 cannot set per-object
+retention on PUT — WORM is the bucket default retention; see the
+deployment hardening guide / the adapter doc).
+
+The service-account token (`{{ release }}-svc-token`) is mounted from
+the k8s Secret written by the bootstrap Job (svc-token-bootstrap-job.yaml).
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.eventstoreCheckpoint.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-eventstore-checkpoint
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: eventstore-checkpoint
+spec:
+  schedule: {{ .Values.scheduledTasks.eventstoreCheckpoint.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: eventstore-checkpoint
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Distroless runtime: invoke `hort-cli` directly; the
+              # idempotency key is computed inside the CLI via
+              # `--idempotency-key-window` (no shell `date`).
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - eventstore-checkpoint
+                - --idempotency-key-window
+                - hour
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

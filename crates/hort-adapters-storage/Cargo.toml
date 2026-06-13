@@ -1,0 +1,41 @@
+[package]
+name = "hort-adapters-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort storage backend implementations (CAS — filesystem, S3, GCS, Azure)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain  = { path = "../hort-domain" }
+hort-config  = { path = "../hort-config" }
+
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+bytes        = { workspace = true }
+futures      = { workspace = true }
+sha2         = { workspace = true }
+uuid         = { workspace = true }
+object_store = { workspace = true }
+tracing      = { workspace = true }
+thiserror    = { workspace = true }
+metrics      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+metrics-util = { workspace = true, features = ["debugging"] }
+tracing-subscriber = { workspace = true }
+# The two `builders::tests::warn_*` tests install a per-thread tracing
+# subscriber via `set_default()` + `rebuild_interest_cache()` to capture
+# WARN events from `build_s3_object_store`. The `CapturingLayer` already
+# returns `Interest::sometimes()` to defend against cache poisoning, but
+# under heavy CI parallelism (especially under `cargo-llvm-cov` coverage
+# builds) two of these tests racing each other can leave the global
+# callsite cache transiently in `Interest::never()` between one thread's
+# `rebuild_interest_cache()` and another's `set_default()`. Marking the
+# two tests `#[serial(hort_tracing_capture)]` forces them to run sequentially
+# — same family-key convention as `hort-adapters-postgres`'s `hort_pg_db`.
+serial_test = { workspace = true }

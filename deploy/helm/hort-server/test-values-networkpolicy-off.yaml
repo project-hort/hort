@@ -1,0 +1,41 @@
+# Escape-hatch / negative-state fixture. `networkPolicy.enabled: false`
+# MUST disable BOTH the app-pod NetworkPolicy AND the additive
+# Job-scoped bootstrap-egress NetworkPolicy.
+#
+# Paired positive state: test-values-cronjobs.yaml (chart-default
+# networkPolicy.enabled: true → both policies render). The harness
+# locks both states so a future template edit cannot silently flip the
+# escape hatch or the carve-out.
+#
+# Usage:
+#   helm template hort deploy/helm/hort-server/ \
+#     -f deploy/helm/hort-server/test-values-networkpolicy-off.yaml
+publicBaseUrl: http://hort.internal.example
+requireHttps: false
+
+# The `basic` provider is retired; this escape-hatch fixture (which only
+# exercises networkPolicy.enabled: false) uses the supported minimal-setup
+# shape: provider=disabled + nativeTokens.enabled.
+auth:
+  provider: disabled
+  nativeTokens:
+    enabled: true
+    signingKey:
+      existingSecret: hort-oci-signing-key
+      secretKey: hort-oci-token-signing-key.pem
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory
+
+networkPolicy:
+  # Escape hatch (F-33). Disables BOTH NetworkPolicies entirely.
+  enabled: false

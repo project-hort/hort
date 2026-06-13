@@ -1,0 +1,23 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  # Key matches the CARGO_REPO_KEY env default in
+  # scripts/native-tests/scenarios/upstream/cargo-upstream-verification.sh.
+  name: cargo-upstream-e2e
+spec:
+  name: "Cargo upstream pull-through smoke"
+  description: "Proxy Cargo repo used by scripts/native-tests/scenarios/upstream/cargo-upstream-verification.sh; upstream is the wiremock-cargo-upstream sidecar serving real index.crates.io fixtures (cfg-if 1.0.0 — sparse-index config.json + per-crate NDJSON + .crate body)."
+  format: cargo
+  type: proxy
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/cargo-upstream-e2e
+  proxy:
+    # Required by the gitops validator (crates/hort-config/src/repository.rs)
+    # for type=proxy. The standalone UpstreamMapping resource at
+    # deploy/compose/example-config/upstreams/cargo-upstream-e2e.yaml is
+    # what populates the repository_upstream_mappings table that the
+    # cargo upstream-pull path's UpstreamResolver actually reads.
+    upstreamUrl: "http://wiremock-cargo-upstream:8080"
+  isPublic: true
+  replicationPriority: local_only

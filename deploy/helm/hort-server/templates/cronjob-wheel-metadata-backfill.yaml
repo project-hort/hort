@@ -1,0 +1,161 @@
+{{/*
+Wheel-metadata-backfill CronJob.
+
+Periodically invokes `hort-server enqueue-wheel-metadata-backfill`, which
+inserts ONE `kind='wheel-metadata-backfill'` row into `public.jobs` using
+the runtime DSN. The always-on worker (`hort-worker`) picks the row up and
+dispatches to `WheelMetadataBackfillHandler`. The handler walks PyPI wheel
+artifacts whose `content_references` row of kind `wheel_metadata` is absent,
+streams each wheel from CAS, invokes
+`FormatHandler::extract_wheel_metadata_bytes`, and on `Some(bytes)` persists
+the bytes to CAS + inserts the ContentReference row — exactly mirroring the
+ingest hook for wheels that pre-date the hook's deployment.
+
+Design rationale for the runtime-DSN delivery: a default-shipped CronJob
+going through the `hort-cli` HTTP admin-task path would drag the whole
+`svc-token-bootstrap` Job chain (and a standing `admin_task_invoke` token
+mount) to default-on. The runtime DSN is least-privilege — it can
+`INSERT INTO public.jobs` and read the schema, full stop. The
+`hort-http-admin-tasks` HTTP route stays available for **manual** operator
+invocation: `hort-cli admin task invoke wheel-metadata-backfill --params-file ...`.
+
+So this CronJob:
+
+  - Uses `hort-server.runtimeEnv` (DSN + log/metric tunables only —
+    same env block the migrate Job uses, MinimalConfig discipline).
+  - Has NO `valueFrom.secretKeyRef` for any svc-token.
+  - Is gated by `wheelMetadataBackfill.enabled` (default **false** —
+    the backfill is a one-shot retrofit for operators upgrading to wheel
+    metadata support, NOT a steady-state sweep. A freshly-deployed
+    operator's wheel inventory is empty; the tick would be a no-op.
+    Operators flip the chart value once after the upgrade, run the
+    backfill until it reports `artifacts_walked = 0` consistently, then
+    can flip it back off).
+  - Does NOT depend on `scheduledTasks.adminTasksEnabled` — that toggle
+    gates the svc-token chain this template deliberately avoids.
+
+Default schedule (when enabled): weekly Sunday 04:00 UTC. The backfill
+is opt-in; tightening below weekly during an active retrofit pass is
+the operator's call (the `find_pypi_wheels_without_kind` candidacy
+query is bounded by the per-tick `batch_size`, so a tighter schedule
+just drains the candidate set faster). Operator-tunable via
+`wheelMetadataBackfill.schedule`.
+
+`batchSize` is forwarded as `--batch-size <N>` to the enqueue
+subcommand, which embeds it in the row's `params` JSON. The
+`WheelMetadataBackfillHandler` caps at 1000 regardless of input;
+operators tightening below the default 100 are explicitly making the
+per-tick wall-clock vs memory tradeoff.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents the
+controller from spawning a second pod while the previous tick is still
+running. (The tick is just one INSERT; controller-restart double-fire
+is harmless — the worker drains both rows, and the handler is
+resumable per artifact via the candidacy query + the CAS / CR upsert
+idempotency.)
+
+Hex-onion discipline: `enqueue-wheel-metadata-backfill` is an inbound
+CLI adapter (parses MinimalConfig, builds the PgPool, calls
+`JobsRepository::enqueue_task`) — no application logic in the binary
+surface.
+*/}}
+{{- if .Values.scheduledTasks.wheelMetadataBackfill.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-wheel-metadata-backfill
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: wheel-metadata-backfill
+spec:
+  schedule: {{ .Values.scheduledTasks.wheelMetadataBackfill.schedule | quote }}
+  # `Forbid` is the cron-conventional choice for "this job is
+  # idempotent but must not overlap itself." The enqueue is one row
+  # insert, so a missed tick is fine — the next tick picks up the
+  # slack.
+  concurrencyPolicy: Forbid
+  # Bound the history Kubernetes retains so a long-running deployment
+  # does not accumulate hundreds of completed Job objects.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # Surface a missed-deadline (the previous run still active when
+  # the schedule fires under `Forbid`) as a non-fatal event in the
+  # controller log rather than a CronJob failure. 600s window is
+  # generous for an INSERT-only pod.
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: wheel-metadata-backfill
+        spec:
+          serviceAccountName: {{ include "hort-server.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: enqueue-wheel-metadata-backfill
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "enqueue-wheel-metadata-backfill"
+                {{- with .Values.scheduledTasks.wheelMetadataBackfill.batchSize }}
+                - "--batch-size"
+                - {{ . | quote }}
+                {{- end }}
+              env:
+                # DB-only subcommand. The `hort-server.runtimeEnv` helper
+                # populates HORT_DATABASE_URL + log/metric tunables; we
+                # deliberately do NOT mount any svc-token secret here (see
+                # template docstring).
+                {{- include "hort-server.runtimeEnv" . | nindent 16 }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+                {{- /* Backlog 078 Item 7 — gate the mount on the
+                       auto-mount source (configMapName/secretName), NOT
+                       on `.path` alone: with `.path` set but no source the
+                       volume below never rendered, leaving a dangling
+                       volumeMount that fails pod admission. */}}
+                {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
+                {{- end }}
+                {{- with .Values.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

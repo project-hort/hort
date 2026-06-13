@@ -1,0 +1,49 @@
+[package]
+name = "hort-adapters-oidc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort OIDC IdentityProvider adapter — validates IdP-issued JWTs via JWKS"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-config     = { path = "../hort-config" }
+hort-domain     = { path = "../hort-domain" }
+
+# The multi-issuer federation validator decodes the JWT payload WITHOUT
+# signature trust to extract the `iss` claim before issuer lookup.
+# `jsonwebtoken::decode` cannot perform this step (it refuses to skip
+# signature verification on the production path); manual base64url
+# decoding is the documented workaround. Same crate version as the rest
+# of the workspace (`hort-formats`, `hort-http-npm`, `hort-http-oci`,
+# `hort-adapters-upstream-http`).
+base64        = "0.22"
+bytes         = { workspace = true }
+chrono        = { workspace = true }
+futures       = { workspace = true }
+jsonwebtoken  = { workspace = true }
+metrics       = { workspace = true }
+reqwest       = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+url           = { workspace = true }
+uuid          = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+wiremock = "0.6"
+# Generate self-signed certs in-process for the extra-CA HTTPS JWKS
+# test (see `extra_ca_anchors_allows_tls_to_private_ca_jwks_server`).
+# `rcgen` is test-only; production paths never construct certificates.
+rcgen       = "0.13"
+# `axum-server` provides `bind_rustls` for the in-process HTTPS JWKS test
+# server. wiremock does not speak TLS, so we stand up a minimal
+# TLS-aware listener for the extra-CA positive/negative test pair.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum        = { workspace = true }
+rustls      = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }

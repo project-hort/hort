@@ -1,0 +1,156 @@
+{{/*
+CAS integrity scrub CronJob.
+
+Walks every blob in the CAS via `hort-server scrub`, re-hashes the bytes
+via streaming SHA-256, and compares against the CAS key. On a hash
+mismatch, the action depends on `scheduledTasks.scrub.actionOnMismatch`:
+
+- `alert` (default) — emit `CasIntegrityMismatch` event + tracing warn
+  + `hort_cas_scrub_checks_total{result="hash_mismatch"}` counter. The
+  blob remains readable; the operator decides the response.
+- `tombstone` — additionally emit an `ArtifactCorrupted` domain event
+  and transition the artifact to `quarantine_status = 'rejected'` via
+  the existing quarantine state machine. Subsequent download attempts
+  are blocked at the application layer (the same existing quarantine
+  error the rejected state already produces). Admin-release override
+  is available via `POST /quarantine/:artifact_id/release`.
+
+Default schedule: `"0 3 * * *"` (daily at 03:00 UTC). Operators
+running large CAS backends (multi-million blobs) typically pair a
+sampling-fraction cron with a less frequent full sweep — set
+`scheduledTasks.scrub.samplingRate` to a fraction in (0, 1] to scrub a subset
+per run.
+
+The CronJob is gated by `scheduledTasks.scrub.enabled` (default true). The
+runtime env block matches the Deployment via the `hort-server.runtimeEnv`
+helper — the scrub binary's `Config::from_env` parses the same shape
+the runtime does, so the two consumers MUST receive the same env, or
+the scrub fails at boot for a value the runtime accepts.
+
+Hex-onion discipline: the scrub CLI parses arguments and builds the
+composition (storage + event store + optional artifact lifecycle), then
+delegates every byte of business logic to `CasScrubUseCase` in
+`hort-app`.
+*/}}
+{{- if .Values.scheduledTasks.scrub.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-scrub
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: scrub
+spec:
+  schedule: {{ .Values.scheduledTasks.scrub.schedule | quote }}
+  # Keep at most one scrub run at a time. A long scrub against a large
+  # CAS can run for hours; concurrent invocations would hammer the
+  # serving path with redundant `get()` calls and the event-store with
+  # duplicate `CasIntegrityMismatch` appends. `Forbid` is the
+  # cron-conventional choice for "this job is idempotent but must not
+  # overlap itself."
+  concurrencyPolicy: Forbid
+  # Bound the history Kubernetes retains so a long-running deployment
+  # does not accumulate hundreds of completed Job objects. The
+  # tracing + metrics emit the per-run audit trail; the K8s Job
+  # history is for "did the last run finish, and what was its exit
+  # code" only.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Surface a missed-deadline (e.g. the previous run is still active
+  # when the schedule fires under `Forbid`) as a non-fatal event in
+  # the controller log rather than as a CronJob failure.
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: scrub
+        spec:
+          serviceAccountName: {{ include "hort-server.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: scrub
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "scrub"
+                {{- if .Values.scheduledTasks.scrub.samplingRate }}
+                - "--sample-fraction"
+                - {{ .Values.scheduledTasks.scrub.samplingRate | quote }}
+                {{- end }}
+                {{- if .Values.scheduledTasks.scrub.concurrency }}
+                - "--concurrency"
+                - {{ .Values.scheduledTasks.scrub.concurrency | quote }}
+                {{- end }}
+              env:
+                {{- include "hort-server.runtimeEnv" . | nindent 16 }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if eq .Values.storage.backend "filesystem" }}
+                - name: data
+                  mountPath: /var/lib/hort-server/cas
+                  # Read-only mount: the scrub re-hashes blobs but
+                  # never writes. The application-layer state
+                  # transition under `tombstone` mode lands in
+                  # Postgres via `ArtifactLifecyclePort`, not in CAS.
+                  readOnly: true
+                {{- end }}
+                {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+                {{- /* Backlog 078 Item 7 — gate the mount on the
+                       auto-mount source (configMapName/secretName), NOT
+                       on `.path` alone: with `.path` set but no source the
+                       volume below never rendered, leaving a dangling
+                       volumeMount that fails pod admission. */}}
+                {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
+                {{- end }}
+                {{- with .Values.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- if eq .Values.storage.backend "filesystem" }}
+            - name: data
+              {{- if .Values.storage.filesystem.pvc.enabled }}
+              persistentVolumeClaim:
+                claimName: {{ include "hort-server.pvcName" . }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+            {{- end }}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

@@ -1,0 +1,75 @@
+[package]
+name = "hort-http-pypi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for the PyPI Simple Repository API (PEP 503)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-formats   = { path = "../hort-formats" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+bytes        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+url          = { workspace = true }
+metrics      = { workspace = true }
+thiserror    = { workspace = true }
+# The internal `IndexSource` trait
+# (`crates/hort-http-pypi/src/index_source.rs`) is `pub(crate)` and
+# dispatched dynamically per `RepositoryType` in the unified serve
+# handler. `async-trait` is the lowest-friction way to ship an async
+# trait with dyn-dispatch; the workspace already pins it. Mirrors
+# the npm crate's adoption.
+async-trait  = { workspace = true }
+# JSON+base64 envelope for the simple-index pull-through cache.
+# `base64` is not a workspace dep but is already pulled in transitively
+# at v0.22; pinning a direct entry at the same major keeps the cache
+# module's encoding choice explicit at the crate boundary.
+base64       = "0.22"
+# HTML link rewriting in the simple-index proxy.
+# A regex over `<a ... href="..."...>` avoids dragging in a
+# full HTML parser for what is a tiny, well-formed PEP 503 surface.
+regex        = "1"
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+# Proxy `.metadata` cache-miss-via-pull test fixtures need to construct
+# minimal wheel ZIPs in memory so the ingest hook can extract the
+# `<dist-info>/METADATA` member during pull-through. The wheel-ZIP
+# builder lives in `hort_formats::test_support::build_wheel_zip` so
+# the `zip` direct dep stays bounded to `hort-formats` per
+# `deny.toml`'s wrappers rule for `zip`. The base entry in
+# `[dependencies]` brings in `hort-formats` for production code; this
+# dev-dep override flips on its `test-support` feature for the tests
+# (Cargo's feature unification merges the two).
+hort-formats                  = { path = "../hort-formats", features = ["test-support"] }
+# Test-only: end_to_end_pypi_metrics_verification drives requests through
+# a real FilesystemStorage so the adapter's metric emission actually fires.
+hort-adapters-storage         = { path = "../hort-adapters-storage" }
+# Test-only: this handler test builds an `AppContext` directly and needs
+# the in-memory `EphemeralStore` to populate the `ephemeral` field.
+hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
+metrics-util                = { workspace = true, features = ["debugging"] }
+tempfile                    = "3"
+regex                       = "1"
+sha2                        = { workspace = true }
+tower                       = { workspace = true }
+arc-swap                    = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+# Item 6: tracing-warn capture test for the non-success branches;
+# mirrors the Cargo crate's adoption in 17.1 Item 7.
+tracing-subscriber          = { workspace = true }

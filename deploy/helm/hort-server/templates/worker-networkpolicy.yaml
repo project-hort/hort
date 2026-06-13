@@ -1,0 +1,95 @@
+{{/*
+Additive, worker-scoped NetworkPolicy that admits a Prometheus scraper
+to the worker's /metrics listener.
+
+WHY THIS EXISTS
+  The worker's `GET /metrics` listener (`worker.metrics.enabled`,
+  HORT_WORKER_METRICS_BIND) has NO per-request auth — the worker is a
+  background processor with no inbound-HTTP auth stack, so mounting the
+  server's metrics-auth middleware would drag the whole auth/`AppContext`
+  machinery into the worker. The access control for the scrape port is
+  therefore a NetworkPolicy, not per-request auth (the standard pod-metrics
+  pattern; design `080-...` §3.6). Enabling the listener and its network
+  control are ONE structural action: this policy renders whenever
+  `worker.metrics.enabled` AND `networkPolicy.enabled`, so an operator can
+  never turn on a world-reachable, unauthenticated metrics port by flipping
+  a single knob (the `repository` metric labels carry repo names — a minor
+  info-leak + cardinality surface if exposed).
+
+ADDITIVE — never relaxes any pod's posture
+  Kubernetes NetworkPolicies are purely additive: the effective allow set
+  for a pod is the UNION of every policy selecting it. The default-on
+  server `networkpolicy.yaml` uses a component-agnostic
+  `podSelector` (`hort-server.selectorLabels`, no `component`), so by
+  matchLabels semantics it ALSO selects the worker pods (which add
+  `app.kubernetes.io/component: worker`); with its default-empty `ingress`
+  that is a DENY-ALL-ingress on the worker, so the /metrics port is
+  default-denied today. This policy ADDS only the scrape allowance on top:
+  it selects ONLY the worker pods (`component: worker`) and grants ONE
+  Ingress rule for the configured scrapers on the metrics port. It declares
+  `policyTypes: [Ingress]` only — egress stays governed by the existing
+  server policy that already covers the worker (component-agnostic), so this
+  policy introduces no egress restriction. Selecting `component: worker`
+  here ALSO makes the worker's ingress coverage explicit/robust (no longer
+  relying on the server policy's component-agnostic selector to deny-by-
+  default the worker's ports).
+
+SCRAPE SOURCE — operator-supplied, no guessing, fail-closed when empty
+  `scrapeFrom` is a verbatim list of k8s NetworkPolicyPeer objects (e.g. your
+  Prometheus namespaceSelector / podSelector). The chart does not guess your
+  cluster's monitoring topology — mirrors the F-33 "chart does not guess your
+  CIDRs" rationale. **An EMPTY `scrapeFrom` renders `ingress: []` — genuine
+  deny-all-ingress — NOT a rule with `from: []`.** This is load-bearing: per
+  the k8s NetworkPolicy spec a rule whose `from` is empty/missing matches ALL
+  sources, so `from: []` would FAIL OPEN (port reachable cluster-wide). We
+  therefore render zero rules when no scrapers are declared. Belt-and-braces,
+  `values.schema.json` rejects `worker.metrics.enabled: true` with an empty
+  `scrapeFrom` at apply time, so the listener can never be turned on without
+  declaring exactly who may scrape it.
+
+ESCAPE HATCH PARITY
+  Gated on `.Values.networkPolicy.enabled` (the same F-33 toggle as the
+  app-pod + Job-scoped policies). `networkPolicy.enabled: false` drops THIS
+  policy too — but then the server policy's deny-all is also gone, so the
+  operator owns the worker port's reachability via their own L3/L4 / mesh
+  controls. Enabling the metrics listener under `networkPolicy.enabled:
+  false` is therefore the operator's explicit choice to govern exposure
+  elsewhere.
+*/}}
+{{- if and .Values.worker.enabled .Values.worker.metrics.enabled .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "hort-server.fullname" . }}-worker-metrics
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  # Selects ONLY the worker pods — explicit/robust coverage that does not
+  # rely on the server policy's component-agnostic selector.
+  podSelector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  # Ingress only — egress stays governed by the existing server policy that
+  # already covers the worker.
+  policyTypes:
+    - Ingress
+  {{- if .Values.worker.metrics.scrapeFrom }}
+  # Additive scrape allowance: the configured Prometheus peers reach the
+  # /metrics port (k8s unions this ALLOW over the server policy's deny-all).
+  ingress:
+    - from:
+        {{- toYaml .Values.worker.metrics.scrapeFrom | nindent 8 }}
+      ports:
+        - port: {{ .Values.worker.metrics.port }}
+          protocol: TCP
+  {{- else }}
+  # No scrapers declared → an EMPTY ingress list (`ingress: []`) is genuine
+  # deny-all-ingress. A rule with `from: []` would mean "ALL sources" per the
+  # k8s NetworkPolicy spec (the opposite of intended), so we render zero
+  # rules, not an empty `from`. The schema also rejects enabled-without-
+  # scrapers at apply (values.schema.json), so this branch is defence-in-depth.
+  ingress: []
+  {{- end }}
+{{- end -}}

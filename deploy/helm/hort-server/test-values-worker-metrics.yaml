@@ -1,0 +1,37 @@
+# Worker /metrics scrape endpoint fixture: enabled.
+#
+# worker.metrics.enabled:true must (a) set HORT_WORKER_METRICS_BIND on the
+# worker, (b) expose the named `metrics` containerPort, and (c) — because
+# networkPolicy.enabled defaults true — co-render the additive worker
+# NetworkPolicy (`*-worker-metrics`) that selects component: worker and
+# admits the configured Prometheus peer to the metrics port. A minimal
+# schema-valid base plus the new worker.metrics block.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+worker:
+  enabled: true
+  metrics:
+    enabled: true
+    port: 9090
+    scrapeFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus

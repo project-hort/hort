@@ -1,0 +1,15 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "/tmp/hort-scan-trivy-AAAA",
+  "ArtifactType": "filesystem",
+  "Metadata": {
+    "ImageConfig": {
+      "architecture": "",
+      "created": "0001-01-01T00:00:00Z",
+      "os": "",
+      "rootfs": { "type": "", "diff_ids": null },
+      "config": {}
+    }
+  },
+  "Results": []
+}

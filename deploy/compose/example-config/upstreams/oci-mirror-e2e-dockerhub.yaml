@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  # UpstreamMapping for the `repository_upstream_mappings` table.
+  # Upstream mappings are managed via gitops YAML; they cannot be
+  # written via the admin REST endpoint.
+  name: oci-mirror-e2e-dockerhub
+spec:
+  repository: oci-mirror-e2e
+  pathPrefix: dockerhub/
+  upstreamUrl: https://registry-1.docker.io
+  auth:
+    type: bearer_challenge

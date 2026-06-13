@@ -1,0 +1,27 @@
+# extraCaBundle smoke fixture: path unset (default).
+# Expected rendering:
+#   - HORT_EXTRA_CA_BUNDLE env var absent
+#   - no `extra-ca-bundle` volumeMount or volume
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory
+
+extraCaBundle:
+  path: ""
+  configMapName: ""
