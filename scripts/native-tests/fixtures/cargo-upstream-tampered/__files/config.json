@@ -1,0 +1,4 @@
+{
+  "dl": "http://wiremock-cargo-tampered:8080/crates",
+  "api": "http://wiremock-cargo-tampered:8080"
+}

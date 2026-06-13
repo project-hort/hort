@@ -1,0 +1,46 @@
+version: 2
+
+secret:
+  # Paths to ignore (test files with intentional test credentials)
+  ignored_paths:
+    - "**/tests/**"
+    - "**/test_*.rs"
+    - "**/test-*.sh"
+    - "**/test_fixtures/**"
+    - "scripts/native-tests/**"
+    - "scripts/mesh-e2e/**"
+    - "**/.astro/**"
+
+  # Specific patterns to ignore
+  ignored_matches:
+    # Test RSA keys for unit testing (GCS, CloudFront backends)
+    - name: "Test RSA key for unit tests"
+      match: "BEGIN PRIVATE KEY"
+    - name: "Test RSA key for unit tests"
+      match: "BEGIN RSA PRIVATE KEY"
+    - name: "Test RSA key for unit tests"
+      match: "END PRIVATE KEY"
+
+    # Default test passwords used in examples and unit tests
+    - name: "Default test password"
+      match: "admin123"
+    - name: "Test password in unit tests"
+      match: "secret123"
+    - name: "Test password in unit tests"
+      match: "password123"
+    - name: "Test secret in unit tests"
+      match: "test-secret"
+    - name: "Test key in unit tests"
+      match: "test-key"
+    - name: "Test API key in unit tests"
+      match: "test-api-key"
+    - name: "Test webhook secret in unit tests"
+      match: "my-secret-key"
+
+    # GCS test service account
+    - name: "Test GCS service account email"
+      match: "iam.gserviceaccount.com"
+
+    # Astro build cache hashes
+    - name: "Astro build cache"
+      match: "data-store.json"

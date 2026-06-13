@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------------------
+# `measurement-tools` — outside-workspace status
+# ---------------------------------------------------------------------------
+#
+# This crate lives under `tools/` and is **not** a workspace member. It is a
+# throwaway one-off calibrator for per-format metadata caps, and its presence
+# in the workspace would otherwise pull a CLI/HTTP-scraping dependency surface
+# (clap, reqwest, tracing-subscriber, chrono, anyhow) into the production
+# lock and lint profile for no production value.
+#
+# Workspace status:
+#   - The workspace root excludes `tools/*` (`exclude = ["backend",
+#     "tools/*"]`), so cargo will not auto-detect this `Cargo.toml` as a
+#     member.
+#   - Path deps reach back into the workspace via `../../crates/<name>` —
+#     the production crates are unmodified by this move.
+#   - This crate cannot use `workspace = true` for `[package]` fields,
+#     `[dependencies]`, or `[lints]`: those references resolve only inside
+#     the workspace and must be inlined here.
+#
+# `reqwest::Client::builder()` mandate (ADR 0010) — formal inapplicability:
+#   The rule that every adapter opening TLS must build via
+#   `reqwest::Client::builder()` (so the composition root can layer
+#   `apply_to_reqwest_builder` onto it) is **scoped to production adapters
+#   in `crates/`**. This crate is:
+#     (a) not in the workspace,
+#     (b) not loaded by `hort-server`'s composition root,
+#     (c) not exposed to operator-controlled TLS configuration
+#         (no `HORT_EXTRA_CA_BUNDLE` plumbing, no proxy plumbing),
+#     (d) operated by an engineer running it manually against public
+#         registries (`pypi.org`, `crates.io`, `registry.npmjs.org`) for a
+#         one-off measurement.
+#   So `reqwest::Client::new()` is permitted here. If the binary is ever
+#   modified to call into internal-network registries, or if any code in
+#   `crates/` ever depends on it, this exemption is void and the call must
+#   migrate to `reqwest::Client::builder()` plus `apply_to_reqwest_builder`.
+#
+# Promotion-back-into-the-workspace guidance:
+#   If a future change requires this crate to be re-promoted (e.g. it
+#   becomes part of an automated calibration pipeline or its results gate a
+#   CI check), the promotion checklist is:
+#     1. Move the directory back under `crates/` (or add `tools/<name>` to
+#        the workspace `members = [...]` list and narrow the `tools/*`
+#        exclude — pick whichever the workspace policy of the day prefers).
+#     2. Switch path deps back to `../<crate>` (single `..`).
+#     3. Restore `version.workspace = true`, `edition.workspace = true`,
+#        `license.workspace = true` on `[package]`.
+#     4. Restore `[lints] workspace = true` and convert each
+#        `[dependencies]` entry back to `{ workspace = true }`.
+#     5. Audit every `reqwest::Client::new()` call site and convert to
+#        `reqwest::Client::builder()` (ADR 0010); wire the result through
+#        `apply_to_reqwest_builder` from `hort-net-egress`.
+#     6. Add the crate to the `cargo audit` / coverage gates as appropriate
+#        for its tier.
+# ---------------------------------------------------------------------------
+
+# Empty `[workspace]` table — required by cargo to mark this manifest as
+# the root of its own (single-crate) workspace. Without it, cargo walks up
+# to the parent `Cargo.toml`, sees that this directory is excluded via
+# `tools/*`, and refuses to build with: "current package believes it's in
+# a workspace when it's not". The empty table is the documented escape
+# hatch from the cargo error message itself; it does not pull in any of
+# the parent workspace's members, lints, or dep tables.
+[workspace]
+
+[package]
+name = "measurement-tools"
+version = "2.0.0-rc.10"
+edition = "2021"
+license = "MIT"
+description = "Throwaway measurement tool — calibrates per-format metadata caps. NOT a production crate."
+publish = false
+
+[[bin]]
+name = "measure-metadata-sizes"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse the real handler code path where it's relevant (name normalisation,
+# format_key, expected_max_bytes). The extraction logic itself is reimplemented
+# minimally because the v2 ingest handlers operate on raw request bodies
+# (multipart/JSON/tarball) rather than on upstream registry JSON — see the
+# methodology section of the output doc for details.
+hort-domain  = { path = "../../crates/hort-domain" }
+hort-formats = { path = "../../crates/hort-formats" }
+
+# Versions inlined from the workspace `[workspace.dependencies]` table.
+# They are intentionally not kept in lockstep with the workspace — this is
+# a throwaway binary; if a future change re-promotes it, restore
+# `{ workspace = true }` per the promotion-back checklist above.
+tokio              = { version = "1.50", features = ["full"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls-native-roots"] }
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+clap               = { version = "4.5", features = ["derive", "env"] }
+anyhow             = "1.0"
+chrono             = { version = "0.4", features = ["serde"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }

@@ -1,0 +1,15 @@
+{
+  "info": {
+    "name": "shady",
+    "version": "1.0"
+  },
+  "urls": [
+    {
+      "filename": "shady-1.0-py3-none-any.whl",
+      "url": "http://example.com/packages/shady-1.0-py3-none-any.whl",
+      "digests": {
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    }
+  ]
+}

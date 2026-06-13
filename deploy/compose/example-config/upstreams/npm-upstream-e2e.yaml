@@ -1,0 +1,27 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  # UpstreamMapping for the `repository_upstream_mappings` row that
+  # crates/hort-http-npm/src/upstream_pull.rs::try_upstream_packument_pull
+  # resolves via UpstreamResolver. npm uses a registry-wide upstream
+  # per repo (no path-prefix routing), mirroring PyPI/Cargo's catch-all
+  # mapping rather than OCI's multi-namespace split.
+  name: npm-upstream-e2e
+spec:
+  repository: npm-upstream-e2e
+  # Empty pathPrefix → catch-all single-upstream mapping. The npm
+  # orchestrator passes "" as the prefix on every resolve() call.
+  pathPrefix: ""
+  # Wiremock service hostname inside the v2 compose network. Serves
+  # the synthesised packument; the tarball leg follows the absolute
+  # URL embedded in dist.tarball (pre-rewritten to point at this same
+  # host in the wiremock fixture).
+  upstreamUrl: http://wiremock-npm-upstream:8080
+  # Explicit opt-in to a plaintext upstream. The wiremock sidecar runs
+  # HTTP-only inside the compose network; production upstreams MUST be
+  # https and this flag MUST be omitted. Every fetch through this
+  # mapping emits a WARN line and ticks
+  # hort_upstream_insecure_total{format="npm", reason="scheme_http"}.
+  insecureUpstreamUrl: true
+  auth:
+    type: anonymous

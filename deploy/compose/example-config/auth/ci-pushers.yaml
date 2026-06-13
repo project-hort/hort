@@ -1,0 +1,19 @@
+# ClaimMapping (e2e fan-out): IdP group `test-developers` ALSO
+# resolves to the `ci-pusher` scope claim, so a `test-developers`
+# member's resolved claim set is [developer, ci-pusher] — the two-claim
+# subject required by the dev-*-e2e grants in this directory.
+#
+# TEST-HARNESS CONTRIVANCE: in production the role claim (`developer`)
+# and the push-scope claim (`ci-pusher`) come from two DIFFERENT IdP
+# groups, so no single group's administrator can unilaterally confer
+# write (fan-out from one group provides no real defense-in-depth). The
+# e2e Keycloak realm defines only one developer group, so both claims
+# are mapped from it; the additive-claims grant shape is identical
+# either way.
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: ci-pushers
+spec:
+  idpGroup: test-developers
+  claim: ci-pusher

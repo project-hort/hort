@@ -1,0 +1,210 @@
+# cargo-deny configuration.
+#
+# Enforces:
+# - RUSTSEC advisory floor (mirrors `.cargo/audit.toml` ignore list).
+# - Banned crates: `openssl-sys`, `native-tls` (both replaced by rustls
+#   stack), `wasmtime` / `wasmtime-wasi` (paused until the WASM
+#   format-module host is introduced).
+# - License allowlist (permissive only — GPL/AGPL/SSPL family denied).
+# - Source pinning: only crates.io and an explicit allowlist of git
+#   repositories may be pulled in.
+#
+# CI consumers:
+# - `.gitlab-ci.yml` security stage runs `cargo deny check` on every push/MR.
+# - `.github/workflows/ci.yml` security-audit job mirrors the gate.
+# - `.github/workflows/release.yml` adds an SBOM artefact via cargo-cyclonedx.
+
+# ---------------------------------------------------------------------------
+# Graph — which targets cargo-deny resolves against.
+# ---------------------------------------------------------------------------
+[graph]
+# Production targets we ship binaries for. Matches the matrix in
+# `.github/workflows/release.yml`. wasm32 is intentionally absent — the
+# rewrite has no first-party wasm32 build today; format-module wasm
+# binaries are produced by their own toolchains and not part of this
+# workspace's resolution.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-gnu" },
+]
+# The workspace is the only resolution root
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ===========================================================================
+# [advisories] — RUSTSEC database + ignore list
+# ===========================================================================
+#
+# IMPORTANT: every ID here MUST also appear in `.cargo/audit.toml` so
+# `cargo audit` and `cargo deny check advisories` agree. The single
+# source of truth is `.cargo/audit.toml`; this list is kept in sync by
+# `scripts/check-advisory-sync.sh`, run on every CI push. Manual edits
+# to either file in isolation break CI.
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# Mirrors `.cargo/audit.toml`. Rationale per ID is duplicated there for
+# the cargo-audit consumer; keeping the comment terse here avoids drift.
+ignore = [
+    # rsa 0.9.10 — Marvin Attack timing sidechannel on RSA *private-key*
+    # ops. Enters the active graph via sigstore→openidconnect (in
+    # hort-worker). hort uses sigstore only for OFFLINE signature
+    # VERIFICATION (public-key RS256) and holds no RSA private key, so the
+    # private-key timing leak is unreachable. No patched rsa exists. See
+    # `.cargo/audit.toml` for the full rationale.
+    "RUSTSEC-2023-0071",
+
+    # lru 0.12.5 — `IterMut` Stacked-Borrows unsoundness. hort-app uses
+    # only `get`/`put`/`push` in `pat_cache`; never constructs an
+    # `IterMut`. See `.cargo/audit.toml` for the full rationale.
+    "RUSTSEC-2026-0002",
+
+    # rand 0.8.5 — unsound only when a custom log::Log impl calls
+    # rand::thread_rng(). We install no custom logger.
+    "RUSTSEC-2026-0097",
+
+    # rustls-pemfile — unmaintained shim around `rustls-pki-types::pem`.
+    # Only path is dev-dep `axum-server` for the mTLS / pinning test
+    # servers; production migrated to `PemObject`.
+    "RUSTSEC-2025-0134",
+]
+
+# ===========================================================================
+# [licenses] — permissive-only allowlist
+# ===========================================================================
+[licenses]
+# SPDX expressions evaluated against an allowlist; anything not on this
+# list (or matched by an explicit exception) fails the check. Keep the
+# list short — every addition expands the legal review surface.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    # SPDX 3.20+ folded the previous Unicode-* identifiers into a
+    # single Unicode-3.0 expression. Modern unicode-ident crates ship
+    # this; both must be allowed during the migration window.
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    # CDLA-Permissive-2.0 is the Linux Foundation's permissive data
+    # licence used by `webpki-roots` (Mozilla CA root certificate
+    # bundle, transitively pulled in by sqlx + reqwest's rustls
+    # paths). It's a permissive, attribution-style licence and the
+    # data-bundle case is exactly what it was authored for.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+# Per-crate license overrides go here. Empty by default — populate only
+# when a crate ships a non-allowlisted but acceptable license (e.g. a
+# stdlib-derived component with custom phrasing). Each addition is a
+# legal-review checkpoint.
+exceptions = []
+
+# Workspace crates are MIT (`workspace.package.license = "MIT"`); the
+# `private` block below short-circuits the check for them.
+[licenses.private]
+ignore = true
+
+# ===========================================================================
+# [bans] — explicit deny list + multi-version policy
+# ===========================================================================
+[bans]
+# Duplicate-version warnings are noisy and rarely actionable in the
+# Rust ecosystem (proc-macro vs runtime `syn` is the canonical example);
+# warn so the report surfaces the issue without blocking CI.
+multiple-versions = "warn"
+# `*` version requirements are a supply-chain hazard — they accept
+# breaking releases unconditionally. We `warn` rather than `deny`
+# because the workspace uses `path = "../crate"` for cross-crate
+# references, which cargo-deny classifies as wildcards: the
+# `allow-wildcard-paths` exception only applies to crates with
+# `publish = false`, and the rewrite crates do not yet declare it.
+# (Real wildcard version requirements would still surface as warnings
+# in the report.)
+wildcards = "warn"
+# Highlight any crate whose only path into the dep tree is via an old
+# version of `cargo` itself; almost always indicates an outdated
+# transitive dep.
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# Crates we explicitly allow as direct deps (empty — relying on the
+# workspace `Cargo.toml` as the source of truth for what's pulled in).
+allow = []
+
+deny = [
+    # ---- TLS stack ---------------------------------------------------
+    # We deliberately use `rustls` end-to-end (sqlx feature
+    # `tls-rustls`, reqwest with `rustls-tls-native-roots`,
+    # object_store via reqwest). Pulling in `openssl-sys` or
+    # `native-tls` re-introduces a C-library FFI surface and a parallel
+    # certificate-verifier path — both of which the project's TLS policy
+    # explicitly rejects. If a new crate brings either back
+    # transitively, fail the build and force the reviewer to switch
+    # features or replace the dep.
+    { crate = "openssl-sys", reason = "rustls is the project-wide TLS stack; openssl FFI is forbidden" },
+    { crate = "native-tls",  reason = "rustls is the project-wide TLS stack; native-tls is forbidden" },
+
+    # ---- WASM host (paused) ------------------------------------------
+    # The WASM format-module host is paused until it is introduced on a
+    # current toolchain (>= 37.x for RUSTSEC-2026-0096). When that work
+    # starts, both entries are removed in the same change.
+    { crate = "wasmtime",      reason = "paused until the WASM format-module host is introduced" },
+    { crate = "wasmtime-wasi", reason = "paused until the WASM format-module host is introduced" },
+
+    # ---- Archive crates ----------------------------------------------
+    # Decompression-bomb defences (output bytes / entry count / nesting
+    # caps) live in `crates/hort-formats/src/archive_bounds.rs`. Every
+    # archive metadata extractor MUST go through that helper. Direct
+    # use of `tar`, `zip`, `flate2`, `bzip2`, `xz2` outside `hort-formats`
+    # bypasses the helper and re-opens the M-7 attack surface — clippy
+    # has no path-scoped "direct dep use" lint and grep is bypassable,
+    # so cargo-deny `wrappers` is the enforcement point. The helper
+    # crate (`hort-formats`) is the only allowed direct consumer; any
+    # transitive consumer (e.g. `flate2` via `tower-http` →
+    # `async-compression` → `compression-codecs` for HTTP-level
+    # response compression) is also permitted because it is unrelated
+    # to archive metadata extraction.
+    #
+    # A verification pass confirmed zero archive-extraction call sites
+    # outside the helper; this is preventive.
+    { crate = "tar",    wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
+    { crate = "zip",    wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
+    { crate = "flate2", wrappers = ["hort-formats", "compression-codecs", "zip"], reason = "gzip metadata parsers must go through hort-formats::archive_bounds; compression-codecs wrapper covers the transitive HTTP-compression path via tower-http; zip is itself locked to hort-formats so zip→flate2 is within the controlled chain" },
+    { crate = "bzip2",  wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
+    { crate = "xz2",    wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
+]
+
+# Duplicates we tolerate without a `multiple-versions` warning. Empty for
+# now; populate when a duplicate is unavoidable upstream and we have a
+# tracking issue for the resolution window.
+skip = []
+skip-tree = []
+
+# ===========================================================================
+# [sources] — registry / git pinning
+# ===========================================================================
+[sources]
+# Only crates.io and the explicit git allowlist below may contribute
+# crates to the dependency graph. Anything else (a private registry, a
+# new git host) must be added here in a reviewed change.
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+# Empty — no first-party git deps in the workspace today. Add only with
+# a recorded justification (and prefer to publish the dep to crates.io).
+allow-git        = []

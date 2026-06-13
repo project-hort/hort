@@ -1,0 +1,43 @@
+[package]
+name = "hort-adapters-kubernetes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort Kubernetes outbound adapter — manages Secret resources for fallback PAT rotation (ADR 0018)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+
+base64        = "0.22"
+chrono        = { workspace = true }
+futures       = { workspace = true }
+k8s-openapi   = { workspace = true }
+kube          = { workspace = true }
+# kube ⇒ hyper-rustls ⇒ rustls 0.23+ requires
+# the process-level CryptoProvider to be installed BEFORE the first TLS
+# handshake. Codebase pattern (mirrors hort-adapters-oidc and
+# hort-adapters-upstream-http) is to call
+# `rustls::crypto::aws_lc_rs::default_provider().install_default()` from
+# the adapter constructor — idempotent, safe to call from multiple
+# adapters in the same process. Direct dep so the call site type-checks.
+rustls        = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+tracing       = { workspace = true }
+uuid          = { workspace = true }
+zeroize       = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+
+[features]
+# Marker feature for kind-cluster e2e tests (`cargo test
+# -p hort-adapters-kubernetes --features kind-cluster -- --ignored`).
+# Today the feature gates no extra deps — the `#[ignore]` attribute
+# already keeps the heavy tests out of the default run. Reserved for
+# future kind-helpers (e.g. `kube::Client::try_default` with a
+# kubeconfig pointing at the e2e cluster).
+kind-cluster = []

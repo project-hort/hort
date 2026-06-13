@@ -1,0 +1,67 @@
+[package]
+name = "hort-notifier-webhook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort webhook EventNotifier adapter — best-effort HMAC-signed POSTs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Outbound port traits + value types this adapter implements.
+hort-domain     = { path = "../hort-domain" }
+# SSRF predicate (`is_routable`) at the create-time guard.
+hort-net-egress = { path = "../hort-net-egress" }
+# Composition hands the trust bundle through; mirrors the upstream-http
+# pattern.
+hort-config     = { path = "../hort-config" }
+# Use-case error classification helpers — match upstream-http /
+# advisory-osv pattern (`UpstreamErrorKind::CaUnknown`).
+hort-app        = { path = "../hort-app" }
+
+# HTTP client with rustls-tls-native-roots; explicit dep so the
+# `Client::builder` TLS discipline (ADR 0010) applies here.
+reqwest    = { workspace = true }
+url        = { workspace = true }
+chrono     = { workspace = true }
+uuid       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Async runtime + DNS lookup. `tokio::net::lookup_host` at the
+# create-time SSRF check AND inside the connect-time guarded resolver
+# (DNS-rebinding TOCTOU guard — see `dns_guard` module); no other tokio surface beyond the timeout.
+tokio = { workspace = true }
+
+# CIDR / host parsing for the `HORT_WEBHOOK_ALLOWLIST_HOSTS` allowlist
+# (`HORT_WEBHOOK_ALLOWLIST_HOSTS` connect-time bypass list). Webhook-scoped:
+# this allowlist is consumed ONLY by the connect-time guarded resolver bound
+# to the webhook `reqwest::Client` — it is never threaded to the
+# upstream-http / S3 / OIDC clients (those stay operator-vetted by
+# deployment configuration, not this allowlist).
+ipnet = { workspace = true }
+
+# HMAC-SHA256 for `X-Hort-Signature`.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+# Lowercase hex encoding of the HMAC signature.
+hex  = { workspace = true }
+
+# Structured logging — the adapter does not emit a metric directly (the
+# dispatcher owns `hort_notify_delivery_*` per design doc §12; cardinality
+# discipline). Tracing spans are optional but kept available so a
+# future warn! on delivery failure (without the URL — design §11 audit
+# row) can be wired without a Cargo.toml change.
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+# Real local HTTP server for delivery-semantics tests.
+wiremock = "0.6"
+# Hex-decoded HMAC verification in tests.
+hex = { workspace = true }
+# Same fixture pattern as upstream-http / advisory-osv: generate a
+# self-signed root in-process for the extra-CA regression test, no
+# committed PEM fixtures.
+rcgen = "0.13"

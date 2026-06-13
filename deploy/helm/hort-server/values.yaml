@@ -1,0 +1,1560 @@
+# =============================================================================
+# hort-server Helm chart — values
+# =============================================================================
+# Every key below maps to one or more `HORT_*` (or auxiliary) environment
+# variables documented in `crates/hort-server/src/config.rs`. The doc-comments
+# here are deliberately short pointers; the canonical rationale lives in
+# `config.rs` and the operator how-tos under
+# `docs/architecture/how-to/deploy/`.
+#
+# Cross-field validation is enforced by `values.schema.json` at
+# `helm install` time.
+# =============================================================================
+
+# -------------------- Image --------------------
+# Container image for the hort-server binary. The chart does not enforce
+# image signatures; consumers (Kyverno, sigstore policy-controller,
+# Connaisseur) verify against `image.cosign.publicKey` if set.
+image:
+  # ${REGISTRY}/${IMAGE_PREFIX}/hort-server is the publish target produced
+  # by the GitLab pipeline; operators override at install time.
+  repository: hort/hort-server
+  # "" ⇒ Chart.appVersion (resolved in `_helpers.tpl`).
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+  cosign:
+    # PEM-encoded public key the deploy-time policy controller verifies
+    # the image signature against. The chart does not enforce signatures
+    # itself — admission control is the policy controller's job.
+    publicKey: ""
+
+# -------------------- Replicas --------------------
+# replicaCount > 1 forces:
+#   - storage.backend == "s3" (RWO PVC cannot multi-attach)
+#   - ephemeralStore.backend == "redis" (multi-node requires shared ephemeral state)
+# `values.schema.json` blocks the inconsistent middle states.
+replicaCount: 1
+
+# -------------------- Public surface --------------------
+# HORT_PUBLIC_BASE_URL — the canonical https URL the operator's edge
+# terminates as. MUST match `^https?://.+`. Required.
+publicBaseUrl: ""
+
+# -------------------- API listener --------------------
+# Backlog 078 Item 10 (chart N3) — the API bind key now follows the
+# `<subsystem>.bindAddr` shape shared by `metrics.bindAddr` and
+# `control.bindAddr` (the pre-078 top-level `apiBindAddr` is retired —
+# HARD rename, no alias). The env var it maps to (`HORT_API_BIND`) is
+# unchanged.
+api:
+  # HORT_API_BIND — bind address for the main API listener. Mirrors the
+  # explicit-address shape of `metrics.bindAddr`: one value, one mental
+  # model, no chart-side default-flip code path.
+  # Examples:
+  #   "0.0.0.0:8080"  (chart default) — all interfaces; kubelet pod-IP
+  #                                     probes need this on most clusters
+  #   "127.0.0.1:8080"                — loopback only; useful when an
+  #                                     in-pod sidecar proxies the binary
+  # A non-default port (e.g. "0.0.0.0:9080") also works; remember to
+  # raise `service.httpPort` to match.
+  bindAddr: "0.0.0.0:8080"
+
+# HORT_REQUIRE_HTTPS — when `true`, the binary refuses to start unless
+# `publicBaseUrl` is `https://...` OR `trustedProxyCidrs` is non-empty
+# (operator wired a TLS-terminating reverse proxy). Disable only if
+# plaintext is intentional.
+requireHttps: true
+
+# HORT_TRUSTED_PROXY_CIDRS — list of CIDRs the binary trusts
+# X-Forwarded-* headers from (gates the requireHttps + HSTS path).
+# Set to your edge's pod / service / LB CIDRs. Empty = no trust,
+# X-Forwarded-* ignored. Example: ["10.244.0.0/16", "::1/128"]
+trustedProxyCidrs: []
+
+# -------------------- Authentication --------------------
+# Note: `auth.provider` gates the main API; `metrics.requireAuth` gates
+# the /metrics endpoint independently. Disabling one does not affect
+# the other — operators set both to align with their threat model.
+auth:
+  # HORT_AUTH_PROVIDER — `oidc` (default) | `disabled`.
+  #
+  # `oidc` is the recommended production setting: full OIDC IdP +
+  # optional native tokens.
+  #
+  # `disabled` skips OIDC entirely. The runtime boot gate
+  # (`ensure_auth_enabled`) requires `nativeTokens.enabled: true` to
+  # be set alongside it — there must be at least one inbound auth
+  # surface — and `disabled + nativeTokens=false` is rejected at
+  # boot. Under `disabled` the inbound identity surface is the
+  # native-token validator only (PAT / `hort_svc_*` / `hort_cli_*`); HTTP
+  # Basic is accepted as a token *carrier* (the password field
+  # carries a native token; the username field is ignored) but never
+  # as an identity source. Minimal-setup bring-up recipe:
+  #
+  #   1. helm install / upgrade with provider=disabled +
+  #      nativeTokens.enabled=true (plus the signingKey secret).
+  #   2. Issue a service-account token from inside the pod:
+  #          kubectl exec -it <pod> -- hort-server admin issue-svc-token \
+  #              --username admin --role developer
+  #      Copy the printed `hort_svc_*` token; it is shown once.
+  #   3. Configure hort-cli on the operator's workstation:
+  #          hort-cli auth login --paste
+  #      (paste the `hort_svc_*` token at the prompt).
+  #
+  # The prior `basic` provider and the `admin bootstrap` CLI are retired —
+  # the HTTP-Basic-against-local-admin-row identity path is gone
+  # end-to-end.
+  provider: oidc
+  oidc:
+    # HORT_OIDC_ISSUER_URL — required when provider = oidc.
+    issuerUrl: ""
+    # HORT_OIDC_AUDIENCE — required when provider = oidc. The audience claim
+    # (`aud`) the binary expects in incoming tokens.
+    audience: ""
+    # HORT_OIDC_GROUPS_CLAIM — claim path the binary reads RBAC group
+    # membership from. Defaults to `groups`.
+    groupsClaim: "groups"
+    # HORT_JWKS_CACHE_TTL_SECS — JWKS refresh interval. Default 600.
+    jwksCacheTtlSeconds: 600
+  # tokenExchange — gates both `POST /api/v1/auth/exchange` (RFC 8693)
+  # and the anonymous discovery
+  # doc at `GET /.well-known/hort-client-config`. Off → both routes 404
+  # (matching the `HORT_NATIVE_TOKENS_ENABLED=false` pattern). Turn on when
+  # an `hort-cli` is in use; the CLI auto-detects via the discovery doc
+  # and falls back to paste-token login when absent.
+  #
+  # When enabled, the binary fail-closes at boot if any of:
+  #   - `auth.provider != oidc` (the exchange port federates to an IdP)
+  #   - `auth.oidc.issuerUrl` is empty
+  #   - `auth.tokenExchange.cliClientId` is empty
+  #   - `publicBaseUrl` is empty
+  tokenExchange:
+    # HORT_TOKEN_EXCHANGE_ENABLED — default false. Off → 404 on both
+    # `/api/v1/auth/exchange` and `/.well-known/hort-client-config`.
+    enabled: false
+    # HORT_OIDC_CLI_CLIENT_ID — the public OIDC client ID the CLI runs the
+    # RFC 8628 device-code flow against. Published in the discovery doc
+    # as `idp.client_id`. Required when `tokenExchange.enabled = true`;
+    # ignored otherwise. Example: "hort-cli".
+    cliClientId: ""
+  # nativeTokens — gates the validator for `hort_(pat|svc|cli)_*`
+  # PAT-shape tokens AND the OCI Distribution
+  # `/v2/auth` JWT-minting path. Off → no native-token validation; PAT-
+  # shape tokens fall through to the OIDC validator and 401.
+  #
+  # **MUST be `enabled: true` whenever `tokenExchange.enabled = true`** —
+  # the exchange endpoint mints `hort_cli_*` tokens, and without
+  # nativeTokens.enabled the validator is unwired and the minted tokens
+  # 401 on every subsequent call. The values.schema.json install-block
+  # rule enforces this; the binary additionally boot-fails on the same
+  # combination (`ConfigError::TokenExchangeRequiresNativeTokens`).
+  #
+  # Required when enabled:
+  #   - `signingKey.existingSecret` — Kubernetes Secret holding the
+  #     ed25519 OCI token-signing private key under `secretKey`. The
+  #     server reads this via `HORT_OCI_TOKEN_SIGNING_KEY` (inline secret).
+  #   - `signingKey.secretKey` — the key inside the Secret (default
+  #     `hort-oci-token-signing-key.pem`).
+  #
+  # Optional rotation:
+  #   - `signingKey.prevExistingSecret` + `signingKey.prevSecretKey` —
+  #     the previous active key, served from the JWKS during a rotation
+  #     window so in-flight tokens minted under the old key still
+  #     validate. Leave empty when not rotating.
+  nativeTokens:
+    # HORT_NATIVE_TOKENS_ENABLED — default false. Required true when
+    # `tokenExchange.enabled = true`.
+    enabled: false
+    signingKey:
+      # Kubernetes Secret holding the OCI token signing key. Created
+      # out-of-band by the operator (the chart does not generate it):
+      #   kubectl create secret generic hort-oci-signing-key \
+      #     --from-file=hort-oci-token-signing-key.pem=path/to/ed25519.pem
+      existingSecret: ""
+      secretKey: "hort-oci-token-signing-key.pem"
+      # Optional previous key (rotation window). Leave both empty when
+      # not rotating.
+      prevExistingSecret: ""
+      prevSecretKey: "hort-oci-token-signing-key-prev.pem"
+
+# -------------------- HTTP transport --------------------
+http:
+  # HORT_HTTP_REQUEST_TIMEOUT_SECS — default 300.
+  # See `docs/architecture/how-to/http-transport-timeouts.md`.
+  requestTimeoutSeconds: 300
+  # HORT_HTTP_HEADER_READ_TIMEOUT_SECS — default 15.
+  headerReadTimeoutSeconds: 15
+  # HORT_MAX_INFLIGHT — global concurrent
+  # request cap. 0 ⇒ binary default (512). Override only when raising
+  # the cap; lowering rarely makes sense.
+  maxInflight: 0
+  # HORT_MAX_INFLIGHT_PER_IP — per-source-IP concurrent cap. 0 ⇒ binary
+  # default (32). Operators behind a reverse proxy that collapses
+  # client IPs typically raise this.
+  maxInflightPerIp: 0
+  # HORT_PUBLISH_BODY_MAX_SIZE —
+  # A human-readable SIZE string ("300Mi", "1Gi", "512Mi") — quote it.
+  # Empty ⇒ env var unset ⇒ binary default (300 MiB). An explicit "0"
+  # is the refuse-all-publishes kill-switch. Override when publishing
+  # artifacts larger than 300 MiB. Strings (not bare integers) so a
+  # multi-GiB value can never round-trip through Helm's float64
+  # coercion into scientific notation (the rc.3 boot-crash class).
+  publishBodyMaxSize: ""
+
+# -------------------- Upstream proxy --------------------
+# Configurable storage backstops on the streaming upstream fetch path.
+# Each cap bounds the per-fetch on-disk write; a trip emits a structured
+# 502 with `bytes_read` + `cap` and the
+# `result=<metadata|manifest|version_object>_too_large` metric label.
+#
+# Values are human-readable size STRINGS — `64Mi`, `1Gi`, `512Ki`,
+# decimal `64M`, or a bare byte integer. Quote them. (Strings, not bare
+# numbers, so a multi-GiB value can never round-trip through Helm's
+# float64 coercion into scientific notation, which the binary's parser
+# rejects at boot.)
+upstream:
+  # HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE — default 64Mi. Caps the
+  # streamed write on `fetch_metadata` (npm packument, PyPI JSON, Cargo
+  # sparse-index). Today's largest known packument is `@types/node` at
+  # ~50 MiB; 64Mi gives ~28% headroom. Raise only if a legitimate
+  # packument tail outgrows the default.
+  metadataCacheMaxSize: "64Mi"
+  # HORT_UPSTREAM_MANIFEST_CACHE_MAX_SIZE — default 16Mi. Plain image
+  # manifest ~1 KB, image index ~5 KB, cosign / notary attached
+  # signatures ~200 KB realistic ceiling; the headroom absorbs
+  # edge-case attestation documents.
+  manifestCacheMaxSize: "16Mi"
+  # HORT_UPSTREAM_PROJECTOR_VERSION_OBJECT_MAX_SIZE — default 2Mi.
+  # Per-version-object cap inside the streaming JSON projector (npm
+  # `versions{}` value, PyPI `files[]` entry); the observed
+  # `@mui/icons-material` max is 1.37 MB.
+  projectorVersionObjectMaxSize: "2Mi"
+  # HORT_UPSTREAM_USER_AGENT — outbound `User-Agent` for upstream
+  # pull-through fetches (blob / manifest / metadata / referrers), applied by
+  # BOTH hort-server and the worker. Empty (the default) → the binary's
+  # built-in `hort/<version> (+project-url)`. A non-empty UA is required by
+  # some registries (crates.io returns 403 to requests without one) and
+  # others rate-limit anonymous clients harder; set this to add operator
+  # contact info, e.g. "hort/1.0 (ops@example.com)". One value for the whole
+  # deployment. Must be a valid HTTP header value — no control characters
+  # (the values.schema.json pattern rejects them at `helm install`/lint, and
+  # `hort-server validate-config` lints it offline); an invalid value is
+  # ignored by the binary, which falls back to the built-in default.
+  userAgent: ""
+
+# -------------------- Metrics --------------------
+# /metrics is always served by the binary. The chart controls WHERE:
+# - `bindAddr` non-empty → dedicated listener on that address. The
+#   main 8080 router has no /metrics route. Container + Service ports
+#   for `metricsPort` are exposed.
+# - `bindAddr` empty → /metrics mounted on the main 8080 router under
+#   `requireAuth`. No separate listener; metrics container/Service
+#   ports skipped.
+metrics:
+  # HORT_METRICS_BIND — bind address for the dedicated /metrics listener
+  # inside the pod. Examples:
+  #   "127.0.0.1:9090" (default) — loopback only; sidecar-scrape pattern
+  #   "0.0.0.0:9090"             — all interfaces; needs allowUnspecifiedBind: true
+  #   ""                         — /metrics on main router (dev mode)
+  bindAddr: "127.0.0.1:9090"
+  # HORT_METRICS_PUBLIC_BIND — required when `bindAddr` binds to
+  # `0.0.0.0` or `::`. The binary refuses to start with an unspecified
+  # bind unless this opt-in is true. Operators wiring an explicit pod-
+  # level bind ALSO take responsibility for restricting reachability via
+  # NetworkPolicy / ingress rules.
+  allowUnspecifiedBind: false
+  # HORT_METRICS_REQUIRE_AUTH — default true.
+  # Setting false emits a prominent NOTES.txt warning post-install.
+  # Note: this is independent of `auth.provider` — that one gates the
+  # main API; this one gates /metrics. Set both to match your threat
+  # model.
+  requireAuth: true
+  serviceMonitor:
+    # When true, renders `templates/servicemonitor.yaml`. Requires the
+    # Prometheus Operator CRDs to be installed in the cluster, AND
+    # `bindAddr` to be non-empty (the ServiceMonitor scrapes the
+    # dedicated metrics Service port).
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # "" ⇒ same namespace as the chart release.
+    namespace: ""
+
+# -------------------- Control plane --------------------
+# The internal-only control-plane tier: the /admin API,
+# /api/v1/admin/* admin surfaces, and the /api/v1/subscriptions
+# subscription-MANAGEMENT routes. Operators reasonably assume these are
+# internal, but by default they share the public 8080 listener. Setting
+# `control.bindAddr` moves them onto a dedicated pod-internal listener
+# (mirrors `metrics.bindAddr` exactly) so a NetworkPolicy can restrict
+# them to the operator network without touching the public artifact or
+# token-generation planes.
+#
+# - `bindAddr` empty (default) → control routes stay on the main 8080
+#   router. The token-generation plane (/api/v1/auth/exchange,
+#   /api/v1/auth, OCI /v2/auth) and artifact-pull plane are NEVER moved
+#   here — they are public by requirement (hardened app-side).
+# - `bindAddr` non-empty → dedicated control listener on that address;
+#   the public 8080 router no longer exposes /admin, /api/v1/admin/*,
+#   or subscription management. Container + Service ports for
+#   `controlPort` are exposed and the NetworkPolicy gains a control-port
+#   ingress rule (see `networkPolicy` below).
+#
+# This is DEFENSE-IN-DEPTH on top of — never instead of — the F-3
+# admin authz gate and the F-4/F-21 webhook allowlist. Network position
+# never substitutes for authz. See
+# `docs/architecture/how-to/deploy/control-plane-tiers.md`.
+control:
+  # HORT_CONTROL_BIND — bind address for the dedicated control-plane
+  # listener inside the pod. Examples:
+  #   ""                         (default) — control on main router
+  #   "127.0.0.1:9443"           — loopback only; mesh-sidecar pattern
+  #   "0.0.0.0:9443"             — all interfaces; needs
+  #                                allowUnspecifiedBind: true AND a
+  #                                NetworkPolicy/firewall in front
+  bindAddr: ""
+  # HORT_CONTROL_PUBLIC_BIND — required when `bindAddr` binds to
+  # `0.0.0.0` or `::`. The binary refuses to start with an unspecified
+  # control bind unless this opt-in is true. Operators taking it ALSO
+  # take responsibility for restricting reachability via NetworkPolicy /
+  # ingress.
+  allowUnspecifiedBind: false
+
+# -------------------- OCI --------------------
+oci:
+  # HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS — OCI long-tail upload window.
+  # Default 3600 (60 min). Grouped under `oci.*` alongside the other OCI
+  # surfaces (the pre-078 `http.ociUploadTimeoutSeconds` is retired —
+  # HARD rename, no alias). The env var it maps to is unchanged.
+  uploadTimeoutSeconds: 3600
+  # HORT_OCI_LEGACY_CATALOG_ENABLED — opt-in to the aggregating /v2/_catalog
+  # endpoint. Stays disabled by default; enable only if an external client
+  # explicitly needs it.
+  legacyCatalogEnabled: false
+  # HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL — 0 ⇒ binary default (32). Cap
+  # on concurrent OCI upload sessions per principal.
+  maxSessionsPerPrincipal: 0
+
+# -------------------- Shutdown --------------------
+shutdown:
+  # HORT_SHUTDOWN_GRACE_SECS — default 60.
+  # Worst-case OCI long-tail upload should be < oci.uploadTimeoutSeconds;
+  # if you have raised that, raise this too.
+  gracefulSeconds: 60
+
+# -------------------- Secrets --------------------
+secrets:
+  # HORT_SECRETS_FILE_ROOT — containment root for the mounted-file secret
+  # adapter. Any secret_ref whose canonical path falls outside this root
+  # is rejected (symlink-escape protection). The chart mounts every entry
+  # in `secrets.mounts` below this root.
+  fileRoot: /etc/hort-server/secrets
+  # List of operator-supplied Secret projections. Each entry mounts one
+  # key from a Kubernetes Secret as a file under `secrets.fileRoot`.
+  # Used for upstream credentials and the mTLS / CA / cert-pinning
+  # surface (mtls_cert_ref, mtls_key_ref, ca_bundle_ref,
+  # pinned_cert_sha256).
+  #
+  # See `docs/architecture/how-to/wire-secrets.md`.
+  #
+  # Each entry: { name, secretName, key, path }
+  #   name       — volume name (chart-internal; must be unique)
+  #   secretName — Kubernetes Secret in the same namespace
+  #   key        — key inside the Secret
+  #   path       — relative path under `secrets.fileRoot` (e.g.
+  #                "upstream/dockerhub/password" → mounted at
+  #                /etc/hort-server/secrets/upstream/dockerhub/password)
+  mounts: []
+
+# -------------------- Postgres --------------------
+# External-only Postgres. Two roles:
+#   - admin (DDL): used by the migrations Job at install/upgrade time
+#   - app   (DML): used by the runtime Deployment; INSERT,SELECT only on events
+# Canonical role-grant recipe (incl. ALTER DEFAULT PRIVILEGES) lives in
+# docs/architecture/how-to/deploy/postgres-roles.md.
+postgres:
+  app:
+    # Kubernetes Secret with key `secretKey` containing
+    # postgres://hort_app_role:...@host:5432/db
+    existingSecret: ""
+    secretKey: DATABASE_URL
+  admin:
+    # Kubernetes Secret with key `secretKey` containing
+    # postgres://hort_admin:...@host:5432/db (Job-only; never on Deployment)
+    existingSecret: ""
+    secretKey: DATABASE_URL
+
+# -------------------- Storage --------------------
+storage:
+  # filesystem (PVC, RWO) | s3
+  backend: filesystem
+  filesystem:
+    pvc:
+      enabled: true
+      size: 50Gi
+      # "" ⇒ cluster default StorageClass.
+      storageClassName: ""
+      accessMode: ReadWriteOnce
+  s3:
+    # AWS_ENDPOINT_URL_S3 — MinIO/zot/AWS S3 URL.
+    endpoint: ""
+    # AWS_REGION
+    region: ""
+    # HORT_STORAGE_S3_BUCKET
+    bucket: ""
+    # HORT_STORAGE_S3_FORCE_PATH_STYLE — required for MinIO/zot, optional
+    # for AWS S3.
+    pathStyle: true
+    # HORT_STORAGE_S3_ALLOW_HTTP — opt in to plain HTTP S3 endpoints
+    # (the rust object_store crate refuses HTTP by default).
+    # Required for in-cluster Garage/MinIO without TLS termination;
+    # the binary's validator rejects this flag on https:// endpoints
+    # and on real AWS S3 (no endpoint override). Acceptable on a
+    # trusted cluster network because the application layer enforces
+    # integrity via SHA-256 CAS (every read recomputes the hash);
+    # never acceptable over the public internet.
+    allowHttp: false
+    # HORT_S3_SSE_MODE — server-side-encryption mode for puts. One of:
+    #   "" (unset)       — no opinion sent on the request; the bucket's
+    #                       default applies. AWS S3 has applied SSE-S3
+    #                       unconditionally since 2023, so this is safe
+    #                       for AWS. For non-AWS S3-compatibles, the
+    #                       server emits a startup WARN naming the
+    #                       endpoint host:port.
+    #   "bucket-default" — explicit no-opinion. Equivalent to unset at
+    #                       the wire level, suppresses the WARN.
+    #   "sse256"         — request SSE-S3 (AES256, AWS-managed keys)
+    #                       on every put.
+    #   "sse-kms"        — request SSE-KMS on every put. `sseKmsKeyArn`
+    #                       MUST be set; the server refuses to start
+    #                       otherwise.
+    sseMode: ""
+    # HORT_S3_SSE_KMS_KEY_ARN — full KMS key ARN. Required when
+    # `sseMode` is "sse-kms"; ignored otherwise. The KMS key MUST grant
+    # the S3 service permission to use it (`kms:Encrypt`, `kms:Decrypt`,
+    # `kms:GenerateDataKey*`). Example:
+    #   arn:aws:kms:us-east-1:123456789012:key/abcd-1234-efgh-5678
+    sseKmsKeyArn: ""
+    # Kubernetes Secret with keys AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY.
+    existingSecret: ""
+# Stateful-upload staging dir — not a user-tunable value. The deployment
+# hard-wires HORT_STATEFUL_UPLOAD_STAGING_DIR to
+# /var/lib/hort-server/staging/stateful-upload for EVERY backend. The
+# binary's S3-backend default is the fixed /var/lib/hort/... path, which
+# sits on the read-only rootfs (no emptyDir) → under
+# readOnlyRootFilesystem:true, chunked uploads (OCI docker push, Git LFS)
+# silently fail. The chart routes staging through the already-mounted
+# writable `staging` emptyDir for all backends (no new volume); the env
+# always wins over the binary default.
+
+# -------------------- Scheduled tasks --------------------
+# Backlog 078 Item 8 (chart N1) — ALL periodic/scheduled tasks now live
+# under the single `scheduledTasks.*` tree (below, just before `worker:`),
+# regardless of execution path. The pre-078 split — five tasks at the top
+# level (`scrub`, `quarantineReleaseSweep`, `prefetchTick`,
+# `prefetchRowRetentionSweep`, `wheelMetadataBackfill`) and the rest nested
+# under `cronJobs.*` — leaked an implementation detail (DSN-direct vs
+# admin-task-HTTP) into the config-tree location. Each task now carries an
+# `executionPath` attribute instead. See the `scheduledTasks:` block for
+# the full set, the global admin-task gate, and the per-task gating notes.
+#
+# NOTE: `scrub.actionOnMismatch` (the HORT_CAS_SCRUB_ACTION_ON_MISMATCH env
+# read by the main Deployment) is now `scheduledTasks.scrub.actionOnMismatch`.
+
+# -------------------- Ephemeral store --------------------
+# HORT_EPHEMERAL_STORE_BACKEND — multi-node deployments MUST use redis
+# (memory backend cannot share state across pods). The schema blocks
+# `replicaCount > 1` + `memory`.
+ephemeralStore:
+  backend: memory
+  memory: {}
+  redis:
+    # HORT_REDIS_URL — exclusive with `existingSecret`. Either set this
+    # plaintext URL or wire a Secret via `existingSecret`. Acts as the
+    # fallback default for both per-class URLs below when those are
+    # unset. Schema Rule 4 enforces that one of `url` /
+    # `existingSecret` is non-empty when `backend == redis`.
+    url: ""
+    existingSecret: ""
+    secretKey: REDIS_URL
+
+    # HORT_REDIS_URL_EVICTABLE — optional override for the evictable class
+    # (Cargo/PyPI/npm sparse-index and packument caches, pull-through
+    # dedup). Empty → falls back to `redis.url` (or its
+    # `existingSecret`). Mutually exclusive with `evictableExistingSecret`
+    # (schema Rule 4b).
+    evictableUrl: ""
+    # K8s-Secret indirection for the evictable class. When non-empty,
+    # `evictableSecretKey` names the key to read from the named
+    # Secret. Mutually exclusive with `evictableUrl`.
+    evictableExistingSecret: ""
+    evictableSecretKey: REDIS_URL_EVICTABLE
+
+    # HORT_REDIS_URL_DURABLE — optional override for the durable class
+    # (auth/PAT lockout flags + counters, OCI upload session records +
+    # per-(repo, principal) session-count caps, auth-event throttle).
+    # Empty → falls back to `redis.url` (or its `existingSecret`).
+    # Mutually exclusive with `durableExistingSecret` (schema Rule 4c).
+    durableUrl: ""
+    # K8s-Secret indirection for the durable class. When non-empty,
+    # `durableSecretKey` names the key to read from the named Secret.
+    # Mutually exclusive with `durableUrl`.
+    durableExistingSecret: ""
+    durableSecretKey: REDIS_URL_DURABLE
+
+# -------------------- ServiceAccount --------------------
+serviceAccount:
+  create: true
+  # "" ⇒ generated from chart fullname.
+  name: ""
+  # Annotations for workload-identity / IAM-role-for-SA (EKS, GKE WI).
+  annotations: {}
+
+# -------------------- Pod-level securityContext (PSS-restricted) --------------------
+podSecurityContext:
+  runAsNonRoot: true
+  # 65532 is the distroless `nonroot` UID. The container image is built
+  # to run as this UID.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# -------------------- Container-level securityContext (PSS-restricted) --------------------
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -------------------- Resources --------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# -------------------- Probes --------------------
+# Wired to Item 1's /healthz + /readyz endpoints.
+#
+# Lifecycle semantics: the startup probe runs first; while it has
+# not yet succeeded, K8s disables the liveness and readiness probes.
+# Once startup succeeds, liveness + readiness take over for the
+# remainder of the pod's life. Tune the startup budget to cover the
+# binary's worst-case BOOT cost; tune liveness for post-bind health
+# slack; keep readiness tight (rotation-responsive).
+#
+# Boot cost contributors (cli/serve.rs):
+#   - Postgres pool connect (~1s nominal, capped by HORT_PG_ACQUIRE_TIMEOUT_SECS)
+#   - migrate::assert_current SELECT (<100ms)
+#   - gitops_boot::apply_config_from_dir (parse + DB writes; depends
+#     on $HORT_CONFIG_DIR contents — 7 envelopes ≈ 5-10s)
+#   - OIDC issuer discovery + initial JWKS fetch (cold IdP /
+#     slow network: 30-60s observed in the wild)
+#   - bind() — instant after the above
+# Total: ~10s nominal, can spike to >2 min on a cold OIDC + slow
+# network. Startup budget below buys 5 min headroom.
+probes:
+  liveness:
+    httpGet:
+      path: /healthz
+      port: http
+    # initialDelaySeconds is moot when a startup probe is present
+    # (liveness only fires after startup succeeds), but kept
+    # non-zero so operators who explicitly null out probes.startup
+    # still get a small grace window before liveness fires.
+    initialDelaySeconds: 10
+    # 15s × 5 = 75s of consecutive failures before kill. Forgiving
+    # enough to ride out post-bind blips (DB pool reconnect,
+    # transient JWKS refresh) without churning the pod, tight
+    # enough to actually catch a stuck binary.
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 5
+  readiness:
+    httpGet:
+      path: /readyz
+      port: http
+    initialDelaySeconds: 5
+    # 5s × 3 = 15s grace before pod is removed from rotation.
+    # Intentionally tight — readiness is about steering load away
+    # from a degraded pod fast, not about tolerating it.
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  startup:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 2
+    # 60 * 5s = 300s startup budget. Accommodates the worst-case
+    # cold OIDC discovery + JWKS fetch + slow network we have
+    # observed in practice. Lower this only if your IdP and DB
+    # are reliably fast; the cost of the larger budget is purely
+    # "time to detect a hung boot," and a hung boot is rare
+    # compared to a slow boot.
+    failureThreshold: 60
+
+# -------------------- PodDisruptionBudget --------------------
+podDisruptionBudget:
+  # When `replicaCount > 1`, the chart auto-renders a PDB regardless of
+  # this flag. Set true to render at replicaCount=1 (rare; typical
+  # single-replica deployments accept eviction).
+  enabled: false
+  minAvailable: 1
+
+# -------------------- NetworkPolicy --------------------
+# DEFAULT ON. Renders by default (secure by default — control-plane/
+# data-plane segmentation is a shipped control, not an operator
+# assumption).
+#
+# ESCAPE HATCH: set `networkPolicy.enabled: false` to disable it
+# entirely (e.g. clusters with a mesh `AuthorizationPolicy` or an
+# external L3/L4 control already governing the namespace). Disabling
+# is an explicit, documented operator choice — the default is on.
+#
+# `ingress`/`egress` are operator-supplied (the chart does not guess
+# your cluster's CIDRs). When `control.bindAddr` is set, add an
+# ingress rule that admits the control port (`service.controlPort`,
+# default 9443) ONLY from the operator/admin namespace, and keep the
+# public 8080 ingress open to the artifact + token-gen clients. The
+# egress posture should restrict HORT to the known webhook-forwarder
+# set (cross-ref F-4/F-21, already shipped) plus Postgres / S3 /
+# Redis / OIDC issuer / upstream registries. See
+# `docs/architecture/how-to/deploy/control-plane-tiers.md` for a
+# worked three-tier example.
+#
+# MIGRATE-JOB / BOOTSTRAP CARVE-OUT. These app-pod `ingress`/`egress`
+# rules apply ONLY to the app pods. An ADDITIONAL, separate NetworkPolicy
+# (`networkpolicy-migrate-job.yaml`) is rendered alongside this one
+# whenever `networkPolicy.enabled` is true. It selects ONLY the
+# Job/CronJob pods (by the `hort-server.io/job` label every such pod
+# carries; the app pods do NOT carry it) and grants them DNS + an
+# additive unrestricted egress. WHY: with this app-pod policy's
+# default-EMPTY `egress`, stock Kubernetes renders a deny-all egress;
+# its `podSelector` (the shared `selectorLabels`) ALSO matched the
+# pre-install `migrate` Helm hook Job, so the deny-all blocked the Job
+# from reaching Postgres and `helm install` aborted before the app ever
+# started. The app-pod posture is byte-unchanged (still
+# secure-by-default deny-all until you populate rules); NetworkPolicies
+# are purely additive, so the Job-scoped policy adds an allowance to the
+# Jobs WITHOUT relaxing the app pods. The DB endpoint lives inside the
+# opaque Secret DSN — the chart deliberately does not guess CIDRs; the
+# carve-out is the standard no-guess bootstrap-Job allowance. Setting
+# `networkPolicy.enabled: false` disables BOTH policies. See the
+# docstring in `templates/networkpolicy-migrate-job.yaml` for the full
+# per-Job verdict table.
+networkPolicy:
+  # Default ON (F-33). Flip to `false` to opt out (documented escape
+  # hatch — see the section comment above).
+  enabled: true
+  # Operator-supplied ingress rules. See K8s NetworkPolicy spec.
+  # With networkPolicy enabled, an EMPTY list renders a policy that
+  # selects the Ingress policyType with zero rules ⇒ stock Kubernetes
+  # DENIES ALL ingress to the pod — there is no implicit namespace
+  # baseline; the pod is unreachable until you populate rules. You MUST
+  # populate: public 8080 from the artifact/token-gen clients, and —
+  # when `control.bindAddr` is set — `service.controlPort` (9443)
+  # restricted to the operator namespace. (See control-plane-tiers.md.)
+  ingress: []
+  # Operator-supplied egress rules. Same semantics: enabled + EMPTY
+  # list ⇒ DENY ALL egress (no namespace baseline) — the pod cannot
+  # reach Postgres / S3 / Redis / OIDC / upstreams until you open them.
+  # Open up to those plus the known webhook-forwarder set ONLY
+  # (F-4/F-21 egress posture).
+  egress: []
+
+# -------------------- Extra surface --------------------
+# extraEnv — for any HORT_* knob the chart does not yet surface as a
+# top-level key. Use sparingly — prefer raising a chart issue when a
+# new knob is needed.
+extraEnv: []
+# extraVolumes — additional pod-level volumes (e.g. extra ConfigMaps,
+# CSI-projected secrets) merged into the Deployment's volume list.
+extraVolumes: []
+# extraVolumeMounts — corresponding container-level mounts for the
+# entries in `extraVolumes`. Operator owns the mount-path/name mapping.
+extraVolumeMounts: []
+# nodeSelector — pod placement: schedule onto nodes whose labels match.
+# Empty {} disables; chart applies via the standard Kubernetes mechanism.
+nodeSelector: {}
+# tolerations — pod placement: tolerate the listed taints (e.g. dedicated
+# registry nodes with `dedicated=registry:NoSchedule`).
+tolerations: []
+# affinity — pod placement: full Kubernetes `affinity` block. Common use:
+# anti-affinity to spread replicas across zones in a multi-replica deploy.
+affinity: {}
+# topologySpreadConstraints — pod placement: spread replicas across
+# topology keys (zones, hosts) for HA. List of full TSC entries.
+topologySpreadConstraints: []
+
+# -------------------- Service --------------------
+service:
+  type: ClusterIP
+  httpPort: 8080
+  metricsPort: 9090
+  # Container/Service port for the dedicated control-plane listener.
+  # Only exposed when `control.bindAddr` is non-empty (mirrors how
+  # `metricsPort` is gated on `metrics.bindAddr`).
+  controlPort: 9443
+  annotations: {}
+
+# -------------------- Extra CA trust --------------------
+# HORT_EXTRA_CA_BUNDLE — path inside the container to a PEM file
+# containing one or more X.509 certificates that are trusted *in
+# addition to* the public CAs. Applies process-wide: upstream proxy
+# requests, S3/MinIO TLS, and OIDC discovery all trust these CAs.
+# Fail-closed: if the path is set but the file is unreadable,
+# malformed, or contains zero parseable certificates, the binary
+# refuses to start. Set to "" to trust only public CAs (default).
+# See `docs/architecture/how-to/deploy/extra-ca-bundle.md`.
+extraCaBundle:
+  # Path inside the container to a PEM file containing one or more
+  # X.509 certificates that are trusted *in addition to* the public
+  # CAs. Leave empty to trust only public CAs. Required whenever an
+  # auto-mount source (`configMapName` / `secretName`) is set — it is
+  # both the mount path AND the value the chart wires into
+  # HORT_EXTRA_CA_BUNDLE.
+  path: ""
+  # Auto-mount source A (Recipe A): name of an existing ConfigMap
+  # holding the PEM bundle under key `ca.crt`. When set, the chart
+  # mounts it read-only at `path` AND sets HORT_EXTRA_CA_BUNDLE on the
+  # server Deployment, the worker Deployment, and the server-runtime
+  # CronJobs — symmetrically. Mutually exclusive with `secretName`.
+  configMapName: ""
+  # Auto-mount source B (Recipe B, auto): name of an existing Secret
+  # holding the PEM bundle under key `ca.crt` (e.g. a cert-manager
+  # output or an operator-managed Secret). Behaves IDENTICALLY to
+  # `configMapName` — same mount path, same read-only 0444 projection,
+  # same auto-mount on server + worker + CronJobs, same
+  # HORT_EXTRA_CA_BUNDLE wiring. Mutually exclusive with
+  # `configMapName` (a pod can mount only one `ca.crt` at `path`); the
+  # chart fails the render at `helm install` if both are set.
+  #
+  # Backlog 078 Item 7 / convention 9 — mount/secret symmetry: the
+  # chart NEVER sets HORT_EXTRA_CA_BUNDLE on a pod unless it also mounts
+  # the bundle on that pod. With NEITHER `configMapName` NOR
+  # `secretName` set (the fully-manual recipe — e.g. a CSI-projected
+  # ClusterTrustBundle), the chart mounts NOTHING and sets NO env: the
+  # operator wires `extraVolumes`/`extraVolumeMounts` (and the
+  # `worker.*` equivalents) AND sets HORT_EXTRA_CA_BUNDLE themselves via
+  # `extraEnv`/`worker.extraEnv`, pointed at `path`.
+  secretName: ""
+
+# -------------------- Worker --------------------
+# `hort-worker` is a separate Deployment from the server. It claims jobs
+# from the shared `jobs` table and dispatches each row to the
+# `TaskHandler` registered for its `kind` (scan, cron-rescan-tick,
+# advisory-watch-tick, staging-sweep, noop).
+#
+# Default `enabled: true`. Quarantine is the default ingest posture; the
+# fail-closed release predicate requires either a `ScanCompleted` event
+# on the artifact's stream OR a `ScanPolicy` with `scan_backends: []`
+# (the explicit `ScanWaived` authority) before the release sweep
+# transitions an expired-window artifact out of `Quarantined`. With
+# `worker.enabled: false`, dispatched `kind='scan'` jobs sit in
+# `pending` forever; no `ScanCompleted` ever fires; the artifact stays
+# in `Quarantined` permanently. Vanilla deploys with no `ScanPolicy`
+# declared became unpullable 24h after first ingest. Defaulting
+# `enabled: true` wires the binary's default-scanner identity
+# (`DefaultPolicy::block_on_critical_default_backends() = ["trivy"]`)
+# end-to-end.
+#
+# The worker container image (`worker.image.repository`) carries the
+# Trivy + osv-scanner CLIs pre-installed; the regular `hort-server`
+# image does not. Operators on air-gapped or private registries who
+# cannot pull `hort/hort-worker:<appVersion>` MUST either
+# mirror the image (and override `worker.image.repository`) or set
+# `worker.enabled: false` + declare a `ScanPolicy` with `scan_backends:
+# []` to keep ingest functional under quarantine-by-default.
+#
+# When `enabled: false`, none of the worker resources render and
+# `kind='scan'` jobs accumulate without progress. Operators choosing
+# this posture MUST declare an explicit `kind: ScanPolicy` with
+# `scan_backends: []` in their `gitopsConfig` to grant the
+# `ScanWaived` release authority — otherwise quarantine-by-default
+# locks the deployment.
+worker:
+  enabled: true
+  # Replica count. 1 is sufficient for typical deployments — the worker
+  # is throughput-bounded by per-job Trivy duration, not by parallelism;
+  # raising replicas beyond 1 only helps when the `jobs` queue depth
+  # grows faster than `pollIntervalSecs * batchSize` can drain it.
+  replicas: 1
+  # HORT_WORKER_ID — operator override for the worker_id the binary
+  # stamps onto every claimed `jobs` row. Empty (the default) leaves
+  # the worker's `${POD_NAME}-${random8hex}` fallback in place
+  # (POD_NAME is wired via the downward API in the Deployment). Set
+  # this only when a stable worker_id is required across pod restarts
+  # — e.g. for log-correlation in a single-replica worker pool. Do
+  # NOT set this with `replicas > 1`: collisions between workers
+  # claiming the same row are decided by the row's `worker_id`
+  # uniqueness, and a shared override defeats that.
+  workerIdOverride: ""
+  image:
+    # Distinct from the main server image — the worker image bundles
+    # the Trivy + osv-scanner CLI binaries on top of the standard Rust
+    # build stage. `${REGISTRY}/${IMAGE_PREFIX}/hort-worker` is the
+    # publish target produced by the GitLab pipeline's
+    # `build-images:hort-worker` job; operators override at install time
+    # (e.g. with a private registry mirror or their own pre-build).
+    repository: hort/hort-worker
+    # "" ⇒ Chart.appVersion (resolved in `_helpers.tpl`).
+    tag: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  scanner:
+    # HORT_SCANNER_POLL_INTERVAL_SECS — default 5.
+    pollIntervalSecs: 5
+    # HORT_SCANNER_BATCH_SIZE — default 4 (FOR UPDATE SKIP LOCKED batch).
+    batchSize: 4
+    # HORT_SCANNER_MAX_ATTEMPTS — default 5.
+    maxAttempts: 5
+    # HORT_SCANNER_LOCK_DURATION_SECS — default 900 (15 min). Workers
+    # whose pods die mid-scan have their claim expire after this window;
+    # another worker re-claims the row.
+    lockDurationSecs: 900
+    trivy:
+      # HORT_SCANNER_TRIVY_ENABLED — load-bearing (Backlog 078 Item 6).
+      # When false, the worker does NOT register the Trivy backend, even
+      # if the binary's `--version` probe would pass: the flag is the
+      # enabling gate; the probe is a secondary health check that only
+      # runs on flag-enabled backends. (Disabling BOTH backends is a
+      # hard boot error — a scanner worker with no backends has nothing
+      # to scan; set worker.enabled=false instead.)
+      enabled: true
+      # HORT_SCANNER_TRIVY_BIN — path inside the container.
+      binary: /usr/local/bin/trivy
+      # HORT_SCANNER_TRIVY_DB_DIR — Trivy DB cache. When set, an emptyDir
+      # is mounted at this path so DB downloads survive across scans
+      # within the pod's lifetime.
+      dbDir: /var/cache/trivy
+    osv:
+      # HORT_SCANNER_OSV_ENABLED — load-bearing (Backlog 078 Item 6),
+      # same contract as trivy.enabled above.
+      enabled: true
+      # HORT_SCANNER_OSV_BIN — path inside the container.
+      binary: /usr/local/bin/osv-scanner
+  advisory:
+    # HORT_ADVISORY_OSV_API_URL — OSV.dev batch endpoint. Override only
+    # when the operator runs an internal OSV mirror.
+    osvUrl: https://api.osv.dev/v1/querybatch
+  # -------------------- Provenance verification --------------
+  # Sigstore/cosign supply-chain provenance verification (OCI cosign
+  # signatures/attestations). Activates the `provenance-verify` worker
+  # job that the ingest path enqueues when a repository's ScanPolicy sets
+  # `provenanceMode: verify_if_present | required` on an OCI repo.
+  #
+  # See docs/architecture/how-to/enable-provenance-verification.md.
+  provenance:
+    cosign:
+      # HORT_PROVENANCE_COSIGN_ENABLED — LOAD-BEARING. When false (the default), the
+      # worker does NOT register the cosign ProvenancePort or the
+      # provenance-verify handler — provenance verification is fully
+      # inert: any enqueued provenance-verify jobs sit unclaimed. This is
+      # NOT cosmetic — the flag gates registration. A repository policy
+      # with `provenanceMode: required` on a verifiable (OCI) format then
+      # leaves artifacts stuck `Pending` (fail-closed but operationally
+      # surprising); to ENFORCE provenance you must set this true AND
+      # provision the pinned trust root below. Default false because the
+      # verifier requires an operator-provisioned trust root and cannot
+      # self-enable safely.
+      enabled: false
+      # HORT_PROVENANCE_TRUSTED_ROOT_FILE — REQUIRED when
+      # `provenance.cosign.enabled: true`. Path (inside the worker
+      # container) to a PINNED Sigstore `trusted_root.json`. The verify
+      # path is fully OFFLINE — there is NO live TUF/Rekor/Fulcio fetch;
+      # the bytes are loaded once at boot and verification runs against
+      # them. Rotate the trust root through the Hort image/release
+      # pipeline (no live client on the verify path). When
+      # `enabled: true` and this file is unset/absent, the worker REFUSES
+      # to boot (a `required`-mode deployment must not run a verifier with
+      # a missing trust root). Mount the file via `worker.extraVolumes` /
+      # `worker.extraVolumeMounts` (e.g. from a ConfigMap or Secret) at
+      # this path.
+      trustedRootFile: /etc/hort/provenance/trusted_root.json
+  # -------------------- Worker metrics scrape ----------
+  metrics:
+    # Worker /metrics scrape endpoint (hort_provenance_*, scan, queue depth).
+    # Disabled by default. enabled:true sets HORT_WORKER_METRICS_BIND=0.0.0.0:<port>, exposes the
+    # container port, and (when networkPolicy.enabled) co-renders a worker NetworkPolicy adding a
+    # Prometheus-scoped Ingress allowance on <port>. The listener has NO per-request auth — the
+    # NetworkPolicy is the control. The default-on server NetworkPolicy already DENIES this port;
+    # this knob adds the scrape allowance.
+    enabled: false
+    port: 9090
+    # scrapeFrom: a list of k8s NetworkPolicyPeer objects (from[]) allowed to scrape — e.g. your
+    # Prometheus namespaceSelector/podSelector. REQUIRED when enabled:true — the schema rejects
+    # enabling the listener with an empty scrapeFrom. (A NetworkPolicy rule with `from: []` means
+    # ALL sources per the k8s spec, i.e. fail-OPEN; so the chart renders `ingress: []` — genuine
+    # deny — when empty, and the schema forces you to declare who may scrape.)
+    scrapeFrom: []
+  # -------------------- Worker Postgres pool -------------
+  # Defense-in-depth backstop for the audit-retention seal path.
+  #
+  # `eventstore-archive`'s `seal_and_remove` appends a `StreamSealed`
+  # tombstone to `admin-eventstore-retention` with NO internal wait
+  # bound. That is safe ONLY under the §10.2-INV single-flight
+  # precondition — at most one `seal_and_remove` in flight cluster-wide
+  # — which is delivered by three layers: the eventstore-archive
+  # CronJob's `concurrencyPolicy: Forbid`, the worker per-kind
+  # semaphore (concurrency=1), and the per-UTC-day idempotency key.
+  #
+  # `lockTimeoutMs` is the connection-level backstop applied (via
+  # `.after_connect`) to BOTH worker Postgres pools — the main pool and
+  # the optional dedicated `hort_retention_role` retention pool. If the
+  # single-flight precondition is ever violated (e.g. a manual
+  # `hort-cli admin task invoke eventstore-archive` racing the CronJob),
+  # a contended row-lock wait degrades to the §10.2 fail-safe
+  # (`Err` → `errors += 1` → retried next sweep) instead of an
+  # unbounded sweep stall.
+  #
+  # `lock_timeout`, NOT `statement_timeout`: it bounds only
+  # lock-acquisition wait, so it fires on the pathological "blocked on
+  # a peer's uncommitted unique slot" case and never aborts a
+  # legitimately slow large-stream `DELETE` (a multi-minute purge of a
+  # huge sealed audit stream is correct work).
+  db:
+    # HORT_WORKER_LOCK_TIMEOUT_MS — default 120000 (2 min). Generous on
+    # purpose: under §10.2-INV single-flight it must NEVER fire in
+    # correct operation; a small value risks a false abort if
+    # single-flight is ever deliberately relaxed.
+    #
+    # 0 disables the backstop (Postgres default; the composition root
+    # skips the `SET lock_timeout` entirely). Only set 0 if you have an
+    # alternative single-flight enforcement; doing so re-opens the
+    # unbounded-block failure mode this backstop covers. Relaxing any
+    # single-flight layer (this knob, `concurrencyPolicy: Allow`, a
+    # second `StreamSealed` emitter) requires F-2 co-review per
+    # §10.2-INV.
+    lockTimeoutMs: 120000
+  # Exec-based liveness probe — the worker has no HTTP surface. The probe
+  # invokes the worker binary's own `healthcheck` subcommand: the runtime
+  # image is distroless (no `procps`), and the probe verifies the env
+  # parses + the configured Postgres DSN is reachable — a stronger "is
+  # this binary actually capable of doing work" signal than a pid check.
+  #
+  # Readiness is intentionally absent: the worker doesn't serve
+  # traffic, so removing it from the (non-existent) Service rotation
+  # has no effect. K8s defaults readiness to "container Running",
+  # which is exactly what we want.
+  #
+  # `timeoutSeconds=3` matches the budget pinned by unit tests at
+  # `crates/hort-worker/src/healthcheck.rs::PROBE_BUDGET` (2.5 s) +
+  # the pool acquire timeout (2 s); both stay strictly below this
+  # limit so DB unreachability fails the probe inside its own budget.
+  probes:
+    liveness:
+      exec:
+        command:
+          - /usr/local/bin/hort-worker
+          - healthcheck
+      initialDelaySeconds: 10
+      periodSeconds: 30
+      timeoutSeconds: 3
+      failureThreshold: 3
+  serviceAccount:
+    # Distinct from the server's `serviceAccount.create` so operators
+    # can attach worker-specific IRSA / workload-identity annotations
+    # without affecting the server.
+    create: true
+    # Empty ⇒ `${chart-fullname}-worker`.
+    name: ""
+    annotations: {}
+  # Standard pod-placement knobs, scoped to the worker so an operator
+  # can park workers on dedicated nodes (heavy CPU + outbound traffic).
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # extraVolumes / extraVolumeMounts — worker-scoped equivalents of the
+  # top-level keys (which apply to the server Deployment only).
+  #
+  # Backlog 078 Item 7 — CA-bundle mount symmetry: you only need these
+  # for the FULLY-MANUAL trust recipe (neither `extraCaBundle.configMapName`
+  # nor `extraCaBundle.secretName` set — e.g. a CSI-projected
+  # ClusterTrustBundle). In that case wire the volume + mount here AND on
+  # the top-level `extraVolumes`/`extraVolumeMounts`, point
+  # `extraCaBundle.path` at the mount path, and set HORT_EXTRA_CA_BUNDLE
+  # yourself via `extraEnv`/`worker.extraEnv` — the chart sets no env for
+  # the manual recipe (it never points the var at a file it did not
+  # mount). When EITHER `extraCaBundle.configMapName` (Recipe A) OR
+  # `extraCaBundle.secretName` (Recipe B) is set, the chart auto-mounts the
+  # bundle on the server AND the worker symmetrically and sets
+  # HORT_EXTRA_CA_BUNDLE on both — so these worker knobs are unnecessary
+  # and the previous "forgot the worker half ⇒ crashloop" footgun is gone.
+  extraVolumes: []
+  extraVolumeMounts: []
+  # extraEnv — worker-scoped equivalent of the top-level `extraEnv`
+  # (which applies to the server Deployment only). Most commonly used
+  # to set `RUST_LOG` for the worker — the binary defaults to
+  # `info` and reads the standard `tracing-subscriber` env-filter
+  # syntax (`<level>,<target>=<level>,...`). Useful targets:
+  # `hort_worker`, `hort_app`, `hort_adapters_postgres`, `sqlx`. Entries
+  # are appended after the chart's hardcoded env block, so an
+  # operator entry with the same name as a hardcoded one wins
+  # (Kubernetes env-array last-write-wins).
+  #
+  # Example:
+  #   extraEnv:
+  #     - name: RUST_LOG
+  #       value: "info,hort_worker=debug,hort_app=debug,sqlx=warn"
+  extraEnv: []
+
+  # -------------------- Worker — fallback PAT rotation -----
+  # The ServiceAccountRotationHandler mints fresh PATs on a CronJob
+  # cadence and writes them into operator-declared k8s Secrets.
+  #
+  # Backlog 078 Item 9 (chart S4) — SINGLE-SOURCE TOGGLE. Fallback PAT
+  # rotation is enabled end-to-end by exactly ONE knob:
+  # `scheduledTasks.serviceAccountRotation.enabled`. That one flag drives
+  # BOTH the CronJob trigger AND the worker-side wiring (the
+  # KubernetesSecretWriter env block in templates/worker-deployment.yaml
+  # + the per-namespace RBAC in templates/svc-rotation-rbac.yaml). There
+  # is no separate `worker.rotation.enabled` switch any more — the
+  # pre-078 two-place switch (where forgetting one half silently
+  # half-enabled rotation) has been collapsed. The keys under
+  # `worker.rotation.*` below are PARAMETERS of that one toggle (which
+  # namespaces to write into, what registry the dockerconfigjson points
+  # at), not a second on/off gate.
+  #
+  # Where two pieces must physically agree, `values.schema.json` enforces
+  # the coupling at `helm install` (fail-fast, mirroring the
+  # `replicaCount ⇒ ephemeralStore/storage` couplings):
+  #   - `scheduledTasks.serviceAccountRotation.enabled = true` REQUIRES
+  #     `scheduledTasks.adminTasksEnabled = true` (the admin-task CronJob
+  #     renders only under the umbrella), and
+  #   - it REQUIRES `worker.rotation.publicRegistryHost` to be non-empty
+  #     (the worker rotation env has nowhere to point otherwise).
+  # A half-set config fails the render with a clear message rather than
+  # silently half-enabling.
+  rotation:
+    # Namespaces the worker is permitted to write Secrets in. MUST
+    # contain every namespace referenced in a ServiceAccount's
+    # `fallbackRotation.targetSecret.namespace` declaration. Per-
+    # namespace Role + RoleBinding objects render for each entry
+    # in this list (templates/svc-rotation-rbac.yaml). An empty
+    # list with rotation enabled is a valid (if useless) shape — the
+    # handler registers and logs `namespace_not_authorized` for
+    # every SA on every tick. The gitops apply path does NOT
+    # cross-check `fallbackRotation.targetSecret.namespace` against
+    # this list; mismatches surface as reconciler warnings, not
+    # apply-time rejection.
+    targetNamespaces: []
+    # Registry host embedded in the `dockerconfigjson`-format
+    # Secret's `auths` map. Required when rotation is enabled
+    # (`scheduledTasks.serviceAccountRotation.enabled = true`) — both
+    # `values.schema.json` and the chart's `required` template function
+    # block install otherwise. Typically the public DNS name + port
+    # consumers use, e.g. `registry.example.com:5443`.
+    publicRegistryHost: ""
+    # Chart-level `defaultValidity` / `defaultRotationInterval` keys are
+    # intentionally absent. The per-SA YAML
+    # (`spec.fallbackRotation.{validity,rotationInterval}`) is the single
+    # source of truth — both fields are required by the apply-time schema,
+    # so chart defaults would never fire; they were removed to prevent
+    # operator confusion about non-load-bearing knobs.
+
+# -------------------- Gitops config --------------------
+# Map from relative file path → YAML content. Each entry becomes a key in
+# the hort-server-config ConfigMap, mounted at HORT_CONFIG_DIR
+# (/etc/hort-server/config) on the Deployment AND the migrations Job.
+# Empty by default — `ApplyConfigUseCase` handles an empty config dir.
+#
+# Example:
+#   gitopsConfig:
+#     "auth/oidc.yaml": |
+#       # gitops-managed auth mappings
+#       mappings:
+#         - claim: groups
+#           value: hort-admins
+#           role: admin
+gitopsConfig: {}
+
+# -------------------- Scheduled tasks (Backlog 078 Item 8 — chart N1) --------------------
+# ALL periodic/scheduled tasks live under this single tree. Before 078 the
+# set was split by execution path: five DSN-direct tasks at the top level
+# and the admin-task-HTTP tasks nested under `cronJobs.*`. That leaked an
+# implementation detail (HOW a task is invoked) into the config-tree
+# *location*. Item 8 makes the execution path a per-task `executionPath`
+# attribute instead, so every task is found in one place.
+#
+# Two execution paths (the `executionPath` attribute records which):
+#
+#   executionPath: dsn-direct
+#     The CronJob runs a `hort-server` subcommand directly in its own pod
+#     (or `hort-server scrub` for the scrub), using only the runtime DSN +
+#     log/metric env (the `hort-server.runtimeEnv` MinimalConfig block) — NO
+#     service-account token, NO svc-token-bootstrap Job. Gated solely by the
+#     task's own `enabled` (it is independent of the admin-task umbrella
+#     gate below). These keep their pre-078 defaults (scrub +
+#     quarantineReleaseSweep default-ON; the three opt-in retrofit/cascade
+#     tasks default-OFF).
+#
+#   executionPath: admin-task
+#     The CronJob invokes `hort-cli admin task invoke <kind>` against the
+#     hort-server admin-task HTTP endpoint, mounting the `<release>-svc-token`
+#     PAT written by the svc-token-bootstrap Job. These are gated by BOTH
+#     the global `adminTasksEnabled` master toggle (which also gates the
+#     bootstrap Job + its RBAC) AND the task's own `enabled` — the pre-078
+#     `cronJobs.enabled` coupling, preserved verbatim. All default-OFF except
+#     `replaySeenPrune` (default-ON once the master toggle is flipped).
+#     (`verifyEventChain` is the one hybrid: it is gated by the admin-task
+#     umbrella like its siblings, but actually runs the `hort-server
+#     verify-event-chain` subcommand directly with the runtime DSN and needs
+#     no PAT — see its block.)
+#
+# Idempotency-Key construction: every
+# admin-task CronJob template builds an Idempotency-Key from
+# `<schedule_window>:<kind>` where the schedule window is
+# `date -u +%Y-%m-%dT%H:%M` (minute granularity). This collapses any
+# controller-restart double-fire onto the same `(kind, key)` tuple, which the
+# server-side dedup short-circuits within a 5-minute window. The
+# minute-granularity window is correct for any schedule with a period
+# >= 5 minutes. For sub-minute schedules — explicitly unsupported —
+# minute-granularity could merge two distinct windows into the same key.
+# Treat the 5-minute period as a hard floor on `schedule:` values.
+scheduledTasks:
+  # Global master toggle for the `executionPath: admin-task` tasks
+  # (replaces the pre-078 `cronJobs.enabled`). Must be true for any
+  # admin-task CronJob template AND the service-account token bootstrap Job
+  # (+ its RBAC) to render. The `executionPath: dsn-direct` tasks below are
+  # NOT gated by this toggle — they keep their own per-task `enabled`.
+  #
+  # Default: disabled. Operators opt in once they have reviewed the
+  # service-account token rotation story.
+  #
+  # Prerequisites (must be configured before enabling):
+  #   - postgres.admin.existingSecret — the bootstrap Job uses the admin DSN
+  #     to write the service-account user and token rows.
+  #   - A working in-cluster network path from the CronJob pods to the
+  #     hort-server Service (HORT_SERVER = http://<fullname>:<httpPort>).
+  adminTasksEnabled: false
+
+  # kubectl image used by the svc-token-bootstrap Job's write-secret
+  # container. Operators running clusters at a different minor version
+  # should override this to match their API server (e.g.
+  # "bitnamilegacy/kubectl:1.29"). Default uses Bitnami's `bitnamilegacy/`
+  # registry — Bitnami's mid-2025 repackaging removed older minor-version
+  # tags from `docker.io/bitnami/*` and rehomed them under
+  # `docker.io/bitnamilegacy/*` as the documented migration path. The
+  # image content (entrypoint, /bin/bash availability) is preserved,
+  # so the chart's `command: [/bin/sh, -c, ...]` shape continues to work.
+  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.30"
+
+  # When `true`, force-rotate the cronjob-tasks svc-token on the next
+  # helm upgrade. The bootstrap Job's init container passes `--rotate`
+  # to `issue-svc-token`, which revokes the existing token and mints a
+  # new one. Admin-task CronJob pods using the prior token will fail auth
+  # until their next pod reschedule pulls the updated Secret.
+  #
+  # Default `false` — routine helm upgrades are idempotent (the
+  # bootstrap Job's main container detects "token row exists in DB AND
+  # Secret already exists in cluster" and exits 0 without writing
+  # anything; see F15). Set true once to rotate, then back to false.
+  #
+  # Recovery from "DB row exists, plaintext lost (no Secret in
+  # cluster)": set `rotateSvcToken: true` and re-run helm upgrade.
+  rotateSvcToken: false
+
+  # ======================================================================
+  # executionPath: dsn-direct — DSN-only CronJobs (no svc-token, not gated
+  # by `adminTasksEnabled`). These default to their pre-078 values.
+  # ======================================================================
+
+  # -- CAS integrity scrub -------------------------
+  # CAS integrity scrub CronJob. Walks every blob, re-hashes via streaming
+  # SHA-256, compares against the CAS key. Renders `templates/cronjob-scrub.yaml`.
+  # See `docs/architecture/explanation/cas-storage.md` for the full rationale.
+  scrub:
+    executionPath: dsn-direct
+    # Whether to render the CronJob at all. Default true — the scrub is a
+    # cheap defence-in-depth backstop for at-rest corruption (M-5 carry-
+    # forward limitation: range-reads cannot be verified against a
+    # whole-object hash). Set false if an external integrity backstop
+    # already exists (e.g. ZFS scrub, S3 inventory + checksum batch job).
+    enabled: true
+    # Cron schedule. Default: daily at 03:00 UTC. Operators with
+    # multi-million-blob CAS backends typically pair a more frequent
+    # sampling cron with a less frequent full sweep.
+    schedule: "0 3 * * *"
+    # Per-blob sampling probability in (0, 1]. Empty / unset → 1.0
+    # (scrub every blob; matches the CLI default). Set to e.g. "0.1"
+    # to scrub roughly 10% of blobs per run — useful for hourly
+    # cadences on very large stores.
+    samplingRate: ""
+    # Maximum number of re-hash tasks in flight. Empty / unset → 4
+    # (matches the CLI default). Higher values help when the CAS
+    # backend is latency-dominated (S3 over WAN); lower values cap
+    # the blast radius if the scrub contends with the serving path.
+    concurrency: ""
+    # HORT_CAS_SCRUB_ACTION_ON_MISMATCH — operator-chosen response when
+    # the scrubber finds a hash mismatch. This value is ALSO read by the
+    # main Deployment (the runtime needs the same env the scrub binary
+    # parses), so it is load-bearing even when `scrub.enabled: false`:
+    #   "alert"     — emit `CasIntegrityMismatch` event + tracing warn
+    #                 + metric. The blob remains readable; the operator
+    #                 decides the response. (default)
+    #   "tombstone" — additionally emit `ArtifactCorrupted` and
+    #                 transition the artifact to
+    #                 `quarantine_status = 'rejected'` via the
+    #                 existing quarantine state machine. Subsequent
+    #                 download attempts are blocked at the application
+    #                 layer. Admin-release override available via the
+    #                 existing `POST /quarantine/:artifact_id/release`.
+    actionOnMismatch: "alert"
+
+  # -- Quarantine release sweep ---------------------------
+  # Periodic release-sweep CronJob.
+  # Inserts ONE `kind='quarantine-release-sweep'` row into `public.jobs`
+  # every tick using the RUNTIME DSN; the always-on worker picks it up
+  # and runs `QuarantineReleaseSweepHandler`, which feeds the
+  # §2.5 candidacy query (one indexed range scan per distinct effective
+  # `ScanPolicy.quarantineDuration`) into the F-6 fail-closed
+  # `QuarantineUseCase::release_expired` (UNCHANGED).
+  #
+  # Design rationale (§2.4 finding 2): this CronJob deliberately does
+  # NOT use the `hort-cli` admin-task HTTP path / svc-token chain — a
+  # default-enabled sweep would otherwise drag the whole
+  # `adminTasksEnabled` + `svc-token-bootstrap` Job machinery to
+  # default-on. The runtime DSN is least-privilege (it owns nothing
+  # identity-wise). For MANUAL operator invocations, the
+  # `hort-http-admin-tasks` route + `hort-cli admin task invoke
+  # quarantine-release-sweep` still work — this template is the
+  # default scheduled path only.
+  quarantineReleaseSweep:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default true.** Phase 1 ships the sweep
+    # ON by default; an operator who has not yet flipped Item 2's
+    # quarantine-by-default posture sees a no-op sweep until they
+    # configure a `ScanPolicy` with a non-zero `quarantineDuration`,
+    # at which point the sweep is the ONLY path that releases those
+    # artifacts (without it they strand in `Quarantined` indefinitely).
+    enabled: true
+    # Cron schedule. Default: every 5 minutes (design §2.4 finding 3).
+    # Bounds both window-gate latency and how fast a
+    # `quarantineDuration` policy change takes effect, on an hours-
+    # scale window. Operators tightening below 5 minutes should also
+    # tighten the 5-minute Idempotency-Key floor that the admin-task
+    # cron ladder pins (see the section header) — though this CronJob
+    # does NOT use that key, since it enqueues directly via the DSN
+    # rather than through the HTTP admin-task path.
+    schedule: "*/5 * * * *"
+
+  # -- Prefetch scheduled tick ------------------------
+  # Periodic prefetch-tick CronJob (design §2.3 + §8). Inserts ONE
+  # `kind='prefetch-tick'` row into `public.jobs` every tick using the
+  # RUNTIME DSN; the worker picks it up and runs `PrefetchTickHandler`,
+  # which walks every repository whose `prefetch_policy.enabled = true`
+  # AND `prefetch_policy.triggers ⊃ Scheduled`, resolves the catch-all
+  # upstream mapping, fetches the upstream catalog via `UpstreamProxy`,
+  # extracts the published version set via the format handler's
+  # `extract_upstream_versions` (npm packument keys / cargo sparse-index
+  # `vers` per line / pypi PEP 503 HTML or PEP 691 JSON), and invokes
+  # the Item-7 `PrefetchUseCase::plan` planner per tracked package.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella. Manual operator invocation still works via the
+  # `hort-http-admin-tasks` HTTP route.
+  prefetchTick:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default false.** Prefetch is opt-in
+    # per-repo via `Repository.prefetch_policy.enabled` + an explicit
+    # `Scheduled` trigger — the CronJob existing-but-disabled-by-default
+    # lets operators flip a single chart value rather than re-deploy
+    # once they have a repo configured. When every repo has
+    # `prefetch_policy.enabled = false`, ticking is a no-op — but the
+    # operator-control surface here is "do you want ticks at all", not
+    # "are any repos opted in".
+    enabled: false
+    # Cron schedule. Default: every 15 minutes. Design §2.3 calls
+    # prefetch jobs "low priority"; the cadence is conservative
+    # compared to the quarantine-release-sweep 5-minute cadence (that
+    # sweep has tighter window-gate latency needs). The 5-minute floor
+    # on the chart's CronJob ladder still applies — tightening below it
+    # is a deliberate operator decision.
+    schedule: "*/15 * * * *"
+
+  # -- Prefetch-row retention sweep -----------------
+  # Periodic prefetch-row retention-sweep CronJob (design §9). Inserts
+  # ONE `kind='prefetch-row-retention-sweep'` row into `public.jobs`
+  # every tick using the RUNTIME DSN; the worker picks it up and runs
+  # `PrefetchRowRetentionSweepHandler`, which deletes terminal
+  # (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'`
+  # rows older than a configurable horizon (default 7 days).
+  #
+  # Pairs with the per-table autovacuum tuning on `public.jobs`
+  # (migration 009: `autovacuum_vacuum_scale_factor = 0.02`). The
+  # The transitive prefetch cascade turns `public.jobs` into a
+  # high-volume table — a closure-warm enqueues thousands of rows;
+  # without periodic GC, terminal `prefetch%` rows accumulate unbounded.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella. Manual operator invocation still works via the
+  # `hort-http-admin-tasks` HTTP route.
+  prefetchRowRetentionSweep:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default false.** The cascade is opt-in
+    # per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`;
+    # if no repo opts in the `jobs` table accumulates nothing and the
+    # sweep has nothing to delete. An operator enabling the cascade
+    # should also enable this sweep so `jobs` does not grow unbounded.
+    enabled: false
+    # Cron schedule. Default: daily at 02:00 UTC. The 7-day retention
+    # 7-day retention horizon gives 6 days of headroom even after a
+    # missed run; daily cadence + autovacuum tuning is sufficient for
+    # production loads. Operators tightening below daily should also
+    # tighten `autovacuum_vacuum_scale_factor` on `public.jobs` (the
+    # lower the sweep cadence, the more aggressive autovacuum must be).
+    schedule: "0 2 * * *"
+
+  # -- Wheel-metadata backfill -----------------------------
+  # Periodic wheel-metadata-backfill CronJob (design §2.8). Inserts ONE
+  # `kind='wheel-metadata-backfill'` row into `public.jobs` every tick
+  # using the RUNTIME DSN; the worker picks it up and runs
+  # `WheelMetadataBackfillHandler`, which walks PyPI wheel artifacts
+  # without a `wheel_metadata` ContentReference, streams each wheel from
+  # CAS, invokes `FormatHandler::extract_wheel_metadata_bytes`, and on
+  # `Some(bytes)` persists the bytes to CAS + inserts the ContentReference
+  # row. Retroactively enables PEP 658 advertisement for pre-existing
+  # wheels.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella. Manual operator invocation still works via the
+  # `hort-http-admin-tasks` HTTP route:
+  # `hort-cli admin task invoke wheel-metadata-backfill`.
+  wheelMetadataBackfill:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default false.** The backfill is a one-shot
+    # One-shot retrofit for operators upgrading from an earlier release,
+    # NOT a steady-state sweep. A freshly-deployed operator's wheel
+    # inventory is empty; the tick would be a no-op. Operators flip the
+    # chart value once after the upgrade, run the backfill until it
+    # reports `artifacts_walked = 0` consistently in `result_summary`,
+    # then flip it back off. (The CronJob existing-but-disabled-by-default
+    # lets operators turn it on with a single `--set` rather than
+    # re-deploy.)
+    enabled: false
+    # Cron schedule. Default: weekly Sunday 04:00 UTC. The retrofit
+    # processes batchSize wheels per tick; for a v1.0+ deployment with
+    # thousands of existing wheels, a tighter cadence (e.g. hourly)
+    # during the active retrofit pass drains the candidate set faster.
+    # Operator-tunable via `scheduledTasks.wheelMetadataBackfill.schedule`.
+    # The 5-minute floor on the chart's CronJob ladder still applies.
+    schedule: "0 4 * * 0"
+    # How many wheel artifacts the worker walks per invocation.
+    # Defaults to the handler's 100 (omit the key to leave empty in the
+    # rendered template → no `--batch-size` flag → handler default).
+    # The handler caps at 1000 regardless of input. Operators tightening
+    # below 100 are explicitly making the per-tick wall-clock vs memory
+    # tradeoff (one fewer wheel per tick = less peak memory; one more
+    # tick to drain).
+    batchSize: 100
+
+  # ======================================================================
+  # executionPath: admin-task — `hort-cli admin task invoke` CronJobs that
+  # mount the `<release>-svc-token` PAT. Gated by `adminTasksEnabled` (the
+  # master toggle above) AND each task's own `enabled`. All default-OFF
+  # except replaySeenPrune (default-ON once the master toggle is flipped).
+  # ======================================================================
+
+  # -- Admin-task v1 task templates (fully implemented) ------------------------
+
+  # Noop task: diagnostic heartbeat that confirms the admin-task framework
+  # is reachable and the service-account token is valid.
+  noop:
+    executionPath: admin-task
+    enabled: false
+    # Daily at midnight UTC. Operators may tighten the schedule for more
+    # frequent heartbeat checks (e.g. "*/15 * * * *" for every 15 minutes).
+    schedule: "0 0 * * *"
+
+  # Staging sweep: expire and purge staging-area uploads that have been
+  # pending beyond HORT_STAGING_MAX_AGE_SECS. Replaces the in-process
+  # sweep scheduler that hort-server ran previously.
+  stagingSweep:
+    executionPath: admin-task
+    enabled: false
+    # Every 15 minutes — matches the binary's default
+    # HORT_STAGING_SWEEP_INTERVAL_SECS = 900.
+    schedule: "*/15 * * * *"
+
+  # -- Scan task templates (rescan + advisory watch) ---------------------
+
+  # Cron-driven rescan: insert kind='scan' jobs for artifacts past their
+  # ScanPolicy.rescanIntervalHours. Default 5-minute cadence. Each tick
+  # is single-active (concurrencyPolicy: Forbid + worker semaphore).
+  cronRescanTick:
+    executionPath: admin-task
+    enabled: false
+    schedule: "*/5 * * * *"
+
+  # Advisory watch: pull OSV per-ecosystem diff, match against
+  # sbom_components, enqueue targeted scan jobs. Default 6-hour cadence.
+  advisoryWatchTick:
+    executionPath: admin-task
+    enabled: false
+    schedule: "0 */6 * * *"
+
+  # -- Retention task templates ---------------
+  #
+  # Destructive — DEFAULT OFF (rollout safety). The handlers are
+  # registered unconditionally with the worker; `enabled:false` is the
+  # only volume control — there is no composition-level switch. Enable
+  # retention-evaluate first, observe, then retention-purge (the
+  # destructive GC), then eventstore-archive (weekly, lowest frequency).
+  #
+  # retention-evaluate: replay-free read of active retention policies +
+  # keyset-paginated non-protected artifacts → append ArtifactExpired
+  # per fresh match (deletes nothing). Daily.
+  retentionEvaluate:
+    executionPath: admin-task
+    enabled: false
+    schedule: "0 3 * * *"
+  # retention-purge: the destructive §5 storage-GC walk. Refuses until
+  # the worker boot refcount-reconcile sweep converged. Daily, after
+  # retention-evaluate.
+  retentionPurge:
+    executionPath: admin-task
+    enabled: false
+    schedule: "0 4 * * *"
+  # eventstore-archive: §4 audit-retention stream sweep (seal terminal
+  # / age-gated streams past the configured retention floor, via the
+  # StreamSealed tombstone chokepoint). Weekly (Sunday) — lowest frequency.
+  eventstoreArchive:
+    executionPath: admin-task
+    enabled: false
+    schedule: "0 5 * * 0"
+
+  # -- Service-account PAT rotation -------------------------------
+
+  # Service-account rotation: trigger the worker's
+  # `ServiceAccountRotationHandler`, which mints and writes fresh PATs
+  # into the operator-declared target Secrets.
+  #
+  # Backlog 078 Item 9 (chart S4) — this `enabled` flag is the SINGLE
+  # source of truth for fallback PAT rotation. Flipping it true (with
+  # the `adminTasksEnabled` umbrella, which the schema requires) drives
+  # BOTH this CronJob trigger AND the worker-side wiring
+  # (templates/worker-deployment.yaml rotation env + the per-namespace
+  # RBAC in templates/svc-rotation-rbac.yaml). There is no separate
+  # `worker.rotation.enabled` toggle — the worker-side PARAMETERS
+  # (`targetNamespaces`, `publicRegistryHost`) live under `worker.rotation.*`.
+  # The schema fails the render fast if the umbrella or the required
+  # `worker.rotation.publicRegistryHost` is missing (no silent half-on).
+  serviceAccountRotation:
+    executionPath: admin-task
+    enabled: false
+    # Default cadence — every 15 minutes. Operators rotating more
+    # aggressively can shorten; the natural floor is the worker's
+    # tick latency (~seconds). The 5-minute lower bound for the
+    # Idempotency-Key window (see section header) applies here too.
+    schedule: "*/15 * * * *"
+
+  # -- Event-chain checkpoint -----------------------------
+
+  # Event-chain checkpoint emission: trigger the worker's
+  # `EventstoreCheckpointHandler`, which assembles the spec §6.2 signed
+  # checkpoint, Ed25519-signs it, and S3-Object-Lock-WORM-anchors it —
+  # closing the external-anchor half of F-2 so `verify-event-chain`
+  # attests anchoring instead of `missing_checkpoint`.
+  #
+  # The worker side ALSO requires S3 storage +
+  # `HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE` (operator Ed25519 PKCS#8
+  # private key, §14 R2) + `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE` (matching
+  # SPKI public key), and the anchor bucket MUST be created with S3
+  # Object Lock enabled + a COMPLIANCE-mode default retention (object_store
+  # cannot set per-object retention on PUT — WORM is the bucket default;
+  # see the deployment hardening guide). If those are absent the handler
+  # is not registered and this CronJob's POST 404s.
+  eventstoreCheckpoint:
+    executionPath: admin-task
+    enabled: false
+    # Default cadence — hourly (spec §6.3 / §14 R6: bounds the
+    # worst-case undetected whole-stream-truncation/rollback window to
+    # ≤ 1h, well inside NIS2 Art. 23 incident-reporting horizons).
+    # Operators with a tighter compliance window may shorten it.
+    schedule: "0 * * * *"
+
+  # -- Replay-guard seen-set TTL cleanup ---------------
+
+  # Replay-seen prune: trigger the worker's `ReplaySeenPruneHandler`,
+  # which runs one `DELETE FROM jwt_replay_seen WHERE expires_at <
+  # now()` tick — the periodic delete-expired cleanup the F-1 spec §4
+  # selected over delete-on-write / DB-side TTL.
+  #
+  # DEFAULT-ENABLED (spec §12 R4) — the *only* admin-task CronJob template
+  # in this chart that defaults to `true`. Justified divergence from
+  # The default-disabled `hort_svc_*` admin-task convention: a never-pruned
+  # `jwt_replay_seen` is a pure storage-growth liability and the prune
+  # has **no security effect either way** (the seen-set never forgets
+  # within TTL; pruning only reclaims storage of already-expired rows
+  # the validator would reject as `Expired` upstream anyway). The global
+  # `adminTasksEnabled` master toggle is still the single opt-in surface;
+  # once it is true, the replay-seen prune runs by default.
+  #
+  # Cleanup degrades SAFE: disabling this or a failed tick only grows
+  # the table — replay protection never degrades (the seen-set is
+  # authoritative regardless of prune state). The handler retries a
+  # failed tick on the next schedule (warn!, never error!).
+  #
+  # Unlike eventstoreCheckpoint, the worker side needs no extra
+  # provisioning — the prune only needs the Postgres pool the worker
+  # always has, so the handler is registered unconditionally and this
+  # route is always live.
+  replaySeenPrune:
+    executionPath: admin-task
+    enabled: true
+    # Default cadence — hourly (spec §4: "interval ≈ the federation max
+    # (hourly)"; the table grows by one row per distinct federated
+    # exchange per hour, so an hourly prune keeps it bounded). The
+    # 5-minute Idempotency-Key window floor (see section header)
+    # applies here too.
+    schedule: "0 * * * *"
+
+  # -- Event-chain verifier -------------------------------------
+
+  # Event-chain verifier: run the F-2 offline tamper-evidence verifier
+  # `hort-server verify-event-chain --format json`, which recomputes every
+  # event stream's per-stream hash chain and cross-checks it against the
+  # externally-anchored checkpoints, and records a liveness breadcrumb on
+  # each completed run.
+  #
+  # `executionPath: admin-task` here records the GATING coupling (it is
+  # gated by `adminTasksEnabled` like its admin-task siblings), but the
+  # CronJob actually runs the `hort-server` binary DIRECTLY in its pod —
+  # the verifier is an in-process reader (runtime DML DSN + the anchor
+  # object store), not a worker `TaskHandler`. It reuses the standard
+  # runtime env (HORT_DATABASE_URL + storage) and needs no svc-token PAT.
+  #
+  # The boot-time `hort_event_chain_verify_overdue` gauge (F-52) reads the
+  # newest completed run and flips to 1 when none is within
+  # `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS ×
+  # HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` (defaults 86400 s × 3),
+  # so a verifier that was enabled and then stopped is alarmable. Keep this
+  # schedule consistent with the expected-interval knob.
+  #
+  # DEFAULT-DISABLED like its siblings. On a filesystem storage
+  # backend (no object store) the anchor cross-check resolves to
+  # `missing_checkpoint` (exit 3); enable `eventstoreCheckpoint` + an S3
+  # anchor bucket for full external-anchor attestation.
+  verifyEventChain:
+    executionPath: admin-task
+    enabled: false
+    # Default cadence — daily, matching the F-52 boot gauge's
+    # HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS default (86400 s).
+    # Operators with a tighter compliance window may shorten both in
+    # lock-step.
+    schedule: "0 2 * * *"

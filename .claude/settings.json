@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+
+    "filesystem": {
+      "allowWrite": [
+        ".",
+        "/tmp",
+        "~/.claude",
+        "~/.claude.json",
+        "~/.cargo",
+        "~/.rustup",
+        "~/.cache"
+      ],
+      "denyRead": [
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.aws",
+        "~/.config/gcloud",
+        "~/.kube"
+      ],
+      "denyWrite": [
+        ".env",
+        "design/**"
+      ]
+    },
+
+    "network": {
+      "allowedDomains": [
+        "api.anthropic.com",
+        "statsig.anthropic.com",
+        "sentry.io",
+
+        "static.crates.io",
+        "crates.io",
+        "index.crates.io",
+        "dl.static.rust-lang.org",
+        "static.rust-lang.org",
+        "sh.rustup.rs",
+
+        "rustwasm.github.io",
+        "github.com/grpc-ecosystem",
+        "github.com/RustSec",
+
+        "pypi.org",
+        "registry.npmjs.org",
+
+        "cheatsheetseries.owasp.org"
+      ]
+    }
+  },
+
+  "permissions": {
+    "allow": [
+      "Bash(cargo:*)",
+      "Bash(rustc:*)",
+      "Bash(rustup:*)",
+      "Bash(wasm-pack:*)",
+      "Bash(protoc:*)",
+      "Bash(grpc-health-probe:*)",
+      "Bash(buf:*)",
+
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(git pull:*)",
+
+      "Bash(cat:*)",
+      "Bash(echo:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(mv:*)",
+      "Bash(jq:*)",
+      "Bash(curl:*)",
+      "Bash(apt-get install:*)",
+      "Bash(which:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /*:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push origin main:*)",
+      "Bash(kubectl*:*)",
+      "Bash(curl * | bash:*)",
+      "Bash(wget * | bash:*)",
+      "Bash(cargo publish:*)"
+    ]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/auto-allow-compound.py\""
+          }
+        ]
+      }
+    ]
+  },
+
+  "worktree": { "baseRef": "head" }
+}

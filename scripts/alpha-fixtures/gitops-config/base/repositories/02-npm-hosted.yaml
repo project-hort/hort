@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: npm-hosted
+spec:
+  name: "npm Hosted"
+  description: "Local-publish hosted npm repo (alpha)"
+  format: npm
+  type: hosted
+  storage:
+    backend: filesystem
+    path: npm-hosted
+  isPublic: true
+  replicationPriority: local_only

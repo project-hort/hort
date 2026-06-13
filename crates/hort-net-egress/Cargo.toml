@@ -1,0 +1,21 @@
+[package]
+name = "hort-net-egress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort shared network-egress safety primitives — IP routability classification (SSRF block-list)"
+
+[lints]
+workspace = true
+
+# Charter: zero business logic. This crate hosts the canonical
+# `is_routable` predicate used at the URL-input-validation layer by
+# adapters that talk to the public internet (`hort-adapters-upstream-http`).
+# It MUST NOT depend on `hort-domain`, `hort-app`, or any `hort-adapters-*`
+# crate (see `docs/architecture/explanation/security.md`).
+#
+# Earlier revisions also hosted `GuardedDnsResolver` (connect-time DNS
+# guard) and `build_egress_redirect_policy`. Both were dropped when the
+# EGRESS-1 posture was re-evaluated, along with their `reqwest`, `tokio`,
+# `url`, `metrics`, and `tracing` dependencies.
+[dependencies]

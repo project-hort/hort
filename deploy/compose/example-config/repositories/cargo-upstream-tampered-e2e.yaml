@@ -1,0 +1,25 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  # Key matches the CARGO_REPO_KEY env default in
+  # scripts/native-tests/scenarios/upstream/cargo-upstream-tampered.sh. Distinct
+  # from the happy-path repo so both can run in the same harness
+  # without colliding on the (repository_id, path_prefix=NULL) row in
+  # repository_upstream_mappings.
+  name: cargo-upstream-tampered-e2e
+spec:
+  name: "Cargo upstream tampering smoke (checksum mismatch, failure path)"
+  description: "Proxy Cargo repo used by scripts/native-tests/scenarios/upstream/cargo-upstream-tampered.sh; upstream is the wiremock-cargo-tampered sidecar serving NDJSON metadata advertising the real upstream cksum alongside tampered .crate body bytes."
+  format: cargo
+  type: proxy
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/cargo-upstream-tampered-e2e
+  proxy:
+    # Required by the gitops validator for type=proxy. The standalone
+    # UpstreamMapping at deploy/compose/example-config/upstreams/
+    # cargo-upstream-tampered-e2e.yaml is what the cargo upstream-pull
+    # path actually resolves through.
+    upstreamUrl: "http://wiremock-cargo-tampered:8080"
+  isPublic: true
+  replicationPriority: local_only

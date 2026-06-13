@@ -1,0 +1,34 @@
+apiVersion: v2
+name: hort-server
+description: hort — secure pull-through artifact registry
+type: application
+# Chart version. `hort-server migrate` re-asserts the events-role
+# hardening after every schema apply, so an operator or reconcile loop
+# running a bulk `GRANT … ON ALL TABLES … TO hort_app_role` cannot
+# leave `events` in a state the runtime probe refuses to boot against.
+version: 1.0.0-rc.14
+# Application (binary) version. Chart and binary are versioned together.
+appVersion: "1.0.0-rc.14"
+# Kubernetes 1.27 introduces the security primitives the chart relies on
+# (RuntimeDefault seccomp, restricted PSS as a hard baseline, native
+# `topologySpreadConstraints` v1).
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/project-hort/hort
+sources:
+  - https://github.com/project-hort/hort
+maintainers:
+  - name: hort
+keywords:
+  - artifact
+  - registry
+  - oci
+  - cargo
+  - npm
+  - pypi
+  - maven
+  - helm
+  - rpm
+  - debian
+icon: ""
+annotations:
+  artifacthub.io/license: MIT

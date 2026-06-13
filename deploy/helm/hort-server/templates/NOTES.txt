@@ -1,0 +1,166 @@
+Hort {{ .Chart.AppVersion }} ({{ .Chart.Name }}-{{ .Chart.Version }}) installed.
+
+Public URL:
+  {{ .Values.publicBaseUrl }}
+
+Service inside the cluster:
+  http://{{ include "hort-server.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+
+Verify:
+  kubectl --namespace {{ .Release.Namespace }} rollout status deploy/{{ include "hort-server.fullname" . }} --timeout=120s
+  kubectl --namespace {{ .Release.Namespace }} get jobs -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "hort-server.fullname" . }} 8080:{{ .Values.service.httpPort }}
+  curl -fsS http://localhost:8080/healthz
+
+{{- if .Values.metrics.requireAuth }}
+
+Metrics:
+  /metrics is auth-gated (HORT_METRICS_REQUIRE_AUTH=true). Wire a bearer
+  token via `secrets.mounts` and your Prometheus ServiceMonitor's
+  `bearerTokenSecret` to scrape it.
+{{- if not .Values.metrics.bindAddr }}
+  metrics.bindAddr is empty: /metrics is mounted on the main 8080
+  router (dev mode); no separate metrics listener is bound.
+{{- end }}
+{{- end }}
+
+{{- if eq .Values.auth.provider "disabled" }}
+
+==============================================================================
+NOTE: auth.provider = "disabled"
+==============================================================================
+The chart is installed with OIDC disabled. The boot gate
+(`ensure_auth_enabled`) requires `nativeTokens.enabled: true` alongside
+this — the inbound identity surface is the native-token validator
+(`Bearer hort_<kind>_*`). Issue a service-account token after rollout:
+
+  kubectl --namespace {{ .Release.Namespace }} exec -it \
+      deploy/{{ include "hort-server.fullname" . }} -- \
+      hort-server admin issue-svc-token \
+        --name=ops \
+        --permission=admin \
+        --output=stdout
+
+then on the operator workstation:
+
+  hort-cli auth login --paste
+
+This is acceptable for small / single-operator deployments. For
+multi-user / federated deployments switch to OIDC:
+
+  helm upgrade ... --set auth.provider=oidc \
+                   --set auth.oidc.issuerUrl=https://your-idp/... \
+                   --set auth.oidc.audience=hort-server
+==============================================================================
+{{- end }}
+
+==============================================================================
+Breaking changes in this release
+==============================================================================
+The following operator-facing surfaces were removed in a hard cutover
+(no compat shim). Values files carried over from an older chart release
+MUST migrate:
+
+  - `auth.provider: basic` (enum value) → use
+    `auth.provider: disabled` + `auth.nativeTokens.enabled: true`
+    (the validator is the new inbound identity surface; see the
+    `disabled`-block note above).
+  - `auth.basic.*` (object) → removed; no replacement.
+  - `HORT_AUTH_LOCKOUT_*` env vars (formerly rendered under
+    `auth.lockout.*`) → removed; the PAT-side brute-force lockout
+    (`HORT_PAT_LOCKOUT_*`, distinct mechanism) is unchanged.
+
+A values file with `auth.provider: basic` will be rejected by chart
+schema validation at `helm install` / `helm upgrade` time.
+==============================================================================
+
+{{- if not .Values.metrics.requireAuth }}
+
+==============================================================================
+WARNING: metrics.requireAuth = false
+==============================================================================
+The /metrics endpoint is unauthenticated. This endpoint is auth-gated
+by default; turning it back off is acceptable only on a private metrics
+network where every scraper is a trusted operator.
+
+Fix:
+  helm upgrade ... --set metrics.requireAuth=true
+==============================================================================
+{{- end }}
+
+{{- if eq .Values.storage.backend "filesystem" }}
+
+Filesystem storage:
+  Backed by PVC `{{ include "hort-server.pvcName" . }}` ({{ .Values.storage.filesystem.pvc.size }}, RWO).
+  The PVC has `helm.sh/resource-policy: keep` — `helm uninstall` will
+  NOT delete artifact data. Reclaim disk explicitly with:
+    kubectl --namespace {{ .Release.Namespace }} delete pvc {{ include "hort-server.pvcName" . }}
+{{- end }}
+
+{{- if .Values.worker.enabled }}
+
+Scanner worker (alpha F22 default):
+  worker.enabled = true (chart default). The hort-worker pod pulls
+  `{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag | default .Chart.AppVersion }}`
+  (Trivy + osv-scanner bundled) and processes `kind='scan'` jobs the
+  binary dispatches on every ingest. Without this, quarantine-by-
+  default + the fail-closed release predicate locks every freshly-ingested
+  artifact in `Quarantined` forever — no `ScanCompleted` event means no
+  release authority.
+
+  If you cannot pull the hort-worker image (air-gapped / private
+  registry), either:
+    --set worker.image.repository=<your-mirror>/hort-worker
+    OR
+    --set worker.enabled=false  + declare a kind: ScanPolicy with
+    scan_backends: [] in gitopsConfig (the ScanWaived authority — see
+    docs/architecture/how-to/declare-gitops-config.md)
+{{- else }}
+
+WARNING: worker.enabled = false
+  Quarantine-by-default is on but no scanner worker is running. The
+  F-6 fail-closed release predicate requires either `ScanCompleted`
+  (which only the worker produces) OR an explicit `ScanPolicy` with
+  `scan_backends: []`. Without one of these, freshly-ingested
+  artifacts will stay in `Quarantined` permanently — downloads return
+  503 indefinitely.
+
+  If this is intentional, declare a kind: ScanPolicy with
+  scan_backends: [] in gitopsConfig — see
+  docs/architecture/how-to/declare-gitops-config.md.
+{{- end }}
+
+Operator docs:
+  - Install:        docs/architecture/how-to/deploy/install.md
+  - Values ref:     docs/architecture/how-to/deploy/values-reference.md
+  - Hardening:      docs/architecture/how-to/deploy/security-hardening-checklist.md
+  - Upgrade:        docs/architecture/how-to/deploy/upgrade-from-prototype.md
+
+{{- /*
+  Backlog 078 Item 9 (chart S4): rotation is enabled by the single
+  toggle `scheduledTasks.serviceAccountRotation.enabled` (under the
+  `adminTasksEnabled` umbrella the schema requires). Gate this NOTES
+  block on `worker.enabled` + that pair so it only advertises the
+  cadence when the worker that actually performs the rotation is also
+  deployed. (Pre-078 this also checked a separate
+  `worker.rotation.enabled`; that second switch was collapsed.)
+*/ -}}
+{{- if and .Values.worker.enabled .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.serviceAccountRotation.enabled }}
+
+==============================================================================
+Service-account PAT rotation enabled
+==============================================================================
+Operators write `kind: ServiceAccount` CRDs (gitops-managed) with a
+`fallbackRotation:` block. The worker mints a fresh PAT on every
+CronJob tick and writes it into the named target Secret.
+
+  CronJob cadence:        {{ .Values.scheduledTasks.serviceAccountRotation.schedule }}
+  Target namespaces:      {{ if .Values.worker.rotation.targetNamespaces }}{{ join ", " .Values.worker.rotation.targetNamespaces }}{{ else }}(none — handler will warn `namespace_not_authorized` on every SA){{ end }}
+  Public registry host:   {{ .Values.worker.rotation.publicRegistryHost }}
+
+See:
+  - docs/architecture/how-to/rotating-service-account-tokens.md
+  - docs/architecture/how-to/federate-k8s-workload-identity.md
+  - docs/architecture/how-to/federate-ci-oidc.md
+==============================================================================
+{{- end }}

@@ -1,0 +1,20 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  # Tampered-bytes companion to cargo-upstream-e2e. Different upstream
+  # URL (wiremock-cargo-tampered) so the two scenarios stay fully
+  # isolated; the NDJSON the tampered wiremock serves still advertises
+  # the real upstream `cksum` — only the .crate body bytes are altered,
+  # which is exactly the supply-chain-attack surface the verification
+  # gate exists to catch.
+  name: cargo-upstream-tampered-e2e
+spec:
+  repository: cargo-upstream-tampered-e2e
+  pathPrefix: ""
+  upstreamUrl: http://wiremock-cargo-tampered:8080
+  # Explicit opt-in for the plaintext tampered-bytes wiremock fixture.
+  # Same posture as the happy-path mapping: dev/e2e only, never
+  # production.
+  insecureUpstreamUrl: true
+  auth:
+    type: anonymous

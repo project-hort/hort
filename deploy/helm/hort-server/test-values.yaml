@@ -1,0 +1,26 @@
+# Minimal-OIDC test values. Used for `helm template` smoke and the
+# Item 11 kind-cluster verification. Single replica, filesystem PVC,
+# memory ephemeral store, OIDC against a placeholder Keycloak realm.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+  filesystem:
+    pvc:
+      enabled: true
+      size: 50Gi
+
+ephemeralStore:
+  backend: memory

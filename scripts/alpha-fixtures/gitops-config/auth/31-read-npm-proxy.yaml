@@ -1,0 +1,22 @@
+# PermissionGrant: [developer, ci-pusher] -> Read on npm-proxy.
+#
+# Two-claim + per-repo (linter-clean): clears both single-claim-grant
+# AND wildcard-repo-non-admin rules (both `reject` by secure default).
+# Mirroring `deploy/compose/example-config/auth/dev-*-e2e.yaml`.
+# Paired with the matching `34-prefetch-npm-proxy.yaml` to satisfy the
+# Read ∧ Prefetch self-service-prefetch requirement.
+#
+# A `test-developers` member authenticated via the OIDC CLI-session flow
+# (the CliSession access token is a claims-carrying signed JWT) carries
+# [developer, ci-pusher], so this grant authorizes
+# `hort-cli list-versions npm-proxy <pkg>`.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: developers-read-npm-proxy
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: npm-proxy

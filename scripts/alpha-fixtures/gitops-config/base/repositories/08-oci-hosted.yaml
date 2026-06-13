@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: oci-hosted
+spec:
+  name: "OCI Hosted"
+  description: "Local-push hosted OCI repo (alpha)"
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+    path: oci-hosted
+  isPublic: true
+  replicationPriority: local_only

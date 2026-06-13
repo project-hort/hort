@@ -1,0 +1,366 @@
+name: Docker Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g., v1.0.0, latest)'
+        required: true
+        default: 'latest'
+
+permissions: {}
+
+# Concurrency rules:
+#
+# - The group is keyed by `event_name` + `ref` so push and workflow_dispatch
+#   for the same branch are in DIFFERENT groups. A manual run (`workflow_dispatch`)
+#   never gets cancelled by an auto run, and vice versa.
+# - `cancel-in-progress` is true ONLY for branch pushes (not tag pushes,
+#   not workflow_dispatch). When a new commit lands on main while an
+#   earlier auto-build is still running, the older one is cancelled so we
+#   stop building stale containers.
+# - Tag pushes (releases) and manual dispatches always run to completion.
+concurrency:
+  group: docker-publish-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  REGISTRY: ghcr.io
+  SERVER_IMAGE: ${{ github.repository }}-server
+
+jobs:
+  build-server:
+    name: Server (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Mapped from the secret so the Docker Hub login step can be skipped
+      # when no creds are configured (secrets can't be used in `if:`
+      # directly). Empty on the public mirror → that step is skipped and
+      # base images pull anonymously.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    outputs:
+      digest-amd64: ${{ steps.build.outputs.digest }}
+      digest-arm64: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Authenticate to Docker Hub before buildx so any transitive `FROM`
+      # base-image pulls from docker.io are not subject to the
+      # 100-pull/6h anonymous rate limit.
+      - name: Log in to Docker Hub (for transitive base-image pulls)
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.hort-server
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=server-${{ matrix.platform }}
+          cache-to: type=gha,scope=server-${{ matrix.platform }},mode=max
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: server-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  scan-containers:
+    name: Security Scan
+    runs-on: ubuntu-24.04
+    needs: [build-server]
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download backend amd64 digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: server-digests-amd64
+          path: /tmp/server-digests
+
+      - name: Resolve image reference
+        id: refs
+        run: |
+          BACKEND_DIGEST=$(ls /tmp/server-digests/)
+          echo "backend=${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}@sha256:${BACKEND_DIGEST}" >> $GITHUB_OUTPUT
+
+      # --- Trivy CVE scanning ---
+      # --ignore-unfixed: only fail on CVEs with available patches.
+      # Unpatched UBI base image CVEs (Red Hat's responsibility) are still
+      # reported in SARIF for visibility but don't block the build.
+      # Trivy scans upload SARIF to GitHub Security tab for visibility.
+      # exit-code: 0 means scan results are informational — unfixed base image
+      # CVEs (Red Hat's responsibility) should not block image publishing.
+      # NOTE: trivy binary extracted from official GHCR image because the
+      # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
+      - name: Install Trivy
+        run: |
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.3)
+          docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
+          docker rm "$CONTAINER_ID"
+          trivy --version
+
+      - name: Trivy scan - Backend
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          image-ref: ${{ steps.refs.outputs.backend }}
+          format: 'sarif'
+          output: 'backend-trivy.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '0'
+          skip-setup-trivy: true
+
+      - name: Upload Backend Trivy SARIF
+        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4
+        if: always()
+        with:
+          sarif_file: 'backend-trivy.sarif'
+          category: 'trivy-backend'
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: trivy-scan-reports
+          path: |
+            backend-trivy.sarif
+          retention-days: 90
+
+      - name: Scan summary
+        if: always()
+        run: |
+          echo "## Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Trivy CVE Scan (server image)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Policy**: CRITICAL / HIGH CVEs reported (informational; unfixed base-image CVEs do not block)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+
+  merge-server:
+    name: Backend Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: [build-server]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: server-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (ghcr.io)
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list and push (ghcr.io)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+
+      - name: Inspect image
+        id: inspect
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:${{ steps.meta.outputs.version }}
+          DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
+            ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}@${{ steps.inspect.outputs.digest }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
+        continue-on-error: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually
+  # publish the expected semver tags on ghcr.io.
+  #
+  # Background: issue #905 was filed because operators believed semver tags
+  # (1.1.7, 1.1.8) were missing on ghcr.io. The reproduction used
+  # `gh api .../packages/.../versions` without `--paginate`; that endpoint
+  # returns at most 30 versions per page sorted by recency, and the page is
+  # dominated by sha-prefixed dev/branch tags, so semver tags get pushed off
+  # the visible window. The tags were in fact present.
+  #
+  # To make the publish contract self-evident, this job probes the registry
+  # the same way consumers do (a HEAD on the manifest endpoint) and fails
+  # the workflow if any expected semver tag is missing for the current ref.
+  # That way we catch the real failure mode (a push that silently no-op'd)
+  # in the publish workflow itself, not days later via a broken helm install.
+  # ════════════════════════════════════════════════════════════════════════════
+  verify-published:
+    name: Verify Published Tags
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    needs: [merge-server]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Probe ghcr.io manifests for expected semver tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVER_IMAGE: ${{ env.SERVER_IMAGE }}
+        run: |
+          set -u
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Verifying ghcr.io semver tags for version: ${VERSION}"
+
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          probe_ghcr() {
+            local name="$1"; local tag="$2"
+            local token
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            curl -sfL --proto =https -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${tag}"
+          }
+
+          # Tags this workflow promises to publish on a tag push. Mirror the
+          # metadata-action `tags:` blocks above.
+          EXPECTED=(
+            "${SERVER_IMAGE}:${VERSION}"
+          )
+
+          missing=()
+          for entry in "${EXPECTED[@]}"; do
+            name="${entry%:*}"
+            tag="${entry#*:}"
+            if probe_ghcr "${name}" "${tag}"; then
+              echo "  ok  ghcr.io/${name}:${tag}"
+            else
+              echo "::error::ghcr.io/${name}:${tag} is missing"
+              missing+=("ghcr.io/${name}:${tag}")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Tag-triggered publish completed but some expected semver tags are not present on ghcr.io. Inspect the merge-* jobs for silent imagetools failures."
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "All expected ghcr.io semver tags present for ${VERSION}."
+
+  summary:
+    name: Publish Summary
+    runs-on: ubuntu-latest
+    permissions: {}
+    needs: [merge-server]
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Server" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
+          echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC)" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='https://github.com/project-hort/.*' ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY

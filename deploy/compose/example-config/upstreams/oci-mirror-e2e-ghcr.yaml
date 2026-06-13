@@ -1,0 +1,10 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: oci-mirror-e2e-ghcr
+spec:
+  repository: oci-mirror-e2e
+  pathPrefix: ghcr/
+  upstreamUrl: https://ghcr.io
+  auth:
+    type: bearer_challenge

@@ -1,0 +1,70 @@
+[package]
+name = "hort-adapters-provenance-sigstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort outbound adapter — Sigstore/cosign offline-bundle provenance verifier (ProvenancePort impl)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+hort-config = { path = "../hort-config" }
+hort-app    = { path = "../hort-app" }
+
+# `reqwest` is the workspace-pinned 0.12. The ONLY live HTTP client this
+# adapter builds is the periodic TUF trust-root refresh (`extra_ca.rs` +
+# `reqwest::Client::builder()` per ADR 0010); the verify path is fully
+# offline. NOTE: the `sigstore` crate pulls in its OWN transitive
+# `reqwest 0.13` for its built-in TUF (`SigstoreTrustRoot::new`) path,
+# which this adapter deliberately does NOT use (it calls
+# `reqwest::Client::new()` internally — the exact ADR 0010 anti-pattern).
+# We fetch the trusted-root bytes with the workspace 0.12 client and hand
+# them to `from_trusted_root_json_unchecked`.
+reqwest    = { workspace = true }
+serde_json = { workspace = true }
+hex        = { workspace = true }
+sha2       = { workspace = true }
+chrono     = { workspace = true }
+
+# Sigstore verification primitives (ADR 0027). Offline bundle verify
+# against an injectable trust root (`ManualTrustRoot` / `SigstoreTrustRoot::
+# from_trusted_root_json_unchecked`) + the `bundle::Bundle` (protobuf-specs)
+# parser. `verify` + `bundle` + `sigstore-trust-root` features; `rustls-tls`
+# (NOT native-tls) to match the workspace rustls posture. We do NOT enable any
+# feature that requires live TUF on the verify path.
+# `cosign` is deliberately NOT enabled: the verify path is entirely
+# `sigstore::bundle::verify::{Verifier, policy}` + `sigstore::bundle::Bundle`
+# (never `sigstore::cosign::*`), so the cosign sign/registry-client feature is
+# dead weight — dropping it prunes ~20 transitive crates (the cosign OCI/
+# registry client tree) with no code change. Verified: adapter tests + worker/
+# server build green without it. (`reqwest 0.13` + `oauth2` are NOT droppable —
+# sigstore's `bundle`/`verify` core pulls them regardless; `sigstore-trust-root`
+# is kept for the library-blessed `from_trusted_root_json_unchecked` loader
+# rather than hand-rolling a `ManualTrustRoot` over the root of trust.)
+sigstore = { version = "0.14.0", default-features = false, features = [
+    "bundle",
+    "verify",
+    "sigstore-trust-root",
+    "rustls-tls",
+] }
+# The bundle / trust-root protobuf types (`Bundle`, the verification-
+# material content oneof, the message-vs-DSSE content oneof) live here.
+# Pinned to the same `0.5` major `sigstore` 0.14 depends on so the
+# `Bundle` type unifies (no duplicate-type mismatch across the boundary).
+sigstore_protobuf_specs = { version = "0.5", default-features = false }
+# Identity extraction from the verified Fulcio leaf certificate. Pinned to
+# the same majors sigstore 0.14 uses so the `x509_cert::Certificate` types
+# unify (no duplicate-type mismatch).
+x509-cert = { version = "0.2", default-features = false, features = ["std", "pem"] }
+const-oid = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+# Self-signed root generation for the extra-CA apply test (same fixture
+# pattern as hort-adapters-advisory-osv — no committed PEM).
+rcgen = "0.13"
+# In-process HTTP server for the TUF trust-root refresh fetch test (the
+# only live-HTTP path in the crate). Same dev-dep the OSV adapter uses.
+wiremock = "0.6"

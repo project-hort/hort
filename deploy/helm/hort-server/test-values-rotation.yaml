@@ -1,0 +1,63 @@
+# Test fixture: enable service-account PAT rotation for
+# helm-template verification.
+#
+# Backlog 078 Item 9 (chart S4) — rotation is enabled by the SINGLE
+# source-of-truth toggle `scheduledTasks.serviceAccountRotation.enabled`.
+# That one flag drives BOTH the CronJob AND the worker-side wiring
+# (env block + per-namespace RBAC). There is no separate
+# `worker.rotation.enabled`; `worker.rotation.*` only carries the
+# worker-side PARAMETERS.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ \
+#       -f deploy/helm/hort-server/test-values-rotation.yaml
+#
+# Expected manifests (beyond the baseline):
+#   - CronJob (cronjob-service-account-rotation.yaml)
+#   - Role + RoleBinding for namespace `ci-system`
+#       (svc-rotation-rbac.yaml)
+#   - Role + RoleBinding for namespace `flux-system`
+#       (svc-rotation-rbac.yaml)
+#   - Worker Deployment env vars:
+#       - HORT_K8S_SECRET_WRITER_ENABLED = "true"
+#       - HORT_ROTATION_TARGET_NAMESPACES = "ci-system,flux-system"
+#       - HORT_PUBLIC_REGISTRY_HOST = "registry.example.com:5443"
+#
+# None of these render with the default values (the single rotation
+# toggle defaults to false). This file is strictly for local helm lint /
+# template smoke tests — it is not a production values file.
+
+worker:
+  enabled: true
+  rotation:
+    targetNamespaces:
+      - ci-system
+      - flux-system
+    publicRegistryHost: "registry.example.com:5443"
+
+scheduledTasks:
+  adminTasksEnabled: true
+  serviceAccountRotation:
+    enabled: true
+    schedule: "*/15 * * * *"
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

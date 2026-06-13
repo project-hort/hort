@@ -1,0 +1,33 @@
+[package]
+name = "hort-http-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for the discovery + self-service prefetch REST surface"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+arc-swap                    = { workspace = true }
+chrono                      = { workspace = true }
+uuid                        = { workspace = true }
+# Inline test module drives routers through tower's ServiceExt::oneshot.
+tower                       = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+metrics-util                = { workspace = true, features = ["debugging"] }
+metrics                     = { workspace = true }

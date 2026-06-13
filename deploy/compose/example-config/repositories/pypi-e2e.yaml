@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: pypi-e2e
+spec:
+  name: "PyPI E2E"
+  description: "Hosted PyPI repo used by scripts/native-tests/scenarios/clients/pypi.sh"
+  format: pypi
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/pypi-e2e
+  isPublic: true
+  replicationPriority: local_only

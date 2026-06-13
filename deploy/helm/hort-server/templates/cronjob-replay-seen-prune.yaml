@@ -1,0 +1,115 @@
+{{/*
+Replay-seen-prune CronJob (federated-JWT replay guard, seen-set
+TTL-cleanup).
+
+Periodically invokes `hort-cli admin task invoke replay-seen-prune`,
+which hits `POST /api/v1/admin/tasks/replay-seen-prune`. The endpoint
+enqueues a `kind='replay-seen-prune'` row that the worker's dispatcher
+hands to the `ReplaySeenPruneHandler` (registered unconditionally in
+`hort-worker::composition` — the prune only needs the Postgres pool the
+worker always has; `jwt_replay_seen` lives in the same database,
+migration 011).
+
+The handler runs one
+`DELETE FROM jwt_replay_seen WHERE expires_at < now()` tick (the
+periodic delete-expired cleanup the F-1 spec §4 selected over
+delete-on-write / DB-side TTL) and reports the deleted-row count in
+the job's `result_summary`.
+
+Architectural note: this CronJob is a *trigger* only. The actual
+DELETE runs in the worker pod (the `PgReplayGuardRepository::prune_expired`
+DML). The CronJob pod only calls the hort-server admin-task HTTP
+endpoint with a service-account PAT.
+
+Default schedule: **hourly** (spec §4 — "interval ≈ the federation
+max (hourly)"; the table only grows by one row per distinct federated
+exchange per hour, so an hourly prune keeps it bounded).
+
+Cleanup degrades SAFE (spec §4 / the F-22/F-1 crux): if this CronJob
+is disabled or the prune fails, the table only grows — the seen-set
+never *forgets* a recorded `jti`/composite within its TTL window, so
+replay protection NEVER degrades. The only cost is storage. Therefore
+a failed tick is retried on the next schedule (the handler returns
+`Failed { retry: true }`, logged at `warn!`, never `error!` and never
+a hard worker failure).
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents a
+second pod while the previous tick runs. Execution-overlap protection
+lives in the worker's per-kind semaphore (the handler is registered
+single-active).
+
+Idempotency-Key: `--idempotency-key-window=hour`
+computes `<UTC hour>:replay-seen-prune`, so a controller-restart
+double-fire within the same hour short-circuits at the framework
+layer rather than enqueuing two prune jobs for the same window
+(harmless if it did — the second DELETE is a no-op — but consistent
+with the other CronJob templates).
+
+DEFAULT-ENABLED: a never-pruned `jwt_replay_seen` is a pure
+storage-growth liability and the prune has no security effect either
+way (the seen-set never forgets within TTL; pruning only reclaims
+storage of already-expired rows the validator would reject as
+`Expired` anyway). So this template ships
+`scheduledTasks.replaySeenPrune.enabled: true` by default — unlike
+every sibling CronJob template, which defaults to `false`. The parent
+toggle `scheduledTasks.adminTasksEnabled` must still be true for ANY
+CronJob (and the svc-token bootstrap Job) to render; that master
+switch is the single opt-in surface, and the replay-seen-prune is on
+by default once it is flipped.
+
+The service-account token (`{{ release }}-svc-token`) is mounted from
+the k8s Secret written by the bootstrap Job (svc-token-bootstrap-job.yaml).
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.replaySeenPrune.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-replay-seen-prune
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: replay-seen-prune
+spec:
+  schedule: {{ .Values.scheduledTasks.replaySeenPrune.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: replay-seen-prune
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Distroless runtime: invoke `hort-cli` directly; the
+              # idempotency key is computed inside the CLI via
+              # `--idempotency-key-window` (no shell `date`).
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - replay-seen-prune
+                - --idempotency-key-window
+                - hour
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

@@ -1,0 +1,36 @@
+{{- if .Values.metrics.serviceMonitor.enabled -}}
+{{- if not .Values.metrics.bindAddr -}}
+{{- fail "metrics.serviceMonitor.enabled=true requires metrics.bindAddr to be set (the ServiceMonitor scrapes the dedicated metrics Service port; with bindAddr empty, /metrics is on the main router and the Service port is not exposed)." -}}
+{{- end -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "hort-server.fullname" . }}
+  {{- with .Values.metrics.serviceMonitor.namespace }}
+  namespace: {{ . | quote }}
+  {{- end }}
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
+  {{- if .Values.metrics.serviceMonitor.namespace }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace | quote }}
+  {{- end }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+      {{- if .Values.metrics.requireAuth }}
+      # When metrics.requireAuth=true, the operator must supply a
+      # Secret carrying a bearer token. Wire it via `secrets.mounts`
+      # AND extend this ServiceMonitor with `bearerTokenSecret`. The
+      # chart cannot guess the operator's token-issuance mechanism
+      # (static, OIDC service-account, K8s SA tokens, …); see
+      # `docs/architecture/how-to/deploy/install.md` § Metrics auth.
+      {{- end }}
+{{- end -}}

@@ -1,0 +1,17 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: pypi-proxy
+spec:
+  name: "PyPI Proxy"
+  description: "Pull-through cache for pypi.org (alpha)"
+  format: pypi
+  type: proxy
+  storage:
+    backend: filesystem
+    path: pypi-proxy
+  proxy:
+    upstreamUrl: "https://pypi.org"
+  isPublic: true
+  replicationPriority: local_only
+  indexMode: include_pending

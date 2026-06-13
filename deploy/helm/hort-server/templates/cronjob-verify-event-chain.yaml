@@ -1,0 +1,93 @@
+{{/*
+Event-chain verifier CronJob.
+
+Periodically runs the F-2 offline tamper-evidence verifier
+`hort-server verify-event-chain --format json`, which reads the `events`
+table (per-stream hash chain) and the externally-anchored checkpoints,
+recomputes every stream's chain, cross-checks it against the anchored
+heads, and exits 0 (intact) / 2 (a detected integrity violation) / 3
+(missing/stale checkpoint, when `--fail-on-missing-checkpoint`, the
+default) / 1 (operational error — verifier could not run). The verdict
+is also surfaced as the `hort_event_chain_verify_total{result}` counter
+(spec §8.2).
+
+Unlike the sibling `cronjob-eventstore-checkpoint.yaml` (a *trigger* that
+POSTs to the worker's admin-task endpoint), this is NOT a worker-
+dispatched task: `verify-event-chain` is a direct `hort-server`
+subcommand that connects to Postgres with the **runtime DML DSN**
+(`HORT_DATABASE_URL`, falling back to bare `DATABASE_URL`; SELECT-only on
+`events` — Backlog 078 Item 5) and reads the anchor object
+store. It therefore reuses the `hort-server.runtimeEnv` helper (the same
+DSN + storage env the Deployment parses), runs the `hort-server` binary
+directly, and does not need the `{{ release }}-svc-token` PAT the
+checkpoint CronJob mounts.
+
+On each completed run the subcommand records a `kind='verify-event-chain'`
+liveness breadcrumb row in `jobs` (`status='completed'`,
+`trigger_source='scheduled'`) via `JobsRepository::record_run_completion`.
+The boot-time `hort_event_chain_verify_overdue` gauge (F-52) reads the
+newest such row, so a verifier that was enabled and then stopped becomes
+alarmable on `max_over_time(hort_event_chain_verify_overdue[…]) > 0`.
+
+Default schedule: **daily** — consistent with the
+`HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS` default (86400 s) the
+F-52 boot gauge uses; operators with a tighter compliance window may
+shorten both in lock-step. (The anchor-*staleness* window the verifier
+applies to checkpoints is the separate `eventstore-checkpoint` cadence;
+this schedule is how often the verifier *runs*, not how fresh a
+checkpoint must be.)
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents a
+second pod while the previous run is still scanning.
+
+Gated by `scheduledTasks.verifyEventChain.enabled` (default false). The parent
+toggle `scheduledTasks.adminTasksEnabled` must also be true. The verifier runs against
+the same storage backend the server uses; on a filesystem backend (no
+object store) the anchor cross-check resolves to `missing_checkpoint`
+(exit 3) — enable the `eventstoreCheckpoint` CronJob + an S3 anchor
+bucket for full external-anchor attestation.
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.verifyEventChain.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-verify-event-chain
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: verify-event-chain
+spec:
+  schedule: {{ .Values.scheduledTasks.verifyEventChain.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: verify-event-chain
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-server
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Direct subcommand — the verifier is an in-process reader,
+              # not a worker-dispatched admin task. JSON output for CI /
+              # log-scrapers (spec §8.2).
+              command:
+                - /usr/local/bin/hort-server
+              args:
+                - verify-event-chain
+                - --format
+                - json
+              env:
+                {{- include "hort-server.runtimeEnv" . | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

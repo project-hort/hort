@@ -1,0 +1,14 @@
+{
+  "name": "multi-algo-pkg",
+  "versions": {
+    "1.0.0": {
+      "name": "multi-algo-pkg",
+      "version": "1.0.0",
+      "dist": {
+        "integrity": "sha512-DpjRMBKjS+x3KT6u9KyeeZbzuLtISAdrQyMI1MAnc6/fCKDe4D8UUGTMAFXJA6RvkFT8Az7wjixSFpmbQvuPXQ== sha384-1EZh44y1Ul0pZkyoqC4b7IqskUE6BB5EMZXJQywIewrvbNvyNMdOSHKCAvQzv99h",
+        "shasum": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "tarball": "https://registry.npmjs.org/multi-algo-pkg/-/multi-algo-pkg-1.0.0.tgz"
+      }
+    }
+  }
+}

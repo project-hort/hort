@@ -1,0 +1,7 @@
+apiVersion: project-hort.de/v1beta1
+kind: Role
+metadata:
+  name: developer-extra
+spec:
+  description: "Operator-declared role used by the gitops-policies smoke test"
+  isSystem: false

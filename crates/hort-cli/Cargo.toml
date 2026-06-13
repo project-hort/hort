@@ -1,0 +1,61 @@
+[package]
+name = "hort-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort command-line client"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hort-cli"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP client — pure HTTP, no DSN, no hort-domain / hort-app / hort-adapters-* deps.
+reqwest    = { workspace = true, features = ["rustls-tls", "json"] }
+clap       = { workspace = true, features = ["derive", "env"] }
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+toml       = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+directories = { workspace = true }
+url        = { workspace = true }
+chrono     = { workspace = true }
+# Uuid type used by the curation BlockOutcomeDto +
+# AddExclusionResponseDto wire DTOs. Used as a typed deserialise target
+# so a malformed `correlation_id` / `exclusion_id` surfaces at parse
+# time rather than later string-handling. No new dep weight — uuid is
+# already in the workspace via every other crate.
+uuid       = { workspace = true }
+# Parse `--expires-in` go-style duration strings
+# (`1h`, `30m`, `4h`, `24h`) via `humantime::parse_duration`.
+humantime  = { workspace = true }
+# Masked terminal input for `auth login`.
+rpassword  = { workspace = true }
+# Best-effort browser launcher for OIDC device flow.
+webbrowser = "1.0"
+# RFC 8252 loopback-redirect flow.
+# tiny_http: a small synchronous HTTP/1.1 server library used to serve
+#   exactly one redirect callback on 127.0.0.1; full axum/hyper is
+#   overkill for a single one-shot request. Run on a blocking task
+#   spawned from the async dispatcher so the tokio runtime stays
+#   responsive.
+# sha2/rand/zeroize: workspace pins, kept identical to other crates'
+#   versions for one resolved version across the workspace. (base64 is
+#   per-crate at 0.22 — same pattern as hort-http-core etc.)
+tiny_http  = "0.12"
+sha2       = { workspace = true }
+rand       = { workspace = true }
+zeroize    = { workspace = true }
+base64     = "0.22"
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+mockito  = { workspace = true }
+tempfile = { workspace = true }

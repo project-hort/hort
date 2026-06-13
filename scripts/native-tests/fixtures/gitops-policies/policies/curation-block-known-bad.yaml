@@ -1,0 +1,9 @@
+apiVersion: project-hort.de/v1beta1
+kind: CurationRule
+metadata:
+  name: block-known-bad-1
+spec:
+  format: any
+  pattern: "evil-package*"
+  action: block
+  reason: "Smoke-test rule attached via gitops-policies fixture"

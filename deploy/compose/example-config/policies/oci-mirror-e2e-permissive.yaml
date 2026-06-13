@@ -1,0 +1,29 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: oci-mirror-e2e-permissive
+spec:
+  # Per-repo operator opt-out of quarantine-by-default. See
+  # `pypi-e2e-permissive.yaml` for the full rationale.
+  #
+  # The OCI multi-upstream pull-through smoke (`test-oci-mirror.sh`)
+  # exercises the proxy path: skopeo asks hort for `dockerhub/library/
+  # alpine:3.19`, hort fetches the manifest + blobs from Docker Hub, and
+  # the test asserts on the FIRST pull (cache miss) that the bytes round-
+  # trip cleanly + the upstream-fetch counter ticks. Under the default
+  # 86_400s quarantine window, the manifest GET that follows the upstream
+  # fetch 503s with `Retry-After 24h` because the manifest's own Artifact
+  # lands in `Quarantined`. The same applies to each layer blob.
+  #
+  # This is the proxy-side mirror of `oci-e2e-permissive.yaml` (the
+  # hosted local-only round-trip), and the same single-line opt-out
+  # restores the cache-miss-and-pull behaviour the test asserts on.
+  scope:
+    repository: oci-mirror-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  # Provenance off for permissive e2e (no per-ingest verify job).
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

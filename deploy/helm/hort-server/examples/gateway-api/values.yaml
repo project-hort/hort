@@ -1,0 +1,20 @@
+# hort-server is exposed via Gateway API v1 (GA in K8s 1.30). Pick this
+# overlay if your cluster has a Gateway controller installed
+# (Cilium, Istio, Envoy Gateway, NGINX Gateway Fabric, etc.) AND
+# you want to consolidate ingress under the Gateway API rather than
+# Ingress.
+
+requireHttps: true
+api:
+  bindAddr: "0.0.0.0:8080"
+
+# Gateway controllers typically front the chart's Service from a pool
+# of controller pods; the pod CIDR is what shows up as the source
+# of X-Forwarded-{For,Proto}. Adjust to your CNI's pod subnet.
+trustedProxyCidrs:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+
+# The Gateway, HTTPRoute, and (optional) BackendTLSPolicy resources
+# are applied alongside the chart — the README documents the YAML.

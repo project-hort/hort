@@ -1,0 +1,8 @@
+{
+  "request": { "method": "GET", "url": "/cf/g-/cfg-if" },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "text/plain; charset=utf-8" },
+    "bodyFileName": "cfg-if-index.ndjson"
+  }
+}

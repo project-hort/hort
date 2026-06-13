@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: pypi-hosted
+spec:
+  name: "PyPI Hosted"
+  description: "Local-publish hosted PyPI repo (alpha)"
+  format: pypi
+  type: hosted
+  storage:
+    backend: filesystem
+    path: pypi-hosted
+  isPublic: true
+  replicationPriority: local_only

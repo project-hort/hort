@@ -1,0 +1,118 @@
+{{/*
+Additive, Job-scoped NetworkPolicy.
+
+WHY THIS EXISTS
+  The app-pod NetworkPolicy (`networkpolicy.yaml`) renders by default
+  with an EMPTY operator-supplied `egress` list. Stock Kubernetes treats
+  `policyTypes: [Egress]` + zero egress rules as DENY-ALL egress. Its
+  `podSelector` matches `hort-server.selectorLabels` — and EVERY
+  Job/CronJob pod template in this chart ALSO carries
+  `hort-server.selectorLabels` (plus its own `hort-server.io/job: <name>`
+  discriminator). So the deny-all also catches the pre-install `migrate`
+  Helm hook Job, which must reach Postgres before the app is ever created
+  → `helm install` aborts at the pre-install hook. The app-pod posture is
+  deliberately secure-by-default (a shipped CRA Annex I (1) control) and
+  is NOT weakened here: "default the policy off" was explicitly rejected.
+  Instead this is an ADDITIVE policy.
+
+  Kubernetes NetworkPolicies are purely additive (the effective allow
+  set for a pod is the UNION of every policy selecting it). This policy
+  introduces NO new restriction on any pod; it only ADDS an egress
+  allowance to the Job/CronJob pods. The app-pod policy in
+  `networkpolicy.yaml` is left byte-identical.
+
+SELECTOR
+  `matchExpressions: hort-server.io/job Exists` selects exactly the
+  Job/CronJob pods (every cronjob-*.yaml + job-migrate.yaml +
+  svc-token-bootstrap-job.yaml pod template sets this label). The app
+  Deployment pods do NOT carry an `hort-server.io/job` label (they carry
+  `app.kubernetes.io/component: server` instead), so this policy never
+  selects an app pod — F-33's app-pod deny-all is untouched.
+
+EGRESS SHAPE — why unrestricted egress + explicit DNS, not an ipBlock
+  The DB endpoint is inside the operator-supplied opaque Secret DSN
+  (`postgres://…@host:5432/db` in `postgres.{admin,app}.existingSecret`)
+  — the chart never sees the host/port/CIDR. This is the SAME reason
+  The app NetworkPolicy ships the `egress` list empty ("the chart does
+  not guess your cluster's CIDRs", values.yaml). Inventing a CIDR here
+  would be a guess; the chart deliberately keeps CIDR auto-discovery
+  out of scope. The deterministic fact is that these
+  Jobs need outbound network at all. The standard, no-guess bootstrap-
+  Job carve-out is therefore: allow DNS resolution (UDP+TCP 53) and
+  otherwise-unrestricted egress, SCOPED to the Job pods only. The
+  migrate Job by design opens exactly one outbound TCP connection (to
+  Postgres via HORT_DATABASE_URL — see job-migrate.yaml) and makes no
+  Kubernetes API calls; the svc-token-bootstrap Job additionally needs
+  the kube-apiserver (kubectl apply of the token Secret). Both are
+  covered by the un-narrowed `to: []` egress rule below without the
+  chart guessing any address. Operators who DO know their cluster CIDRs
+  and want a tighter Job egress narrow it via the app `egress` posture
+  guidance in control-plane-tiers.md; this policy guarantees the
+  default install is not bricked.
+
+PER-PRE-APP-HOOK-JOB VERDICT (audit table)
+  | Template                       | Kind | Helm hook / trigger          | Needs net before app readiness?              | Disposition |
+  |--------------------------------|------|------------------------------|----------------------------------------------|-------------|
+  | job-migrate.yaml               | Job  | pre-install,pre-upgrade (-5) | YES — Postgres before the Deployment exists   | CARVE-OUT (the F4 defect; this policy fixes it) |
+  | svc-token-bootstrap-job.yaml   | Job  | post-install,post-upgrade(5) | YES — init-ctr → Postgres (admin DSN); main-ctr → kube-apiserver (kubectl). Runs while the deny-all is active. | CARVE-OUT (same scoped allowance; covered by this policy's `hort-server.io/job` selector) |
+  | cronjob-noop.yaml              | CronJob | schedule (scheduledTasks.adminTasksEnabled, default OFF) | NO — scheduled, never on the install critical path; not a pre-app hook | not pre-app; covered defensively by the same selector (cheap, correct, identical deny-all problem) |
+  | cronjob-staging-sweep.yaml     | CronJob | schedule                  | NO — scheduled task, post-readiness            | not pre-app; covered defensively |
+  | cronjob-scrub.yaml             | CronJob | schedule (scrub.enabled)  | NO — scheduled CAS scrub, post-readiness       | not pre-app; covered defensively |
+  | cronjob-cron-rescan-tick.yaml  | CronJob | schedule                  | NO — scheduled rescan tick, post-readiness     | not pre-app; covered defensively |
+  | cronjob-advisory-watch-tick.yaml | CronJob | schedule                | NO — scheduled advisory watch, post-readiness  | not pre-app; covered defensively |
+  | cronjob-eventstore-checkpoint.yaml | CronJob | schedule              | NO — scheduled checkpoint, post-readiness      | not pre-app; covered defensively |
+  | cronjob-eventstore-archive.yaml | CronJob | schedule                 | NO — scheduled archive, post-readiness         | not pre-app; covered defensively |
+  | cronjob-replay-seen-prune.yaml | CronJob | schedule                  | NO — scheduled prune, post-readiness           | not pre-app; covered defensively |
+  | cronjob-retention-evaluate.yaml | CronJob | schedule                 | NO — scheduled retention eval, post-readiness  | not pre-app; covered defensively |
+  | cronjob-retention-purge.yaml   | CronJob | schedule                  | NO — scheduled retention purge, post-readiness | not pre-app; covered defensively |
+  | cronjob-service-account-rotation.yaml | CronJob | schedule           | NO — scheduled SA rotation, post-readiness     | not pre-app; covered defensively |
+  Verdict summary: ONLY job-migrate is a true pre-app (pre-Deployment)
+  hook that bricks `helm install`. svc-token-bootstrap is a post-app
+  hook that still needs net while the deny-all is active. The CronJobs
+  are scheduled tasks (default-disabled), never on the install critical
+  path — but they share the identical deny-all problem, so the single
+  `hort-server.io/job Exists` selector covers them too at zero extra cost
+  and with no posture change to the app pods.
+
+ESCAPE HATCH PARITY
+  Gated on the SAME `.Values.networkPolicy.enabled` as the app-pod
+  policy. `networkPolicy.enabled: false` disables BOTH (the F-33 escape
+  hatch is unchanged): no app-pod policy, no Job-scoped policy, stock
+  cluster default applies to everything.
+*/}}
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "hort-server.fullname" . }}-job-bootstrap-egress
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+spec:
+  # Selects exactly the Job/CronJob pods (every such pod template sets
+  # an `hort-server.io/job` label). The app Deployment pods do not carry
+  # this label key, so this policy never selects an app pod.
+  podSelector:
+    matchExpressions:
+      - key: hort-server.io/job
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    # DNS — Postgres/S3/OIDC/registry hostnames in the operator DSNs and
+    # config must resolve before any TCP connection. UDP is the default
+    # resolver transport; TCP 53 covers truncated/large responses and
+    # resolvers configured TCP-only.
+    - ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Bootstrap egress. Unrestricted `to:` because the destination (the
+    # Postgres host in the opaque Secret DSN, and — for the
+    # svc-token-bootstrap Job — the kube-apiserver) is not known to the
+    # chart and MUST NOT be guessed (the chart deliberately keeps
+    # CIDR auto-discovery out of scope). This is an ADDITIVE
+    # allowance on the Job pods only; the app-pod F-33 deny-all is
+    # unchanged. Operators who know their CIDRs can layer a tighter
+    # policy — this one only guarantees the default install is not
+    # bricked.
+    - {}
+{{- end -}}

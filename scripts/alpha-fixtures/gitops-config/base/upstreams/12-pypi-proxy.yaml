@@ -1,0 +1,11 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: pypi-proxy
+spec:
+  repository: pypi-proxy
+  # PyPI is single-catch-all like npm — empty pathPrefix.
+  pathPrefix: ""
+  upstreamUrl: https://pypi.org
+  auth:
+    type: anonymous

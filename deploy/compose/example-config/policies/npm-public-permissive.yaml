@@ -1,0 +1,19 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: npm-public-permissive
+spec:
+  # Pull-through proxy: release ingested tarballs immediately so clients can
+  # install them. Without a policy, pulled-through artifacts quarantine by
+  # default and the tarball download 503s ("artifact is quarantined"). Mirrors
+  # npm-e2e-permissive.yaml; the pull-dedup smoke
+  # (scripts/native-tests/scenarios/proxy/pull-dedup.sh) installs lodash through this repo.
+  scope:
+    repository: npm-public
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  # Provenance off for the permissive mirror (no per-ingest verify job).
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

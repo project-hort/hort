@@ -1,0 +1,29 @@
+[package]
+name = "hort-adapters-scanner-osv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort outbound adapter — osv-scanner SBOM scanner (ScannerPort impl)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+
+tokio      = { workspace = true, features = ["process", "io-util", "fs", "macros", "rt-multi-thread"] }
+futures    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+bytes      = { workspace = true }
+tempfile   = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+
+[features]
+# Optional: integration tests against a real `osv-scanner` CLI on PATH.
+# Default off — CI environments without osv-scanner installed must build green.
+osv-scanner-cli = []

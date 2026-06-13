@@ -1,0 +1,14 @@
+{
+  "name": "truncated-pkg",
+  "versions": {
+    "1.0.0": {
+      "name": "truncated-pkg",
+      "version": "1.0.0",
+      "dist": {
+        "integrity": "sha512-InscLlPP1KPcHMJsg7nE/M7yEw+QWu8xI/3D3CyeTfY=",
+        "shasum": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "tarball": "https://registry.npmjs.org/truncated-pkg/-/truncated-pkg-1.0.0.tgz"
+      }
+    }
+  }
+}

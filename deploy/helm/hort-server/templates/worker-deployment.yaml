@@ -1,0 +1,378 @@
+{{- if and .Values.worker .Values.worker.enabled -}}
+{{/*
+Deployment for the multi-kind worker.
+
+Mirrors the server Deployment's structure (security context, secret
+wiring, terminationGracePeriodSeconds shape) but diverges on:
+
+- No `args:` for the dispatcher path — the binary's default (no
+  subcommand) is the dispatcher. The `healthcheck` subcommand is used
+  for the livenessProbe exec gate.
+- No HTTP ports — the worker is not an inbound HTTP edge. The
+  `livenessProbe` is exec-based, invoking
+  `["/usr/local/bin/hort-worker", "healthcheck"]`. There is no
+  readinessProbe (the worker doesn't serve traffic). The liveness
+  probe uses the worker binary's own `healthcheck` subcommand; the
+  runtime image is distroless and ships no `procps`.
+- Pulls the `hort_app_role` Postgres credentials from the same Secret as
+  the server's runtime DSN. The worker NEVER runs migrations.
+- Trivy + osv-scanner CLIs are bundled into a separate image
+  (`worker.image.repository`, default `…/hort-worker`)
+  built off the server's Rust stage with the scanner binaries
+  COPYed in.
+- HORT_REDIS_URL_EVICTABLE is REQUIRED — the OSV advisory cache reads
+  this slot. The chart fails the schema if `enabled: true` but the
+  ephemeral store config is unwired (see values.schema.json).
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hort-server.fullname" . }}-worker
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        # Roll pods when the worker ConfigMap changes.
+        checksum/worker-config: {{ include (print $.Template.BasePath "/worker-configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "hort-server.worker.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Worker drains in-flight scans before exiting; the binary uses a
+      # 15s drain deadline. Add 30s slack for kubelet's
+      # terminationGracePeriodSeconds before SIGKILL escalates.
+      terminationGracePeriodSeconds: 45
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: hort-worker
+          image: {{ include "hort-server.worker.image" . | quote }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          # No args — the binary's main is the poll loop.
+          env:
+            # ----- Postgres (app-role DSN, NOT admin) -----
+            # Backlog 078 Item 5 — inject only the canonical HORT_DATABASE_URL,
+            # uniform with the server/migrate/cronjob pods. The worker (like
+            # hort-server) prefers HORT_DATABASE_URL and falls back to bare
+            # DATABASE_URL (sqlx-cli / Tier-2 / 12-factor), so the previously
+            # belt-and-suspenders duplicate DATABASE_URL injection is redundant
+            # and has been dropped.
+            - name: HORT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.app.existingSecret | quote }}
+                  key: {{ .Values.postgres.app.secretKey | quote }}
+            # ----- Storage (must match server — same CAS namespace) -----
+            - name: HORT_STORAGE_BACKEND
+              value: {{ .Values.storage.backend | quote }}
+            {{- if eq .Values.storage.backend "filesystem" }}
+            - name: HORT_STORAGE_FILESYSTEM_PATH
+              value: /var/lib/hort-server/cas
+            {{- else if eq .Values.storage.backend "s3" }}
+            - name: AWS_ENDPOINT_URL_S3
+              value: {{ .Values.storage.s3.endpoint | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.storage.s3.region | quote }}
+            - name: HORT_STORAGE_S3_BUCKET
+              value: {{ .Values.storage.s3.bucket | quote }}
+            - name: HORT_STORAGE_S3_FORCE_PATH_STYLE
+              value: {{ .Values.storage.s3.pathStyle | quote }}
+            - name: HORT_STORAGE_S3_ALLOW_HTTP
+              value: {{ .Values.storage.s3.allowHttp | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret | quote }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret | quote }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- end }}
+            # ----- Evictable Redis (advisory cache) -----
+            {{- if .Values.ephemeralStore.redis.evictableUrl }}
+            - name: HORT_REDIS_URL_EVICTABLE
+              value: {{ .Values.ephemeralStore.redis.evictableUrl | quote }}
+            {{- else if .Values.ephemeralStore.redis.evictableExistingSecret }}
+            - name: HORT_REDIS_URL_EVICTABLE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ephemeralStore.redis.evictableExistingSecret | quote }}
+                  key: {{ .Values.ephemeralStore.redis.evictableSecretKey | quote }}
+            {{- else if .Values.ephemeralStore.redis.existingSecret }}
+            # Fall back to the shared Redis URL when no evictable
+            # override is configured. The worker logs a warn and uses
+            # the in-memory cache when none of these are set.
+            - name: HORT_REDIS_URL_EVICTABLE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ephemeralStore.redis.existingSecret | quote }}
+                  key: {{ .Values.ephemeralStore.redis.secretKey | quote }}
+            {{- else if .Values.ephemeralStore.redis.url }}
+            - name: HORT_REDIS_URL_EVICTABLE
+              value: {{ .Values.ephemeralStore.redis.url | quote }}
+            {{- end }}
+            # ----- Logging -----
+            - name: HORT_LOG_FORMAT
+              value: "json"
+            {{- if .Values.upstream.userAgent }}
+            # Outbound User-Agent for worker upstream fetches (prefetch +
+            # provenance referrer fetch) — same value as hort-server so a
+            # custom UA applies uniformly. Empty → the binary built-in.
+            - name: HORT_UPSTREAM_USER_AGENT
+              value: {{ .Values.upstream.userAgent | quote }}
+            {{- end }}
+            # ----- Kubernetes downward API — POD_NAME feeds the
+            #       worker_id default `${POD_NAME}-${random8hex}`. -----
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # ----- Worker identity override — when non-empty, the
+            #       worker uses this verbatim instead of the
+            #       `${POD_NAME}-${random8hex}` fallback. Empty default
+            #       (the Helm value) keeps the random fallback active.
+            #       Operators set this only when they need a stable
+            #       worker_id (e.g. for log correlation across pod
+            #       restarts in a single-replica worker pool). -----
+            - name: HORT_WORKER_ID
+              value: {{ .Values.worker.workerIdOverride | default "" | quote }}
+            # ----- Scanner-specific env from the ConfigMap -----
+            {{- /* Backlog 078 Item 6 (chart S3) — load-bearing scanner */}}
+            {{- /* enable flags. The worker gates backend registration  */}}
+            {{- /* on these BEFORE the `--version` probe runs, so        */}}
+            {{- /* `enabled: false` reliably disables a backend even     */}}
+            {{- /* when its binary is present.                           */}}
+            - name: HORT_SCANNER_TRIVY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_TRIVY_ENABLED
+            - name: HORT_SCANNER_OSV_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_OSV_ENABLED
+            - name: HORT_SCANNER_TRIVY_BIN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_TRIVY_BIN
+            {{- if .Values.worker.scanner.trivy.dbDir }}
+            - name: HORT_SCANNER_TRIVY_DB_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_TRIVY_DB_DIR
+            {{- end }}
+            - name: HORT_SCANNER_OSV_BIN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_OSV_BIN
+            {{- /* Load-bearing cosign provenance enable flag.            */}}
+            - name: HORT_PROVENANCE_COSIGN_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_PROVENANCE_COSIGN_ENABLED
+            {{- if .Values.worker.provenance.cosign.enabled }}
+            - name: HORT_PROVENANCE_TRUSTED_ROOT_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_PROVENANCE_TRUSTED_ROOT_FILE
+            {{- end }}
+            - name: HORT_ADVISORY_OSV_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_ADVISORY_OSV_API_URL
+            - name: HORT_SCANNER_POLL_INTERVAL_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_POLL_INTERVAL_SECS
+            - name: HORT_SCANNER_BATCH_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_BATCH_SIZE
+            - name: HORT_SCANNER_MAX_ATTEMPTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_MAX_ATTEMPTS
+            - name: HORT_SCANNER_LOCK_DURATION_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_SCANNER_LOCK_DURATION_SECS
+            {{- /* Defense-in-depth seal-pool lock_timeout backstop for   */}}
+            {{- /* the single-flight precondition.                        */}}
+            - name: HORT_WORKER_LOCK_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_WORKER_LOCK_TIMEOUT_MS
+            {{- /* Worker /metrics scrape listener bind. Inline (not         */}}
+            {{- /* ConfigMap-backed): the value is composed directly from    */}}
+            {{- /* the chart knob, has no other consumer, and renders only   */}}
+            {{- /* when the operator opts in. Pairs with the `metrics`       */}}
+            {{- /* containerPort below and the additive worker NetworkPolicy  */}}
+            {{- /* in worker-networkpolicy.yaml (the listener has no         */}}
+            {{- /* per-request auth — the NetworkPolicy is the access gate). */}}
+            {{- if .Values.worker.metrics.enabled }}
+            - name: HORT_WORKER_METRICS_BIND
+              value: "0.0.0.0:{{ .Values.worker.metrics.port }}"
+            {{- end }}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- /* Backlog 078 Item 7 (b / convention 9): set
+                   HORT_EXTRA_CA_BUNDLE on the worker ONLY when the chart
+                   also auto-mounts the bundle on the worker pod
+                   (extraCaBundle.configMapName or .secretName, mounted
+                   symmetrically with the server below). Previously this
+                   was gated on `.path` alone, so a path-only config set
+                   the env without mounting the file → the worker boot's
+                   fail-closed read of HORT_EXTRA_CA_BUNDLE crashlooped.
+                   For the manual extraVolumes recipe the operator sets
+                   this var themselves via `worker.extraEnv`. */}}
+            - name: HORT_EXTRA_CA_BUNDLE
+              value: {{ .Values.extraCaBundle.path | quote }}
+            {{- end }}
+            {{- /* Service-account PAT rotation env vars. Gated by the     */}}
+            {{- /* single source-of-truth toggle                           */}}
+            {{- /* `scheduledTasks.serviceAccountRotation.enabled` (NOT a  */}}
+            {{- /* separate worker switch — the single toggle also renders  */}}
+            {{- /* the CronJob trigger + the per-namespace RBAC, so        */}}
+            {{- /* flipping it on/off moves all three in lockstep). The    */}}
+            {{- /* schema requires `adminTasksEnabled` +                   */}}
+            {{- /* `worker.rotation.publicRegistryHost` when this is on,  */}}
+            {{- /* so a half-set config fails at `helm install`.          */}}
+            {{- /*  - HORT_K8S_SECRET_WRITER_ENABLED gates the writer       */}}
+            {{- /*    adapter (Item 6).                                   */}}
+            {{- /*  - HORT_ROTATION_TARGET_NAMESPACES gates which           */}}
+            {{- /*    namespaces the rotation handler is willing to       */}}
+            {{- /*    write into (Item 7). Comma-separated; empty         */}}
+            {{- /*    string means "register but warn on every SA".       */}}
+            {{- /*  - HORT_PUBLIC_REGISTRY_HOST is REQUIRED — the           */}}
+            {{- /*    `dockerconfigjson.auths` map has nowhere to point   */}}
+            {{- /*    without it. `required` short-circuits chart render  */}}
+            {{- /*    so a misconfigured operator gets a clear error at   */}}
+            {{- /*    install time, not at runtime.                       */}}
+            {{- if .Values.scheduledTasks.serviceAccountRotation.enabled }}
+            - name: HORT_K8S_SECRET_WRITER_ENABLED
+              value: "true"
+            - name: HORT_ROTATION_TARGET_NAMESPACES
+              value: {{ join "," .Values.worker.rotation.targetNamespaces | quote }}
+            - name: HORT_PUBLIC_REGISTRY_HOST
+              value: {{ required "worker.rotation.publicRegistryHost is required when scheduledTasks.serviceAccountRotation.enabled=true" .Values.worker.rotation.publicRegistryHost | quote }}
+            {{- end }}
+            {{- /* Worker-scoped extraEnv — appended last so an */}}
+            {{- /* operator entry can override a hardcoded one  */}}
+            {{- /* (Kubernetes env-array last-write-wins). Most */}}
+            {{- /* common use: RUST_LOG override.               */}}
+            {{- with .Values.worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- /* Expose the /metrics scrape port only when the listener is  */}}
+          {{- /* enabled. The worker otherwise has no inbound HTTP surface.  */}}
+          {{- if .Values.worker.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.worker.metrics.port }}
+              protocol: TCP
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          # Exec-based liveness probe — the worker has no HTTP surface.
+          # The probe invokes the worker binary's own `healthcheck`
+          # subcommand: the runtime image is distroless (no `procps`),
+          # and the probe verifies env parses + DB is reachable, which
+          # is a stronger signal than "is the process alive".
+          #
+          # No readinessProbe — the worker doesn't serve traffic.
+          # K8s defaults readiness to "container Running" in its
+          # absence, which matches the worker's pure-pull model.
+          livenessProbe:
+            {{- toYaml .Values.worker.probes.liveness | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.worker.scanner.trivy.dbDir }}
+            - name: trivy-cache
+              mountPath: {{ .Values.worker.scanner.trivy.dbDir }}
+            {{- end }}
+            {{- if eq .Values.storage.backend "filesystem" }}
+            - name: data
+              mountPath: /var/lib/hort-server/cas
+              # Workers SHARE the server's CAS volume — they read
+              # bytes the server wrote at ingest time. RWX volume
+              # required when the worker runs as a separate Pod from
+              # the server. `readOnly: true` enforces the
+              # consume-only contract: the worker never writes to the
+              # CAS, only the server's ingest path does. Mirrors the
+              # `cas:/var/lib/hort-server/cas:ro` mount on the v2
+              # docker-compose `hort-worker` service.
+              readOnly: true
+            {{- end }}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- /* Backlog 078 Item 7 (a) — symmetric with the server
+                   Deployment: configMapName OR secretName auto-mounts on
+                   the worker too. */}}
+            {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.worker.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.worker.scanner.trivy.dbDir }}
+        - name: trivy-cache
+          emptyDir: {}
+        {{- end }}
+        {{- if eq .Values.storage.backend "filesystem" }}
+        - name: data
+          {{- if .Values.storage.filesystem.pvc.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hort-server.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+        {{- include "hort-server.extraCaBundle.volume" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.worker.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end -}}

@@ -1,0 +1,46 @@
+[package]
+name = "hort-adapters-advisory-osv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort outbound adapter — OSV.dev advisory feed (AdvisoryPort impl)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain   = { path = "../hort-domain" }
+hort-config   = { path = "../hort-config" }
+hort-app      = { path = "../hort-app" }
+hort-formats  = { path = "../hort-formats" }
+
+reqwest    = { workspace = true }
+tokio      = { workspace = true }
+futures    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+metrics    = { workspace = true }
+tracing    = { workspace = true }
+bytes      = { workspace = true }
+# `blake3` is not currently a workspace dep; use `sha2` (already in the
+# workspace) for cache-key hashing. The hash is content-derived, not
+# cryptographic-trust-boundary-bearing — SHA-256 is more than adequate.
+sha2       = { workspace = true }
+thiserror  = { workspace = true }
+chrono     = { workspace = true }
+tempfile   = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio        = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+wiremock     = "0.6"
+# test-support feature exposes build_zip_bytes() for test fixture creation.
+hort-formats   = { path = "../hort-formats", features = ["test-support"] }
+metrics-util = { workspace = true, features = ["debugging"] }
+# In-process EphemeralStore for the cache hit/miss tests. Test-only; no
+# production dep on another adapter crate.
+hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
+# Same fixture pattern as hort-adapters-upstream-http: generate a self-
+# signed root in-process for the extra-CA regression test, no committed
+# PEM fixtures.
+rcgen        = "0.13"

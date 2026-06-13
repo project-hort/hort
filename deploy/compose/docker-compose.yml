@@ -1,0 +1,311 @@
+# Local v2 stack — postgres + hort-server.
+#
+# Intentionally minimal: unblocks E2E testing via the native-client scripts.
+# Production deployment (ingress, TLS, secrets, HA postgres) is out of
+# scope for Phase B.
+
+name: hort
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+      # Ephemeral data root: see the `tmpfs` block below. `PGDATA` lives
+      # under a subdirectory of the tmpfs mount because the official
+      # postgres entrypoint refuses to initdb into the root of a
+      # pre-existing mount (the tmpfs surface is root-owned, owned by
+      # the container's root, not the `postgres` user). With `PGDATA`
+      # one level deep, the entrypoint creates + chowns the subdir
+      # itself.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    tmpfs:
+      # Tmpfs (RAM-backed) rather than a named volume because the v2
+      # compose stack is for smokes + dev-stack experimentation, not
+      # state preservation. `compose down` (with OR without `-v`) and
+      # the next `up` get a freshly-initdb'd cluster — bypasses the
+      # whole class of `_sqlx_migrations` checksum drift seen when a
+      # named `pgdata` volume outlives a developer's branch switch.
+      # Capped at 512 MiB which is comfortable for v1 smoke data
+      # volumes (tens-of-MB tarballs at most).
+      - /var/lib/postgresql/data:size=512m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "registry", "-d", "artifact_registry"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # No host port mapping — hort-server reaches postgres via the compose
+    # network (`postgres:5432`). For ad-hoc psql, use:
+    #   docker compose -f deploy/compose/docker-compose.yml exec postgres \
+    #     psql -U registry -d artifact_registry
+    #
+    # Postgres data is ephemeral (tmpfs above) — `compose down` + `up`
+    # = empty DB. Don't rely on local fixture data surviving across
+    # restarts; rebuild it each run via gitops boot + the script
+    # overlays.
+
+  keycloak:
+    # Preconfigured realm for E2E auth testing. Dev-mode only; no
+    # persistence, no TLS, no clustering. The realm import file ships
+    # three users (admin / dev-user / reader-user) covering the 200 /
+    # 403 / 401 assertion scenarios.
+    #
+    # Official upstream image ships OpenJDK 21 — Keycloak 26.6 supports
+    # JDK 25 as a runtime, but the upstream image holds at 21 for FIPS
+    # compatibility. Staying on the official image keeps the dev stack
+    # aligned with what Keycloak themselves CI against.
+    image: quay.io/keycloak/keycloak:26.6
+    container_name: hort-keycloak
+    command:
+      - start-dev
+      - --import-realm
+      - --http-enabled=true
+      - --hostname-strict=false
+      - --health-enabled=true
+    environment:
+      # Keycloak 26 renamed the bootstrap admin env vars.
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: "8080"
+      KC_HEALTH_ENABLED: "true"
+      # Must match hort-server's HORT_OIDC_ISSUER_URL host:port exactly — the
+      # adapter validates tokens with `iss == HORT_OIDC_ISSUER_URL` AND fetches
+      # JWKS from whatever URL Keycloak advertises in the discovery
+      # document. Setting this to `localhost` breaks both: the JWKS URL
+      # becomes `http://localhost:8080/...` (unreachable from inside the
+      # hort-server container) and the `iss` claim stamps `localhost` too.
+      # `hostname-strict=false` (in the command args) still lets the
+      # host-side liveness probe at port 25082 return 200 — that probe
+      # only checks reachability, not URL correctness.
+      KC_HOSTNAME: http://keycloak:8080
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+    ports:
+      # Host port in the 25xxx range per the developer-machine memory.
+      # Container-internal port stays 8080 so HORT_OIDC_ISSUER_URL inside
+      # the compose network remains http://keycloak:8080/realms/...
+      - "25082:8080"
+    # No in-container healthcheck: the Keycloak image lacks curl/wget,
+    # and bash's /dev/tcp + printf approach is brittle across minor
+    # versions (different response framing, slow realm-import cold
+    # starts tripping the grep). Readiness is gated by the sibling
+    # `keycloak-ready` init container below — a short-lived curl
+    # probe that exits 0 only when the realm's OIDC discovery doc
+    # returns 200. hort-server's depends_on waits for that init's
+    # `service_completed_successfully`, which is a reliable signal.
+
+  keycloak-ready:
+    # One-shot readiness gate for Keycloak. Polls the realm's OIDC
+    # discovery endpoint until it returns 200 (meaning the server is
+    # up AND the realm import has finished), then exits 0. hort-server
+    # waits for this container's `service_completed_successfully`
+    # rather than Keycloak's own healthcheck.
+    image: curlimages/curl:8.10.1
+    container_name: hort-keycloak-ready
+    depends_on:
+      - keycloak
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - >
+        echo "[keycloak-ready] waiting for realm discovery doc...";
+        for i in $$(seq 1 120); do
+          if curl -fsS http://keycloak:8080/realms/hort/.well-known/openid-configuration > /dev/null; then
+            echo "[keycloak-ready] realm hort is live (attempt $$i)";
+            exit 0;
+          fi;
+          sleep 2;
+        done;
+        echo "[keycloak-ready] timeout after ~240s";
+        exit 1
+
+  cas-init:
+    # One-shot helper that fixes the named-volume root's ownership.
+    # Docker named volumes start owned by root (uid 0). The hort-server
+    # and hort-worker images both run as uid 65532 — they need write
+    # access to /var/lib/hort-server/cas. We `chown 65532:65532` the
+    # volume root once at stack-up time so the non-root containers can
+    # mkdir / write inside it. Pinning a tiny alpine image rather than
+    # reusing hort-server keeps this layer cheap and root-only.
+    image: alpine:3.20
+    container_name: hort-cas-init
+    command: ["sh", "-c", "chown 65532:65532 /var/lib/hort-server/cas && chmod 0750 /var/lib/hort-server/cas"]
+    user: "0:0"
+    volumes:
+      - cas:/var/lib/hort-server/cas
+    restart: "no"
+
+  hort-server-migrate:
+    # The runtime no longer applies migrations on boot. `hort-server
+    # serve` calls `migrate::assert_current` on startup and refuses to
+    # start if `_sqlx_migrations` is missing or stale. In Kubernetes
+    # the chart runs a pre-install Job (`templates/job-migrate.yaml`);
+    # the docker-compose equivalent is this one-shot service. Runs with
+    # only DATABASE_URL set, exits successfully, then `hort-server`
+    # starts.
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: hort-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: "postgres://registry:registry@postgres:5432/artifact_registry"
+      HORT_LOG_FORMAT: "json"
+      RUST_LOG: "hort_server=info,hort_adapters_postgres=info,sqlx=warn"
+    restart: "no"
+
+  hort-server:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak-ready:
+        condition: service_completed_successfully
+      hort-server-migrate:
+        condition: service_completed_successfully
+      cas-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgres://registry:registry@postgres:5432/artifact_registry"
+      HORT_STORAGE_BACKEND: "filesystem"
+      HORT_STORAGE_FILESYSTEM_PATH: "/var/lib/hort-server/cas"
+      HORT_API_BIND: "0.0.0.0:8080"
+      HORT_METRICS_BIND: "0.0.0.0:9090"
+      # Explicit opt-in to bind /metrics on 0.0.0.0; hort-server
+      # refuses the unspecified-address bind without this flag. The
+      # compose network namespace requires 0.0.0.0 so the host
+      # port-mapping (25090:9090) reaches the listener — there is no
+      # per-interface alternative inside a container. Production
+      # deployments behind a TLS-terminating proxy should remove this
+      # and bind metrics on a dedicated internal interface or expose
+      # the listener only on the proxy network.
+      HORT_METRICS_PUBLIC_BIND: "true"
+      # Keep /metrics scrape anonymous in this example/dev compose so
+      # the e2e harness's readiness probe (`curl -sf $METRICS_URL`
+      # before any token is fetched) and any local Prometheus instance
+      # can scrape without bearer config. The startup WARN documents
+      # the deliberate downgrade. Production MUST leave this UNSET
+      # (defaults to true) and configure the scraper with a
+      # Keycloak-issued bearer.
+      HORT_METRICS_REQUIRE_AUTH: "false"
+      METRICS_INCLUDE_REPOSITORY_LABEL: "true"
+      HORT_LOG_FORMAT: "json"
+      # E2E runs without a TLS-terminating proxy; clients hit hort-server
+      # directly over plain HTTP. Pin the public URL so packument and
+      # config.json emissions use http:// — without this the handlers
+      # default to https:// (the production-safe default assuming a
+      # proxy chain) and npm/cargo fail with ERR_SSL_WRONG_VERSION_NUMBER.
+      # Production behind nginx/Caddy/traefik leaves this UNSET and
+      # relies on the proxy's X-Forwarded-Proto header.
+      HORT_PUBLIC_BASE_URL: "http://hort-server:8080"
+      RUST_LOG: "hort_server=info,hort_app=info,hort_http_core=info,hort_http_cargo=info,hort_http_npm=info,hort_http_pypi=info,hort_http_oci=info,hort_adapters_postgres=info,hort_adapters_storage=info,hort_adapters_oidc=debug,hort_http_core::middleware::auth=debug"
+      # HORT_OIDC_ISSUER_URL uses the compose network alias so hort-server
+      # can fetch JWKS without leaving the network. The realm is imported
+      # from keycloak/realm.json at Keycloak startup.
+      HORT_AUTH_PROVIDER: oidc
+      HORT_OIDC_ISSUER_URL: "http://keycloak:8080/realms/hort"
+      HORT_OIDC_AUDIENCE: hort-server
+      HORT_OIDC_GROUPS_CLAIM: groups
+      # Gitops configuration. HORT_CONFIG_DIR points at the mounted
+      # example-config tree; the boot sequence reads every *.yaml under
+      # it before binding the listener and rejects API writes against
+      # managed objects with 409 problem+json. Mount
+      # $HORT_CONFIG_DIR/auth/*.yaml for claim-mapping envelopes.
+      HORT_CONFIG_DIR: /etc/hort/config
+      # Upstream-resolver snapshot refresh cadence. Production default
+      # is 60s; the e2e POSTs upstream mappings via the admin endpoint
+      # and then has to wait for the next refresh before the mirror
+      # flow can resolve them. Pin to the validated floor (5s, see
+      # config.rs upstream_resolver_refresh_secs clamp) so the smoke
+      # wait is ~8s instead of ~65s.
+      HORT_UPSTREAM_RESOLVER_REFRESH_SECS: "5"
+    volumes:
+      - cas:/var/lib/hort-server/cas
+      - ./example-config:/etc/hort/config:ro
+    ports:
+      # Host ports in the 25xxx range — this developer already has
+      # services on 8080/9090. Container-internal ports stay 8080/9090.
+      - "25080:8080"
+      - "25090:9090"
+
+  hort-worker:
+    # Multi-kind worker companion to hort-server. Polls `jobs` and
+    # dispatches each row to the registered `TaskHandler` for its
+    # `kind` (scan, cron-rescan-tick, advisory-watch-tick,
+    # staging-sweep, noop). Lives behind a docker-compose profile so
+    # the rest of the smoke set keeps booting without it; the
+    # vulnerability-scan smoke turns the profile on explicitly via
+    # `--profile worker`.
+    #
+    # Image is built locally from docker/Dockerfile.worker
+    # (multi-stage Rust build + pinned trivy / osv-scanner binaries).
+    # CI may override `image:` with a registry-published tag.
+    profiles:
+      - worker
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.worker
+    image: hort-worker:dev
+    container_name: hort-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hort-server-migrate:
+        condition: service_completed_successfully
+      cas-init:
+        condition: service_completed_successfully
+    environment:
+      # DSN matches hort-server's so the worker hits the same database
+      # via the compose-network alias `postgres`.
+      HORT_DATABASE_URL: "postgres://registry:registry@postgres:5432/artifact_registry"
+      HORT_LOG_FORMAT: "json"
+      RUST_LOG: "hort_worker=info,hort_app=info,hort_adapters_postgres=info,hort_adapters_scanner_trivy=info,hort_adapters_scanner_osv=info,hort_adapters_advisory_osv=info,sqlx=warn"
+      # Storage selector mirrors hort-server's CAS — the worker streams
+      # artifact bytes from the same filesystem mount the server wrote
+      # them to. Mounted read-write so the worker can persist per-finding
+      # blobs alongside artifacts. The `cas-init` service chowns the
+      # volume root to 65532 at stack-up so the non-root worker has
+      # write access — see that service's comment for context.
+      HORT_STORAGE_BACKEND: "filesystem"
+      HORT_STORAGE_FILESYSTEM_PATH: "/var/lib/hort-server/cas"
+      # Scanner CLI binary paths inside the image. Must match the
+      # `COPY --from=trivy/osv` layers in
+      # docker/Dockerfile.worker.
+      HORT_SCANNER_TRIVY_BIN: "/usr/local/bin/trivy"
+      HORT_SCANNER_OSV_BIN: "/usr/local/bin/osv-scanner"
+      # OSV.dev batch endpoint — the smoke uses the live endpoint so a
+      # fixture-validation step in the test confirms the upstream is
+      # reachable before declaring a fixture-drift failure.
+      HORT_ADVISORY_OSV_API_URL: "https://api.osv.dev/v1/querybatch"
+      # Worker tunables: keep the smoke fast (5s poll, batch 4) but
+      # leave generous lock duration + retry headroom so a slow
+      # Trivy invocation doesn't get reaped mid-scan.
+      HORT_SCANNER_POLL_INTERVAL_SECS: "5"
+      HORT_SCANNER_BATCH_SIZE: "4"
+      HORT_SCANNER_MAX_ATTEMPTS: "5"
+      HORT_SCANNER_LOCK_DURATION_SECS: "900"
+      HORT_WORKER_ID: "hort-worker-v2"
+    volumes:
+      # Shared CAS volume with hort-server. The worker needs WRITE access
+      # so `ScanOrchestrationUseCase::record_outcome` can persist
+      # per-finding blobs — findings are stored as hash-referenced CAS
+      # objects and the `ScanCompleted` event carries the hash, not the
+      # bytes. With `:ro` the scan path fails with `storage write
+      # failed: Permission denied` (EACCES) the moment a scan produces
+      # findings.
+      - cas:/var/lib/hort-server/cas
+
+volumes:
+  # Postgres data is on a tmpfs (see the `postgres` service) — no
+  # named volume here. `cas` is named so artifact bytes survive
+  # `compose restart` within a single smoke run; `compose down` (with
+  # `-v`) clears it.
+  cas:

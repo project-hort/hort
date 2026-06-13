@@ -1,0 +1,9 @@
+# ClaimMapping: IdP group `hort-readers` resolves to the `reader`
+# claim. The claim confers no power until a PermissionGrant requires it.
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: readers
+spec:
+  idpGroup: hort-readers
+  claim: reader

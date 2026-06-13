@@ -1,0 +1,17 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: cargo-proxy
+spec:
+  name: "Cargo Proxy"
+  description: "Pull-through cache for crates.io (alpha)"
+  format: cargo
+  type: proxy
+  storage:
+    backend: filesystem
+    path: cargo-proxy
+  proxy:
+    upstreamUrl: "https://crates.io"
+  isPublic: true
+  replicationPriority: local_only
+  indexMode: include_pending

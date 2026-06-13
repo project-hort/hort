@@ -1,0 +1,32 @@
+# extraCaBundle render-FAILURE fixture: configMapName AND secretName both
+# set (Backlog 078 Item 7 / convention 9).
+#
+# The two auto-mount sources are mutually exclusive — a pod can mount only
+# one `ca.crt` at `extraCaBundle.path`. The schema (oneOf coupling) and
+# the `hort-server.extraCaBundle.validateSources` template helper both
+# reject this; `helm template` MUST fail at install time rather than
+# silently double-mount at runtime.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory
+
+extraCaBundle:
+  path: /etc/hort-server/ca-bundle/ca.crt
+  configMapName: corporate-ca-bundle
+  secretName: corporate-ca-bundle-secret

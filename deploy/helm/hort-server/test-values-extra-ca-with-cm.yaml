@@ -1,0 +1,30 @@
+# extraCaBundle smoke fixture: path + configMapName both set (Recipe A).
+# Expected rendering (Backlog 078 Item 7 — symmetric auto-mount):
+#   - HORT_EXTRA_CA_BUNDLE env var present on BOTH server + worker
+#   - volumeMounts + volumes entry for `extra-ca-bundle` on server,
+#     worker, and the two always-on CronJobs (scrub, quarantineRelease-
+#     Sweep), all referencing the ConfigMap (read-only 0444)
+#   - checksum/extra-ca-bundle pod-template annotation (ConfigMap path only)
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory
+
+extraCaBundle:
+  path: /etc/hort-server/ca-bundle/ca.crt
+  configMapName: corporate-ca-bundle

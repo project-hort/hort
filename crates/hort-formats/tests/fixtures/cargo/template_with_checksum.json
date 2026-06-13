@@ -1,0 +1,3 @@
+{
+  "dl": "https://artifacts.example.com/crates/{crate}/{version}/{sha256-checksum}.crate"
+}

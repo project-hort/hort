@@ -1,0 +1,96 @@
+# Dependency containers for the v2 alpha-testing runbook.
+#
+# Runs Postgres + Redis only. The binaries under test (hort-server,
+# hort-worker, hort-cli) run NATIVELY via `cargo run` per the runbook's
+# scope. Trivy and osv-scanner are used as CLI tools from $PATH, not
+# server-hosted, so no scanner/search sidecars are needed.
+#
+# Usage:
+#   # Track A (no OIDC): Postgres + Redis only
+#   docker compose -f scripts/alpha-fixtures/compose-deps.yml up -d
+#   # Track B (OIDC, full features): also bring up Keycloak (realm `hort`)
+#   docker compose -f scripts/alpha-fixtures/compose-deps.yml --profile oidc up -d
+#   docker compose -f scripts/alpha-fixtures/compose-deps.yml --profile oidc down -v  # wipe
+#
+# Ports:
+#   Postgres: 30432 (alpha-isolated; shares image+schema with local-dev)
+#   Redis:    30379
+#   Keycloak: 25380 (Track B only — compose profile `oidc`)
+#
+# Volumes are named so they persist across `down` (NOT `down -v`).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hort-alpha-postgres
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    ports:
+      - "30432:5432"
+    volumes:
+      - hort_alpha_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry -q"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: hort-alpha-redis
+    # PAT cache + PAT-lockout counter + prefetch dedup. hort's
+    # ephemeral-keyspace adapter is the consumer — unset
+    # HORT_REDIS_URL / HORT_REDIS_URL_EVICTABLE to fall back to the
+    # in-memory adapter (single-process only, not for multi-replica).
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "30379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    restart: unless-stopped
+
+  keycloak:
+    # Track B (OIDC, full features) ONLY — gated behind the `oidc`
+    # compose profile so Track A's plain `up -d` skips it. Reuses the
+    # rebranded realm from deploy/compose (realm `hort`, client `hort-server`,
+    # groups test-developers / hort-admins / hort-readers — which match
+    # the gitops auth/ ClaimMapping fixtures). Dev-mode only: no TLS, no
+    # persistence, no clustering.
+    profiles: ["oidc"]
+    image: quay.io/keycloak/keycloak:26.6
+    container_name: hort-alpha-keycloak
+    command:
+      - start-dev
+      - --import-realm
+      - --http-enabled=true
+      - --hostname-strict=false
+      - --health-enabled=true
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: "8080"
+      KC_HEALTH_ENABLED: "true"
+      # The host-native binaries reach Keycloak at localhost:25380, so
+      # the issuer it stamps (`iss`) and the JWKS URL it advertises must
+      # both be localhost:25380 — set HORT_OIDC_ISSUER_URL to match
+      # (alpha.env.oidc does). `localhost` here (unlike the compose-DNS
+      # alias used by deploy/compose) is correct: the consumer is on the host.
+      KC_HOSTNAME: http://localhost:25380
+    volumes:
+      # Reuse the deploy/compose realm export (realm `hort`). Path is relative
+      # to this compose file's directory (scripts/alpha-fixtures/).
+      - ../../deploy/compose/keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+    ports:
+      - "25380:8080"
+
+volumes:
+  hort_alpha_postgres_data:
+    name: hort_alpha_postgres_data

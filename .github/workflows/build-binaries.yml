@@ -1,0 +1,160 @@
+name: Build Binaries
+
+# Reusable cross-platform build of the release binaries. Shared by:
+#   - release.yml (publish: true)  — stamps the tag version + cosign-signs assets
+#   - ci.yml      (publish: false) — build + package + upload only, no signing,
+#                                    so PRs verify the binaries compile without
+#                                    ever creating a release.
+# Keeping the matrix here means CI verifies the exact binaries the release ships.
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: >-
+          true  = release mode (stamp the tag version and cosign-sign each asset);
+          false = verification only (build + package + upload artifacts).
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write   # keyless cosign (only exercised when publish == true)
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The `hort-cli` client ships for every platform; the `hort-server`
+        # and `hort-worker` daemons ship for Linux only. `bin` selects which
+        # workspace binary to build; `name` is the published asset base name.
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest, bin: hort-cli,    name: hort-cli-linux-amd64 }
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest, bin: hort-server, name: hort-server-linux-amd64 }
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest, bin: hort-worker, name: hort-worker-linux-amd64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, bin: hort-cli,    name: hort-cli-linux-arm64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, bin: hort-server, name: hort-server-linux-arm64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, bin: hort-worker, name: hort-worker-linux-arm64 }
+          - { target: x86_64-apple-darwin,       os: macos-latest,  bin: hort-cli,    name: hort-cli-darwin-amd64 }
+          - { target: aarch64-apple-darwin,      os: macos-latest,  bin: hort-cli,    name: hort-cli-darwin-arm64 }
+          - { target: x86_64-pc-windows-gnu,     os: ubuntu-latest, bin: hort-cli,    name: hort-cli-windows-amd64 }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # rust-toolchain.toml pins the channel, so dtolnay's `targets:` adds the
+      # cross target to `stable` while the build actually runs on the pinned
+      # toolchain. Add the target to whatever the pin resolves to (no-op when
+      # the target equals the host).
+      - name: Add Rust target to the pinned toolchain
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Install Windows cross-compilation tools
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get install -y mingw-w64
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Release mode only: stamp the workspace version from the tag. In verify
+      # mode there is no tag (GITHUB_REF_NAME is a branch), so we build with the
+      # committed version — rewriting it to a branch name would be invalid semver.
+      - name: Set version from tag
+        if: ${{ inputs.publish }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Setting workspace version to ${VERSION}"
+          # Portable in-place edit: BSD/macOS `sed -i` takes a mandatory backup
+          # suffix and differs from GNU sed, so write to a temp file and move it.
+          sed "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+          head -5 Cargo.toml
+
+      - name: Build
+        # aarch64-linux builds run natively on ubuntu-24.04-arm (no cross
+        # toolchain); only the Windows target is cross-compiled, via mingw.
+        env:
+          SQLX_OFFLINE: true
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --target ${{ matrix.target }} --bin ${{ matrix.bin }}
+
+      - name: Package binary (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.name }}
+          chmod +x dist/${{ matrix.name }}
+          cd dist
+          tar -czvf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          else
+            shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          fi
+
+      - name: Package binary (Windows)
+        if: contains(matrix.target, 'windows')
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }}.exe dist/${{ matrix.name }}.exe
+          cd dist
+          sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
+
+      # cosign sign-blob each asset (release mode only) so downstream consumers
+      # can verify provenance with `cosign verify-blob`. Keyless OIDC; cosign v3
+      # writes a self-contained Sigstore bundle (--bundle).
+      - name: Install cosign
+        if: ${{ inputs.publish }}
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign binary with cosign sign-blob (Unix)
+        if: ${{ inputs.publish && !contains(matrix.target, 'windows') }}
+        working-directory: dist
+        run: |
+          cosign sign-blob --yes \
+            --bundle ${{ matrix.name }}.tar.gz.bundle \
+            ${{ matrix.name }}.tar.gz
+
+      - name: Sign binary with cosign sign-blob (Windows)
+        if: ${{ inputs.publish && contains(matrix.target, 'windows') }}
+        working-directory: dist
+        run: |
+          cosign sign-blob --yes \
+            --bundle ${{ matrix.name }}.exe.bundle \
+            ${{ matrix.name }}.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}.tar.gz*
+            dist/${{ matrix.name }}.exe*
+          # Long-lived for releases (downloaded by the release job); short for
+          # verification artifacts.
+          retention-days: ${{ inputs.publish && 90 || 7 }}

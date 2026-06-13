@@ -1,0 +1,145 @@
+{{/*
+Prefetch-row retention-sweep CronJob.
+
+Periodically invokes `hort-server enqueue-prefetch-row-retention-sweep`,
+which inserts ONE `kind='prefetch-row-retention-sweep'` row into
+`public.jobs` using the runtime DSN. The always-on worker (`hort-worker`)
+picks the row up and dispatches to `PrefetchRowRetentionSweepHandler`,
+which deletes terminal `kind LIKE 'prefetch%'` rows older than a
+configurable horizon (default 7 days).
+
+Design rationale: a default-enabled CronJob going through the `hort-cli`
+HTTP admin-task path would drag the whole `svc-token-bootstrap` Job chain
++ a standing `admin_task_invoke` token mount to default-on. The runtime
+DSN is least-privilege — it can `INSERT INTO public.jobs` and read the
+schema, full stop. The `hort-http-admin-tasks` HTTP route stays available
+for **manual** operator invocation.
+
+So this CronJob:
+
+  - Uses `hort-server.runtimeEnv` (DSN + log/metric tunables only —
+    same env block the migrate Job uses, MinimalConfig discipline).
+  - Has NO `valueFrom.secretKeyRef` for any svc-token.
+  - Is gated by `prefetchRowRetentionSweep.enabled` (default **false** —
+    the cascade is opt-in per-repo via
+    `prefetch_policy.triggers.contains(TransitiveDeps)`; if no repo opts
+    in the `jobs` table accumulates nothing and the sweep has nothing to
+    delete. An operator enabling the cascade should also enable this
+    sweep so `jobs` does not grow unbounded).
+  - Does NOT depend on `scheduledTasks.adminTasksEnabled` — that toggle
+    gates the svc-token chain this template deliberately avoids.
+
+Default schedule: daily at 02:00 UTC. The 7-day retention horizon means
+even a missed daily run leaves the operator with 6 days of headroom; the
+sweep is one DELETE per tick, so cron-tier drift is harmless. Operators tightening below daily should also
+tighten the schema's `autovacuum_vacuum_scale_factor` on
+`public.jobs` (migration 009 sets it to 0.02 — the lower the
+sweep cadence, the more aggressive autovacuum must be).
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents
+the controller from spawning a second pod while the previous tick
+is still running. (The tick is just one INSERT; controller-restart
+double-fire is harmless — the worker drains both rows, and the
+DELETE is idempotent.)
+
+Hex-onion discipline: `enqueue-prefetch-row-retention-sweep` is an
+inbound CLI adapter (parses MinimalConfig, builds the PgPool, calls
+`JobsRepository::enqueue_task`) — no application logic in the
+binary surface.
+*/}}
+{{- if .Values.scheduledTasks.prefetchRowRetentionSweep.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-prefetch-row-retention-sweep
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: prefetch-row-retention-sweep
+spec:
+  schedule: {{ .Values.scheduledTasks.prefetchRowRetentionSweep.schedule | quote }}
+  # `Forbid` is the cron-conventional choice for "this job is
+  # idempotent but must not overlap itself." The enqueue is one row
+  # insert, so a missed tick is fine — the next tick picks up the
+  # slack within the 7-day retention window.
+  concurrencyPolicy: Forbid
+  # Bound the history Kubernetes retains so a long-running deployment
+  # does not accumulate hundreds of completed Job objects.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # Surface a missed-deadline (the previous run still active when
+  # the schedule fires under `Forbid`) as a non-fatal event in the
+  # controller log rather than a CronJob failure. 600s window is
+  # generous for an INSERT-only pod.
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: prefetch-row-retention-sweep
+        spec:
+          serviceAccountName: {{ include "hort-server.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: enqueue-prefetch-row-retention-sweep
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "enqueue-prefetch-row-retention-sweep"
+              env:
+                # DB-only subcommand. The `hort-server.runtimeEnv` helper
+                # populates HORT_DATABASE_URL + log/metric tunables; we
+                # deliberately do NOT mount any svc-token secret here (see
+                # template docstring).
+                {{- include "hort-server.runtimeEnv" . | nindent 16 }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+                {{- /* Backlog 078 Item 7 — gate the mount on the
+                       auto-mount source (configMapName/secretName), NOT
+                       on `.path` alone: with `.path` set but no source the
+                       volume below never rendered, leaving a dangling
+                       volumeMount that fails pod admission. */}}
+                {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
+                {{- end }}
+                {{- with .Values.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

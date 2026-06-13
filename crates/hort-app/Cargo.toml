@@ -1,0 +1,114 @@
+[package]
+name = "hort-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort application layer — orchestrates domain and outbound ports"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+# `ApplyConfigUseCase` consumes `DesiredState`, computes the
+# `ApplyPlan` via `diff`, and orchestrates the managed-write port
+# methods. `hort-config` is zero-I/O so it doesn't pull new
+# infrastructure into `hort-app`.
+hort-config = { path = "../hort-config" }
+uuid = { workspace = true, features = ["v4"] }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+metrics = { workspace = true }
+# Argon2id helper for both password and PAT hashing (the
+# Argon2id-not-bcrypt invariant; see `tests/no_bcrypt.rs`).
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+# `OciTokenExchangeUseCase` mints a Distribution-Spec-shaped JWT
+# signed with a dedicated Ed25519 key.
+# `jsonwebtoken` is already in the workspace for OIDC validation;
+# `ed25519-dalek` lands here for the sign/verify primitives.
+jsonwebtoken = { workspace = true }
+ed25519-dalek = { workspace = true }
+# `StoragePort::list_all` returns `BoxStream`. `hort-app` consumers (the
+# scrub use case, test doubles) need to build / iterate the stream.
+futures = { workspace = true }
+# `MockUpstreamProxy` (the test_support mock)
+# materializes the stored payload as a `Bytes` chunk for the
+# returned blob stream. hort-domain's storage port already uses
+# `bytes` transitively but doesn't re-export the type.
+bytes = { workspace = true }
+# The `project_cached` helper and the test-support mock upstream
+# proxy write upstream bodies to a tempfile so `MetadataFetchOutcome`
+# / `ManifestFetchOutcome` can carry a `CachedBodyHandle` with a real
+# on-disk path (ADR 0026 streaming-metadata contract). Tiny pure-Rust
+# crate.
+tempfile = { workspace = true }
+# Streaming SHA-256 in the CAS scrub use case;
+# also used by the `test-support` feature's mock storage.
+sha2 = { workspace = true }
+# Probabilistic sampling for the CAS scrub use case.
+# `ScrubOpts::sample_fraction` rolls a uniform `f64` per listed hash.
+rand = { workspace = true }
+# `RepositoryAccessUseCase` carries an
+# `Arc<ArcSwap<RbacEvaluator>>` so it sees the same live-refresh
+# snapshot the inbound `AuthContext::Enabled` carries.
+arc-swap = { workspace = true }
+# LRU half of the dual-index PAT validation
+# cache. `PatCache` pairs an `LruCache<CacheKey, _>` with a reverse
+# `HashMap<Uuid, CacheKey>` so `invalidate_token` is O(1). See
+# workspace-level pin for the version rationale.
+lru = { workspace = true }
+# BLAKE3 hashing in the NoopTaskHandler for
+# testing the end-to-end task framework.
+blake3 = { workspace = true }
+# `ScanPolicyApplier` parses
+# `quarantineDuration` / `maxArtifactAge` humantime strings into
+# seconds for the `PolicyCreated` / `PolicyUpdated` event payloads.
+# `hort-config` already validated the format at parse-time; the applier
+# re-parses to obtain the numeric seconds.
+humantime = { workspace = true }
+# `apply_upstream_mappings` parses each
+# mapping's `upstream_url` and asserts the host against
+# `HORT_UPSTREAM_ALLOWLIST_HOSTS`. `hort-domain` already validated the URL
+# shape via `RepositoryUpstreamMappingArgs::try_into_mapping`; we
+# re-parse here only to extract the host component.
+url = { workspace = true }
+# Layer-A in-process coalescing map for
+# `PullDedup`. `DashMap<DedupKey, Weak<broadcast::Sender<DedupOutcome>>>`
+# is the canonical shape; shard-locked, cheap on disjoint keys.
+dashmap = { workspace = true }
+# TaskDispatcher uses CancellationToken for
+# graceful shutdown signalling and per-kind Semaphore for concurrency limits.
+tokio-util = { workspace = true }
+# `SecurityScoreUseCase` encodes the opaque
+# pagination cursor as URL-safe-no-pad base64 of a Uuid's 16 bytes.
+# Same major version `hort-http-cargo` pins for its sparse-index cache
+# envelope.
+base64 = "0.22"
+# The `MockKubernetesSecretWriter` constructs
+# `ManagedSecretSpec` instances, which carry the plaintext PAT in a
+# `Zeroizing<String>`. Both production callers (the rotation handler)
+# and downstream test consumers go through `test_support`, so
+# `zeroize` is a hard dep on `hort-app` rather than test-only.
+zeroize = { workspace = true }
+
+# Enabled by the `test-support` feature; pulled in so the mocks compile.
+metrics-util = { workspace = true, features = ["debugging"], optional = true }
+
+[features]
+# Exposes `use_cases::test_support` with Mock* types for downstream crate tests.
+# Also exposes `metrics::capture_metrics` for asserting emitted metrics.
+test-support = ["dep:metrics-util"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+metrics-util = { workspace = true, features = ["debugging"] }
+# Captures `tracing` events in the
+# Write-grant denial test to assert the audit signal fires.
+tracing-subscriber = { workspace = true }

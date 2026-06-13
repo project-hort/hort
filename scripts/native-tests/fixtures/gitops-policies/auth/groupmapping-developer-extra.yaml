@@ -1,0 +1,7 @@
+apiVersion: project-hort.de/v1beta1
+kind: GroupMapping
+metadata:
+  name: developer-extra-mapping
+spec:
+  group: hort-developer-extra
+  role: developer-extra

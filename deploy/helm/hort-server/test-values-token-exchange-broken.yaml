@@ -1,0 +1,29 @@
+# Token-exchange broken-config fixture — tokenExchange.enabled=true
+# without nativeTokens.enabled=true. The values.schema.json install-
+# block rule must trip and `helm template` must fail. Exists so the
+# misconfig surfaces at deploy-time instead of at server-startup time
+# (the binary boot-fails on the same combination via
+# ConfigError::TokenExchangeRequiresNativeTokens).
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+  tokenExchange:
+    enabled: true
+    cliClientId: hort-cli
+  # nativeTokens.enabled left at default false → schema rule trips.
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory

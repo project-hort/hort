@@ -1,0 +1,23 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  # Key matches the NPM_REPO_KEY env default in
+  # scripts/native-tests/scenarios/upstream/npm-upstream-verification.sh.
+  name: npm-upstream-e2e
+spec:
+  name: "npm upstream pull-through smoke"
+  description: "Proxy npm repo used by scripts/native-tests/scenarios/upstream/npm-upstream-verification.sh; upstream is the wiremock-npm-upstream sidecar serving a synthesised packument + tarball with a pre-computed dist.integrity (SHA-512 SRI) so the packument-vs-tarball alignment is deterministic across runs."
+  format: npm
+  type: proxy
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/npm-upstream-e2e
+  proxy:
+    # Required by the gitops validator (crates/hort-config/src/repository.rs)
+    # for type=proxy. The standalone UpstreamMapping resource at
+    # deploy/compose/example-config/upstreams/npm-upstream-e2e.yaml is what
+    # populates the repository_upstream_mappings table that the npm
+    # upstream-pull path's UpstreamResolver actually reads.
+    upstreamUrl: "http://wiremock-npm-upstream:8080"
+  isPublic: true
+  replicationPriority: local_only

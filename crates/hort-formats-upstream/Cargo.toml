@@ -1,0 +1,46 @@
+[package]
+name = "hort-formats-upstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "`UpstreamMetadataPort` composition crate. Dispatches per-format `fetch_raw_with_cache` helpers + `FormatHandler::extract_upstream_versions` parsers."
+
+[lints]
+workspace = true
+
+# This is the ONLY production crate other than `hort-server` that imports
+# multiple `hort-http-<format>` inbound crates as a normal dep. The
+# dispatch table on `format` ("npm" / "pypi" / "cargo") is the
+# composition seam; the helpers it calls (`fetch_raw_with_cache` in each
+# per-format crate) are `pub` solely for this dep edge plus the in-crate
+# inbound HTTP handlers (see the per-helper rustdoc warning). A fourth
+# caller breaks the dep-graph rationale documented in the crate-level
+# module comment (see `docs/architecture/explanation/format-handlers.md`).
+[dependencies]
+hort-domain      = { path = "../hort-domain" }
+hort-app         = { path = "../hort-app" }
+hort-formats     = { path = "../hort-formats" }
+hort-http-npm    = { path = "../hort-http-npm" }
+hort-http-pypi   = { path = "../hort-http-pypi" }
+hort-http-cargo  = { path = "../hort-http-cargo" }
+
+bytes          = { workspace = true }
+tracing        = { workspace = true }
+# `synthetic_repo` builds a `Repository` for the per-format helpers'
+# `&Repository` param; the struct carries `created_at` / `updated_at`
+# fields. chrono is a workspace dep already pulled in transitively
+# (via hort-domain / hort-app / per-format crates); the explicit
+# `Utc::now()` call is the only direct use here.
+chrono         = { workspace = true }
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util", "macros", "rt"] }
+# Item 4 §6 tests construct the mock ports (resolver, ephemeral store,
+# upstream-proxy, pull-dedup). The mocks live in `hort-app::use_cases::test_support`
+# and `hort-http-core::test_support`, both gated behind the `test-support`
+# feature on those crates.
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+metrics-exporter-prometheus = { workspace = true }
+chrono                      = { workspace = true }
+uuid                        = { workspace = true }

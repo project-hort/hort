@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hort-server.fullname" . }}
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "hort-server.selectorLabels" . | nindent 4 }}
+    # Pin to the server Deployment's pods only. The bare
+    # name+instance selectorLabels are stamped chart-wide, so without
+    # this discriminator the Service also selects the worker + Job/
+    # CronJob pods (no :8080 listener) and kube-proxy black-holes a
+    # share of connections (connect-timeout). selectorLabels itself MUST
+    # stay stable (see _helpers.tpl), so the discriminator lives here +
+    # on the server pod template, not in selectorLabels.
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.metrics.bindAddr }}
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}

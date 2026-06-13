@@ -1,0 +1,24 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: default-quarantine
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  # Provenance off for permissive e2e (no per-ingest verify job).
+  provenanceMode: off
+  maxArtifactAge: 90d
+  licensePolicy:
+    allowed: [Apache-2.0, MIT]
+    denied: [GPL-3.0]
+  # Explicit `[]` rather than omitted: omitting defaults to
+  # `["trivy"]` (the default), which the cross-spec validator
+  # checks against the live `scanner_registry`. The compose stack used
+  # by `test-gitops-policies.sh` doesn't run an hort-worker — the smoke
+  # exercises policy CRUD + event emission, not the scanner pipeline
+  # (`test-vulnerability-scan.sh` covers that with the `worker` compose
+  # profile). Empty list means "policy without scanning"; the parser
+  # supports this shape (`parse_explicit_empty_scan_backends_means_no_scanning`).
+  scanBackends: []

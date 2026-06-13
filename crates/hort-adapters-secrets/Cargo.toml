@@ -1,0 +1,27 @@
+[package]
+name = "hort-adapters-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort secret-resolution adapters (env-var, mounted-file, dispatch)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+
+tokio    = { workspace = true, features = ["fs", "rt"] }
+tracing  = { workspace = true }
+metrics  = { workspace = true }
+zeroize  = { workspace = true }
+
+[dev-dependencies]
+tokio         = { workspace = true, features = ["test-util", "macros"] }
+tempfile      = "3"
+metrics-util  = { workspace = true, features = ["debugging"] }
+temp-env      = "0.3"
+# Captures per-test tracing events so the mode-warning +
+# demoted-info-to-debug behaviour can be asserted without a global
+# subscriber. Same version pin as hort-server.
+tracing-test  = "0.2"

@@ -1,0 +1,427 @@
+{{- /* Backlog 078 Item 7 — fail-fast on a double-source / path-less
+       extraCaBundle config (mutually-exclusive configMapName/secretName,
+       or an auto-mount source with no path). */}}
+{{- include "hort-server.extraCaBundle.validateSources" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hort-server.fullname" . }}
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.labels" . | nindent 8 }}
+        # Server-only Service discriminator. Added to the pod template
+        # (mutable) NOT spec.selector.matchLabels (immutable);
+        # matchLabels ⊆ pod labels still holds. Pairs with the matching
+        # selector key in service.yaml so the hort-server Service stops
+        # also selecting the worker + Job/CronJob pods.
+        app.kubernetes.io/component: server
+      annotations:
+        # Roll pods when the gitops ConfigMap changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.extraCaBundle.configMapName }}
+        # Roll pods when the operator-supplied extra-CA-bundle ConfigMap
+        # changes (or when the values switch which ConfigMap is referenced).
+        # See `hort-server.extraCaConfigMapChecksum` in `_helpers.tpl` for
+        # the rotation-contract caveat: hot edits to the underlying ConfigMap
+        # require `kubectl rollout restart` because
+        # `helm upgrade` is the only path that re-renders the lookup.
+        # (Secret-backed auto-mount uses Kubernetes' own Secret-update
+        # propagation; no checksum annotation is needed for it.)
+        checksum/extra-ca-bundle: {{ include "hort-server.extraCaConfigMapChecksum" . }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hort-server.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # HORT_SHUTDOWN_GRACE_SECS is read by the binary; pod-level
+      # terminationGracePeriodSeconds must be at least as large to give
+      # the binary the full window before SIGKILL.
+      terminationGracePeriodSeconds: {{ add (int .Values.shutdown.gracefulSeconds) 30 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: hort-server
+          image: {{ include "hort-server.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+              protocol: TCP
+            {{- if .Values.metrics.bindAddr }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.control.bindAddr }}
+            # Dedicated internal-only control-plane listener port.
+            # Only exposed when `control.bindAddr` is set
+            # (mirrors the metrics port gate).
+            - name: control
+              containerPort: {{ .Values.service.controlPort }}
+              protocol: TCP
+            {{- end }}
+          env:
+            # ----- Postgres (app-role DSN, NOT admin) -----
+            # Backlog 078 Item 5 — canonical HORT_DATABASE_URL. The binary
+            # falls back to bare DATABASE_URL (sqlx-cli / Tier-2 / 12-factor),
+            # so the bare name still works; the chart sets the canonical one.
+            - name: HORT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.app.existingSecret | quote }}
+                  key: {{ .Values.postgres.app.secretKey | quote }}
+            # ----- Public surface -----
+            - name: HORT_PUBLIC_BASE_URL
+              value: {{ .Values.publicBaseUrl | quote }}
+            - name: HORT_API_BIND
+              value: {{ .Values.api.bindAddr | quote }}
+            - name: HORT_REQUIRE_HTTPS
+              value: {{ .Values.requireHttps | quote }}
+            {{- if .Values.trustedProxyCidrs }}
+            - name: HORT_TRUSTED_PROXY_CIDRS
+              value: {{ join "," .Values.trustedProxyCidrs | quote }}
+            {{- end }}
+            # ----- Auth -----
+            - name: HORT_AUTH_PROVIDER
+              value: {{ .Values.auth.provider | quote }}
+            {{- if eq .Values.auth.provider "oidc" }}
+            - name: HORT_OIDC_ISSUER_URL
+              value: {{ .Values.auth.oidc.issuerUrl | quote }}
+            - name: HORT_OIDC_AUDIENCE
+              value: {{ .Values.auth.oidc.audience | quote }}
+            - name: HORT_OIDC_GROUPS_CLAIM
+              value: {{ .Values.auth.oidc.groupsClaim | quote }}
+            - name: HORT_JWKS_CACHE_TTL_SECS
+              value: {{ .Values.auth.oidc.jwksCacheTtlSeconds | quote }}
+            {{- if .Values.auth.tokenExchange.enabled }}
+            - name: HORT_TOKEN_EXCHANGE_ENABLED
+              value: "true"
+            - name: HORT_OIDC_CLI_CLIENT_ID
+              value: {{ .Values.auth.tokenExchange.cliClientId | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /*
+               Native-token validator + OCI `/v2/auth` JWT signing key.
+               Rendered INDEPENDENT of `auth.provider` because the
+               composition root wires `AuthContext::BearerOnly` when
+               `provider=disabled + nativeTokens.enabled=true`: the
+               native-token validator (`Bearer hort_<kind>_*`) is the
+               inbound identity surface; HTTP Basic is accepted as a
+               token *carrier* only (the password field carries a
+               native token; the username field is ignored). Previously
+               this block was nested under the `oidc` arm, which
+               silently dropped native-token support under
+               `provider=disabled` and broke the documented
+               service-account auth path.
+            */}}
+            {{- if .Values.auth.nativeTokens.enabled }}
+            - name: HORT_NATIVE_TOKENS_ENABLED
+              value: "true"
+            - name: HORT_OCI_TOKEN_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.nativeTokens.signingKey.existingSecret | quote }}
+                  key: {{ .Values.auth.nativeTokens.signingKey.secretKey | quote }}
+            {{- if .Values.auth.nativeTokens.signingKey.prevExistingSecret }}
+            - name: HORT_OCI_TOKEN_SIGNING_KEY_PREV
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.nativeTokens.signingKey.prevExistingSecret | quote }}
+                  key: {{ .Values.auth.nativeTokens.signingKey.prevSecretKey | quote }}
+            {{- end }}
+            {{- end }}
+            # ----- HTTP transport -----
+            - name: HORT_HTTP_REQUEST_TIMEOUT_SECS
+              value: {{ .Values.http.requestTimeoutSeconds | quote }}
+            - name: HORT_HTTP_HEADER_READ_TIMEOUT_SECS
+              value: {{ .Values.http.headerReadTimeoutSeconds | quote }}
+            {{- /* Backlog 078 Item 10 — the OCI upload timeout is now keyed
+                   under `oci.uploadTimeoutSeconds` (grouped with the other OCI
+                   surfaces); the env var name + emit position are unchanged. */}}
+            - name: HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS
+              value: {{ .Values.oci.uploadTimeoutSeconds | quote }}
+            {{- if gt (int .Values.http.maxInflight) 0 }}
+            - name: HORT_MAX_INFLIGHT
+              value: {{ .Values.http.maxInflight | quote }}
+            {{- end }}
+            {{- if gt (int .Values.http.maxInflightPerIp) 0 }}
+            - name: HORT_MAX_INFLIGHT_PER_IP
+              value: {{ .Values.http.maxInflightPerIp | quote }}
+            {{- end }}
+            {{- if .Values.http.publishBodyMaxSize }}
+            - name: HORT_PUBLISH_BODY_MAX_SIZE
+              {{- /* Backlog 078 Item 4: this knob is a human-readable SIZE
+                     string ("300Mi", "1Gi"), not a bare byte integer.
+                     Strings never go through Helm's float64 number coercion,
+                     so there is no scientific-notation path (the rc.3
+                     boot-crash class); the binary parses the suffix. Keep it
+                     a quoted string; do NOT convert to a bare integer. An
+                     empty value leaves the env var unset (binary default,
+                     300 MiB); an explicit "0" is the refuse-all-publishes
+                     kill-switch. */}}
+              value: {{ .Values.http.publishBodyMaxSize | quote }}
+            {{- end }}
+            # ----- Upstream proxy storage backstops -----
+            # These are human-readable SIZE strings ("64Mi", "1Gi") — passed
+            # through verbatim as quoted strings. Strings never go through
+            # Helm's float64 number coercion, so there is no scientific-
+            # notation path (the rc.3 boot-crash class); the binary parses the
+            # suffix. Keep them quoted strings; do NOT convert to bare integers.
+            - name: HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE
+              value: {{ .Values.upstream.metadataCacheMaxSize | quote }}
+            - name: HORT_UPSTREAM_MANIFEST_CACHE_MAX_SIZE
+              value: {{ .Values.upstream.manifestCacheMaxSize | quote }}
+            - name: HORT_UPSTREAM_PROJECTOR_VERSION_OBJECT_MAX_SIZE
+              value: {{ .Values.upstream.projectorVersionObjectMaxSize | quote }}
+            {{- if .Values.upstream.userAgent }}
+            # Outbound User-Agent for upstream fetches. Empty value omits the
+            # env so the binary's built-in `hort/<version>` UA applies.
+            - name: HORT_UPSTREAM_USER_AGENT
+              value: {{ .Values.upstream.userAgent | quote }}
+            {{- end }}
+            # ----- Metrics -----
+            - name: HORT_METRICS_REQUIRE_AUTH
+              value: {{ .Values.metrics.requireAuth | quote }}
+            {{- if .Values.metrics.bindAddr }}
+            - name: HORT_METRICS_BIND
+              value: {{ .Values.metrics.bindAddr | quote }}
+            {{- end }}
+            {{- if .Values.metrics.allowUnspecifiedBind }}
+            - name: HORT_METRICS_PUBLIC_BIND
+              value: "true"
+            {{- end }}
+            # ----- Control plane -----
+            {{- if .Values.control.bindAddr }}
+            - name: HORT_CONTROL_BIND
+              value: {{ .Values.control.bindAddr | quote }}
+            {{- if .Values.control.allowUnspecifiedBind }}
+            - name: HORT_CONTROL_PUBLIC_BIND
+              value: "true"
+            {{- end }}
+            {{- end }}
+            # ----- OCI -----
+            - name: HORT_OCI_LEGACY_CATALOG_ENABLED
+              value: {{ .Values.oci.legacyCatalogEnabled | quote }}
+            {{- if gt (int .Values.oci.maxSessionsPerPrincipal) 0 }}
+            - name: HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL
+              value: {{ .Values.oci.maxSessionsPerPrincipal | quote }}
+            {{- end }}
+            # ----- Shutdown -----
+            - name: HORT_SHUTDOWN_GRACE_SECS
+              value: {{ .Values.shutdown.gracefulSeconds | quote }}
+            # ----- CAS scrub -----
+            # Surface to the runtime even though `serve` does not call
+            # the scrub use case directly — the binary's `Config::from_env`
+            # parses every var on every invocation, so a misconfigured
+            # value (typo) MUST be a loud rejection at boot, not a
+            # surprise at the next CronJob fire.
+            - name: HORT_CAS_SCRUB_ACTION_ON_MISMATCH
+              value: {{ .Values.scheduledTasks.scrub.actionOnMismatch | quote }}
+            # ----- Secrets containment root -----
+            - name: HORT_SECRETS_FILE_ROOT
+              value: {{ .Values.secrets.fileRoot | quote }}
+            # ----- gitops config dir -----
+            - name: HORT_CONFIG_DIR
+              value: /etc/hort-server/config
+            # ----- Storage -----
+            - name: HORT_STORAGE_BACKEND
+              value: {{ .Values.storage.backend | quote }}
+            {{- if eq .Values.storage.backend "filesystem" }}
+            - name: HORT_STORAGE_FILESYSTEM_PATH
+              value: /var/lib/hort-server/cas
+            {{- else if eq .Values.storage.backend "s3" }}
+            - name: AWS_ENDPOINT_URL_S3
+              value: {{ .Values.storage.s3.endpoint | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.storage.s3.region | quote }}
+            - name: HORT_STORAGE_S3_BUCKET
+              value: {{ .Values.storage.s3.bucket | quote }}
+            - name: HORT_STORAGE_S3_FORCE_PATH_STYLE
+              value: {{ .Values.storage.s3.pathStyle | quote }}
+            - name: HORT_STORAGE_S3_ALLOW_HTTP
+              value: {{ .Values.storage.s3.allowHttp | quote }}
+            {{- if .Values.storage.s3.sseMode }}
+            - name: HORT_S3_SSE_MODE
+              value: {{ .Values.storage.s3.sseMode | quote }}
+            {{- end }}
+            {{- if .Values.storage.s3.sseKmsKeyArn }}
+            - name: HORT_S3_SSE_KMS_KEY_ARN
+              value: {{ .Values.storage.s3.sseKmsKeyArn | quote }}
+            {{- end }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret | quote }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret | quote }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- end }}
+            # ----- Stateful-upload staging -----
+            # Set UNCONDITIONALLY for every storage backend (NOT gated on
+            # storage.backend). The binary's default (config.rs:348-351) is
+            # `<HORT_STORAGE_FILESYSTEM_PATH>/stateful-upload-staging` for the
+            # filesystem backend OR the fixed
+            # `/var/lib/hort/stateful-upload-staging` when the
+            # backend is S3 (no filesystem path). The latter is on the
+            # read-only rootfs (no emptyDir covers it) → under
+            # readOnlyRootFilesystem:true the S3 backend's chunked uploads
+            # (OCI `docker push`, Git LFS) are silently non-functional.
+            # `/var/lib/hort-server/staging` is already a writable emptyDir
+            # (volume `staging`); a subdir under it is covered by that mount
+            # — no new volume/mount. Pointing every backend here is uniform
+            # and harmless (filesystem already worked via /var/lib/hort-server/cas).
+            - name: HORT_STATEFUL_UPLOAD_STAGING_DIR
+              value: /var/lib/hort-server/staging/stateful-upload
+            # ----- Ephemeral store -----
+            - name: HORT_EPHEMERAL_STORE_BACKEND
+              value: {{ .Values.ephemeralStore.backend | quote }}
+            {{- if eq .Values.ephemeralStore.backend "redis" }}
+            {{- if .Values.ephemeralStore.redis.existingSecret }}
+            - name: HORT_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ephemeralStore.redis.existingSecret | quote }}
+                  key: {{ .Values.ephemeralStore.redis.secretKey | quote }}
+            {{- else }}
+            - name: HORT_REDIS_URL
+              value: {{ .Values.ephemeralStore.redis.url | quote }}
+            {{- end }}
+            {{- /* Per-class evictable override. Inline value wins over secret
+                   indirection; when neither is set the env var is omitted
+                   entirely and the runtime falls back to HORT_REDIS_URL
+                   via the resolution chain. */}}
+            {{- if .Values.ephemeralStore.redis.evictableUrl }}
+            - name: HORT_REDIS_URL_EVICTABLE
+              value: {{ .Values.ephemeralStore.redis.evictableUrl | quote }}
+            {{- else if .Values.ephemeralStore.redis.evictableExistingSecret }}
+            - name: HORT_REDIS_URL_EVICTABLE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ephemeralStore.redis.evictableExistingSecret | quote }}
+                  key: {{ .Values.ephemeralStore.redis.evictableSecretKey | quote }}
+            {{- end }}
+            {{- /* Per-class durable override. Same shape. */}}
+            {{- if .Values.ephemeralStore.redis.durableUrl }}
+            - name: HORT_REDIS_URL_DURABLE
+              value: {{ .Values.ephemeralStore.redis.durableUrl | quote }}
+            {{- else if .Values.ephemeralStore.redis.durableExistingSecret }}
+            - name: HORT_REDIS_URL_DURABLE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.ephemeralStore.redis.durableExistingSecret | quote }}
+                  key: {{ .Values.ephemeralStore.redis.durableSecretKey | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- /* Extra CA trust. The chart sets HORT_EXTRA_CA_BUNDLE ONLY
+                   when it also auto-mounts the bundle on this pod
+                   (extraCaBundle.configMapName or .secretName). For the
+                   manual extraVolumes recipe (path set, no auto-mount
+                   source) the operator sets this env themselves via
+                   `extraEnv` — the chart never points the var at a file
+                   it did not mount. */}}
+            - name: HORT_EXTRA_CA_BUNDLE
+              value: {{ .Values.extraCaBundle.path | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # Probes wired to Item 1's /healthz + /readyz endpoints.
+          livenessProbe:
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          startupProbe:
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem requires explicit emptyDir for every
+            # writable path the binary uses.
+            - name: tmp
+              mountPath: /tmp
+            - name: staging
+              mountPath: /var/lib/hort-server/staging
+            {{- if eq .Values.storage.backend "filesystem" }}
+            - name: data
+              mountPath: /var/lib/hort-server/cas
+            {{- end }}
+            - name: gitops-config
+              mountPath: /etc/hort-server/config
+              readOnly: true
+            {{- range .Values.secrets.mounts }}
+            - name: {{ .name }}
+              mountPath: {{ printf "%s/%s" $.Values.secrets.fileRoot .path }}
+              subPath: {{ .key }}
+              readOnly: true
+            {{- end }}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: staging
+          emptyDir: {}
+        {{- if eq .Values.storage.backend "filesystem" }}
+        - name: data
+          {{- if .Values.storage.filesystem.pvc.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hort-server.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        - name: gitops-config
+          configMap:
+            name: {{ include "hort-server.fullname" . }}-config
+            optional: true
+        {{- range .Values.secrets.mounts }}
+        - name: {{ .name }}
+          secret:
+            secretName: {{ .secretName | quote }}
+            items:
+              - key: {{ .key | quote }}
+                path: {{ .key | quote }}
+        {{- end }}
+        {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+        {{- include "hort-server.extraCaBundle.volume" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

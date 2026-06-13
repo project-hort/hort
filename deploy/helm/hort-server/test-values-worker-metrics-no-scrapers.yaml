@@ -1,0 +1,35 @@
+# Regression fixture: worker /metrics enabled with NO
+# scrapers declared MUST be rejected at `helm template`.
+#
+# `worker.metrics.enabled: true` + an empty `scrapeFrom` is the fail-OPEN trap:
+# a NetworkPolicy ingress rule with `from: []` means ALL sources per the k8s
+# spec, so allowing it would open the metrics port cluster-wide. The schema's
+# `if enabled then scrapeFrom minItems 1` rule must reject this combination so
+# the listener can never be turned on without declaring exactly who may scrape
+# it. (The template also renders `ingress: []` — genuine deny — for empty
+# scrapeFrom, as defence-in-depth if schema validation is bypassed.)
+#
+# Identical to test-values-worker-metrics.yaml except scrapeFrom is empty.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+worker:
+  enabled: true
+  metrics:
+    enabled: true
+    port: 9090
+    scrapeFrom: []

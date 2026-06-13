@@ -1,0 +1,15 @@
+# ClaimMapping: the OIDC group `test-developers` (declared in
+# `deploy/compose/keycloak/realm.json` — `dev-user` is the canonical alpha
+# member, password `dev`) resolves to the `developer` claim. The claim
+# itself confers no power; the PermissionGrants in this directory are
+# what turn the claim into authority.
+#
+# Mirrors `deploy/compose/example-config/auth/developers.yaml` so the alpha
+# fixture and the E2E example tree agree on the dev-group's claim name.
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: developers
+spec:
+  idpGroup: test-developers
+  claim: developer

@@ -1,0 +1,58 @@
+{{/*
+`helm test` Job. Polls /healthz over the cluster Service until it
+returns 200, exits 0. busybox carries `wget`; the hort-server image is
+distroless and has no shell, so we run the test from a separate image.
+
+Helm v3 best practice: `helm test` Jobs are stable across cleanup
+(unlike Pods, which the test runner sometimes leaves behind on failure).
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "hort-server.fullname" . }}-test-connection
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.selectorLabels" . | nindent 8 }}
+        hort-server.io/job: test-connection
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: wget
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              url="http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort }}/healthz"
+              for i in $(seq 1 30); do
+                if wget -q -O - "$url" >/dev/null 2>&1; then
+                  echo "OK: /healthz reachable on attempt $i"
+                  exit 0
+                fi
+                echo "attempt $i: $url not yet reachable"
+                sleep 2
+              done
+              echo "FAIL: /healthz unreachable after 30 attempts"
+              exit 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

@@ -1,0 +1,52 @@
+# HA-S3-Redis test values. Three replicas, S3 storage, Redis ephemeral
+# store. Exercises the `replicaCount > 1` path, the auto-PDB, and the
+# S3 + Redis branches in the Deployment template.
+publicBaseUrl: https://hort.example.com
+replicaCount: 3
+trustedProxyCidrs:
+  - 10.244.0.0/16
+  - "::1/128"
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: s3
+  s3:
+    endpoint: https://minio.example.com
+    region: us-east-1
+    bucket: hort-artifacts
+    pathStyle: true
+    existingSecret: hort-s3-creds
+
+ephemeralStore:
+  backend: redis
+  redis:
+    existingSecret: hort-redis-creds
+
+metrics:
+  serviceMonitor:
+    enabled: true
+
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              ingress-allowed: "true"
+  egress:
+    - to:
+        - namespaceSelector: {}
+
+podDisruptionBudget:
+  minAvailable: 2

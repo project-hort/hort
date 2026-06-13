@@ -1,0 +1,29 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  # UpstreamMapping for the `repository_upstream_mappings` row that
+  # crates/hort-http-pypi/src/upstream_pull.rs::try_upstream_file_pull
+  # resolves via UpstreamResolver. PyPI uses a single catch-all
+  # upstream per repo (no path-prefix routing), mirroring Cargo's
+  # registry-wide upstream mapping rather than OCI's multi-namespace
+  # split.
+  name: pypi-upstream-e2e
+spec:
+  repository: pypi-upstream-e2e
+  # Empty pathPrefix → catch-all single-upstream mapping. The PyPI
+  # orchestrator passes "" as the prefix on every resolve() call.
+  pathPrefix: ""
+  # Wiremock service hostname inside the v2 compose network. The
+  # simple-index proxy fetches /simple/{name}/ here; the file leg
+  # uses the absolute URL embedded in the per-version JSON body
+  # (also pre-rewritten to point at this same host — see the
+  # __files/json/requests/2.31.0.json fixture).
+  upstreamUrl: http://wiremock-pypi-upstream:8080
+  # Explicit opt-in to a plaintext upstream. The wiremock sidecar runs
+  # HTTP-only inside the compose network; production upstreams MUST be
+  # https and this flag MUST be omitted. Every fetch through this
+  # mapping emits a WARN line and ticks
+  # hort_upstream_insecure_total{format="pypi", reason="scheme_http"}.
+  insecureUpstreamUrl: true
+  auth:
+    type: anonymous

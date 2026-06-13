@@ -1,0 +1,37 @@
+[package]
+name = "hort-adapters-ephemeral-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Redis adapter for the EphemeralStore port — fred-based, Lua EVAL for CAS"
+
+[lints]
+workspace = true
+
+[features]
+# Gates the port-contract integration tests so the default `cargo
+# test` / Fast CI run never requires a Redis sidecar. CI runs the
+# suite with `--features redis-integration-tests` when it can spin
+# up a Redis container; local dev opts in with the same flag when
+# `HORT_REDIS_URL` points at a reachable instance.
+redis-integration-tests = []
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+# `MeteredEphemeralStore::new` takes `EphemeralKeyspaceClass`
+# (defined in `hort-app::ephemeral_keyspace`) so every metric series
+# carries the `class={evictable|durable}` label. Pure data import —
+# no I/O brought in.
+hort-app    = { path = "../hort-app" }
+
+async-trait = { workspace = true }
+bytes       = { workspace = true }
+fred        = { workspace = true }
+metrics     = { workspace = true }
+tokio       = { workspace = true, features = ["sync", "time", "rt"] }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio        = { workspace = true, features = ["macros", "rt-multi-thread"] }
+metrics-util = { workspace = true, features = ["debugging"] }
+uuid         = { workspace = true, features = ["v4"] }

@@ -1,0 +1,81 @@
+{{/*
+Staging sweep task CronJob.
+
+Periodically invokes `hort-cli admin task invoke staging-sweep` to expire
+staging-area uploads that have been pending for longer than the configured
+window (`HORT_STAGING_MAX_AGE_SECS`). This task keeps hort-server
+scheduler-free by running the sweep externally on a CronJob cadence.
+
+Default schedule: every 15 minutes (matching `HORT_STAGING_SWEEP_INTERVAL_SECS
+= 900`). Operators with high upload volume or a shorter staging window may
+want a more frequent schedule.
+
+Gated by `scheduledTasks.stagingSweep.enabled` (default false). The parent toggle
+`scheduledTasks.adminTasksEnabled` must also be true for this template to render.
+
+The service-account token (`{{ release }}-svc-token`) is mounted from the
+k8s Secret written by the bootstrap Job (svc-token-bootstrap-job.yaml).
+
+Idempotency-Key: `hort-cli admin task invoke` is passed
+`--idempotency-key-window=minute`, which computes the key as
+`<UTC minute>:staging-sweep` (matches the legacy shell shape
+`date -u +%Y-%m-%dT%H:%M`). A double-fire from a controller restart
+short-circuits at the framework layer rather than double-counting in
+the audit trail and metrics.
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.stagingSweep.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-staging-sweep
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: staging-sweep
+spec:
+  schedule: {{ .Values.scheduledTasks.stagingSweep.schedule | quote }}
+  # Forbid concurrent sweeps. A sweep that runs long (large staging table)
+  # should not be interrupted by the next tick — the second run would see
+  # the same expired uploads and perform duplicate work.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: staging-sweep
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Distroless runtime: invoke `hort-cli` directly and let it
+              # compute the idempotency key via `--idempotency-key-window`.
+              # See cronjob-service-account-rotation.yaml for context.
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - staging-sweep
+                - --idempotency-key-window
+                - minute
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

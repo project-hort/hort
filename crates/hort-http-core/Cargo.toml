@@ -1,0 +1,86 @@
+[package]
+name = "hort-http-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort shared HTTP inbound primitives"
+
+[lints]
+workspace = true
+
+[features]
+# Exposes test-only helpers (`error::assert_no_internal_leakage`, the
+# `test_support::build_mock_ctx` + `MockPorts` harness) to downstream
+# inbound-HTTP crates when they pull this crate in via
+# `dev-dependencies`. Never enabled on the production dep edge.
+#
+# Activates `hort-app/test-support` so the `build_mock_ctx` wiring can
+# construct the mocks it returns via `MockPorts`. Also pulls in the
+# in-memory `EphemeralStore` adapter used by `build_mock_ctx`.
+test-support = ["hort-app/test-support", "dep:hort-adapters-ephemeral-memory"]
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+hort-app    = { path = "../hort-app" }
+# `AppContext.extra_trust_anchors` holds the process-wide extra CA
+# trust bundle parsed at composition time (ADR 0010).
+# `hort-config` is zero-I/O so this dep does not widen the runtime
+# footprint of `hort-http-core`.
+hort-config = { path = "../hort-config" }
+
+# Optional — enabled by the `test-support` feature so `build_mock_ctx`
+# can wire an in-memory `EphemeralStore` into the mock AppContext.
+# Never on the production dependency edge.
+hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory", optional = true }
+
+axum                        = { workspace = true }
+tower                       = { workspace = true }
+tower-http                  = { workspace = true }
+tower_governor              = { version = "=0.5.0", default-features = false, features = ["axum"] }
+governor                    = "0.8"
+tokio                       = { workspace = true }
+tokio-util                  = { workspace = true }
+# Per-IP semaphore map for the
+# `middleware::load_shed::per_ip_load_shed_middleware`. Sharded map
+# keyed by `IpAddr` with `Arc<Semaphore>` values.
+dashmap                     = { workspace = true }
+bytes                       = { workspace = true }
+serde                       = { workspace = true }
+serde_json                  = { workspace = true }
+tracing                     = { workspace = true }
+metrics                     = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+arc-swap                    = { workspace = true }
+ipnet                       = { workspace = true }
+url                         = { workspace = true }
+uuid                        = { workspace = true }
+chrono                      = { workspace = true }
+# Basic-auth header decoding in `middleware::auth::extract_basic_credentials`.
+base64                      = "0.22"
+# `#[async_trait]` impls on `FromRequestParts` extractors in
+# `limits::BoundedPath` and `authz::extractors::{AdminPrincipal, WriteRepoAccess, ReadRepoAccess}`.
+# axum 0.7's `FromRequestParts` still requires the macro — a future axum
+# bump would let us drop it.
+async-trait                 = "0.1"
+
+[dev-dependencies]
+tokio                        = { workspace = true, features = ["test-util"] }
+# `futures::future::join_all` for the
+# concurrency-cap acceptance test in `middleware::load_shed`. Drives N
+# requests cooperatively on a single-threaded runtime so the
+# `metrics::with_local_recorder` thread-local stays in scope for the
+# counter assertion.
+futures                      = "0.3"
+hort-app                       = { path = "../hort-app", features = ["test-support"] }
+# Needed unconditionally for the `extractors.rs` test module that
+# builds a mock `AppContext` with a live `ephemeral` port — the
+# `test-support` feature makes it available as a regular dep too,
+# but that feature may not be active under `cargo test -p hort-http-core`.
+hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
+metrics-util                 = { workspace = true, features = ["debugging"] }
+tempfile                     = "3"
+regex                        = "1"
+# `traced_test` + `logs_assert`
+# for the trusted-proxy XFF-sentinel WARN throttle assertions in
+# `middleware::trust::tests`. Same dep already used by `hort-server`.
+tracing-test                 = { version = "0.2", features = ["no-env-filter"] }

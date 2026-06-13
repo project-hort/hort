@@ -1,0 +1,60 @@
+{{/*
+Service-account RBAC for the svc-token bootstrap Job.
+
+Creates a dedicated ServiceAccount + Role + RoleBinding that grants the
+bootstrap Job exactly the permissions needed to write the
+{{ release }}-svc-token Secret. The Role is intentionally minimal:
+  - get/patch/update on the named secret (for idempotent re-runs)
+  - create on secrets (cannot be scoped by resourceName in k8s RBAC — see
+    inline comment; a separate rule is the standard workaround)
+
+All three resources are gated by `scheduledTasks.adminTasksEnabled` — they
+are only useful when the bootstrap Job renders, so they appear and disappear
+together.
+*/}}
+{{- if .Values.scheduledTasks.adminTasksEnabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "hort-server.fullname" . }}-svc-bootstrap
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "hort-server.fullname" . }}-svc-bootstrap
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+rules:
+  # get/patch/update the specific Secret. resourceNames scoping is supported
+  # for these verbs, so we lock them down to the exact secret name.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ include "hort-server.fullname" . }}-svc-token
+    verbs: ["get", "patch", "update"]
+  # "create" cannot be scoped by resourceName in k8s RBAC (the API server
+  # rejects such rules with a validation error). A separate rule without
+  # resourceNames is the standard workaround — see
+  # https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "hort-server.fullname" . }}-svc-bootstrap
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hort-server.fullname" . }}-svc-bootstrap
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "hort-server.fullname" . }}-svc-bootstrap
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

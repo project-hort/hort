@@ -1,0 +1,63 @@
+# Test fixture: half-set rotation misconfig (Backlog 078 Item 9, chart S4).
+#
+# Item 9 collapsed the pre-078 two-place rotation switch into a SINGLE
+# source-of-truth toggle `scheduledTasks.serviceAccountRotation.enabled`.
+# The pieces that must still physically agree when that toggle is on are
+# enforced by the top-level `values.schema.json` `allOf` couplings
+# (rules 9a/9b, mirroring the `replicaCount ⇒ ephemeralStore/storage`
+# couplings):
+#   9a: serviceAccountRotation.enabled ⇒ scheduledTasks.adminTasksEnabled
+#   9b: serviceAccountRotation.enabled ⇒ worker.enabled
+#                                      ∧ worker.rotation.publicRegistryHost
+#
+# This fixture is the canonical half-set state: the single rotation toggle
+# is flipped ON, but the `adminTasksEnabled` umbrella is left at its
+# default (false) — so the admin-task CronJob would silently render
+# NOTHING. The schema rejects it at `helm install` / `helm template`
+# instead of silently half-enabling rotation.
+#
+# Usage (expected to EXIT NON-ZERO with the schema validation error
+# citing scheduledTasks.adminTasksEnabled):
+#   helm template deploy/helm/hort-server/ \
+#       -f deploy/helm/hort-server/test-values-rotation-half-on.yaml
+#
+# Other half-set shapes the same schema rejects (reproduce by editing):
+#   - adminTasksEnabled: true but worker.rotation.publicRegistryHost: ""
+#     (rule 9b — worker env has nowhere to point).
+#   - adminTasksEnabled: true but worker.enabled: false
+#     (rule 9b — the worker that performs rotation is not deployed).
+
+worker:
+  enabled: true
+  rotation:
+    targetNamespaces:
+      - ci-system
+    publicRegistryHost: "registry.example.com:5443"
+
+scheduledTasks:
+  # adminTasksEnabled left at its default (false) — the umbrella the
+  # rotation CronJob renders under. With it absent, the single rotation
+  # toggle below is a silent half-on; rule 9a rejects this combination.
+  serviceAccountRotation:
+    enabled: true
+
+# Minimal required values to pass the unrelated schema rules.
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

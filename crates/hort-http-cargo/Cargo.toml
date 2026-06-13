@@ -1,0 +1,57 @@
+[package]
+name = "hort-http-cargo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for Cargo sparse registry (RFC 2789)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-formats   = { path = "../hort-formats" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+bytes        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+url          = { workspace = true }
+metrics      = { workspace = true }
+thiserror    = { workspace = true }
+# The internal `IndexSource` trait
+# (`crates/hort-http-cargo/src/index_source.rs`) is `pub(crate)` and
+# dispatched dynamically per `RepositoryType` in the unified serve
+# handler. `async-trait` is the lowest-friction way to ship an async
+# trait with dyn-dispatch; the workspace already pins it.
+async-trait  = { workspace = true }
+# JSON+base64 envelope for the sparse-index pull-through cache.
+# `base64` is not a workspace dep but is already pulled in transitively
+# at v0.22; pinning a direct entry at the same major keeps the cache
+# module's encoding choice explicit at the crate boundary.
+base64       = "0.22"
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+metrics-util                = { workspace = true, features = ["debugging"] }
+tempfile                    = "3"
+regex                       = "1"
+sha2                        = { workspace = true }
+# Inline test module drives routers through tower's ServiceExt::oneshot.
+tower                       = { workspace = true }
+# `AuthContext::Enabled` fixtures in the test harness wrap the RBAC
+# evaluator snapshot in Arc<ArcSwap<_>>.
+arc-swap                    = { workspace = true }
+# Tests scope a Prometheus recorder to verify metric emission paths fire.
+metrics-exporter-prometheus = { workspace = true }
+# Item 7: tracing-warn capture test for the checksum-mismatch branch.
+tracing-subscriber           = { workspace = true }

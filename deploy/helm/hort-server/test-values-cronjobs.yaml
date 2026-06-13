@@ -1,0 +1,83 @@
+# Test fixture: enable all scheduled-task CronJob templates for
+# helm-template verification.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values-cronjobs.yaml
+#
+# Expected manifests:
+#   - ServiceAccount (svc-bootstrap-rbac.yaml)
+#   - Role (svc-bootstrap-rbac.yaml)
+#   - RoleBinding (svc-bootstrap-rbac.yaml)
+#   - Job (svc-token-bootstrap-job.yaml)
+#   - CronJob (cronjob-noop.yaml)
+#   - CronJob (cronjob-staging-sweep.yaml)
+#   - CronJob (cronjob-cron-rescan-tick.yaml)
+#   - CronJob (cronjob-advisory-watch-tick.yaml)
+#   - CronJob (cronjob-eventstore-checkpoint.yaml)
+#   - CronJob (cronjob-replay-seen-prune.yaml)
+#
+# cronjob-replay-seen-prune.yaml is the ONE admin-task template that is
+# default-ENABLED (spec §12 R4): it renders whenever the
+# `scheduledTasks.adminTasksEnabled` master toggle is true even without an
+# explicit per-job `enabled: true` (its default in values.yaml is true). It
+# is still set explicitly in the block below for test clarity.
+#
+# None of the admin-task CronJobs render with the default values
+# (scheduledTasks.adminTasksEnabled: false — the master toggle gates ALL
+# admin-task templates, including the default-enabled replay-seen-prune).
+# The DSN-direct tasks (scrub + quarantineReleaseSweep) are NOT gated by the
+# master toggle and render at their own defaults. This file is strictly for
+# local helm lint/template smoke tests — it is not a production values file.
+
+scheduledTasks:
+  adminTasksEnabled: true
+  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.30"
+  noop:
+    enabled: true
+    schedule: "0 0 * * *"
+  stagingSweep:
+    enabled: true
+    schedule: "*/15 * * * *"
+  cronRescanTick:
+    enabled: true
+    schedule: "*/5 * * * *"
+  advisoryWatchTick:
+    enabled: true
+    schedule: "0 */6 * * *"
+  eventstoreCheckpoint:
+    enabled: true
+    schedule: "0 * * * *"
+  replaySeenPrune:
+    enabled: true
+    schedule: "0 * * * *"
+  # The three retention CronJobs.
+  retentionEvaluate:
+    enabled: true
+    schedule: "0 3 * * *"
+  retentionPurge:
+    enabled: true
+    schedule: "0 4 * * *"
+  eventstoreArchive:
+    enabled: true
+    schedule: "0 5 * * 0"
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

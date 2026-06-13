@@ -1,0 +1,25 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  # Key matches the NPM_REPO_KEY env default in
+  # scripts/native-tests/scenarios/upstream/npm-upstream-tampered.sh. Distinct from
+  # the happy-path repo so both can run in the same harness without
+  # colliding on the (repository_id, path_prefix=NULL) row in
+  # repository_upstream_mappings.
+  name: npm-upstream-tampered-e2e
+spec:
+  name: "npm upstream tampering smoke (checksum mismatch, failure path)"
+  description: "Proxy npm repo used by scripts/native-tests/scenarios/upstream/npm-upstream-tampered.sh; upstream is the wiremock-npm-tampered sidecar serving a packument that advertises the real dist.integrity alongside tampered tarball body bytes — the supply-chain-attack surface the SHA-512 SRI verification gate exists to catch."
+  format: npm
+  type: proxy
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/npm-upstream-tampered-e2e
+  proxy:
+    # Required by the gitops validator for type=proxy. The standalone
+    # UpstreamMapping at deploy/compose/example-config/upstreams/
+    # npm-upstream-tampered-e2e.yaml is what the npm upstream-pull
+    # path actually resolves through.
+    upstreamUrl: "http://wiremock-npm-tampered:8080"
+  isPublic: true
+  replicationPriority: local_only

@@ -1,0 +1,37 @@
+# Token-exchange happy-path fixture — token-exchange + native-tokens
+# enabled together. Exercises:
+#   - HORT_TOKEN_EXCHANGE_ENABLED renders
+#   - HORT_NATIVE_TOKENS_ENABLED renders
+#   - HORT_OCI_TOKEN_SIGNING_KEY renders via secretKeyRef pointing at the
+#     operator-supplied Secret
+#   - HORT_OCI_TOKEN_SIGNING_KEY_PREV renders when the rotation slot is
+#     wired
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+  tokenExchange:
+    enabled: true
+    cliClientId: hort-cli
+  nativeTokens:
+    enabled: true
+    signingKey:
+      existingSecret: hort-oci-signing-key
+      secretKey: hort-oci-token-signing-key.pem
+      prevExistingSecret: hort-oci-signing-key-prev
+      prevSecretKey: hort-oci-token-signing-key-prev.pem
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory

@@ -1,0 +1,78 @@
+[package]
+name = "hort-notifier-nats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort NATS JetStream EventNotifier adapter — best-effort publish with explicit ack"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Outbound port trait + value types this adapter implements.
+hort-domain = { path = "../hort-domain" }
+
+# The process-wide extra-CA trust bundle (`HORT_EXTRA_CA_BUNDLE`).
+# `ExtraTrustAnchors` is the cross-crate value object that hands out DER
+# bytes without leaking the rustls type — the same source
+# `hort-adapters-upstream-http` / `-oidc` / `-storage` consume.
+hort-config = { path = "../hort-config" }
+
+# JetStream client. `default-features = false` keeps the dep lean — we
+# don't need the optional `kv`, `object-store`, `service`, or
+# `websockets` features that the default bundle pulls in. `jetstream`
+# is the only feature this adapter exercises; `server_2_10` keeps the
+# wire compatibility floor at the same NATS server release line the
+# v1 deploy targets. `ring` selects the same TLS crypto provider the
+# rest of the workspace uses via `rustls`.
+async-nats = { workspace = true, default-features = false, features = ["jetstream", "server_2_10", "ring"] }
+
+chrono     = { workspace = true }
+uuid       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Async runtime — `tokio::time::timeout` wraps the publish-ack future
+# with a 2s deadline per design doc §7.
+tokio = { workspace = true }
+
+# `Bytes` is the payload type `Context::publish` accepts; the adapter
+# converts the serialised JSON via `Bytes::from(Vec<u8>)`.
+bytes = { workspace = true }
+
+# Structured logging — adapter does not emit a metric directly (the
+# dispatcher owns `hort_notify_delivery_*` per design doc §12; cardinality
+# discipline). `warn!` on publish/ack failure with truncated subject
+# only per design doc §11 audit logging row.
+tracing = { workspace = true }
+
+# F-20: OS native root CA store for the `tls://`-with-internal-CA path.
+# async-nats re-exports `rustls` (= `tokio_rustls::rustls`) but does NOT
+# re-export `rustls-native-certs`, so it is declared here. Version `0.8`
+# matches `hort-adapters-upstream-http` (and async-nats' own `0.8`
+# transitive) — net-zero new transitive crates, and the augmented root
+# store stays consistent with the upstream-http TLS path (ADR 0010).
+# The `rustls::ClientConfig` we build for `ConnectOptions::tls_client_config`
+# uses the `async_nats::rustls` re-export so the type is identical to the
+# one async-nats compiled against regardless of Cargo version unification
+# (no separate `rustls` dep — that could resolve to a distinct instance).
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+# Webhook-target construction in the misrouted-target safety-net test
+# (the unit suite never speaks HTTP).
+url = { workspace = true }
+# `testcontainers` integration tests stand up `nats:latest` with
+# JetStream enabled. All tests in `tests/jetstream_publish.rs`
+# early-return when the `HORT_TEST_NATS=1` sentinel env var is unset so
+# dev environments without Docker keep the suite green — same gating
+# discipline as `hort-adapters-postgres`'s `DATABASE_URL` tests.
+testcontainers = { workspace = true }
+# F-20: generate a fully-valid self-signed X.509 CA in-process so the
+# extra-CA root-store tests exercise a cert rustls actually accepts as a
+# trust anchor (a static truncated PEM parses but fails
+# `RootCertStore::add`). Same generator + version as
+# `hort-notifier-webhook` / `hort-adapters-upstream-http` test suites.
+# rcgen is test-only; production paths never construct certificates.
+rcgen = "0.13"

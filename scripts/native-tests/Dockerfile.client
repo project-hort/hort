@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1.7
+# scripts/native-tests/Dockerfile.client
+# One image with every client tool the scenarios need, so each scenario runs in
+# a container instead of on a host with drifting toolchains (no PEP 668 venv
+# dance, no host node/cargo version skew). Built (cached) by run.sh, which passes
+# the REPO ROOT as the build context (stage 1 needs the workspace).
+
+# ---------- Stage 1: build hort-cli (the admin CLI) ----------
+# The quarantine + scanning scenarios drive `hort-cli admin ...`. It is a
+# pure-HTTP client crate (no DSN / hort-app / sqlx deps — see crates/hort-cli),
+# so this compiles only its own subgraph, not the whole workspace. Built on
+# rust:1.94-bookworm (workspace MSRV) so the binary's glibc matches the bookworm
+# final stage. cargo needs every member's Cargo.toml for workspace resolution,
+# hence `COPY crates`, but only hort-cli's subgraph is compiled.
+FROM rust:1.94-bookworm AS cli-builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p hort-cli && \
+    cp target/release/hort-cli /usr/local/bin/hort-cli
+
+# ---------- Stage 2: the client image ----------
+# Based on python:3.12-slim-bookworm (Debian bookworm + a MODERN pip) rather than
+# debian:bookworm-slim: scenarios create venvs (`python3 -m venv`) and Debian's
+# stock pip 23.0.1 crashes on hort's PEP 658/714 simple-index metadata
+# ("TypeError: unhashable type: 'dict'"). python:3.12-slim ships pip 24.x and its
+# ensurepip seeds venvs with it — matching run-e2e's proven PYPI_IMAGE.
+FROM python:3.12-slim-bookworm
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash curl ca-certificates jq git xz-utils \
+      gcc libc6-dev \
+      postgresql-client \
+      skopeo \
+    && rm -rf /var/lib/apt/lists/*
+# Node 20 (Debian bookworm ships 18; the smokes are validated on 20).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+# Rust/cargo (matches the retired run-e2e CARGO_IMAGE 1.88).
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+# Python publish/build tooling baked in so scenarios never pip-install at runtime.
+# (The base image's pip is not externally-managed, so no --break-system-packages.)
+RUN python3 -m pip install --no-cache-dir build twine
+# The hort-cli admin client (built in stage 1) — used by the quarantine +
+# scanning scenarios that drive admin/release/rescan flows over HTTP.
+COPY --from=cli-builder /usr/local/bin/hort-cli /usr/local/bin/hort-cli
+WORKDIR /work
