@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # The runner already has docker + compose. Every client toolchain
       # (twine/build, cargo, npm, skopeo, psql, hort-cli) runs INSIDE the
