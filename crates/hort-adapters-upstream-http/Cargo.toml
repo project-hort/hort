@@ -112,5 +112,5 @@ rcgen        = "0.13"
 # `axum-server` provides `bind_rustls` for the in-process HTTPS test
 # servers that exercise the CA + pinning paths. wiremock does not speak
 # TLS, so we stand up a minimal TLS-aware listener for those tests only.
-axum-server  = { version = "0.7", features = ["tls-rustls"] }
+axum-server  = { version = "0.8", features = ["tls-rustls"] }
 axum         = { workspace = true }
