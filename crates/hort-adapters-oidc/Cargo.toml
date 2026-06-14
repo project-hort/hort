@@ -40,7 +40,7 @@ wiremock = "0.6"
 # Generate self-signed certs in-process for the extra-CA HTTPS JWKS
 # test (see `extra_ca_anchors_allows_tls_to_private_ca_jwks_server`).
 # `rcgen` is test-only; production paths never construct certificates.
-rcgen       = "0.13"
+rcgen       = "0.14"
 # `axum-server` provides `bind_rustls` for the in-process HTTPS JWKS test
 # server. wiremock does not speak TLS, so we stand up a minimal
 # TLS-aware listener for the extra-CA positive/negative test pair.

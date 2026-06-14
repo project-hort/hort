@@ -64,7 +64,7 @@ const-oid = { version = "0.9", default-features = false }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
 # Self-signed root generation for the extra-CA apply test (same fixture
 # pattern as hort-adapters-advisory-osv — no committed PEM).
-rcgen = "0.13"
+rcgen = "0.14"
 # In-process HTTP server for the TUF trust-root refresh fetch test (the
 # only live-HTTP path in the crate). Same dev-dep the OSV adapter uses.
 wiremock = "0.6"
