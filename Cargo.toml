@@ -407,7 +407,7 @@ rpassword = "7"
 # required so individual consumers can opt back in via `features = [...]`;
 # the v1 consumer (`hort-notifier-nats`) selects `jetstream` +
 # `server_2_10` + `ring`.
-async-nats = { version = "0.48", default-features = false }
+async-nats = { version = "0.49", default-features = false }
 
 # Integration-test container harness — used only as a dev-dep by
 # `hort-notifier-nats` to stand up `nats:latest` with JetStream enabled.
