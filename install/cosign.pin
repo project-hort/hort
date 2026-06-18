@@ -1,0 +1,8 @@
+# install/cosign.pin — pinned cosign for the hort-cli installer bootstrap.
+# Bump procedure: install/README.md. Format: POSIX-sh KEY=VALUE.
+COSIGN_VERSION=v3.1.1
+COSIGN_SHA256_linux_amd64=ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc
+COSIGN_SHA256_linux_arm64=2ec865872e331c32fd12b08dae15332d3f92c0aa029219589684a4903ca85d11
+COSIGN_SHA256_darwin_amd64=14d2678dfbfde18798151e86fbd91ebdadbb7424b18412a42a155dd8a2df4c7a
+COSIGN_SHA256_darwin_arm64=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5
+COSIGN_SHA256_windows_amd64=9d2c026e667bfd979fa7ba1cab8c4b24d2e73f336ec2d57f7fc72c7e73e5b4b6

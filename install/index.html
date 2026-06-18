@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Install hort-cli</title>
+<style>
+  body{font:16px/1.6 system-ui,-apple-system,sans-serif;max-width:48rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a}
+  h1{margin-bottom:.2rem} h2{margin-top:2rem}
+  code,pre{background:#f4f4f5;border-radius:6px} pre{padding:1rem;overflow:auto} code{padding:.1rem .35rem}
+  a{color:#2563eb}
+</style>
+</head><body>
+<h1>Install <code>hort-cli</code></h1>
+<p>The Hort command-line client.</p>
+
+<h2>Linux / macOS</h2>
+<pre><code>curl -fsSL https://hort.rs/install-cli.sh | sh</code></pre>
+
+<h2>Windows (PowerShell)</h2>
+<pre><code>irm https://hort.rs/install-cli.ps1 | iex</code></pre>
+
+<p>The installer is <strong>fail-closed</strong>: it verifies the SHA-256 and the keyless
+<a href="https://docs.sigstore.dev/">cosign</a> signature of every download before installing —
+no valid signature, no install. If <code>cosign</code> isn't already on your system the installer
+bootstraps a version-pinned copy and verifies its checksum first. To verify a download yourself,
+see the <a href="https://github.com/project-hort/hort/blob/main/docs/architecture/how-to/release-verification.md">manual verification guide</a>.</p>
+
+<h2>Options</h2>
+<p>Both scripts accept <code>--version vX.Y.Z</code> (pin a release), <code>--dir &lt;path&gt;</code>
+(install location), and <code>--add-to-path</code> (PowerShell: <code>-AddToPath</code>). Pin a version:</p>
+<pre><code>HORT_VERSION=v1.0.0 curl -fsSL https://hort.rs/install-cli.sh | sh</code></pre>
+<p>There is intentionally no option to skip verification. Uninstall is a single file: remove
+<code>hort-cli</code> from your install directory.</p>
+</body></html>

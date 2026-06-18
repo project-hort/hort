@@ -23,6 +23,20 @@ The name is the platform's four load-bearing guarantees:
   per-stream cryptographic event chain. Every state transition is an immutable
   event; the chain is the audit trail.
 
+## Install the CLI
+
+```sh
+# Linux / macOS
+curl -fsSL https://hort.rs/install-cli.sh | sh
+
+# Windows (PowerShell)
+irm https://hort.rs/install-cli.ps1 | iex
+```
+
+The installer is **fail-closed** — it verifies each download's SHA-256 and keyless cosign
+signature before installing (bootstrapping a pinned cosign if you don't have one), with no
+option to skip verification. See [docs/architecture/how-to/install-cli.md](docs/architecture/how-to/install-cli.md).
+
 ## Architecture
 
 Hort is layered hexagonally (onion):
