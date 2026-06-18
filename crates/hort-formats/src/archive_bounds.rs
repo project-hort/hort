@@ -104,7 +104,7 @@ pub const COMPRESSION_RATIO_LIMIT: u64 = 10;
 /// "tar with a million 1-byte entries used as a CPU exhaustion vector".
 pub const MAX_ENTRIES: usize = 1024;
 
-/// Entry-count cap for trusted bulk feeds (audit F-5 remediation).
+/// Entry-count cap for trusted bulk feeds.
 ///
 /// ~1e5 (100 000). Sized for full-ecosystem OSV bulk archives: the npm
 /// ecosystem zip currently contains ~20 000 advisories; PyPI and Maven
@@ -113,7 +113,7 @@ pub const MAX_ENTRIES: usize = 1024;
 /// A malicious zip-bomb payload with 100 001 entries is still rejected.
 pub const MAX_ENTRIES_TRUSTED_BULK: usize = 100_000;
 
-/// Per-entry output-byte ceiling for trusted bulk feeds (audit F-5 remediation).
+/// Per-entry output-byte ceiling for trusted bulk feeds.
 ///
 /// 2 GiB.  This cap is applied **per advisory JSON entry** by
 /// [`BoundsConfig::output_cap_for`] — a fresh [`BoundedReader`] is
@@ -197,7 +197,7 @@ impl BoundsConfig {
     /// Contrast with [`BoundsConfig::default_for_metadata_extraction`]: the
     /// metadata extraction caps (1024 entries, 10 MiB) MUST NOT be reused for
     /// bulk feeds — doing so silently drops all advisories beyond entry 1024
-    /// (the F-5 failure mode: entire ecosystem ingests abort as `ParseError`).
+    /// (entire ecosystem ingests abort as `ParseError`).
     #[must_use]
     pub const fn for_trusted_bulk_feed() -> Self {
         Self {
@@ -499,7 +499,7 @@ const NESTED_ARCHIVE_SUFFIXES: &[&str] = &[
 /// entry-count / nested-archive) or a malformed / non-gzip-tar archive
 /// returns `Err(DomainError::Validation)` — never a silent `Ok`/`Ok(None)`.
 ///
-/// # F2 — the output cap is CUMULATIVE, not per-entry
+/// # Note — the output cap is CUMULATIVE, not per-entry
 ///
 /// `BoundedReader` wraps the *single* gzip stream, so its cap bounds the
 /// **cumulative** decompressed bytes across the whole sequential tar scan,
@@ -857,8 +857,7 @@ mod tests {
     #[test]
     fn iter_zip_entries_trusted_bulk_config_completes_all_for_large_archive() {
         // Verify that for_trusted_bulk_feed() allows >1024 entries without
-        // tripping — the direct bounds fix for audit F-5.
-        // With the restored original contract, Ok(()) means all entries visited.
+        // tripping. With the restored original contract, Ok(()) means all entries visited.
         let n: usize = 1030;
         let files: Vec<(String, Vec<u8>)> = (0..n)
             .map(|i| {
@@ -991,7 +990,7 @@ mod tests {
         // size ~= the decompressed size, so output_cap_for(compressed) =
         // 10× comfortably exceeds the decompressed tar's content + fixed
         // 512-byte-block overhead — the scan completes and reports a clean
-        // Ok(None). (A small or compressible fixture would trip the F2
+        // Ok(None). (A small or compressible fixture would trip the
         // cumulative cap on tar block padding; real npm/cargo archives are
         // never that small.)
         let body: Vec<u8> = {

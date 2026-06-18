@@ -401,7 +401,7 @@ impl ArtifactRepository for PgArtifactRepository {
                 collision_key = %key,
                 "find_canonical_name_by_collision_key"
             );
-            // Spec 075 — fold the stored `name` the same way
+            // Fold the stored `name` the same way
             // `FormatHandler::collision_key` folds: lowercase + `_`→`-`.
             // Cargo names are already stored lowercase, so `lower()` is a
             // no-op for the only current caller — but the method signature
@@ -501,7 +501,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // The DB stores `QuarantineStatus::None` as NULL; map
             // accordingly.
             //
-            // F27 fix: select ONLY `version, quarantine_status` — these are
+            // Select ONLY `version, quarantine_status` — these are
             // exactly the columns in the covering index's INCLUDE list, so
             // the plan stays an index-only scan with no heap fetch on this
             // highest-QPS serve-path read. The previous `quarantine_deadline`
@@ -999,8 +999,7 @@ mod tests {
     }
 
     /// At `LIMIT_LIST_MAX_ITEMS + 1` rows the adapter truncates to
-    /// exactly the cap and flips `truncated`. This is the M-6
-    /// regression test from the acceptance line.
+    /// exactly the cap and flips `truncated`.
     #[tokio::test]
     #[serial(hort_pg_db)]
     #[ignore = "requires DATABASE_URL"]
@@ -1261,9 +1260,9 @@ mod tests {
     /// drifted to `NOT NULL` (or a bind that silently substituted a
     /// default) would fail this test.
     ///
-    /// The clock-skew clamp lives in the application layer (Item 6's
-    /// `min(published, ingested)`), NOT here — the adapter stores the
-    /// untrusted value verbatim for audit (Item 3 acceptance).
+    /// The clock-skew clamp lives in the application layer
+    /// (`min(published, ingested)`), NOT here — the adapter stores the
+    /// untrusted value verbatim for audit.
     #[tokio::test]
     #[serial(hort_pg_db)]
     #[ignore = "requires DATABASE_URL"]
@@ -1567,7 +1566,7 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// Spec 075 — the registration-collision probe folds `-`/`_` on BOTH
+    /// The registration-collision probe folds `-`/`_` on BOTH
     /// sides (the probe key is pre-folded by `cargo_collision_key`; the
     /// stored name is folded in SQL via `replace(name, '_', '-')`), so a
     /// stored `foo-bar` is found by a would-be `foo_bar` publish's key and

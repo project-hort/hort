@@ -2,9 +2,9 @@
 //! RFC 7235 §4.1 + the Docker token spec.
 //!
 //! Pure, dependency-free, single-pass. The OCI upstream adapter
-//! (Item 3) calls [`parse_www_authenticate`] when an upstream
-//! returns 401 to discover the realm/service/scope triple it must
-//! exchange a token against.
+//! calls [`parse_www_authenticate`] when an upstream returns 401
+//! to discover the realm/service/scope triple it must exchange a
+//! token against.
 //!
 //! No I/O. No `tracing` calls — failures are surfaced via the typed
 //! [`ChallengeParseError`] variants and the caller is responsible
@@ -32,7 +32,7 @@ pub struct Challenge {
     pub scope: Option<String>,
 }
 
-/// Parse failure modes the adapter (Item 3) needs to distinguish.
+/// Parse failure modes the adapter needs to distinguish.
 ///
 /// `NotBearer` and `Malformed` map to different runtime decisions:
 /// non-Bearer schemes surface the original 401 verbatim (no
@@ -45,7 +45,7 @@ pub enum ChallengeParseError {
     #[error("WWW-Authenticate header is empty")]
     Empty,
     /// Scheme is something other than Bearer (Basic, Digest, NTLM,
-    /// vendor schemes). Item 3 surfaces the original 401 verbatim
+    /// vendor schemes). The adapter surfaces the original 401 verbatim
     /// in this case — no exchange attempt.
     #[error("non-Bearer auth scheme: {0}")]
     NotBearer(String),

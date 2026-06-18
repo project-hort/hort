@@ -2,7 +2,7 @@
 # `admin` claim (RbacEvaluator short-circuits on it). The bundled Keycloak
 # realm puts the `admin` user in `hort-admins`, so a Track B OIDC token for
 # that user carries full admin authority — required for the admin-only
-# surfaces (admin quarantine release §8.4, patch-candidate listing §11).
+# surfaces (admin quarantine release, patch-candidate listing).
 # Mirrors deploy/compose/example-config/auth/admins.yaml.
 apiVersion: project-hort.de/v1beta1
 kind: ClaimMapping

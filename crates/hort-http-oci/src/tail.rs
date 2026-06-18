@@ -5,8 +5,8 @@
 //! route level (wildcards are terminal and can't be followed by literal
 //! segments). This module does that disambiguation after the route
 //! captures `*tail` as a single string, so the pull handlers can
-//! dispatch on [`TailKind`] to the right serve function (blobs, Item 6;
-//! manifests, Item 7; tags list, Item 8 — when it lands).
+//! dispatch on [`TailKind`] to the right serve function (blobs,
+//! manifests, or tags list).
 //!
 //! Name segments themselves are allowed to contain slashes
 //! (`library/nginx`), so parsing uses `rsplit_once` on the right-most

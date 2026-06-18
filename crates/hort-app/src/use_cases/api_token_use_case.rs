@@ -24,15 +24,14 @@
 //! 20 bytes random → 160 bits of entropy. Total length 39 chars.
 //!
 //! `token_prefix` is the **first 8 chars of the body** (NOT including
-//! `hort_<kind>_`); the prefix is what the indexed lookup keys on
-//! (validator B5 path).
+//! `hort_<kind>_`); the prefix is what the indexed lookup keys on.
 //!
 //! # Audit events
 //!
 //! Every successful mint emits [`ApiTokenIssued`] to the **token-owner's**
 //! user stream. Every successful revoke emits [`ApiTokenRevoked`] to
 //! the same. Every refused issuance emits [`ApiTokenIssuanceDenied`]
-//! to the **requesting actor's** user stream (per §8 invariant 9). The
+//! to the **requesting actor's** user stream. The
 //! `Actor` lives on the [`PersistedEvent`](hort_domain::events::PersistedEvent)
 //! envelope, not in the payload — see the api_token_events module
 //! docstring for the rationale.
@@ -72,8 +71,8 @@ use super::read_expected_version;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum length of `ApiToken.description` per §3 schema CHECK
-/// (`api_tokens_description_length_check`). The use case rejects up
+/// Maximum length of `ApiToken.description` (schema CHECK
+/// `api_tokens_description_length_check`). The use case rejects up
 /// front so the row never reaches the schema layer with an oversize
 /// payload.
 pub const MAX_DESCRIPTION_LEN: usize = 1024;
@@ -84,18 +83,18 @@ pub const MAX_DESCRIPTION_LEN: usize = 1024;
 pub const MAX_NAME_LEN: usize = 255;
 
 /// Global default expiry for PAT and service-account tokens when the
-/// caller omits `expires_in_days`. 90 days for PAT (§3 / §4) — the
+/// caller omits `expires_in_days`. 90 days for PAT — the
 /// service-account path overrides to 365 in `default_expiry_days`.
 pub const DEFAULT_PAT_EXPIRY_DAYS: u32 = 90;
 
-/// Default expiry for service-account tokens (§3 / §4 admin-mint).
+/// Default expiry for service-account tokens (admin-mint).
 pub const DEFAULT_SVC_EXPIRY_DAYS: u32 = 365;
 
-/// Hard cap on `expires_in_days` for non-admin tokens (§4 step 5).
+/// Hard cap on `expires_in_days` for non-admin tokens.
 pub const MAX_EXPIRY_DAYS: u32 = 365;
 
 /// Tighter cap when the token's `declared_permissions` contains
-/// `Permission::Admin` (§4 step 4 second half / NIS2 Art 21(i) — admin
+/// `Permission::Admin` (NIS2 Art 21(i) — admin
 /// tokens have severe blast radius on leak; 30 days bounds it).
 pub const MAX_ADMIN_EXPIRY_DAYS: u32 = 30;
 
@@ -153,7 +152,7 @@ const TOKEN_BODY_LEN: usize = 32;
 /// Number of random bytes for the body (20 bytes → 160 bits of
 /// entropy, well above the 128-bit cryptographic floor).
 const TOKEN_BODY_RAW_BYTES: usize = 20;
-/// Prefix length the indexed lookup keys on (§3 — first 8 chars of
+/// Prefix length the indexed lookup keys on (first 8 chars of
 /// body). `parse_pat_token_format` returns this slice.
 const TOKEN_PREFIX_LEN: usize = 8;
 
@@ -230,7 +229,7 @@ pub struct FederationSource {
     /// `ReplayKey::Composite` fallback; when the composite path is
     /// selected (`jti = None`, `require_jti = false`) but `iat` is
     /// `None`, the composite is not constructible and the use case
-    /// denies `jti_required`-equivalent (§5).
+    /// denies `jti_required`-equivalent.
     pub iat: Option<i64>,
     /// Raw `exp` NumericDate
     /// seconds. Always present (the validator enforced `exp`). Part of
@@ -428,8 +427,7 @@ pub fn clamp_lifetime(secs: u64, has_admin: bool) -> Result<u64, ApiTokenError> 
 // ---------------------------------------------------------------------------
 
 /// Typed errors surfaced by [`ApiTokenUseCase`]. Mapped to HTTP
-/// envelopes by the handler crate per the wire-status table in the
-/// B7 backlog item.
+/// envelopes by the handler crate per the wire-status table.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiTokenError {
     /// 403 — declared permissions exceed user's current authority.
@@ -647,7 +645,7 @@ impl ApiTokenUseCase {
     /// signer and the denylist are wired together because shipping the
     /// claims-carrying JWT mint without the AK-side revocation denylist
     /// would regress today's immediate revocation — a security
-    /// regression the design (§13.4) forbids deferring past the cutover.
+    /// regression that must not be deferred past the cutover.
     #[must_use]
     pub fn with_cli_session_signing(
         mut self,
@@ -937,7 +935,7 @@ impl ApiTokenUseCase {
         //      token row, no event — "no partial side effects on deny").
         if let Some(fs) = request.federation_source.as_ref() {
             // The seen-set TTL horizon is exactly the resolved token
-            // expiry (§4). The system-mint path always resolves a
+            // expiry. The system-mint path always resolves a
             // bounded `expires_at` (the unbounded path is closed for
             // federation), so a `None` here is an invariant violation,
             // not a "never expires" seen-set row.
@@ -949,7 +947,7 @@ impl ApiTokenUseCase {
                 ))
             })?;
 
-            // §5 behaviour matrix → either a ReplayKey or the
+            // Replay-key selection → either a ReplayKey or the
             // `jti_required` *validation* deny (never reaches the
             // guard, not on the replay metric).
             let key = build_replay_key(fs)?;
@@ -1003,7 +1001,7 @@ impl ApiTokenUseCase {
                     return Err(ApiTokenError::ReplayDetected { composite });
                 }
                 Err(hort_domain::ports::replay_guard::ReplayGuardError::Unavailable(cause)) => {
-                    // FAIL-CLOSED (anti-F-22). The adapter already
+                    // FAIL-CLOSED. The adapter already
                     // logged the infra cause at error!; the app logs
                     // the *deny* at info!. NOT on the replay counter
                     // (no replay was detected) — it rides the existing
@@ -1049,7 +1047,7 @@ impl ApiTokenUseCase {
             // single audit-trail link from minted token back to JWT.
             // The system-mint path is reached by BOTH the rotation
             // reconciler (`federation_source = None`) AND the
-            // federation handler (Item 5 — `Some(_)` carrying the
+            // federation handler (`Some(_)` carrying the
             // issuer/jti/sub). Threading verbatim keeps the field
             // contract identical to `issue_inner`'s.
             source_issuer: request
@@ -1165,7 +1163,7 @@ impl ApiTokenUseCase {
     ) -> Result<IssuedToken, ApiTokenError> {
         let target = self.users.find_by_id(principal.user_id).await?;
 
-        // Forced-fields table — design doc 039 §6.
+        // Forced-fields table.
         // Truncate (NOT reject) the wire client_id; default empty /
         // whitespace to "hort-cli".
         let trimmed = request.client_name.as_deref().map(str::trim).unwrap_or("");
@@ -1213,7 +1211,7 @@ impl ApiTokenUseCase {
         // An empty footprint (caller holds none of the requested
         // permissions) ⇒ `None` ⇒ we DENY here exactly as the clamp's
         // global branch would have, rather than minting an empty-cap token
-        // that silently authorizes nothing (§13.8 acceptance #4).
+        // that silently authorizes nothing.
         let derived_cap = {
             let rbac_guard = self.rbac.load();
             rbac_guard.derive_cli_session_cap(principal, &requested_permissions)
@@ -1222,7 +1220,7 @@ impl ApiTokenUseCase {
             // Zero effective authority for any requested permission.
             // Emit the same denial event + return the same error the
             // clamp's global branch would have, so the audit trail and
-            // the wire 403 are identical to the pre-Item-11 deny.
+            // the wire 403 are identical to the pre-change deny.
             let actor = ApiActor {
                 user_id: principal.user_id,
             };
@@ -1261,8 +1259,7 @@ impl ApiTokenUseCase {
         // The derived cap is the clamped footprint — `permissions` is the
         // held subset of the requested scope, `repository_ids` is `None`
         // (admin / global) or `Some(repos)` (per-repo). Log it at `debug`
-        // (Item 11 observability — never logs claim names; permission +
-        // repo-count only).
+        // Never logs claim names; permission + repo-count only.
         tracing::debug!(
             user_id = %principal.user_id,
             derived_permission_count = derived_cap.permissions.len(),
@@ -1336,7 +1333,7 @@ impl ApiTokenUseCase {
         // `GrantSubject::Claims` grants) plus a fresh `jti` (the
         // emergency-revocation denylist key). NO `api_tokens` row is
         // persisted: claims live in the token, never a DB column
-        // (§1.1 / §2 hard-block preserved).
+        // (no claims-column hard-block preserved).
         let Some(signer) = self.cli_session_signer.as_ref() else {
             // Composition bug — fail CLOSED rather than fall back to the
             // removed opaque `hort_cli_*` shape (which would silently emit
@@ -1425,8 +1422,7 @@ impl ApiTokenUseCase {
     /// cutover would otherwise lose: a signed JWT is non-revocable until
     /// `exp` by construction, so without this denylist a leaked
     /// admin-capable CliSession token would be live-and-unrevocable for
-    /// its whole TTL (§13.4 — the denylist MUST ship with the cutover,
-    /// not after).
+    /// its whole TTL (the denylist MUST ship with the cutover, not after).
     ///
     /// `exp` past `now` ⇒ a non-positive TTL: the token is already
     /// expired, so revoking it is a no-op (the entry would expire
@@ -1474,8 +1470,8 @@ impl ApiTokenUseCase {
     }
 
     /// Shared issuance pipeline for both self-mint and admin-mint.
-    /// `caller` is the authority used for the cap-vs-grants check (§4
-    /// step 2). For self-mint that is the user themselves; for
+    /// `caller` is the authority used for the cap-vs-grants check.
+    /// For self-mint that is the user themselves; for
     /// admin-mint that is the admin (the service account's grants
     /// don't gate this — runtime intersection bounds the eventual
     /// authority down to the SA's actual grants).
@@ -1622,10 +1618,10 @@ impl ApiTokenUseCase {
         // 1. Static request validation (description / name / empty
         //    repository_ids). These do not produce a denial event —
         //    they are malformed-input rejects, not authority
-        //    refusals. The denial-event taxonomy in §B7 covers
-        //    refusals tied to authority + flag gating; raw shape
-        //    errors (empty repository_ids) DO emit a denial because
-        //    that is one of the four §4 reject paths in the
+        //    refusals. The denial-event taxonomy covers refusals
+        //    tied to authority + flag gating; raw shape errors
+        //    (empty repository_ids) DO emit a denial because that is
+        //    one of the reject paths in the
         //    `DenialReason::InvalidRepositorySet` arm.
         //
         // Mutual-exclusion check on the expiry-unit
@@ -1663,7 +1659,7 @@ impl ApiTokenUseCase {
             return Err(ApiTokenError::InvalidRepositorySet);
         }
 
-        // 3. Admin-token gating — §4 step 4. Two distinct error
+        // 3. Admin-token gating. Two distinct error
         //    modes: AdminTokenDisallowed (flag off) and
         //    AdminAuthorityRequired (caller not admin). Both emit
         //    DenialReason::AdminTokenDisallowed (the public taxonomy
@@ -1714,7 +1710,7 @@ impl ApiTokenUseCase {
         //    this arm trusts the value (defensive bounds-check would
         //    duplicate the clamp logic and drift). The seconds path
         //    is the one CliSession issuance flows through after
-        //    Item 2's Step D rewrite of `issue_cli_session_inner`.
+        //    The seconds path flows through `issue_cli_session_inner`.
         let expires_at = if let Some(secs) = request.expires_in_seconds {
             Some(Utc::now() + Duration::seconds(secs as i64))
         } else {
@@ -1724,7 +1720,7 @@ impl ApiTokenUseCase {
             //    - PAT: None falls back to default (90); else clamped to [1, 365].
             match (declares_admin, kind, request.expires_in_days) {
                 // Admin token, no expiry → always reject. Even with
-                // HORT_TOKEN_ALLOW_UNBOUNDED_SVC=true (per §4 step 4 second half).
+                // HORT_TOKEN_ALLOW_UNBOUNDED_SVC=true.
                 (true, _, None) => {
                     self.emit_denial(
                         actor.user_id,
@@ -1842,8 +1838,8 @@ impl ApiTokenUseCase {
         //    silently drop per-repo grants.
         //
         //    For self-mint: caller IS target; for admin-mint: caller is
-        //    the admin and we gate against admin's grants (per §4
-        //    admin-mint permission-cap rule). Runtime intersection
+        //    the admin and we gate against admin's grants (admin-mint
+        //    permission-cap rule). Runtime intersection
         //    bounds the eventual authority for both cases.
         // Take ONE evaluator snapshot for the whole cap loop. Calling
         // `.load()` per (perm, repo) is cheap (lock-free + uncontended on
@@ -2011,7 +2007,7 @@ impl ApiTokenUseCase {
             actor_kind = actor_kind,
             "API token revoked"
         );
-        // B9 — emit `hort_api_token_revoked_total{actor_kind}` AFTER the
+        // Emit `hort_api_token_revoked_total{actor_kind}` AFTER the
         // repo revoke succeeds AND the event is appended. Failure paths
         // (TokenNotFound, NotAuthorized, infrastructure) do NOT emit —
         // the metric counts successful revocations only.
@@ -2054,7 +2050,7 @@ impl ApiTokenUseCase {
 /// invocation of [`ApiTokenUseCase::issue_self_token`] and
 /// [`ApiTokenUseCase::issue_for_service_account`] — every Ok and Err
 /// arm goes through one of the two `emit_issued_metric` calls in the
-/// public wrappers (design doc §9).
+/// public wrappers.
 const ISSUED_METRIC: &str = "hort_api_token_issued_total";
 /// `hort_api_token_revoked_total` metric name. Emitted only on
 /// successful revocation, after the repo `revoke()` call AND the
@@ -2080,7 +2076,7 @@ const JWT_REPLAY_REJECTED_METRIC: &str = "hort_jwt_replay_rejected_total";
 /// (`hort_pat_`, `hort_svc_`, `hort_cli_`) so dashboards filter on the same
 /// 3-char vocabulary operators see in token plaintexts. Note: `svc`
 /// is the wire short-form for the schema's `service_account` long
-/// form (design doc §3 token-format paragraph).
+/// form.
 fn token_kind_metric_label(kind: TokenKind) -> &'static str {
     match kind {
         TokenKind::Pat => "pat",
@@ -2093,7 +2089,7 @@ fn token_kind_metric_label(kind: TokenKind) -> &'static str {
 /// [`ReplayKey`](hort_domain::ports::replay_guard::ReplayKey) for a
 /// federation exchange, or return the `jti_required` *validation* deny.
 ///
-/// This is the pure §5 matrix. It never performs I/O and is exercised
+/// This is the pure replay-key selection matrix. It never performs I/O and is exercised
 /// directly by unit tests (100 % hort-app branch coverage):
 ///
 /// ```text
@@ -2128,14 +2124,14 @@ fn build_replay_key(
             }),
             // Issuer allows missing jti but the JWT also lacks `iat` —
             // the composite anti-replay key is not constructible.
-            // Treated as `jti_required`-equivalent (§5).
+            // Treated as `jti_required`-equivalent.
             None => Err(ApiTokenError::JtiRequired),
         },
     }
 }
 
 /// Map an [`ApiTokenUseCase::issue_*`] outcome to the `result` label
-/// of `hort_api_token_issued_total` per design doc §9. Closed taxonomy
+/// of `hort_api_token_issued_total`. Closed taxonomy
 /// — every variant maps to exactly one of the four buckets.
 ///
 /// Buckets:
@@ -2491,7 +2487,7 @@ mod tests {
     /// Build an evaluator with one role (`developer`) granting the
     /// supplied list of `(permission, optional_repo)` tuples. The
     /// principals returned by [`principal_with_grants`] carry that role.
-    /// This is the F3 watchpoint #1 fixture: a non-admin principal whose
+    /// This is the per-repo grant fixture: a non-admin principal whose
     /// authority is materialised through the SAME evaluator that
     /// production handlers consume. Returns the bare `RbacEvaluator` so
     /// the live-reload regression test can build a fresh evaluator and
@@ -3402,7 +3398,7 @@ mod tests {
         assert_eq!(events.appended_batches().len(), 1);
     }
 
-    /// Fail-CLOSED regression (centerpiece, anti-F-22): the guard
+    /// Fail-CLOSED regression: the guard
     /// returns `Unavailable` ⇒ the exchange is denied
     /// `ReplayGuardUnavailable`, **no token row, no ApiTokenIssued
     /// event**. There must be NO path where a guard outage falls
@@ -3477,7 +3473,7 @@ mod tests {
         );
     }
 
-    /// §5 matrix: issuer requires jti, JWT has none ⇒ `JtiRequired`
+    /// Replay-key matrix: issuer requires jti, JWT has none ⇒ `JtiRequired`
     /// validation deny BEFORE the guard (guard never consulted, no
     /// mint, no event).
     #[tokio::test]
@@ -3504,8 +3500,8 @@ mod tests {
         assert!(events.appended_batches().is_empty());
     }
 
-    /// §5 matrix: issuer allows missing jti (`require_jti=false`) and
-    /// the JWT has `iat` ⇒ composite key; a replay is denied
+    /// Replay-key matrix: issuer allows missing jti (`require_jti=false`)
+    /// and the JWT has `iat` ⇒ composite key; a replay is denied
     /// `ReplayDetected{composite:true}`.
     #[tokio::test]
     async fn federation_composite_replay_denied() {
@@ -3534,7 +3530,7 @@ mod tests {
         assert!(tokens.inserts().is_empty());
     }
 
-    /// §5 matrix: issuer allows missing jti but the JWT also lacks
+    /// Replay-key matrix: issuer allows missing jti but the JWT also lacks
     /// `iat` ⇒ composite not constructible ⇒ `JtiRequired`-equivalent,
     /// guard never consulted.
     #[tokio::test]
@@ -3557,7 +3553,7 @@ mod tests {
         assert!(tokens.inserts().is_empty());
     }
 
-    // -- build_replay_key pure §5 matrix (exhaustive) --------------------
+    // -- build_replay_key pure matrix (exhaustive) --------------------
 
     fn fs_with(jti: Option<&str>, require_jti: bool, iat: Option<i64>) -> FederationSource {
         FederationSource {
@@ -3693,7 +3689,7 @@ mod tests {
 
     #[test]
     fn replay_rejected_metric_not_emitted_on_guard_unavailable() {
-        // §8: replay_guard_unavailable is NOT on this counter (no
+        // replay_guard_unavailable is NOT on this counter (no
         // replay was detected).
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snap = recorder.snapshotter();
@@ -3912,10 +3908,9 @@ mod tests {
     // `RbacEvaluator::authorize`, the same evaluator the request-time
     // authorize path consults.
 
-    /// F3 watchpoint #1 — non-admin user with a per-repo Read grant
-    /// can mint a token capped to `[Read]` × `[repo_a]`. This is the
-    /// regression that the pre-F3 code rejected with
-    /// `CapExceedsAuthority`.
+    /// Non-admin user with a per-repo Read grant can mint a token
+    /// capped to `[Read]` × `[repo_a]`. This is the regression that
+    /// the previous code rejected with `CapExceedsAuthority`.
     #[tokio::test]
     async fn issue_self_token_non_admin_with_per_repo_grant_succeeds_for_that_repo() {
         let repo_a = Uuid::from_u128(0xA);
@@ -3943,7 +3938,7 @@ mod tests {
         assert_eq!(count_denials(&events), 0);
     }
 
-    /// F3 — same per-repo Read grant on `repo_a`; minting against
+    /// Same per-repo Read grant on `repo_a`; minting against
     /// `repo_b` MUST fail with `CapExceedsAuthority` and the failed
     /// list must carry exactly `(Some(repo_b), Read)`.
     #[tokio::test]
@@ -3975,9 +3970,9 @@ mod tests {
         ));
     }
 
-    /// F3 — non-admin with a GLOBAL Read grant CAN mint a global
-    /// (None-scoped) token. This was always working pre-F3; pinned
-    /// here so the new code path doesn't regress the global case.
+    /// Non-admin with a GLOBAL Read grant CAN mint a global
+    /// (None-scoped) token. Pinned here so the cap-vs-authority
+    /// rewrite doesn't regress the global case.
     #[tokio::test]
     async fn issue_self_token_non_admin_with_global_grant_can_mint_global_token() {
         let (caller, rbac) = principal_with_grants(vec![(Permission::Read, None)]);
@@ -4000,7 +3995,7 @@ mod tests {
         assert_eq!(count_denials(&events), 0);
     }
 
-    /// F3 — a per-repo-only grantee CANNOT mint a global (None-scoped)
+    /// A per-repo-only grantee CANNOT mint a global (None-scoped)
     /// token even for the permission they're granted. The cap-vs-
     /// authority loop hits `rbac.authorize(_, perm, None)`, which the
     /// per-repo grant fails (`grant.repository_id = Some(_)` does not
@@ -4034,7 +4029,7 @@ mod tests {
         ));
     }
 
-    /// F3 — admin role short-circuits ANY (perm, repo) tuple. Pinned
+    /// Admin role short-circuits ANY (perm, repo) tuple. Pinned
     /// here so the rewrite preserves admin-can-mint-anything.
     #[tokio::test]
     async fn issue_self_token_admin_role_authorizes_anything() {
@@ -4060,7 +4055,7 @@ mod tests {
         assert_eq!(inserts[0].repository_ids, Some(vec![arbitrary_repo]));
     }
 
-    /// F3 — the cap-vs-authority loop must call the evaluator for
+    /// The cap-vs-authority loop must call the evaluator for
     /// EVERY (perm, repo) tuple in the request. With one repo
     /// authorized and one not, the failed list carries the
     /// not-authorized entry only — proving the loop walks every
@@ -4091,7 +4086,7 @@ mod tests {
         }
     }
 
-    /// F3 — per-tuple loop: with two declared permissions and two
+    /// Per-tuple loop: with two declared permissions and two
     /// repos and NO grants, every (perm, repo) tuple appears in
     /// `failed`. Pins the matrix expansion so the loop's structure
     /// can't silently change to "fail-fast on first miss".
@@ -4124,7 +4119,7 @@ mod tests {
         }
     }
 
-    /// F3 live-reload regression — the `ApiTokenUseCase` must read its
+    /// Live-reload regression — the `ApiTokenUseCase` must read its
     /// `RbacEvaluator` through the `ArcSwap` pointer, not a snapshot
     /// taken at composition time. This locks in the contract that the
     /// grant-refresh task can extend a user's authority and
@@ -4806,12 +4801,11 @@ mod tests {
     // -- issue_cli_session ---------------------------------------------------
     //
     // The cli_session minting path is the issuance side of the RFC 8693
-    // token-exchange flow (`POST /api/v1/auth/exchange`). Forced fields
-    // per design doc 039 §6 — `kind=CliSession`, hardcoded
-    // `[Read,Write,Delete]` (NEVER Admin), no repo restriction, 30-day
-    // expiry — and admin-disallow is enforced by overwriting
-    // `declared_permissions` upstream of the existing
-    // `allow_admin_tokens` gate (design doc 039 §8 invariant 4).
+    // token-exchange flow (`POST /api/v1/auth/exchange`). Forced fields:
+    // `kind=CliSession`, hardcoded `[Read,Write,Delete]` (NEVER Admin),
+    // no repo restriction, 30-day expiry — and admin-disallow is enforced
+    // by overwriting `declared_permissions` upstream of the existing
+    // `allow_admin_tokens` gate.
 
     // ---------- CliSession JWT test rig ----------
 
@@ -4978,11 +4972,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_cli_session_mints_jwt_carrying_resolved_claims() {
-        // §13 footgun fix (headline mint side): the minted CliSession
-        // token is a signed JWT carrying the principal's resolved claim
-        // set (`["developer"]`), NOT an opaque `hort_cli_*` token with
-        // `claims: []`. The signer verifies it round-trips with the
-        // claims + token_kind + a jti.
+        // The minted CliSession token is a signed JWT carrying the
+        // principal's resolved claim set (`["developer"]`), NOT an
+        // opaque `hort_cli_*` token with `claims: []`. The signer
+        // verifies it round-trips with the claims + token_kind + a jti.
         let (uc, _tokens, users, _events, signer, _denylist, caller) = make_cli_session_use_case();
         users.insert(user(false));
 
@@ -5023,7 +5016,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_cli_session_persists_no_db_row() {
-        // §13.4 / §1.1 — the CliSession JWT carries its claims; there is
+        // The CliSession JWT carries its claims; there is
         // NO `api_tokens` row (and a fortiori no claims column).
         let (uc, tokens, users, _events, _signer, _denylist, caller) = make_cli_session_use_case();
         users.insert(user(false));
@@ -5169,8 +5162,8 @@ mod tests {
     }
 
     /// Evaluator granting `developer` per-repo `Read` + `Prefetch` on the
-    /// supplied repos, with NO global grant — the canonical dev-user shape
-    /// (§13.8). Returns the bare evaluator wrapped in `ArcSwap`.
+    /// supplied repos, with NO global grant — the canonical dev-user shape.
+    /// Returns the bare evaluator wrapped in `ArcSwap`.
     fn per_repo_dev_evaluator(repos: &[Uuid]) -> Arc<ArcSwap<RbacEvaluator>> {
         let mut rows = Vec::new();
         for &repo in repos {
@@ -5182,11 +5175,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_cli_session_per_repo_grantee_mints_with_derived_per_repo_cap() {
-        // §13.8 / acceptance #2 — a per-repo-ONLY grantee (developer holds
-        // Read+Prefetch on three repos, no global grant) mints a
-        // CliSession successfully. The pre-Item-11 hardcoded
-        // `repository_ids: None` would have routed this through the global
-        // branch and denied with `cap_exceeds_authority`.
+        // A per-repo-ONLY grantee (developer holds Read+Prefetch on three
+        // repos, no global grant) mints a CliSession successfully. The
+        // prior hardcoded `repository_ids: None` would have routed this
+        // through the global branch and denied with `cap_exceeds_authority`.
         let npm = Uuid::new_v4();
         let pypi = Uuid::new_v4();
         let cargo = Uuid::new_v4();
@@ -5203,7 +5195,7 @@ mod tests {
                 make_cli_request_scoped(vec![Permission::Read, Permission::Prefetch]),
             )
             .await
-            .expect("per-repo grantee must mint a CliSession (Item 11 — was 403)");
+            .expect("per-repo grantee must mint a CliSession (was 403 before per-repo derivation)");
 
         assert_eq!(issued.kind, TokenKind::CliSession);
         assert!(matches!(
@@ -5216,9 +5208,9 @@ mod tests {
 
     #[tokio::test]
     async fn issue_cli_session_admin_derives_global_cap_unchanged() {
-        // §13.8 / acceptance #3 (regression) — an admin caller derives a
-        // GLOBAL cap (`repository_ids: None`) via the admin short-circuit;
-        // the existing global-branch + ≤1h admin gate run unchanged. The
+        // Regression — an admin caller derives a GLOBAL cap
+        // (`repository_ids: None`) via the admin short-circuit; the
+        // existing global-branch + ≤1h admin gate run unchanged. The
         // admin path is untouched by the per-repo derivation.
         let (caller, rbac) = admin_principal();
         let (uc, _tokens, users, events) =
@@ -5250,10 +5242,9 @@ mod tests {
 
     #[tokio::test]
     async fn issue_cli_session_zero_authority_caller_denied_cap_exceeds_authority() {
-        // §13.8 / acceptance #4 — a caller holding NONE of the requested
-        // permissions derives an empty footprint → still 403
-        // `cap_exceeds_authority`. The fix must NOT mint an empty-cap
-        // token that silently authorizes nothing.
+        // A caller holding NONE of the requested permissions derives an
+        // empty footprint → still 403 `cap_exceeds_authority`. The fix
+        // must NOT mint an empty-cap token that silently authorizes nothing.
         let other_repo = Uuid::new_v4();
         // The evaluator grants the `developer` claim, but the caller
         // carries an unrelated claim → no matching grant.
@@ -5307,15 +5298,15 @@ mod tests {
 
     #[test]
     fn issue_cli_session_cap_derivation_observability_evaluates_log_fields() {
-        // Item 11 observability: the success path emits a `debug!` carrying
-        // the derived (permission_count, repository_count) footprint, and
-        // the empty-footprint denial emits an `info!` carrying the
+        // The success path emits a `debug!` carrying the derived
+        // (permission_count, repository_count) footprint, and the
+        // empty-footprint denial emits an `info!` carrying the
         // requested-permission count. Drive BOTH under a `DEBUG`-level
         // subscriber installed for the duration of the test so the
         // structured-field expressions are actually evaluated (a disabled
-        // level short-circuits them) — this pins the field exprs the
-        // §13.8 / Item-11 observability requirement adds, and asserts the
-        // log NEVER carries a claim name (claims are operator topology).
+        // level short-circuits them) — this pins the field exprs and
+        // asserts the log NEVER carries a claim name (claims are operator
+        // topology).
         use tracing_subscriber::fmt::format::FmtSpan;
 
         let collector = tracing_subscriber::fmt()
@@ -5398,8 +5389,8 @@ mod tests {
             .await
             .expect("default-scope non-admin cli_session issuance succeeds");
         assert_eq!(issued.kind, TokenKind::CliSession);
-        // Default-scope sessions clamp to the 15 min ceiling (no admin →
-        // same 900 s cap as admin per Item 10).
+        // Default-scope sessions clamp to the 15 min ceiling (the 900 s cap
+        // applies to admin and non-admin alike).
         let diff = (issued.expires_at.unwrap() - Utc::now()).num_seconds();
         assert!((900 - 60..=900 + 60).contains(&diff), "got {diff}s");
         // The JWT verifies and carries the caller's resolved claims, not
@@ -5413,7 +5404,7 @@ mod tests {
     #[tokio::test]
     async fn issue_cli_session_empty_client_name_defaults_to_hort_cli() {
         // Three sub-cases: None, Some(""), Some("   "). All resolve to
-        // the documented default name "hort-cli" per design doc 039 §6.
+        // the documented default name "hort-cli".
         for client_name in [None, Some(""), Some("   ")] {
             let (caller, rbac) = full_grants_principal();
             let (uc, _tokens, users, _events) =
@@ -5434,7 +5425,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_cli_session_oversize_client_name_truncated() {
-        // Per design doc 039 §6 — truncate, do NOT reject. A 300-char
+        // Truncate, do NOT reject. A 300-char
         // client_id from the wire must yield a 255-char name on the
         // resulting token, not a NameTooLong error.
         let (caller, rbac) = full_grants_principal();
@@ -5501,7 +5492,7 @@ mod tests {
                 ),
             )
             .await
-            .expect("admin-cap cli_session issuance succeeds under §1.5-a");
+            .expect("admin-cap cli_session issuance succeeds");
 
         assert_eq!(issued.kind, TokenKind::CliSession);
         let diff = (issued.expires_at.unwrap() - Utc::now()).num_seconds();
@@ -5822,8 +5813,8 @@ mod tests {
 
     #[test]
     fn issuance_result_label_table_is_exhaustive() {
-        // Pin the result-mapping table from B9. Any future variant
-        // added to ApiTokenError must update issuance_result_label
+        // Pin the result-mapping table. Any future variant added to
+        // ApiTokenError must update issuance_result_label
         // and this test (the match in the helper is exhaustive, so
         // a new variant breaks the build; this test pins the
         // mapping verbatim).

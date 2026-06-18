@@ -88,7 +88,7 @@ struct AuthEventGate {
 /// Window-size for the per-`(client_ip_bucket, result)` audit-event
 /// throttle. One append wins the window; the rest tick the
 /// `hort_auth_events_appended_total{result="throttled"}` counter. 60s
-/// matches the design-doc §3.4 "info-rate-equivalent" target —
+/// matches the "info-rate-equivalent" target —
 /// operators need a strong-enough signal to alert on but not so dense
 /// the events table fills with attacker-driven noise.
 const AUTH_EVENT_THROTTLE_TTL: Duration = Duration::from_secs(60);
@@ -184,7 +184,7 @@ pub async fn maybe_append_auth_event(
 /// *after* the persist succeeds and only when an **existing** user
 /// row's prior `is_admin` actually differs from the recomputed value:
 /// it makes a spurious flip (transient IdP outage / empty-groups
-/// response — audit F-35) auditable without altering the persistence.
+/// response) auditable without altering the persistence.
 ///
 /// **Emission discipline.**
 /// - `previous_is_admin == None` (JIT-provisioned user, no prior
@@ -201,7 +201,7 @@ pub async fn maybe_append_auth_event(
 /// event-store error does NOT propagate — the OIDC login still returns
 /// its principal. Unlike the auth-failure path there is no throttle: a
 /// persisted-admin flip is rare and *every* flip is audit-worthy (a
-/// throttle could swallow exactly the spurious flip F-35 is about).
+/// throttle could swallow exactly the spurious flip this function exists to catch).
 ///
 /// **Tracing.** `info!` (audit-style state change), never `err` — a
 /// flip is an authority event, not an infrastructure error.
@@ -228,7 +228,7 @@ async fn maybe_emit_admin_transition(
     tracing::info!(
         user_id = %user_id,
         result = result.as_str(),
-        "persisted is_admin bit flipped on OIDC login (audit F-35)"
+        "persisted is_admin bit flipped on OIDC login"
     );
 
     // The metric + the `info!` are unconditional once a flip is
@@ -366,8 +366,8 @@ pub struct AuthenticateUseCase {
     /// enabled — CliSession tokens are minted via the OIDC `/exchange`
     /// flow). On the bearer path, a token that verifies as a CliSession
     /// JWT (correct issuer + CliSession `aud` + `token_kind` claim)
-    /// builds a principal carrying the JWT's resolved claims (the §13
-    /// footgun fix). A non-CliSession AK-JWT (e.g. an OCI `/v2/auth`
+    /// builds a principal carrying the JWT's resolved claims. A
+    /// non-CliSession AK-JWT (e.g. an OCI `/v2/auth`
     /// token, wrong `aud`) falls through to the OIDC validator (→ 401),
     /// so it can never replay against the CliSession-gated surfaces.
     cli_session_verifier: Option<Arc<crate::cli_session_signing::CliSessionTokenSigner>>,
@@ -638,10 +638,9 @@ impl AuthenticateUseCase {
         // branch above. Try the CliSession verifier BEFORE the OIDC
         // fallthrough: a token that verifies as a CliSession JWT
         // (correct issuer + CliSession `aud` + `token_kind` claim) yields
-        // a principal carrying the JWT's RESOLVED claim set — the §13
-        // footgun fix.
+        // a principal carrying the JWT's RESOLVED claim set.
         //
-        // Discriminator (§13.4): the OCI `/v2/auth` token and the
+        // Discriminator: the OCI `/v2/auth` token and the
         // CliSession token share the issuer + signing key, so
         // issuer/signature alone do NOT separate them. The verifier
         // gates on the CliSession `aud` + `token_kind`; a non-CliSession
@@ -740,7 +739,7 @@ impl AuthenticateUseCase {
                 username: claims.username.clone(),
                 email: claims.email.clone(),
                 // Admin is recomputed from current group claim every login
-                // (design §7) — DB row is NOT the source of truth.
+                // DB row is NOT the source of truth; groups are recomputed on login.
                 is_admin,
                 last_login_at: Some(now),
                 updated_at: now,
@@ -952,10 +951,10 @@ impl AuthenticateUseCase {
     /// 2. **Live user re-resolution.** `find_by_id` so a deactivated
     ///    user is rejected on the next request even though the JWT is
     ///    still cryptographically valid (mirrors the PAT path's live
-    ///    re-resolution; §8 invariant 2).
+    ///    re-resolution).
     /// 3. **Principal build.** The principal's `claims` = the JWT's
-    ///    resolved claim set (the §13 footgun fix — a CliSession now
-    ///    authorizes `GrantSubject::Claims` grants), `token_kind =
+    ///    resolved claim set (a CliSession authorizes `GrantSubject::Claims`
+    ///    grants), `token_kind =
     ///    Some(CliSession)`, `token_cap = None` (authority is claims +
     ///    live grants, not a per-token permission cap).
     async fn build_cli_session_principal(
@@ -1065,7 +1064,7 @@ impl AuthenticateUseCase {
 /// 429 envelope so the wire shape stays byte-identical across every
 /// PAT-failure variant — the operator-visible signal is the metric
 /// `hort_api_token_validation_total{result="rate_limited"}`, not a
-/// distinguishable status code (the §5 lockout's purpose is to mask
+/// distinguishable status code (the lockout's purpose is to mask
 /// brute-force attribution from the caller). Operators can still
 /// route on the metric label; clients see the same 401 they'd see for
 /// a forged token.
@@ -1210,11 +1209,10 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_bearer_cli_session_jwt_carries_resolved_claims() {
-        // §13 footgun fix (headline validate side): a CliSession JWT
-        // builds a principal whose `claims` = the JWT's resolved claim
-        // set (NOT `[]`), with `token_kind = Some(CliSession)`. This is
-        // what lets a `GrantSubject::Claims([developer])` grant authorize
-        // the CliSession-gated discovery/prefetch endpoints.
+        // A CliSession JWT builds a principal whose `claims` = the JWT's
+        // resolved claim set (NOT `[]`), with `token_kind = Some(CliSession)`.
+        // This is what lets a `GrantSubject::Claims([developer])` grant
+        // authorize the CliSession-gated discovery/prefetch endpoints.
         let sub = Uuid::from_u128(0xD15C);
         let (uc, signer, _denylist, _users) = make_cli_session_use_case(sub);
         let jwt = signer
@@ -1267,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_bearer_revoked_cli_session_jti_is_rejected() {
-        // §13.4 emergency revocation: a `jti` on the denylist → 401
+        // Emergency revocation: a `jti` on the denylist → 401
         // BEFORE the token's `exp`, even though the signature is valid.
         let sub = Uuid::from_u128(0xD15C);
         let (uc, signer, denylist, _users) = make_cli_session_use_case(sub);
@@ -1296,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_bearer_cli_session_denylist_unavailable_fails_closed() {
-        // §13.4 fail-closed: if the denylist cannot be read, deny rather
+        // Fail-closed: if the denylist cannot be read, deny rather
         // than admit a possibly-revoked token.
         let sub = Uuid::from_u128(0xD15C);
         let idp = Arc::new(MockIdentityProvider::new());
@@ -1795,8 +1793,8 @@ mod tests {
     //   4. groups=[unknown-group] + is_admin=false → claims == []
     //
     // `user.is_admin` is NOT a pre-existing DB bit on the OIDC path: it
-    // is recomputed from the resolved set every login (§5.2 as-built
-    // ordering note). So "is_admin=true" is driven by the IdP returning
+    // is recomputed from the resolved set every login. So "is_admin=true"
+    // is driven by the IdP returning
     // the `admins` group, which `admin_mapping()` maps to `admin`.
 
     /// One mapping pointing a single group at the `developer` claim,
@@ -1821,8 +1819,7 @@ mod tests {
         let principal = uc.authenticate_bearer("t").await.unwrap();
         assert_eq!(principal.claims, vec!["developer".to_string()]);
         assert_eq!(principal.token_kind, None);
-        // §6 invariant 3 — is_admin bit tracks the (absence of an)
-        // admin claim.
+        // is_admin bit tracks the (absence of an) admin claim.
         let row = users.find_by_id(principal.user_id).await.unwrap();
         assert!(!row.is_admin);
     }
@@ -1831,7 +1828,7 @@ mod tests {
     async fn oidc_claims_resolved_developer_and_admin_set_equal() {
         // Case 2: both `admins` (→admin) and `team-alpha` (→developer)
         // groups present. Order is implementation-defined; assert
-        // set-equality per the backlog acceptance note.
+        // set-equality (order is unspecified).
         let (uc, idp, users) = make_use_case(admin_mapping());
         idp.register_token(
             "t",
@@ -1859,7 +1856,7 @@ mod tests {
         // groups + is_admin=true → ['admin']" we drive is_admin via a
         // pre-existing admin DB row whose claim recompute yields [] then
         // synthesises `admin`… but the OIDC path RECOMPUTES is_admin
-        // from groups (§5.2), so an empty-groups login is is_admin=FALSE
+        // from groups, so an empty-groups login is is_admin=FALSE
         // by construction. The faithful case-3 here is: the `admins`
         // group maps to `admin` and there is no other group, so the
         // resolved set is exactly ["admin"] (mapping-derived, and the
@@ -1879,7 +1876,7 @@ mod tests {
         // Case 3 corollary + the genuine empty-set shape: zero IdP
         // groups and no admin mapping hit → claims == [] and the
         // persisted is_admin bit is false (recomputed from the empty
-        // resolved set per §5.2).
+        // resolved set).
         let (uc, idp, users) = make_use_case(admin_mapping());
         idp.register_token("t", sample_claims("kc:none", vec![]));
 
@@ -1889,7 +1886,7 @@ mod tests {
         let row = users.find_by_id(principal.user_id).await.unwrap();
         assert!(
             !row.is_admin,
-            "empty IdP groups must recompute is_admin=false (§5.2)"
+            "empty IdP groups must recompute is_admin=false"
         );
     }
 
@@ -1929,10 +1926,9 @@ mod tests {
         entries: Mutex<HashMap<String, (Bytes, Instant)>>,
         /// Latch that, when set, makes the NEXT `put_if_absent` call
         /// return `Err(...)` instead of consulting / mutating the map.
-        /// Used by Item 16 tests to exercise the audit-event helper's
-        /// fail-open branch (`maybe_append_auth_event` warns then
-        /// proceeds when the throttle check itself fails). Resets
-        /// itself after firing once.
+        /// Used by tests to exercise the audit-event helper's fail-open
+        /// branch (`maybe_append_auth_event` warns then proceeds when the
+        /// throttle check itself fails). Resets itself after firing once.
         fail_next_put_if_absent: AtomicBool,
     }
 
@@ -2039,7 +2035,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     /// Minimal `EventStore` mock that captures every appended batch.
-    /// Only the methods Item 16's helper invokes (`append`) actually
+    /// Only the methods the audit helper invokes (`append`) actually
     /// do work; reads are stubbed.
     struct CapturingEventStore {
         batches: Mutex<Vec<AppendEvents>>,
@@ -2134,7 +2130,7 @@ mod tests {
     /// with the audit-event gate, a pre-seeded Local user with bcrypt
     /// hash, and returns the use case alongside the mock handles each
     /// test asserts against. Avoids the nine-line setup boilerplate
-    /// that previously preceded each Item 16 audit test.
+    /// that previously preceded each audit test.
     ///
     /// The helper is deliberately private to this module — promoting
     /// it to `test_support` is out of scope (the broader test surface
@@ -2247,7 +2243,7 @@ mod tests {
         // Capture metrics around the failing append so we can assert
         // the `error` result label was emitted exactly once. The
         // helper itself swallows the event-store error (best-effort
-        // audit; design §3.4 — never propagate to the caller), so the
+        // audit (never propagate to the caller), so the
         // test passes by *not* panicking AND by observing the metric.
         let snap = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -2334,9 +2330,8 @@ mod tests {
     /// `maybe_append_auth_event` fail-opens when the ephemeral throttle
     /// check itself errors: a `warn!` is emitted (not asserted here —
     /// tracing capture would couple the test to log machinery) and the
-    /// append proceeds anyway. Verifies the design-doc §3.4 invariant
-    /// that ephemeral-store outages do not silently drop audit
-    /// records.
+    /// append proceeds anyway. Verifies the invariant that ephemeral-store
+    /// outages do not silently drop audit records.
     #[tokio::test(start_paused = true)]
     async fn audit_event_swallows_ephemeral_failure_and_proceeds() {
         let (uc, ephemeral, events) = make_audit_use_case();
@@ -2700,7 +2695,7 @@ mod tests {
 
             let principal = h.uc.authenticate_bearer(VALID_PAT).await.unwrap();
             assert_eq!(principal.user_id, user_id);
-            // §B6 — token_cap must be Some on the PAT-success path.
+            // token_cap must be Some on the PAT-success path.
             let cap = principal.token_cap.expect("token_cap is Some on PAT");
             assert_eq!(cap.permissions, vec![Permission::Read, Permission::Write]);
         }
@@ -2995,7 +2990,7 @@ mod tests {
 
             let principal = h.uc.authenticate_bearer(VALID_PAT).await.unwrap();
             assert_eq!(principal.token_kind, Some(TokenKind::Pat));
-            // §6 invariant 6 corollary — the kind is NEVER a claim.
+            // The token kind is NEVER a claim.
             assert!(
                 !principal
                     .claims
@@ -3053,7 +3048,7 @@ mod tests {
             // The typed kind carrier and the synthetic `admin` claim are
             // independent. An admin CliSession carries both
             // `token_kind = Some(CliSession)` AND `claims = ["admin"]`
-            // (the §1.5 admin-cap CLI session flow). The kind is NOT a
+            // (the admin-cap CLI session flow). The kind is NOT a
             // claim — `claims` is exactly `["admin"]`, nothing else.
             let token_id = Uuid::new_v4();
             let user_id = Uuid::new_v4();

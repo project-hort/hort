@@ -6,7 +6,7 @@ spec:
   # Global scope — applies to every repository unless a per-repo
   # ScanPolicy with the same scan-policy name overrides it.
   scope: global
-  # Critical-only is the alpha default: the runbook §8.3 exercises a
+  # Critical-only is the alpha default: the runbook exercises a
   # known-CVE artifact that scans at Critical (event-stream@3.3.6 —
   # GHSA-mh6f-8j2x-4483). Lowering to High/Medium catches more in
   # production but introduces noise during alpha walks.
@@ -16,8 +16,8 @@ spec:
   # enough that the alpha tester doesn't wait minutes between
   # publish and download. Production typically uses 24h–72h.
   quarantineDuration: 60s
-  # No approval workflow in alpha. Manual-review surface is its own
-  # initiative (ApprovalRequested / ApprovalDecided events exist but
+  # No approval workflow in alpha. The manual-review surface
+  # (ApprovalRequested / ApprovalDecided events exist but
   # the operator playbook is out of scope for this runbook).
   requireApproval: false
   # Sigstore/cosign provenance verification. `verify_if_present`

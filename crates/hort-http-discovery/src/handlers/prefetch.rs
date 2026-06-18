@@ -16,12 +16,12 @@
 //!    `200 OK` (continue-on-error envelope — even a fully-failed batch
 //!    returns 200 with the partition populated).
 //!
-//! The token-kind gate (§2.6), the `Permission::Read ∧ Permission::Prefetch`
-//! gate (§2.5 Finding E), and the OCI rejection (§8) all live INSIDE the
+//! The token-kind gate, the `Permission::Read ∧ Permission::Prefetch`
+//! gate, and the OCI rejection all live INSIDE the
 //! use case. Per the architect-doc *"Emission by layer"* rule, business
 //! metrics (`hort_prefetch_self_service_total`) emit at the `hort-app` layer.
 //!
-//! # Status code rules (§2.3 + acceptance #3)
+//! # Status code rules
 //!
 //! - **All items succeeded** → `200 OK`, empty `skipped` / `rejected` /
 //!   `failed` arrays.
@@ -36,7 +36,7 @@
 //! - **Anonymous** → `401 Unauthorized` (returned by `require_principal`
 //!   before the handler runs).
 //! - **OCI rejection** → `400 Bad Request` (`AppError::Domain(Validation)`
-//!   from the use case via the §8 short-circuit).
+//!   from the use case).
 //! - **Repo key unknown** → `404 Not Found` (anti-enumeration; the use
 //!   case collapses `RepositoryRepository::find_by_key` `NotFound`).
 
@@ -63,8 +63,6 @@ pub async fn prefetch(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(dto): Json<SelfServicePrefetchRequestDto>,
 ) -> Result<(StatusCode, Json<PrefetchOutcome>), ApiError> {
-    // The Item 7 → Item 8 split — see the matching `.expect` in
-    // `list_versions.rs` for the rationale.
     let use_case = ctx
         .self_service_prefetch_use_case
         .as_ref()

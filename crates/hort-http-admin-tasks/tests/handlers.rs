@@ -20,9 +20,9 @@
 //! 10. `list_tasks_invalid_status_filter_returns_400`
 //! 11. `get_task_returns_404_for_missing_id`
 //! 12. `get_task_returns_200_for_seeded_row`
-//! 13. `invoke_emits_hort_admin_tasks_enqueued_ok_on_success` (Item 13 metric)
-//! 14. `invoke_emits_hort_admin_tasks_enqueued_rbac_denied`   (Item 13 metric)
-//! 15. `invoke_emits_hort_admin_tasks_enqueued_validation_error` (Item 13 metric)
+//! 13. `invoke_emits_hort_admin_tasks_enqueued_ok_on_success`
+//! 14. `invoke_emits_hort_admin_tasks_enqueued_rbac_denied`
+//! 15. `invoke_emits_hort_admin_tasks_enqueued_validation_error`
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -486,7 +486,7 @@ async fn get_task_returns_200_for_seeded_row() {
 }
 
 // ---------------------------------------------------------------------------
-// Metric helpers (Tests 13-15) — design §6.2
+// Metric helpers (Tests 13-15)
 // ---------------------------------------------------------------------------
 
 type MetricEntry = (

@@ -97,8 +97,8 @@ pub async fn harden_events_role(pool: &PgPool) -> anyhow::Result<()> {
 /// Extracted (behaviour-preserving) from the `assert_current` `.map_err`
 /// closure so every match arm is unit-testable without a live Postgres.
 /// The `42501 insufficient_privilege` arm in particular had **no**
-/// automated coverage (audit finding F-12) — there is no throwaway-role
-/// harness in the workspace, so the contract is pinned by a hand-rolled
+/// automated coverage — there is no throwaway-role harness in the
+/// workspace, so the contract is pinned by a hand-rolled
 /// `sqlx::error::DatabaseError` stub in this module's `tests`.
 ///
 /// **Enforcement model (ADR 0009).** The operator `REVOKE`/grant
@@ -169,13 +169,13 @@ mod tests {
     //! Pins the operator-actionable error-message contract for the
     //! `_sqlx_migrations` read failure (`assert_current`'s `.map_err`).
     //!
-    //! Audit finding F-12: the `42501 insufficient_privilege` branch
-    //! shipped with zero automated coverage because stubbing
-    //! `code() == "42501"` requires a hand-rolled `sqlx::error::DatabaseError`
-    //! impl (no throwaway-role harness exists in the workspace). These
-    //! tests provide exactly that stub and drive every match arm of
-    //! `map_assert_current_db_err`, so a `sqlx` upgrade or refactor that
-    //! breaks the mapping fails CI instead of degrading to an opaque crash.
+    //! The `42501 insufficient_privilege` branch shipped with zero automated
+    //! coverage because stubbing `code() == "42501"` requires a hand-rolled
+    //! `sqlx::error::DatabaseError` impl (no throwaway-role harness exists
+    //! in the workspace). These tests provide exactly that stub and drive
+    //! every match arm of `map_assert_current_db_err`, so a `sqlx` upgrade
+    //! or refactor that breaks the mapping fails CI instead of degrading to
+    //! an opaque crash.
     //!
     //! Enforcement model: the operator `REVOKE`/grant least-privilege
     //! recipe is the *primary* control; this serve-path read-only-ness is
@@ -187,8 +187,8 @@ mod tests {
     use std::fmt;
 
     /// Minimal test-only `sqlx::error::DatabaseError` that reports a
-    /// caller-chosen SQLSTATE via `code()`. This is the F-12
-    /// "known-hard part" — without it the `42501` arm is untestable.
+    /// caller-chosen SQLSTATE via `code()`. Without it the `42501` arm
+    /// is untestable.
     #[derive(Debug)]
     struct StubDbError {
         code: &'static str,
@@ -232,9 +232,8 @@ mod tests {
         sqlx::Error::Database(Box::new(StubDbError { code }))
     }
 
-    /// F-12 core: `42501 insufficient_privilege` → operator-actionable
-    /// "grant SELECT on _sqlx_migrations" message. This is the branch
-    /// the audit flagged as untested.
+    /// `42501 insufficient_privilege` → operator-actionable "grant SELECT on
+    /// _sqlx_migrations" message.
     #[test]
     fn maps_42501_to_grant_select_message() {
         let mapped = map_assert_current_db_err(db_err("42501"));
@@ -243,7 +242,7 @@ mod tests {
             msg,
             "permission denied reading _sqlx_migrations — grant SELECT on _sqlx_migrations \
              to the runtime role (see docs/architecture/how-to/deploy/postgres-roles.md)",
-            "the 42501 operator-actionable message is a regressing contract (F-12)"
+            "the 42501 operator-actionable message is a regression-guarded contract"
         );
     }
 

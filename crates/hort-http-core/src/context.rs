@@ -660,7 +660,7 @@ pub struct AppContext {
     /// Infallible pass-through for the public-facing base URL used in
     /// packument / `config.json` / index responses.
     /// This is a zero-sized type: all trust evaluation lives in
-    /// [`crate::middleware::trust`] (F2), which populates
+    /// [`crate::middleware::trust`], which populates
     /// [`crate::middleware::trust::RequestTrust::public_url`] on every
     /// request. Handlers call `ctx.url_resolver.resolve(&trust)` to
     /// retrieve it. See [`crate::url_resolver`].

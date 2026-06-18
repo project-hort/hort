@@ -1,6 +1,6 @@
 //! `008_api_tokens.sql` migration tests.
 //!
-//! Asserts the §3 schema invariants the migration ships with:
+//! Asserts the schema invariants the migration ships with:
 //!
 //! 1. `applies_on_baseline` — fresh DB → all migrations through
 //!    008 run cleanly, table + indexes exist.
@@ -131,7 +131,7 @@ async fn applies_on_baseline() {
         "api_tokens table must exist after running through 008"
     );
 
-    // The three §3 indexes exist with the spec-defined names.
+    // The three expected indexes exist with their defined names.
     let mut index_rows = sqlx::query(
         "SELECT indexname FROM pg_indexes \
          WHERE schemaname = 'public' AND tablename = 'api_tokens' \

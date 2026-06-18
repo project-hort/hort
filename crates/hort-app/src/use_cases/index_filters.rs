@@ -99,8 +99,8 @@ impl IndexFilter for NonServableStatusFilter {
 ///
 /// See the module-level rustdoc for the per-entry truth table. The
 /// filter is constructed with the repository's [`IndexMode`]; the
-/// per-format serve handler (Items 2/3/4) reads
-/// `repository.index_mode` and passes it to [`IndexModeFilter::new`].
+/// per-format serve handler reads `repository.index_mode` and passes it
+/// to [`IndexModeFilter::new`].
 ///
 /// The `filter_served_versions` semantics are load-bearing — the
 /// existing per-format
@@ -169,19 +169,18 @@ fn is_servable_status(status: QuarantineStatus) -> bool {
 mod tests {
     use super::*;
 
-    // Note on test approach: `PerVersionPayload` is uninhabited in
-    // Item 1 (no variants until Items 2/3/4), so we cannot construct
-    // a `VersionEntry` directly — the `payload` field has no
-    // constructible value. Each filter's `apply` is exercised on the
-    // empty input (which pins the trait shape + the empty-input
-    // behaviour) and the per-arm predicate is tested directly via a
-    // mirror function that reproduces the closure body. The two
-    // matrix tests below cover every cell of the truth tables in
-    // both filter implementations.
+    // Note on test approach: `PerVersionPayload` is currently uninhabited
+    // (no variants yet), so we cannot construct a `VersionEntry` directly —
+    // the `payload` field has no constructible value. Each filter's `apply`
+    // is exercised on the empty input (which pins the trait shape + the
+    // empty-input behaviour) and the per-arm predicate is tested directly via
+    // a mirror function that reproduces the closure body. The two matrix
+    // tests below cover every cell of the truth tables in both filter
+    // implementations.
     //
-    // Once Items 2/3/4 add the first `PerVersionPayload` variant,
-    // this test module gains real `VersionEntry`-shaped fixtures and
-    // the matrix tests become end-to-end through `apply`.
+    // Once the first `PerVersionPayload` variant is added, this test module
+    // gains real `VersionEntry`-shaped fixtures and the matrix tests become
+    // end-to-end through `apply`.
 
     // -----------------------------------------------------------------
     // NonServableStatusFilter
@@ -199,8 +198,7 @@ mod tests {
         // The predicate the filter encodes — see the `match` in
         // `NonServableStatusFilter::apply`. We exercise each arm
         // directly because constructing a `VersionEntry` requires a
-        // `PerVersionPayload` value, which is uninhabited until
-        // Items 2/3/4.
+        // `PerVersionPayload` value, which is currently uninhabited.
         //
         // Keeps: None, Some(Released), Some(None-variant).
         // Drops: Some(Quarantined), Some(Rejected), Some(ScanIndeterminate).

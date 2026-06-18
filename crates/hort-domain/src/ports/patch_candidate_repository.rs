@@ -115,8 +115,7 @@ pub struct PatchCandidateFilter {
     /// `"unknown"` is **not** reachable from the HTTP handler today:
     /// `find_by_key` returning `NotFound` surfaces as 404 to the caller
     /// before the use case is invoked. The sentinel is reserved for
-    /// non-HTTP / dispatcher paths that may exist in future
-    /// initiatives.
+    /// non-HTTP / dispatcher paths that may exist in future.
     pub repository_key_for_metric: Option<String>,
 }
 
@@ -134,7 +133,7 @@ impl Default for PatchCandidateFilter {
 ///
 /// One method: [`Self::list_candidates`]. The Postgres adapter
 /// (`hort-adapters-postgres::patch_candidate_repository`) executes the
-/// query in §3.2 of the design doc; the in-test mock in
+/// candidacy query; the in-test mock in
 /// `patch_candidate_use_case::tests` is a Mutex-backed recorder.
 pub trait PatchCandidateRepository: Send + Sync {
     /// List quarantined artifacts that have an earlier released

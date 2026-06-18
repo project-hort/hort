@@ -98,7 +98,7 @@ pub enum TargetKindWire {
 ///   [`crate::events::StreamCategory`]'s `Display` impl —
 ///   `"artifact"`, `"policy"`, `"admin"`, `"ref"`, `"artifact_group"`,
 ///   `"curation"`, `"repository"`, `"auth"`, `"authorization"`, `"user"`).
-///   `Vec<String>` is deliberate per design doc §8 wire form (just a
+///   `Vec<String>` is deliberate for the wire form (just a
 ///   string list); a typed enum would force readers to share the
 ///   domain crate's `StreamCategory` definition for a field they only
 ///   need to filter on.
@@ -320,9 +320,8 @@ impl SubscriptionDeleted {
 /// Recorded when the dispatcher transitions a subscription into
 /// [`SubscriptionState::Disabled`](crate::entities::subscription::SubscriptionState::Disabled).
 ///
-/// Lands on the owner's user stream. Per design §11 invariant 10,
-/// "silently dropping into muted state is a footgun this initiative
-/// refuses" — every disable transition emits this event so operators can
+/// Lands on the owner's user stream. Silently dropping into a muted state
+/// is a footgun — every disable transition emits this event so operators can
 /// see the muted subscription via the audit log even if they miss the
 /// CRUD-API state field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

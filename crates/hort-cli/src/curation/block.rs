@@ -12,7 +12,7 @@
 //!   — partial success is 200 OK, NOT 5xx).
 //!
 //! See the parent `curation/mod.rs` docs for why this is split into two
-//! sub-subcommands instead of the design §2.7 literal "single `block` with
+//! sub-subcommands instead of a literal "single `block` with
 //! XOR-of-positional-vs-flags" shape: clap's XOR error messages on misuse
 //! are vague; the explicit `block artifact` / `block versions` split is
 //! self-documenting in `--help`.
@@ -129,11 +129,10 @@ pub enum BlockCommand {
 
     /// Bulk block by `(repository, package, version-list)`.
     ///
-    /// Continue-on-error per §2.3 — partial success is 200 OK with a
+    /// Continue-on-error — partial success is 200 OK with a
     /// non-empty `failed` list; the operator retries the failed subset
     /// using the same `correlation_id`. Future ingests of any version
-    /// the resolver could not find are NOT auto-blocked (design §1 OOS
-    /// — Item 15 playbook documents the gap).
+    /// the resolver could not find are NOT auto-blocked.
     Versions(BlockVersionsArgs),
 }
 
@@ -268,8 +267,8 @@ pub async fn run_versions_with_output(
 /// when non-zero **AND `use_ansi` is true** so the operator notices:
 ///
 /// - `not_found_versions` → the operator should know future ingests of
-///   those versions are NOT auto-blocked (Item 15 playbook).
-/// - `failed` → continue-on-error per §2.3 — the operator retries the
+///   those versions are NOT auto-blocked.
+/// - `failed` → continue-on-error — the operator retries the
 ///   failed subset using the same `correlation_id`.
 ///
 /// `use_ansi` is a TTY gate — production callers compute it once via

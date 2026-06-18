@@ -17,7 +17,7 @@
 //! 'rejected', 'scan_indeterminate')` — i.e. `none` / `released`, the
 //! retention-eligible set (the eligibility filter, pushed SQL-side).
 //! Keyset-paginated by `artifact.id`. Per-policy-scope SQL
-//! pre-filtering is **deliberately not** done here: B3's evaluator
+//! pre-filtering is **deliberately not** done here: the evaluator
 //! does scope matching via the pure
 //! [`RetentionScope::matches`](crate::retention::RetentionScope::matches),
 //! invoked in `RetentionUseCase::evaluate_one` **before** the
@@ -36,7 +36,7 @@
 //! excluded), reading `policy_projections.rescan_interval_hours` — the
 //! identical `JOIN LATERAL` the `rescan_candidates` adapter uses. A
 //! **LEFT** join (not the rescan adapter's INNER join): an artifact
-//! with no resolved scan policy yields `None` (→ B3's default 24 h)
+//! with no resolved scan policy yields `None` (→ the default 24 h)
 //! rather than being dropped — age-based retention applies even
 //! without a scan policy.
 
@@ -50,13 +50,12 @@ use crate::error::DomainResult;
 use super::BoxFuture;
 
 /// One retention candidate: the artifact plus the resolved rescan
-/// interval for its repository (the §6-inv-7 freshness-window input).
+/// interval for its repository (the freshness-window input).
 ///
-/// An `hort-domain`-defined row DTO (NOT B3's `hort-app`
+/// An `hort-domain`-defined row DTO (NOT `hort-app`'s
 /// `RetentionUseCase::RetentionCandidate` — an `hort-domain` port cannot
 /// depend on an `hort-app` type). `RetentionEvaluateHandler` maps this
-/// to B3's `RetentionCandidate` with a trivial field copy (RESOLVED #5
-/// — no B3 type relocation / signature change). Every field is
+/// to `RetentionCandidate` with a trivial field copy. Every field is
 /// already an `hort-domain` type ([`Artifact`] is `hort-domain`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetentionCandidateRow {
@@ -72,8 +71,8 @@ pub struct RetentionCandidateRow {
     /// The resolved `rescan_interval_hours` for the artifact's
     /// repository. `Some(0)` is meaningful (rescanning disabled — a
     /// security-driven predicate is then always-stale → fail-safe
-    /// never-expire); `None` means no scan policy resolved → B3's
-    /// default 24 h. Mirrors B3's `RetentionCandidate
+    /// never-expire); `None` means no scan policy resolved → the
+    /// default 24 h. Mirrors `RetentionCandidate
     /// .resolved_rescan_interval_hours` semantics exactly.
     pub resolved_rescan_interval_hours: Option<i64>,
 }

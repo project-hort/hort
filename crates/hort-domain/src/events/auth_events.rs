@@ -5,11 +5,11 @@
 //! authentication attempt fails. Successes deliberately do NOT produce
 //! events — the audit-value-per-byte trade-off (every authenticated
 //! request would otherwise dominate stream volume) keeps successes in
-//! tracing only. See design doc §3.4 + §6.
+//! tracing only.
 //!
 //! Streams live in [`StreamCategory::AuthAttempts`](super::StreamCategory::AuthAttempts).
 //! Daily rotation: one stream per UTC date (`StreamId::auth_attempts(date)`).
-//! After Item 7 hardens the events table against role compromise, this
+//! This
 //! stream is the tamper-resistant access-decision record NIS2 Art. 21(2)(h)
 //! asks for.
 //!
@@ -218,8 +218,8 @@ impl OidcKeyRotated {
 /// change it.
 /// What it adds is observability: a transient IdP outage / empty-groups
 /// response silently mutates a durable bit (a legitimate admin flips to
-/// non-admin; a spurious resolve persists a wrong bit
-/// composes with F-11). Auditors need to see the transition fact.
+/// non-admin; a spurious resolve persists an incorrect bit).
+/// Auditors need to see the transition fact.
 ///
 /// **Emission discipline.** Emitted by
 /// `hort-app::use_cases::authenticate_use_case` **only** when an

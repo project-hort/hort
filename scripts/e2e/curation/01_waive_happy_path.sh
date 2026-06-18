@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Scenario 1: Waive happy path.
 #
-# Spec (backlog Item 16): ingest an artifact under quarantine-by-default;
-# record a clean scan; via `hort-cli curation waive <id> --justification
-# "<text>"` release it before the window elapses; assert the artifact is
-# downloadable AND `ArtifactReleased` event carries
-# `released_by_user_id = <curator>` + `authority = CuratorWaiver`.
+# Ingest an artifact under quarantine-by-default; record a clean scan;
+# via `hort-cli curation waive <id> --justification "<text>"` release it
+# before the window elapses; assert the artifact is downloadable AND
+# `ArtifactReleased` event carries `released_by_user_id = <curator>` +
+# `authority = CuratorWaiver`.
 #
 # Implementation strategy:
 #   1. Use the existing pypi-e2e gitops-managed repo (default

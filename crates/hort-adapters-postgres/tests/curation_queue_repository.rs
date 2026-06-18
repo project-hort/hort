@@ -1,6 +1,6 @@
 //! `PgCurationQueueRepository` integration tests.
 //!
-//! Exercises the §2.5 + §3 query end-to-end against a real Postgres.
+//! Exercises the curation queue query end-to-end against a real Postgres.
 //! Each acceptance scenario from the backlog gets its own
 //! `#[tokio::test]`.
 //!
@@ -365,7 +365,7 @@ async fn list_queue_status_filter_isolates_rejected() {
 
 // ---------------------------------------------------------------------------
 // Test 3 — `ScanIndeterminate` rows surface in default filter
-// (curator-actionable set per §2.5).
+// (curator-actionable set).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -506,7 +506,7 @@ async fn list_queue_limit_clamps_at_500() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6 — Cross-repo deadline difference (load-bearing per §2.5).
+// Test 6 — Cross-repo deadline difference.
 // Two repos with different `quarantine_duration_secs` produce two
 // different per-row deadlines for the same `window_start`.
 // ---------------------------------------------------------------------------

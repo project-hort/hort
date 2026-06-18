@@ -3,14 +3,13 @@
 //! Streaming `Visitor::visit_seq` over the PEP 691 `files[]` array in
 //! the simple-index endpoint.
 //!
-//! **Shape note vs. design doc §4.2.** The §4.2 sketch described a
-//! `releases{}` map projection (matching PyPI's `/pypi/<pkg>/json`
-//! shape). The consumer that actually drives the serve path —
+//! **Shape note.** The consumer that drives the serve path —
 //! `ProxyPypiSource::fetch` — fetches the PEP 691 simple-index `files[]`
-//! array shape, not `releases{}`. The `releases{}` shape lives in
-//! `prefetch_ingest`. Same architectural pattern (DTO with `IgnoredAny`,
-//! custom `Visitor`, per-value cap via `CountingReader`); the streamed
-//! container is a seq rather than a map.
+//! array shape. The `releases{}` map shape (matching PyPI's
+//! `/pypi/<pkg>/json` endpoint) lives in `prefetch_ingest`. Same
+//! architectural pattern (DTO with `IgnoredAny`, custom `Visitor`,
+//! per-value cap via `CountingReader`); the streamed container here is
+//! a seq rather than a map.
 //!
 //! # Two distinct PyPI upstream endpoints, two projectors
 //!

@@ -21,7 +21,7 @@
 //!    The password field is treated as the bearer token. Legacy
 //!    clients (twine, docker pre-OCI-spec) embed an IdP-issued JWT
 //!    in the password slot; this is the documented Docker Hub
-//!    convention and what `require_principal` accepted pre-Item-7.
+//!    convention and what `require_principal` accepted.
 //!
 //! 4. **`AuthContext::Disabled`** (dev / single-node bootstrap): the
 //!    middleware runs the same code path as `Enabled`, but the
@@ -513,7 +513,7 @@ mod tests {
     /// Under `AuthContext::Disabled` the OCI middleware MUST NOT synthesise
     /// an admin principal. An anonymous request receives the same
     /// `Option<CallerPrincipal>::None` sentinel as under `Enabled`-no-header,
-    /// so downstream F1 extractors fail closed with 401.
+    /// so downstream extractors fail closed with 401.
     #[test]
     fn disabled_auth_anonymous_request_inserts_no_principal() {
         let parsed = run(async {

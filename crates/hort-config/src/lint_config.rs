@@ -79,8 +79,8 @@ impl RuleActionSpec {
 /// `hort_app::lint::RuleOverrides`.
 ///
 /// Only the three rules with a tunable action are present;
-/// `claim-name-collision` is fixed at `reject` (§8.1, no downgrade
-/// knob) and is deliberately absent from this struct. A present field
+/// `claim-name-collision` is fixed at `reject` (no downgrade knob)
+/// and is deliberately absent from this struct. A present field
 /// may only *downgrade* its rule (validated in
 /// [`validate_lint_config`]); absent ⇒ the secure design default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,9 +105,8 @@ pub struct RuleOverridesSpec {
 ///
 /// Carries the **full** `LintConfig` opt-out surface — the allowlist
 /// **and** the per-rule downgrade actions — not allowlist-only. An
-/// allowlist-only kind would re-create the exact F2 defect (§704/§8.1
-/// would still overstate the as-built surface; another reconciliation
-/// owed). `camelCase` + `deny_unknown_fields` so a typo surfaces
+/// allowlist-only kind would re-create the same defect. `camelCase` +
+/// `deny_unknown_fields` so a typo surfaces
 /// immediately rather than silently coercing to a default (the same
 /// footgun-free posture every other spec carries).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,16 +192,16 @@ pub fn parse_lint_config(
     Ok(env)
 }
 
-/// Per-spec validation (design doc §2.1 rules 2 & 3; rule 1 — the
-/// singleton-count — is enforced at the [`crate::desired::DesiredState`]
-/// absorb layer because this kind is an `Option`, not a `Vec`):
+/// Per-spec validation (rule 1 — the singleton-count — is enforced at
+/// the [`crate::desired::DesiredState`] absorb layer because this kind
+/// is an `Option`, not a `Vec`):
 ///
 /// 2. Every `single_claim_allowlist` entry is a syntactically valid
 ///    claim name and is not a reserved name
 ///    ([`RESERVED_ALLOWLIST_NAMES`]).
 /// 3. Every present `rule_overrides` entry only *relaxes* its rule —
 ///    an override that restates (no-op) or raises strictness above the
-///    §8.1 design default (`reject` for all three tunable rules) is
+///    design default (`reject` for all three tunable rules) is
 ///    rejected. "Must be explicit": a no-op override is dead config
 ///    and an operator could wrongly believe they hardened something.
 ///
@@ -243,8 +242,7 @@ pub fn validate_lint_config(env: &Envelope<PermissionGrantLintConfigSpec>) -> Ve
         }
     }
 
-    // Downgrade-only: every tunable rule's §8.1 design default is
-    // `reject`. An override is accepted only when it is *strictly
+    // Downgrade-only: every tunable rule's design default is `reject`. An override is accepted only when it is *strictly
     // looser* than `reject` (i.e. `warn` or `pass`). A `reject`
     // override is a no-op that must be explicit (removed, not silently
     // accepted); anything ranked >= the default would raise strictness
@@ -272,14 +270,14 @@ pub fn validate_lint_config(env: &Envelope<PermissionGrantLintConfigSpec>) -> Ve
     errors
 }
 
-/// The §8.1 design-default action for every tunable rule. All three
+/// The design-default action for every tunable rule. All three
 /// (`single-claim-grant`, the high-privilege arm of
 /// `direct-user-grant-without-justification`, `wildcard-repo-non-admin`)
 /// default to `reject`; the override may only relax below this.
 const DESIGN_DEFAULT_CEILING: RuleActionSpec = RuleActionSpec::Reject;
 
 /// Push an [`ValidationError::Invalid`] when a present override does
-/// not *strictly* relax its rule below the §8.1 design default. An
+/// not *strictly* relax its rule below the design default. An
 /// absent override is the secure default and is always fine. An
 /// override equal to the default is a no-op-that-must-be-explicit
 /// (rejected); a stricter one would raise strictness (rejected).
@@ -524,7 +522,7 @@ mod tests {
     fn validate_rejects_strictness_raising_override() {
         // `reject` is the design default ceiling; an explicit `reject`
         // override is a no-op that must be removed, not declared
-        // (design doc §6 invariant 3 — "no-op but must be explicit").
+        // ("no-op but must be explicit").
         let body = "
   ruleOverrides:
     singleClaimGrant: reject

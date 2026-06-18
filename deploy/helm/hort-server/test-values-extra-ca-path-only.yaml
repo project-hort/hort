@@ -1,13 +1,12 @@
 # extraCaBundle smoke fixture: path set, NO auto-mount source
 # (configMapName AND secretName both empty) — the fully-manual recipe.
 #
-# Backlog 078 Item 7 / convention 9: with no auto-mount source the chart
-# mounts NOTHING and sets NO env. The operator owns the entire wiring —
-# they mount their own volume (e.g. a CSI-projected ClusterTrustBundle)
-# via extraVolumes/extraVolumeMounts AND set HORT_EXTRA_CA_BUNDLE
-# themselves via extraEnv/worker.extraEnv, pointed at `path`. The chart
-# never points the env at a file it did not mount (the old behaviour set
-# the env on the worker without mounting → crashloop; that is fixed).
+# With no auto-mount source the chart mounts NOTHING and sets NO env.
+# The operator owns the entire wiring — they mount their own volume
+# (e.g. a CSI-projected ClusterTrustBundle) via extraVolumes/
+# extraVolumeMounts AND set HORT_EXTRA_CA_BUNDLE themselves via
+# extraEnv/worker.extraEnv, pointed at `path`. The chart never points
+# the env at a file it did not mount.
 #
 # Expected rendering:
 #   - NO chart-set HORT_EXTRA_CA_BUNDLE env var (operator sets it)

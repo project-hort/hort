@@ -5,14 +5,13 @@
 //!
 //! The apply pipeline ([`ApplyConfigUseCase::run_pre_write_validation`])
 //! runs a sequence of config checks before the first managed-write. Some
-//! depend on the current-state snapshot or the live worker registry
-//! (rows 1, 4 in design §2 — kept inline on the apply path); the rest are
-//! **desired-only** functions of static deployment facts (rows 2, 3, 5,
-//! 6, 7, 7b). This struct holds exactly those static facts and runs
-//! exactly those rows, so the same logic can be reused by the offline
-//! `hort-server validate-config` command (Item 2) **without** drifting
-//! from what apply enforces — the no-drift guarantee. The struct cannot
-//! hold a snapshot or a port, so the snapshot-free invariant is
+//! depend on the current-state snapshot or the live worker registry and
+//! are kept inline on the apply path; the rest are **desired-only**
+//! functions of static deployment facts. This struct holds exactly those
+//! static facts and runs exactly those checks, so the same logic can be
+//! reused by the offline `hort-server validate-config` command **without**
+//! drifting from what apply enforces — the no-drift guarantee. The struct
+//! cannot hold a snapshot or a port, so the snapshot-free invariant is
 //! *structural*, not conventional.
 //!
 //! # Purity contract
@@ -28,8 +27,8 @@
 //!   with that rule's `AppError::Domain(DomainError::Validation(_))`.
 //!   Warnings are non-aborting. This reproduces the historical
 //!   first-failing-row-aborts behaviour byte-identically.
-//! - the **validate-config CLI** (Item 2) may surface every finding at
-//!   once (collect-all — strictly more information, same reject *set*).
+//! - the **validate-config CLI** may surface every finding at once
+//!   (collect-all — strictly more information, same reject *set*).
 //!
 //! Each [`LintFinding`] carries the [`LinterRule`] that produced it (not
 //! a bare string) precisely so the apply caller can emit the per-rule
@@ -88,25 +87,24 @@ pub(crate) const RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_SCAN_BACKENDS: &str =
 pub(crate) const RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED: &str =
     "prefetch_max_age_days_not_implemented";
 
-/// The snapshot-free apply-config lint rules (design §2 rows 2,3,5,6,7,7b).
+/// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
 /// caller can emit `hort_apply_config_linter_total{rule,result}` for the
-/// rules that have a metric (rows 5 and 6 only — see
-/// [`Self::metric_rule`]) and reproduce the historical
-/// first-failing-row abort.
+/// rules that have a metric (see [`Self::metric_rule`]) and reproduce the
+/// historical first-failing-row abort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinterRule {
     /// Row 2 — `ServiceAccount.federatedIdentities[].issuer` cross-kind FK
     /// against `desired.oidc_issuers`. Reject (no metric today).
     SaIssuerFk,
-    /// Row 3 — under-constrained `federatedIdentities[]` (audit F-7).
+    /// Row 3 — under-constrained `federatedIdentities[]`.
     /// Advisory warning (no metric, never aborts).
     UnderConstrainedFederatedIdentities,
     /// Row 5 — `trust_upstream_publish_time = true` × resolved
-    /// `scan_backends:[]` cross-opt-in collapse (F-46.3). Reject + metric.
+    /// `scan_backends:[]` cross-opt-in collapse. Reject + metric.
     TrustUpstreamPublishTimeRequiresScanBackends,
-    /// Row 6 — accepted-but-inert `PrefetchPolicy.max_age_days` (F-46.7).
+    /// Row 6 — accepted-but-inert `PrefetchPolicy.max_age_days`.
     /// Reject + metric.
     PrefetchMaxAgeDaysNotImplemented,
     /// Row 7 — provenance-config linter: backend/identity
@@ -133,10 +131,11 @@ impl LinterRule {
     /// takes for this rule, or `None` for rules that emit **no**
     /// `hort_apply_config_linter_total` metric today.
     ///
-    /// Only the F-46.3 (row 5) and F-46.7 (row 6) rejects tick the
-    /// counter on the apply path; every other row emits no linter metric
+    /// Only the cross-opt-in collapse and the inert-field rejects tick the
+    /// counter on the apply path; every other rule emits no linter metric
     /// (verified against `apply_config_use_case::run_pre_write_validation`
-    /// — rows 2, 3, 7, 7b have no `emit_apply_config_linter` call). The
+    /// — `SaIssuerFk`, `UnderConstrainedFederatedIdentities`, `ProvenanceConfig`,
+    /// and `RepoStorageBackendMismatch` have no `emit_apply_config_linter` call). The
     /// returned string is the **same** const the apply caller's emission
     /// site uses (single source of truth — no duplicated literal).
     pub fn metric_rule(&self) -> Option<&'static str> {
@@ -167,7 +166,7 @@ impl LinterRule {
 /// (which carry no structured fields).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarnContext {
-    /// Row 3 (audit F-7) — an under-constrained `federatedIdentities[]` entry.
+    /// Row 3 — an under-constrained `federatedIdentities[]` entry.
     /// Mirrors the original apply
     /// `warn!(service_account, federated_identity_index, issuer, "…— {detail}")`.
     UnderConstrainedFederatedIdentities {
@@ -239,9 +238,8 @@ pub struct StaticLintReport {
     pub warnings: Vec<LintFinding>,
 }
 
-/// The snapshot-free apply-config validator (design §3.1). Holds only
-/// **static** deployment facts — no ports, no `CurrentSnapshot`, no
-/// `EnvSnapshot`.
+/// The snapshot-free apply-config validator. Holds only **static**
+/// deployment facts — no ports, no `CurrentSnapshot`, no `EnvSnapshot`.
 pub struct StaticConfigValidator {
     /// Row 7 — the set of repository-format strings some registered
     /// `ProvenancePort` covers (Tier-1 = `{"oci"}`). A `Required`
@@ -263,7 +261,7 @@ pub struct StaticConfigValidator {
     /// opted out) that the desired state's `PermissionGrantLintConfig`
     /// resolves on top of — identical to apply's resolution. The grant
     /// linter emits **no** metric from here (a [`metrics::NoopRecorder`]
-    /// swallows them — validator purity + §5 CLI-no-metric).
+    /// swallows them — validator purity; the CLI is metric-free).
     grant_lint_base: Option<LintConfig>,
 }
 
@@ -292,9 +290,9 @@ impl StaticConfigValidator {
     /// Enable row 8 (the offline permission-grant linter)
     /// with `base` as the composition-root `LintConfig` (the
     /// secure [`LintConfig::default`] unless the root opted out via
-    /// `with_lint_config`). The CLI (Item 2) calls this so
-    /// [`Self::validate`] reproduces apply's row-8 verdict offline; the
-    /// apply path never calls it (its own gate stays the authority).
+    /// `with_lint_config`). The offline CLI calls this so
+    /// [`Self::validate`] reproduces apply's row-8 verdict without a DB;
+    /// the apply path never calls it (its own gate stays the authority).
     ///
     /// Builder, not a `new` argument, so the apply call site
     /// (`StaticConfigValidator::new(..)`) is unchanged and keeps row 8
@@ -304,10 +302,10 @@ impl StaticConfigValidator {
         self
     }
 
-    /// Run every snapshot-free check (design §2 rows 2,3,5,6,7,7b) over
-    /// `desired`, **in apply's row order**, collecting all findings. Pure
-    /// — no ports, no DB, no `EnvSnapshot`, no metric or `tracing`
-    /// emission. The caller owns surfacing (see the module docs).
+    /// Run every snapshot-free check over `desired`, **in apply's row
+    /// order**, collecting all findings. Pure — no ports, no DB, no
+    /// `EnvSnapshot`, no metric or `tracing` emission. The caller owns
+    /// surfacing (see the module docs).
     pub fn validate(&self, desired: &DesiredState) -> StaticLintReport {
         let mut report = StaticLintReport::default();
 
@@ -320,7 +318,7 @@ impl StaticConfigValidator {
                 .push(LintFinding::error(LinterRule::SaIssuerFk, message));
         }
 
-        // Row 3 — under-constrained federatedIdentities advisory (F-7). The
+        // Row 3 — under-constrained federatedIdentities advisory. The
         // `message` is the FULLY-RENDERED line the CLI prints; the
         // `warn_context` carries the typed fields the apply path re-emits as
         // structured `warn!` fields (service_account / federated_identity_index
@@ -343,7 +341,7 @@ impl StaticConfigValidator {
             }
         }
 
-        // Row 5 — trust_upstream_publish_time × scan_backends:[] (F-46.3).
+        // Row 5 — trust_upstream_publish_time × scan_backends:[].
         for err in hort_config::desired::validate_trust_upstream_publish_time_against_scan_backends(
             desired,
         ) {
@@ -353,7 +351,7 @@ impl StaticConfigValidator {
             ));
         }
 
-        // Row 6 — accepted-but-inert PrefetchPolicy.max_age_days (F-46.7).
+        // Row 6 — accepted-but-inert PrefetchPolicy.max_age_days.
         for err in hort_config::desired::validate_prefetch_max_age_days_not_implemented(desired) {
             report.errors.push(LintFinding::error(
                 LinterRule::PrefetchMaxAgeDaysNotImplemented,
@@ -406,8 +404,8 @@ impl StaticConfigValidator {
     ///
     /// Metric-free: the linter emits `hort_apply_config_linter_total`
     /// internally; we run it under a [`metrics::NoopRecorder`] so **no**
-    /// series escapes (validator purity + the §5 CLI-no-metric rule). The
-    /// apply path keeps its own emission on its own call site.
+    /// series escapes — the validator is pure and the CLI is metric-free.
+    /// The apply path keeps its own emission on its own call site.
     fn collect_permission_grants(
         &self,
         base: &LintConfig,
@@ -498,7 +496,7 @@ impl StaticConfigValidator {
         let effective_cfg = crate::lint::resolve_effective_lint_config(base, desired);
 
         // Run the linter with NO observable side-effects, so the validator
-        // stays pure (design §3.1 / §5):
+        // stays pure:
         //  - a `NoopRecorder` swallows the `hort_apply_config_linter_total`
         //    series the linter emits internally (the CLI is metric-free);
         //  - a `NoSubscriber` swallows the linter's internal
@@ -890,7 +888,7 @@ mod tests {
     }
 
     /// An SA whose single FI references `issuer` with a repository +
-    /// environment claim (well-constrained — no F-7 warning).
+    /// environment claim (well-constrained — no under-constrained warning).
     fn sa_env_well_constrained(name: &str, issuer: &str) -> Envelope<ServiceAccountSpec> {
         let mut claims = BTreeMap::new();
         claims.insert("repository".to_string(), "my-org/my-repo".to_string());
@@ -912,7 +910,7 @@ mod tests {
     }
 
     /// An SA whose single FI references `issuer` with ONLY a repository
-    /// claim (under-constrained — the F-7 Class-1 warning shape).
+    /// claim (under-constrained — the Class-1 warning shape).
     fn sa_env_under_constrained(name: &str, issuer: &str) -> Envelope<ServiceAccountSpec> {
         let mut claims = BTreeMap::new();
         claims.insert("repository".to_string(), "my-org/my-repo".to_string());
@@ -1090,11 +1088,11 @@ mod tests {
         );
         let msg = &report.warnings[0].message;
         // The fully-rendered apply log line: the prefix + the detector
-        // message (carries SA name, issuer, F-7).
+        // message (carries SA name, issuer, and the risk detail).
         assert!(msg.contains("under-constrained federatedIdentities"));
         assert!(msg.contains("ci-loose"));
         assert!(msg.contains("github-actions"));
-        assert!(msg.contains("F-7"));
+        assert!(msg.contains("discriminating"));
     }
 
     #[test]
@@ -1808,11 +1806,10 @@ mod tests {
                 && f.message.contains("wildcard-repo-non-admin")));
     }
 
-    /// §5 / metric-suppression: running `validate()` with row 8 enabled
-    /// INSIDE a `DebuggingRecorder` records ZERO
-    /// `hort_apply_config_linter_total` series — the local `NoopRecorder`
-    /// swallowed every emission the grant linter makes internally, so the
-    /// CLI path emits no metric.
+    /// Metric-suppression: running `validate()` with row 8 enabled INSIDE
+    /// a `DebuggingRecorder` records ZERO `hort_apply_config_linter_total`
+    /// series — the local `NoopRecorder` swallowed every emission the grant
+    /// linter makes internally, so the CLI path emits no metric.
     #[test]
     fn row8_emits_no_linter_metric() {
         use metrics_util::debugging::DebuggingRecorder;

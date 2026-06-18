@@ -57,7 +57,7 @@ use hort_domain::ports::api_token_cache_invalidator::ApiTokenCacheInvalidator;
 ///
 /// Newtype around `[u8; 32]` so callers cannot accidentally pass a raw
 /// slice or a `Vec<u8>` of the wrong length. Construction is explicit —
-/// the validator (B5b) will compute the digest and call
+/// the validator will compute the digest and call
 /// [`CacheKey::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheKey([u8; 32]);
@@ -78,10 +78,10 @@ impl CacheKey {
 ///
 /// Intentionally minimal — anything not needed by the auth-middleware
 /// hot path stays out (the `token_hash`, `token_prefix`,
-/// `last_used_*` columns are repository-only). The validator (B5b)
+/// `last_used_*` columns are repository-only). The validator
 /// re-checks `expires_at` and `revoked_at` on every cache hit so a
 /// token that expires mid-cache-TTL is still rejected without a round
-/// trip — see design doc §5 step 2 ("Cache hit + non-revoked +
+/// trip — see the cache-hit fast path ("Cache hit + non-revoked +
 /// non-expired → return cached").
 ///
 /// Eq/PartialEq are derived for test convenience (assert a cached
@@ -168,7 +168,7 @@ pub struct PatCache {
 
 impl PatCache {
     /// Build a cache with the given capacity (default 10k per
-    /// `HORT_PAT_CACHE_SIZE`) and TTL (default 5 min per design doc §5),
+    /// `HORT_PAT_CACHE_SIZE`) and TTL (default 5 min per `HORT_PAT_CACHE_TTL_SECS`),
     /// using [`SystemClock`].
     ///
     /// `capacity` is clamped to `1` if `0` is supplied — `lru::LruCache`
@@ -381,7 +381,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Acceptance tests (B5a checklist)
+    // Acceptance tests
     // -----------------------------------------------------------------
 
     #[test]
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn _assert_dyn_compat() {
         // `&PatCache` coerces to `&dyn ApiTokenCacheInvalidator` —
-        // this is the wiring the composition root depends on (B5c).
+        // this is the wiring the composition root depends on.
         let clock = MockClock::new(t0());
         let cache = cache_with_clock(8, Duration::from_secs(300), clock);
         let _: &dyn ApiTokenCacheInvalidator = &cache;

@@ -117,9 +117,7 @@ Fallback PAT rotation is enabled by a **single** chart toggle:
 `scheduledTasks.serviceAccountRotation.enabled`. That one flag drives
 *both* the CronJob trigger *and* the worker-side wiring (the
 `KubernetesSecretWriter` env block + the per-namespace RBAC) — there is
-no separate `worker.rotation.enabled` switch. (Pre-078 this was a
-two-place switch where forgetting one half silently half-enabled
-rotation; Backlog 078 Item 9 collapsed it.) Edit your Helm values:
+no separate `worker.rotation.enabled` switch. Edit your Helm values:
 
 ```yaml
 scheduledTasks:

@@ -136,8 +136,8 @@ fn sample_job_row(id: Uuid, kind: &str) -> JobRow {
 // ---------------------------------------------------------------------------
 
 /// A non-admin (read-only) principal calling `GET /api/v1/admin/tasks`
-/// must get **403**. Today (`AuthenticatedCaller`) it returns 200 — the
-/// F-41 gap this test pins.
+/// must get **403**. This test pins the access-control gap where a
+/// non-admin principal could previously read the queue.
 #[tokio::test]
 async fn list_tasks_non_admin_principal_returns_403() {
     let (ctx, mocks) = new_ctx();
@@ -158,7 +158,7 @@ async fn list_tasks_non_admin_principal_returns_403() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "a non-admin principal must NOT be able to read the admin-task queue (F-41)"
+        "a non-admin principal must NOT be able to read the admin-task queue"
     );
 }
 
@@ -249,7 +249,7 @@ async fn get_task_non_admin_principal_returns_403() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "a non-admin principal must NOT read a single task row (F-41)"
+        "a non-admin principal must NOT read a single task row"
     );
 }
 

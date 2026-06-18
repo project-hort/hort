@@ -11,8 +11,8 @@
 //!
 //! Purely additive: a brand-new adapter for a brand-new (additive)
 //! port. No existing adapter or port signature is touched — the frozen
-//! [`crate::event_store::PgEventStore`] (and the B9 `seal_and_remove`
-//! chokepoint it owns) is left exactly as shipped; B5's use case routes
+//! [`crate::event_store::PgEventStore`] (and the `seal_and_remove`
+//! chokepoint it owns) is left exactly as shipped; the use case routes
 //! seals through that chokepoint, never through this reader.
 //!
 //! # The enumeration query (one set-based aggregate)
@@ -197,8 +197,8 @@ mod tests {
 
     /// Append a minimal event to an arbitrary stream. `prev`/
     /// `event_hash` are 32-byte fillers — these tests exercise the
-    /// enumeration aggregate, not the F-2 chain verifier, so any
-    /// 32-byte value satisfies the width CHECK.
+    /// enumeration aggregate, not the chain verifier, so any 32-byte
+    /// value satisfies the width CHECK.
     async fn append_event(
         pool: &PgPool,
         stream_id: &str,

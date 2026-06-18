@@ -3,7 +3,7 @@
 -- Adds the api_tokens table. This is a fresh CREATE with the v2-correct
 -- shape: typed scopes (declared_permissions), Argon2id-encoded
 -- token_hash, kind enum (pat/service_account/cli_session), and a 1 KB
--- description CHECK per the F7 GDPR data-minimisation review.
+-- description CHECK per GDPR data-minimisation review.
 --
 -- Schema choice: declared_permissions uses `text[]` (matches the v2
 -- baseline's existing pattern in `roles.permissions text[]` from
@@ -43,7 +43,7 @@ CREATE TABLE public.api_tokens (
     -- 1 KB cap on description: longer values are wasteful and a small DoS
     -- vector on list_for_user. The use case maps the constraint to
     -- 400 invalid_description; raw INSERT bypassing the use case still
-    -- gets caught at the schema layer (F7 GDPR data-minimisation review).
+    -- gets caught at the schema layer (GDPR data-minimisation review).
     CONSTRAINT api_tokens_description_length_check CHECK (
         description IS NULL OR length(description) <= 1024
     ),

@@ -31,7 +31,7 @@
 //! the **observed** identity it extracts from the verified leaf cert (see
 //! [`identity`]).
 //!
-//! ## Digest binding (design §4 / Item 4 seam)
+//! ## Digest binding
 //! `sigstore`'s only public offline-verify entry,
 //! `Verifier::verify_digest(input: Sha256, …)`, takes a **`Sha256` hasher
 //! it finalizes** — it needs the artifact *preimage* bytes, not a
@@ -46,8 +46,7 @@
 //! asserts the subject invariant `sha256(payload) == content_hash` before
 //! verifying. The cert-chain / SCT / SET / signature crypto runs **for
 //! real** against the injected trust root (it is *not* a stub). The
-//! **offline** and **injectable-trust-root** guarantees (the load-bearing
-//! parts of §4) are fully met here.
+//! **offline** and **injectable-trust-root** guarantees are fully met here.
 //!
 //! [`NoAttestation`]: hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
 //! [`Rejected(BundleMalformed)`]: hort_domain::ports::provenance::ProvenanceRejectReason::BundleMalformed
@@ -74,7 +73,7 @@ use hort_domain::ports::provenance::{
 };
 use hort_domain::ports::BoxFuture;
 
-/// The format this verifier applies to (`cosign` → OCI, design §4).
+/// The format this verifier applies to (`cosign` → OCI).
 const COSIGN_FORMAT: &str = "oci";
 
 /// Stable backend id used in `ScanPolicy.provenance_backends`.
@@ -83,8 +82,8 @@ const BACKEND_NAME: &str = "cosign";
 /// Sigstore/cosign offline-bundle provenance verifier.
 ///
 /// Holds the cached, injectable [`CachedTrustRoot`]; constructed once at
-/// composition time (Item 6). The verify path is fully offline — the only
-/// live HTTP in the whole adapter is the periodic trust-root refresh
+/// composition time. The verify path is fully offline — the only live HTTP
+/// in the whole adapter is the periodic trust-root refresh
 /// (`trust_root::refresh_trusted_root_json`), wired by the composition
 /// root, never by `verify`.
 pub struct SigstoreProvenanceAdapter {
@@ -122,7 +121,7 @@ impl ProvenancePort for SigstoreProvenanceAdapter {
         policy: &'a ProvenanceRequirements<'a>,
     ) -> BoxFuture<'a, DomainResult<ProvenanceVerdict>> {
         Box::pin(async move {
-            // Empty bundles → the unsigned case. NOT an error (design §4).
+            // Empty bundles → the unsigned case. NOT an error.
             if bundles.is_empty() {
                 return Ok(ProvenanceVerdict::no_attestation());
             }
@@ -177,9 +176,9 @@ impl ProvenancePort for SigstoreProvenanceAdapter {
     fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
         Box::pin(async move {
             // Offline health: the trust root must be loaded AND within its
-            // refresh window. It does NOT probe live Rekor/Fulcio (design
-            // §4 / §6) — a stale-but-loaded root still fails so a worker
-            // does not boot a verifier with an out-of-date trust root.
+            // refresh window. It does NOT probe live Rekor/Fulcio —
+            // a stale-but-loaded root still fails so a worker does not
+            // boot a verifier with an out-of-date trust root.
             if self.trust_root.is_fresh() {
                 Ok(())
             } else {
@@ -271,8 +270,8 @@ mod tests {
     #[tokio::test]
     async fn payload_not_hashing_to_content_hash_is_an_invariant_error() {
         // The `ProvenanceSubject` invariant is `sha256(payload) ==
-        // content_hash`. If a caller (Item 4 orchestrator) loads the wrong
-        // preimage from storage, the adapter surfaces an Invariant — a
+        // content_hash`. If a caller loads the wrong preimage from
+        // storage, the adapter surfaces an Invariant — a
         // caller bug — rather than feeding `verify_digest` a hasher that
         // could never reach `Verified` and silently mislabelling it a
         // bundle problem. This guard is BundleMalformed-distinct on purpose.

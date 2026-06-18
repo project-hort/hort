@@ -239,9 +239,9 @@ file), and `crates/hort-http-oci/src/manifests.rs` +
       hex-encoded before constructing `UpstreamPublishedChecksum`.
       The struct stores hex.
 - [ ] SHA-1 fallback is **not** added. SHA-1 is collision-broken
-      (SHAttered, 2017) and the design explicitly rejects it
-      (§16). Legacy artifacts with only `dist.shasum` cannot be
-      proxied; users upload them directly.
+      (SHAttered, 2017) and is not a supported verification algorithm.
+      Legacy artifacts with only `dist.shasum` cannot be proxied;
+      users upload them directly.
 
 ### 3 — Create the `hort-http-{format}` crate skeleton
 
@@ -393,13 +393,12 @@ defense-in-depth for reads** — read authorization is delegated
 *entirely* to each use case's per-resource visibility filter. That
 filter is the **only** authz gate on a read path.
 
-Consequence (audit finding **F-25**, anonymous-by-default): a read
-handler or read use case that forgets to thread and enforce the caller
-is **silently world-readable** — it returns data, not a `403`, with
-nothing in front of it. This is not a hypothetical: the same
-anonymous-by-default delegation is what let **F-3** (privileged-category
-events streamed to a self-owned webhook with no category-admin gate)
-through on the notification path.
+Consequence: a read handler or read use case that forgets to thread
+and enforce the caller is **silently world-readable** — it returns
+data, not a `403`, with nothing in front of it. This is not a
+hypothetical: the same anonymous-by-default delegation has previously
+allowed privileged-category events to be streamed to a self-owned
+webhook with no category-admin gate on the notification path.
 
 The concrete rule for a new read handler:
 

@@ -99,7 +99,7 @@ Filesystem storage:
 
 {{- if .Values.worker.enabled }}
 
-Scanner worker (alpha F22 default):
+Scanner worker (enabled by default):
   worker.enabled = true (chart default). The hort-worker pod pulls
   `{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag | default .Chart.AppVersion }}`
   (Trivy + osv-scanner bundled) and processes `kind='scan'` jobs the
@@ -119,7 +119,7 @@ Scanner worker (alpha F22 default):
 
 WARNING: worker.enabled = false
   Quarantine-by-default is on but no scanner worker is running. The
-  F-6 fail-closed release predicate requires either `ScanCompleted`
+  fail-closed release predicate requires either `ScanCompleted`
   (which only the worker produces) OR an explicit `ScanPolicy` with
   `scan_backends: []`. Without one of these, freshly-ingested
   artifacts will stay in `Quarantined` permanently — downloads return
@@ -137,13 +137,12 @@ Operator docs:
   - Upgrade:        docs/architecture/how-to/deploy/upgrade-from-prototype.md
 
 {{- /*
-  Backlog 078 Item 9 (chart S4): rotation is enabled by the single
-  toggle `scheduledTasks.serviceAccountRotation.enabled` (under the
+  Rotation is enabled by the single toggle
+  `scheduledTasks.serviceAccountRotation.enabled` (under the
   `adminTasksEnabled` umbrella the schema requires). Gate this NOTES
   block on `worker.enabled` + that pair so it only advertises the
   cadence when the worker that actually performs the rotation is also
-  deployed. (Pre-078 this also checked a separate
-  `worker.rotation.enabled`; that second switch was collapsed.)
+  deployed.
 */ -}}
 {{- if and .Values.worker.enabled .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.serviceAccountRotation.enabled }}
 

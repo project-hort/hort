@@ -46,11 +46,10 @@
 //!
 //! The read is **streamed per stream, ordered by `(stream_id,
 //! stream_position)`**, one stream's bounded pages at a time (the
-//! adapter pages internally) — never buffering the whole table
-//! (spec §8.2).
+//! adapter pages internally) — never buffering the whole table.
 //!
-//! ## Exit codes (spec §8.2 — distinct so the Phase-E CI gate keys on
-//! them deterministically)
+//! ## Exit codes (distinct so automated gates can key on them
+//! deterministically)
 //!
 //! - `0` — [`ChainReport::Ok`].
 //! - `2` — [`ChainReport::Broken`] (a detected integrity violation).
@@ -105,7 +104,7 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Arguments to `hort-server verify-event-chain` (spec §8.2).
+/// Arguments to `hort-server verify-event-chain`.
 #[derive(Debug, Args)]
 pub struct VerifyEventChainArgs {
     /// Verify only the named stream(s) (repeatable). Default: every
@@ -133,7 +132,7 @@ pub struct VerifyEventChainArgs {
     pub format: OutputFormat,
 
     /// Whether `missing_checkpoint` is a non-zero exit. CI wants `true`
-    /// (the default — a coverage gap must be investigated, spec §6.4);
+    /// (the default — a coverage gap must be investigated);
     /// an operator spot-check may pass `--fail-on-missing-checkpoint=false`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fail_on_missing_checkpoint: bool,
@@ -144,7 +143,7 @@ pub struct VerifyEventChainArgs {
 // ---------------------------------------------------------------------------
 
 /// Map a [`ChainReport`] (+ the `--fail-on-missing-checkpoint` flag) to
-/// a process exit code (spec §8.2). Pure.
+/// a process exit code. Pure.
 fn report_to_exit_code(report: ChainReport, fail_on_missing: bool) -> ExitCode {
     match report {
         ChainReport::Ok => ExitCode::SUCCESS,
@@ -169,15 +168,14 @@ fn result_label(report: ChainReport) -> &'static str {
 }
 
 /// Emit `hort_event_chain_verify_total{result}` exactly once per run.
-/// **The single emitter** for this metric (design doc §4 row; architect
-/// "one metric, one layer, no double-count"). Called once, here, from
-/// the subcommand layer — never from `hort-domain` or
-/// `hort-adapters-postgres`.
+/// **The single emitter** for this metric ("one metric, one layer, no
+/// double-count"). Called once, here, from the subcommand layer — never
+/// from `hort-domain` or `hort-adapters-postgres`.
 fn emit_metric(report: ChainReport) {
     metrics::counter!(METRIC_NAME, "result" => result_label(report)).increment(1);
 }
 
-/// Structured log for the verdict (design doc §4 / spec §11):
+/// Structured log for the verdict:
 /// `error!` on a detected break (unrecoverable integrity failure),
 /// `warn!` on `missing_checkpoint` (a coverage gap, not a proven
 /// violation), `info!` on ok. **No `#[instrument(err)]`** anywhere on
@@ -302,8 +300,8 @@ pub fn run(args: VerifyEventChainArgs) -> ExitCode {
 async fn run_async(args: VerifyEventChainArgs) -> anyhow::Result<VerifySummary> {
     // DB-only subcommand → MinimalConfig (same pattern as
     // reconcile-groups). The runtime DML DSN is read from
-    // `HORT_DATABASE_URL`, falling back to bare `DATABASE_URL`
-    // (Backlog 078 Item 5) — identical to the serve path and the worker.
+    // `HORT_DATABASE_URL`, falling back to bare `DATABASE_URL` —
+    // identical to the serve path and the worker.
     let cfg = MinimalConfig::from_env().context("parsing environment")?;
     telemetry::init_tracing(cfg.log_format)?;
 
@@ -352,14 +350,14 @@ async fn run_async(args: VerifyEventChainArgs) -> anyhow::Result<VerifySummary> 
     // pure core correctly maps to `missing_checkpoint`.
     let anchor = build_anchor(&full).await?;
 
-    // The anchor-staleness window cadence (spec §6.4(c) / §14 R6) — from
-    // config (default hourly), not hardcoded. MUST match the deployment's
-    // `eventstore-checkpoint` CronJob cadence.
+    // The anchor-staleness window cadence — from config (default hourly),
+    // not hardcoded. MUST match the deployment's `eventstore-checkpoint`
+    // CronJob cadence.
     let cadence = Duration::from_secs(full.event_chain_checkpoint_cadence_secs);
 
     let summary = verify(&reader, &args, anchor.as_ref(), cadence).await?;
 
-    // Single emitter (design doc §4) — once per run, here.
+    // Single emitter — once per run, here.
     emit_metric(summary.report);
     log_report(summary.report, &summary);
     println!("{}", summary.render(args.format));
@@ -394,8 +392,8 @@ async fn run_async(args: VerifyEventChainArgs) -> anyhow::Result<VerifySummary> 
 /// Build the `CheckpointAnchorPort` read adapter. Returns an
 /// `Arc<dyn CheckpointAnchorPort>`. For a filesystem storage backend
 /// (no object store) the anchor is `None` — the verifier then reports
-/// `missing_checkpoint` (a correct, spec-defined verdict §6.4(a) when
-/// no anchor is configured/deployed).
+/// `missing_checkpoint` (a correct, spec-defined verdict when no anchor
+/// is configured/deployed).
 async fn build_anchor(
     cfg: &crate::config::Config,
 ) -> anyhow::Result<Arc<dyn CheckpointAnchorPort>> {
@@ -433,20 +431,19 @@ async fn build_anchor(
         }
         StorageConfig::Filesystem { .. } => {
             // No object store to anchor checkpoints in. The verifier
-            // still runs the per-stream chain check (I1); the anchor
-            // cross-check (I2) resolves to `missing_checkpoint`.
+            // still runs the per-stream chain check; the anchor
+            // cross-check resolves to `missing_checkpoint`.
             Ok(Arc::new(NoAnchor))
         }
     }
 }
 
-/// Operator-provisioned anchor public-key PEM file (spec §14 R2 — a
-/// file under the existing `HORT_*` posture, KMS/HSM deferred). Read from
+/// Operator-provisioned anchor public-key PEM file. Read from
 /// `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE`.
 fn read_anchor_public_key() -> anyhow::Result<String> {
     let path = std::env::var("HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE").context(
         "HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE must point to the operator-provisioned \
-         anchor Ed25519 SPKI public-key PEM (spec §14 R2)",
+         anchor Ed25519 SPKI public-key PEM",
     )?;
     std::fs::read_to_string(&path).with_context(|| format!("reading anchor public key file {path}"))
 }
@@ -490,8 +487,8 @@ fn explicit_stream_ids(streams: &[String]) -> Vec<String> {
 /// from the audit-meta stream), then `roll_up`. All `sqlx` lives behind
 /// the port; the pure verdict logic is entirely `hort-domain`.
 ///
-/// `cadence` is the anchor-staleness window input (spec §6.4(c)) — from
-/// config (default hourly), not hardcoded.
+/// `cadence` is the anchor-staleness window input — from config (default
+/// hourly), not hardcoded.
 async fn verify(
     reader: &dyn EventChainReaderPort,
     args: &VerifyEventChainArgs,
@@ -501,7 +498,7 @@ async fn verify(
     // Stream selection: the explicit `--stream` allow-list short-circuits
     // the DB read; otherwise the port lists ids (optionally filtered by
     // `--since-global`, a *stream-selection* filter — each selected
-    // stream is still read from genesis by the adapter, spec §8.2).
+    // stream is still read from genesis by the adapter).
     let stream_ids = if args.streams.is_empty() {
         reader
             .list_stream_ids(args.since_global)
@@ -668,7 +665,7 @@ mod tests {
         assert!(r.contains("fail-on-missing-checkpoint"));
     }
 
-    // -- Exit-code mapping: all 4 codes (spec §8.2) ------------------------
+    // -- Exit-code mapping: all 4 codes ------------------------------------
 
     #[test]
     fn ok_maps_to_success() {
@@ -746,7 +743,7 @@ mod tests {
         );
     }
 
-    // -- Metric: DebuggingRecorder catalog test (design doc §4) -----------
+    // -- Metric: DebuggingRecorder catalog test ---------------------------
 
     type MetricEntry = (
         CompositeKey,
@@ -952,7 +949,7 @@ mod tests {
     const TEST_CADENCE: Duration = Duration::from_secs(3600);
 
     async fn maybe_pool() -> Option<sqlx::PgPool> {
-        // Backlog 078 Item 5 — bare `DATABASE_URL` is read here INTENTIONALLY:
+        // bare `DATABASE_URL` is read here INTENTIONALLY:
         // this is the Tier-2 test-helper / sqlx-tooling fallback that the
         // canonical `HORT_DATABASE_URL` precedence keeps alive (NOT a
         // straggler). The operator/runtime DSN read lives in `MinimalConfig`.
@@ -1147,7 +1144,7 @@ mod tests {
 
         // Anchor matches the (untampered) head value we read earlier;
         // the break must be detected by the per-stream chain check, not
-        // the anchor cross-check, so this isolates the I1 path.
+        // the anchor cross-check, so this isolates the per-stream chain path.
         let anchor = anchor_for(&sid, head, final_pos);
         let args = args_for(&sid, None);
 
@@ -1171,7 +1168,7 @@ mod tests {
     /// Empty anchor store → `ChainReport::MissingCheckpoint`: exit 3
     /// with `--fail-on-missing-checkpoint` (default), exit 0 without.
     /// The per-stream chain is intact (clean seed) so the only reason
-    /// for the verdict is the absent checkpoint (spec §6.4(a)).
+    /// for the verdict is the absent checkpoint.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn verify_empty_anchor_is_missing_checkpoint() {
@@ -1249,14 +1246,14 @@ mod tests {
         assert_eq!(summary.rows_read, 4);
     }
 
-    /// **Important #3 regression guard.** `EventChainReaderPort::list_stream_ids`
+    /// **Inclusive boundary regression guard.** `EventChainReaderPort::list_stream_ids`
     /// with `--since-global N` must select a stream whose genesis activity
-    /// is *exactly* at `global_position == N` (spec §8.2 line 297: `>= N`,
-    /// not `> N`). Pre-fix the predicate was `global_position > $1` with
-    /// `$1 = N` (i.e. `>= N+1`), silently dropping such a stream. This test
-    /// seeds a stream, reads its genesis `global_position`, then asks the
-    /// reader for the `--since-global == that position` set (the adapter's
-    /// DB query now owns this boundary) and asserts the stream is in it.
+    /// is *exactly* at `global_position == N` (`>= N`, not `> N`). Pre-fix
+    /// the predicate was `global_position > $1` with `$1 = N` (i.e.
+    /// `>= N+1`), silently dropping such a stream. This test seeds a stream,
+    /// reads its genesis `global_position`, then asks the reader for the
+    /// `--since-global == that position` set (the adapter's DB query now
+    /// owns this boundary) and asserts the stream is in it.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn list_stream_ids_since_global_is_inclusive_regression() {
@@ -1272,8 +1269,8 @@ mod tests {
         assert!(
             ids.iter().any(|s| s == &sid),
             "a stream whose only activity is exactly at global_position \
-             == N must be selected by --since-global N (>= N, spec §8.2 \
-             line 297); pre-fix `> N` dropped it (Important #3)"
+             == N must be selected by --since-global N (>= N, inclusive); \
+             pre-fix `> N` dropped it"
         );
 
         // And one position above its genesis it must NOT be selected

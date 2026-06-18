@@ -197,13 +197,12 @@ nothing — the SA bearer never resolves claims. To change what a
 ServiceAccount can do, edit its `role` / `repositories` in the
 `kind: ServiceAccount` envelope.
 
-### 3.1 Prefer a durable `User`-subject Admin grant for `HORT_TOKEN_ALLOW_ADMIN` deployments (audit F-35)
+### 3.1 Prefer a durable `User`-subject Admin grant for `HORT_TOKEN_ALLOW_ADMIN` deployments
 
 `is_admin` is recomputed from the IdP `groups` claim and **persisted**
 onto the user row on *every* OIDC login. That is the
 intended mechanism — the IdP group is the admin source of truth, not a
-stale DB row. The accompanying
-observability: every persisted `is_admin` **flip** emits an
+stale DB row. The accompanying observability: every persisted `is_admin` **flip** emits an
 `AdminStatusChanged` audit event on the per-user stream
 (`StreamId::user(user_id)`) plus the
 `hort_is_admin_transition_total{result ∈ {granted, revoked}}` metric.
@@ -222,13 +221,13 @@ means a normal PAT held by a user whose bit was spuriously flipped
 exist (≤30 d clamp), so a single bad login can yield durable admin for
 up to the PAT's life.
 
-**Operator recommendation (audit F-35).** If you run with
+**Operator recommendation.** If you run with
 `HORT_TOKEN_ALLOW_ADMIN=true`:
 
 1. **Alert on `hort_is_admin_transition_total`.** A flip outside a
    planned access change — especially a burst of `revoked` during an
-   IdP incident, or an unexpected `granted` — is the signal F-35 is
-   about. Correlate with the per-user `AdminStatusChanged` events for
+   IdP incident, or an unexpected `granted` — is the signal to act on.
+   Correlate with the per-user `AdminStatusChanged` events for
    who/which `sub`.
 2. **Make a durable `User`-subject `Admin` grant the admin source of
    truth**, not the purely-IdP-derived persisted bit. Declare a

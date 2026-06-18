@@ -1,9 +1,8 @@
-//! Query parameter parsing + response shape for `GET /api/v1/events`
-//! (design doc §9).
+//! Query parameter parsing + response shape for `GET /api/v1/events`.
 //!
 //! Handler-specific DTOs derive `Deserialize` / `Serialize`; domain
 //! types do NOT — the wire shape is owned here, not on the domain.
-//! Matches the §8 webhook delivery shape byte-for-byte so consumers
+//! Matches the webhook delivery shape byte-for-byte so consumers
 //! parse one envelope regardless of whether the event arrived via
 //! push or pull.
 
@@ -11,16 +10,16 @@ use serde::{Deserialize, Serialize};
 
 /// Default `max` page size when the query param is absent.
 pub const DEFAULT_MAX: u32 = 100;
-/// Upper clamp on `max` — design doc §9 ("clamped to [1, 1000]").
+/// Upper clamp on `max` — clamped to [1, 1000].
 pub const MAX_MAX: u32 = 1000;
 /// Default `wait_ms` when the query param is absent (no long-poll).
 pub const DEFAULT_WAIT_MS: u32 = 0;
-/// Upper clamp on `wait_ms` — design doc §9 ("clamped to [0, 30000]").
+/// Upper clamp on `wait_ms` — clamped to [0, 30000].
 pub const MAX_WAIT_MS: u32 = 30_000;
 
 /// Query parameters for `GET /api/v1/events`.
 ///
-/// Field validation per design doc §9:
+/// Field validation:
 /// - `category` is required; parsed via [`parse_category`] (closed match).
 /// - `after` defaults to 0 (start from beginning of the global log).
 /// - `max` defaults to [`DEFAULT_MAX`]; clamped to `[1, MAX_MAX]`.
@@ -48,12 +47,12 @@ impl EventsQuery {
     }
 }
 
-/// Response envelope for `GET /api/v1/events`. Per design doc §9:
+/// Response envelope for `GET /api/v1/events`.
 /// - `events` — the page of events visible to the caller (may be smaller
 ///   than `max` after per-repo filtering).
 /// - `next_after` — last-seen `global_position` BEFORE filtering, so
 ///   consumers replaying don't double-process events that pass filtering
-///   on a re-call. This is the design-doc trade-off.
+///   on a re-call.
 /// - `has_more` — `true` when the unfiltered page size equalled `max`
 ///   (caller should re-query with the new `next_after`).
 #[derive(Debug, Clone, Serialize)]
@@ -64,8 +63,8 @@ pub struct EventsResponse {
 }
 
 /// Wire-shape of a [`hort_domain::events::PersistedEvent`]. Matches the
-/// webhook delivery payload (design doc §8) field-for-field so a
-/// consumer parses one envelope regardless of source.
+/// webhook delivery payload field-for-field so a consumer parses one
+/// envelope regardless of source.
 ///
 /// Field-level notes:
 /// - `stream_category` is the lowercase wire string (`"artifact"`,
@@ -75,7 +74,7 @@ pub struct EventsResponse {
 ///   `"subkind"` discriminator.
 /// - `payload` is `serde_json::to_value(&event.event)` — the
 ///   `DomainEvent` enum's `Serialize` impl produces the same shape the
-///   webhook adapter emits in §8.
+///   webhook adapter emits.
 #[derive(Debug, Clone, Serialize)]
 pub struct PersistedEventDto {
     pub global_position: u64,
@@ -170,8 +169,7 @@ pub fn actor_to_wire(actor: &hort_domain::events::Actor) -> serde_json::Value {
 
 /// Closed-match category parser. Wire strings mirror
 /// `StreamId::FromStr`'s table in `hort-domain::events::mod`. Adding a
-/// new `StreamCategory` variant fails to compile here on purpose —
-/// same discipline as Item 9's dto.rs uses on filter categories.
+/// new `StreamCategory` variant fails to compile here on purpose.
 pub fn parse_category(s: &str) -> Result<hort_domain::events::StreamCategory, EventsQueryError> {
     use hort_domain::events::StreamCategory;
     match s {

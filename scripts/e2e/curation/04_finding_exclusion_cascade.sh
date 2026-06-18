@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 # Scenario 4: Finding-exclusion cascade.
 #
-# Spec: ingest two artifacts that scan dirty with the same CVE → both
+# Ingest two artifacts that scan dirty with the same CVE → both
 # `Rejected`; via `hort-cli curation exclude-finding --policy <p> --cve
 # <id> --justification "<text>"` add the exclusion; assert BOTH artifacts
 # transition out of `Rejected` via `re_evaluate_after_exclusion`; assert
 # ONE `ExclusionAdded` + TWO `ArtifactReleased { authority:
 # PolicyReEvaluation }` events in the stream; assert
-# `exclusion_projections.added_by_actor_id` carries the curator's
-# user_id (Item 8 projector augmentation).
+# `exclusion_projections.added_by_actor_id` carries the curator's user_id.
 #
-# **DEVIATION FROM SPEC — DOCUMENTED**: this scenario requires the
-# `vuln-scan` E2E to have already produced two artifacts in `rejected`
-# state due to the same CVE. The existing `test-vulnerability-scan.sh`
-# stages lodash@4.17.20 + CVE-2021-23337, but only ingests ONE artifact
-# — so the "two artifacts share one CVE" fixture is not present in the
-# default v2 stack. We scan the DB for two rejected artifacts whose
-# scan_findings share at least one CVE; if not present, the scenario
-# self-skips with exit 2. The scenario is otherwise complete — when the
-# fixture is staged (e.g. via a future ingest+scan helper), the
-# assertions will fire end-to-end.
+# **DEVIATION — DOCUMENTED**: this scenario requires the `vuln-scan` E2E
+# to have already produced two artifacts in `rejected` state due to the
+# same CVE. The existing `test-vulnerability-scan.sh` stages
+# lodash@4.17.20 + CVE-2021-23337, but only ingests ONE artifact — so
+# the "two artifacts share one CVE" fixture is not present in the default
+# v2 stack. We scan the DB for two rejected artifacts whose scan_findings
+# share at least one CVE; if not present, the scenario self-skips with
+# exit 2. The scenario is otherwise complete — when the fixture is staged
+# (e.g. via a future ingest+scan helper), the assertions will fire
+# end-to-end.
 
 set -uo pipefail
 
@@ -57,7 +56,7 @@ if [ -z "$CVE_ROW" ]; then
     log "      Scenario 4 needs a fixture in which two artifacts scan dirty"
     log "      with the same CVE. The existing v2 test-vulnerability-scan.sh"
     log "      ingests one artifact only. Staging a second artifact (e.g."
-    log "      lodash@4.17.19) is out of scope for Item 16; the scenario"
+    log "      lodash@4.17.19); the scenario"
     log "      script is complete and will exercise the assertions once a"
     log "      multi-artifact CVE fixture lands."
     exit 2
@@ -128,7 +127,7 @@ if [ -n "$ACTOR_ID" ] && [ "$ACTOR_ID" != "null" ]; then
     assert_pass "exclusion_projections.added_by_actor_id populated ($ACTOR_ID)"
 else
     assert_fail "exclusion_projections.added_by_actor_id populated" \
-        "got null — Item 8 projector augmentation may not have fired"
+        "got null — projector augmentation may not have fired"
 fi
 
 # -----------------------------------------------------------------------------

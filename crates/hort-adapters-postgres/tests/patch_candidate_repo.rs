@@ -1,6 +1,6 @@
 //! `PgPatchCandidateRepository` integration tests.
 //!
-//! Exercises the §3.2 query end-to-end against a real Postgres. The
+//! Exercises the patch-candidate query end-to-end against a real Postgres. The
 //! five acceptance scenarios (basic detection, repository filter, OCI
 //! exclusion, soft-delete exclusion, severity ordering) each get their
 //! own `#[tokio::test]`.
@@ -72,7 +72,7 @@ async fn seed_repo(pool: &PgPool, format_literal: &'static str) -> Uuid {
 }
 
 /// Seed an artifact row. `created_at` lets tests order the released
-/// predecessor strictly before the quarantined sibling (the §3.2 query
+/// predecessor strictly before the quarantined sibling (the query
 /// requires `v.created_at < q.created_at`).
 #[allow(clippy::too_many_arguments)]
 async fn seed_artifact(
@@ -273,7 +273,7 @@ async fn list_candidates_repository_filter_excludes_other_repos() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 — OCI repos are excluded from the result set per §3.2
+// Test 3 — OCI repos are excluded from the result set
 // (`r.format <> 'oci'`).
 // ---------------------------------------------------------------------------
 

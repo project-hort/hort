@@ -48,10 +48,10 @@
 //!   artifact failed.
 //!
 //! **Decision: we fold `add_member` failures into `event_read_error`
-//! rather than introducing a fifth `commit_error` label.** The backlog
-//! acceptance criteria pin the four-label set; divergence would make
-//! the catalog drift from the only document that enumerates the
-//! permissible values. An `add_member` failure IS an infrastructure
+//! rather than introducing a fifth `commit_error` label.** The
+//! four-label set is pinned; divergence would make the catalog drift from
+//! the only document that enumerates the permissible values. An
+//! `add_member` failure IS an infrastructure
 //! hazard that prevents the heal; surfacing it under the same bucket
 //! as event-store read failures keeps the dashboard cardinality
 //! stable. We disambiguate in tracing: `warn!(..., stage="add_member")`
@@ -81,7 +81,7 @@ use crate::metrics::{emit_group_reconcile, values, GroupReconcileResult};
 use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
 
 /// Default window when the operator does not supply `--since`.
-/// Mirrors the backlog spec: "default = last 7 days".
+/// Mirrors the documented default: "default = last 7 days".
 const DEFAULT_SINCE_DAYS: i64 = 7;
 
 /// Page size for `read_category` calls. Bounded so a misconfigured
@@ -117,7 +117,7 @@ pub struct ReconcileReport {
 /// **Handler registry.** `handlers` is keyed by
 /// [`FormatHandler::format_key`] (e.g. `"pypi"`, `"cargo"`, `"npm"`).
 /// Matches the composition root's existing handler layout; when
-/// multi-format ingest lands in a later initiative we consume the
+/// multi-format ingest lands in future we consume the
 /// same map.
 pub struct GroupReconcileUseCase {
     event_store: Arc<EventStorePublisher>,
@@ -344,9 +344,9 @@ impl GroupReconcileUseCase {
 
         // Heal — mint a FRESH correlation_id; carry the REAL
         // PersistedEvent.event_id as causation. This is the canonical
-        // point where the causation chain is correct (Item 7's ingest-
-        // path hook has to use a placeholder because AppendResult
-        // doesn't carry the persisted event_id).
+        // point where the causation chain is correct (the ingest-path
+        // hook has to use a placeholder because AppendResult doesn't
+        // carry the persisted event_id).
         let correlation_id = Uuid::new_v4();
         let actor = system_actor();
         let add_result = self

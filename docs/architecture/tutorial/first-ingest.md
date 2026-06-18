@@ -197,10 +197,9 @@ After `COMMIT`:
 
 If the repository had a non-zero `quarantineDuration`, the
 handler would pass `quarantine_until = Some(...)` and
-`IngestUseCase` would (in its extended form per the design doc) also
-append `ArtifactQuarantined` using an internal-actor constructor
-(the `system_actor()` helper in `hort-domain`; see
-[domain-model.md](../explanation/domain-model.md) for why handlers
+`IngestUseCase` would also append `ArtifactQuarantined` using an
+internal-actor constructor (the `system_actor()` helper in `hort-domain`;
+see [domain-model.md](../explanation/domain-model.md) for why handlers
 cannot forge internal actors directly). That event flips the
 projection that maintains `quarantine_status` on the artifact row to
 `Quarantined`, and subsequent `download()` calls refuse to serve the

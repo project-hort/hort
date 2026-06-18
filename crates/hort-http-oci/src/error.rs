@@ -28,8 +28,8 @@
 //! `UNAVAILABLE` and `INTERNAL` are hort extensions — the
 //! OCI Distribution v1.1 spec does not define codes for either
 //! quarantine holds or unrecoverable server errors. `TOOMANYREQUESTS`
-//! was rejected for quarantine because its §2.8 mapping is HTTP 429,
-//! and Artifactory clients apply rate-limit-adaptive retry heuristics
+//! was rejected for quarantine because its HTTP 429 mapping causes
+//! Artifactory clients to apply rate-limit-adaptive retry heuristics
 //! on that code — which would misread a quarantine as rate pressure.
 //! See `docs/architecture/explanation/scanning-pipeline.md` for the
 //! quarantine-status HTTP mapping rationale (ADR 0007).
@@ -46,9 +46,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
-/// OCI error codes, per design §2.8. Only the four needed in this PR
-/// are wired; additional variants are added as their emitting code
-/// lands (Items 5+).
+/// OCI error codes per the OCI Distribution Spec. Additional variants are
+/// added as their emitting code lands.
 ///
 /// Each variant's carried data is what the spec's `detail` field
 /// expects for that code:
@@ -84,13 +83,11 @@ pub enum OciError {
     /// (e.g. non-sha256 digest algorithm).
     Unsupported { message: String },
     /// 404 — a blob with the given digest is not known in this
-    /// repository. Item 6: `GET`/`HEAD /v2/<name>/blobs/<digest>` miss
-    /// or cross-repo foreign-blob reject. `digest` is echoed in
-    /// `detail.digest` so the client sees which blob the server looked
-    /// for (OCI clients sometimes retry with a corrected digest on a
-    /// race).
+    /// repository. `digest` is echoed in `detail.digest` so the client
+    /// sees which blob the server looked for (OCI clients sometimes retry
+    /// with a corrected digest on a race).
     BlobUnknown { digest: String },
-    /// 404 — a manifest at the given reference is not known. Item 7:
+    /// 404 — a manifest at the given reference is not known.
     /// `GET`/`HEAD /v2/<name>/manifests/<ref>` miss (tag unknown, or
     /// digest-by-ref with no row at path). `reference` echoes the
     /// original client input (tag name or `sha256:<hex>`).
@@ -103,22 +100,19 @@ pub enum OciError {
     /// variants separate lets the handler emit the right code without
     /// duplicating the message-vs-detail wire shape.
     DigestInvalid { message: String },
-    /// 406 — the client's `Accept` header does not include the
-    /// manifest's stored media-type and is not `*/*`. Item 7 content
-    /// negotiation. Uses the spec's `MANIFEST_UNKNOWN` code with a 406
-    /// status — the backlog pins this shape over 404 because some
-    /// clients (notably tooling that hard-codes a single Accept) would
-    /// loop on 404 but back off on 406. `detail.media_type` echoes the
-    /// server's stored type so the client can retry with a compatible
-    /// `Accept`.
+    /// 406 — the client's `Accept` header does not include the manifest's
+    /// stored media-type and is not `*/*`. Uses the spec's
+    /// `MANIFEST_UNKNOWN` code with a 406 status — this shape is
+    /// preferred over 404 because some clients would loop on 404 but
+    /// back off on 406. `detail.media_type` echoes the server's stored
+    /// type so the client can retry with a compatible `Accept`.
     ManifestNotAcceptable { media_type: String },
     /// 503 — the artifact or manifest is in a time-bounded quarantine
     /// hold. Emits HTTP 503 + a `Retry-After` header whose value is
     /// `retry_after_seconds`. Code is `UNAVAILABLE` — a spec-extension
     /// with the closest upstream-compatible semantics; chosen over
-    /// `TOOMANYREQUESTS` (which §2.8 maps to HTTP 429) to avoid
-    /// overloading rate-limit-adaptive retry heuristics in strict
-    /// clients like Artifactory. Documented in §2.8.
+    /// `TOOMANYREQUESTS` (HTTP 429) to avoid overloading rate-limit-
+    /// adaptive retry heuristics in strict clients like Artifactory.
     Quarantined { retry_after_seconds: i64 },
     /// 500 — unrecoverable server error that doesn't map to any OCI
     /// standard code. Code is `INTERNAL`, an hort
@@ -131,8 +125,8 @@ pub enum OciError {
     /// entirely, TTL-expired, or bound to a different repository —
     /// tenant-isolation mismatches MUST surface as `BLOB_UPLOAD_UNKNOWN`
     /// rather than `DENIED` to avoid leaking "a session for that UUID
-    /// exists elsewhere" as an enumeration oracle). §2.8 + Item 2
-    /// review finding tenant-isolation.
+    /// exists elsewhere" as an enumeration oracle). Tenant-isolation
+    /// mismatches must surface as `BLOB_UPLOAD_UNKNOWN`, not `DENIED`.
     BlobUploadUnknown { session_id: String },
     /// 400 — three-phase blob upload PATCH / PUT was rejected for a
     /// reason other than a name / digest / auth problem. Covers
@@ -142,10 +136,10 @@ pub enum OciError {
     /// `Content-Range` start that disagrees with the session's current
     /// `bytes_received`. The 416 form sets `Range: 0-<bytes_received-1>`
     /// via a dedicated response-helper path — the envelope field
-    /// stays `BLOB_UPLOAD_INVALID` per §2.8 regardless of status.
+    /// stays `BLOB_UPLOAD_INVALID` regardless of HTTP status.
     BlobUploadInvalid { message: String },
     /// 413 — incoming chunk would push the session past the configured
-    /// max-blob-bytes cap. §2.8 pins 413 (not 400) so clients can
+    /// max-blob-bytes cap. The spec pins 413 (not 400) so clients can
     /// distinguish size-cap rejection from generic upload-invalid
     /// responses. `message` carries operator-supplied copy.
     SizeInvalid { message: String },
@@ -153,12 +147,12 @@ pub enum OciError {
     /// `bytes_received`. The response MUST carry a `Range:
     /// 0-<current - 1>` header (or `bytes=0-0` when `current == 0`) so
     /// the client can resume. Envelope code stays `BLOB_UPLOAD_INVALID`
-    /// per §2.8 — the status code, not the envelope, distinguishes
-    /// range-mismatch from the generic 400 form.
+    /// The status code, not the envelope, distinguishes range-mismatch
+    /// from the generic 400 form.
     RangeNotSatisfiable { current: u64 },
     /// 400 — manifest is malformed (invalid JSON, missing required
     /// fields, media type not in the allowlist, declared digest /
-    /// content mismatch on a digest-reference PUT). §2.8 pins
+    /// content mismatch on a digest-reference PUT). The spec pins
     /// `MANIFEST_INVALID` here — explicitly NOT `UNSUPPORTED` (which is
     /// reserved for well-formed-but-unsupported operations like
     /// `sha512:` digests). `detail` is variant-specific (operators
@@ -167,7 +161,7 @@ pub enum OciError {
     ManifestInvalid { detail: Option<serde_json::Value> },
     /// 400 — the manifest references blobs that are not present in the
     /// target repository (or exist but live in a foreign repository).
-    /// §2.14.3 intentionally commits the manifest artifact BEFORE this
+    /// The manifest artifact is intentionally committed BEFORE this
     /// validation fires so the client's retry-after-mounting path is
     /// idempotent. The response body carries a `detail.blobs` array
     /// listing the missing digests so the client knows which ones to
@@ -196,7 +190,7 @@ pub enum OciError {
     /// (`HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL`).
     /// Carries `retry_after_seconds` for the `Retry-After` header
     /// (advisory; clients use it to back off). Spec code is
-    /// `TOOMANYREQUESTS` per §2.8.
+    /// `TOOMANYREQUESTS`.
     TooManyRequests { retry_after_seconds: i64 },
     /// 400 — image name violates the OCI Distribution Spec name
     /// grammar `[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*`,
@@ -236,7 +230,7 @@ impl OciError {
             Self::BlobUploadUnknown { .. } => "BLOB_UPLOAD_UNKNOWN",
             Self::BlobUploadInvalid { .. } => "BLOB_UPLOAD_INVALID",
             Self::SizeInvalid { .. } => "SIZE_INVALID",
-            // §2.8 maps 416 onto the `BLOB_UPLOAD_INVALID` envelope
+            // The spec maps 416 onto the `BLOB_UPLOAD_INVALID` envelope
             // code — the HTTP status distinguishes the range-mismatch
             // sub-case from the generic 400 form.
             Self::RangeNotSatisfiable { .. } => "BLOB_UPLOAD_INVALID",
@@ -251,7 +245,7 @@ impl OciError {
         }
     }
 
-    /// HTTP status per the §2.8 mapping table.
+    /// HTTP status per the OCI Distribution Spec mapping table.
     fn status(&self) -> StatusCode {
         match self {
             Self::NameUnknown { .. } => StatusCode::NOT_FOUND,
@@ -408,8 +402,8 @@ impl IntoResponse for OciError {
             } => Some(*retry_after_seconds),
             _ => None,
         };
-        // `Range` header is set on 416 responses per §2.8 — the client
-        // uses it to resume from the session's real `bytes_received`.
+        // `Range` header is set on 416 responses — the client uses it
+        // to resume from the session's real `bytes_received`.
         // Computed before `code()`/`message()`/`detail()` for the same
         // borrow reason as `retry_after`.
         let range_current: Option<u64> = match &self {
@@ -432,14 +426,14 @@ impl IntoResponse for OciError {
         if let Some(secs) = retry_after {
             // `Retry-After` per RFC 9110 §10.2.3 accepts either a
             // delta-seconds integer or an HTTP-date. We use the
-            // integer form — simpler and the §2.8 table specifies it.
+            // integer form — simpler and the spec table specifies it.
             // `HeaderValue::from` on i64 is infallible for any numeric
             // value; the `max(1)` clamp at the caller site guarantees
             // a positive delta.
             response.headers_mut().insert("Retry-After", secs.into());
         }
         if let Some(current) = range_current {
-            // §2.8: 416 response carries `Range: 0-<current - 1>` when
+            // 416 response carries `Range: 0-<current - 1>` when
             // `current > 0`, `0-0` when the session is still empty
             // (client PATCHed with start != 0 before any bytes landed).
             // The `Range` header values are bare-bytes ranges per the
@@ -738,7 +732,7 @@ mod tests {
         assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(range, "0-99");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // §2.8 code is BLOB_UPLOAD_INVALID on 416 (the status
+        // Spec code is BLOB_UPLOAD_INVALID on 416 (the status
         // distinguishes range-mismatch from the generic 400 form).
         assert_eq!(parsed["errors"][0]["code"], "BLOB_UPLOAD_INVALID");
         assert_eq!(parsed["errors"][0]["detail"]["bytes_received"], 100);

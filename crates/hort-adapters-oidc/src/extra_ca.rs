@@ -3,8 +3,7 @@
 //! Applies a process-wide [`ExtraTrustAnchors`] bundle to a
 //! `reqwest::ClientBuilder`. The return type is a crate-local
 //! `ExtraCaApplyError` — not `DomainResult` (that's the upstream-http
-//! shape) and not `object_store::Error` (that's the storage shape). See
-//! design §3 for the three-shape decision.
+//! shape) and not `object_store::Error` (that's the storage shape).
 
 use reqwest::ClientBuilder;
 
@@ -52,8 +51,7 @@ impl From<reqwest::Error> for ExtraCaApplyError {
 /// parseable as PEM / DER but is not a valid X.509 trust anchor. The failure
 /// surfaces as [`ExtraCaApplyError::CertInvalid`]. Unlike the upstream-http
 /// helper (which folds into `DomainResult`), the OIDC helper has no equivalent
-/// classification infrastructure — a crate-local error is the cleanest fit
-/// per design §3.
+/// classification infrastructure — a crate-local error is the cleanest fit.
 pub(crate) fn apply_to_reqwest_builder(
     builder: ClientBuilder,
     anchors: Option<&ExtraTrustAnchors>,

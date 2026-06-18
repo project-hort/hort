@@ -66,7 +66,7 @@ use crate::middleware::oci_auth::v2_auth_challenge_value;
 /// `serde_urlencoded` materialises repeated `scope=` params into a
 /// `Vec<String>` when the field is a `Vec`. An entirely-omitted
 /// `scope` is acceptable — the response is a token with an empty
-/// `access[]` per design doc §6 ("ping-style" anonymous-equivalent).
+/// `access[]` ("ping-style" anonymous-equivalent).
 #[derive(Debug, Deserialize)]
 pub struct V2AuthQuery {
     /// Registry hostname per Distribution-Spec convention. Echoed in
@@ -165,9 +165,9 @@ pub async fn handle_v2_auth(
             // envelope (clients parse it with the same code path as
             // the established `invalid scope` 400), constant message
             // `"service mismatch"` — the body NEVER echoes the
-            // requested / expected host (spec §3.3 — no reflected
-            // value; the structured audit log in `hort-app` carries
-            // both for the operator). The
+            // requested / expected host — no reflected value; the
+            // structured audit log in `hort-app` carries both for the
+            // operator. The
             // `Docker-Distribution-API-Version` header is present,
             // consistent with every other `/v2/*` error.
             service_mismatch_response()

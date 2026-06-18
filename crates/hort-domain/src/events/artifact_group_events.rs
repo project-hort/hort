@@ -16,12 +16,12 @@
 //!   adapter canonicalises coords on write (drops per-file `path` and
 //!   `metadata`), but the event payload preserves whatever the use case
 //!   chose to emit — the adapter is responsible for not rewriting event
-//!   payloads (design §2.6a, §2.9).
+//!   payloads.
 //! - `ArtifactGroupMemberRemoved::reason` is `Option<String>`. Admin
 //!   corrections carry a reason; GC-driven removals do not. An empty
 //!   string in `Some(_)` is a caller bug — use `None` instead — and is
 //!   rejected by `validate()`.
-//! - `ArtifactGroupPrimaryRoleAssigned` exists for §2.10 case 2 only:
+//! - `ArtifactGroupPrimaryRoleAssigned` exists only for the case where
 //!   when the group was created with `primary_role = ""` (first member
 //!   was not primary) and a later member arrives with `is_primary =
 //!   true`. It is NOT emitted on the common happy path where the first
@@ -67,14 +67,14 @@ const MAX_REASON_LEN: usize = 512;
 /// The event carries the full canonical coords so that a replayer can
 /// rebuild the `artifact_groups` projection row from the event stream
 /// alone. `primary_role` may be the empty string when the first member
-/// was not primary — see §2.10 case 2 and [`ArtifactGroupPrimaryRoleAssigned`].
+/// was not primary — see [`ArtifactGroupPrimaryRoleAssigned`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactGroupInitiated {
     pub group_id: Uuid,
     pub repository_id: Uuid,
     pub coords: ArtifactCoords,
     /// Role of the first primary member, or `""` when the first member
-    /// was not primary (§2.10 case 2). The sentinel is explicitly valid.
+    /// was not primary. The sentinel is explicitly valid.
     pub primary_role: String,
 }
 
@@ -138,10 +138,10 @@ impl ArtifactGroupMemberRemoved {
 // ArtifactGroupPrimaryRoleAssigned
 // ---------------------------------------------------------------------------
 
-/// Emitted when a group created with `primary_role = ""` (§2.10 case 2)
-/// later receives a member with `is_primary = true`. The adapter gates
-/// the assignment with a race-safe `UPDATE ... WHERE primary_role = ''`
-/// (§2.10 + Item 6); the event lands only when the update succeeded.
+/// Emitted when a group created with `primary_role = ""` later receives a
+/// member with `is_primary = true`. The adapter gates the assignment with a
+/// race-safe `UPDATE ... WHERE primary_role = ''`; the event lands only
+/// when the update succeeded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactGroupPrimaryRoleAssigned {
     pub group_id: Uuid,

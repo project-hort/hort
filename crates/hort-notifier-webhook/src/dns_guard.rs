@@ -8,8 +8,7 @@
 //! re-validation of the address actually dialed. An attacker who
 //! controls a domain can resolve it to a public IP at create-time and
 //! flip DNS to `169.254.169.254` / `127.0.0.1` / RFC1918 before the
-//! first delivery — a classic DNS-rebinding TOCTOU (audit F-4, High
-//! P0).
+//! first delivery — a classic DNS-rebinding TOCTOU.
 //!
 //! [`GuardedDnsResolver`] closes that race by re-running
 //! [`hort_net_egress::is_routable`] on **every address the resolver
@@ -35,7 +34,7 @@
 //! those stay operator-vetted by deployment configuration. Re-globalizing
 //! this guard to operator-vetted clients is an anti-pattern; do not do it.
 //!
-//! # F-21 — `HORT_WEBHOOK_ALLOWLIST_HOSTS`
+//! # `HORT_WEBHOOK_ALLOWLIST_HOSTS`
 //!
 //! Legitimate internal webhook receivers (an in-DMZ forwarder, an
 //! in-cluster receiver) resolve to non-routable addresses and would be
@@ -63,7 +62,7 @@ use ipnet::IpNet;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 /// Environment variable carrying the comma-separated host / CIDR
-/// allowlist (F-21). Absent / empty ⇒ no allowlist (strict guard).
+/// allowlist. Absent / empty ⇒ no allowlist (strict guard).
 pub(crate) const ALLOWLIST_ENV: &str = "HORT_WEBHOOK_ALLOWLIST_HOSTS";
 
 /// Parsed `HORT_WEBHOOK_ALLOWLIST_HOSTS` — a bounded set of exact host
@@ -128,8 +127,8 @@ impl HostAllowlist {
     ///
     /// `pub(crate)` so the create/update [`crate::WebhookTargetGuard`]
     /// path (`check_url_routable` in `lib.rs`) consults the SAME matching
-    /// logic the delivery-path [`GuardedDnsResolver::permit`] uses — F-21
-    /// reuses this, it does not re-implement the match.
+    /// logic the delivery-path [`GuardedDnsResolver::permit`] uses — this
+    /// reuses that logic, it does not re-implement the match.
     pub(crate) fn host_allowed(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
         self.hosts.contains(&host)
@@ -138,7 +137,7 @@ impl HostAllowlist {
     /// `true` iff `ip` falls inside an allowlisted CIDR (or equals an
     /// allowlisted bare IP).
     ///
-    /// `pub(crate)` for the same F-21 reuse reason as
+    /// `pub(crate)` for the same reuse reason as
     /// [`HostAllowlist::host_allowed`].
     pub(crate) fn ip_allowed(&self, ip: IpAddr) -> bool {
         self.cidrs.iter().any(|net| net.contains(&ip))
@@ -157,8 +156,8 @@ impl HostAllowlist {
 ///    allowlisted OR the address is inside an allowlisted CIDR;
 /// 3. returns only the permitted addresses. If every address is
 ///    filtered out, it yields an **empty** address set, which reqwest
-///    surfaces as a connect error — the delivery fails closed (audit
-///    F-4: the rebind target is never dialed).
+///    surfaces as a connect error — the delivery fails closed (the
+///    rebind target is never dialed).
 #[derive(Debug, Clone)]
 pub(crate) struct GuardedDnsResolver {
     allowlist: HostAllowlist,
@@ -277,7 +276,7 @@ mod tests {
     #[test]
     fn permit_blocks_nonroutable_without_allowlist() {
         let g = GuardedDnsResolver::new(HostAllowlist::default());
-        // The DNS-rebinding-to-IMDS case (audit F-4).
+        // The DNS-rebinding-to-IMDS case.
         assert!(!g.permit("rebind.attacker.example", sock("169.254.169.254")));
         // RFC1918 + loopback also blocked.
         assert!(!g.permit("rebind.attacker.example", sock("127.0.0.1")));
@@ -287,14 +286,14 @@ mod tests {
     #[test]
     fn permit_blocks_ipv4_mapped_ipv6_imds() {
         // is_routable's IPv6 branch covers `::ffff:` mapped IMDS; pin
-        // the guard wiring (audit H-3 regression at the connect layer).
+        // the guard wiring (IPv4-mapped IPv6 regression at the connect layer).
         let g = GuardedDnsResolver::new(HostAllowlist::default());
         assert!(!g.permit("rebind.example", sock("::ffff:169.254.169.254")));
     }
 
     #[test]
     fn permit_allows_nonroutable_when_host_allowlisted() {
-        // F-21: a legitimate internal receiver, allowlisted by host.
+        // A legitimate internal receiver, allowlisted by host.
         let g = GuardedDnsResolver::new(HostAllowlist::parse(Some("internal.webhook.svc")));
         assert!(g.permit("internal.webhook.svc", sock("10.0.0.5")));
         // …but a DIFFERENT host resolving into RFC1918 is still blocked
@@ -304,7 +303,7 @@ mod tests {
 
     #[test]
     fn permit_allows_nonroutable_when_cidr_allowlisted() {
-        // F-21: allowlist a CIDR; any host resolving inside it bypasses.
+        // Allowlist a CIDR; any host resolving inside it bypasses.
         let g = GuardedDnsResolver::new(HostAllowlist::parse(Some("10.0.0.0/8")));
         assert!(g.permit("anything.internal", sock("10.9.9.9")));
         // Outside the allowlisted CIDR and non-routable → still blocked.
@@ -315,7 +314,7 @@ mod tests {
     async fn resolve_filters_nonroutable_localhost_to_empty() {
         // `localhost` resolves to 127.0.0.1 / ::1 — both non-routable
         // and not allowlisted. The guarded resolver must yield an EMPTY
-        // address set so reqwest fails the connect closed (F-4: the
+        // address set so reqwest fails the connect closed (the
         // rebind/loopback target is never dialed).
         let g = GuardedDnsResolver::new(HostAllowlist::default());
         let name = Name::from_str("localhost").expect("valid name");
@@ -328,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_keeps_localhost_when_allowlisted() {
-        // F-21: same `localhost`, now allowlisted by host name → the
+        // Same `localhost`, now allowlisted by host name → the
         // loopback address is RETAINED (legitimate internal receiver).
         let g = GuardedDnsResolver::new(HostAllowlist::parse(Some("localhost")));
         let name = Name::from_str("localhost").expect("valid name");

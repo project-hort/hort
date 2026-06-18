@@ -1,5 +1,5 @@
 //! `hort-http-events` — inbound HTTP adapter for `GET /api/v1/events`
-//! pull-resync (design doc §9).
+//! pull-resync.
 //!
 //! # Route
 //!

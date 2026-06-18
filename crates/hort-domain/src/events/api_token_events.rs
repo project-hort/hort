@@ -20,7 +20,7 @@
 
 //! # Actor lives on the envelope, not the payload
 //!
-//! The B7 backlog text shows an `actor: Actor` field on each event,
+//! An earlier design showed an `actor: Actor` field on each event,
 //! but the project's existing event vocabulary keeps `Actor` on the
 //! [`PersistedEvent`](super::PersistedEvent) envelope (`actor_type` /
 //! `actor_id` columns written by `actor_to_columns`). Putting it
@@ -74,33 +74,29 @@ pub enum RevokeReason {
 
 /// Reason category for [`ApiTokenIssuanceDenied`]. Closed enum;
 /// matches the use case's typed [`ApiTokenError`] variants 1:1 on the
-/// denial side (per design doc §4 + B7 acceptance bullet 12).
+/// denial side.
 ///
 /// [`ApiTokenError`]: ../../../hort_app/use_cases/api_token_use_case/enum.ApiTokenError.html
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DenialReason {
     /// Caller's `declared_permissions` exceeded their current
-    /// authority on at least one repo (§4 step 2).
+    /// authority on at least one repo.
     CapExceedsAuthority,
     /// Service-account user (`is_service_account = true`) attempted
-    /// to self-mint via `POST /users/me/tokens` (§4 step 3).
+    /// to self-mint via `POST /users/me/tokens`.
     ServiceAccountSelfMint,
-    /// `Permission::Admin` requested but `HORT_TOKEN_ALLOW_ADMIN=false`
-    /// (§4 step 4 first half).
+    /// `Permission::Admin` requested but `HORT_TOKEN_ALLOW_ADMIN=false`.
     AdminTokenDisallowed,
     /// Service-account `expires_in_days = null` requested but
-    /// `HORT_TOKEN_ALLOW_UNBOUNDED_SVC=false` (§4 step 5).
+    /// `HORT_TOKEN_ALLOW_UNBOUNDED_SVC=false`.
     UnboundedSvcTokenDisallowed,
     /// `repository_ids = Some(vec![])` — locking to no repos is
-    /// useless; callers must omit the field for "inherit user grants"
-    /// (§4 step 6).
+    /// useless; callers must omit the field for "inherit user grants".
     InvalidRepositorySet,
     /// Admin-token `expires_in_days` outside `[1, 30]` — admin tokens
-    /// are clamped tighter than the global 365-day max (§4 step 4
-    /// second half / NIS2 Art 21(i)).
+    /// are clamped tighter than the global 365-day max (NIS2 Art 21(i)).
     AdminTokenExceedsThirtyDays,
-    /// Admin-mint target user is not `is_service_account = true` (§4
-    /// admin-mint subsection).
+    /// Admin-mint target user is not `is_service_account = true`.
     NotServiceAccount,
 }
 
@@ -179,8 +175,7 @@ pub struct ApiTokenIssued {
     /// from the `jti` claim. `None` when the JWT carried no `jti`
     /// claim, OR for every non-federated issuance path. Audit
     /// consumers can correlate this back to the issuing platform's
-    /// JWT log; hort-server does NOT use it for replay detection (§4
-    /// "Replay / `jti` reuse").
+    /// JWT log; hort-server does NOT use it for replay detection.
     ///
     /// Backward-compatibility contract: identical to
     /// [`source_issuer`](Self::source_issuer) — `#[serde(default)]`

@@ -7,7 +7,7 @@
 //! The canonical metric catalog lives at `docs/metrics-catalog.md`. Every
 //! string in this module corresponds to a row in that catalog.
 //!
-//! Layering (design doc §1): each adapter owns its own result enum locally.
+//! Layering: each adapter owns its own result enum locally.
 //! This module MUST NOT be shared with `hort-app` or `hort-adapters-storage`,
 //! and MUST NOT be added to `hort-domain`.
 

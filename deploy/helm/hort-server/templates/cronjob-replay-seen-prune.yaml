@@ -12,23 +12,23 @@ migration 011).
 
 The handler runs one
 `DELETE FROM jwt_replay_seen WHERE expires_at < now()` tick (the
-periodic delete-expired cleanup the F-1 spec §4 selected over
-delete-on-write / DB-side TTL) and reports the deleted-row count in
-the job's `result_summary`.
+periodic delete-expired cleanup selected over delete-on-write /
+DB-side TTL) and reports the deleted-row count in the job's
+`result_summary`.
 
 Architectural note: this CronJob is a *trigger* only. The actual
 DELETE runs in the worker pod (the `PgReplayGuardRepository::prune_expired`
 DML). The CronJob pod only calls the hort-server admin-task HTTP
 endpoint with a service-account PAT.
 
-Default schedule: **hourly** (spec §4 — "interval ≈ the federation
-max (hourly)"; the table only grows by one row per distinct federated
-exchange per hour, so an hourly prune keeps it bounded).
+Default schedule: **hourly** — the table only grows by one row per
+distinct federated exchange per hour, so an hourly prune keeps it
+bounded.
 
-Cleanup degrades SAFE (spec §4 / the F-22/F-1 crux): if this CronJob
-is disabled or the prune fails, the table only grows — the seen-set
-never *forgets* a recorded `jti`/composite within its TTL window, so
-replay protection NEVER degrades. The only cost is storage. Therefore
+Cleanup degrades SAFE: if this CronJob is disabled or the prune
+fails, the table only grows — the seen-set never *forgets* a recorded
+`jti`/composite within its TTL window, so replay protection NEVER
+degrades. The only cost is storage. Therefore
 a failed tick is retried on the next schedule (the handler returns
 `Failed { retry: true }`, logged at `warn!`, never `error!` and never
 a hard worker failure).

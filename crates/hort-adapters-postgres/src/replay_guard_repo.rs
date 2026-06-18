@@ -12,7 +12,7 @@
 //!   within its TTL window — the use case denies, no token minted),
 //! - any sqlx error ⇒ [`ReplayGuardError::Unavailable`] (logged
 //!   `error!` here at the adapter; the use case maps it to a
-//!   fail-CLOSED 503 deny — anti-F-22).
+//!   fail-CLOSED 503 deny).
 //!
 //! The database arbitrates concurrent replays via the primary key; no
 //! application-level lock and no read-then-write TOCTOU window.
@@ -111,7 +111,7 @@ impl ReplayGuardPort for PgReplayGuardRepository {
             // conflicts and gets zero rows (Replayed). The INSERT does
             // NOT gate on `expires_at` — an unexpired duplicate must
             // still conflict; expired-row reclamation is the prune's
-            // job, never relied upon for correctness (spec §4).
+            // job, never relied upon for correctness.
             let returned: Option<(String,)> = sqlx::query_as(
                 r#"INSERT INTO jwt_replay_seen
                        (issuer_name, key_kind, jti, sub, iss, iat, exp,
@@ -134,8 +134,8 @@ impl ReplayGuardPort for PgReplayGuardRepository {
             .map_err(|e| {
                 // Infrastructure cause logged here at the adapter
                 // (error!). The app layer logs the *deny* at info!;
-                // one each, no double-emit (spec §8). No jti / token
-                // material in the log — only the issuer + key_kind.
+                // one each, no double-emit. No jti / token material in
+                // the log — only the issuer + key_kind.
                 tracing::error!(
                     error = %e,
                     issuer_name = %issuer_name,

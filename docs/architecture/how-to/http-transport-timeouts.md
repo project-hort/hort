@@ -98,10 +98,10 @@ edge cache.
 image (so layers are fresh and small), 600 s is plenty and reduces
 the worker-pinning surface.
 
-**Helm key:** wire this via `oci.uploadTimeoutSeconds` (Backlog 078
-Item 10 grouped it with the other OCI surfaces; the pre-078
-`http.ociUploadTimeoutSeconds` key is retired — HARD rename, no alias).
-The env var name above is unchanged.
+**Helm key:** wire this via `oci.uploadTimeoutSeconds` (grouped with the
+other OCI surfaces; the prior `http.ociUploadTimeoutSeconds` key is
+retired — HARD rename, no alias — ADR 0029). The env var name above is
+unchanged.
 
 ### `HORT_SHUTDOWN_GRACE_SECS`
 

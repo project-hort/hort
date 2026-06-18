@@ -13,9 +13,9 @@
 //!
 //! Behaviour when `sbom: None`: the adapter logs `info!` and returns
 //! `Ok(vec![])`. osv-scanner needs an SBOM input — there is no
-//! payload-based fallback. The orchestrator (Item 11) chains scanners
-//! sequentially; an empty result here is the documented "skip"
-//! signal, not an error.
+//! payload-based fallback. The orchestrator chains scanners
+//! sequentially; an empty result here is the documented "skip" signal,
+//! not an error.
 //!
 //! Module layout:
 //! - [`severity`] — score / label → `SeverityThreshold` (pure)
@@ -144,9 +144,8 @@ pub fn parse_findings_from_json(stdout: &[u8]) -> DomainResult<Vec<Finding>> {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Static configuration for [`OsvScannerAdapter`]. Mirrors the envvar
-/// surface in §6 of the design doc — the composition root populates
-/// these from `HORT_SCANNER_OSV_*` envvars.
+/// Static configuration for [`OsvScannerAdapter`]. The composition root
+/// populates these from `HORT_SCANNER_OSV_*` envvars.
 #[derive(Debug, Clone)]
 pub struct OsvScannerConfig {
     /// Path to the `osv-scanner` binary. Default: `osv-scanner`
@@ -191,7 +190,7 @@ impl Default for OsvScannerConfig {
         Self {
             osv_scanner_bin: PathBuf::from("osv-scanner"),
             timeout: Duration::from_secs(300),
-            // F-40 — 256 MiB report-drain cap. See field doc.
+            // 256 MiB report-drain cap. See field doc.
             max_report_size: 256 * 1024 * 1024,
             subprocess_ca_bundle: None,
         }
@@ -259,7 +258,7 @@ impl OsvScannerAdapter {
     }
 
     /// Run the osv-scanner CLI against `sbom_path`, return the parsed
-    /// report. Errors mirror the design doc's error-mapping table.
+    /// report.
     ///
     /// **Exit-code policy.** osv-scanner uses non-zero exits to signal
     /// "found vulnerabilities" (exit 1) as well as actual errors (exit
@@ -267,7 +266,7 @@ impl OsvScannerAdapter {
     /// stdout — that is the find-something path. Empty stdout on a
     /// non-zero exit is treated as a real error.
     ///
-    /// **Timeout enforcement (F5).** osv-scanner exposes no `--timeout`
+    /// **Timeout enforcement.** osv-scanner exposes no `--timeout`
     /// CLI flag, so we wrap the child in `tokio::time::timeout`. The
     /// shape: spawn the child, take owned `stdout`/`stderr` pipes,
     /// race a single future that drains both pipes and awaits
@@ -346,8 +345,8 @@ impl OsvScannerAdapter {
             };
 
         if report_tripped {
-            // F-40 — the report drain hit the cap. Kill the child (it is
-            // blocked writing into a full pipe) and fail the scan CLOSED.
+            // The report drain hit the cap. Kill the child (it is blocked
+            // writing into a full pipe) and fail the scan CLOSED.
             // `info!` (audit, not error): scanner kind + byte cap, never
             // the artifact id (high-cardinality / tracing-only).
             let _ = child.kill().await;
@@ -562,14 +561,14 @@ mod tests {
         let c = OsvScannerConfig::default();
         assert_eq!(c.osv_scanner_bin, PathBuf::from("osv-scanner"));
         assert_eq!(c.timeout, Duration::from_secs(300));
-        // F-40 — default report-drain cap is 256 MiB (shared knob with
-        // the Trivy adapter; see the field doc).
+        // Default report-drain cap is 256 MiB (shared knob with the
+        // Trivy adapter; see the field doc).
         assert_eq!(c.max_report_size, 256 * 1024 * 1024);
     }
 
-    // -- F-40 bounded report drain --------------------------------------
+    // -- bounded report drain -------------------------------------------
 
-    /// F-40 — the bounded drain stops at the cap and reports the trip.
+    /// The bounded drain stops at the cap and reports the trip.
     /// An over-cap payload is detected and the buffer is bounded to
     /// `cap + 1` bytes (no unbounded allocation).
     #[tokio::test]
@@ -585,7 +584,7 @@ mod tests {
         );
     }
 
-    /// F-40 — a payload of EXACTLY the cap does NOT false-positive.
+    /// A payload of EXACTLY the cap does NOT false-positive.
     #[tokio::test]
     async fn drain_capped_exactly_cap_bytes_does_not_trip() {
         let cap: u64 = 32;
@@ -598,7 +597,7 @@ mod tests {
         assert_eq!(buf.len() as u64, cap);
     }
 
-    /// F-40 — an under-cap payload drains fully and does not trip.
+    /// An under-cap payload drains fully and does not trip.
     #[tokio::test]
     async fn drain_capped_under_cap_drains_fully() {
         let cap: u64 = 1024;
@@ -608,9 +607,9 @@ mod tests {
         assert_eq!(buf, b"small report");
     }
 
-    /// F-40 — when the child's stdout exceeds `max_report_size`,
-    /// `run_scan` kills the child and returns the distinguishable
-    /// "report exceeded cap" `Invariant` error (→ `ScanIndeterminate`).
+    /// When the child's stdout exceeds `max_report_size`, `run_scan`
+    /// kills the child and returns the distinguishable "report exceeded
+    /// cap" `Invariant` error (→ `ScanIndeterminate`).
     #[tokio::test]
     async fn run_scan_over_cap_stdout_kills_child_and_returns_report_too_large() {
         if !std::path::Path::new("/bin/sh").exists() {

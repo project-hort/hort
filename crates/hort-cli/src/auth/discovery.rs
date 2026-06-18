@@ -9,8 +9,7 @@
 //!
 //! The discovery call is **anonymous** (no `Authorization: Bearer` header).
 //! `AkClient` is bearer-bound and intentionally not used here. A fresh
-//! `reqwest::Client::builder()` is built per call. See design doc §3
-//! "HTTP-client decision (locked)".
+//! `reqwest::Client::builder()` is built per call.
 
 use anyhow::Result;
 use serde::Deserialize;

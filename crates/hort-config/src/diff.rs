@@ -6,9 +6,9 @@
 //! executes the plan; this module only computes it.
 //!
 //! "Changed" is digest-based: `spec_digest` hashes the canonicalised
-//! spec (sorted-key JSON, then SHA-256). Item 8 writes the digest
-//! alongside each managed row, so re-applying the same YAML on the
-//! next boot produces an empty plan instead of a redundant UPDATE.
+//! spec (sorted-key JSON, then SHA-256). The digest is written alongside
+//! each managed row, so re-applying the same YAML on the next boot
+//! produces an empty plan instead of a redundant UPDATE.
 
 use std::collections::{HashMap, HashSet};
 
@@ -189,7 +189,7 @@ pub struct CurrentUpstreamMapping {
 }
 
 /// What `apply` should do for one kind. `Spec` is `RepositorySpec` or
-/// `ClaimMappingSpec` — Item 8 dispatches per kind.
+/// `ClaimMappingSpec`.
 #[derive(Debug, Clone)]
 pub struct KindPlan<Spec, K>
 where
@@ -965,8 +965,8 @@ mod tests {
 
     #[test]
     fn local_row_with_same_key_as_desired_is_not_visible_to_diff() {
-        // Conflict surfaces from `validate_against` (Item 7's other
-        // path); the diff itself treats Local rows as invisible.
+        // Conflict surfaces from `validate_against`; the diff itself
+        // treats Local rows as invisible.
         let snapshot = CurrentSnapshot {
             repositories: vec![current_repo("npm-public", ManagedBy::Local, None)],
             ..CurrentSnapshot::default()

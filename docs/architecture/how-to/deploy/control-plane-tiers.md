@@ -28,7 +28,7 @@ documented control. This document is that documentation.
 | Tier | Routes | Reachability | Sole protection |
 |---|---|---|---|
 | **(i) Public artifact-serving plane** | npm / PyPI / Cargo / OCI pulls + pushes, `/api/v1/events` pull-resync read API, `/healthz` `/readyz` | Public — package managers and CI pull from anywhere | Per-route authz + the app-layer middleware stack |
-| **(ii) Public token-generation plane** | `/api/v1/auth/exchange` (RFC 8693 federation exchange), `/api/v1/auth`, OCI `/v2/auth`, self-service `/api/v1/users/me/tokens` | **Public by requirement** — external push clients and CI/CD *must* be able to mint/exchange tokens (operator-confirmed) | **Application-layer only.** There is **no network backstop** and there cannot be one. F-1 anti-replay (`jti` seen-set), F-7 audience binding, per-issuer rate-limiting, short minted-token TTLs and brute-force lockout are *load-bearing and unsubstitutable* here. |
+| **(ii) Public token-generation plane** | `/api/v1/auth/exchange` (RFC 8693 federation exchange), `/api/v1/auth`, OCI `/v2/auth`, self-service `/api/v1/users/me/tokens` | **Public by requirement** — external push clients and CI/CD *must* be able to mint/exchange tokens (operator-confirmed) | **Application-layer only.** There is **no network backstop** and there cannot be one. Anti-replay (`jti` seen-set), audience binding, per-issuer rate-limiting, short minted-token TTLs and brute-force lockout are *load-bearing and unsubstitutable* here. |
 | **(iii) Internal-only control plane** | the `/admin` API, the `/api/v1/admin/*` admin surfaces (incl. `/api/v1/admin/tasks`, `/api/v1/admin/subscriptions`), and `/api/v1/subscriptions` subscription **management** | Internal — operator/admin network only | Network position (this listener + NetworkPolicy) **plus** the admin-gate (claim-based RBAC). DiD, not either-or. |
 
 Tier (ii) **cannot be hidden** behind any network choice, because the
@@ -36,9 +36,10 @@ clients that legitimately use it are the same untrusted internet that
 an attacker comes from. No `HORT_*_BIND` knob, ingress rule, or
 NetworkPolicy removes its core threats (replay of a captured-but-valid
 JWT, audience confusion, mint brute-force) — those arrive as
-legitimate-looking requests. The F-1/F-7 application-layer controls are
-the *sole* protection for tier (ii) and that is by design, not an
-oversight. **A control-plane listener does not change this.**
+legitimate-looking requests. The application-layer anti-replay and
+audience-binding controls are the *sole* protection for tier (ii) and
+that is by design, not an oversight. **A control-plane listener does
+not change this.**
 
 ### What is deliberately NOT on the control tier
 
@@ -93,9 +94,9 @@ existing `HORT_METRICS_BIND` / metrics-listener split exactly.
 All three pod-listener bind keys share one `<subsystem>.bindAddr` shape
 — `api.bindAddr` (the main API listener, `HORT_API_BIND`),
 `metrics.bindAddr` (`HORT_METRICS_BIND`), and `control.bindAddr`
-(`HORT_CONTROL_BIND`). Backlog 078 Item 10 retired the pre-078
-top-level `apiBindAddr` key to land this consistency (HARD rename, no
-alias; the env var is unchanged).
+(`HORT_CONTROL_BIND`). The pre-existing top-level `apiBindAddr` key was
+retired to land this consistency (HARD rename, no alias; the env var is
+unchanged).
 
 Example overlay (control on a pod-internal interface, restricted by the
 default-on NetworkPolicy):
@@ -122,7 +123,7 @@ networkPolicy:
 
 ## 3. Egress posture + the `HORT_TOKEN_BIND` P1 sketch
 
-### Egress posture — SHIPPED (F-4 / F-21)
+### Egress posture — SHIPPED
 
 The Helm `networkPolicy` is **on by default**.
 The recommended egress posture is to restrict
@@ -147,9 +148,9 @@ governing the namespace). The default is on.
 ### `HORT_TOKEN_BIND` — P1, NOT YET IMPLEMENTED (design sketch)
 
 > **Status: P1 defense-in-depth, not implemented.** This is a recorded
-> design sketch (audit F-33), sequenced *alongside* (never before) the
-> F-1/F-7 application-layer hardening. It is documented here so the
-> intended end-state is visible; **no `HORT_TOKEN_BIND` knob exists
+> design sketch, sequenced *alongside* (never before) the application-layer
+> anti-replay and audience-binding hardening. It is documented here so
+> the intended end-state is visible; **no `HORT_TOKEN_BIND` knob exists
 > today.**
 
 The sketch: split `build_router` so the token-generation routes
@@ -176,8 +177,9 @@ The sketch: split `build_router` so the token-generation routes
 **What it buys and what it does not:** a configurable token-gen
 listener narrows *who can reach* the token-gen plane and isolates its
 DoS budget; it never changes *what a reachable caller does with a valid
-credential*. Tier (ii) stays public by requirement; F-1/F-7 stay
-load-bearing and are not reordered or substituted by this sketch.
+credential*. Tier (ii) stays public by requirement; the application-layer
+anti-replay and audience-binding controls stay load-bearing and are not
+reordered or substituted by this sketch.
 
 ---
 
@@ -204,8 +206,9 @@ sufficient for the insider and egress threats it does not cover:
   with subscription-create rights* (insider or stolen ordinary-user
   token) — that attacker is already inside whatever tier the API lives
   on, and subscription delivery is outbound by design. The enforcement
-  point there is **authz** (admin-gate privileged-category
-  subscriptions, F-3) and **egress** (F-4/F-21), not ingress placement.
+  point there is **authz** (admin-gate on privileged-category
+  subscriptions) and **egress** (the default-on NetworkPolicy), not
+  ingress placement.
 - A reverse proxy / mesh `AuthorizationPolicy` is **required but
   insufficient as the sole boundary**: L7 path-routing is fully
   bypassed if anything reaches the pod `IP:port` directly (mesh peer,
@@ -223,7 +226,7 @@ proving you are allowed to use it. Keep both.**
 ## Cross-links
 
 - [`security-hardening-checklist.md`](./security-hardening-checklist.md)
-  — the per-control checklist (H-3 metrics-listener split is the
+  — the per-control checklist (the metrics-listener split is the
   pattern this listener mirrors).
 - [`values-reference.md`](./values-reference.md) — per-key values
   reference (`control.*`, `networkPolicy.*`, `service.controlPort`).

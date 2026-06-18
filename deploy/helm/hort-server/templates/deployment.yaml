@@ -1,6 +1,6 @@
-{{- /* Backlog 078 Item 7 — fail-fast on a double-source / path-less
-       extraCaBundle config (mutually-exclusive configMapName/secretName,
-       or an auto-mount source with no path). */}}
+{{- /* Fail-fast on a double-source / path-less extraCaBundle config
+       (mutually-exclusive configMapName/secretName, or an auto-mount
+       source with no path). */}}
 {{- include "hort-server.extraCaBundle.validateSources" . }}
 apiVersion: apps/v1
 kind: Deployment
@@ -89,9 +89,9 @@ spec:
             {{- end }}
           env:
             # ----- Postgres (app-role DSN, NOT admin) -----
-            # Backlog 078 Item 5 — canonical HORT_DATABASE_URL. The binary
-            # falls back to bare DATABASE_URL (sqlx-cli / Tier-2 / 12-factor),
-            # so the bare name still works; the chart sets the canonical one.
+            # Canonical HORT_DATABASE_URL. The binary falls back to bare
+            # DATABASE_URL (sqlx-cli / Tier-2 / 12-factor), so the bare
+            # name still works; the chart sets the canonical one.
             - name: HORT_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -162,9 +162,9 @@ spec:
               value: {{ .Values.http.requestTimeoutSeconds | quote }}
             - name: HORT_HTTP_HEADER_READ_TIMEOUT_SECS
               value: {{ .Values.http.headerReadTimeoutSeconds | quote }}
-            {{- /* Backlog 078 Item 10 — the OCI upload timeout is now keyed
-                   under `oci.uploadTimeoutSeconds` (grouped with the other OCI
-                   surfaces); the env var name + emit position are unchanged. */}}
+            {{- /* The OCI upload timeout is keyed under `oci.uploadTimeoutSeconds`
+                   (grouped with the other OCI surfaces); the env var name +
+                   emit position are unchanged. */}}
             - name: HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS
               value: {{ .Values.oci.uploadTimeoutSeconds | quote }}
             {{- if gt (int .Values.http.maxInflight) 0 }}
@@ -177,15 +177,13 @@ spec:
             {{- end }}
             {{- if .Values.http.publishBodyMaxSize }}
             - name: HORT_PUBLISH_BODY_MAX_SIZE
-              {{- /* Backlog 078 Item 4: this knob is a human-readable SIZE
-                     string ("300Mi", "1Gi"), not a bare byte integer.
-                     Strings never go through Helm's float64 number coercion,
-                     so there is no scientific-notation path (the rc.3
-                     boot-crash class); the binary parses the suffix. Keep it
-                     a quoted string; do NOT convert to a bare integer. An
-                     empty value leaves the env var unset (binary default,
-                     300 MiB); an explicit "0" is the refuse-all-publishes
-                     kill-switch. */}}
+              {{- /* This knob is a human-readable SIZE string ("300Mi", "1Gi"),
+                     not a bare byte integer. Strings never go through Helm's
+                     float64 number coercion, so there is no scientific-notation
+                     path; the binary parses the suffix. Keep it a quoted string;
+                     do NOT convert to a bare integer. An empty value leaves the
+                     env var unset (binary default, 300 MiB); an explicit "0"
+                     is the refuse-all-publishes kill-switch. */}}
               value: {{ .Values.http.publishBodyMaxSize | quote }}
             {{- end }}
             # ----- Upstream proxy storage backstops -----
@@ -358,7 +356,7 @@ spec:
             {{- end }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          # Probes wired to Item 1's /healthz + /readyz endpoints.
+          # Probes wired to the /healthz + /readyz endpoints.
           livenessProbe:
             {{- toYaml .Values.probes.liveness | nindent 12 }}
           readinessProbe:

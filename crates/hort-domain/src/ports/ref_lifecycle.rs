@@ -4,22 +4,22 @@
 //! the mutated `mutable_refs` projection row in a single transaction. The
 //! read-side lookup port lives at [`super::ref_registry::RefRegistryPort`];
 //! splitting the read and write ports keeps consumers that only lookup
-//! independent of the transactional-write path. See design doc §2.3a and §2.4.
+//! independent of the transactional-write path.
 //!
 //! **Adapter-authoritative idempotence.** Implementations MUST re-read the
 //! current target inside the transaction (`SELECT ... FOR UPDATE`) before
 //! appending a `RefMoved`. If the current target already equals the new
 //! target, the adapter commits without appending an event — the use case's
 //! read-then-check is an optimisation; correctness under a concurrent
-//! same-target race lives here. See design doc §2.4 note on "`from ==
-//! Some(to)` is not an event".
+//! same-target race lives here. The rule: "`from == Some(to)` is not an
+//! event".
 //!
 //! **Concurrent first-placement surfaces as [`RefCommitOutcome::RefAlreadyExists`].**
 //! When two callers race on a brand-new `(repo, namespace, ref_name)` with
 //! different tentative `ref_id`s, the adapter's `INSERT ... ON CONFLICT
 //! (...) DO NOTHING RETURNING id` produces no row on the losing side; the
 //! whole transaction rolls back (discarding the loser's `batch` verbatim,
-//! mirrors Item 6's adapter-never-mutates-payloads rule for groups) and the
+//! mirrors the adapter-never-mutates-payloads rule for groups) and the
 //! adapter returns the winner's id. The use case retries by re-reading and
 //! dispatching as a move.
 
@@ -32,8 +32,8 @@ use crate::ports::event_store::AppendEvents;
 use super::BoxFuture;
 
 /// Outcome of a [`RefLifecyclePort::move_ref`] call. Mirrors the
-/// typed-outcome shape used by `ArtifactGroupLifecyclePort` (Item 6) so
-/// callers decide whether to retry without parsing error strings.
+/// typed-outcome shape used by `ArtifactGroupLifecyclePort` so callers
+/// decide whether to retry without parsing error strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefCommitOutcome {
     /// The projection row is at the caller-supplied target and the

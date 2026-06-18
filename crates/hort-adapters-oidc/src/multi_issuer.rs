@@ -175,8 +175,7 @@ impl MultiIssuerJwksValidator {
                 // but we log it distinctly to avoid an outage looking
                 // like a config error in the dashboard. Surface as
                 // `UnknownIssuer` because the federation path has no
-                // distinct "infrastructure unavailable" deny variant —
-                // see design doc §4 deny catalogue.
+                // distinct "infrastructure unavailable" deny variant.
                 warn!(
                     iss = %iss,
                     error = %e,
@@ -442,7 +441,7 @@ impl MultiIssuerJwksValidator {
                 issuer = %issuer.name,
                 jwks_uri = %discovery.jwks_uri,
                 reason = ?e,
-                "federation jwks_uri rejected by same-host origin guard (F-48)"
+                "federation jwks_uri rejected by same-host origin guard"
             );
             return Err(FederationDenyReason::UnknownKid);
         }
@@ -955,8 +954,7 @@ yDp6g/51WjALM10lhGCQasE=
         nbf: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
         jti: Option<String>,
-        /// Arbitrary extra claim used to test the `all_claims` round trip
-        /// (Item 5 will exact-match against this).
+        /// Arbitrary extra claim used to test the `all_claims` round trip.
         #[serde(skip_serializing_if = "Option::is_none")]
         repository: Option<String>,
     }

@@ -69,7 +69,7 @@ pub struct SubscriptionId(pub Uuid);
 /// Operator-authored subscription that delivers filtered events to one
 /// [`SubscriptionTarget`].
 ///
-/// **Ownership and audit attribution (design §3 / §11 invariant 6).** The
+/// **Ownership and audit attribution.** The
 /// `owner_user_id` is the authz scope — current grants on this user filter
 /// every delivery. `created_by_token_id` is *audit attribution only*: it
 /// records which token authored the row but does not drive authz. Rotating
@@ -169,8 +169,7 @@ pub enum SubscriptionTarget {
 // SubscriptionFilter
 // ---------------------------------------------------------------------------
 
-/// Closed-enum filter applied at every delivery (design §4 evaluation
-/// contract).
+/// Closed-enum filter applied at every delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionFilter {
     /// Stream categories the subscription consumes. Empty list means
@@ -190,7 +189,7 @@ pub struct SubscriptionFilter {
 // EventTypeFilter
 // ---------------------------------------------------------------------------
 
-/// Event-type filter (design §4 step 2).
+/// Event-type filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventTypeFilter {
     /// Every event type in the selected categories matches.
@@ -225,7 +224,7 @@ impl EventTypeFilter {
 ///
 /// **Exhaustiveness invariant.** [`EventTypeKind::of`] matches `DomainEvent`
 /// without a `_ =>` arm; adding a new `DomainEvent` variant is a compile
-/// error here, **on purpose** (design §11 invariant 4). The compile error
+/// error here, **on purpose**. The compile error
 /// forces the contributor to decide whether the new variant carries a
 /// repository association and what its `EventTypeKind` is.
 ///
@@ -380,7 +379,7 @@ impl EventTypeKind {
     /// **Exhaustive match — no `_ =>` arm.** Adding a new `DomainEvent`
     /// variant fails to compile here until the contributor adds the
     /// corresponding `EventTypeKind` variant and its arm. This is the
-    /// closed-enum invariant (design §11 invariant 4).
+    /// closed-enum invariant.
     pub fn of(event: &DomainEvent) -> EventTypeKind {
         match event {
             DomainEvent::ArtifactIngested(_) => EventTypeKind::ArtifactIngested,
@@ -457,14 +456,13 @@ impl EventTypeKind {
         }
     }
 
-    /// Extract the repository association from an event payload (design §4
-    /// step 3).
+    /// Extract the repository association from an event payload.
     ///
     /// **Exhaustive match — no `_ =>` arm.** Returns `Some(uuid)` only when
     /// the payload carries a single `repository_id` field. Payloads with
     /// `source_repository_id` + `target_repository_id` pairs (promotion
     /// events) return `None` for v1 — the dispatcher then falls through to
-    /// the `RepositoryScope::OwnedByActor` no-op step (design §4: "for
+    /// the `RepositoryScope::OwnedByActor` no-op step ("for
     /// events without a repository association ... the predicate downstream
     /// falls back to no repo association"). Subscription-lifecycle /
     /// user-lifecycle / policy-lifecycle / auth-event variants return
@@ -602,21 +600,20 @@ impl EventTypeKind {
 
     /// Returns `true` when this kind is in [`HIGH_VOLUME_EVENT_TYPES`].
     ///
-    /// Used by the issuance use case (Item 4) to reject filters that request
+    /// Used by the issuance use case to reject filters that request
     /// any of `ArtifactDownloaded`, `ApiTokenUsed`, or
-    /// `AuthenticationAttempted` — see design §3 "Excluded event types —
-    /// invariant".
+    /// `AuthenticationAttempted`.
     pub fn is_high_volume(&self) -> bool {
         HIGH_VOLUME_EVENT_TYPES.contains(self)
     }
 }
 
-/// High-volume event-type exclusion list (design §3 / §11 invariant 5).
+/// High-volume event-type exclusion list.
 ///
 /// Subscriptions whose filter requests any of these are rejected at
 /// issuance with [`SubscriptionDenialReason::UnsupportedEventType`]. The
-/// list is a compile-time `const` so the exclusion is canonical and so
-/// future high-volume-notifications initiatives lift it deliberately.
+/// list is a compile-time `const` so the exclusion is canonical and any
+/// future change to it is deliberate.
 ///
 /// All three list members are emittable from `DomainEvent` and are emitted
 /// in production: `AuthenticationAttempted` (auth audit),
@@ -636,7 +633,7 @@ pub const HIGH_VOLUME_EVENT_TYPES: &[EventTypeKind] = &[
 
 /// Repository scope component of [`SubscriptionFilter`].
 ///
-/// Design §5 token-cap interaction:
+/// Token-cap interaction:
 /// - `OwnedByActor` requires an uncapped session (no repo cap on the token).
 ///   Repo-capped tokens MUST supply `Some(filter_ids)` so the cap is captured
 ///   as the stored list — see [`SubscriptionDenialReason::RepoScopeMustBeExplicit`].
@@ -648,7 +645,7 @@ pub const HIGH_VOLUME_EVENT_TYPES: &[EventTypeKind] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositoryScope {
     /// Every repository the owner can currently read. Resolved live at
-    /// delivery — see design §4 step 4.
+    /// delivery — resolved live at the dispatcher.
     OwnedByActor,
     /// Explicit allow-list (cap snapshot).
     Some(Vec<Uuid>),
@@ -662,15 +659,15 @@ pub enum RepositoryScope {
 
 /// Closed enum of named composite predicates over event payloads.
 ///
-/// **v1 ships zero variants** (design §3 / §11 invariant 4). The type is
-/// reserved as the audited extension point for future composite filters;
-/// for v1 every consumer that needs composite logic computes it client-side
-/// from the raw events delivered by category + event-type + repository
-/// filtering. The no-DSL stance is settled in design §2 closed-indefinitely.
+/// **v1 ships zero variants.** The type is reserved as the audited extension
+/// point for future composite filters; for v1 every consumer that needs
+/// composite logic computes it client-side from the raw events delivered by
+/// category + event-type + repository filtering. The no-DSL stance is
+/// settled and closed indefinitely.
 ///
-/// Adding a v1.x variant is a backlog item with its own PR, its own catalog
-/// entry, its own test, and its own deferred-items-sweep entry confirming
-/// the consumer demand is real (not speculative).
+/// Adding a v1.x variant requires its own PR, its own catalog entry, its
+/// own test, and confirmation that the consumer demand is real (not
+/// speculative).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NamedPredicate {}
 
@@ -678,7 +675,7 @@ pub enum NamedPredicate {}
 // SubscriptionState
 // ---------------------------------------------------------------------------
 
-/// Subscription delivery state (design §3).
+/// Subscription delivery state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionState {
     /// Delivering normally.
@@ -707,7 +704,7 @@ pub enum DisableReason {
     /// The `owner_user_id` was deactivated.
     OwnerDeactivated,
     /// The dispatcher's 100-failures-per-hour budget exhausted — see
-    /// design §6 and §11 invariant 10.
+    /// the delivery failure budget limit.
     DeliveryFailureBudgetExhausted,
     /// Explicit admin action via `PATCH .../disable`.
     OperatorDisabled,
@@ -764,8 +761,7 @@ pub enum SsrfBlockReason {
 // SubscriptionDenialReason
 // ---------------------------------------------------------------------------
 
-/// Closed enum of reasons a subscription CRUD call is refused. Mirrors
-/// design §5 reject paths verbatim.
+/// Closed enum of reasons a subscription CRUD call is refused.
 ///
 /// Each variant maps to a distinct `SubscriptionCreationDenied`
 /// `denial_reason` event value and a distinct HTTP `400` / `403` error
@@ -788,7 +784,7 @@ pub enum SubscriptionDenialReason {
     /// `RepositoryScope::All` requested via a repo-capped token.
     AdminScopeRequiresUncappedToken,
     /// `RepositoryScope::OwnedByActor` requested via a repo-capped token
-    /// (design §5 — the cap must be captured as an explicit list).
+    /// (the cap must be captured as an explicit list).
     RepoScopeMustBeExplicit,
     /// `RepositoryScope::Some(filter_ids)` where
     /// `filter_ids ⊄ token_cap.repository_ids`.

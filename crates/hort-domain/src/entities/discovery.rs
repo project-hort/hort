@@ -66,7 +66,7 @@ pub struct DiscoveryVersionEntry {
     /// Version string in the format-native spelling.
     pub version: String,
     /// Current status of this version in this repository, including
-    /// the §6.8 distinction between active-quarantine and
+    /// the distinction between active-quarantine and
     /// awaiting-release-authority sub-states.
     pub status: DiscoveryVersionStatus,
 }
@@ -114,7 +114,7 @@ pub enum DiscoveryVersionStatus {
 /// One item in a self-service prefetch batch.
 ///
 /// Internal command type — no `Serialize`, no `Deserialize`. The HTTP
-/// handler in `hort-http-discovery` (Item 7) decodes the request DTO and
+/// handler in `hort-http-discovery` decodes the request DTO and
 /// constructs a `Vec<PrefetchRequestItem>` at the inbound boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrefetchRequestItem {
@@ -181,14 +181,14 @@ pub struct PackageCoords {
 pub struct RejectedItem {
     /// The coordinate the operator submitted.
     pub coords: PackageCoords,
-    /// Why this version cannot be re-prefetched (§6.5).
+    /// Why this version cannot be re-prefetched.
     pub reason: RejectionReason,
 }
 
 /// Terminal HORT statuses that refuse a fresh prefetch.
 ///
-/// **Arm set is pinned at two** — `ScanRejected` and `ScanIndeterminate`
-/// (§3.1). Both share the same operator-actionable handling ("curator
+/// **Arm set is pinned at two** — `ScanRejected` and `ScanIndeterminate`.
+/// Both share the same operator-actionable handling ("curator
 /// waive OR admin override"); the discriminator is preserved here so
 /// dashboards / future audit consumers can distinguish them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -206,7 +206,7 @@ pub enum RejectionReason {
 pub struct FailedItem {
     /// The coordinate the operator submitted.
     pub coords: PackageCoords,
-    /// Per-item failure classification (§3.1).
+    /// Per-item failure classification.
     pub error: PrefetchItemError,
 }
 
@@ -214,18 +214,18 @@ pub struct FailedItem {
 ///
 /// **Arm set is pinned at eight** — `UpstreamNotFound`, `Unauthorized`,
 /// `RateLimited`, `Upstream4xx`, `Upstream5xx`, `NetworkError`,
-/// `Timeout`, `ParseError` (§3.1).
+/// `Timeout`, `ParseError`.
 ///
-/// **Alignment with `UpstreamFetchError` (§3.2).** These eight variants
+/// **Alignment with `UpstreamFetchError`.** These eight variants
 /// map 1:1 to the upstream-fetch subset of `UpstreamErrorKind` (the
-/// metric `result` taxonomy in §7). The Item 6 use case translates the
+/// metric `result` taxonomy). The prefetch use case translates the
 /// per-item `UpstreamFetchError` returned by the port to the matching
 /// `PrefetchItemError` for the response envelope AND to the matching
 /// metric `result` label — one classification at the port boundary,
 /// two consumers downstream.
 ///
 /// `UpstreamFetchError::UnsupportedFormat` is NOT mirrored here — OCI
-/// rejection is a call-level short-circuit (§2.6 gate order), not a
+/// rejection is a call-level short-circuit (gate order), not a
 /// per-item failure.
 ///
 /// **Sanitisation invariant.** `NetworkError` and `ParseError` carry no
@@ -248,7 +248,7 @@ pub enum PrefetchItemError {
     /// surfaced at this layer (operator sees the bucket).
     ///
     /// The explicit `serde(rename)` matches the `upstream_4xx` label in
-    /// the §7 `UpstreamErrorKind` metrics taxonomy; the default
+    /// the `UpstreamErrorKind` metrics taxonomy; the default
     /// `snake_case` rule does not insert an underscore between letters
     /// and digits, which would otherwise drift the label.
     #[serde(rename = "upstream_4xx")]

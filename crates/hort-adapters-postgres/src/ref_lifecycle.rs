@@ -15,14 +15,11 @@
 //! [`RefCommitOutcome::RefAlreadyExists`]. The adapter uses
 //! `INSERT ... ON CONFLICT (repository_id, namespace, ref_name) DO NOTHING
 //! RETURNING id` on the first-placement path; empty RETURNING rolls the
-//! whole transaction back (discarding `batch` verbatim — mirrors Item 6's
-//! adapter-never-mutates-payloads rule for groups) and surfaces the
-//! winner's id so the use case can retry as a move. Pre-review-B5 this
-//! path used `ON CONFLICT DO UPDATE` and two concurrent first-placement
-//! calls left one RefMoved event orphaned on the loser's tentative
-//! `ref-<id>` stream — fixed in commit 2 of the review-B5/B6/M5 series.
-//!
-//! See design doc §2.4 and §2.9.
+//! whole transaction back (discarding `batch` verbatim — the adapter
+//! never mutates the caller's payload) and surfaces the winner's id so
+//! the use case can retry as a move. Previously this path used
+//! `ON CONFLICT DO UPDATE` and two concurrent first-placement calls left
+//! one RefMoved event orphaned on the loser's tentative `ref-<id>` stream.
 
 use std::sync::Arc;
 
@@ -154,8 +151,8 @@ impl RefLifecyclePort for PgRefLifecycle {
             // RETURNING id` collapses the "did we win the create race?"
             // question into a single round-trip. Empty RETURNING means
             // another writer landed first — roll back the whole
-            // transaction (discarding `batch` verbatim, same guarantee
-            // as Item 6 for groups) and return the winner's id.
+            // transaction (discarding `batch` verbatim) and return the
+            // winner's id.
             let inserted: Option<Uuid> = sqlx::query_scalar(
                 r#"INSERT INTO mutable_refs (
                        id, repository_id, namespace, ref_name,
@@ -637,18 +634,17 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// B5 regression guard: two concurrent first-placements of the same
-    /// `(repo, namespace, ref_name)` with DIFFERENT tentative `ref_id`s
-    /// must produce exactly ONE `RefMoved` event on the winner's stream
-    /// and ZERO events on the loser's tentative stream. The loser's
-    /// `batch` is discarded verbatim when `INSERT ON CONFLICT DO NOTHING`
-    /// returns empty; the adapter surfaces
+    /// Concurrent first-placement regression guard: two concurrent
+    /// first-placements of the same `(repo, namespace, ref_name)` with
+    /// DIFFERENT tentative `ref_id`s must produce exactly ONE `RefMoved`
+    /// event on the winner's stream and ZERO events on the loser's
+    /// tentative stream. The loser's `batch` is discarded verbatim when
+    /// `INSERT ON CONFLICT DO NOTHING` returns empty; the adapter surfaces
     /// `Ok(RefCommitOutcome::RefAlreadyExists { existing_id = winner_id })`.
     ///
-    /// Pre-fix the adapter used `ON CONFLICT DO UPDATE`: both racers
+    /// Previously the adapter used `ON CONFLICT DO UPDATE`: both racers
     /// appended to their own tentative stream, leaving an orphan
-    /// `RefMoved` on the loser's `ref-<loser_id>` stream. This test is
-    /// the regression guard.
+    /// `RefMoved` on the loser's `ref-<loser_id>` stream.
     /// Wait for at least one session on `pool` to be blocked on a
     /// transactionid lock — i.e. an `INSERT` waiting for an
     /// uncommitted conflicting row to resolve. The observation loop
@@ -684,7 +680,8 @@ mod tests {
         panic!("adapter never blocked on the unique-index lock (5s budget exhausted)");
     }
 
-    /// B5 regression guard — deterministic via pg_stat_activity polling.
+    /// Concurrent first-placement regression guard — deterministic via
+    /// pg_stat_activity polling.
     ///
     /// The flaky tokio-barrier variant of this test was replaced once
     /// it turned out that userspace scheduling does not reliably force
@@ -696,7 +693,7 @@ mod tests {
     /// semantics guarantee that unique-index conflict waiters wait
     /// until the first writer commits or aborts; committing forces the
     /// adapter's `INSERT ... ON CONFLICT DO NOTHING` to return empty
-    /// `RETURNING`, which is the exact code path B5 fixed.
+    /// `RETURNING`, which is the exact code path this test pins.
     ///
     /// Asserts:
     /// - The adapter returns `Ok(RefAlreadyExists { existing_id })`
@@ -824,8 +821,8 @@ mod tests {
 
         // ZERO events on the loser's tentative stream — the whole
         // adapter txn rolled back, so `append_in_tx` never landed.
-        // This is the load-bearing assertion: pre-fix the UPSERT path
-        // appended an orphan `RefMoved` on `ref-<id_b>`.
+        // Load-bearing assertion: previously the UPSERT path appended
+        // an orphan `RefMoved` on `ref-<id_b>`.
         let loser_event_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
                 .bind(format!("ref-{id_b}"))

@@ -1,11 +1,11 @@
 //! Shared quarantine-response helper for OCI pull handlers.
 //!
-//! Both the blob (Item 6) and manifest (Item 7) handlers must check
+//! Both the blob and manifest handlers must check
 //! `Artifact.quarantine_status` directly — see `blobs.rs` module doc
 //! for why handler-side check + 503 + `Retry-After` is the shape
 //! required for OCI clients behind transparent proxies (Artifactory).
 //! The two handlers previously open-coded the same 23-line block with
-//! only the hidden-404 code string differing; Item 19 (proxy-fetch)
+//! only the hidden-404 code string differing; the proxy-fetch path
 //! will make it a third call site. Extracting the shared logic here
 //! keeps the 503 response shape and the `hort_download_total{result=
 //! "quarantined"}` counter consistent across every OCI read path.

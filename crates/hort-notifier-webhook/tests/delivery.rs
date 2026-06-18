@@ -31,8 +31,7 @@ use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// The plaintext the operator provisioned behind the `SecretRef`. This
-/// is the HMAC key the receiver verifies with (F-19) — NOT any stored
-/// hash.
+/// is the HMAC key the receiver verifies with — NOT any stored hash.
 const SHARED_SECRET: &[u8] = b"webhook-shared-secret-plaintext";
 
 /// Test [`SecretPort`] returning a fixed plaintext — mirrors the
@@ -306,9 +305,9 @@ async fn signature_verifies_with_resolved_plaintext_secret() {
     let received_hex = sig_value.strip_prefix("sha256=").unwrap();
 
     // Receiver-side verification: re-compute HMAC over the raw body
-    // bytes with the SecretPort-RESOLVED PLAINTEXT (F-19). The adapter
-    // signs the body verbatim — no re-serialisation. Wire format is
-    // unchanged; only the key source changed.
+    // bytes with the SecretPort-RESOLVED PLAINTEXT. The adapter signs
+    // the body verbatim — no re-serialisation. Wire format is unchanged;
+    // only the key source changed.
     let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET).expect("any-length HMAC key");
     mac.update(body_bytes);
     let expected_hex = hex::encode(mac.finalize().into_bytes());
@@ -316,7 +315,7 @@ async fn signature_verifies_with_resolved_plaintext_secret() {
     assert_eq!(
         received_hex, expected_hex,
         "receiver-side HMAC over body must match X-Hort-Signature (keyed by \
-         the resolved plaintext, F-19)"
+         the resolved plaintext)"
     );
 }
 
@@ -405,11 +404,11 @@ async fn body_is_json_with_required_fields() {
 //
 // `body_is_json_with_required_fields` above checks schema_version as part
 // of a bundle of body assertions. This dedicated round-trip test is the
-// load-bearing pin for design doc §11 invariant 7 ("schema_version is a
-// public-API commitment"): a refactor that quietly dropped or renamed the
-// field would still pass the bundle test if the surrounding assertions
-// held, but must trip THIS test. The single-purpose assertion makes the
-// intent unmistakable in failure output.
+// load-bearing pin for invariant 7 ("schema_version is a public-API
+// commitment"): a refactor that quietly dropped or renamed the field would
+// still pass the bundle test if the surrounding assertions held, but must
+// trip THIS test. The single-purpose assertion makes the intent
+// unmistakable in failure output.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -452,7 +451,7 @@ async fn body_schema_version_field_is_literal_one() {
     assert_eq!(
         schema_version,
         &serde_json::json!(1),
-        "schema_version is the public-API commitment from §11 invariant 7"
+        "schema_version is the public-API commitment (invariant 7)"
     );
     assert_eq!(
         schema_version.as_u64(),
@@ -463,7 +462,7 @@ async fn body_schema_version_field_is_literal_one() {
 
 // ---------------------------------------------------------------------------
 // notify() returns within the 11s ceiling (10s timeout + 1s slack) when
-// the downstream is unreachable — §11 invariant 1.
+// the downstream is unreachable.
 //
 // The invariant is "notify MUST NOT block". The 10s `TOTAL_TIMEOUT` is
 // the reqwest-level ceiling; this test asserts the call returns within
@@ -493,7 +492,7 @@ async fn notify_returns_within_11s_when_downstream_unreachable() {
         notifier.notify(&target, sub_id(), &[]),
     )
     .await
-    .expect("notify must return within 11s when downstream is unreachable — §11 invariant 1");
+    .expect("notify must return within 11s when downstream is unreachable");
 
     // The exact failure reason depends on platform — ConnectionRefused
     // on Linux/macOS when the kernel sends RST, or RequestTimeout / Other

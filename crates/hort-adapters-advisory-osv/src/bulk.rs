@@ -228,7 +228,7 @@ pub(crate) async fn pull_one_ecosystem(
                 message: format!("osv bulk: reopen tempfile: {e}"),
             })?;
             let mut out: Vec<AdvisoryEntry> = Vec::new();
-            // F-5: use for_trusted_bulk_feed(), NOT default_for_metadata_extraction().
+            // Use for_trusted_bulk_feed(), NOT default_for_metadata_extraction().
             let result = iter_zip_entries(
                 file,
                 BoundsConfig::for_trusted_bulk_feed(),
@@ -254,7 +254,7 @@ pub(crate) async fn pull_one_ecosystem(
             );
             match result {
                 Ok(()) => {}
-                // F-5: Bounds-tripped on a trusted bulk feed is a warning,
+                // Bounds-tripped on a trusted bulk feed is a warning,
                 // not a ParseError. The entries already visited are kept; the
                 // cap only fires if the ecosystem has grown beyond
                 // MAX_ENTRIES_TRUSTED_BULK (~1e5) — an operational signal to
@@ -673,10 +673,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F-5 regression — >1024-entry ecosystem zip must ingest every advisory
+    // Regression — >1024-entry ecosystem zip must ingest every advisory
     // -----------------------------------------------------------------------
     //
-    // Audit finding F-5: the OSV bulk path previously used
+    // The OSV bulk path previously used
     // `BoundsConfig::default_for_metadata_extraction()` (max_entries=1024).
     // A real ecosystem zip (npm, PyPI, Maven) contains thousands of
     // advisories.  Entry 1025 tripped the entry counter and the whole
@@ -727,7 +727,7 @@ mod tests {
         let result =
             pull_one_ecosystem(&http_client(), &server.uri(), "npm", Ecosystem::Npm, since).await;
 
-        // Must NOT fail with ParseError (the F-5 failure mode).
+        // Must NOT fail with ParseError.
         assert!(
             result.is_ok(),
             "large ecosystem zip must not abort as ParseError: {result:?}"
@@ -742,10 +742,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F-5 regression — large single advisory must survive per-entry cap
+    // Regression — large single advisory must survive per-entry cap
     // -----------------------------------------------------------------------
     //
-    // Audit finding F-5 failure mode 2: a single advisory whose decompressed
+    // A single advisory whose decompressed
     // size exceeds the per-entry output cap imposed by the old
     // `default_for_metadata_extraction()` config would be SILENTLY DROPPED —
     // `BoundedReader` returns an IO error, `read_to_string` fails, the visitor
@@ -857,11 +857,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F-5 call-site tolerance — bounds trip on trusted path must NOT be ParseError
+    // Call-site tolerance — bounds trip on trusted path must NOT be ParseError
     // -----------------------------------------------------------------------
     //
-    // Audit F-5 remediation governance: the match logic inside the blocking
-    // closure of `pull_one_ecosystem` distinguishes `Err(ZipIterError::Bounds(_))`
+    // The match logic inside the blocking closure of `pull_one_ecosystem`
+    // distinguishes `Err(ZipIterError::Bounds(_))`
     // (warn + keep collected advisories) from all other `ZipIterError` variants
     // (→ ParseError). This test exercises that arm directly using a deliberately
     // tiny `BoundsConfig` to force `Err(ZipIterError::Bounds(...))`, verifying

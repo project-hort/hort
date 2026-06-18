@@ -883,7 +883,7 @@ mod tests {
     /// defaults to `None` in the sample fixture, mirroring the
     /// constructor default. Writers without parseable upstream metadata
     /// stamp `None`; the ingest path populates the field from
-    /// per-format upstream metadata; Item 6 is the consumer.
+    /// per-format upstream metadata; the prefetch use case is the consumer.
     #[test]
     fn artifact_sample_defaults_upstream_published_at_to_none() {
         let a = sample_artifact();
@@ -1186,7 +1186,7 @@ mod tests {
         // The shadow-IT case: an already-released artifact is pulled from
         // the catalog after the operator is paged by external advisory
         // intelligence. Mirrors reject_from_retroactive_curation's
-        // Released → Rejected transition (design doc §2.3 line 99).
+        // Released → Rejected transition (same shape as reject_from_retroactive_curation).
         let mut a = released_artifact();
         let curator_id = Uuid::new_v4();
         let event = a
@@ -1200,7 +1200,7 @@ mod tests {
 
     #[test]
     fn block_by_curator_from_rejected_fails() {
-        // Use-case layer (Item 5) treats this Err as the idempotent no-op
+        // The use-case layer treats this Err as the idempotent no-op
         // short-circuit (BlockOutcome.already_rejected_ids; no event
         // appended). The entity contract is: do NOT mutate state, do NOT
         // emit an event — return Invariant so the caller skips append.
@@ -1543,7 +1543,7 @@ mod tests {
     /// The quarantine window is NEVER read in `release()` — expiry is
     /// the sweep's *candidacy* signal, not its *authorization*. Proven
     /// by: an expired-window artifact with no scan authority is NOT
-    /// released (it would be under the pre-F-6 timer-only guard).
+    /// released (it would be under a timer-only guard).
     /// Sets both the stored anchor and the transient computed deadline
     /// to an elapsed window so neither is read.
     #[test]
@@ -1582,9 +1582,8 @@ mod tests {
 
     // -- ProvenanceClearance gate on the timer arm (ADR 0027) ---------------
     //
-    // The timer arm gains a provenance AND-precondition:
-    //   (Timer, ScanSucceeded|ScanWaived) && matches!(provenance,
-    //     NotRequired|Cleared)  => release
+    // The timer arm carries a provenance AND-precondition:
+    //   (Timer, ScanSucceeded|ScanWaived) && provenance in {NotRequired,Cleared} => release
     //   (Timer, ScanSucceeded|ScanWaived) && Pending => deny (stay quarantined)
     // The Admin / Curator / PolicyReEval arms IGNORE the provenance param
     // (explicit overrides are unaffected — no new ReleaseAuthorization).
@@ -1684,8 +1683,8 @@ mod tests {
 
     /// Admin override releases regardless of the provenance param — pass
     /// `Pending` and confirm it still releases (the override arm ignores
-    /// provenance; the F-6 §2.3 invariant "never blocks an explicit
-    /// Admin/Curator/PolicyReEval release").
+    /// provenance; explicit Admin/Curator/PolicyReEval releases are never
+    /// blocked by the provenance gate).
     #[test]
     fn release_admin_override_ignores_provenance_pending() {
         let mut a = quarantined_artifact();
@@ -1727,11 +1726,11 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
     }
 
-    /// F-6 fail-closed property re-asserted across the provenance
-    /// dimension: a never-scanned artifact (no `ScanSucceeded`/`ScanWaived`
-    /// authority constructible) does NOT timer-release under ANY
-    /// `ProvenanceClearance` — provenance never *adds* release authority,
-    /// only ever an AND-precondition that can subtract it.
+    /// Fail-closed property re-asserted across the provenance dimension:
+    /// a never-scanned artifact (no `ScanSucceeded`/`ScanWaived` authority
+    /// constructible) does NOT timer-release under ANY `ProvenanceClearance`
+    /// — provenance never *adds* release authority, only ever an
+    /// AND-precondition that can subtract it.
     #[test]
     fn f6_fail_closed_unscanned_never_timer_releases_under_any_clearance() {
         for clearance in [
@@ -1750,7 +1749,7 @@ mod tests {
                         Err(DomainError::Invariant(_))
                     ),
                     "timer release with non-scan authority {authz:?} and clearance \
-                     {clearance:?} must be denied (F-6 fail-closed)"
+                     {clearance:?} must be denied (fail-closed predicate)"
                 );
                 assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
             }
@@ -1785,7 +1784,7 @@ mod tests {
         // A Verified verdict must NOT release early (like
         // ScanCompleted(clean)) — status stays Quarantined and a
         // ProvenanceVerified event is emitted for the audit trail / the
-        // release-sweep `Cleared` computation (Item 4).
+        // release-sweep `Cleared` computation.
         for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Required] {
             let mut a = quarantined_artifact();
             let signer = crate::ports::provenance::SignerIdentity {
@@ -2308,7 +2307,7 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::ScanIndeterminate);
     }
 
-    // -- Quarantine-Invariant interaction arms (spec §5) --------------------
+    // -- Quarantine-Invariant interaction arms ------------------------------
 
     /// Inv #1 — downloads blocked: ScanIndeterminate is outside the
     /// `is_downloadable` whitelist, so the gate blocks it by construction.
@@ -2358,9 +2357,8 @@ mod tests {
     /// layer cannot mint `ScanSucceeded`/`ScanWaived` (no successful
     /// `ScanCompleted`, scanning not waived), so a timer release with
     /// any non-scan authority is denied. The entity stays pure: it
-    /// trusts the typed token; the app layer (spec §6) guarantees no
-    /// `ScanSucceeded` token is ever constructed for an unscanned
-    /// artifact.
+    /// trusts the typed token; the app layer guarantees no `ScanSucceeded`
+    /// token is ever constructed for an unscanned artifact.
     #[test]
     fn invariant_3_scan_indeterminate_timer_without_scan_authority_denied() {
         for authz in [
@@ -2381,8 +2379,9 @@ mod tests {
     }
 
     /// Inv #3 — re_evaluate() is NOT widened to ScanIndeterminate (spec
-    /// §13 R3): a finding-exclusion is a no-op for an artifact with no
-    /// finding. re_evaluate from ScanIndeterminate is an Invariant error.
+    /// re_evaluate is not widened to ScanIndeterminate: a finding-exclusion
+    /// is a no-op for an artifact with no finding. re_evaluate from
+    /// ScanIndeterminate is an Invariant error.
     #[test]
     fn invariant_3_re_evaluate_not_widened_to_scan_indeterminate() {
         let mut a = scan_indeterminate_artifact();

@@ -14,7 +14,7 @@
 //!   [`dashmap::DashMap`] of `IpAddr → Arc<Semaphore>`. Default 32
 //!   in-flight per IP (`HORT_MAX_INFLIGHT_PER_IP`). Reads
 //!   [`RequestTrust::client_ip`] from request extensions (populated by
-//!   F2's trust layer); a missing trust extension surfaces as a 500
+//!   the request trust layer); a missing trust extension surfaces as a 500
 //!   rather than silently bypassing the cap (mirrors
 //!   [`crate::middleware::rate_limit::TrustAwareKeyExtractor`]).
 //!
@@ -163,7 +163,7 @@ pub struct ConcurrencyLimitState {
     /// 2^80 unique /128 source addresses and grow the map without bound. Operators
     /// deploying on IPv6 should put an L4 proxy in front that aggregates source IPs
     /// at /64 or /48, or bucket the keys here using the same /24 (IPv4) /48 (IPv6)
-    /// pattern Item 16 uses for the EphemeralStore auth-events key. Track this as a
+    /// pattern used for the EphemeralStore auth-events key. Track this as a
     /// follow-on if the IPv4-only bound is insufficient for the deployment.
     per_ip: Arc<DashMap<IpAddr, Arc<Semaphore>>>,
     /// Per-IP cap. Stored here (not just on the semaphores) so [`gc_tick`]
@@ -304,8 +304,8 @@ pub async fn global_load_shed_middleware(
     // The permit is held across `next.run(request).await`, which resolves once the
     // inner handler produces `Response<Body>`. The response body then streams to the
     // client outside this middleware's stack frame, so the cap binds to request-body
-    // consumption (the OCI blob upload threat from M-8), NOT to response-body
-    // streaming. For response-body slowloris guards see request_timeout (H-2).
+    // consumption (the OCI blob upload threat), NOT to response-body
+    // streaming. For response-body slowloris guards see request_timeout.
     let response = next.run(request).await;
     drop(permit);
     response
@@ -317,8 +317,8 @@ pub async fn global_load_shed_middleware(
 
 /// Per-IP concurrency cap with immediate load-shed on overflow.
 ///
-/// Reads `client_ip` from [`RequestTrust`] (populated by F2's trust
-/// layer). On a missing extension surfaces 500 — same conservative
+/// Reads `client_ip` from [`RequestTrust`] (populated by the request
+/// trust layer). On a missing extension surfaces 500 — same conservative
 /// failure mode as [`crate::middleware::rate_limit::TrustAwareKeyExtractor`].
 /// Get-or-inserts an `Arc<Semaphore>` for that IP and try-acquires one
 /// permit; failure sheds with 503 and the

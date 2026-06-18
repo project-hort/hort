@@ -46,14 +46,13 @@
 //!
 //! # Reference implementation
 //!
-//! Item 3 wires this into the npm packument serve path
-//! (`hort-http-npm/src/packument.rs`); the per-format Item 4 templates
-//! reuse the same helper unchanged for PyPI / Cargo / Maven by passing
-//! their respective [`VersionOrdering`] implementations. Picking the
-//! newest served version needs per-format *ordering* only — distinct
-//! from and **far simpler than** Item 11's per-format range *resolver*
-//! (`resolve_range_max`, range satisfaction), which is Phase-2 territory
-//! and deliberately not a dependency of this Phase-1 helper.
+//! The npm packument serve path (`hort-http-npm/src/packument.rs`) wires
+//! this helper; per-format callers reuse it unchanged for PyPI / Cargo /
+//! Maven by passing their respective [`VersionOrdering`] implementations.
+//! Picking the newest served version needs per-format *ordering* only —
+//! distinct from and **far simpler than** the per-format range *resolver*
+//! (`resolve_range_max`, range satisfaction), which is future territory
+//! and deliberately not a dependency of this helper.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -67,16 +66,16 @@ use hort_domain::entities::repository::IndexMode;
 /// to pick "the newest version": semver for npm / Cargo, PEP 440 for
 /// PyPI, Maven's version-comparison algorithm for Maven.
 ///
-/// This is **ordering only** — not range satisfaction. Phase-1 callers
-/// (this helper, Item 7's non-transitive prefetch) need only an
-/// ordering to find the newest *served* version; Item 11's range
-/// *resolver* (`resolve_range_max`) is Phase-2.
+/// This is **ordering only** — not range satisfaction. Callers
+/// (this helper, the non-transitive prefetch) need only an ordering to
+/// find the newest *served* version; the range *resolver*
+/// (`resolve_range_max`) is future territory.
 ///
 /// A pure trait so callers can build a `&dyn VersionOrdering` and the
 /// helper stays free-function-shaped. Implementations live in the
 /// format-domain layer they speak for; the reference impl
-/// [`NpmSemverOrdering`] is here because the npm wiring is the Item 3
-/// reference implementation Item 4 templates from.
+/// [`NpmSemverOrdering`] is here because the npm wiring is the
+/// reference implementation that per-format callers template from.
 pub trait VersionOrdering {
     /// Compare two version strings. Returns `Ordering::Less` if `a < b`,
     /// `Equal` if `a == b`, `Greater` if `a > b`. Inputs are unvalidated
@@ -131,7 +130,7 @@ pub fn filter_served_versions(
 
     // Build a status map for O(1) lookups. A version may appear at most
     // once in the adapter's result (the artifacts projection is
-    // `(repository_id, name, version)`-unique by §5 / §9), but the
+    // `(repository_id, name, version)`-unique), but the
     // helper doesn't rely on that — a duplicate in `status` is resolved
     // by last-write-wins, the same as a HashMap insert.
     let status_by_version: HashMap<&str, QuarantineStatus> =
@@ -209,7 +208,7 @@ fn pick_latest(served: &BTreeSet<String>, ordering: &dyn VersionOrdering) -> Opt
 // ---------------------------------------------------------------------------
 
 /// Semver-ish version ordering for npm — the reference
-/// [`VersionOrdering`] implementation Item 4 templates from.
+/// [`VersionOrdering`] implementation that per-format callers template from.
 ///
 /// Parses `MAJOR.MINOR.PATCH(-prerelease)?(+build)?` and orders per
 /// [semver.org §11](https://semver.org/#spec-item-11): numeric segments
@@ -402,13 +401,11 @@ impl PartialOrd for ParsedNpmVersion {
 /// Cargo sparse-index version ordering. Cargo's version grammar is
 /// SemVer 2.0 ([Cargo Book §SemVer compatibility][cargo-semver]) — the
 /// same `MAJOR.MINOR.PATCH(-prerelease)?(+build)?` shape and the same
-/// §11 precedence rules npm follows. The Item-3 [`NpmSemverOrdering`]
+/// §11 precedence rules npm follows. The [`NpmSemverOrdering`]
 /// reference implementation is therefore correct for Cargo too; this
 /// alias spells the format at the call site without duplicating logic.
 ///
-/// Per the Item-4 instructions: "if its scope and naming are general
-/// enough to reuse for Cargo, reuse it; otherwise add a clearly-named
-/// sibling." The implementation is general (semver §11, no
+/// The implementation is general (semver §11, no
 /// npm-specific quirks except the tolerated `v` / `V` prefix, which
 /// Cargo upstream NDJSON `vers` keys never carry — degrades to a no-op
 /// when absent); the name is npm-flavoured, so the alias makes the
@@ -462,8 +459,8 @@ pub type CargoSemverOrdering = NpmSemverOrdering;
 /// Workspace policy: no `pep440` / `pep440_rs` crate dependency. The
 /// per-format need here is *ordering only* — pick the newest served
 /// version from a small set Hort already holds — not range satisfaction
-/// (Item 11 territory, Phase 2). A hand-rolled parser is the right
-/// size for the job and consistent with the npm path.
+/// (range satisfaction is future territory). A hand-rolled parser is
+/// the right size for the job and consistent with the npm path.
 ///
 /// [pep440]: https://peps.python.org/pep-0440/
 #[derive(Debug, Default, Clone, Copy)]

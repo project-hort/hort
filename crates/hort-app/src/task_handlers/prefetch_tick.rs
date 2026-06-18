@@ -125,7 +125,7 @@ use crate::use_cases::prefetch_use_case::PrefetchUseCase;
 /// A single tick visits at most this many repos; subsequent CronJob runs
 /// drain any backlog. Pinning as a `u64` constant (rather than wiring
 /// through env) follows the v1 sweep precedent — ENV-tuning is out of
-/// scope for this initiative.
+/// scope here.
 const MAX_REPOS_PER_TICK: u64 = 1000;
 
 /// Soft cap on distinct package names walked per repository per tick.
@@ -134,7 +134,7 @@ const MAX_REPOS_PER_TICK: u64 = 1000;
 /// ticks — the planner is idempotent so the partition is harmless.
 const MAX_PACKAGES_PER_REPO: u64 = 1000;
 
-/// Spec 077 §3.5 — per-tick enqueue budget. The walk is bulk
+/// Per-tick enqueue budget. The walk is bulk
 /// (`repos × tracked-packages × depth`), so the row-fan-out is bounded
 /// here even though the L3 `target_key` single-flight (`ON CONFLICT DO
 /// NOTHING`) collapses cross-tick duplicates. Checked **between
@@ -144,16 +144,15 @@ const MAX_PACKAGES_PER_REPO: u64 = 1000;
 /// the same spirit as `MAX_REPOS_PER_TICK` / `MAX_PACKAGES_PER_REPO`.
 const MAX_PREFETCHES_PER_TICK: usize = 5000;
 
-/// Spec 077 §3.2 — `kind` for the leaf-ingest rows the tick enqueues.
-/// Dispatched to `PrefetchIngestHandler` (the same kind the cascade +
-/// self-service use).
+/// `kind` for the leaf-ingest rows the tick enqueues. Dispatched to
+/// `PrefetchIngestHandler` (the same kind the cascade + self-service use).
 const PREFETCH_INGEST_KIND: &str = "prefetch";
 
-/// Spec 077 §3.2 / §3.4 — `trigger_source` for scheduled enqueues.
-/// Deliberately NOT `"prefetch"` (the cascade-internal marker): a
-/// `"scheduled"` leaf is a SEED, so its ingest re-fires the transitive
-/// cascade (`is_cascade_internal_leaf` is `trigger_source == "prefetch"`).
-/// Must be present in the `jobs.trigger_source` CHECK (migration 009).
+/// `trigger_source` for scheduled enqueues. Deliberately NOT `"prefetch"`
+/// (the cascade-internal marker): a `"scheduled"` leaf is a SEED, so its
+/// ingest re-fires the transitive cascade (`is_cascade_internal_leaf` is
+/// `trigger_source == "prefetch"`). Must be present in the
+/// `jobs.trigger_source` CHECK (migration 009).
 const SCHEDULED_TRIGGER_SOURCE: &str = "scheduled";
 
 // ---------------------------------------------------------------------------
@@ -166,10 +165,9 @@ pub struct PrefetchTickHandler {
     repositories: Arc<dyn RepositoryRepository>,
     artifacts: Arc<dyn ArtifactRepository>,
     prefetch: Arc<PrefetchUseCase>,
-    /// Spec 077 §3.1 — the jobs port the tick enqueues `prefetch`
-    /// leaf-ingests through (via `enqueue_prefetch_batch`, the cascade's
-    /// `target_key`-deduped path). Mirrors `PrefetchDependenciesHandler`'s
-    /// port-only shape.
+    /// The jobs port the tick enqueues `prefetch` leaf-ingests through
+    /// (via `enqueue_prefetch_batch`, the cascade's `target_key`-deduped
+    /// path). Mirrors `PrefetchDependenciesHandler`'s port-only shape.
     jobs: Arc<dyn JobsRepository>,
     upstream_proxy: Arc<dyn UpstreamProxy>,
     upstream_mappings: Arc<dyn RepositoryUpstreamMappingRepository>,
@@ -180,17 +178,17 @@ pub struct PrefetchTickHandler {
     /// the worker already owns this map and clones it into the
     /// handler at registration time.
     format_handlers: HashMap<String, Arc<dyn FormatHandler>>,
-    /// Spec 077 §3.5 — per-tick enqueue budget. Defaults to
-    /// [`MAX_PREFETCHES_PER_TICK`]; a field (not a bare const read) so the
-    /// budget boundary is unit-testable without a 5000-row fixture.
+    /// Per-tick enqueue budget. Defaults to [`MAX_PREFETCHES_PER_TICK`]; a
+    /// field (not a bare const read) so the budget boundary is
+    /// unit-testable without a 5000-row fixture.
     max_prefetches_per_tick: usize,
 }
 
 impl PrefetchTickHandler {
-    /// Construct the handler from its port dependencies + the Item-7
-    /// planner. `prefetch` is `Arc<PrefetchUseCase>` for shape consistency
-    /// with the rest of the use-case surface — `PrefetchUseCase` is a
-    /// zero-cost unit struct so the `Arc` is a trivial wrapper.
+    /// Construct the handler from its port dependencies + the planner.
+    /// `prefetch` is `Arc<PrefetchUseCase>` for shape consistency with the
+    /// rest of the use-case surface — `PrefetchUseCase` is a zero-cost unit
+    /// struct so the `Arc` is a trivial wrapper.
     pub fn new(
         repositories: Arc<dyn RepositoryRepository>,
         artifacts: Arc<dyn ArtifactRepository>,
@@ -221,16 +219,16 @@ struct TickSummary {
     repos_walked: u64,
     packages_walked: u64,
     prefetches_planned: u64,
-    /// Spec 077 §3.6 — `prefetch` leaf rows actually inserted by
-    /// `enqueue_prefetch_batch` (the ids it returned). Mirrors the
-    /// cascade's `WalkSummary::prefetch_rows_enqueued`.
+    /// `prefetch` leaf rows actually inserted by `enqueue_prefetch_batch`
+    /// (the ids it returned). Mirrors the cascade's
+    /// `WalkSummary::prefetch_rows_enqueued`.
     prefetches_enqueued: u64,
-    /// Spec 077 §3.6 — planned rows collapsed by the L3 `target_key`
-    /// `ON CONFLICT DO NOTHING` (`attempted − inserted`). Mirrors the
-    /// cascade's `WalkSummary::prefetch_rows_deduped`.
+    /// Planned rows collapsed by the L3 `target_key` `ON CONFLICT DO
+    /// NOTHING` (`attempted − inserted`). Mirrors the cascade's
+    /// `WalkSummary::prefetch_rows_deduped`.
     prefetches_deduped: u64,
-    /// Spec 077 §3.5 — `true` when the per-tick enqueue budget stopped
-    /// the walk early (remaining packages resume next tick).
+    /// `true` when the per-tick enqueue budget stopped the walk early
+    /// (remaining packages resume next tick).
     budget_exhausted: bool,
     skipped_disabled: u64,
     skipped_no_trigger: u64,
@@ -505,7 +503,7 @@ impl TaskHandler for PrefetchTickHandler {
                         continue;
                     }
 
-                    // ----- Step 5: enqueue the cohort (spec 077 §3.2) ------
+                    // ----- Step 5: enqueue the cohort -------------------------
                     // One `prefetch` leaf row per planned version, batched
                     // through the cascade's `target_key`-deduped path
                     // (`enqueue_prefetch_batch` → `ON CONFLICT (target_key)
@@ -552,9 +550,9 @@ impl TaskHandler for PrefetchTickHandler {
                         }
                     }
 
-                    // Per-tick budget (spec 077 §3.5), checked BETWEEN
-                    // packages so each walked package's cohort enqueues
-                    // whole (keeps the plan-time metric aligned per package).
+                    // Per-tick budget, checked BETWEEN packages so each
+                    // walked package's cohort enqueues whole (keeps the
+                    // plan-time metric aligned per package).
                     if summary.prefetches_enqueued >= self.max_prefetches_per_tick as u64 {
                         summary.budget_exhausted = true;
                         tracing::warn!(
@@ -617,7 +615,7 @@ fn run_planner_sync(
 /// Map a [`RepositoryFormat`] reference to a Phase-1 [`VersionOrdering`]
 /// reference. Returns `None` for formats without a Phase-1 reference
 /// ordering (Maven, OCI, generic, etc.). Mirrors the per-format pick at
-/// the format-crate serve sites (Item 3 + Item 4).
+/// the format-crate serve sites.
 fn ordering_for_format(format: &RepositoryFormat) -> Option<&'static dyn VersionOrdering> {
     static NPM: NpmSemverOrdering = NpmSemverOrdering;
     static CARGO: CargoSemverOrdering = NpmSemverOrdering;
@@ -627,8 +625,7 @@ fn ordering_for_format(format: &RepositoryFormat) -> Option<&'static dyn Version
         RepositoryFormat::Cargo => Some(&CARGO as &dyn VersionOrdering),
         RepositoryFormat::Pypi => Some(&PEP440 as &dyn VersionOrdering),
         // Maven, OCI, Helm, RPM, Debian, … — Phase-1 has no reference
-        // ordering. Phase-2 (Item 9 OCI, Item 11 Maven) extends this
-        // match.
+        // ordering. Phase-2 extends this match.
         _ => None,
     }
 }
@@ -1165,8 +1162,8 @@ mod tests {
         )
     }
 
-    /// Spec 077 — variant that threads a caller-supplied `MockJobsRepository`
-    /// so a test can assert the `enqueue_prefetch_batch` rows / dedup.
+    /// Variant that threads a caller-supplied `MockJobsRepository` so a test
+    /// can assert the `enqueue_prefetch_batch` rows / dedup.
     fn make_handler_with_jobs(
         repos: Arc<MockRepoRepo>,
         arts: Arc<MockArtRepo>,
@@ -1397,13 +1394,12 @@ mod tests {
     }
 
     // =====================================================================
-    // Item 8b: a real upstream-vs-held divergence walks the planner
-    // and ticks `hort_prefetch_enqueued_total{trigger="scheduled"}`.
+    // A real upstream-vs-held divergence walks the planner and ticks
+    // `hort_prefetch_enqueued_total{trigger="scheduled"}`.
     //
     // **No fixture-injected divergence at the planner tier** — the test
     // wires the full handler (UpstreamProxy + FormatHandler-by-key +
-    // mapping repo) and lets the production code path drive the
-    // emission. This is the Item 8b acceptance metric assertion.
+    // mapping repo) and lets the production code path drive the emission.
     // =====================================================================
 
     #[test]
@@ -1485,7 +1481,7 @@ mod tests {
             .expect(
                 "hort_prefetch_enqueued_total must fire with trigger=scheduled \
                  from the prefetch-tick handler walking real upstream-vs-held \
-                 divergence (Item 8b acceptance)",
+                 divergence",
             );
         match &enqueued.3 {
             DebugValue::Counter(c) => {
@@ -1496,7 +1492,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Spec 077 — the scheduled tick ENQUEUES `prefetch` leaf rows
+    // The scheduled tick ENQUEUES `prefetch` leaf rows
     // (`enqueue_prefetch_batch`), it does not merely plan + count.
     // =====================================================================
 
@@ -1590,7 +1586,7 @@ mod tests {
     /// (same `target_key` the handler computes) is collapsed by the L3
     /// `ON CONFLICT DO NOTHING` — counted `deduped`, not a second row. This
     /// is the cross-tick / cross-cascade dedup the self-service mirror would
-    /// NOT have provided (review H1).
+    /// NOT have provided.
     #[tokio::test]
     async fn scheduled_tick_dedups_already_inflight_target_key() {
         let r = repo_with(
@@ -1729,9 +1725,9 @@ mod tests {
         }
     }
 
-    /// Spec 077 §3.2 — a `enqueue_prefetch_batch` failure is best-effort:
-    /// logged and the walk continues to completion (the versions re-plan
-    /// next tick), nothing counted as enqueued/deduped.
+    /// A `enqueue_prefetch_batch` failure is best-effort: logged and the
+    /// walk continues to completion (the versions re-plan next tick),
+    /// nothing counted as enqueued/deduped.
     #[tokio::test]
     async fn scheduled_tick_continues_on_batch_enqueue_error() {
         let r = repo_with(
@@ -1791,8 +1787,8 @@ mod tests {
         }
     }
 
-    /// Spec 077 §3.2 — when the planner returns no new versions (upstream ==
-    /// held), the package is walked but no batch is enqueued.
+    /// When the planner returns no new versions (upstream == held), the
+    /// package is walked but no batch is enqueued.
     #[tokio::test]
     async fn scheduled_tick_skips_enqueue_when_nothing_planned() {
         let r = repo_with(
@@ -1849,9 +1845,9 @@ mod tests {
     }
 
     // =====================================================================
-    // Item 8b failure-mode partitions: no mapping / fetch error / parse
-    // error / package-status error each route into the matching summary
-    // counter and the walk continues.
+    // Failure-mode partitions: no mapping / fetch error / parse error /
+    // package-status error each route into the matching summary counter
+    // and the walk continues.
     // =====================================================================
 
     #[tokio::test]

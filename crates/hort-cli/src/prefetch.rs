@@ -83,7 +83,7 @@ struct SelfServicePrefetchRequestBody {
 /// **Sync-required**: mirrors
 /// `hort_http_discovery::dto::PrefetchRequestItemDto`. `version: None`
 /// means *latest upstream-advertised* — the server resolves at enqueue
-/// time (§3.1).
+/// time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PrefetchRequestItemBody {
     package: String,
@@ -135,7 +135,7 @@ pub struct FailedItemDto {
 }
 
 /// Mirror of `hort_domain::entities::discovery::PrefetchItemError` — the
-/// eight-arm closed enum aligned with `UpstreamErrorKind` (§3.2).
+/// eight-arm closed enum aligned with `UpstreamErrorKind`.
 ///
 /// `Upstream4xx` / `Upstream5xx` carry the explicit `serde(rename)` per
 /// the domain definition so the wire labels are exactly `upstream_4xx`
@@ -169,7 +169,7 @@ pub enum PrefetchItemErrorDto {
 /// a UUID); `package` is the format-native spelling. `--version` is
 /// optional — omitted means "latest upstream-advertised", which the
 /// server resolves at enqueue time via
-/// `UpstreamMetadataPort::list_versions` (design §3.1).
+/// `UpstreamMetadataPort::list_versions`.
 #[derive(Args, Debug)]
 pub struct PrefetchArgs {
     /// Repository stable key (e.g. `npm-proxy`).
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn build_path_uses_long_form_url() {
-        // URL-2 (design §2.2) — `/repositories/` not `/repos/`.
+        // Use `/repositories/` not `/repos/`.
         let path = build_path("npm-proxy");
         assert_eq!(path, "/api/v1/repositories/npm-proxy/prefetch");
         assert!(!path.contains("/repos/"));

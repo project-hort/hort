@@ -6,7 +6,7 @@
 //! [`ReplayGuardPort`](super::replay_guard::ReplayGuardPort) is the
 //! **hot-path** atomic claim used inside the federation token-exchange
 //! mint use case. The seen-set's TTL cleanup is an entirely separate,
-//! **cold-path** concern (spec §4): a periodic
+//! **cold-path** concern: a periodic
 //! `DELETE FROM jwt_replay_seen WHERE expires_at < now()` driven by the
 //! worker `TaskHandler` + external-CronJob model — exactly the
 //! pattern the sibling cleanup/maintenance tasks
@@ -21,7 +21,7 @@
 //! `jwt_replay_seen`), so there is exactly one place the table's DML
 //! lives.
 //!
-//! # Cleanup degrades SAFE (spec §4 — the F-22/F-1 crux)
+//! # Cleanup degrades safe
 //!
 //! If the prune never runs the table only grows; the seen-set never
 //! *forgets* a `jti` within its TTL window, so a stale-but-present row
@@ -62,8 +62,8 @@ pub trait ReplaySeenPrunePort: Send + Sync {
     /// [`ReplayGuardError::Unavailable`] if the backing store could not
     /// be reached. The caller (the `replay-seen-prune` `TaskHandler`)
     /// maps `Unavailable` to a retry-on-next-tick outcome — cleanup
-    /// degrades **safe** (spec §4): a missed prune only grows the
-    /// table, it never forgets a recorded replay.
+    /// degrades **safe**: a missed prune only grows the table, it never
+    /// forgets a recorded replay.
     fn prune_expired(&self) -> BoxFuture<'_, Result<u64, ReplayGuardError>>;
 }
 

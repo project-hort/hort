@@ -55,7 +55,7 @@ pub struct ArtifactGroupMember {
 /// # Canonicalization contract — load-bearing
 ///
 /// `coords_json` is the unique key on `artifact_groups`. The handler that
-/// produces a `GroupMembership { group_coords, … }` in Item 7 MUST populate
+/// produces a `GroupMembership { group_coords, … }` MUST populate
 /// `group_coords` with ONLY the identity-forming fields of [`ArtifactCoords`] —
 /// `name`, `name_as_published`, `version`, `format`. The per-file fields
 /// (`path`, `metadata`) MUST be their type-default values
@@ -77,8 +77,7 @@ pub struct ArtifactGroup {
     /// consumer needs "the main file" without disambiguation (e.g.
     /// `HEAD /<group>/<artifact>/<version>/` with no file-name).
     /// Advisory, not enforced. The empty-string sentinel (`""`) is
-    /// allowed and represents "no primary role assigned yet" — see
-    /// design doc §2.10 case 2.
+    /// allowed and represents "no primary role assigned yet".
     pub primary_role: String,
     pub members: Vec<ArtifactGroupMember>,
     pub created_at: DateTime<Utc>,
@@ -161,8 +160,8 @@ mod tests {
 
     #[test]
     fn artifact_group_allows_empty_primary_role() {
-        // Case 2 per §2.10: first member not primary, group created with
-        // empty-string sentinel so a later primary can claim the slot.
+        // First member is not primary; group created with empty-string
+        // sentinel so a later primary can claim the slot.
         let g = ArtifactGroup {
             primary_role: String::new(),
             ..sample_group()

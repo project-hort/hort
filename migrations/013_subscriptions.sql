@@ -28,8 +28,8 @@
 --     subscription row vanishes with it. Same convention as
 --     `api_tokens.user_id` (ADR 0012).
 --   * `created_by_token_id` → `api_tokens(id) ON DELETE SET NULL` —
---     audit attribution only (design §3 / §11 invariant 6). Rotating
---     or deleting the authoring token does NOT cascade-delete the
+--     audit attribution only. Rotating or deleting the authoring token
+--     does NOT cascade-delete the
 --     subscription (the cap snapshot lives in `filter.repositories`,
 --     not in a token reference). When the token is removed, the
 --     attribution column nulls out — the subscription stays live.
@@ -53,21 +53,20 @@
 --     (`{"kind": "all"}` or `{"kind": "some", "kinds": [...]}`),
 --     `repositories` (`{"kind": "owned_by_actor" | "some" | "all"}`),
 --     `named_predicates` (empty in v1; reserved as the audited
---     extension point — design §3 / §11 invariant 4).
+--     extension point).
 --   * `last_failure` — `{"at": <RFC3339>, "reason": <NotifyFailureReason JSON>,
 --     "consecutive_failures": <u32>}` overwritten on each new failure
---     (design §3 — visibility aid, NOT delivery semantics).
+--     (visibility aid, NOT delivery semantics).
 --   This is typed Rust DTOs in the adapter — NOT operator-typed YAML.
 --   Schemas evolve via deliberate Rust code changes, not opaque blob
 --   edits.
 --
 -- Closed-enum constraints:
 --   * `target_kind ∈ {webhook, nats_jetstream}` mirrors the two v1
---     `SubscriptionTarget` variants (design §3).
---   * `state ∈ {active, paused, disabled}` mirrors `SubscriptionState`
---     (design §3).
+--     `SubscriptionTarget` variants.
+--   * `state ∈ {active, paused, disabled}` mirrors `SubscriptionState`.
 --   * `disable_reason ∈ {owner_deactivated, delivery_failure_budget_exhausted,
---     operator_disabled}` OR NULL mirrors `DisableReason` (design §3).
+--     operator_disabled}` OR NULL mirrors `DisableReason`.
 --     `NULL` is the steady-state value when `state != 'disabled'`.
 --
 -- GRANTs / role wiring: this migration ships NO explicit
@@ -105,7 +104,7 @@ CREATE TABLE public.subscriptions (
     name character varying(255) NOT NULL,
     description text,
     -- 1 KB cap on description — same data-minimisation discipline as
-    -- `api_tokens.description` (F7 GDPR review). The use case maps the
+    -- `api_tokens.description` (GDPR review). The use case maps the
     -- constraint to `400 invalid_description`; raw INSERT bypassing the
     -- use case still gets caught at the schema layer.
     CONSTRAINT subscriptions_description_length_check CHECK (
@@ -129,7 +128,7 @@ CREATE TABLE public.subscriptions (
     state character varying(32) NOT NULL DEFAULT 'active'
         CHECK (state IN ('active', 'paused', 'disabled')),
     disable_reason character varying(64),
-    -- Mirror the closed-enum `DisableReason` (design §3) at the
+    -- Mirror the closed-enum `DisableReason` at the
     -- schema layer so out-of-band SQL cannot land a nonsense reason
     -- that the adapter's `disable_reason_from_text` would later
     -- surface as a corrupt-row Invariant.

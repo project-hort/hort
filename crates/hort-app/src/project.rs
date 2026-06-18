@@ -221,7 +221,7 @@ mod tests {
             .expect("project");
         assert_eq!(bytes, b"hello world");
         // Test artefact cleanup; in production the cache layer owns
-        // lifetime (Item 2 / Item 7).
+        // the file lifetime.
         std::fs::remove_file(&handle.path).ok();
     }
 

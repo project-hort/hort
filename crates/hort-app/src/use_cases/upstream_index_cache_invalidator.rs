@@ -108,9 +108,8 @@ impl UpstreamIndexCacheInvalidator for AppUpstreamIndexCacheInvalidator {
             }
 
             // Per-format key derivation. Aliased families route per
-            // their underlying format (spec §4 — the comment table
-            // in the module docs); unsupported formats yield no keys
-            // and the loop is a no-op.
+            // their underlying format (see module docs); unsupported
+            // formats yield no keys and the loop is a no-op.
             let keys: Vec<String> = mappings
                 .iter()
                 .flat_map(|m| derive_cache_keys(&repo.format, m.id, &package))
@@ -278,13 +277,13 @@ fn derive_cache_keys(
 // Post-commit hook helper — extracted because the three emitter sites
 // (CurationUseCase::block_one, QuarantineUseCase::record_scan_result
 // Reject branch, ApplyConfigUseCase::commit_retroactive_block) cross
-// the 3-blocks duplication threshold (CLAUDE.md). See spec §5.
+// the 3-blocks duplication threshold (CLAUDE.md).
 // ---------------------------------------------------------------------------
 
 /// Best-effort post-commit cache-invalidation hook. Called by each
 /// `ArtifactRejected` emitter **after** its `commit_*` returns
-/// `Ok(_)`. Logs `tracing::debug!` on success (per spec §5 — defense-
-/// in-depth, not security-relevant) and `tracing::warn!` on failure.
+/// `Ok(_)`. Logs `tracing::debug!` on success (defense-in-depth, not
+/// security-relevant) and `tracing::warn!` on failure.
 /// Returns `()` — the caller never propagates this error (the event-
 /// store append already committed).
 pub(crate) async fn invalidate_after_reject(
@@ -483,11 +482,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Tests (spec §7)
+    // Tests
     // -----------------------------------------------------------------
 
-    /// Spec §7 case 1 — two npm mappings, same package. Both cache
-    /// rows evicted in one call. Unrelated-package row survives.
+    /// Two npm mappings, same package. Both cache rows evicted in one
+    /// call. Unrelated-package row survives.
     #[tokio::test]
     async fn invalidates_npm_packument_for_two_mappings() {
         let repo = make_repo(RepositoryFormat::Npm);
@@ -542,9 +541,9 @@ mod tests {
         );
     }
 
-    /// Spec §7 case 3 — cargo invalidates the per-crate key but
-    /// preserves the per-mapping `cargo_index_config:` row (sibling
-    /// keyspace; per-mapping config, not per-package).
+    /// Cargo invalidates the per-crate key but preserves the per-mapping
+    /// `cargo_index_config:` row (sibling keyspace; per-mapping config,
+    /// not per-package).
     #[tokio::test]
     async fn invalidates_cargo_index_skipping_config_key() {
         let repo = make_repo(RepositoryFormat::Cargo);
@@ -573,9 +572,9 @@ mod tests {
         );
     }
 
-    /// Spec §7 case 4 — PyPI key derivation uses PEP 503 normalised
-    /// form so cache-row identity follows the writer's key shape. The
-    /// invalidator receives a raw name and normalises internally.
+    /// PyPI key derivation uses PEP 503 normalised form so cache-row
+    /// identity follows the writer's key shape. The invalidator receives
+    /// a raw name and normalises internally.
     #[tokio::test]
     async fn invalidates_pep503_normalised_pypi_name() {
         let repo = make_repo(RepositoryFormat::Pypi);
@@ -597,9 +596,9 @@ mod tests {
         assert!(!eph.has(&format!("pypi_simple_proj:{}:some-package", m.id)));
     }
 
-    /// Spec §7 case 5 — a repo with no upstream mappings yields
-    /// `Ok(0)` and emits zero `EphemeralStore::delete` calls. The
-    /// delete-call counter pins the no-op contract.
+    /// A repo with no upstream mappings yields `Ok(0)` and emits zero
+    /// `EphemeralStore::delete` calls. The delete-call counter pins the
+    /// no-op contract.
     #[tokio::test]
     async fn repository_with_no_mappings_returns_zero() {
         let repo = make_repo(RepositoryFormat::Npm);
@@ -622,9 +621,9 @@ mod tests {
         );
     }
 
-    /// Spec §7 case 6 — when `EphemeralStore::delete` errors, the
-    /// invalidator propagates `Err`. The caller logs `warn!` and does
-    /// not roll back the event-store append (that is the contract of
+    /// When `EphemeralStore::delete` errors, the invalidator propagates
+    /// `Err`. The caller logs `warn!` and does not roll back the
+    /// event-store append (that is the contract of
     /// `invalidate_after_reject` — covered by the integration test).
     #[tokio::test]
     async fn ephemeral_store_error_propagates_to_caller() {

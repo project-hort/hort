@@ -8,7 +8,7 @@
 //!
 //! - [`HostedCargoSource`] — reads the local artifact projection via
 //!   [`ArtifactUseCase::list_by_raw_name_visible`] (threading the
-//!   caller principal so F-25 anti-enumeration applies — denied / no-
+//!   caller principal so anti-enumeration applies — denied / no-
 //!   rows / missing-repo all collapse to `NotFound` at the unified
 //!   handler).
 //! - [`ProxyCargoSource`] — drives the upstream-fetch + cache +
@@ -54,7 +54,7 @@
 //! Cargo mirrors the npm/PyPI shape: hosted sources can be truncated
 //! (the paginated read caps at `LIMIT_LIST_MAX_ITEMS`); proxy sources
 //! cannot (upstream cargo sparse-index NDJSON is not paginated on the
-//! wire). Re-declared here per the design (sources are crate-private;
+//! wire). Re-declared here (sources are crate-private;
 //! the support type is also crate-private and per-crate-local) —
 //! mirrors `IndexSourceOutput` in `hort-http-npm/src/index_source.rs`
 //! and `hort-http-pypi/src/index_source.rs`.
@@ -94,12 +94,12 @@ pub(crate) struct IndexSourceOutput {
     pub truncated: bool,
 }
 
-/// Per-format index source. Stays `pub(crate)` per design §2.3 —
+/// Per-format index source. Stays `pub(crate)` —
 /// sources are an implementation detail of the format HTTP crate.
 #[async_trait]
 pub(crate) trait IndexSource: Send + Sync {
     /// Produce per-version entries for `crate_name` on `repo`.
-    /// `caller` is threaded for F-25 anti-enumeration (the hosted
+    /// `caller` is threaded for anti-enumeration (the hosted
     /// source's use-case call requires it).
     async fn fetch(
         &self,
@@ -119,7 +119,7 @@ pub(crate) trait IndexSource: Send + Sync {
 ///
 /// Reads the local artifact projection via
 /// [`ArtifactUseCase::list_by_raw_name_visible`] (the
-/// per-resource-visibility-enforcing entry point — F-25 invariant).
+/// per-resource-visibility-enforcing anti-enumeration entry point).
 /// Each Artifact row becomes one [`VersionEntry`] whose
 /// `payload.Cargo` carries the hosted-emission NDJSON-line fields:
 /// `name` from `Artifact.name` (drift-resilience pin), `vers` from
@@ -222,10 +222,10 @@ impl IndexSource for ProxyCargoSource {
         crate_name: &str,
         caller: Option<&CallerPrincipal>,
     ) -> Result<IndexSourceOutput, AppError> {
-        // F-25 thread-through — defensive re-resolve. The unified
+        // Anti-enumeration defensive re-resolve. The unified
         // handler performs `RepositoryAccessUseCase::resolve(_, actor,
         // Read)` before invoking the source; we re-resolve here
-        // defensively so the F-25 invariant holds even if a future
+        // defensively so the anti-enumeration invariant holds even if a future
         // caller bypasses the dispatch hop. Mirrors `ProxyNpmSource`'s
         // same defensive re-resolve.
         let _ = ctx

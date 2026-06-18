@@ -79,10 +79,10 @@ pub struct EnqueueQuarantineReleaseSweepArgs {}
 
 /// Synchronous entry point. Delegates to [`super::run_with_runtime`]
 /// which builds a Tokio runtime, runs [`run_async`], and maps the
-/// result to a process exit code. Per design §2.4 finding 2 the
-/// CronJob's success criterion is **exit code only**: `0` on a
-/// successful insert (the row is visible in `public.jobs`), non-zero
-/// on connect/insert failure (next cron tick retries).
+/// result to a process exit code. The CronJob's success criterion is
+/// **exit code only**: `0` on a successful insert (the row is visible
+/// in `public.jobs`), non-zero on connect/insert failure (next cron
+/// tick retries).
 pub fn run(args: EnqueueQuarantineReleaseSweepArgs) -> ExitCode {
     super::run_with_runtime(move || run_async(args), |_| ExitCode::SUCCESS)
 }

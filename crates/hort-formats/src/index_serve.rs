@@ -11,11 +11,10 @@
 //! circular edge.
 //!
 //! This module re-exports the public surface under the
-//! `hort_formats::index_serve` path the design doc §2.6 names so
-//! format-crate consumers — the per-format `IndexBuilder`
-//! implementations that land in
-//! `hort_formats::<format>::index` in Items 2/3/4 — have a single
-//! import location: `use hort_formats::index_serve::{VersionEntry,
+//! `hort_formats::index_serve` path so format-crate consumers —
+//! the per-format `IndexBuilder` implementations that land in
+//! `hort_formats::<format>::index` — have a single import location:
+//! `use hort_formats::index_serve::{VersionEntry,
 //! IndexBuilder, BuildContext, …};`.
 //!
 //! See the [`hort_app::use_cases::index_serve`] module docs for the
@@ -31,14 +30,14 @@ mod tests {
 
     /// Smoke-test the re-export — the items must be reachable via
     /// `hort_formats::index_serve::…` so the per-format `IndexBuilder`
-    /// modules (Items 2/3/4) can pull them from a single path.
+    /// modules can pull them from a single path.
     #[test]
     fn reexports_are_reachable() {
         // VersionEntry is a struct shape — pin that the three fields
         // are visible at the re-export path. An empty `Vec` exercises
         // the type at the type level without requiring a constructed
-        // `PerVersionPayload` value (the npm variant lands via Item 2
-        // and is exercised in `hort-formats::npm::index`'s test module).
+        // `PerVersionPayload` value (the npm variant is exercised in
+        // `hort-formats::npm::index`'s test module).
         let entries: Vec<VersionEntry> = Vec::new();
         assert!(entries.is_empty());
 

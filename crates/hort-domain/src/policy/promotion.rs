@@ -31,7 +31,7 @@
 //! Until those ports land, the artifact passes the promotion gate as
 //! soon as no excluded-and-thresholded CVE remains. License-policy
 //! shape violations stored on `ScanPolicyProjection.license_policy`
-//! still surface through the scan-result path (Item 4) at scan time;
+//! still surface through the scan-result path at scan time;
 //! a clean promotion attempt does not need to re-check them.
 //!
 //! ## Outcome derivation
@@ -55,9 +55,8 @@
 //! When the artifact has never been scanned, `last_scan_summary` is
 //! [`None`]. The evaluator treats that as a clean baseline (zero
 //! findings) — the artifact passes the CVE check and the outcome
-//! falls out of the same translator. See backlog Item 8 acceptance:
-//! "missing scan summary (artifact never scanned) treats CVE input as
-//! empty/clean."
+//! falls out of the same translator. A missing scan summary (artifact
+//! never scanned) treats CVE input as empty/clean.
 //!
 //! This is intentional. v1 does not require a scan to have run before
 //! promotion. When scanner integration

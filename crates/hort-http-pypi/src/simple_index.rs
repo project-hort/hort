@@ -567,7 +567,7 @@ pub async fn fetch_raw_with_cache(
 /// Stream the cached upstream body through the format-appropriate
 /// projector, optionally mirroring the raw body (PASS 2). The JSON arm
 /// receives a PRE-BUILT [`PypiSimpleIndexProjector`] (`Some`) whose
-/// `cap_trip_flag` the caller holds so an I-6 per-file-object cap trip is
+/// `cap_trip_flag` the caller holds so a per-file-object cap trip is
 /// discriminated from a generic parse error after the coalesce; the HTML
 /// arm (`None`) builds its [`HtmlSimpleIndexProjector`] internally (it has
 /// no per-file-object cap concept). Both yield a
@@ -605,7 +605,7 @@ async fn project_body(
 
 /// Re-project a raw simple-index body from the metadata mirror through
 /// the format-appropriate streaming projector. Used **only** on the
-/// stale-while-error / air-gapped fallback path (§4) — off the hot serve
+/// stale-while-error / air-gapped fallback path — off the hot serve
 /// path, which never reads the mirror (it renders the cached
 /// projection). The mirror reader is read into a buffer here and
 /// projected via `Cursor`: the sync `MetadataProjector`
@@ -673,9 +673,9 @@ async fn project_from_mirror(
 /// not double-pull.
 ///
 /// **Spawn vs DB job row.** Hot-path triggers (every simple-index
-/// serve fires this) deliberately spawn — design §9 calls out the
-/// per-serve `jobs` row churn as the cost the planner is sized to
-/// avoid. The `scheduled` trigger (Item 8) is the DB-backed path.
+/// serve fires this) deliberately spawn — the per-serve `jobs` row
+/// churn is the cost the planner is sized to avoid. The scheduled
+/// trigger is the DB-backed path.
 pub(crate) fn fire_prefetch_trigger_pypi(
     ctx: &Arc<AppContext>,
     repo: &Repository,
@@ -1225,7 +1225,7 @@ mod tests {
         assert_eq!(payload.files.len(), 2, "wheel + sdist");
     }
 
-    /// (B5) A malformed JSON upstream body fails closed: rejects with
+    /// A malformed JSON upstream body fails closed: rejects with
     /// `MetadataMalformed` (maps to `parse_error` / 4xx, NOT the
     /// `UpstreamUnavailable` network bucket), and neither Redis nor the
     /// mirror is written.
@@ -1267,7 +1267,7 @@ mod tests {
         assert!(mocks.metadata_mirror.keys().is_empty());
     }
 
-    /// (I-6) A JSON body whose single per-file object exceeds the
+    /// A JSON body whose single per-file object exceeds the
     /// per-value cap surfaces as the TYPED `VersionObjectTooLarge` variant
     /// (NOT `MetadataMalformed`), driven by the projector's `cap_trip_flag`
     /// rather than a brittle error-string match. Fail-closed: nothing
@@ -1301,7 +1301,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, IndexFetchError::VersionObjectTooLarge { .. }),
-            "per-file cap trip must be the typed VersionObjectTooLarge (I-6), \
+            "per-file cap trip must be the typed VersionObjectTooLarge, \
              NOT MetadataMalformed; got {err:?}"
         );
         // Fail-closed: nothing cached, nothing mirrored.
@@ -1315,7 +1315,7 @@ mod tests {
         assert!(mocks.metadata_mirror.keys().is_empty());
     }
 
-    /// (B5) A non-UTF-8 HTML upstream body fails closed the same way.
+    /// A non-UTF-8 HTML upstream body fails closed the same way.
     #[tokio::test]
     async fn html_arm_malformed_maps_to_parse_error_fail_closed() {
         let (ctx, mocks) = build_mock_ctx(handle());
@@ -1396,8 +1396,8 @@ mod tests {
 
     /// Stale projection in Redis + upstream down → serve the stale
     /// projection (stale-while-error), no error. Mirrors the npm
-    /// (`packument.rs`) and cargo (`index_cache.rs`) Spec §4 acceptance
-    /// rung: a genuine upstream OUTAGE (an `Invariant` error, NOT a
+    /// (`packument.rs`) and cargo (`index_cache.rs`) stale-fallback
+    /// acceptance: a genuine upstream OUTAGE (an `Invariant` error, NOT a
     /// `Validation` parse fault) must NOT be surfaced when a decodable
     /// stale projection is in Redis.
     #[tokio::test]
@@ -1451,9 +1451,9 @@ mod tests {
 
     /// No stale projection in Redis + upstream down + mirror present →
     /// re-project from the raw mirror and serve (air-gapped / outage
-    /// path). Mirrors the npm / cargo Spec §4 acceptance rung. The mirror
-    /// key is FORMAT-DISTINCT (`flask#json`), so the JSON projector is
-    /// applied to the stored raw body.
+    /// path). Mirrors the npm / cargo stale-fallback acceptance rung. The
+    /// mirror key is FORMAT-DISTINCT (`flask#json`), so the JSON projector
+    /// is applied to the stored raw body.
     #[tokio::test]
     async fn fetch_reprojects_from_mirror_when_redis_empty_and_upstream_down() {
         let (ctx, mocks) = build_mock_ctx(handle());

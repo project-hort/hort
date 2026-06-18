@@ -9,7 +9,7 @@
 //! `.jar`, `.whl`, …), so we do **not** extract here — handing Trivy
 //! the raw payload is enough.
 //!
-//! **F-15.** Bytes are streamed from `StoragePort::get` to the temp
+//! Bytes are streamed from `StoragePort::get` to the temp
 //! file in fixed-size chunks with a running byte count — no
 //! full-artifact RAM buffer. The copy is bounded by a configurable
 //! `max_artifact_size` cap (from [`TrivyConfig`](crate::TrivyConfig)):
@@ -79,7 +79,7 @@ pub(crate) async fn prepare_workspace(
     prepare_workspace_with_cap(storage, content_hash, max_artifact_size).await
 }
 
-/// F-15 core: streaming, size-capped CAS→tempfile copy. Split out
+/// Streaming, size-capped CAS→tempfile copy. Split out
 /// under an explicit name so unit tests can drive the cap behaviour
 /// directly without constructing a full adapter.
 ///

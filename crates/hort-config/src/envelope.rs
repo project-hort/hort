@@ -330,9 +330,9 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("ArtifactRepository"));
         assert!(rendered.contains("ClaimMapping"));
-        // The Initiative-14 additions must surface in the same error
-        // message — operators typing `policy` should see `ScanPolicy`
-        // suggested, not silently fall through to a generic message.
+        // All kinds must surface in the same error message — operators
+        // typing `policy` should see `ScanPolicy` suggested, not
+        // silently fall through to a generic message.
         assert!(rendered.contains("ScanPolicy"));
         assert!(rendered.contains("Exclusion"));
     }

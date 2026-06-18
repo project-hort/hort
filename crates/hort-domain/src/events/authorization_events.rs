@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn grant_subject_record_claims_wire_shape_is_tagged() {
-        // §8.2 wire contract: `{ "kind": "claims", "required": [..] }`.
+        // Wire contract: `{ "kind": "claims", "required": [..] }`.
         // The audit log + the effective-permissions endpoint speak one
         // subject vocabulary; a tag rename here breaks both consumers.
         let r = GrantSubjectRecord::Claims {
@@ -916,7 +916,7 @@ mod tests {
         assert!(e.validate().is_ok());
     }
 
-    // -- Item 5 LOAD-BEARING SECURITY GATE ------------------------------------
+    // -- LOAD-BEARING SECURITY GATE -------------------------------------------
     //
     // `RepositoryUpstreamMappingChanged` payloads MUST carry the secret-ref
     // *identifier*, never the resolved secret value. A regression that lets
@@ -1499,8 +1499,8 @@ mod tests {
 
     #[test]
     fn destructive_task_kinds_is_exactly_the_audited_three() {
-        // The F-9 destructive set is closed at the three kinds the audit
-        // names; scope-creep into other kinds is a regression.
+        // The destructive set is closed at the three audited kinds;
+        // scope-creep into other kinds is a regression.
         let mut got: Vec<&str> = DESTRUCTIVE_TASK_KINDS.to_vec();
         got.sort_unstable();
         let mut want = [

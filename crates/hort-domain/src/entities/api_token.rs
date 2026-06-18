@@ -33,8 +33,7 @@
 //!    propagate immediately).
 //! 2. The token's declared cap, if any. The cap is fixed at issuance and
 //!    never widens. A token issued with `[Read]` cannot acquire `Write`
-//!    even if the user later gains `Write` on the target repo (§8
-//!    invariant 4).
+//!    even if the user later gains `Write` on the target repo.
 //!
 //! The function takes both inputs and returns a single `bool`. The "live"
 //! part — re-resolving user grants on every call — is the caller's
@@ -81,14 +80,13 @@ pub enum TokenKind {
 
 /// The cap a token carries — an upper bound on its effective permissions.
 ///
-/// Per §3:
 /// - `permissions` is the typed subset of [`Permission`] the token is
 ///   allowed to exercise.
 /// - `repository_ids = None` means "inherit user grants" — the cap places
 ///   no per-repository restriction. `Some(vec![…])` locks the token to
-///   exactly those repos. `Some(vec![])` is rejected at issuance (see §4
-///   step 6) but is structurally allowed for forward-compat with
-///   `kind = CliSession`'s transient empty-set state.
+///   exactly those repos. `Some(vec![])` is rejected at issuance but is
+///   structurally allowed for forward-compat with `kind = CliSession`'s
+///   transient empty-set state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenCap {
     pub permissions: Vec<Permission>,
@@ -149,7 +147,7 @@ pub struct ApiToken {
 // Cap intersection
 // ---------------------------------------------------------------------------
 
-/// AND-of-cap-and-grants intersection check, per §5 step 4.
+/// AND-of-cap-and-grants intersection check.
 ///
 /// Returns `true` iff all of the following hold:
 ///
@@ -172,17 +170,16 @@ pub struct ApiToken {
 ///
 /// `user_grants` must be the user's **currently resolved** grant set.
 /// Group claims propagate immediately; tokens cannot retain authority
-/// the user has lost (§8 invariant 2). The "live" part is the caller's
-/// responsibility — the function is pure.
+/// the user has lost. The "live" part is the caller's responsibility —
+/// the function is pure.
 ///
 /// # Cap-vs-user-authority discipline
 ///
-/// At issuance the use case rejects caps wider than the user's authority
-/// (§4 step 2), but runtime intersection is authoritative — even if
-/// `cap.permissions` were somehow wider than the user's grants, the user
-/// grants leg of the AND would deny. Conversely, if the user later gains
-/// `Write` on a repo but the cap only declares `Read`, the cap leg of
-/// the AND denies (§8 invariant 4).
+/// At issuance the use case rejects caps wider than the user's authority,
+/// but runtime intersection is authoritative — even if `cap.permissions`
+/// were somehow wider than the user's grants, the user grants leg of the
+/// AND would deny. Conversely, if the user later gains `Write` on a repo
+/// but the cap only declares `Read`, the cap leg of the AND denies.
 pub fn effective_permission(
     token_cap: Option<&TokenCap>,
     user_grants: &[PermissionGrant],
@@ -535,7 +532,7 @@ mod tests {
         ));
     }
 
-    // -- §8 invariant 4: token-cap-narrower-than-user --------------------------
+    // -- token-cap-narrower-than-user invariant ---------------------------------
 
     #[test]
     fn invariant_4_user_gains_write_later_token_still_capped_to_read() {
@@ -563,7 +560,7 @@ mod tests {
         ));
     }
 
-    // -- §8 invariant 2: user loses role, token authority drops --------------
+    // -- user loses role, token authority drops --------------------------------
 
     #[test]
     fn invariant_2_user_loses_role_token_authority_drops() {
@@ -661,7 +658,7 @@ mod tests {
 
     #[test]
     fn cap_admin_token_with_admin_user_passes() {
-        // Admin tokens (off by default per §8 invariant 5) — when allowed,
+        // Admin tokens (off by default) — when allowed,
         // the cap must explicitly list Admin and the user must hold Admin
         // authority. Both legs of the AND apply.
         let cap_admin = cap(vec![Permission::Admin], None);
@@ -825,8 +822,8 @@ mod tests {
 
     #[test]
     fn cap_optional_repo_per_repo_cap_denies_system_level_op() {
-        // The load-bearing reconciliation case for §B6: a per-repo-restricted
-        // token cannot authorize a `repository_id = None` operation.
+        // A per-repo-restricted token cannot authorize a
+        // `repository_id = None` operation.
         let c = cap(vec![Permission::Read], Some(vec![repo_a()]));
         assert!(!cap_allows_optional_repo(Some(&c), Permission::Read, None));
     }

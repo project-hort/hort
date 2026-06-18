@@ -138,9 +138,8 @@ pub fn parse_findings_from_json(stdout: &[u8]) -> DomainResult<Vec<Finding>> {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Static configuration for [`TrivyAdapter`]. Mirrors the envvar
-/// surface in §6 of the design doc — the composition root populates
-/// these from `HORT_SCANNER_TRIVY_*` envvars.
+/// Static configuration for [`TrivyAdapter`]. The composition root
+/// populates these from `HORT_SCANNER_TRIVY_*` envvars.
 #[derive(Debug, Clone)]
 pub struct TrivyConfig {
     /// Path to the `trivy` binary. Default: `trivy` (resolved via
@@ -155,9 +154,9 @@ pub struct TrivyConfig {
     /// Rust-side `tokio::time::timeout` backstop in
     /// [`TrivyAdapter::run_scan`] — if `trivy` hangs before honouring
     /// its own `--timeout`, the adapter kills the child after this
-    /// duration. Default: 5 minutes. (F-15.)
+    /// duration. Default: 5 minutes.
     pub timeout: Duration,
-    /// F-15 — maximum artifact size, in bytes, that the adapter will
+    /// Maximum artifact size, in bytes, that the adapter will
     /// stream into a scan workspace. `prepare_workspace` streams the
     /// CAS bytes to the temp file with a running byte count; if the
     /// copy would exceed this cap it is aborted and the artifact is
@@ -208,9 +207,9 @@ impl Default for TrivyConfig {
             trivy_bin: PathBuf::from("trivy"),
             db_dir: None,
             timeout: Duration::from_secs(300),
-            // F-15 — 8 GiB. See field doc for the sizing rationale.
+            // 8 GiB. See field doc for the sizing rationale.
             max_artifact_size: 8 * 1024 * 1024 * 1024,
-            // F-40 — 256 MiB report-drain cap. See field doc.
+            // 256 MiB report-drain cap. See field doc.
             max_report_size: 256 * 1024 * 1024,
             severity_filter: vec!["CRITICAL", "HIGH", "MEDIUM", "LOW"],
             subprocess_ca_bundle: None,
@@ -275,9 +274,9 @@ impl TrivyAdapter {
     }
 
     /// Run the Trivy CLI against `target_dir`, return the parsed
-    /// report. Errors mirror the design doc's error-mapping table.
+    /// report.
     ///
-    /// **Timeout enforcement (F-15).** Trivy's own `--timeout` CLI
+    /// **Timeout enforcement.** Trivy's own `--timeout` CLI
     /// flag is cooperative defence-in-depth; it is the inner deadline.
     /// The outer guarantee is a Rust-side `tokio::time::timeout` of
     /// the same duration around the spawned child: if `trivy` hangs
@@ -326,7 +325,7 @@ impl TrivyAdapter {
 
         let timeout_duration = self.config.timeout;
         let max_report_size = self.config.max_report_size;
-        // F-40 — bound BOTH report pipes. Each pipe is drained through
+        // Bound BOTH report pipes. Each pipe is drained through
         // `drain_capped` (`.take(cap + 1)`); we do NOT await
         // `child.wait()` inside this race, because a cap-tripping child
         // keeps writing into a now-full pipe and never exits — racing
@@ -369,7 +368,7 @@ impl TrivyAdapter {
             };
 
         if report_tripped {
-            // F-40 — the report drain hit the cap. Kill the child (it is
+            // The report drain hit the cap. Kill the child (it is
             // blocked writing into a full pipe) and fail the scan CLOSED.
             // `info!` (audit, not error): the scanner kind + the byte cap,
             // never the artifact id (high-cardinality / tracing-only).
@@ -639,12 +638,12 @@ mod tests {
         assert!(c.db_dir.is_none());
         assert_eq!(c.timeout, Duration::from_secs(300));
         assert_eq!(c.severity_filter, vec!["CRITICAL", "HIGH", "MEDIUM", "LOW"]);
-        // F-15 — default artifact-size cap is a few GB: large enough
-        // not to false-positive on real OCI layers, small enough to
-        // keep a single hung/oversize artifact from OOM-ing the worker.
+        // Default artifact-size cap is a few GB: large enough not to
+        // false-positive on real OCI layers, small enough to keep a
+        // single hung/oversize artifact from OOM-ing the worker.
         assert_eq!(c.max_artifact_size, 8 * 1024 * 1024 * 1024);
-        // F-40 — default report-drain cap is 256 MiB: comfortably above
-        // any legitimate findings JSON, small enough that a runaway /
+        // Default report-drain cap is 256 MiB: comfortably above any
+        // legitimate findings JSON, small enough that a runaway /
         // adversarial report cannot OOM the worker before the wall-clock
         // timeout fires.
         assert_eq!(c.max_report_size, 256 * 1024 * 1024);
@@ -773,11 +772,11 @@ mod tests {
         }
     }
 
-    // -- F-40 bounded report drain --------------------------------------
+    // -- bounded report drain -------------------------------------------
 
     use hort_domain::ports::scanner::SCAN_REPORT_TOO_LARGE_MARKER;
 
-    /// F-40 — the bounded drain stops at the cap and reports the trip.
+    /// The bounded drain stops at the cap and reports the trip.
     /// A payload strictly larger than the cap is detected (`tripped ==
     /// true`) and the buffer is bounded to `cap + 1` bytes (NOT the
     /// whole input) — no unbounded allocation.
@@ -795,7 +794,7 @@ mod tests {
         );
     }
 
-    /// F-40 — a payload of EXACTLY the cap does NOT false-positive: it
+    /// A payload of EXACTLY the cap does NOT false-positive: it
     /// reads `cap` bytes, hits EOF, and `tripped` stays false. This is
     /// the boundary the `.take(cap + 1)` design guarantees.
     #[tokio::test]
@@ -810,7 +809,7 @@ mod tests {
         assert_eq!(buf.len() as u64, cap);
     }
 
-    /// F-40 — an under-cap payload drains fully and does not trip.
+    /// An under-cap payload drains fully and does not trip.
     #[tokio::test]
     async fn drain_capped_under_cap_drains_fully() {
         let cap: u64 = 1024;
@@ -820,8 +819,8 @@ mod tests {
         assert_eq!(buf, b"small report");
     }
 
-    /// F-40 — when the child's stdout exceeds the configured
-    /// `max_report_size`, `run_scan` kills the child and returns the
+    /// When the child's stdout exceeds the configured `max_report_size`,
+    /// `run_scan` kills the child and returns the
     /// distinguishable "report exceeded cap" `Invariant` error (the
     /// shape the orchestrator routes to `ScanIndeterminate`). Uses a
     /// real child: a tiny executable script that ignores its argv and

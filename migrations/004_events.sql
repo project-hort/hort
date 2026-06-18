@@ -14,19 +14,19 @@
 -- audit invariant as the trigger + REVOKE and is co-located here by the
 -- same principle (immutability + integrity story in one file).
 --
--- Backfill note (spec §5 / §3.2 / §4.3): the §5 nullable→backfill→
--- SET NOT NULL recipe is the *forward-ALTER-on-a-populated-table*
--- pattern. This is the edit-in-place path: the columns are part of the
+-- Backfill note: the nullable→backfill→SET NOT NULL recipe is the
+-- *forward-ALTER-on-a-populated-table* pattern. This is the
+-- edit-in-place path: the columns are part of the
 -- `CREATE TABLE events` body, so the table is born with them and has
 -- zero pre-existing rows to backfill (a freshly-created table is
 -- empty). The columns are therefore `NOT NULL` directly, with no
 -- nullable window. The per-event hash value is `SHA-256(
--- canonical_event_bytes(typed DomainEvent))` (spec §3) — computed in
--- Rust on the append path (hort-adapters-postgres event_store), never in
--- SQL, because the canonical form (§3.2) is a typed-`DomainEvent`
--- serialization that pure SQL cannot reproduce. No row is inserted
--- without the Rust-computed hash, so the `NOT NULL` + `CHECK` always
--- hold from the first INSERT forward.
+-- canonical_event_bytes(typed DomainEvent))` — computed in Rust on the
+-- append path (hort-adapters-postgres event_store), never in SQL,
+-- because the canonical form is a typed-`DomainEvent` serialization that
+-- pure SQL cannot reproduce. No row is inserted without the
+-- Rust-computed hash, so the `NOT NULL` + `CHECK` always hold from the
+-- first INSERT forward.
 --
 -- Tables:
 --   events — append-only domain event log. UPDATE blocked for every

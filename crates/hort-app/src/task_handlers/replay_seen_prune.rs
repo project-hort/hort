@@ -42,14 +42,13 @@
 //! deleted-row count, no key material); `warn!` on a prune failure
 //! (cleanup degrades safe, the worker retries — **not** `error!`).
 //! `#[tracing::instrument(skip(self))]` WITHOUT `err` (a prune failure
-//! is a `TaskOutcome::Failed`, not a `Result::Err`; and per spec §4 it
-//! is explicitly NOT an ERROR-level condition). **No new metric**: the
-//! spec §8 names only `hort_jwt_replay_rejected_total` (the guard's
-//! metric, emitted in `hort-app` at the claim site, not here). A
-//! prune-outage gauge is called out in spec §4/§8 as a
-//! *recommended-but-optional* follow-on, **not mandated** — inventing
-//! one here without a catalog row would violate the metrics-catalog
-//! hard rule, so it is deliberately not added.
+//! is a `TaskOutcome::Failed`, not a `Result::Err`; it is explicitly NOT
+//! an ERROR-level condition). **No new metric**: only
+//! `hort_jwt_replay_rejected_total` (the guard's metric, emitted in
+//! `hort-app` at the claim site, not here) is tracked. A prune-outage
+//! gauge is a *recommended-but-optional* follow-on, **not mandated** —
+//! inventing one here without a catalog row would violate the
+//! metrics-catalog hard rule, so it is deliberately not added.
 
 use std::sync::Arc;
 
@@ -107,9 +106,9 @@ impl TaskHandler for ReplaySeenPruneHandler {
                     })
                 }
                 Err(err) => {
-                    // Cleanup degrades SAFE (spec §4): a missed prune
-                    // only grows the table — the seen-set never forgets
-                    // a recorded replay within TTL. So this is warn! +
+                    // Cleanup degrades SAFE: a missed prune only grows
+                    // the table — the seen-set never forgets a recorded
+                    // replay within TTL. So this is warn! +
                     // retry-on-next-tick, NEVER error! and NEVER a hard
                     // worker failure.
                     tracing::warn!(

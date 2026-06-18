@@ -17,7 +17,7 @@
 #   - CronJob (cronjob-replay-seen-prune.yaml)
 #
 # cronjob-replay-seen-prune.yaml is the ONE admin-task template that is
-# default-ENABLED (spec §12 R4): it renders whenever the
+# default-ENABLED: it renders whenever the
 # `scheduledTasks.adminTasksEnabled` master toggle is true even without an
 # explicit per-job `enabled: true` (its default in values.yaml is true). It
 # is still set explicitly in the block below for test clarity.

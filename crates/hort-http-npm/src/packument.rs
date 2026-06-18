@@ -42,9 +42,9 @@
 //! prefix versions the key for the amendment (a rolling deploy never has
 //! new code read a pre-amendment `npm_packument_raw:` entry that holds
 //! the raw body, not a serialized projection).
-//! The **mapping id** is the invalidation axis (mirrors Cargo Item 4 /
-//! PyPI Item 3): an upstream URL change rotates the mapping, which is
-//! exactly when stale upstream-derived bytes should die. The
+//! The **mapping id** is the invalidation axis: an upstream URL change
+//! rotates the mapping, which is exactly when stale upstream-derived
+//! bytes should die. The
 //! URL-encoded name is what actually appears on the wire (`@types%2fnode`
 //! for scoped packages), so scoped vs unscoped packages cannot collide.
 //!
@@ -485,7 +485,7 @@ pub async fn fetch_raw_with_cache(
 
 /// Re-project a raw packument body from the metadata mirror through the
 /// streaming projector. Used **only** on the stale-while-error /
-/// air-gapped fallback path (§4) — off the hot serve path, which never
+/// air-gapped fallback path — off the hot serve path, which never
 /// reads the mirror (it renders the cached projection). The mirror
 /// reader is read into a buffer here and projected via `Cursor`: the
 /// sync `MetadataProjector` (`R: std::io::Read`) cannot take an

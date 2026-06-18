@@ -6,26 +6,25 @@
 //!
 //! # Why this exists
 //!
-//! Item B3 (`RetentionUseCase::evaluate_policies`) is stage one of the
-//! two-stage retention split — it appends an
+//! `RetentionUseCase::evaluate_policies` is stage one of the two-stage
+//! retention split — it appends an
 //! [`ArtifactExpired`](crate::events::ArtifactExpired) to the artifact
-//! stream and deletes nothing. Item B4 is stage two: for every
+//! stream and deletes nothing. `PurgeUseCase` is stage two: for every
 //! `ArtifactExpired` with no following
-//! [`ArtifactPurged`](crate::events::ArtifactPurged) it runs the §5
-//! algorithm (decrement `content_references`, delete the CAS blob iff
-//! the cross-`kind` refcount hit `0`, append `ArtifactPurged`). The
-//! `hort-app` `PurgeUseCase` is pure orchestration over this port plus
-//! the existing [`StoragePort`](super::storage::StoragePort) and the
-//! event store; the §5 SQL (lock + `DELETE … RETURNING` + cross-`kind`
-//! count) lives in the Postgres adapter.
+//! [`ArtifactPurged`](crate::events::ArtifactPurged) it runs the
+//! decrement-and-GC algorithm (decrement `content_references`, delete the
+//! CAS blob iff the cross-`kind` refcount hit `0`, append `ArtifactPurged`).
+//! The `hort-app` `PurgeUseCase` is pure orchestration over this port plus
+//! the existing [`StoragePort`](super::storage::StoragePort) and the event
+//! store; the SQL (lock + `DELETE … RETURNING` + cross-`kind` count) lives
+//! in the Postgres adapter.
 //!
 //! # Why a *new, separate* additive port (not extra methods on
 //! [`ContentReferenceIndex`](super::content_reference_index::ContentReferenceIndex))
 //!
-//! Identical reasoning to the B3.5
+//! Identical reasoning to the
 //! [`RefcountReconcilePort`](super::refcount_reconcile::RefcountReconcilePort)
-//! split (B4's literal hard prerequisite and structural sibling). The
-//! B4 scope contract forbids changing any existing port/trait
+//! split. The scope contract forbids changing any existing port/trait
 //! signature; `ContentReferenceIndex` already ships with `insert` /
 //! `find_by_target` / `delete_by_source` plus several impls and mocks.
 //! Adding the transactional GC-walk surface to *that* trait would
@@ -39,13 +38,12 @@
 //! Keeping the transactional decrement and the storage delete /
 //! `ArtifactPurged` append as separate concerns that exchange typed
 //! decision data lets the `hort-app` `PurgeUseCase` stay pure
-//! orchestration (100% mock-testable per the `hort-app` coverage tier —
-//! the §6-invariant-1 re-assertion, the two-stage idempotency split,
-//! the `info!`/`warn!`/`error!` policy, the summary) while the SQL
-//! (row lock, set-based `DELETE … RETURNING`, cross-`kind` count)
-//! stays in the Postgres adapter (≥85% integration-tested). The use
-//! case never embeds SQL; the adapter never embeds the
-//! tracing/summary/idempotency-orchestration policy.
+//! orchestration (100% mock-testable — the release-gate re-assertion, the
+//! two-stage idempotency split, the `info!`/`warn!`/`error!` policy, the
+//! summary) while the SQL (row lock, set-based `DELETE … RETURNING`,
+//! cross-`kind` count) stays in the Postgres adapter (≥85%
+//! integration-tested). The use case never embeds SQL; the adapter never
+//! embeds the tracing/summary/idempotency-orchestration policy.
 
 use uuid::Uuid;
 
@@ -56,21 +54,21 @@ use crate::types::ContentHash;
 use super::BoxFuture;
 
 /// One artifact with a pending `ArtifactExpired` (no following
-/// `ArtifactPurged`) the §5 GC walk must process. Carries the
-/// quarantine status so the use case can re-assert §6 invariant 1
+/// `ArtifactPurged`) the GC walk must process. Carries the quarantine
+/// status so the use case can re-assert the release-gate invariant
 /// (defence-in-depth) before any destructive step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPurge {
     /// The artifact whose `ArtifactExpired` is pending purge. Also the
     /// `entity_id` of its artifact stream.
     pub artifact_id: Uuid,
-    /// Status as projected at scan time — used only to re-assert §6
-    /// invariant 1 (the adapter already excludes the protected states;
-    /// this is the conservative second check a destructive item owes).
+    /// Status as projected at scan time — used only to re-assert the
+    /// release-gate invariant (the adapter already excludes the protected
+    /// states; this is the conservative second check).
     pub quarantine_status: QuarantineStatus,
 }
 
-/// One refcount decision the adapter's transactional §5 step 2+3
+/// One refcount decision the adapter's transactional decrement step
 /// produced for a single CAS hash referenced by the purged artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgedRef {
@@ -81,26 +79,26 @@ pub struct PurgedRef {
     /// already gone.
     pub content_hash: ContentHash,
     /// Cross-`kind` `content_references` count for `content_hash`
-    /// **after** this artifact's references were removed (§5 step 3).
+    /// **after** this artifact's references were removed.
     /// `0` ⇒ the blob is GC-eligible and must be deleted; `> 0` ⇒ a
     /// live reference keeps the blob and only this ref is gone.
     pub refs_remaining: u32,
 }
 
-/// Read + transactional-decrement outbound port for the
-/// storage-GC walk. Purely additive — introduces no change to any
-/// existing port. The Postgres adapter implements the SQL (lock +
-/// `DELETE … RETURNING` + cross-`kind` count) in one committed,
-/// idempotent transaction; unit tests use an in-memory mock.
+/// Read + transactional-decrement outbound port for the storage-GC walk.
+/// Purely additive — introduces no change to any existing port. The
+/// Postgres adapter implements the SQL (lock + `DELETE … RETURNING` +
+/// cross-`kind` count) in one committed, idempotent transaction; unit
+/// tests use an in-memory mock.
 pub trait PurgeGcPort: Send + Sync {
     /// Every artifact with an `ArtifactExpired` event and **no**
-    /// following `ArtifactPurged` — the §5 "pending purge" work set.
+    /// following `ArtifactPurged` — the pending-purge work set.
     /// MUST exclude `quarantine_status ∈ {quarantined, rejected,
-    /// scan_indeterminate}` (§6 invariant 1); the use case re-asserts
-    /// this regardless (defence-in-depth).
+    /// scan_indeterminate}`; the use case re-asserts this regardless
+    /// (defence-in-depth).
     fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>>;
 
-    /// §5 steps 1–3 in **one committed, idempotent transaction**:
+    /// Steps 1–3 in **one committed, idempotent transaction**:
     /// lock the artifact row `FOR UPDATE`, `DELETE` the
     /// `primary_content` + `metadata_blob` `content_references` rows,
     /// and return one [`PurgedRef`] per distinct hash with the
@@ -189,7 +187,7 @@ mod tests {
 
     /// The data types are plain value structs — round-trip equality +
     /// the `quarantine_status` field carries through (used by the
-    /// use-case §6-invariant-1 re-assertion).
+    /// use-case release-gate re-assertion).
     #[test]
     fn data_types_round_trip() {
         let a = Uuid::new_v4();

@@ -15,7 +15,7 @@
 //! `hort-adapters-upstream-http` (which would be an inbound-from-format
 //! shape regression) and does NOT depend on `hort-adapters-advisory-osv`
 //! either. If at 5+ copies the maintenance pain becomes real, a
-//! unification initiative is the right place to address it — out of
+//! a future refactoring effort is the right place to address it — out of
 //! scope here.
 
 use reqwest::ClientBuilder;

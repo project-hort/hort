@@ -35,18 +35,18 @@
 //!    `Forbidden`. Fires first (cheapest — no repo resolution required)
 //!    and emits `result="token_kind_denied"` ONCE per call.
 //! 2. **RBAC gate** — `Permission::Read ∧ Permission::Prefetch` on the
-//!    resolved repo (§2.5 Finding E — BOTH required). Denial emits
+//!    resolved repo (BOTH required). Denial emits
 //!    `result="permission_denied"` ONCE per call.
 //! 3. **OCI rejection** — if the repo's format is `"oci"`, emits
-//!    `result="oci_unsupported"` ONCE per call and returns the §8 exact
-//!    wording wrapped in [`DomainError::Validation`].
+//!    `result="oci_unsupported"` ONCE per call and returns an error
+//!    wrapped in [`DomainError::Validation`].
 //!
 //! All three gates short-circuit per CALL (not per item). After all
 //! three pass, the use case iterates `items` and emits per-item ticks
 //! for the remaining ten `result` values (a 100-item batch with 80
 //! successes + 15 rejected + 5 timeouts produces 100 ticks).
 //!
-//! # Per-item orchestration (§§6.3-6.5, §6.4a)
+//! # Per-item orchestration
 //!
 //! For each [`PrefetchRequestItem`]:
 //!
@@ -95,8 +95,7 @@
 //! Per-item failures partition into the four [`PrefetchOutcome`]
 //! envelope buckets; the batch never aborts on a single bad item. This
 //! mirrors the `BlockOutcome` shape at
-//! `crates/hort-app/src/use_cases/curation_use_case.rs:118` (§3.1 design
-//! note).
+//! `crates/hort-app/src/use_cases/curation_use_case.rs:118`.
 //!
 //! # Observability
 //!
@@ -105,13 +104,13 @@
 //!   denials with infrastructure errors).
 //! - Token-kind / RBAC denials → `tracing::info!` (audit trail — this
 //!   is a security-sensitive operation).
-//! - Success → `tracing::info!` per §7 with fields `repo_key`,
+//! - Success → `tracing::info!` with fields `repo_key`,
 //!   `package_count`, `caller_user_id`, `caller_token_kind`. Package
 //!   names are intentionally NOT logged at info — they could amplify
 //!   index cardinality on busy deployments.
 //! - One `hort_prefetch_self_service_total{format, repository, result}`
 //!   tick per call for the three short-circuit gates; per-item ticks
-//!   for everything else (§7 tick semantics).
+//!   for everything else.
 
 use std::sync::Arc;
 
@@ -229,12 +228,12 @@ impl SelfServicePrefetchUseCase {
         items: Vec<PrefetchRequestItem>,
         caller: &CallerPrincipal,
     ) -> AppResult<PrefetchOutcome> {
-        // -------- Gate 1: token-kind (cheapest first per §2.6) --------
+        // -------- Gate 1: token-kind (cheapest first) --------
         //
         // Pre-repo-resolution — fires before any port I/O. The `format`
         // label is unknown here because we have not resolved the repo
         // yet; emit `FORMAT_UNKNOWN` per the catalog's missing-format
-        // sentinel rule. Per §7 the `repository` label collapses to
+        // sentinel rule. The `repository` label collapses to
         // `REPOSITORY_ALL` for pre-resolution gate ticks.
         if caller.token_kind != Some(TokenKind::CliSession) {
             tracing::info!(
@@ -275,11 +274,11 @@ impl SelfServicePrefetchUseCase {
 
         // -------- Gate 2: RBAC `Permission::Read ∧ Permission::Prefetch` --
         //
-        // Both required per §2.5 Finding E — `Prefetch` alone without
-        // `Read` would let an actor amplify against a repo they cannot
-        // enumerate; the AND aligns prefetch authority with discovery
-        // authority. One denial tick per call (not two — the operator
-        // sees a single failure mode).
+        // Both required — `Prefetch` alone without `Read` would let an
+        // actor amplify against a repo they cannot enumerate; the AND
+        // aligns prefetch authority with discovery authority. One denial
+        // tick per call (not two — the operator sees a single failure
+        // mode).
         let evaluator = self.rbac.load();
         let has_read = evaluator.authorize(caller, Permission::Read, Some(repository.id));
         let has_prefetch = evaluator.authorize(caller, Permission::Prefetch, Some(repository.id));
@@ -303,7 +302,7 @@ impl SelfServicePrefetchUseCase {
             ))));
         }
 
-        // -------- Gate 3: OCI rejection (§8 non-goal) ------------------
+        // -------- Gate 3: OCI rejection ------------------
         //
         // The check is on the resolved repo's format — no need to
         // round-trip the upstream port to learn the format is OCI; the
@@ -313,7 +312,7 @@ impl SelfServicePrefetchUseCase {
             tracing::info!(
                 caller_user_id = %caller.user_id,
                 repository = %repository.key,
-                "self-service prefetch rejected: OCI format is a §8 non-goal",
+                "self-service prefetch rejected: OCI format is not supported for self-service prefetch",
             );
             emit_prefetch_self_service(
                 &format_label,
@@ -325,7 +324,7 @@ impl SelfServicePrefetchUseCase {
             )));
         }
 
-        // -------- Resolve upstream mapping (catch-all per §6.2) -------
+        // -------- Resolve upstream mapping (catch-all) -------
         //
         // The mapping resolver mirrors `discovery_use_case` and every
         // other repo-scoped proxy call site: pick the catch-all
@@ -372,7 +371,7 @@ impl SelfServicePrefetchUseCase {
             .await;
         }
 
-        // -------- Success log (audit trail per §7) --------------------
+        // -------- Success log (audit trail) --------------------
         tracing::info!(
             repo_key = %repository.key,
             package_count = item_count,
@@ -483,7 +482,7 @@ impl SelfServicePrefetchUseCase {
             version: Some(resolved_version.clone()),
         };
 
-        // ----- Pre-flight against HORT's held set (§§6.3-6.5, §6.4a) ---
+        // ----- Pre-flight against HORT's held set ---
         let held_status = match self
             .artifacts
             .package_version_status(repository.id, &item.package)
@@ -524,13 +523,13 @@ impl SelfServicePrefetchUseCase {
 
         if let Some(status) = held_match {
             match status {
-                // §6.4 + §6.4a — `Released` and `Quarantined` (incl. the
-                // read-time `QuarantinedAwaitingRelease` derivation, which
-                // the projection returns as plain `Quarantined`) mean the
+                // `Released` and `Quarantined` (incl. the read-time
+                // `QuarantinedAwaitingRelease` derivation, which the
+                // projection returns as plain `Quarantined`) mean the
                 // artifact is locally ingested and already covered →
                 // `skipped_already_held`.
                 //
-                // H6: `None` is deliberately NOT folded here. For a PROXY,
+                // `None` is deliberately NOT folded here. For a PROXY,
                 // `package_version_status` returns `None` for versions
                 // that are known upstream but NOT locally ingested — those
                 // are exactly what self-service prefetch must warm, so
@@ -540,10 +539,10 @@ impl SelfServicePrefetchUseCase {
                 QuarantineStatus::Released | QuarantineStatus::Quarantined => {
                     outcome.skipped_already_held.push(coords_resolved);
                     // Skipped items do NOT tick a per-item result —
-                    // per §7 the 13-value `result` set does not have
-                    // a `skipped` bucket. (Per-item observability for
-                    // "already held" lives in the response envelope
-                    // partition counts, not in the metric.)
+                    // the `result` label set does not have a `skipped`
+                    // bucket. (Per-item observability for "already held"
+                    // lives in the response envelope partition counts,
+                    // not in the metric.)
                     return;
                 }
                 // Known upstream, not locally held → fall through to the
@@ -640,16 +639,15 @@ impl SelfServicePrefetchUseCase {
                     existing_job_id: job_id,
                 },
             ) => {
-                // Item 1 passes None so Duplicate cannot fire from the
-                // DB layer; the L3 partial-unique single-flight that
-                // self-service prefetch relies on surfaces as
+                // The `job_key` is `None` here so Duplicate cannot fire
+                // from the DB layer; the partial-unique single-flight
+                // that self-service prefetch relies on surfaces as
                 // `Err(Conflict)` from the adapter below, not as a
                 // Duplicate outcome. The Duplicate arm is fused with
                 // Enqueued here purely to keep the call site exhaustive
-                // — if Item 2 ever wires a DB-side key here, the
-                // operator intent ("this coordinate is being pulled")
-                // is already satisfied and the arm naturally Just
-                // Works.
+                // — if a DB-side key is ever wired here, the operator
+                // intent ("this coordinate is being pulled") is already
+                // satisfied and the arm naturally Just Works.
                 outcome.enqueued_job_ids.push(job_id);
                 emit_prefetch_self_service(
                     format_label,
@@ -1129,8 +1127,7 @@ mod tests {
 
     #[test]
     fn permission_denied_when_caller_holds_read_but_not_prefetch() {
-        // §2.5 Finding E — Read alone is insufficient; the AND
-        // gate must reject.
+        // Read alone is insufficient; the AND gate must reject.
         let snap = capture(|| {
             Box::pin(async {
                 let repo = npm_repo();
@@ -1163,9 +1160,8 @@ mod tests {
 
     #[test]
     fn permission_denied_when_caller_holds_prefetch_but_not_read() {
-        // §2.5 Finding E — Prefetch without Read is the dangerous
-        // case (amplify against a repo the actor cannot enumerate);
-        // the AND gate must reject.
+        // Prefetch without Read is the dangerous case (amplify against
+        // a repo the actor cannot enumerate); the AND gate must reject.
         let snap = capture(|| {
             Box::pin(async {
                 let repo = npm_repo();
@@ -1427,7 +1423,7 @@ mod tests {
     }
 
     // ============================================================
-    // Already-held buckets (§§6.4 + 6.4a — three states fold together)
+    // Already-held buckets (three states fold together)
     // ============================================================
 
     #[test]
@@ -1584,7 +1580,7 @@ mod tests {
     }
 
     // ============================================================
-    // Rejected buckets (§6.5 — both flavors)
+    // Rejected buckets (both flavors)
     // ============================================================
 
     #[test]
@@ -1986,7 +1982,7 @@ mod tests {
                 "rejected_version"
             ),
             Some(2),
-            "both rejected flavors tick the same label per §7",
+            "both rejected flavors tick the same label",
         );
         assert_eq!(
             counter_value(&snap, "hort_prefetch_self_service_total", "timeout"),

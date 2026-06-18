@@ -48,7 +48,7 @@ use hort_domain::types::ContentHash;
 
 use crate::{map_sqlx_error, BoxFuture};
 
-/// PostgreSQL adapter for the §3.2 eligibility query.
+/// PostgreSQL adapter for the rescan eligibility query.
 pub struct PgRescanCandidatesRepository {
     pool: PgPool,
 }

@@ -125,8 +125,7 @@ the boot sequence.
 One envelope per workload identity. The `federatedIdentities[]`
 block lists which `(issuer, claims)` shapes may assume this SA.
 Multiple shapes are an OR — any single match suffices; multiple
-matches across SAs are a `multiple_sa_match` deny (§5 of the
-design doc).
+matches across SAs are a `multiple_sa_match` deny.
 
 ```yaml
 apiVersion: project-hort.de/v1beta1

@@ -3,7 +3,7 @@
 //!
 //! # What this is
 //!
-//! When an artifact transitions to `Rejected` (curator-block, F-6
+//! When an artifact transitions to `Rejected` (curator-block,
 //! fail-closed scan rejection, or retroactive curation-rule rejection),
 //! the upstream packument / simple-index / sparse-index cache continues
 //! to advertise the now-revoked artifact until the entry's TTL elapses.

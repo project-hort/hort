@@ -52,7 +52,7 @@ use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 
-/// 7 days — design §9 default retention horizon. Operators tune
+/// 7 days — default retention horizon. Operators tune
 /// via the `horizon_seconds` param on the enqueue. Picked as a
 /// compromise: long enough that an operator debugging a cascade
 /// failure can read the failed rows the next morning; short enough

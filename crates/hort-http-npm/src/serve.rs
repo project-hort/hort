@@ -10,13 +10,13 @@
 //!      error contract);
 //!    - anything else → [`HostedNpmSource`] (reads
 //!      [`ArtifactUseCase::list_by_raw_name_visible`] — the
-//!      F-25-anti-enumeration-enforcing entry point).
+//!      anti-enumeration-enforcing entry point).
 //! 2. **Filter pipeline.** `NonServableStatusFilter` then
 //!    `IndexModeFilter::new(repo.index_mode)`. Future operator-defined
-//!    exclusion filters append to this list per the design doc §2.4.
+//!    exclusion filters append to this list.
 //! 3. **Builder.** [`NpmIndexBuilder`] emits the packument JSON.
 //!
-//! # F-25 anti-enumeration shape
+//! # Anti-enumeration shape
 //!
 //! Anonymous / denied callers on a private repo receive `404`, not
 //! `403`. The hosted source's `list_by_raw_name_visible` already
@@ -55,10 +55,8 @@
 //! - **One `info!` line** carrying `format`, `repository`, `package`,
 //!   `index_source = "hosted" | "proxy"`, and the
 //!   `upstream_versions` / `served_versions` / `filtered_versions`
-//!   triple. `index_source` is the new tracing field design §4
-//!   added; no metric exists for it (operators dashboard from the
-//!   tracing field instead per the design's explicit "tracing field,
-//!   NOT a new metric" rule).
+//!   triple. `index_source` is a tracing field only; no metric exists
+//!   for it (operators dashboard from the tracing field).
 
 use std::sync::Arc;
 
@@ -108,8 +106,8 @@ pub(crate) async fn serve_packument_unified(
     caller: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
     // ---- Resolve the repo + access check -----------------------------
-    // F-25: this is the central anti-enumeration hop.
-    // Anonymous on private collapses to `NotFound { entity: "Repository" }`
+    // Anti-enumeration: anonymous on private collapses to
+    // `NotFound { entity: "Repository" }`
     // — same 404 envelope as a missing repo. The hosted source re-
     // resolves through `list_by_raw_name_visible` (its own access check),
     // and the proxy source re-resolves defensively; this top-level
@@ -275,7 +273,7 @@ mod tests {
     //!    packument.
     //! 2. Rejected hosted artifact (rescan-driven) filtered out.
     //! 3. `dist-tags.latest` preservation under both `IndexMode` arms.
-    //! 4. F-25 anti-enumeration — anonymous caller on a private repo
+    //! 4. Anti-enumeration — anonymous caller on a private repo
     //!    receives `NotFound`, not `403`.
     //!
     //! Plus a smoke for the truncation-`Warning` header pass-through.
@@ -590,7 +588,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 4. F-25 anti-enumeration — anonymous caller on a private repo
+    // 4. Anti-enumeration — anonymous caller on a private repo
     //    receives NotFound (not 403). Mirrors the existing
     //    `anonymous_get_packument_on_private_repo_returns_404` shape
     //    but tests the unified handler directly.
@@ -636,13 +634,13 @@ mod tests {
             .await
             .expect_err("anonymous on private MUST be denied");
         // The unified handler returns `ApiError`; we inspect its
-        // status mapping. F-25 anti-enumeration: the envelope MUST be
+        // status mapping. Anti-enumeration: the envelope MUST be
         // 404, never 403.
         let response = err.into_response();
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "F-25 anti-enumeration: denied caller MUST receive 404, NEVER 403",
+            "anti-enumeration: denied caller MUST receive 404, NEVER 403",
         );
     }
 

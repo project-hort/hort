@@ -39,7 +39,7 @@ const CARGO_NAME_MAX: usize = 64;
 const CARGO_VERSION_MAX: usize = 64;
 
 /// Compressed-input cap for the whole stored cargo `.crate` artifact fed to
-/// [`CargoFormatHandler::extract_dependency_specs`] (spec 076 Item 4).
+/// [`CargoFormatHandler::extract_dependency_specs`].
 ///
 /// The cascade caller reads the artifact from CAS under a 32 MiB
 /// **compressed** bound (`prefetch_dependencies::read_artifact_bytes`) before
@@ -48,7 +48,7 @@ const CARGO_VERSION_MAX: usize = 64;
 /// future caller streams an unbounded reader in. It is a *compressed* cap (a
 /// plausibility/storage bound, large — feedback_cap_taxonomy_streaming_vs_buffered);
 /// the decompressed-output / compression-ratio / entry-count bomb guards live
-/// in [`crate::archive_bounds::read_tar_gz_entry`] (spec 076 §3.2), not here.
+/// in [`crate::archive_bounds::read_tar_gz_entry`], not here.
 /// Deliberately mirrors npm's `NPM_TARBALL_MAX_BYTES`.
 const CARGO_CRATE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
@@ -68,7 +68,7 @@ const CARGO_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 /// Returns [`DomainError::Validation`] tagged with the structured
 /// field name `cargo.name`. Error messages **never** include the
 /// rejected input (it can be megabytes of attacker-controlled bytes
-/// — log-pollution risk noted in design doc §4.2).
+/// — log-pollution risk).
 ///
 /// Visibility: `pub` so the cargo HTTP adapter (`hort-http-cargo`) can
 /// reuse the same validator on the publish path before any storage
@@ -239,11 +239,10 @@ impl FormatHandler for CargoFormatHandler {
 
         let name = self.normalize_name(raw_name);
 
-        // Spec 074 §1.2 — the read path uses the SSOT constructor so it can
-        // never diverge from the write-sites. `build` re-normalizes (same
-        // lowercase result), so passing `raw_name` is equivalent to passing
-        // the already-normalized `name`. cargo derives the filename from
-        // name+version, so `filename = None`.
+        // The read path uses the SSOT constructor so it can never diverge
+        // from the write-sites. `build` re-normalizes (same lowercase result),
+        // so passing `raw_name` is equivalent to passing the already-normalized
+        // `name`. cargo derives the filename from name+version, so `filename = None`.
         let path = self.build_artifact_logical_path(raw_name, version, None)?;
 
         Ok(ArtifactCoords {
@@ -256,8 +255,8 @@ impl FormatHandler for CargoFormatHandler {
         })
     }
 
-    /// Spec 074 §1.1 — the single logical-projection-path constructor for
-    /// cargo. `crates/{n}/{version}/{n}-{version}.crate` with
+    /// The single logical-projection-path constructor for cargo.
+    /// `crates/{n}/{version}/{n}-{version}.crate` with
     /// `n = normalize_name(name)` (lowercase, separators preserved per the
     /// registry-index spec). `filename` is ignored — cargo derives the
     /// canonical `.crate` filename from name+version.
@@ -279,7 +278,7 @@ impl FormatHandler for CargoFormatHandler {
         name.to_lowercase()
     }
 
-    /// Cargo's registration-uniqueness key (spec 075). crates.io forbids
+    /// Cargo's registration-uniqueness key. crates.io forbids
     /// publishing a crate whose name collides under case AND `-`/`_`
     /// folding (`error-def` ≡ `error_def`), even though the index *lookup*
     /// path (`normalize_name`) preserves separators. So the collision key
@@ -631,7 +630,7 @@ impl FormatHandler for CargoFormatHandler {
     /// consistent with cascade warming — a platform-gated dep is not on the
     /// universal run path); this limitation is explicit, not silent.
     ///
-    /// **Renamed deps (H3).** `foo = { package = "bar", version = "1" }`
+    /// **Renamed deps.** `foo = { package = "bar", version = "1" }`
     /// declares a dep on crate `bar`; the parser uses the `package` value as
     /// the spec name, never the TOML key (see
     /// [`parse_cargo_toml_runtime_dependencies`]).
@@ -639,8 +638,8 @@ impl FormatHandler for CargoFormatHandler {
     /// **Archive bounds.** Extraction routes through the audited
     /// [`crate::archive_bounds::read_tar_gz_entry`]: the gzip decompressor is
     /// wrapped in a `BoundedReader` (compression-ratio + cumulative-output
-    /// cap), entry count is bounded, and nested archives are rejected. F2:
-    /// the cap is *cumulative* across the sequential tar scan, so `Cargo.toml`
+    /// cap), entry count is bounded, and nested archives are rejected. The cap
+    /// is *cumulative* across the sequential tar scan, so `Cargo.toml`
     /// MUST be an early entry — which every real `.crate` satisfies (cargo
     /// writes the manifest near the front).
     ///
@@ -679,9 +678,9 @@ impl FormatHandler for CargoFormatHandler {
             |len, max| format!("cargo artifact is {len} bytes; cargo crate max is {max}"),
         )?;
         // Locate the single top-level `{dir}/Cargo.toml` inside the gzip-tar
-        // under the audited archive_bounds caps. F2: Cargo.toml must be an
-        // early entry. The predicate matches an entry path with exactly one
-        // segment before `/Cargo.toml` (the `{name}-{version}/` dir) without
+        // under the audited archive_bounds caps. Cargo.toml must be an early
+        // entry. The predicate matches an entry path with exactly one segment
+        // before `/Cargo.toml` (the `{name}-{version}/` dir) without
         // hardcoding the crate name or version.
         let manifest = crate::archive_bounds::read_tar_gz_entry(
             &buf[..],
@@ -722,8 +721,7 @@ impl FormatHandler for CargoFormatHandler {
     /// `{upstream_url}/{name}/{version}/download`. This is the shape
     /// `crates.io` serves (the `dl` field on its `config.json` has no
     /// placeholders, so the spec mandates appending the suffix); it
-    /// also matches every public-mirror Cargo registry the Phase-1
-    /// shipping fleet has observed.
+    /// also matches every public-mirror Cargo registry observed in practice.
     ///
     /// **Private registries with custom `dl` templates** (e.g.
     /// `{prefix}/{lowerprefix}/{crate}-{version}.crate`) are NOT
@@ -733,17 +731,15 @@ impl FormatHandler for CargoFormatHandler {
     /// `/{name}/{version}/download` path also resolves (most do, via
     /// a 302 redirect to the templated URL); otherwise the leaf
     /// prefetch ingest fails its `fetch_artifact` and the cohort
-    /// degrades to the existing hot-path serve-site pull-through
-    /// (Item 4) when a client requests the crate. This is a
-    /// deliberate scope cap on Item 12b's leaf-ingest path — adding
-    /// `config.json` resolution would either bind `build_pull_url` to
-    /// the `UpstreamProxy` port (breaking trait purity) or duplicate
+    /// degrades to the existing hot-path serve-site pull-through when
+    /// a client requests the crate. This is a deliberate scope cap —
+    /// adding `config.json` resolution would either bind `build_pull_url`
+    /// to the `UpstreamProxy` port (breaking trait purity) or duplicate
     /// the `resolve_registry_config` logic that already lives in
-    /// `hort-http-cargo` (a layering violation). The right
-    /// fix when private registries with non-conventional `dl`
-    /// templates become a real operator pain point is to move the
-    /// per-crate URL composition into a richer cascade-driver crate
-    /// that owns both layers.
+    /// `hort-http-cargo` (a layering violation). The right fix when
+    /// private registries with non-conventional `dl` templates become a
+    /// real operator pain point is to move the per-crate URL composition
+    /// into a richer cascade-driver crate that owns both layers.
     ///
     /// Returns `Err(Validation)` for empty package or version (a
     /// genuinely structural error). Strips trailing `/` on
@@ -790,7 +786,7 @@ fn cargo_toml_version_from_value(value: &serde_json::Value) -> Option<String> {
 }
 
 /// Whether `path` is the single top-level `Cargo.toml` of a `.crate`
-/// archive (spec 076 Item 4).
+/// archive.
 ///
 /// A real `.crate` lays out a single top-level `{name}-{version}/`
 /// directory; the manifest is at `{name}-{version}/Cargo.toml`. This
@@ -810,7 +806,7 @@ fn is_top_level_cargo_toml(path: &str) -> bool {
 }
 
 /// Parse the *declared runtime* dependency specs from a `Cargo.toml`
-/// manifest body (spec 076 Item 4).
+/// manifest body.
 ///
 /// **Runtime classes only.** Reads ONLY the top-level `[dependencies]`
 /// table. `[dev-dependencies]` (test-only) and `[build-dependencies]`
@@ -820,7 +816,7 @@ fn is_top_level_cargo_toml(path: &str) -> bool {
 /// `[target.*.dependencies]` are out of scope for v1 (best-effort; see the
 /// [`CargoFormatHandler::extract_dependency_specs`] doc).
 ///
-/// **Renamed deps (H3).** For `foo = { package = "bar", version = "1" }`
+/// **Renamed deps.** For `foo = { package = "bar", version = "1" }`
 /// the dependency is on crate **`bar`** (the fetch target), not `foo`. The
 /// published `.crate` `Cargo.toml` preserves the `package` rename key, so the
 /// parser uses it as the [`DependencySpec::name`] when present, else the TOML
@@ -857,9 +853,9 @@ fn parse_cargo_toml_runtime_dependencies(manifest: &[u8]) -> DomainResult<Vec<De
     };
     let mut out = Vec::with_capacity(deps.len());
     for (key, value) in deps {
-        // Renamed dep (H3): `{ package = "bar", .. }` declares a dep on
-        // `bar`, not on the TOML key. Use the `package` value as the name
-        // when present, else the TOML key.
+        // Renamed dep: `{ package = "bar", .. }` declares a dep on `bar`,
+        // not on the TOML key. Use the `package` value as the name when
+        // present, else the TOML key.
         let name = value
             .as_table()
             .and_then(|t| t.get("package"))
@@ -1046,7 +1042,7 @@ mod tests {
         );
     }
 
-    // -- build_artifact_logical_path (spec 074 SSOT constructor) ---------------
+    // -- build_artifact_logical_path ------------------------------------------
 
     /// `crates/{n}/{version}/{n}-{version}.crate` with `n` lowercased.
     /// `filename` is ignored (cargo derives it from name+version).
@@ -1073,7 +1069,7 @@ mod tests {
 
     /// Round-trip / inverse: the canonical download request parses to the
     /// canonical path, and rebuilding from the parsed (name, version)
-    /// yields the same path (spec 074 §3).
+    /// yields the same path.
     #[test]
     fn build_logical_path_round_trip() {
         let coords = handler()
@@ -1089,7 +1085,7 @@ mod tests {
     }
 
     /// Case-folds: `Serde` and `serde` collapse to the same path
-    /// (`normalize_name` lowercases) — spec 074 §1.0 / §3.
+    /// (`normalize_name` lowercases).
     #[test]
     fn build_logical_path_case_folds() {
         let upper = handler()
@@ -1104,7 +1100,7 @@ mod tests {
 
     /// Separators are PRESERVED (NOT folded): `foo-bar` and `foo_bar`
     /// build DISTINCT paths. Pins the cargo registry-index rule — folding
-    /// `-`/`_` would be the regression spec 074 §1.0 caught.
+    /// `-`/`_` would silently break the separator invariant.
     #[test]
     fn build_logical_path_preserves_separators_distinct() {
         let hyphen = handler()
@@ -1118,7 +1114,7 @@ mod tests {
         assert_ne!(hyphen, underscore);
     }
 
-    // -- cargo_collision_key + collision_key (spec 075) -----------------------
+    // -- cargo_collision_key + collision_key ----------------------------------
 
     /// The collision key folds BOTH case and `-`/`_` (to `-`) — the
     /// crates.io registration-uniqueness key, DISTINCT from `normalize_name`
@@ -1488,8 +1484,7 @@ mod tests {
     // bound (`STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES` = 64 MiB), NOT the
     // small in-memory `metadata_expected_max_bytes()` (now the
     // upload-payload cap only). The cap-check rejects with a diagnostic
-    // that names cap and observed length but never echoes the body bytes
-    // (design-doc §5).
+    // that names cap and observed length but never echoes the body bytes.
     //
     // The cap is 64 MiB, so a materialised over-cap `Vec` would be a
     // 64 MiB allocation. The tests use a LAZY reader instead: a small
@@ -1550,8 +1545,8 @@ mod tests {
         let max = crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES;
         let mut body = cargo_lazy_padded_reader(max + 1);
         // The body carries the sentinel `cksum` / `serde` tokens; assert
-        // the error message does not echo them (design-doc §5: error
-        // messages MUST NOT echo offending input verbatim).
+        // the error message does not echo them (error messages MUST NOT
+        // echo offending input verbatim).
         let coords = serde_coords("1.0.214");
         let err = handler()
             .parse_upstream_checksum(&mut body, &coords)
@@ -1909,7 +1904,7 @@ mod tests {
         assert!(matches!(err, DomainError::Validation(_)));
     }
 
-    // -- is_top_level_cargo_toml (spec 076 Item 4) -------------------------
+    // -- is_top_level_cargo_toml ------------------------------------------
 
     #[test]
     fn is_top_level_cargo_toml_matches_single_dir_manifest() {
@@ -1933,7 +1928,7 @@ mod tests {
         assert!(!is_top_level_cargo_toml("/Cargo.toml"));
     }
 
-    // -- parse_cargo_toml_runtime_dependencies (spec 076 Item 4) -----------
+    // -- parse_cargo_toml_runtime_dependencies --------------------------------
 
     #[test]
     fn parse_cargo_toml_runtime_drops_dev_and_build_and_honors_rename() {
@@ -2021,7 +2016,7 @@ real = "2.3"
         assert!(matches!(err, DomainError::Validation(_)));
     }
 
-    // -- extract_dependency_specs (spec 076 Item 4 — archive-aware) ---------
+    // -- extract_dependency_specs (archive-aware) -----------------------------
 
     /// Build a gzip-tar (`.crate`-shape) archive in memory from
     /// `(path, body)` pairs. Mirrors the npm/archive_bounds fixtures.
@@ -2043,7 +2038,7 @@ real = "2.3"
 
     /// A real `.crate` is a gzip-tar with a single top-level
     /// `{name}-{version}/` dir containing `Cargo.toml` as an EARLY entry
-    /// (F2 — the manifest must precede the cap).
+    /// (the manifest must precede the cumulative cap).
     #[test]
     fn extract_dependency_specs_cargo_from_crate_runtime_only_with_rename() {
         let manifest = br#"
@@ -2060,7 +2055,7 @@ foo = { package = "bar", version = "1" }
 proptest = "1"
 "#;
         let archive = make_tar_gz(&[
-            // Cargo.toml first (early entry) so the F2 cumulative cap is
+            // Cargo.toml first (early entry) so the cumulative cap is
             // reached after it.
             ("demo-0.1.0/Cargo.toml", manifest),
             ("demo-0.1.0/src/lib.rs", b"// code"),

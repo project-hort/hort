@@ -29,14 +29,14 @@ use sha2::{Digest, Sha256};
 use super::{DomainEvent, PersistedEvent};
 
 // ---------------------------------------------------------------------------
-// Domain separation constants (frozen — see §3.3 "Versioning")
+// Domain separation constants (frozen)
 // ---------------------------------------------------------------------------
 
 /// Field-0 domain tag: the 16 ASCII bytes `hort-evchain/v1\0`
-/// (spec §3.1 row 0). Bumping this is a chain-format version break.
+/// (field 0 in the canonical byte order). Bumping this is a chain-format version break.
 const DOMAIN_TAG: &[u8; 16] = b"hort-evchain/v1\0";
 
-/// Pre-image of the genesis sentinel (spec §2.2). A literal zero array
+/// Pre-image of the genesis sentinel. A literal zero array
 /// is deliberately NOT used — a zero predecessor is indistinguishable
 /// from "field not yet written / NULL coerced to zero".
 const GENESIS_PREIMAGE: &[u8] = b"hort-event-chain/v1/genesis";
@@ -62,7 +62,7 @@ impl EventHash {
     }
 }
 
-/// The genesis sentinel for `stream_position == 0` (spec §2.2).
+/// The genesis sentinel for `stream_position == 0`.
 ///
 /// `SHA-256(b"hort-event-chain/v1/genesis")`. Pure and deterministic;
 /// the verifier asserts the first row of every stream chains from this
@@ -94,13 +94,13 @@ pub struct ActorCanonical<'a> {
     pub actor_spec_digest: Option<&'a [u8]>,
 }
 
-/// Everything the per-event hash binds (spec §3.1). Built by the
+/// Everything the per-event hash binds. Built by the
 /// adapter (append path) or the verifier from a stored row. Pure data.
 ///
 /// `stored_at` and `global_position` are deliberately absent — they
 /// are store-assigned/sequence-assigned and excluded from the hash by
-/// design (§3.1, §13 divergence 3/6). The typed `event` is what the
-/// payload is canonicalized from, never the stored JSONB text (§3.2).
+/// design. The typed `event` is what the
+/// payload is canonicalized from, never the stored JSONB text.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainInput<'a> {
     /// Predecessor `event_hash` (genesis sentinel for position 0).
@@ -119,7 +119,7 @@ pub struct ChainInput<'a> {
     /// The `event_version` column (today always 1).
     pub event_version: u32,
     /// The typed event — the payload is canonicalized from this, not
-    /// the stored JSONB (spec §3.2).
+    /// the stored JSONB.
     pub event: &'a DomainEvent,
     /// Correlation id (16 raw bytes).
     pub correlation_id: uuid::Uuid,
@@ -130,7 +130,7 @@ pub struct ChainInput<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical encoding (spec §3)
+// Canonical encoding
 // ---------------------------------------------------------------------------
 
 /// Append a `u64`-big-endian length prefix followed by the bytes.
@@ -150,7 +150,7 @@ fn put_opt<F: FnOnce(&mut Vec<u8>)>(buf: &mut Vec<u8>, present: bool, emit: F) {
     }
 }
 
-/// Canonical payload bytes (spec §3.2): `serde_json::to_vec` of the
+/// Canonical payload bytes: `serde_json::to_vec` of the
 /// typed `DomainEvent`, wrapped in the `{"type":…,"data":…}` envelope
 /// `serialize_event_data` uses, with object keys recursively sorted so
 /// the few `serde_json::Value` payload fields are deterministic. The
@@ -160,7 +160,7 @@ fn put_opt<F: FnOnce(&mut Vec<u8>)>(buf: &mut Vec<u8>, present: bool, emit: F) {
 /// Infallible: it serializes an already-`validate()`d typed event;
 /// `serde_json` cannot fail on `DomainEvent` (no maps with non-string
 /// keys, no custom `Serialize` that errors). The append path therefore
-/// gains no new fallible step (spec §10).
+/// gains no new fallible step.
 fn canonical_payload_bytes(event: &DomainEvent) -> Vec<u8> {
     // Mirror `mappers::serialize_event_data`'s reshape so the canonical
     // form is a deterministic function of the typed event and matches
@@ -204,7 +204,7 @@ fn reshape_to_envelope(
         // externally-tagged enum representation changed unexpectedly.
         // Passing it through unchanged keeps `reshape_to_envelope` a
         // faithful mirror of `serialize_event_data` for all inputs —
-        // not only object inputs — so the F-2 tamper-evidence verifier
+        // not only object inputs — so the tamper-evidence verifier
         // and the append-side serializer always agree.
         other => other,
     };
@@ -233,7 +233,7 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Canonical byte form of a chained event (spec §3.1, frozen field
+/// Canonical byte form of a chained event (frozen field
 /// order). Domain-separated, length-prefixed. Infallible by
 /// construction (see [`canonical_payload_bytes`]).
 pub fn canonical_event_bytes(input: &ChainInput<'_>) -> Vec<u8> {
@@ -312,7 +312,7 @@ pub fn compute_event_hash(input: &ChainInput<'_>) -> EventHash {
 }
 
 // ---------------------------------------------------------------------------
-// Stream verification (I1 + genesis) — spec §8.1
+// Stream verification
 // ---------------------------------------------------------------------------
 
 /// One row's view as the verifier needs it: the stored hashes plus
@@ -413,7 +413,7 @@ impl ChainRow {
     }
 }
 
-/// Why a stream chain is broken (spec §8.1).
+/// Why a stream chain is broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainBreak {
     /// Recomputed `event_hash` != the stored `event_hash` at this
@@ -432,14 +432,14 @@ pub enum ChainBreak {
     /// (a gap — a row was excised).
     PositionGap,
     /// The stream is absent from the live DB with no justifying
-    /// `StreamSealed` record (used by the anchor cross-check, §2.3).
+    /// `StreamSealed` record (used by the anchor cross-check).
     UnsealedAbsentStream,
     /// A `StreamSealed` head was not covered by any anchored
-    /// checkpoint at-or-after the seal (§2.3).
+    /// checkpoint at-or-after the seal.
     HeadNotAnchored,
 }
 
-/// Verdict for one stream (spec §8.1).
+/// Verdict for one stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamVerdict {
     /// Chain intact; carries the verified head + final position.
@@ -455,8 +455,7 @@ pub enum StreamVerdict {
     SealedGap { final_event_hash: EventHash },
 }
 
-/// Verify one stream's chain in isolation (integrity invariant I1 +
-/// the genesis rule). The rows MUST be ordered by `stream_position`
+/// Verify one stream's chain in isolation. The rows MUST be ordered by `stream_position`
 /// ascending. An empty slice is `Ok` with the genesis head at a
 /// sentinel position (`u64::MAX`) — "no rows to contradict"; callers
 /// that care about absent-vs-empty use the anchor cross-check.
@@ -526,11 +525,11 @@ pub fn verify_stream_chain(rows: &StreamRows<'_>) -> StreamVerdict {
 }
 
 // ---------------------------------------------------------------------------
-// Anchor cross-check (I2) — spec §6.2 / §8.1
+// Anchor cross-check
 // ---------------------------------------------------------------------------
 
 /// A `StreamSealed` fact as the verifier consumes it (the bits of the
-/// §2.3 tombstone the anchor cross-check needs).
+/// tombstone the anchor cross-check needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedStreamRecord {
     /// Wire-form id of the sealed/deleted stream.
@@ -539,14 +538,14 @@ pub struct SealedStreamRecord {
     pub final_event_hash: EventHash,
 }
 
-/// A signed, anchored checkpoint, already deserialized (spec §6.2).
-/// I/O — fetching it from the WORM store — is the Item-3 adapter's job;
+/// A signed, anchored checkpoint, already deserialized.
+/// I/O — fetching it from the WORM store — is the adapter's job;
 /// this is the pure shape the verify core consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
-    /// `"hort-evchain/v1"` — selects the canonicalizer (§3.3).
+    /// `"hort-evchain/v1"` — selects the canonicalizer.
     pub chain_format_version: String,
-    /// Monotonic sequence; a gap means a missing checkpoint (§6.4).
+    /// Monotonic sequence; a gap means a missing checkpoint.
     pub checkpoint_seq: u64,
     /// Emit time (store-supplied).
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -557,7 +556,7 @@ pub struct Checkpoint {
     pub sealed_streams: Vec<SealedStreamRecord>,
 }
 
-/// Why the anchor attestation is incomplete (spec §6.4).
+/// Why the anchor attestation is incomplete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingReason {
     /// No checkpoint exists at all (chain present, never anchored).
@@ -571,7 +570,7 @@ pub enum MissingReason {
 }
 
 /// An actual anchor-level integrity violation (distinct from a missing
-/// checkpoint, which is a coverage gap — spec §6.4).
+/// checkpoint, which is a coverage gap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorBreak {
     /// A live stream head does not match the head the newest
@@ -583,7 +582,7 @@ pub enum AnchorBreak {
     SealUnanchored,
 }
 
-/// Result of the anchor cross-check (spec §8.1).
+/// Result of the anchor cross-check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorVerdict {
     /// Live heads + seals are all consistent with the newest anchored
@@ -596,13 +595,13 @@ pub enum AnchorVerdict {
 }
 
 /// Cross-check live stream heads + sealed records against the newest
-/// anchored checkpoint (integrity invariant I2 — spec §6.2/§8.1).
+/// anchored checkpoint.
 ///
 /// `live_heads`: every present stream's `(stream_id,
 /// final_stream_position, head_hash)`. `sealed`: the `StreamSealed`
 /// records read from the audit-meta stream. `checkpoints`: all
 /// checkpoints read from the anchor store. `now` / `cadence`: for the
-/// staleness check (§6.4(c)).
+/// staleness check.
 pub fn verify_against_checkpoint(
     live_heads: &[(String, u64, EventHash)],
     sealed: &[SealedStreamRecord],
@@ -664,7 +663,7 @@ pub fn verify_against_checkpoint(
     }
 
     // Every `StreamSealed` must have its head anchored by some
-    // checkpoint (so the seal is provably expected, §2.3).
+    // checkpoint (so the seal is provably expected).
     for rec in sealed {
         let anchored = checkpoints.iter().any(|c| {
             c.sealed_streams.iter().any(|s| {
@@ -681,11 +680,11 @@ pub fn verify_against_checkpoint(
 }
 
 // ---------------------------------------------------------------------------
-// Top-level roll-up — spec §8.1
+// Top-level roll-up
 // ---------------------------------------------------------------------------
 
-/// The top-level pure verdict the Item-3 subcommand maps to a process
-/// exit code + the `hort_event_chain_verify_total{result}` metric.
+/// The top-level pure verdict the `verify-event-chain` subcommand maps to
+/// a process exit code + the `hort_event_chain_verify_total{result}` metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainReport {
     /// Every stream verified and the anchor cross-check passed.
@@ -698,7 +697,7 @@ pub enum ChainReport {
 }
 
 /// Roll the per-stream verdicts + the anchor verdict into the single
-/// top-level report (spec §8.1). `Broken` dominates
+/// top-level report. `Broken` dominates
 /// `MissingCheckpoint` dominates `Ok` — a real violation is never
 /// masked by a coverage gap.
 pub fn roll_up(stream_verdicts: &[StreamVerdict], anchor: &AnchorVerdict) -> ChainReport {
@@ -809,7 +808,7 @@ mod tests {
     fn genesis_hash_is_stable_and_not_zero() {
         let g = genesis_hash();
         assert_eq!(g, genesis_hash());
-        assert_ne!(g.0, [0u8; 32], "genesis must not be the zero array (§2.2)");
+        assert_ne!(g.0, [0u8; 32], "genesis must not be the zero array");
         // Known-answer: SHA-256("hort-event-chain/v1/genesis").
         let want: [u8; 32] = Sha256::digest(GENESIS_PREIMAGE).into();
         assert_eq!(g.0, want);
@@ -1512,7 +1511,7 @@ mod tests {
         assert_eq!(roll_up(&v, &AnchorVerdict::Ok), ChainReport::Ok);
     }
 
-    // ---- spec §3.2 determinism: full-64-variant canonical round-trip ----
+    // ---- Determinism: full-64-variant canonical round-trip ----
 
     /// Canonical-bytes determinism binding test.
     ///
@@ -1538,7 +1537,7 @@ mod tests {
     ///
     /// If any variant fails, the test panics loudly identifying the variant
     /// name and the hex diff of the two byte slices. A failure here is a
-    /// genuine F-2 bug (a `serde(default)`/`skip_serializing_if`/untagged
+    /// a genuine tamper-evidence bug (a `serde(default)`/`skip_serializing_if`/untagged
     /// field that breaks payload identity) — do NOT paper over it.
     #[test]
     fn canonical_payload_bytes_round_trip_all_variants() {
@@ -1595,7 +1594,7 @@ mod tests {
             let roundtrip_bytes = canonical_payload_bytes(&deserialized);
             if original_bytes != roundtrip_bytes {
                 panic!(
-                    "spec §3.2 round-trip FAILED for variant `{event_type}`:\n  \
+                    "canonical round-trip FAILED for variant `{event_type}`:\n  \
                      original  ({} bytes): {}\n  \
                      roundtrip ({} bytes): {}",
                     original_bytes.len(),

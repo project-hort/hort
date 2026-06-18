@@ -1,7 +1,7 @@
 //! `PgCurationExclusionsRepository` integration tests +
 //! `ExclusionAdded` projector envelope-attribution tests.
 //!
-//! Exercises the §2.9 + §3 active-exclusions listing against a real
+//! Exercises the active-exclusions listing against a real
 //! Postgres + verifies the projector populates the `added_by_actor_id`
 //! column from the event envelope (`api`-actor envelope → `Some(user_id)`;
 //! non-api envelope → `NULL`).

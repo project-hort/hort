@@ -40,7 +40,7 @@ fn reject_traversal(key: &str) -> DomainResult<()> {
 
 /// Filesystem-backed mirror. `key` is a `/`-delimited logical key; it maps
 /// to `<root>/<key>` with parent dirs created on put. Overwrite via
-/// write-temp + rename (atomic). Files are created mode `0o600` (F-44).
+/// write-temp + rename (atomic). Files are created mode `0o600`.
 pub struct FilesystemMetadataMirror {
     root: PathBuf,
 }
@@ -75,8 +75,8 @@ impl MetadataMirrorStore for FilesystemMetadataMirror {
             }
             let tmp = path.with_extension("tmp");
 
-            // F-44: create the temp file mode 0600 atomically with
-            // creation. The rename below preserves the inode + mode, so
+            // Create the temp file mode 0600 atomically with creation.
+            // The rename below preserves the inode + mode, so
             // the final mirror blob inherits 0600 without a follow-up
             // chmod. On non-Unix the mode is silently ignored (Windows
             // ACL semantics differ; the project's primary target is Linux).
@@ -275,8 +275,8 @@ mod tests {
         store.delete("meta-mirror/npm/m/p").await.unwrap();
     }
 
-    /// F-44: mirror blobs hold authenticated-upstream metadata; they must
-    /// be created mode 0600 (owner rw only), never the default 0644.
+    /// Mirror blobs hold authenticated-upstream metadata; they must be
+    /// created mode 0600 (owner rw only), never the default 0644.
     #[cfg(unix)]
     #[tokio::test]
     async fn fs_put_creates_file_mode_0600() {

@@ -9,18 +9,18 @@
 //! semantics, §8 wire shape, §11 invariant 1 (best-effort, no retry, no
 //! buffering).
 //!
-//! # Wire shape (matches design doc §8)
+//! # Wire shape
 //!
 //! Published payload is the same JSON body the webhook adapter sends.
 //! Header propagation is intentionally not used — receivers parse one
-//! wire shape regardless of transport (§7 "No NATS message headers").
+//! wire shape regardless of transport.
 //!
 //! # Delivery semantics
 //!
 //! - `Context::publish(subject, payload).await?` returns a
 //!   [`async_nats::jetstream::context::PublishAckFuture`]; we wrap that
 //!   inner future with `tokio::time::timeout(2s)` so this adapter's
-//!   ack-timeout discipline is the design doc §7 value, not the
+//!   ack-timeout discipline is the 2s value, not the
 //!   `async-nats` default (which has shifted between releases).
 //! - On ack within 2s → [`NotifyOutcome::Delivered`].
 //! - On timeout → [`NotifyOutcome::Failed`] with
@@ -44,7 +44,7 @@
 //! add a wrapper reconnect loop. If a `publish` call hits a
 //! disconnected state the client may return immediately with an error;
 //! that surfaces as `Failed { ConnectionLost }` and the dispatcher's
-//! failure budget handles the rest (Item 6b).
+//! failure budget handles the rest.
 
 use std::time::Duration;
 
@@ -61,10 +61,10 @@ use serde::Serialize;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// Constants — design doc §7 + §8
+// Constants
 // ---------------------------------------------------------------------------
 
-/// JetStream ack timeout per design doc §7 ("Publish-with-ack: 2s
+/// JetStream ack timeout ("Publish-with-ack: 2s
 /// timeout → `Failed { AckTimeout }`"). The inner publish-ack future is
 /// awaited with this deadline regardless of any default that
 /// `async-nats` ships with.
@@ -72,26 +72,25 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Wire-format `schema_version`, matching `hort-notifier-webhook`'s
 /// constant. Bumped only on breaking changes to the wire shape;
-/// receivers across both transports parse the same value (design doc
-/// §11 invariant 7).
+/// receivers across both transports parse the same value (invariant 7).
 const SCHEMA_VERSION: u32 = 1;
 
-/// Maximum tracing-subject prefix length. Design doc §12 specifies
+/// Maximum tracing-subject prefix length. The tracing discipline specifies
 /// "subject prefix only (truncated)" to avoid leakage of operator
 /// subject hierarchies in audit logs. 32 chars is enough to identify a
 /// namespace without exposing the leaf.
 const TRACING_SUBJECT_MAX: usize = 32;
 
 // ---------------------------------------------------------------------------
-// Wire body — design doc §8
+// Wire body
 // ---------------------------------------------------------------------------
 
 /// Wire-shape of the payload published to the JetStream subject.
-/// Matches design doc §8 byte-for-byte and the webhook adapter's
-/// `WebhookBody` so receivers parse one shape regardless of transport.
+/// Matches the webhook adapter's `WebhookBody` so receivers parse one
+/// shape regardless of transport.
 ///
 /// No `Deserialize` — adapters never reconstitute domain types from
-/// external input (design doc §11 invariant on type-deserialisation).
+/// external input (the no-deserialisation rule).
 #[derive(Serialize)]
 struct NatsPayload<'a> {
     schema_version: u32,
@@ -118,7 +117,7 @@ pub struct NatsNotifier {
 impl NatsNotifier {
     /// Construct from a pre-opened [`async_nats::Client`]. The
     /// composition root opens the client once (`HORT_NATS_URL` +
-    /// optional auth knobs introduced in Item 11) and threads it here.
+    /// optional auth knobs) and threads it here.
     pub fn new(client: async_nats::Client) -> Self {
         Self {
             jetstream: jetstream::new(client),
@@ -142,7 +141,7 @@ impl NatsNotifier {
     /// # Behaviour
     ///
     /// - `None` (or an empty bundle) → **byte-equivalent to the
-    ///   pre-F-20 behaviour**: plain `async_nats::connect(url)` with the
+    ///   prior behaviour**: plain `async_nats::connect(url)` with the
     ///   client's default trust. Zero behaviour change for the
     ///   no-extra-CA deployment.
     /// - `Some(non-empty)` → connect via
@@ -157,7 +156,7 @@ impl NatsNotifier {
     ///
     /// ## Why `tls_client_config`, not `add_root_certificates`
     ///
-    /// The F-20 recommendation literally names
+    /// The original recommendation literally named
     /// `ConnectOptions::add_root_certificates`, but in async-nats 0.48
     /// that method is **path-based** (`fn add_root_certificates(self,
     /// path: PathBuf)`) — it reads a PEM file off the filesystem. Our
@@ -181,7 +180,7 @@ impl NatsNotifier {
     /// is unchanged.
     pub async fn connect(url: &str, extra_ca: Option<&ExtraTrustAnchors>) -> DomainResult<Self> {
         let client = match decide_nats_tls(extra_ca)? {
-            // Byte-equivalent to the pre-F-20 path: plain connect, same
+            // Plain-connect path: plain connect, same
             // default trust, same `nats_connect:` error sentinel.
             NatsTls::Default => async_nats::connect(url)
                 .await
@@ -222,7 +221,7 @@ use rustls::{ClientConfig, RootCertStore};
 /// enum small (clippy `large_enum_variant`).
 enum NatsTls {
     /// No extra CA in play → plain `async_nats::connect(url)`, the
-    /// pre-F-20 behaviour, byte-for-byte.
+    /// prior behaviour, byte-for-byte.
     Default,
     /// Extra CA present → connect with this augmented rustls config.
     Custom(Box<ClientConfig>),
@@ -231,7 +230,7 @@ enum NatsTls {
 /// Decide which TLS path [`NatsNotifier::connect`] takes.
 ///
 /// `None` or an empty bundle → [`NatsTls::Default`] (byte-equivalent to
-/// the pre-F-20 plain connect). A non-empty bundle → [`NatsTls::Custom`]
+/// the plain connect). A non-empty bundle → [`NatsTls::Custom`]
 /// carrying the augmented `rustls::ClientConfig`.
 fn decide_nats_tls(extra_ca: Option<&ExtraTrustAnchors>) -> DomainResult<NatsTls> {
     match extra_ca {
@@ -362,7 +361,7 @@ impl EventNotifier for NatsNotifier {
 
 /// Build the canonical JSON payload bytes that the JetStream publish
 /// call sends as `Bytes`. Extracted from [`deliver`] so a unit test can
-/// verify the wire shape (especially the `schema_version` literal — §11
+/// verify the wire shape (especially the `schema_version` literal —
 /// invariant 7) without standing up a live broker.
 ///
 /// `pub(crate)` rather than private so the inner `tests` module can call
@@ -386,7 +385,7 @@ fn build_payload_bytes(
 
 /// Single-shot JetStream delivery. Builds the canonical JSON body,
 /// publishes to `subject`, and awaits the inner `PublishAck` with the
-/// design-doc §7 2s deadline.
+/// 2s deadline.
 async fn deliver(
     js: &jetstream::Context,
     subject: String,
@@ -411,7 +410,7 @@ async fn deliver(
     // `PublishAckFuture`. The outer future completes when the publish
     // request has been accepted by the client; the inner future
     // completes on broker ack. We wrap the inner with
-    // `tokio::time::timeout` so the design-doc §7 2s deadline applies
+    // `tokio::time::timeout` so the 2s deadline applies
     // regardless of any default `async-nats` ships with.
     let ack_future = match js
         .publish(subject.clone(), Bytes::from(payload_bytes))
@@ -513,10 +512,10 @@ fn classify_publish_error(e: &PublishError) -> NotifyFailureReason {
 // Tracing helpers
 // ---------------------------------------------------------------------------
 
-/// Truncate `subject` for tracing. Design doc §12 says "subject prefix
-/// only (truncated)" to avoid log-injection / leakage of operator
-/// subject hierarchies. The 32-byte budget is enough to identify the
-/// namespace without exposing the leaf.
+/// Truncate `subject` for tracing. The tracing discipline specifies
+/// "subject prefix only (truncated)" to avoid log-injection / leakage
+/// of operator subject hierarchies. The 32-byte budget is enough to
+/// identify the namespace without exposing the leaf.
 ///
 /// The truncation respects UTF-8 boundaries — multi-byte chars that
 /// straddle byte 32 are dropped wholesale rather than producing
@@ -708,7 +707,7 @@ mod tests {
 
     // -- build_payload_bytes (schema_version round-trip) -------------------
 
-    /// Wire-shape pin for design doc §11 invariant 7: `schema_version`
+    /// Wire-shape pin for invariant 7: `schema_version`
     /// is a public-API commitment. The NATS integration tests are gated
     /// on `HORT_TEST_NATS=1` so dev environments without Docker still need
     /// a pure unit assertion that the wire body carries `schema_version
@@ -728,7 +727,7 @@ mod tests {
         assert_eq!(
             schema_version,
             &serde_json::json!(1),
-            "schema_version is the public-API commitment from §11 invariant 7"
+            "schema_version is the public-API commitment (invariant 7)"
         );
         assert_eq!(
             schema_version.as_u64(),
@@ -771,7 +770,7 @@ mod tests {
     /// same generator + helper shape `hort-notifier-webhook` /
     /// `hort-adapters-upstream-http` use. Unlike the static truncated PEM
     /// in `hort-config`'s `extra_ca.rs` tests (which only needs to *parse*
-    /// as PEM), the F-20 root-store assertions push the cert into a real
+    /// as PEM), the extra-CA root-store assertions push the cert into a real
     /// `rustls::RootCertStore`, which performs full trust-anchor
     /// validation and rejects a truncated cert. A real rcgen CA is the
     /// established workspace pattern for that path.
@@ -791,7 +790,7 @@ mod tests {
     }
 
     /// `None` → the `Default` branch (plain `async_nats::connect(url)` —
-    /// byte-equivalent to the pre-F-20 behaviour for the no-extra-CA
+    /// byte-equivalent to the prior behaviour for the no-extra-CA
     /// deployment). Pure decision, asserted without a broker.
     #[test]
     fn decide_nats_tls_none_is_default() {

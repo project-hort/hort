@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# hort-server — production runtime image (Initiative 21 Item 2).
+# hort-server — production runtime image.
 #
 # Sibling to `deploy/compose/Dockerfile` (the dev / E2E debug image, which
 # stays untouched) and to the prototype `docker/Dockerfile.backend*`
@@ -9,7 +9,7 @@
 # Two stages:
 #   1. builder: rust:${RUST_VERSION}-slim — produces the stripped
 #      release binary. `[profile.release] strip = "symbols"` is set in
-#      the workspace `Cargo.toml` (Initiative 21 Item 1), so the
+#      the workspace `Cargo.toml`, so the
 #      `cargo build --release -p hort-server` invocation below does not
 #      need an explicit `--strip` flag. The `:slim` variant matches the
 #      tag the test pipeline already pulls (`RUST_IMAGE` in
@@ -24,15 +24,14 @@
 #
 # OCI labels: only the non-CI-driven pair (`title`, `licenses`) is
 # baked in. `source`, `revision`, `version`, `created` are passed by
-# the CI publish job via `--label` on the build invocation, per
-# `docs/plans/031-initiative-21-deploy.md` §3.1.
+# the CI publish job via `--label` on the build invocation.
 #
 # No HEALTHCHECK directive: Kubernetes liveness / readiness probes
-# call `/healthz` and `/readyz` directly (Item 1); compose / podman
+# call `/healthz` and `/readyz` directly; compose / podman
 # users run `deploy/compose/docker-compose.yml`, not this image.
 #
 # No ENV defaults and no CMD: every env var lives in the chart's
-# `values.yaml` + Deployment template (design doc §3.4); operators
+# `values.yaml` + Deployment template; operators
 # pass the subcommand explicitly (`serve`, `migrate`, `scrub`,
 # `admin`, `reconcile-groups`).
 
@@ -87,7 +86,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 
 # OCI Image Spec v1.1 labels. The two below are static; CI passes the
 # rest (`source`, `revision`, `version`, `created`) via `--label` on
-# the publish job (design doc §3.1).
+# the publish job.
 LABEL org.opencontainers.image.title="hort"
 LABEL org.opencontainers.image.licenses="MIT"
 
@@ -100,8 +99,7 @@ WORKDIR /var/lib/hort-server
 
 # Public listener (default 8080) + admin/metrics listener (default
 # 9090). Operators may rebind via `HORT_HTTP_PUBLIC_BIND` /
-# `HORT_HTTP_ADMIN_BIND`; the EXPOSE values reflect the documented
-# defaults from `docs/plans/031-initiative-21-deploy.md` §3.1.
+# `HORT_HTTP_ADMIN_BIND`.
 EXPOSE 8080 9090
 
 COPY --from=builder /usr/local/bin/hort-server /usr/local/bin/hort-server

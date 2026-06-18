@@ -14,8 +14,8 @@
 //!
 //! # Scan: one set-based query per drift category
 //!
-//! `scan_repo_drift` issues three index-bound queries (the §3 G1
-//! "run in two parts so the query plan stays index-bound" guidance,
+//! `scan_repo_drift` issues three index-bound queries (following the
+//! "run in two parts so the query plan stays index-bound" pattern,
 //! extended to three because rejected-source rows are a third
 //! category):
 //!
@@ -550,10 +550,11 @@ mod tests {
             return;
         };
         let repo = seed_repo(&pool).await;
-        // A1's migration back-fill only runs on existing rows at
+        // The migration back-fill only runs on existing rows at
         // migration time; a row inserted after has no projection row,
-        // exactly the post-commit-write-lagged case B3.5 repairs. We
-        // delete any auto-row to force the missing state deterministically.
+        // exactly the post-commit-write-lagged case the reconciler
+        // repairs. We delete any auto-row to force the missing state
+        // deterministically.
         let art = seed_artifact(&pool, repo, "missing-pc", HASH_A, None).await;
         sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
             .bind(art)

@@ -5,7 +5,7 @@
 //! `ScanIndeterminate`, with per-row quarantine deadline resolved at
 //! query time and a rejection-reason discriminator for rejected rows.
 //!
-//! Query parameters (design §2.7):
+//! Query parameters:
 //! - `repository` — stable repository key (string). Resolves to a UUID
 //!   via [`hort_app::use_cases::repository_use_case::RepositoryUseCase::get_by_key`];
 //!   missing key → 404.
@@ -19,7 +19,7 @@
 //!   at the boundary). Invalid value → 400.
 //! - `limit` — 1..=500. Default 100 when absent. Invalid range → 400.
 //!
-//! Status-code map (design §3):
+//! Status-code map:
 //! - `200 OK` — success, body is [`CurationQueueResponseDto`]
 //! - `400 Bad Request` — invalid `status` / `reason` value, oversize
 //!   `limit`, or `limit = 0`
@@ -178,7 +178,7 @@ pub async fn get_queue(
         Some(s) => Some(s.parse::<QuarantineStatus>().map_err(ApiError::from)?),
     };
 
-    // Validate `?reason=` against the closed set Item 6's adapter
+    // Validate `?reason=` against the closed set the adapter
     // actually emits (`scanner | curator | curation_retroactive`).
     // `corruption` is NOT a curation-queue reason (corrupted
     // artifacts surface via the separate
@@ -245,7 +245,7 @@ pub async fn get_queue(
 
 #[cfg(test)]
 mod tests {
-    //! Item 10 acceptance — `GET /queue` handler-layer assertions.
+    //! `GET /queue` handler-layer assertions.
     //!
     //! Tests use [`build_mock_ctx`] (the anti-pattern checklist
     //! forbids hand-rolling `AppContext`). The recording
@@ -609,10 +609,10 @@ mod tests {
     }
 
     // NOTE: The "missing principal" path is exercised by the
-    // `authz_scope_tests` module in `mod.rs` (Item 9) and by the
-    // unit tests in `authz::extractors`. The minimal `harness()`
-    // here mounts the route directly without the auth middleware
-    // (matching Item 9's `waive.rs::tests::harness`), so a request
+    // `authz_scope_tests` module in `mod.rs` and by the unit tests
+    // in `authz::extractors`. The minimal `harness()` here mounts the
+    // route directly without the auth middleware (matching the shape
+    // in `waive.rs::tests::harness`), so a request
     // with no injected principal surfaces as 500 from the extractor
     // composition-bug guard — not a useful wire-shape assertion for
     // this handler. The 403 path that DOES belong here is exercised

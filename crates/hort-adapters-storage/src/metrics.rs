@@ -9,7 +9,7 @@
 //! string in this module corresponds to a row in that catalog. A new metric
 //! name or label value requires a catalog update first.
 //!
-//! Layering (design doc section 1): each adapter owns its own result taxonomy.
+//! Layering: each adapter owns its own result taxonomy.
 //! The storage adapter does NOT depend on `hort-app::metrics`, and the domain
 //! layer has no knowledge of metrics at all. 5-10 variants of duplication is
 //! cheaper than a shared dependency that pulls metric concerns into the
@@ -128,7 +128,7 @@ pub(crate) fn emit_dedup(backend: &'static str) {
 /// **Emission contract.** Called from `StoragePort::delete`'s
 /// successful-delete branch only, with `bytes` = the object size
 /// stat'd *before* the delete. An already-absent blob (the
-/// `DomainError::NotFound` / idempotent re-purge path, §6 invariant 4)
+/// `DomainError::NotFound` / idempotent re-purge path)
 /// does NOT call this — re-running a purge on a gone blob reclaims
 /// nothing, so double-counting on retry is impossible by construction.
 /// `backend` is the only label (bounded — `filesystem` / `s3` / `gcs`

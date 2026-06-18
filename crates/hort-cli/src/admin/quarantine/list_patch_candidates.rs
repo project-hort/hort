@@ -151,7 +151,7 @@ pub async fn run_with_output(
 
 /// Render the candidate listing as an aligned table.
 ///
-/// Columns mirror the design doc §3.5 layout:
+/// Columns:
 /// `PACKAGE  FORMAT  VULN_VERSION → QUARANTINED  SEVERITY  FINDINGS  QUARANTINE_UNTIL`.
 /// `QUARANTINE_UNTIL` is rendered as a relative duration (`in 6h 14m`)
 /// against `now` so the operator sees "how long until auto-evaluation"

@@ -11,28 +11,24 @@
 //!
 //! `EventStore::read_stream`/`read_category` return [`PersistedEvent`],
 //! which by design does **not** carry the `prev_event_hash`/`event_hash`
-//! chain columns the verifier's §7/§8.1 model needs to localize a tamper
-//! to an exact `Broken { at_position }`. An earlier rule said
-//! "reuse the existing read ports; do not widen the port" — but that is
-//! not implementable through `PersistedEvent`. The correct
-//! resolution: a dedicated,
+//! chain columns the verifier needs to localize a tamper to an exact
+//! `Broken { at_position }`. The correct resolution: a dedicated,
 //! additive read port — implemented by `PgEventChainReader` in
-//! `hort-adapters-postgres` — exactly mirroring the emitter half's
+//! `hort-adapters-postgres` — mirroring the emitter half's
 //! [`EventChainHeadReaderPort`](super::event_chain_head_reader). This
 //! keeps **all** `sqlx` in the Postgres adapter (the verifier no longer
 //! issues raw `SELECT`s from the `hort-server` binary) and keeps the
 //! verifier backend-agnostic: it depends on `Arc<dyn EventChainReaderPort>`,
 //! so an EventStoreDB/KurrentDB backend implements the same port. The
-//! `EventStore` trait is **neither used nor widened** (governance +
-//! `feedback_no_port_contract_changes`: this is a *new* port, not a
-//! widening of the well-designed `EventStore` trait).
+//! `EventStore` trait is **neither used nor widened**: this is a *new*
+//! port, not a widening of the existing `EventStore` trait.
 //!
 //! ## Read posture (adapter concern)
 //!
 //! `SELECT`-only on the **runtime DML DSN** (the `hort_app_role` equivalent
 //! that holds only `SELECT`/`INSERT` on `events`) — never DDL, never a
 //! write to `events`. Each method is bounded; per-stream reads page
-//! internally so the verifier never buffers the whole table (spec §8.2).
+//! internally so the verifier never buffers the whole table.
 
 use crate::error::DomainResult;
 use crate::events::{ChainRow, SealedStreamRecord};
@@ -52,7 +48,7 @@ pub trait EventChainReaderPort: Send + Sync {
     /// every stream with any activity at `global_position >= n`; `None`
     /// selects all streams. It never restricts which rows *within* a
     /// selected stream are read — [`read_stream_chain`] always reads from
-    /// genesis (spec §8.2). The explicit `--stream` allow-list is applied
+    /// genesis. The explicit `--stream` allow-list is applied
     /// by the caller before reaching the port (no DB read needed).
     ///
     /// [`read_stream_chain`]: EventChainReaderPort::read_stream_chain

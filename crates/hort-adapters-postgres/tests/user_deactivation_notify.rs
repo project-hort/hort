@@ -77,7 +77,7 @@ fn make_user(is_active: bool) -> User {
         email: format!("f8-{id}@example.test"),
         auth_provider: AuthProvider::Local,
         external_id: None,
-        display_name: Some("F8 deactivation test fixture".into()),
+        display_name: Some("deactivation test fixture".into()),
         is_active,
         is_admin: false,
         is_service_account: false,
@@ -167,7 +167,7 @@ async fn save_with_is_active_false_emits_user_prefix_notify() {
     let expected = format!("{}{}", USER_PREFIX, user.id);
     assert_eq!(
         payload, expected,
-        "payload must be the literal `user:<uuid>` shape design doc §5 requires"
+        "payload must be the literal `user:<uuid>` shape"
     );
 }
 
@@ -314,7 +314,7 @@ async fn user_deactivation_invalidates_cached_pat_via_listener() {
     let repo = PgUserRepository::new(pool.clone());
     repo.save(&user).await.expect("save inactive user");
 
-    // Poll for the dispatch — same shape as the existing B5c integration
+    // Poll for the dispatch — same shape as the existing integration
     // tests in `api_token_revocation_listener.rs`.
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {

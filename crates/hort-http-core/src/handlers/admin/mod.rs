@@ -26,7 +26,7 @@
 //! and deletes happen by editing the YAML and restarting the
 //! process. The `RepositoryUseCase::create` method is still callable
 //! from in-process callers (the apply pipeline does NOT use it —
-//! see Item 8's `save_managed` path — but Item 4's
+//! see the `save_managed` path — but the
 //! `ManagedByConfiguration` collision check on `create` remains
 //! load-bearing for any future inbound that mounts it).
 //!
@@ -73,9 +73,9 @@ pub mod curation;
 /// Exposed as a sub-module so the composition-root mount site
 /// (`hort-server::http::control_plane_routes`) can pull the sub-router
 /// via `admin::policies::policies_routes()`. The new routes are gated
-/// by [`crate::authz::CurateOrAdminPrincipal`] (same gate as Item 9 /
-/// Item 10), NOT by the [`AdminPrincipal`] gate that protects the rest
-/// of this module's `admin_routes()` tree.
+/// by [`crate::authz::CurateOrAdminPrincipal`], NOT by the
+/// [`AdminPrincipal`] gate that protects the rest of this module's
+/// `admin_routes()` tree.
 pub mod policies;
 
 /// Maximum byte length of the operator-supplied justification on
@@ -135,9 +135,9 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
     // gitops is the only writer. The standalone `UpstreamMappingSpec` gitops
     // kind is that writer — ApplyConfigUseCase emits RepositoryUpstreamMapping
     // rows from it (via `apply_upstream_mappings`). There is no inline
-    // `ProxySpec.secret_ref` field (a parsed-but-never-wired field is
-    // an anonymous-pull footgun); authenticated upstreams use
-    // the `UpstreamMappingSpec` kind, which carries its own `secret_ref`.
+    // `ProxySpec.secret_ref` field (a parsed-but-never-wired field is an
+    // anonymous-pull footgun); authenticated upstreams use the
+    // `UpstreamMappingSpec` kind, which carries its own `secret_ref`.
 }
 
 // ---------------------------------------------------------------------------
@@ -228,9 +228,9 @@ struct PatchCandidateDto {
     /// Rendered as the lowercase status string ("quarantined", etc.)
     /// via the [`QuarantineStatus`](hort_domain::entities::artifact::QuarantineStatus)
     /// `Display` impl. Always `"quarantined"` for rows surfaced by
-    /// this endpoint per the design-doc §3.2 query filter; the field
-    /// is preserved for symmetry with the domain DTO and so any
-    /// future relaxation of the filter remains forward-compatible.
+    /// this endpoint; the field is preserved for symmetry with the
+    /// domain DTO and so any future relaxation of the filter remains
+    /// forward-compatible.
     quarantined_status: String,
     quarantined_until: Option<DateTime<Utc>>,
     repository_id: Uuid,
@@ -250,8 +250,7 @@ struct PatchCandidateDto {
     /// "medium", "low") via the
     /// [`SeverityThreshold`](hort_domain::entities::scan_policy::SeverityThreshold)
     /// `Display` impl. `None` is the type-level possibility for
-    /// "no findings"; the design-doc §3.2 LATERAL filter prevents
-    /// it in practice.
+    /// "no findings"; the LATERAL filter prevents it in practice.
     vulnerable_max_severity: Option<String>,
 }
 
@@ -666,7 +665,7 @@ mod tests {
     //! Admin handler tests.
     //!
     //! The suite runs under [`AuthContext::Enabled`] and injects a
-    //! [`CallerPrincipal`] into request extensions manually — F1's
+    //! [`CallerPrincipal`] into request extensions manually — the
     //! `AdminPrincipal` extractor pulls from that slot, skipping the
     //! `require_principal` auth middleware (which needs a live IdP).
     //! This mirrors the pattern in `crate::authz::extractors::tests`.
@@ -709,8 +708,7 @@ mod tests {
 
     /// Construct a `GET /admin/repositories/<key>` request with an
     /// optional pre-inserted principal. When `principal` is `None`
-    /// the AdminPrincipal extractor returns 500 (router-wiring bug —
-    /// matches the F1 behaviour at `authz/extractors.rs:178`).
+    /// the AdminPrincipal extractor returns 500 (router-wiring bug).
     ///
     /// The principal is wrapped in
     /// the `AuthenticatedPrincipal` newtype before insertion. The
@@ -808,9 +806,9 @@ mod tests {
 
     #[tokio::test]
     async fn admin_get_reader_principal_returns_403() {
-        // F1 AdminPrincipal extractor short-circuits on caller
-        // identity before the handler body runs. The seeded row
-        // therefore never matters; we don't bother seeding.
+        // AdminPrincipal extractor short-circuits on caller identity
+        // before the handler body runs. The seeded row therefore never
+        // matters; we don't bother seeding.
         let (router, _) = lookup_harness();
         let response = router
             .oneshot(admin_get(
@@ -824,14 +822,14 @@ mod tests {
         assert_eq!(
             &bytes[..],
             br#"{"error":"insufficient permissions"}"#,
-            "body must match the F1 extractor's 403 shape"
+            "body must match the extractor's 403 shape"
         );
     }
 
     #[tokio::test]
     async fn admin_get_missing_principal_returns_500() {
         // Models the router-wiring bug where `require_principal` is
-        // absent — F1's extractor surfaces it as 500.
+        // absent — the extractor surfaces it as 500.
         let (router, _) = lookup_harness();
         let response = router.oneshot(admin_get("pypi-e2e", None)).await.unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1334,7 +1332,7 @@ mod tests {
         );
     }
 
-    /// Non-admin principal → 403 FORBIDDEN. The F1 `AdminPrincipal`
+    /// Non-admin principal → 403 FORBIDDEN. The `AdminPrincipal`
     /// extractor short-circuits before the handler body runs; the
     /// `PatchCandidateUseCase::list` is never reached and the mock
     /// repo records no calls.
@@ -1369,7 +1367,7 @@ mod tests {
     use hort_domain::entities::user::{AuthProvider, User};
 
     /// Reuse the patch-candidate harness shape: a fully-wired mock
-    /// `AppContext` under `AuthContext::Enabled` so the F1
+    /// `AppContext` under `AuthContext::Enabled` so the
     /// `AdminPrincipal` extractor runs, plus the full `MockPorts` so the
     /// test seeds `mocks.users` and `mocks.permission_grants`.
     fn effective_permissions_harness() -> (Router, crate::test_support::MockPorts) {
@@ -1559,7 +1557,7 @@ mod tests {
         assert!(g0["repository_id"].is_null(), "global grant ⇒ null repo");
     }
 
-    /// Non-admin caller → 403 via the F1 `AdminPrincipal` extractor.
+    /// Non-admin caller → 403 via the `AdminPrincipal` extractor.
     #[tokio::test]
     async fn effective_permissions_non_admin_returns_403() {
         let (router, mocks) = effective_permissions_harness();
@@ -1594,7 +1592,7 @@ mod tests {
     // ----- POST /admin/rbac/resolve --------------------
 
     /// Reuse the effective-permissions harness shape: a fully-wired mock
-    /// `AppContext` under `AuthContext::Enabled` so the F1 `AdminPrincipal`
+    /// `AppContext` under `AuthContext::Enabled` so the `AdminPrincipal`
     /// extractor runs, plus the full `MockPorts` so the test seeds
     /// `mocks.claim_mappings` (group→claim) and `mocks.permission_grants`
     /// (the grant set the resolved claims enumerate against).
@@ -1804,7 +1802,7 @@ mod tests {
         );
     }
 
-    /// Non-admin caller → 403 via the F1 `AdminPrincipal` extractor; the
+    /// Non-admin caller → 403 via the `AdminPrincipal` extractor; the
     /// request body is never parsed.
     #[tokio::test]
     async fn rbac_resolve_non_admin_returns_403() {

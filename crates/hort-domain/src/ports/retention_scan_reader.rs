@@ -7,19 +7,14 @@
 //! # Why a *new, separate* trait (not extra methods on
 //! [`ScanFindingsRepository`](super::scan_findings_repository::ScanFindingsRepository))
 //!
-//! The B3 backlog wording calls for an "additive new port trait" that
-//! exposes `list_findings_for_artifact` + `repo_security_score`,
-//! *reusing* the existing [`Finding`](crate::types::Finding) /
-//! [`RepoSecurityScore`](super::repo_security_score_repository::RepoSecurityScore)
-//! types. A trait named `ScanFindingsRepository` already ships
+//! A trait named `ScanFindingsRepository` already ships
 //! (`insert_batch` only). Adding read methods to *that* trait
 //! would mutate an existing port signature surface (every existing
 //! impl + every mock would have to grow the methods), and
 //! changing an existing well-designed port signature is forbidden. So the
 //! retention read surface is a **distinct, purely-additive** trait —
 //! zero existing impls are touched. It reuses the shipped row types so
-//! nothing is redefined. (Recorded as the §4-vs-code naming decision in
-//! the B3 report.)
+//! nothing is redefined.
 //!
 //! # Source of the rows
 //!
@@ -43,14 +38,12 @@
 //! `fixed_versions` / `references` / `aliases` **empty** (the
 //! projection has nothing to populate them from). The predicate logic
 //! is written against `Finding::fixed_versions` so that a future
-//! richer source (the carve-out below) makes `HasFixAvailable` work
+//! richer source makes `HasFixAvailable` work
 //! unchanged — but **with the v1 projection-only adapter,
 //! `HasFixAvailable` can only ever observe an empty `fixed_versions`
 //! and so never matches from projection data.** This is the honest
 //! precision gap; the named follow-on is "blob-sourced
-//! `fixed_versions` precision for `HasFixAvailable`" (part of the
-//! "successor-in-our-repo / per-finding first-seen"
-//! refinement family).
+//! `fixed_versions` precision for `HasFixAvailable`".
 
 use uuid::Uuid;
 
@@ -75,7 +68,7 @@ pub trait RetentionScanReader: Send + Sync {
     /// distinguishes "never scanned" via [`Self::repo_security_score`]'s
     /// `last_scan_at`, not via an empty findings list). `fixed_versions`
     /// / `references` / `aliases` are empty on every returned row — see
-    /// the module-level §4-vs-code divergence note.
+    /// the module-level precision note.
     fn list_findings_for_artifact(
         &self,
         artifact_id: Uuid,
@@ -83,8 +76,7 @@ pub trait RetentionScanReader: Send + Sync {
 
     /// The per-repository `repo_security_scores` projection row, or
     /// `None` when the repository has no row yet (no scan has ever
-    /// completed in it). The freshness gate (§6 invariant 7) keys off
-    /// the row's `last_scan_at`.
+    /// completed in it). The freshness gate keys off the row's `last_scan_at`.
     fn repo_security_score(
         &self,
         repo_id: Uuid,

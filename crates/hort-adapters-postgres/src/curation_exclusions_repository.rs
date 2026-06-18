@@ -1,10 +1,9 @@
 //! PostgreSQL adapter for [`CurationExclusionsRepository`].
 //!
-//! Reads the §2.9 + §3 active-exclusions listing from the
+//! Reads the active-exclusions listing from the
 //! `exclusion_projections` table (the same projection
 //! `QuarantineUseCase::record_scan_result` consults at
-//! `quarantine_use_case.rs:343`). The table gains two new columns
-//! in this initiative:
+//! `quarantine_use_case.rs:343`). The table gains two new columns:
 //!
 //! - `added_by_actor_id uuid` — envelope-side author attribution
 //!   sourced from the `ExclusionAdded` event's persisted
@@ -20,7 +19,7 @@
 //! edit-in-place rule). Existing DBs must be re-migrated when the
 //! file's checksum changes.
 //!
-//! ## Filters (design §3)
+//! ## Filters
 //!
 //! - `policy_id: Option<Uuid>` — equality
 //! - `cve_id: Option<String>` — equality on the canonical CVE id
@@ -28,7 +27,7 @@
 //!   surfaces only rows whose envelope was an `api` actor with the
 //!   given user_id
 //! - `limit: u32` — capped at 500 defensively; the use case validates
-//!   `> 500` as `AppError::Validation` (mirrors Item 6 / Item 7)
+//!   `> 500` as `AppError::Validation`
 //!
 //! ## Ordering
 //!
@@ -38,8 +37,8 @@
 //! ## DTO discipline (port docs)
 //!
 //! `CurationExclusionEntry` does NOT derive `Serialize` — DTO
-//! crossing the HTTP boundary lives in `hort-http-admin-curation`
-//! (Item 9), not the domain layer.
+//! crossing the HTTP boundary lives in `hort-http-admin-curation`,
+//! not the domain layer.
 //!
 //! See `docs/architecture/how-to/curator-workflow.md` for operator guidance.
 
@@ -78,7 +77,7 @@ impl CurationExclusionsRepository for PgCurationExclusionsRepository {
     ) -> BoxFuture<'a, DomainResult<Vec<CurationExclusionEntry>>> {
         Box::pin(async move {
             // Defensive clamp (use case already validates > 500 →
-            // Validation). Same pattern as Item 6 / Item 7.
+            // Validation).
             let limit = filter.limit.min(MAX_LIMIT);
 
             // Parameters:
@@ -169,16 +168,13 @@ mod tests {
     use super::*;
 
     /// Compile-time assertion that the adapter implements the port.
-    /// Mirrors the convention in Item 6 / Item 7.
     #[test]
     fn pg_adapter_implements_port() {
         fn assert_impl<T: CurationExclusionsRepository>() {}
         assert_impl::<PgCurationExclusionsRepository>();
     }
 
-    /// The adapter's hard cap matches the design's documented value
-    /// (mirrors Items 6 / 7 — single canonical limit across the
-    /// three §2.9 listings).
+    /// The adapter's hard cap matches the port-defined limit.
     #[test]
     fn max_limit_matches_design() {
         assert_eq!(MAX_LIMIT, 500);

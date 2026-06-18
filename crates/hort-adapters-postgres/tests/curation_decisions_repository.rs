@@ -1,6 +1,6 @@
 //! `PgCurationDecisionsRepository` integration tests.
 //!
-//! Exercises the §2.9 + §3 event-log query end-to-end against a real
+//! Exercises the curation event-log query end-to-end against a real
 //! Postgres. Each acceptance scenario from the backlog gets its own
 //! `#[tokio::test]`.
 //!
@@ -835,7 +835,7 @@ async fn list_decisions_repository_filter_narrows_artifact_keyed_rows() {
     // Exclusion: policy-keyed → no-op for the repo filter (still surfaces).
     assert!(
         ids.contains(&exclude_evt),
-        "policy-keyed exclusion must surface despite repo filter (no-op per design §2.9)"
+        "policy-keyed exclusion must surface despite repo filter (scope is policy-keyed, not repo-keyed)"
     );
 
     cleanup_repo(&pool, repo_a).await;

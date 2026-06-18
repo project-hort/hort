@@ -234,16 +234,16 @@ async fn download(
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs.
     //
-    // Spec 074 §2 — resolve via the single SSOT path constructor, which
-    // lowercases the name (`normalize_name`). This was previously the lone
-    // raw-form outlier (`crates/{name}/...` with the un-lowercased URL
-    // segment), inconsistent with publish (`lib.rs` `do_publish`) and the
-    // read-side `parse_download_path` — both of which store/lookup the
-    // lowercased canonical row. The retired "drift-resilience" rationale
-    // traded publish/read coherence for resilience against a normalization
-    // change that should be a re-projection migration, not a read-time
-    // guess (spec 074 §5). A `Serde`-cased download now resolves the
-    // `serde`-stored row instead of 404-ing.
+    // Resolve via the single SSOT path constructor, which lowercases
+    // the name (`normalize_name`). This was previously the lone raw-form
+    // outlier (`crates/{name}/...` with the un-lowercased URL segment),
+    // inconsistent with publish (`lib.rs` `do_publish`) and the read-side
+    // `parse_download_path` — both of which store/lookup the lowercased
+    // canonical row. The retired "drift-resilience" rationale traded
+    // publish/read coherence for resilience against a normalization change
+    // that should be a re-projection migration, not a read-time guess.
+    // A `Serde`-cased download now resolves the `serde`-stored row instead
+    // of 404-ing.
     let artifact_path = CargoFormatHandler
         .build_artifact_logical_path(&name, &version, None)
         .map_err(ApiError::from)?;
@@ -445,8 +445,8 @@ async fn publish(
     let raw_name = metadata.name.clone();
     let normalized = handler.normalize_name(&metadata.name);
     let version = metadata.vers;
-    // Spec 074 §2 — the canonical stored path comes from the single SSOT
-    // constructor (`crates/{n}/{v}/{n}-{v}.crate`, `n` lowercased), the
+    // The canonical stored path comes from the single SSOT constructor
+    // (`crates/{n}/{v}/{n}-{v}.crate`, `n` lowercased), the
     // exact string `parse_download_path` + the download handler produce.
     // cargo derives the filename from name+version, so `filename = None`.
     let path = handler
@@ -485,9 +485,8 @@ async fn publish(
                 legacy_sha1: None, // cargo's cksum IS the SHA-256 storage hash
                 legacy_md5: None,
                 // Cargo sparse-index metadata (`PublishMetadata` — features,
-                // deps, yanked) extraction lands as a follow-up when the
-                // index read path consumes it — see the Item 2 "Not in
-                // scope" note in the backlog.
+                // deps, yanked) extraction is deferred until the index read
+                // path consumes it.
                 payload_metadata: serde_json::Value::Null,
             },
             stream,
@@ -595,8 +594,8 @@ mod tests {
             .build_recorder()
             .handle();
         let (ctx, mocks) = build_mock_ctx(metrics_handle);
-        // Post-Item-3 cargo tests drive `config.json` through the F2
-        // trust layer. `TrustConfig::default()` pins
+        // Cargo tests drive `config.json` through the request-trust
+        // layer. `TrustConfig::default()` pins
         // `http://hort-server:8080`, which would short-circuit every
         // `Host: registry.example.com` → `https://registry.example.com/...`
         // assertion. Override with the untrusted-peer fallback so the
@@ -611,12 +610,12 @@ mod tests {
         }
     }
 
-    /// Build a router with the F2 request-trust layer attached.
+    /// Build a router with the request-trust layer attached.
     ///
-    /// Post-Item-3, `config_json` pulls the public URL from
-    /// `RequestTrust` via the F2 layer. Router helpers in this test
-    /// module replicate the production wiring so handler tests
-    /// exercise the same path as the integration stack.
+    /// `config_json` pulls the public URL from `RequestTrust`.
+    /// Router helpers in this test module replicate the production
+    /// wiring so handler tests exercise the same path as the
+    /// integration stack.
     fn router(ctx: Arc<AppContext>) -> Router {
         let trust_cfg = ctx.trust_config.clone();
         Router::new()
@@ -974,16 +973,15 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
-    /// Spec 074 §2/§3 (behaviour change, accepted): the download handler
-    /// now resolves via the single SSOT path constructor, which lowercases
-    /// the name (`normalize_name`). A case-mismatched hand-constructed URL
-    /// (`/Serde/1.0.0/download`) therefore RESOLVES the canonical `serde`
-    /// row instead of 404-ing. This was previously the lone raw-form
-    /// outlier (inconsistent with publish + `parse_download_path`, both of
-    /// which store/lookup the lowercased canonical row). The retired
-    /// "drift-resilience" rationale traded publish/read coherence for
-    /// resilience against a normalization change that should be a
-    /// re-projection migration, not a read-time guess (spec 074 §5).
+    /// The download handler resolves via the single SSOT path constructor,
+    /// which lowercases the name (`normalize_name`). A case-mismatched
+    /// hand-constructed URL (`/Serde/1.0.0/download`) therefore RESOLVES
+    /// the canonical `serde` row instead of 404-ing. This was previously
+    /// the lone raw-form outlier (inconsistent with publish +
+    /// `parse_download_path`, both of which store/lookup the lowercased
+    /// canonical row). The retired "drift-resilience" rationale traded
+    /// publish/read coherence for resilience against a normalization change
+    /// that should be a re-projection migration, not a read-time guess.
     #[tokio::test]
     async fn download_resolves_case_variant_to_canonical_row() {
         let h = harness();
@@ -1310,13 +1308,11 @@ mod tests {
         /// Happy path: cache miss + Proxy + upstream serves the
         /// advertised crate body.
         ///
-        /// Wire is already covered by Item 5's
-        /// `download_proxy_repo_cache_miss_success_returns_200`; this
-        /// test asserts the FRAMEWORK invariants:
+        /// This test asserts the FRAMEWORK invariants:
         /// - `ChecksumVerified` and `ArtifactIngested` ride in the
-        ///   SAME `commit_transition` batch (atomic with the mint
-        ///   per design §13), and that batch lands on the
-        ///   `StreamCategory::Artifact` stream.
+        ///   SAME `commit_transition` batch (atomic with the mint),
+        ///   and that batch lands on the `StreamCategory::Artifact`
+        ///   stream.
         /// - The freshly-fetched body is present in the CAS at its
         ///   computed hash (`storage.put` ran exactly once and the
         ///   bytes are recoverable).
@@ -1405,9 +1401,7 @@ mod tests {
         /// Tampered crate: cache miss + Proxy + upstream serves bytes
         /// that disagree with the advertised cksum.
         ///
-        /// Wire is already covered by Item 5's
-        /// `download_proxy_repo_cache_miss_checksum_mismatch_returns_502`;
-        /// this test asserts the FRAMEWORK invariants from §13:
+        /// This test asserts the FRAMEWORK invariants:
         /// - `ChecksumMismatch` is appended to the REPOSITORY stream
         ///   (never the artifact stream — there is no artifact yet
         ///   under mint-after-verify).
@@ -1529,9 +1523,7 @@ mod tests {
         /// Missing cksum: NDJSON entry for the requested
         /// (name, version) lacks the `cksum` field.
         ///
-        /// Wire is already covered by Item 5's
-        /// `download_proxy_repo_cache_miss_no_cksum_returns_502`; this
-        /// test asserts the FRAMEWORK invariants:
+        /// This test asserts the FRAMEWORK invariants:
         /// - `parse_upstream_checksum` fails BEFORE `ingest_verified`
         ///   is called, so no event is ever emitted on either stream.
         /// - `storage.put` is never called (the parser short-circuits
@@ -2036,20 +2028,17 @@ mod tests {
         assert!(!entry["yanked"].as_bool().unwrap());
     }
 
-    /// Normalisation-drift regression (arch findings Item 6) — updated for
-    /// spec 074. The index-emission drift recovery is UNCHANGED: a raw
-    /// client name that doesn't match the current normalise is still
-    /// recovered via the `name_as_published` fallback
+    /// Normalisation-drift regression. The index-emission drift recovery
+    /// is UNCHANGED: a raw client name that doesn't match the current
+    /// normalise is still recovered via the `name_as_published` fallback
     /// (`list_by_raw_name`), and the NDJSON `name` still carries the
-    /// stored form. What spec 074 §2/§3 changes is the DOWNLOAD handler:
-    /// it now resolves via the single SSOT path constructor, which
-    /// lowercases the name — so the canonical projection row is stored at
-    /// the lowercased path and a follow-up download via the
-    /// canonical-cased URL hits it. (Storing the row at a mixed-case path
-    /// and serving it via a mixed-case download URL was the retired
+    /// stored form. The DOWNLOAD handler resolves via the single SSOT path
+    /// constructor, which lowercases the name — so the canonical projection
+    /// row is stored at the lowercased path and a follow-up download via
+    /// the canonical-cased URL hits it. (Storing the row at a mixed-case
+    /// path and serving it via a mixed-case download URL was the retired
     /// raw-form "drift-resilience" hack — the wrong tool for a
-    /// normalization change, which is a re-projection migration, spec
-    /// 074 §5.)
+    /// normalization change, which is a re-projection migration.)
     ///
     /// The test asserts:
     /// (a) `list_by_raw_name` recovers the row via `name_as_published`
@@ -2070,8 +2059,8 @@ mod tests {
         artifact.repository_id = repo.id;
         // The NDJSON `name` field echoes the stored mixed-case name (the
         // index-emission drift case is unchanged). The PROJECTION row is
-        // keyed on the canonical lowercased path — spec 074: publish and
-        // the read-side `parse_download_path` both store/lookup the
+        // keyed on the canonical lowercased path — publish and the
+        // read-side `parse_download_path` both store/lookup the
         // lowercased canonical path.
         artifact.name = "Legacy-Crate".into();
         artifact.name_as_published = "drift-crate".into();
@@ -2192,11 +2181,11 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Unknown-repo regression — pinned at the dispatcher layer because
-    /// the new Item 4 dispatch resolves the repo BEFORE branching on
-    /// `repo_type`. A regression that swallowed `NotFound` and routed
-    /// to either branch unconditionally would surface as a 200/502 for
-    /// a non-existent `repo_key` instead of the expected 404.
+    /// Unknown-repo regression — pinned at the dispatcher layer, which
+    /// resolves the repo BEFORE branching on `repo_type`. A regression
+    /// that swallowed `NotFound` and routed to either branch
+    /// unconditionally would surface as a 200/502 for a non-existent
+    /// `repo_key` instead of the expected 404.
     #[tokio::test]
     async fn sparse_index_unknown_repo_returns_404() {
         let h = harness();
@@ -2214,14 +2203,14 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
-    // -- Item 4 dispatch regression -------------------------------------------
+    // -- Proxy/Hosted dispatch regression -------------------------------------
 
-    /// `RepositoryType::Hosted` MUST NOT route through the Item 4
+    /// `RepositoryType::Hosted` MUST NOT route through the
     /// `index_cache` path. Pin the regression by seeding bogus bytes
-    /// at the Item 4 cache key shape — if the dispatcher ever
-    /// accidentally routed Hosted reads through `fetch_with_cache`,
-    /// the test would either return the bogus body or 502. Both fail
-    /// the `OK` + actual-NDJSON assertion.
+    /// at the cache key shape — if the dispatcher ever accidentally
+    /// routed Hosted reads through `fetch_with_cache`, the test would
+    /// either return the bogus body or 502. Both fail the `OK` +
+    /// actual-NDJSON assertion.
     #[tokio::test]
     async fn local_repo_uses_existing_local_index_path() {
         use sha2::{Digest, Sha256};
@@ -2393,9 +2382,9 @@ mod tests {
             DebugValue,
         );
 
-        // Item 13 — wraps the evaluator in `Arc<ArcSwap<_>>`, matching
-        // the pypi/npm helpers. Tests hold a static snapshot reachable
-        // via `.load()`; the refresh path is exercised in
+        // Wraps the evaluator in `Arc<ArcSwap<_>>`, matching the
+        // pypi/npm helpers. Tests hold a static snapshot reachable via
+        // `.load()`; the refresh path is exercised in
         // `hort-server::cli::serve::rbac_refresh`.
         /// Evaluator where the `developer` claim grants global `Write`
         /// (flat `GrantSubject::Claims` grant set per ADR 0012).
@@ -2635,11 +2624,10 @@ mod tests {
         /// Compare two `(StatusCode, Vec<u8>)` 404 responses for
         /// anti-enumeration equivalence: status MUST match and the
         /// JSON envelope shape (`{"error":"not found: Repository
-        /// <id>"}`) MUST be identical except for the id token. Per
-        /// design doc §5: "Both are the canonical
-        /// `not found: Repository <id>` envelope, differing only in
-        /// the id token. Format equality is what an operator-side
-        /// enumeration probe would observe."
+        /// <id>"}`) MUST be identical except for the id token. Both
+        /// are the canonical `not found: Repository <id>` envelope,
+        /// differing only in the id token — format equality is what
+        /// an operator-side enumeration probe would observe.
         fn assert_anti_enumeration_envelope(
             private: &(StatusCode, Vec<u8>),
             missing: &(StatusCode, Vec<u8>),
@@ -2869,7 +2857,7 @@ mod tests {
     // measurements in `crates/measurement-tools/src/cargo.rs`).
     //
     // The cap fires before the slice and the diagnostic carries no
-    // input bytes (design-doc §5).
+    // input bytes.
 
     /// Build a publish frame whose declared `meta_len` is `meta_len_decl`
     /// and whose metadata segment is `meta_len_decl` bytes of ASCII

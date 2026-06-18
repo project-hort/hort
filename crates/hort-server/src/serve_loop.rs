@@ -47,8 +47,7 @@ use tracing::{debug, warn};
 
 /// Hard wall-clock cap on the shutdown drain. Beyond this, in-flight
 /// connections are dropped on the floor — the alternative is shutdown
-/// hanging indefinitely on a stuck timed-out connection (which is
-/// exactly the H-2 vector this initiative closes from the other end).
+/// hanging indefinitely on a stuck timed-out connection.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Per-connection HTTP transport timeouts. Carried as a struct so the
@@ -90,8 +89,8 @@ impl HttpTimeouts {
 }
 
 /// Drive the supplied `axum::Router` over the supplied TCP listener
-/// using `hyper_util`'s explicit auto-builder, with the H-2 transport
-/// timeouts wired in.
+/// using `hyper_util`'s explicit auto-builder, with transport timeouts
+/// wired in.
 ///
 /// `router` is consumed and turned into a per-connection
 /// `MakeService<SocketAddr, _>` via
@@ -179,8 +178,7 @@ pub async fn serve_with_hyper_util(
 
     // Graceful drain: signal in-flight connections to finish, then wait
     // up to SHUTDOWN_DEADLINE before forcing exit. The deadline exists
-    // so a stuck timed-out connection cannot pin shutdown forever — H-2
-    // acceptance bar item 6.
+    // so a stuck timed-out connection cannot pin shutdown forever.
     match tokio::time::timeout(SHUTDOWN_DEADLINE, graceful.shutdown()).await {
         Ok(()) => {
             debug!("graceful shutdown complete");

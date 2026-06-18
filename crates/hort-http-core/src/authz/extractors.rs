@@ -368,7 +368,7 @@ impl FromRequestParts<Arc<AppContext>> for DeleteRepoAccess {
 /// `handlers/pypi.rs::resolve_actor_user_id` (pypi.rs:752).
 ///
 /// Under [`AuthContext::Disabled`] the extractor still requires a
-/// principal. F1 is only engaged on auth-enabled deployments — call sites
+/// principal. This extractor is only engaged on auth-enabled deployments — call sites
 /// that want a no-auth escape hatch continue to use the older inline
 /// pattern. Accepted as-is: refusing to
 /// synthesise a `Uuid::nil()` actor silently is the intended end state,
@@ -439,7 +439,7 @@ fn extract_principal(
 /// `Bearer realm=/v2/token` challenge would force the OCI-spec
 /// token-exchange dance; the legacy `require_principal` middleware
 /// already used `Basic` for OCI paths (see
-/// `auth.rs::unauthorized_missing_header` pre-Item-7) and this
+/// `auth.rs::unauthorized_missing_header`) and this
 /// matches that.
 fn unauthorized_bearer_response(_parts: &Parts) -> RejectResponse {
     use axum::body::Body;
@@ -641,7 +641,7 @@ fn evaluate_rbac(
 ) -> Result<bool, RejectResponse> {
     let rbac_handle = match &state.auth {
         AuthContext::Disabled => {
-            // Mirrors `authorize`'s Disabled branch — the F1 extractors
+            // Mirrors `authorize`'s Disabled branch — extractors
             // grant unconditionally under Disabled. We still need to
             // emit a single allow tick at the call site, so we return
             // `Ok(true)` here and let the caller decide whether to
@@ -672,12 +672,10 @@ fn authorize(
 ) -> Result<(), RejectResponse> {
     let rbac_handle = match &state.auth {
         AuthContext::Disabled => {
-            // Disabled deployments opt out of auth entirely. Every F1
+            // Disabled deployments opt out of auth entirely. Every
             // extractor grants. Audit trail still records the attempted
             // permission + anonymous actor so operators can see what
-            // traffic looked like pre-Enabled. This unifies the F1 pattern
-            // (extractors) with the legacy pypi/npm/cargo pattern
-            // (`resolve_actor_user_id`): handlers can use `WriteRepoAccess`
+            // traffic looked like pre-Enabled. Handlers can use `WriteRepoAccess`
             // and get correct behaviour under both Enabled and Disabled.
             tracing::info!(
                 user_id = %principal.user_id,
@@ -1251,7 +1249,7 @@ mod tests {
             (status, body)
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        // Item 10: no internal leakage on 5xx.
+        // No internal leakage on 5xx.
         crate::error::assert_no_internal_leakage(status, &body);
     }
 
@@ -1259,8 +1257,7 @@ mod tests {
     /// inserts `Option<CallerPrincipal> = Some(principal)` rather
     /// than the bare `CallerPrincipal` slot `require_principal`
     /// uses. The `AdminPrincipal` extractor must accept that source
-    /// too — otherwise admin GETs (Init 12's
-    /// `GET /admin/repositories/<key>` lookup) 500 with
+    /// too — otherwise admin GETs (`GET /admin/repositories/<key>` lookup) 500 with
     /// "router-wiring bug" even though auth ran successfully.
     #[test]
     fn admin_extractor_allows_optional_principal_some_some_path() {
@@ -1706,11 +1703,10 @@ mod tests {
     #[test]
     fn delete_extractor_denies_principal_with_only_write_grant_with_403() {
         // Critical reclassification assertion: a principal granted
-        // `Permission::Write` does NOT satisfy `DeleteRepoAccess`. This
-        // is the boundary M-A5 closes — pre-fix, the OCI manifest
-        // delete handler used `WriteRepoAccess` so a write-only role
-        // could destroy landed manifests. Post-fix, the same role
-        // gets a clean 403.
+        // `Permission::Write` does NOT satisfy `DeleteRepoAccess`. The
+        // OCI manifest delete handler requires `DeleteRepoAccess`, not
+        // `WriteRepoAccess` — a write-only role must get a clean 403
+        // rather than being able to destroy landed manifests.
         let (snap, (status, body)) = capture(|| {
             run_async(async {
                 let (spy, repo) = seeded_repo();
@@ -1756,8 +1752,7 @@ mod tests {
         // `RbacEvaluator::authorize` (rbac.rs:104) without consulting
         // any grants. Even with zero `permission_grants` rows seeded,
         // an admin principal must satisfy `DeleteRepoAccess`. This
-        // pins the "admin role is unaffected" line in the M-A5
-        // CHANGELOG entry.
+        // pins the "admin role is unaffected" invariant.
         let (snap, status) = capture(|| {
             run_async(async {
                 let (spy, _repo) = seeded_repo();
@@ -1846,9 +1841,8 @@ mod tests {
 
     /// **Security lock — deny path.** A foreign middleware that
     /// (mistakenly or maliciously) inserts a bare `CallerPrincipal`
-    /// MUST NOT satisfy the `AdminPrincipal` extractor. Pre-Item-21
-    /// the bare slot was the canonical position; post-Item-21 it is
-    /// not consulted at all and the request 500s with the
+    /// MUST NOT satisfy the `AdminPrincipal` extractor. The bare slot
+    /// is not consulted; the request 500s with the
     /// router-wiring-bug envelope.
     #[test]
     fn admin_extractor_rejects_bare_caller_principal_extension() {
@@ -1860,9 +1854,8 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
             // Inject ONLY the bare `CallerPrincipal`. The newtype slot
-            // stays empty. Pre-Item-21 this satisfied `AdminPrincipal`
-            // and authorized as admin; post-Item-21 it must 500 (no
-            // upstream auth ran, from the extractor's perspective).
+            // stays empty. Without the newtype the request must 500
+            // (no upstream auth ran, from the extractor's perspective).
             req.extensions_mut().insert(principal(&["admin"]));
             let resp = router.oneshot(req).await.unwrap();
             let status = resp.status();
@@ -1907,12 +1900,12 @@ mod tests {
 
     #[test]
     fn extractor_under_disabled_auth_grants_with_audit_info() {
-        // Under `AuthContext::Disabled` every F1 extractor must grant
+        // Under `AuthContext::Disabled` every extractor must grant
         // (the deployment has opted out of auth) while still emitting
         // the `hort_authz_decisions_total{result="allow"}` counter so
-        // operators keep audit visibility pre-Enabled. The legacy
+        // operators keep audit visibility. The legacy
         // `resolve_actor_user_id` pattern had the same shape; this
-        // unifies F1 with it.
+        // extractor unifies with it.
         let (snap, status) = capture(|| {
             run_async(async {
                 let repos = Arc::new(MockRepositoryRepository::new());

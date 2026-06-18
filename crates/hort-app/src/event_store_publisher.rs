@@ -66,7 +66,7 @@ impl EventStorePublisher {
     /// Subscribe to the broadcast channel.
     ///
     /// Returns `None` when the publisher was constructed without a sender
-    /// (`HORT_NOTIFICATIONS_ENABLED=false`). Item 6b's dispatcher calls this
+    /// (`HORT_NOTIFICATIONS_ENABLED=false`). The dispatcher calls this
     /// once per process; other consumers (future projections, replicator)
     /// do likewise.
     pub fn subscribe(&self) -> Option<broadcast::Receiver<Arc<PersistedEvent>>> {
@@ -148,9 +148,8 @@ impl EventStore for EventStorePublisher {
                 };
                 // Silently drop SendError: best-effort by contract.
                 // No receivers / lagged consumers are not the
-                // publisher's concern; the use-case append path NEVER
-                // blocks on broadcast outcome (design doc §11
-                // invariant 1).
+                // publisher's concern; the use-case append path MUST NEVER
+                // block on broadcast outcome.
                 let _ = sender.send(Arc::new(persisted));
             }
 

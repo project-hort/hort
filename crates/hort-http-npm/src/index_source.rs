@@ -7,9 +7,8 @@
 //!
 //! - [`HostedNpmSource`] — reads the local artifact projection via
 //!   [`ArtifactUseCase::list_by_raw_name_visible`] (threading the
-//!   caller principal so F-25 anti-enumeration applies — denied / no-
-//!   rows / missing-repo all collapse to `NotFound` at the unified
-//!   handler).
+//!   caller principal so anti-enumeration applies — denied / no-rows /
+//!   missing-repo all collapse to `NotFound` at the unified handler).
 //! - [`ProxyNpmSource`] — drives the upstream-fetch, cache, dedup,
 //!   and stale-while-error path via
 //!   [`crate::packument::fetch_raw_with_cache`] (which streams the body
@@ -27,7 +26,7 @@
 //! and the builder ([`NpmIndexBuilder`]) are reached through the
 //! unified serve handler at `crates/hort-http-npm/src/serve.rs`.
 //!
-//! # Error shape (design §2.3)
+//! # Error shape
 //!
 //! Both adapters return [`AppError`] — the existing shape — rather
 //! than inventing a new error enum. The mapping back to HTTP
@@ -93,8 +92,8 @@ pub(crate) struct IndexSourceOutput {
 
 /// Per-format index source — produces `Vec<VersionEntry>` from either
 /// local DB (hosted) or upstream fetch+parse (proxy). Stays
-/// `pub(crate)` per design §2.3 — sources are an implementation
-/// detail of the format HTTP crate.
+/// Stays `pub(crate)` — sources are an implementation detail of the
+/// format HTTP crate.
 ///
 /// Async because the hosted source reads `ArtifactUseCase` (which
 /// goes through the storage adapter) and the proxy source dials
@@ -104,8 +103,8 @@ pub(crate) struct IndexSourceOutput {
 #[async_trait]
 pub(crate) trait IndexSource: Send + Sync {
     /// Produce per-version entries for `package_name` on `repo`.
-    /// `caller` is threaded for F-25 anti-enumeration (the hosted
-    /// source's use-case call requires it).
+    /// `caller` is threaded for anti-enumeration (the hosted source's
+    /// use-case call requires it).
     async fn fetch(
         &self,
         ctx: &Arc<AppContext>,
@@ -124,8 +123,8 @@ pub(crate) trait IndexSource: Send + Sync {
 ///
 /// Reads the local artifact projection via
 /// [`ArtifactUseCase::list_by_raw_name_visible`] (the
-/// per-resource-visibility-enforcing entry point — F-25 invariant).
-/// Returns the stored canonical name as
+/// per-resource-visibility-enforcing entry point — anti-enumeration
+/// invariant). Returns the stored canonical name as
 /// [`IndexSourceOutput::canonical_name`] so the unified handler can
 /// pin the wire shape to the drift-resilience contract (see ADR 0008):
 /// the request-parameter form is *not* echoed back — the stored form
@@ -239,10 +238,10 @@ impl IndexSource for ProxyNpmSource {
         package_name: &str,
         caller: Option<&CallerPrincipal>,
     ) -> Result<IndexSourceOutput, AppError> {
-        // F-25 thread-through: the unified handler resolves the repo
-        // before invoking the source; we re-resolve here defensively
-        // so the F-25 invariant holds even if a future caller bypasses
-        // the dispatch hop. The re-resolve is a single in-memory
+        // Anti-enumeration thread-through: the unified handler resolves
+        // the repo before invoking the source; we re-resolve here
+        // defensively so the invariant holds even if a future caller
+        // bypasses the dispatch hop. The re-resolve is a single in-memory
         // hashmap probe at the mock layer / index lookup at the adapter
         // — sub-millisecond.
         let _ = ctx

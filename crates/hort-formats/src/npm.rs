@@ -45,7 +45,7 @@ const fn npm_projector_per_version_cap() -> u64 {
 /// HARD-CODED + decoupled from `metadata_expected_max_bytes` (the
 /// upload/HashReference threshold) so retuning that threshold can't move
 /// this buffer cap. The archive-level decompression-bomb guard is
-/// `archive_bounds`' job (spec 076 §3.2), not a second cap here.
+/// `archive_bounds`' job, not a second cap here.
 const NPM_MANIFEST_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// Compressed-input cap for the whole stored npm `.tgz` artifact fed to
@@ -55,9 +55,9 @@ const NPM_MANIFEST_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// this cap is set to that same 32 MiB to admit every artifact the cascade
 /// can present while still bounding the buffer if a future caller streams an
 /// unbounded reader in. It is a *compressed* cap (a plausibility/storage
-/// bound, large — feedback_cap_taxonomy_streaming_vs_buffered); the
+/// bound, large); the
 /// decompressed-output / compression-ratio / entry-count bomb guards live in
-/// `archive_bounds::read_tar_gz_entry` (spec 076 §3.2), not here.
+/// `archive_bounds::read_tar_gz_entry`, not here.
 const NPM_TARBALL_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Maximum length of an npm package name in bytes (including any
@@ -66,7 +66,7 @@ const NPM_TARBALL_MAX_BYTES: usize = 32 * 1024 * 1024;
 const NPM_NAME_MAX: usize = 214;
 
 /// Parse the *declared runtime* dependency specs from an npm
-/// `package.json` manifest body (spec 076 Item 3).
+/// `package.json` manifest body.
 ///
 /// **Runtime classes only.** Reads ONLY the top-level `dependencies`
 /// object. `devDependencies`, `peerDependencies`, `optionalDependencies`,
@@ -255,7 +255,7 @@ impl FormatHandler for NpmFormatHandler {
         let version =
             extract_version(filename, unscoped_basename).ok_or_else(|| invalid_path(path))?;
 
-        // Spec 074 §1.2 — the read path uses the SSOT constructor so it
+        // The read path uses the SSOT constructor so it
         // can never diverge from the write-sites. npm derives the filename
         // from name+version, so `filename = None` here.
         let logical_path = self.build_artifact_logical_path(&name, &version, None)?;
@@ -273,8 +273,8 @@ impl FormatHandler for NpmFormatHandler {
         })
     }
 
-    /// Spec 074 §1.1 — the single logical-projection-path constructor for
-    /// npm. `{n}/-/{basename}-{version}.tgz` with `n = normalize_name(name)`
+    /// The single logical-projection-path constructor for npm.
+    /// `{n}/-/{basename}-{version}.tgz` with `n = normalize_name(name)`
     /// (URL-decode, case-preserving) and `basename` the unscoped tail of
     /// `n` (`@scope/pkg → pkg`). `filename` is ignored — npm derives the
     /// canonical tarball filename from name+version.
@@ -334,8 +334,8 @@ impl FormatHandler for NpmFormatHandler {
     /// set declared by [`NPM_SUMMARY_KEYS`]; fields not present in
     /// `full` are simply omitted (NOT filled with `Value::Null`) so
     /// summary-only consumers get the exact shape the client
-    /// published. Returns `Value::Null` when `full` is not an object —
-    /// the defensive branch documented in the design doc §9.
+    /// published. Returns `Value::Null` when `full` is not an object
+    /// (the defensive branch for non-object input).
     fn extract_metadata_summary(&self, full: &serde_json::Value) -> serde_json::Value {
         let Some(obj) = full.as_object() else {
             return serde_json::Value::Null;
@@ -363,8 +363,7 @@ impl FormatHandler for NpmFormatHandler {
     ///
     /// Returns `Some(_)` unconditionally — the packument path does not
     /// depend on `coords.version`. The orchestrator passes the parsed
-    /// per-version body (Item 1's other method) the version it cares
-    /// about.
+    /// per-version body to the caller alongside the version it cares about.
     ///
     /// See ADR 0006 §11 and the npm registry API spec.
     fn upstream_checksum_metadata_path(&self, coords: &ArtifactCoords) -> Option<String> {
@@ -375,11 +374,10 @@ impl FormatHandler for NpmFormatHandler {
     /// and decode `dist.integrity` (an SRI string of the form
     /// `sha512-<base64>`) into an [`UpstreamPublishedChecksum`].
     ///
-    /// SHA-1 `dist.shasum` fallback is **rejected**
-    /// (design doc §16): a packument that publishes only `dist.shasum`
-    /// without `dist.integrity` produces a `Validation` error, not a
-    /// softer fallback. SHA-1 has been collision-broken since 2017
-    /// (SHAttered).
+    /// SHA-1 `dist.shasum` fallback is **rejected**: a packument that
+    /// publishes only `dist.shasum` without `dist.integrity` produces a
+    /// `Validation` error, not a softer fallback. SHA-1 has been
+    /// collision-broken since 2017 (SHAttered).
     ///
     /// Multi-algorithm SRI strings (space-separated, e.g.
     /// `sha512-... sha384-...`) pick the strongest sha512 entry; if no
@@ -650,7 +648,7 @@ impl FormatHandler for NpmFormatHandler {
     /// audited [`archive_bounds::read_tar_gz_entry`], the single sanctioned
     /// home for archive decoding: the gzip decompressor is wrapped in a
     /// `BoundedReader` (compression-ratio + cumulative-output cap), entry
-    /// count is bounded, and nested archives are rejected. F2: the cap is
+    /// count is bounded, and nested archives are rejected. The cap is
     /// *cumulative* across the sequential tar scan, so `package/package.json`
     /// MUST be an early entry — which every real npm tarball satisfies.
     ///
@@ -690,7 +688,7 @@ impl FormatHandler for NpmFormatHandler {
             |len, max| format!("npm artifact is {len} bytes; npm tarball max is {max}"),
         )?;
         // Locate package/package.json inside the gzip-tar under the audited
-        // archive_bounds caps. F2: the manifest must be an early entry.
+        // archive_bounds caps. The manifest must be an early entry.
         let manifest = crate::archive_bounds::read_tar_gz_entry(
             &buf[..],
             buf.len() as u64,
@@ -1286,7 +1284,7 @@ mod tests {
         assert_eq!(coords.name, "@types/node");
     }
 
-    // -- build_artifact_logical_path (spec 074 SSOT constructor) ---------------
+    // -- build_artifact_logical_path ------------------------------------------
 
     /// Unscoped: `{name}/-/{name}-{version}.tgz`. `filename` is ignored
     /// (npm derives it from name+version).
@@ -1327,7 +1325,7 @@ mod tests {
     /// Round-trip / inverse: for a canonical request path `p`,
     /// `parse_download_path(p).path == p`, and rebuilding from the parsed
     /// (name, version) yields `p`. Structural now that `parse_download_path`
-    /// delegates to `build_artifact_logical_path` (spec 074 §3).
+    /// delegates to `build_artifact_logical_path`.
     #[test]
     fn build_logical_path_round_trip_unscoped() {
         let p = "express/-/express-4.18.2.tgz";
@@ -1356,8 +1354,7 @@ mod tests {
 
     /// npm is case-SENSITIVE (`normalize_name` is decode-only, no folding):
     /// `Foo` and `foo` build DISTINCT paths. Pins that the npm distinction
-    /// is preserved (spec 074 §1.0 / §3 — folding would break legacy
-    /// mixed-case resolution).
+    /// is preserved (folding would break legacy mixed-case resolution).
     #[test]
     fn build_logical_path_case_sensitive_distinct() {
         let upper = handler()
@@ -1372,8 +1369,8 @@ mod tests {
     }
 
     /// npm is case-sensitive and folds no separators, so it needs no
-    /// registration-collision check (spec 075 §1) — `collision_key` is
-    /// `None` and the publish path skips the gate.
+    /// registration-collision check — `collision_key` is `None` and the
+    /// publish path skips the gate.
     #[test]
     fn collision_key_is_none() {
         assert_eq!(handler().collision_key("Foo_Bar"), None);
@@ -1919,7 +1916,7 @@ mod tests {
     #[test]
     fn parse_upstream_checksum_legacy_no_integrity_returns_validation_error() {
         // Synthesised packument with `dist.shasum` but NO `dist.integrity`.
-        // Design doc §16: SHA-1 fallback is collision-broken, must reject.
+        // SHA-1 fallback is collision-broken; this validates we reject it.
         let body = include_bytes!("../tests/fixtures/npm/legacy_no_integrity.packument.json");
         let coords = coords_for(
             "legacy-pkg",
@@ -2791,7 +2788,7 @@ mod tests {
     /// Build a minimal npm `.tgz` (gzip-tar) in memory from `(name, body)`
     /// entries, in order. The npm convention is that the package tree is
     /// rooted at `package/`, so the manifest lives at `package/package.json`.
-    /// F2: the manifest MUST be placed as an EARLY entry — the cumulative
+    /// The manifest MUST be placed as an EARLY entry — the cumulative
     /// decompressed-output cap aborts the scan before any entry ordered
     /// after >cap decompressed bytes.
     fn make_npm_tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -2864,7 +2861,7 @@ mod tests {
         // size stays ~= decompressed size; then output_cap_for(compressed)
         // = 10× comfortably clears the decompressed tar (content + 512-byte
         // block overhead) and the scan reaches the "absent" branch rather
-        // than tripping the F2 cumulative output cap on tar padding.
+        // than tripping the cumulative output cap on tar padding.
         // (Mirrors the archive_bounds `read_tar_gz_entry_returns_none_when_absent`
         // test's incompressible-fixture rationale.)
         let body: Vec<u8> = {
@@ -2959,7 +2956,7 @@ mod tests {
 
     #[test]
     fn parse_npm_runtime_dependencies_range_is_preserved_opaque() {
-        // The range string round-trips verbatim. Item 11's `range` is
+        // The range string round-trips verbatim. The `range` value is
         // OPAQUE — `resolve_range_max` decides how to parse it.
         let body = br#"{
             "dependencies": {

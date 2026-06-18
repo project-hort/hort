@@ -77,7 +77,7 @@ impl FromStr for CurationRuleAction {
 /// pipeline diffs by name. `format = None` matches packages of any format;
 /// otherwise the rule fires only when `RepositoryFormat` matches. `package_pattern`
 /// is a glob-style match on the package name (the matching engine is
-/// Initiative-16 territory; the entity just carries the string).
+/// format-handler territory; the entity just carries the string).
 ///
 /// `managed_by` follows the same provenance contract as other gitops kinds
 /// — `Local` rows are CRUD-mutable; `GitOps` rows are owned by `$HORT_CONFIG_DIR`

@@ -1,6 +1,6 @@
 //! `PgRepoSecurityScoreRepository` integration tests.
 //!
-//! Exercises the `repo_security_scores` projection (migration 009 §3.6)
+//! Exercises the `repo_security_scores` projection (migration 009)
 //! end-to-end against a real Postgres. DATABASE_URL-gated; tests early-
 //! return when unset so dev environments without a database keep the
 //! suite green. Mirrors the convention in

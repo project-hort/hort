@@ -1,6 +1,6 @@
 //! PostgreSQL adapter for [`RetentionScanReader`] — the read surface
-//! the retention evaluator uses against the `scan_findings` (§3.5)
-//! and `repo_security_scores` (§3.6) projections from migration 009.
+//! the retention evaluator uses against the `scan_findings` and
+//! `repo_security_scores` projections from migration 009.
 //!
 //! Purely additive: a brand-new adapter for a brand-new (additive)
 //! port. No existing adapter or port signature is touched.
@@ -60,7 +60,7 @@ impl FindingRow {
     /// Map a projection row to the shipped [`Finding`] value type.
     /// `fixed_versions` / `references` / `aliases` are empty — the
     /// projection has no columns to populate them from (see module
-    /// docs §4-vs-code divergence). An unrecognised `severity` literal
+    /// docs). An unrecognised `severity` literal
     /// is a corruption signal (the migration 009 CHECK constrains it
     /// to the four-value set); surface it loudly rather than guessing.
     fn into_domain(self) -> DomainResult<Finding> {

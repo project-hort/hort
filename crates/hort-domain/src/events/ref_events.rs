@@ -4,7 +4,7 @@
 //! category [`StreamCategory::Ref`](super::StreamCategory::Ref); each
 //! ref has one stream keyed by `ref_id`, so the full history of a ref
 //! (every move plus its eventual retirement) is ordered within that
-//! single stream. See design doc §2.4.
+//! single stream.
 //!
 //! **Idempotent re-pointing is NOT an event.** Setting a ref to its
 //! current target is a no-op — no `RefMoved` emission. The domain
@@ -48,7 +48,7 @@ const MAX_REF_NAME_LEN: usize = 512;
 /// target.
 ///
 /// `from: None` models the first placement of a ref (creation); subsequent
-/// moves carry `from: Some(prior_target)`. See §2.4 of the design doc.
+/// moves carry `from: Some(prior_target)`.
 ///
 /// **Invariant.** `from != Some(to)` — a move that does not change the
 /// target is not an event. Idempotent re-pointing is a no-op at the
@@ -94,7 +94,7 @@ impl RefMoved {
 /// retirement. Preserved in the event so replay can reconstruct the
 /// ref's final state without consulting the projection — the event
 /// stream alone is sufficient to tell "what did `library/nginx:latest`
-/// point at when it was retired?". See §2.4 of the design doc.
+/// point at when it was retired?".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefRetired {
     pub ref_id: Uuid,

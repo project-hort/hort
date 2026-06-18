@@ -17,17 +17,15 @@
 //!    per-tick total cap bounds one tick; the daily cron drains any
 //!    backlog — identical posture to cron-rescan's single-shot cap).
 //! 4. Per batch, map `RetentionCandidateRow → RetentionUseCase::
-//!    RetentionCandidate` (a trivial field copy — B3's type stays in
-//!    `hort-app`, RESOLVED #5) and call
+//!    RetentionCandidate` (a trivial field copy — the type stays in
+//!    `hort-app`) and call
 //!    `RetentionUseCase::evaluate_policies(now, &policies,
-//!    &candidates)` (B3's signature is **unchanged**), accumulating
-//!    the per-batch [`EvaluateSummary`].
+//!    &candidates)`, accumulating the per-batch [`EvaluateSummary`].
 //! 5. Return [`TaskOutcome::Completed`] with the projected JSON.
 //!
-//! The handler appends nothing directly — B3's `evaluate_policies`
-//! owns the `ArtifactExpired` append (now `RetentionScheduler`-actor
-//! after the Q4 swap). No new metrics (B7 catalogued/owns the
-//! retention metrics; the handler returns `result_summary` JSON only).
+//! The handler appends nothing directly — `evaluate_policies` owns the
+//! `ArtifactExpired` append. No new metrics are introduced; the handler
+//! returns `result_summary` JSON only.
 
 use std::sync::Arc;
 
@@ -98,7 +96,7 @@ impl TaskHandler for RetentionEvaluateHandler {
                 }
             };
             if policies.is_empty() {
-                // §8 steady state: no policies configured → no-op.
+                // Steady state: no policies configured → no-op.
                 tracing::info!("retention-evaluate: no active policies — no-op");
                 return Ok(TaskOutcome::Completed {
                     result_summary: json!({
@@ -139,8 +137,8 @@ impl TaskHandler for RetentionEvaluateHandler {
                 cursor = rows.last().map(|r| r.artifact.id);
                 let short_page = (rows.len() as u32) < BATCH_SIZE;
 
-                // RetentionCandidateRow → B3's RetentionCandidate
-                // (trivial field copy; no B3 type relocation).
+                // RetentionCandidateRow → RetentionCandidate
+                // (trivial field copy).
                 let candidates: Vec<RetentionCandidate> = rows
                     .into_iter()
                     .map(|r| RetentionCandidate {
@@ -456,8 +454,8 @@ mod tests {
     fn age_policy() -> RetentionPolicy {
         // A pure-age policy that matches nothing here (artifacts are
         // UNIX_EPOCH..now; the evaluator's pure match is exercised by
-        // B3's own tests — this handler test only asserts orchestration
-        // counts + the projection/JSON shape).
+        // the use-case's own tests — this handler test only asserts
+        // orchestration counts + the projection/JSON shape).
         RetentionPolicy::project(&[hort_domain::retention::RetentionPolicyEvent::Created {
             id: Uuid::new_v4(),
             name: "p".into(),

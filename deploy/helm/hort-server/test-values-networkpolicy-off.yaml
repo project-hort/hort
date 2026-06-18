@@ -37,5 +37,5 @@ ephemeralStore:
   backend: memory
 
 networkPolicy:
-  # Escape hatch (F-33). Disables BOTH NetworkPolicies entirely.
+  # Escape hatch. Disables BOTH NetworkPolicies entirely.
   enabled: false

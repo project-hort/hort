@@ -36,7 +36,7 @@ use super::retention_events::StreamSealed;
 // cycle: `retention` and `events` are both top-level `pub mod`s in
 // `hort-domain`) is bridged into `DomainEvent` via the
 // `RetentionPolicyChanged` wrapper (Shape A) rather than duplicating
-// B1's payloads.
+// the retention payload types.
 use super::service_account_events::{
     ServiceAccountCreated, ServiceAccountDeleted, ServiceAccountTokenRotated, ServiceAccountUpdated,
 };
@@ -211,7 +211,7 @@ pub enum DomainEvent {
     /// Successful PAT or service-account revocation — token-owner stream.
     ApiTokenRevoked(ApiTokenRevoked),
     /// Refused issuance — requesting-actor stream. Records the four
-    /// edge-case rejections from design doc §4 (cap-exceeds-authority,
+    /// edge-case rejections (cap-exceeds-authority,
     /// service-account-self-mint, admin-token-disallowed,
     /// unbounded-svc-token-disallowed) plus the schema-level rejects
     /// (invalid_repository_set, admin-token-exceeds-30-days,
@@ -270,8 +270,7 @@ pub enum DomainEvent {
     /// Subscription deleted (owner or admin) — owner's user stream.
     SubscriptionDeleted(SubscriptionDeleted),
     /// Dispatcher (or admin action) transitioned the subscription to
-    /// `Disabled` — owner's user stream. Per §11 invariant 10, no silent
-    /// muting.
+    /// `Disabled` — owner's user stream. No silent muting.
     SubscriptionDisabled(SubscriptionDisabled),
 
     // -- Event-store retention sealing --
@@ -302,7 +301,7 @@ pub enum DomainEvent {
     /// (`"RetentionPolicyCreated"` / `…Updated` / `…Archived` /
     /// `…Evaluated`); `validate()` delegates to
     /// [`RetentionPolicyEvent::validate`]. The projection-load adapter
-    /// unwraps these rows and folds them through B1's pure
+    /// unwraps these rows and folds them through the pure
     /// `RetentionPolicy::project`. Appended by `RetentionPolicyUseCase`
     /// (gitops-authored, `GitOpsActor`); the `Evaluated` breadcrumb is
     /// appended by `RetentionEvaluateHandler` (`RetentionScheduler`
@@ -471,11 +470,11 @@ impl DomainEvent {
     /// future `DomainEvent` variant fails to compile here until its
     /// authorization-disposition is consciously decided, so a new variant
     /// cannot silently default into the "leak-to-`Read`" bucket (the RT-2
-    /// root shared with the F-36 linter guard).
+    /// root of a silently-leaking-event bug class).
     ///
     /// `CurationApplied` is deliberately **not** in this set: curation
     /// outcomes are visible to repo readers by design (it rides the
-    /// non-admin `Curation` category) and is outside F-39/F-37's scope.
+    /// non-admin `Curation` category) and is outside that scope.
     /// `TaskInvoked` / `TaskFailed` / `StreamSealed` are already gated by
     /// their `requires_admin() == true` categories (`Authorization` /
     /// `Admin`); the type predicate is additive, so leaving them `false`
@@ -1362,7 +1361,7 @@ pub(crate) mod tests {
         let bad = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
             id: Uuid::nil(),
             name: "bad".into(),
-            // B1: a zero-second TTL is a footgun and is rejected by
+            // A zero-second TTL is a footgun and is rejected by
             // `PolicyPredicate::validate()`.
             predicate: PolicyPredicate::AgeExceeds(0),
             scope: RetentionScope::AllRepos,
@@ -1406,7 +1405,7 @@ pub(crate) mod tests {
         ]
     }
 
-    /// The privileged-audit set the §3.1 fix names (F-37). High-volume
+    /// The privileged-audit set. High-volume
     /// privileged-observation telemetry + native-token issuance audit.
     fn privileged_audit_type_names() -> &'static [&'static str] {
         &[
@@ -1420,7 +1419,7 @@ pub(crate) mod tests {
         ]
     }
 
-    /// F-39: every authorization-model-mutation type is classified
+    /// Every authorization-model-mutation type is classified
     /// `is_authorization_model_mutation()` AND is NOT a privileged-audit.
     #[test]
     fn authorization_model_mutations_are_classified() {
@@ -1431,7 +1430,7 @@ pub(crate) mod tests {
             {
                 assert!(
                     e.is_authorization_model_mutation(),
-                    "{t} must be an authorization-model mutation (F-39)"
+                    "{t} must be an authorization-model mutation"
                 );
                 assert!(
                     !e.is_privileged_audit(),
@@ -1441,7 +1440,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// F-37: every privileged-audit type is classified
+    /// Every privileged-audit type is classified
     /// `is_privileged_audit()` AND is NOT an authorization-model mutation.
     #[test]
     fn privileged_audits_are_classified() {
@@ -1450,7 +1449,7 @@ pub(crate) mod tests {
             if privileged_audit_type_names().contains(&t) {
                 assert!(
                     e.is_privileged_audit(),
-                    "{t} must be a privileged-audit observation (F-37)"
+                    "{t} must be a privileged-audit observation"
                 );
                 assert!(
                     !e.is_authorization_model_mutation(),

@@ -13,9 +13,8 @@
 //!
 //! **Pure domain — zero I/O.** The verdict / requirement / subject types
 //! defined here are plain owned/borrowed data; the *network and crypto*
-//! live entirely in the adapter (Item 3). Bundle bytes are opaque to the
-//! domain ([`AttestationBundle`] is a thin blob wrapper); the adapter
-//! parses them.
+//! live entirely in the adapter. Bundle bytes are opaque to the domain
+//! ([`AttestationBundle`] is a thin blob wrapper); the adapter parses them.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,10 +37,10 @@ use super::BoxFuture;
 /// `ProvenanceRejected` events.
 ///
 /// **Invariant: `sha256(payload) == content_hash`.** The orchestrator
-/// (Item 4) loads `payload` from the [`StoragePort`](super::storage) (for
-/// OCI cosign, the manifest bytes) so the verifier can finalize the
-/// preimage to the same digest the attestation bundle binds. A verifier
-/// may rely on this invariant and treat a violation as a caller bug
+/// loads `payload` from the [`StoragePort`](super::storage) (for OCI
+/// cosign, the manifest bytes) so the verifier can finalize the preimage
+/// to the same digest the attestation bundle binds. A verifier may rely
+/// on this invariant and treat a violation as a caller bug
 /// (internal/invariant error), not an attestation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProvenanceSubject<'a> {
@@ -59,11 +58,10 @@ pub struct ProvenanceSubject<'a> {
 
 /// An opaque raw attestation bundle as fetched by the orchestrator.
 ///
-/// The domain treats the bytes as opaque — the Sigstore adapter (Item 3)
-/// parses the Fulcio cert chain + Rekor inclusion proof / SET out of the
-/// bundle and verifies it offline against a cached trust root. A simple
-/// owned-blob wrapper here keeps the port dyn-compatible and the domain
-/// crypto-free.
+/// The domain treats the bytes as opaque — the Sigstore adapter parses
+/// the Fulcio cert chain + Rekor inclusion proof / SET out of the bundle
+/// and verifies it offline against a cached trust root. A simple owned-blob
+/// wrapper here keeps the port dyn-compatible and the domain crypto-free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationBundle {
     /// The raw bundle bytes (e.g. a cosign `*.sigstore`/`*.bundle` JSON).
@@ -80,11 +78,11 @@ impl AttestationBundle {
 /// A trusted signer identity — the `{issuer, san}` pair an OIDC-backed
 /// Sigstore signature certificate binds.
 ///
-/// The **same shape** as `ServiceAccount.federatedIdentities[].claims`
-/// (design §2.1 / §5): `issuer` is the OIDC issuer URL the Fulcio cert
-/// was minted against (e.g. `https://token.actions.githubusercontent.com`);
-/// `san` is the certificate Subject Alternative Name (the workflow
-/// identity, e.g. a GitHub Actions workflow ref).
+/// The **same shape** as `ServiceAccount.federatedIdentities[].claims`:
+/// `issuer` is the OIDC issuer URL the Fulcio cert was minted against
+/// (e.g. `https://token.actions.githubusercontent.com`); `san` is the
+/// certificate Subject Alternative Name (the workflow identity, e.g. a
+/// GitHub Actions workflow ref).
 ///
 /// Carries `Serialize`/`Deserialize` because it rides the
 /// `ProvenanceVerified` event payload (the audit record of *who* signed).
@@ -100,31 +98,30 @@ pub struct SignerIdentity {
 /// the **allowed** signer-identity *patterns* for this scope.
 ///
 /// Borrowed (`&'a ProvenanceRequirements<'a>`) so the orchestrator passes
-/// a view into the resolved `ScanPolicy.provenance_identities` (Item 2)
-/// without cloning. Tier-2 predicate-type / SLSA-level fields attach here
-/// when those land (design §1 "Out"); Tier-1 carries identities only.
+/// a view into the resolved `ScanPolicy.provenance_identities` without
+/// cloning. Tier-2 predicate-type / SLSA-level fields attach here when
+/// those land; Tier-1 carries identities only.
 ///
 /// **Carries [`SignerIdentityPattern`], not [`SignerIdentity`]**.
-/// The policy stores allowed signers as *patterns*
-/// (exact or bounded glob); the verifier matches an
-/// **observed** [`SignerIdentity`] (read from the verified Fulcio leaf
-/// cert) against these patterns via
+/// The policy stores allowed signers as *patterns* (exact or bounded
+/// glob); the verifier matches an **observed** [`SignerIdentity`] (read
+/// from the verified Fulcio leaf cert) against these patterns via
 /// [`SignerIdentityPattern::matches`](crate::entities::scan_policy::SignerIdentityPattern::matches).
-/// Item 1 originally held `&[SignerIdentity]` as a placeholder — matching
-/// against the concrete type (exact equality) would have made the
-/// bounded-glob half of every stored pattern silently inert.
+/// Using patterns (rather than concrete identities) means the
+/// bounded-glob matching half of every stored pattern is active, not
+/// silently inert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProvenanceRequirements<'a> {
     /// The signer-identity patterns a valid signature must match one of.
-    /// An empty slice under `Required` is an apply-time reject (Item 5 —
-    /// the any-signer footgun); the port itself does not enforce that
-    /// policy rule (it is a verify-time input only). The verifier accepts
-    /// a signature whose observed `{issuer, san}` matches **any** pattern
+    /// An empty slice under `Required` is an apply-time reject (the
+    /// any-signer footgun); the port itself does not enforce that policy
+    /// rule (it is a verify-time input only). The verifier accepts a
+    /// signature whose observed `{issuer, san}` matches **any** pattern
     /// here ([`SignerIdentityPattern::matches`](crate::entities::scan_policy::SignerIdentityPattern::matches)).
     pub allowed_identities: &'a [SignerIdentityPattern],
 }
 
-/// Why a verifier rejected an attestation (design §2.1).
+/// Why a verifier rejected an attestation.
 ///
 /// Each variant is a distinct, audited rejection cause carried on the
 /// emitted `ProvenanceRejected` event so an operator can tell a forged
@@ -143,7 +140,7 @@ pub enum ProvenanceRejectReason {
     UntrustedIdentity,
     /// The bundle's Rekor inclusion proof / SignedEntryTimestamp could
     /// not be validated (missing or invalid SET). **Never** a fall-back
-    /// to a live Rekor fetch (design §4).
+    /// to a live Rekor fetch.
     RekorNotFound,
     /// The Fulcio certificate chain failed validation against the cached
     /// trust root.
@@ -153,7 +150,7 @@ pub enum ProvenanceRejectReason {
     BundleMalformed,
 }
 
-/// The outcome of a single verification (design §2.1).
+/// The outcome of a single verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvenanceOutcome {
     /// A trusted signature was verified. Carries the matched signer and
@@ -174,11 +171,11 @@ pub enum ProvenanceOutcome {
     Rejected(ProvenanceRejectReason),
     /// No bundle was found / passed — the unsigned case. Under
     /// `VerifyIfPresent` this is allowed (no event); under `Required` the
-    /// orchestrator maps it to `Rejected(Unsigned)` (design §2.2).
+    /// orchestrator maps it to `Rejected(Unsigned)`.
     NoAttestation,
 }
 
-/// A verifier's verdict for one artifact (design §2.1).
+/// A verifier's verdict for one artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenanceVerdict {
     /// The verification outcome.
@@ -227,8 +224,8 @@ pub trait ProvenancePort: Send + Sync {
     /// Whether this verifier can verify the given repository format
     /// (`cosign` → `"oci"`; a Tier-2 PGP verifier → `"maven"`). The
     /// orchestrator enqueues a `provenance-verify` job only when some
-    /// registered port `applies_to(format)` (design §3.2), so a non-OCI
-    /// ingest under the Tier-1 cosign-only set is zero-overhead.
+    /// registered port `applies_to(format)`, so a non-OCI ingest under
+    /// the Tier-1 cosign-only set is zero-overhead.
     fn applies_to(&self, format: &str) -> bool;
 
     /// Verify the artifact's attestation bundles against the policy's
@@ -247,9 +244,9 @@ pub trait ProvenancePort: Send + Sync {
 
     /// Health check invoked at worker startup. For the Sigstore adapter
     /// this verifies the cached trust root is loaded and within its TUF
-    /// refresh window (it does **not** probe live Rekor/Fulcio — design
-    /// §4 / §6). Failure means the backend is not deployable; the worker
-    /// logs and exits non-zero.
+    /// refresh window (it does **not** probe live Rekor/Fulcio). Failure
+    /// means the backend is not deployable; the worker logs and exits
+    /// non-zero.
     fn health_check(&self) -> BoxFuture<'_, DomainResult<()>>;
 }
 

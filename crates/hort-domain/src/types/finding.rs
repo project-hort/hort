@@ -25,7 +25,7 @@ use crate::entities::scan_policy::SeverityThreshold;
 use crate::error::{DomainError, DomainResult};
 use crate::events::SeveritySummary;
 
-/// Per-finding length caps — design §3.4. Bytes, not chars. Each is
+/// Per-finding length caps. Bytes, not chars. Each is
 /// validated in [`Finding::validate`]; violators surface as
 /// [`DomainError::Validation`] naming the field and the offending
 /// size.
@@ -176,7 +176,7 @@ fn severity_tier(s: SeverityThreshold) -> u8 {
 }
 
 impl Finding {
-    /// Validate the per-finding length caps (design §3.4 / §9).
+    /// Validate the per-finding length caps.
     /// Returns `DomainError::Validation` naming the offending field
     /// and its observed size on failure. Lengths are byte-counted via
     /// `String::len()` and `Vec::len()`.

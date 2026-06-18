@@ -33,7 +33,6 @@
 //!    NOT land; the caller chose a privileged operation and needs to
 //!    know it didn't stick.
 //!
-//! See design doc §2.6a, §2.9–§2.11.
 
 use std::sync::Arc;
 
@@ -142,7 +141,7 @@ impl ArtifactGroupLifecyclePort for PgArtifactGroupLifecycle {
             };
 
             // -----------------------------------------------------------
-            // Step 2 — primary-role assignment (§2.10 case 2).
+            // Step 2 — primary-role assignment.
             // -----------------------------------------------------------
             // Race-safe conditional update: only fills a previously-
             // empty slot. `rows_affected = 0` means another writer got

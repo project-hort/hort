@@ -1,7 +1,7 @@
 //! `eventstore-checkpoint` TaskHandler — the external-anchor
 //! *emission* half of the event-chain tamper-evidence design.
 //!
-//! Composes the pure §6.2 checkpoint assembly (`hort-domain`
+//! Composes the pure checkpoint assembly (`hort-domain`
 //! `build_checkpoint`) with the three outbound ports the I/O lives
 //! behind.
 //!
@@ -13,16 +13,16 @@
 //! sealed since the previous checkpoint). Runtime-DML DSN, `SELECT`-only
 //! (the adapter's posture).
 //!
-//! [`CheckpointAnchorPort`] — the **shipped Item-3 read** port, reused
-//! byte-unchanged to derive the next monotonic `checkpoint_seq` (max
-//! existing + 1, §6.4) and the first-post-migration test (no prior
-//! checkpoint ⇒ attach the §5 `backfill_baseline` honesty caveat).
+//! [`CheckpointAnchorPort`] — the read port, reused byte-unchanged to
+//! derive the next monotonic `checkpoint_seq` (max existing + 1) and
+//! the first-post-migration test (no prior checkpoint ⇒ attach the
+//! `backfill_baseline` honesty caveat).
 //!
 //! [`CheckpointEmitterPort`] — the **additive** sign + S3-Object-Lock
 //! WORM write (the verifier↔emitter `SignedBody` contract pin lives in
 //! the same crate as the reader, so it cannot drift).
 //!
-//! ## Cadence / trigger (spec §6.3)
+//! ## Cadence / trigger
 //!
 //! Default **hourly**, driven by an external k8s CronJob via the
 //! admin-task framework (`POST /api/v1/admin/tasks/eventstore-checkpoint`
@@ -32,9 +32,9 @@
 //! ## Pre-purge emission hook (DEFINED here, CALLED by the
 //! eventstore-retention purge handler)
 //!
-//! Spec §6.3 also requires an *unconditional* checkpoint **before** any
+//! An *unconditional* checkpoint is required **before** any
 //! `delete_stream`/`archive_stream` retention purge, so a `StreamSealed`
-//! is always anchored by a checkpoint that post-dates it. This item
+//! is always anchored by a checkpoint that post-dates it. This module
 //! **defines the contract** as the public, dependency-injected
 //! [`CheckpointEmissionHook`] trait below; the
 //! retention-purge handler **calls** `hook.emit_checkpoint_now()`
@@ -44,7 +44,7 @@
 //! site; it provides the seam + the always-available implementation
 //! ([`CheckpointEmitterHookAdapter`]) the retention handler wires.
 //!
-//! ## Observability (architect one-metric-one-layer + spec §11)
+//! ## Observability
 //!
 //! The **distinct** counter `hort_event_chain_checkpoint_total{result}`
 //! with `result ∈ {emitted, sign_failed, anchor_write_failed}` is
@@ -75,15 +75,15 @@ use hort_domain::ports::BoxFuture;
 // ---------------------------------------------------------------------------
 
 /// The chain-format version this emitter writes (selects the
-/// canonicalizer, spec §3.3 — v1 is the only format).
+/// canonicalizer — v1 is the only format).
 const CHAIN_FORMAT_VERSION: &str = "hort-evchain/v1";
 
-/// The distinct emission metric (architect one-metric-one-layer; spec
-/// §11 reserved-name discipline — **never** `hort_event_chain_verify_total`).
+/// The distinct emission metric (one-metric-one-layer discipline —
+/// **never** `hort_event_chain_verify_total`).
 const METRIC_NAME: &str = "hort_event_chain_checkpoint_total";
 const RESULT_EMITTED: &str = "emitted";
-/// Reserved closed-taxonomy label (spec §11). **No v1 runtime path
-/// emits it**: the signing key is validated at adapter construction and
+/// Reserved closed-taxonomy label. **No v1 runtime path emits it**:
+/// the signing key is validated at adapter construction and
 /// ed25519 signing of an in-memory `Vec` is infallible, so a cycle
 /// cannot reach a sign fault at run time. It is part of the catalog row
 /// and exercised by the `DebuggingRecorder` catalog test so the metric
@@ -97,7 +97,7 @@ const RESULT_ANCHOR_WRITE_FAILED: &str = "anchor_write_failed";
 
 /// The three closed `result` values, in catalog order. The single
 /// source of truth the `DebuggingRecorder` catalog test asserts each
-/// label of (design §4 last-paragraph obligation). `dead_code` is
+/// label of. `dead_code` is
 /// allowed: in v1 it is referenced only from the test (the
 /// `sign_failed` arm has no runtime path — see [`RESULT_SIGN_FAILED`]).
 #[allow(dead_code)]
@@ -115,12 +115,12 @@ fn emit_metric(result: &'static str) {
 }
 
 // ---------------------------------------------------------------------------
-// The §5 backfill-baseline source (operator-provisioned honesty caveat)
+// The backfill-baseline source (operator-provisioned honesty caveat)
 // ---------------------------------------------------------------------------
 
-/// The §5 honesty-caveat inputs the **first** post-migration checkpoint
-/// records: the max `global_position` the in-migration backfill chained
-/// at trust-on-migrate and the migration timestamp. Operator-provisioned
+/// The honesty-caveat inputs for the **first** post-migration checkpoint:
+/// the max `global_position` the in-migration backfill chained at
+/// trust-on-migrate and the migration timestamp. Operator-provisioned
 /// (the migration recorded these); passed to the handler at composition
 /// time. `None` ⇒ the deployment has no recorded baseline (e.g. a
 /// green-field deploy where the chain was present from the first event)
@@ -131,7 +131,7 @@ pub struct BackfillBaselineConfig {
     /// Max `events.global_position` the in-migration backfill covered.
     pub baseline_max_global_position: u64,
     /// The migration timestamp — the "tamper-evident from `<this>`"
-    /// boundary the compliance wording refers to (spec §5).
+    /// boundary the compliance wording refers to.
     pub migration_timestamp: DateTime<Utc>,
 }
 
@@ -173,9 +173,9 @@ pub trait CheckpointEmissionHook: Send + Sync {
 // Handler
 // ---------------------------------------------------------------------------
 
-/// [`TaskHandler`] for the periodic + pre-purge checkpoint emission
-/// (spec §6). Constructed at composition time with the three ports it
-/// composes + the operator-provisioned §5 baseline.
+/// [`TaskHandler`] for the periodic + pre-purge checkpoint emission.
+/// Constructed at composition time with the three ports it composes +
+/// the operator-provisioned backfill baseline.
 pub struct EventstoreCheckpointHandler {
     heads: Arc<dyn EventChainHeadReaderPort>,
     anchor_read: Arc<dyn CheckpointAnchorPort>,
@@ -187,12 +187,12 @@ impl EventstoreCheckpointHandler {
     /// Construct the handler.
     ///
     /// * `heads` — live-chain snapshot port (runtime DML DSN, SELECT-only).
-    /// * `anchor_read` — the **shipped Item-3** `CheckpointAnchorPort`
-    ///   (reused byte-unchanged) to derive next seq + first-checkpoint.
+    /// * `anchor_read` — the `CheckpointAnchorPort` (reused
+    ///   byte-unchanged) to derive next seq + first-checkpoint.
     /// * `emitter` — the additive sign + WORM-write port.
-    /// * `backfill_baseline` — the §5 operator-provisioned honesty
-    ///   caveat, attached to the **first** post-migration checkpoint
-    ///   only. `None` for a green-field deploy with no pre-chain history.
+    /// * `backfill_baseline` — the operator-provisioned honesty caveat,
+    ///   attached to the **first** post-migration checkpoint only.
+    ///   `None` for a green-field deploy with no pre-chain history.
     pub fn new(
         heads: Arc<dyn EventChainHeadReaderPort>,
         anchor_read: Arc<dyn CheckpointAnchorPort>,
@@ -215,9 +215,9 @@ impl EventstoreCheckpointHandler {
     /// `Err`). Emits the distinct metric + the `info!`/`error!` exactly
     /// once per cycle (the single emitter layer).
     async fn emit_once(&self) -> Result<CheckpointToEmit, CheckpointCycleError> {
-        // 1. Read every signature-verified existing checkpoint (the
-        //    shipped Item-3 read port). An empty set ⇒ first checkpoint
-        //    (seq 1 + the §5 backfill_baseline). An operational read
+        // 1. Read every signature-verified existing checkpoint. An empty
+        //    set ⇒ first checkpoint (seq 1 + the backfill_baseline). An
+        //    operational read
         //    failure aborts the cycle (retryable) — do NOT emit a
         //    seq-1 duplicate against a transiently-unreadable store.
         let existing = self
@@ -233,8 +233,8 @@ impl EventstoreCheckpointHandler {
             .await
             .map_err(CheckpointCycleError::HeadSnapshotFailed)?;
 
-        // 3. Pure §6.2 assembly: sorted witness + Merkle root +
-        //    monotonic seq + first-only backfill_baseline. The builder
+        // 3. Pure assembly: sorted witness + Merkle root + monotonic seq
+        //    + first-only backfill_baseline. The builder
         //    defensively drops the baseline on any non-first checkpoint.
         let backfill = self
             .backfill_baseline
@@ -296,7 +296,7 @@ impl CheckpointCycleError {
     /// v1 the signing key is validated at adapter construction and
     /// ed25519 signing of an in-memory `Vec` is infallible, so no cycle
     /// can reach a sign fault at run time — the label is in the closed
-    /// taxonomy (spec §11) and is exercised by the catalog test, but no
+    /// taxonomy and is exercised by the catalog test, but no
     /// runtime path emits it (documented, not faked).
     fn metric_result(&self) -> &'static str {
         match self {
@@ -376,7 +376,7 @@ impl TaskHandler for EventstoreCheckpointHandler {
 /// any row. It runs the **same** emission cycle as the periodic tick
 /// (same metric / log / signature contract), so a pre-purge checkpoint
 /// is indistinguishable from a scheduled one to the verifier — exactly
-/// what spec §2.3 needs (a seal is always anchored by a checkpoint that
+/// what is needed (a seal is always anchored by a checkpoint that
 /// post-dates it).
 pub struct CheckpointEmitterHookAdapter {
     handler: Arc<EventstoreCheckpointHandler>,
@@ -404,7 +404,7 @@ impl CheckpointEmissionHook for CheckpointEmitterHookAdapter {
                         sealed_count = cp.sealed_streams.len(),
                         backfill_baseline = cp.backfill_baseline.is_some(),
                         "pre-purge event-chain checkpoint emitted and WORM-anchored \
-                         (spec §2.3 — a seal must be anchored by a post-dating checkpoint)"
+                         (a seal must be anchored by a post-dating checkpoint)"
                     );
                     Ok(())
                 }
@@ -669,7 +669,7 @@ mod tests {
             .map(|h| h.stream_id.as_str())
             .collect();
         assert_eq!(ids, vec!["admin-a", "admin-b"]);
-        // §5: first checkpoint carries the baseline.
+        // First checkpoint carries the baseline.
         let b = cp.backfill_baseline.expect("first checkpoint has baseline");
         assert_eq!(b.baseline_max_global_position, 4242);
         // Metric: exactly `emitted`.
@@ -706,7 +706,7 @@ mod tests {
         assert_eq!(cp.checkpoint_seq, 3);
         assert_eq!(
             cp.backfill_baseline, None,
-            "§5: backfill_baseline is first-checkpoint-only"
+            "backfill_baseline is first-checkpoint-only"
         );
     }
 
@@ -896,8 +896,7 @@ mod tests {
 
     #[test]
     fn debugging_recorder_every_result_label_fires() {
-        // Architect / design §4 last-paragraph obligation: a
-        // DebuggingRecorder test asserting each catalog label fires.
+        // DebuggingRecorder catalog test asserting each label fires.
         for r in CHECKPOINT_RESULTS {
             let snap = capture(|| emit_metric(r));
             let e = snap.into_vec();

@@ -6,13 +6,13 @@
 //! `/decisions` because exclusions have **ongoing state** (active
 //! until removed or expired); decisions are point-in-time.
 //!
-//! Query parameters (design §2.7):
+//! Query parameters:
 //! - `policy` — UUID; invalid → 400.
 //! - `cve` — string (CVE identifier); the use case forwards verbatim.
 //! - `actor` — UUID; invalid → 400.
 //! - `limit` — 1..=500. Default 100. Invalid range → 400.
 //!
-//! Status-code map (design §3):
+//! Status-code map:
 //! - `200 OK` — body is [`CurationExclusionsResponseDto`]
 //! - `400 Bad Request` — invalid UUID for `policy` / `actor`,
 //!   oversize `limit`, or `limit = 0`

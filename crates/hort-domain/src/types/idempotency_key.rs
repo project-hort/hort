@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn accepts_mixed_destructive_cron_shape() {
-        // The shape the HTTP handler will derive in Item 2.
+        // The shape the HTTP handler derives.
         let raw = "cron:eventstore-archive:2026-06-03";
         let k = IdempotencyKey::try_from(raw).expect("destructive-cron shape must accept");
         assert_eq!(k.as_str(), raw);

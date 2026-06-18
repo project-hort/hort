@@ -1,10 +1,9 @@
 //! PostgreSQL adapter for [`PatchCandidateRepository`].
 //!
-//! Executes the §3.2 query against the live `artifacts`, `repositories`,
+//! Executes the candidacy query against the live `artifacts`, `repositories`,
 //! and `scan_findings` tables and maps the row shape onto the domain
 //! [`PatchCandidate`] DTO. The severity-rank `i16` produced by the
-//! LATERAL subquery is adapter-private (§3.1 "Adapter responsibility
-//! for severity-rank mapping") — the trait surface returns
+//! LATERAL subquery is adapter-private — the trait surface returns
 //! `Option<SeverityThreshold>` and the integer never leaves this
 //! module.
 
@@ -39,9 +38,9 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
         filter: PatchCandidateFilter,
     ) -> BoxFuture<'a, DomainResult<Vec<PatchCandidate>>> {
         Box::pin(async move {
-            // The query in design-doc §3.2 — `repository_key` projected
-            // per §3.4 ("adapter, not use case, resolves the
-            // human-readable repository key"). `r.format::text` casts
+            // The candidacy query — `repository_key` projected by the
+            // adapter (not the use case) from the human-readable
+            // repository key. `r.format::text` casts
             // the ENUM to TEXT so sqlx reads it as `String` (the
             // established pattern in `mappers.rs:35,67`). The cast on
             // `r.format::text <> 'oci'` mirrors the same idiom so the
@@ -108,10 +107,10 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
     }
 }
 
-/// sqlx FromRow shape mirroring the §3.2 projection.
+/// sqlx FromRow shape mirroring the candidacy query projection.
 ///
 /// `quarantined_status` is read as `Option<String>` because the
-/// underlying column is `varchar(20) NULL` per migration 003. The §3.2
+/// underlying column is `varchar(20) NULL` per migration 003. The
 /// outer filter pins it to the literal `'quarantined'`, but the
 /// adapter still parses through [`QuarantineStatus::from_str`] to keep
 /// the mapping semantically honest — a future migration that loosens
@@ -135,13 +134,13 @@ struct PatchCandidateRow {
 
 impl PatchCandidateRow {
     fn into_domain(self) -> DomainResult<PatchCandidate> {
-        // The §3.2 outer filter pins this to `'quarantined'`, but the
+        // The outer filter pins this to `'quarantined'`, but the
         // mapper parses through `from_str` so a future loosened filter
         // surfaces drift as `DomainError::Invariant` (mirrors the
         // strict mapper convention from `mappers.rs:UserRow`).
         //
         // The `None` arm is **defence-in-depth**, not currently
-        // reachable: the §3.2 WHERE clause forces
+        // reachable: the WHERE clause forces
         // `q.quarantine_status = 'quarantined'` (a non-NULL literal),
         // so a NULL value cannot land in this column today. The arm
         // exists because the schema permits NULL and a future relaxed
@@ -165,9 +164,9 @@ impl PatchCandidateRow {
         };
 
         // `RepositoryFormat::from_str` is infallible — unknown literals
-        // round-trip as `Other(s)`. The §3.2 SQL filter excludes
-        // `'oci'`, so the row mapper never sees `RepositoryFormat::Oci`
-        // out of this query. Mirror `mappers.rs:67` for the fallback.
+        // round-trip as `Other(s)`. The SQL filter excludes `'oci'`,
+        // so the row mapper never sees `RepositoryFormat::Oci` out of
+        // this query. Mirror `mappers.rs:67` for the fallback.
         let format: RepositoryFormat = self.format.parse().unwrap_or(RepositoryFormat::Generic);
 
         Ok(PatchCandidate {
@@ -194,11 +193,10 @@ impl PatchCandidateRow {
 /// round-trip is the contract that pins [`severity_from_rank`] to the
 /// same mapping the query uses.
 ///
-/// Renders a [`SeverityThreshold`] as the integer rank used by the §3.2
+/// Renders a [`SeverityThreshold`] as the integer rank used by the
 /// LATERAL subquery (`critical=4, high=3, medium=2, low=1`).
 ///
-/// Adapter-private (not `pub`) per design §3.1 "Adapter responsibility
-/// for severity-rank mapping" — the rank never leaves this module. A
+/// Adapter-private (not `pub`) — the rank never leaves this module. A
 /// future code path that needs to bind a rank as a query parameter has
 /// the canonical mapping here as well.
 #[allow(dead_code)] // SQL hard-codes the forward direction; helper anchors the round-trip test.
@@ -216,7 +214,7 @@ fn severity_rank(s: SeverityThreshold) -> i16 {
 /// rather than panicking — defensive against migration drift in a
 /// future rank computation.
 ///
-/// In practice the §3.2 query's `f.finding_count > 0` LATERAL filter
+/// In practice the query's `f.finding_count > 0` LATERAL filter
 /// prevents `0` from surfacing. The `None` arm exists at the type
 /// level so a buggy rank in the future cannot crash the read path.
 fn severity_from_rank(r: i16) -> Option<SeverityThreshold> {
@@ -280,7 +278,7 @@ mod tests {
 
     #[test]
     fn severity_from_rank_zero_is_none() {
-        // The §3.2 LATERAL `ELSE 0` branch. The `finding_count > 0`
+        // The LATERAL `ELSE 0` branch. The `finding_count > 0`
         // filter should keep this out of the result set, but the
         // mapper is defensive — return `None` rather than panic.
         assert_eq!(severity_from_rank(0), None);

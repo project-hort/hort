@@ -507,8 +507,9 @@ Environment=HORT_TRUSTED_PROXY_CIDRS=127.0.0.1/32
 **precise** CIDR of the proxy peer, not a permissive range. Trusting
 a broad CIDR lets any host in that range forge `client_ip` via
 `X-Forwarded-For` past rate-limit / fail2ban / audit attribution
-(see [`security-hardening-checklist.md`](security-hardening-checklist.md)
-M-A3). Co-locating Caddy and `hort-server` on the same host makes
+(see the "Rightmost-untrusted `X-Forwarded-For`" section in
+[`security-hardening-checklist.md`](security-hardening-checklist.md)).
+Co-locating Caddy and `hort-server` on the same host makes
 `127.0.0.1/32` the right answer; if you ever move the proxy to a
 separate host, narrow this to that host's IP.
 

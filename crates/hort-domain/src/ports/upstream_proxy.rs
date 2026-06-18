@@ -7,8 +7,7 @@
 //!
 //! # Why a port
 //!
-//! Same rationale as Item 9's [`crate::ports::upstream_resolver`]:
-//! the implementation lives in a dedicated adapter crate
+//! The implementation lives in a dedicated adapter crate
 //! (`hort-adapters-upstream-http`) so `reqwest` stays off the
 //! `hort-http-oci` dependency edge. The trait is in `hort-domain` so
 //! `AppContext` can hold it as `Arc<dyn UpstreamProxy>` without
@@ -119,7 +118,7 @@ pub struct BlobFetch {
 /// referrer manifest + its bundle blob via
 /// [`UpstreamProxy::fetch_manifest`] / [`UpstreamProxy::fetch_blob`].
 ///
-/// No `ReferrersIndex` wrapper: the design (§3.3) deliberately returns
+/// No `ReferrersIndex` wrapper: the design deliberately returns
 /// `Vec<ReferrerDescriptor>` directly — a single-`Vec` newtype carries
 /// no behaviour and back-compat is not required pre-v1.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,9 +218,7 @@ pub trait UpstreamProxy: Send + Sync {
     ///
     /// `accept` mirrors [`fetch_manifest`](Self::fetch_manifest):
     /// empty → no `Accept` header (defer to upstream default);
-    /// non-empty → comma-joined per RFC 7231 §5.3.2. Landing the
-    /// parameter on the first definition avoids a second port-shape
-    /// PR for PyPI's PEP 691 negotiation in 17.2.
+    /// non-empty → comma-joined per RFC 7231 §5.3.2.
     ///
     /// Returns a [`MetadataFetchOutcome`] carrying a
     /// [`CachedBodyHandle`]; consumers run per-format projection via
@@ -320,7 +317,7 @@ pub struct ManifestFetchOutcome {
 /// Format-supplied streaming projector. Sync `Read` because the
 /// `project_cached` helper opens the cache file synchronously and the
 /// projector runs under `tokio::task::spawn_blocking`. Per-format
-/// impls (Items 3–6) declare DTOs that omit unwanted fields; serde's
+/// impls declare DTOs that omit unwanted fields; serde's
 /// `deserialize_ignored_any` consumes skipped JSON tokens without
 /// allocating, bounding memory by the projected shape regardless of
 /// upstream body size.
@@ -335,11 +332,9 @@ pub trait MetadataProjector: Send + 'static {
 }
 
 /// Compile-through projector: reads the cached body into a `Vec<u8>`.
-/// Used by Item 1's caller-side migration before per-format projectors
-/// (Items 3–6) land. Lives in `hort-domain` because every consumer
-/// needs it during the transition and it has no I/O dependency (it
-/// just calls `Read::read_to_end` on whatever reader the helper hands
-/// it).
+/// Lives in `hort-domain` because every consumer needs it and it has
+/// no I/O dependency (it just calls `Read::read_to_end` on whatever
+/// reader the helper hands it).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IdentityProjector;
 

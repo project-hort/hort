@@ -65,8 +65,7 @@ impl Default for CurationExclusionFilter {
 
 /// Outbound port: paginated current-state of active exclusions.
 ///
-/// **Item 5 stub.** Full body + Postgres adapter in Item 8. The trait
-/// exists here so `CurationUseCase` can hold `Arc<dyn _>` one-shot.
+/// The trait exists here so `CurationUseCase` can hold `Arc<dyn _>`.
 pub trait CurationExclusionsRepository: Send + Sync {
     fn list_exclusions<'a>(
         &'a self,

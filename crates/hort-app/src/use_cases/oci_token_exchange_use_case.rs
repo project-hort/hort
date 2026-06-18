@@ -19,7 +19,7 @@
 //! - [`OciTokenExchangeError::InvalidScope`] — malformed scope, unknown
 //!   resource_type, unknown action, or wildcard resource_name. Maps
 //!   to 400 with the Distribution-Spec `UNSUPPORTED` envelope.
-//! - **Empty granted subset is NOT an error** — per design doc §6 the
+//! - **Empty granted subset is NOT an error** — the
 //!   flow returns 200 with an empty `access[]` array (clients
 //!   interpret it as "anonymous-equivalent"). Increments
 //!   `hort_oci_v2_auth_total{result="no_grant"}`.
@@ -107,7 +107,7 @@ pub enum OciTokenExchangeError {
     /// **HTTP 400** with the Distribution-Spec `UNSUPPORTED` envelope
     /// and the constant message `"service mismatch"` — the `requested`
     /// / `expected` hosts go to the structured audit log only, never
-    /// the wire body (spec §3.3 — no reflected value in the response).
+    /// the wire body — no reflected value in the response.
     #[error("service mismatch")]
     ServiceMismatch { requested: String, expected: String },
     /// PAT validation rejected the supplied Basic credential. Maps to
@@ -186,7 +186,7 @@ impl OciTokenExchangeUseCase {
         }
     }
 
-    /// Drive the full /v2/auth flow per design §6.
+    /// Drive the full /v2/auth flow.
     pub async fn exchange(
         &self,
         request: OciTokenExchangeRequest,
@@ -194,7 +194,7 @@ impl OciTokenExchangeUseCase {
         // Step 0: the inbound `?service=` MUST
         // match the configured registry audience. This is an
         // unbypassable gate inside the shared use case — no inbound
-        // caller can skip it (spec §3.2). It runs BEFORE scope parse and
+        // caller can skip it. It runs BEFORE scope parse and
         // BEFORE the expensive Argon2 PAT verify: a `service` mismatch
         // means the client is talking to the wrong registry entirely,
         // so the scopes + credential are moot. Comparison is
@@ -204,15 +204,15 @@ impl OciTokenExchangeUseCase {
         // and therefore mismatches → 400. Bare-host vs bare-host: a
         // client that sends a scheme or port (`https://host`,
         // `host:5000`) mismatches and 400s — that is itself a
-        // misconfiguration worth surfacing (spec §3.2, open-question 2).
+        // misconfiguration worth surfacing.
         let requested = normalize_service(&request.service);
         let expected = normalize_service(&self.config.jwt_audience);
         if requested != expected {
             emit_verify_metric(VerifyResultLabel::ServiceMismatch);
             // Audit fact (client/config error, NOT an `error!`): both
             // values are hostnames (server config + client-echoed) — no
-            // credential, no PII (spec §6.2). The wire body stays
-            // constant (§3.3); the operator-debuggable detail lives here.
+            // credential, no PII. The wire body stays
+            // constant; the operator-debuggable detail lives here.
             tracing::info!(
                 event = "oci_v2_auth_denied",
                 reason = "service_mismatch",
@@ -254,17 +254,15 @@ impl OciTokenExchangeUseCase {
 
         // Step 3: build a synthetic principal carrying the validated
         // user_id + token_cap. Roles are seeded from the live `User`
-        // row's `is_admin` bit, mirroring `authenticate_pat` (design
-        // §5 step 3 + §8 invariant 2 — live re-resolution per
-        // request). PAT-bearing callers carry no fresh IdP claim, so
-        // `groups` stays empty and the only authority leg through the
-        // user-grants path is the admin short-circuit (when
-        // `is_admin = true`) or per-repo `PermissionGrant` rows
-        // attached to roles the user holds. Without this re-
-        // resolution `roles: Vec::new()` would short-circuit
-        // `RbacEvaluator::user_grants_authorize` to `false` and every
-        // minted JWT would carry an empty `access[]` — that was the
-        // F2-review bug.
+        // row's `is_admin` bit, mirroring `authenticate_pat` (live
+        // re-resolution per request). PAT-bearing callers carry no
+        // fresh IdP claim, so `groups` stays empty and the only
+        // authority leg through the user-grants path is the admin
+        // short-circuit (when `is_admin = true`) or per-repo
+        // `PermissionGrant` rows attached to roles the user holds.
+        // Without this re-resolution `roles: Vec::new()` would
+        // short-circuit `RbacEvaluator::user_grants_authorize` to
+        // `false` and every minted JWT would carry an empty `access[]`.
         //
         // The validator already short-circuited on `is_active = false`
         // upstream, so a successful `validation` implies the user row
@@ -276,7 +274,7 @@ impl OciTokenExchangeUseCase {
         // Behaviour-preserving: the
         // `is_admin → ["admin"]` derivation is reproduced exactly via
         // the shared synthetic-admin helper — no claim is invented beyond
-        // the synthetic `admin` (§6 invariant 6). PAT-bearing callers carry
+        // the synthetic `admin` claim. PAT-bearing callers carry
         // no fresh IdP claim, so the claim set is at most `["admin"]`.
         let mut claims = Vec::new();
         add_admin_claim_if_admin(&mut claims, user.is_admin);
@@ -355,8 +353,8 @@ impl OciTokenExchangeUseCase {
         let jwt = match self.signing_key.mint(&claims) {
             Ok(jwt) => jwt,
             Err(err) => {
-                // Mint failure — signing key broken (spec §6.1 maps the
-                // mint-path failure to `denied`). The existing
+                // Mint failure — signing key broken: the mint-path
+                // failure maps to `denied`. The existing
                 // `error!` at the inbound site (v2_auth.rs) stays; this
                 // is the verify-axis counter only.
                 emit_verify_metric(VerifyResultLabel::Denied);
@@ -364,9 +362,9 @@ impl OciTokenExchangeUseCase {
             }
         };
 
-        // Mint path succeeded: PAT validated + JWT minted (spec §6.1
-        // `ok`). Orthogonal to `hort_oci_v2_auth_total` (grant breadth) —
-        // this is the verify-outcome axis (R2/F-28).
+        // Mint path succeeded: PAT validated + JWT minted (`ok`).
+        // Orthogonal to `hort_oci_v2_auth_total` (grant breadth) —
+        // this is the verify-outcome axis.
         emit_verify_metric(VerifyResultLabel::Ok);
 
         Ok(OciTokenExchangeResponse {
@@ -450,13 +448,12 @@ impl OciTokenExchangeUseCase {
     ///
     /// The Ed25519 sign/verify primitive ([`OciTokenSigningKey`]) is
     /// **unchanged** — it is the OCI Distribution-Spec issuer
-    /// mechanism, not bespoke-by-choice (spec §11 D1). The expected
+    /// mechanism, not bespoke-by-choice. The expected
     /// audience is `self.config.jwt_audience` — the **same** value the
     /// mint side embeds in the JWT `aud` claim. Centralising both
     /// derivations on this one config field eliminates the latent
-    /// mint/consume aud-derivation drift (spec §5.3 / divergence D3:
-    /// the consume side previously re-derived
-    /// `host_of(oci_public_base_url)` independently).
+    /// mint/consume aud-derivation drift (the consume side previously
+    /// re-derived `host_of(oci_public_base_url)` independently).
     #[tracing::instrument(skip_all)]
     pub fn verify_inbound(&self, jwt: &str) -> OciVerifyOutcome {
         match self.signing_key.verify(jwt, &self.config.jwt_audience) {
@@ -466,18 +463,15 @@ impl OciTokenExchangeUseCase {
             }
             // Not an hort-server-OCI-minted JWT (bad signature /
             // structurally not ours). Fall through to the IdP-JWT
-            // validator. Same semantics as the pre-R2
-            // `InvalidSignature | Malformed → fall through`. NOT
-            // counted `denied` — a fall-through is not a denial
-            // (counting it would double-count against the IdP path's
-            // own telemetry; spec §6.1).
+            // validator. NOT counted `denied` — a fall-through is not
+            // a denial (counting it would double-count against the IdP
+            // path's own telemetry).
             Err(VerificationError::InvalidSignature) | Err(VerificationError::Malformed { .. }) => {
                 OciVerifyOutcome::NotOurToken
             }
             // Structurally-ours token that is invalid (expired / wrong
             // audience). HARD reject — the middleware must NOT fall
-            // through (an expired ours-token is identical to the
-            // pre-R2 `Err(other) => reject`).
+            // through.
             Err(VerificationError::Expired) => {
                 emit_verify_metric(VerifyResultLabel::Denied);
                 tracing::info!(
@@ -647,8 +641,8 @@ impl ScopeAction {
         }
     }
 
-    /// Map to the internal `Permission` enum. Per design doc §6 step
-    /// 4: `pull → Read`, `push → Write` (push implies pull — the
+    /// Map to the internal `Permission` enum: `pull → Read`,
+    /// `push → Write` (push implies pull — the
     /// caller checks both Read AND Write when push is requested),
     /// `delete → Delete`.
     fn required_permission(self) -> Permission {
@@ -678,8 +672,7 @@ impl GrantedActions {
 ///
 /// Grammar: `<resource_type>:<resource_name>:<action>[,<action>...]`.
 /// - `resource_type` ∈ {`repository`, `registry`}.
-/// - `resource_name` cannot contain `*` (wildcard rejection per
-///   design doc §6).
+/// - `resource_name` cannot contain `*` (wildcard rejection).
 /// - `action` ∈ {`pull`, `push`, `delete`}.
 /// - **`push` implies `pull`** per spec — the parser auto-promotes
 ///   `push` to `pull,push` (with deduplication) so downstream evaluation
@@ -804,7 +797,7 @@ enum VerifyResultLabel {
     /// Mint path: PAT invalid / scope invalid / mint failure. Consume
     /// path: `OciVerifyOutcome::Rejected` (expired / wrong aud).
     /// `NotOurToken` is **not** counted here (fall-through, not a
-    /// denial — spec §6.1).
+    /// denial).
     Denied,
 }
 
@@ -838,9 +831,9 @@ fn emit_action_metric(action: &str) {
 fn map_pat_error(err: PatValidationError) -> OciTokenExchangeError {
     match err {
         PatValidationError::Infrastructure(d) => OciTokenExchangeError::Infrastructure(d),
-        // Every other variant collapses to InvalidCredential per
-        // design doc §6 — the OCI client only sees a 401 + Bearer
-        // challenge regardless of the underlying reason.
+        // Every other variant collapses to InvalidCredential —
+        // the OCI client only sees a 401 + Bearer challenge
+        // regardless of the underlying reason.
         _ => OciTokenExchangeError::InvalidCredential,
     }
 }
@@ -955,7 +948,7 @@ mod tests {
     }
 
     // =================================================================
-    // F2 — DebuggingRecorder happy- and failure-path tests for the OCI
+    // DebuggingRecorder happy- and failure-path tests for the OCI
     // token-exchange metrics:
     //   - `hort_oci_v2_auth_total{result}`
     //   - `hort_oci_v2_auth_scope_actions_granted_total{action}`
@@ -1364,10 +1357,10 @@ mod tests {
     /// planted row deterministically.
     ///
     /// `is_admin` controls the `User.is_admin` bit of the seeded user
-    /// row. Per F2-followup, `OciTokenExchangeUseCase::exchange` re-
-    /// resolves the user via `UserRepository::find_by_id` and seeds
-    /// `roles: vec!["admin"]` when the row is admin (mirroring
-    /// `authenticate_pat`). The full-grant / pull-push-delete tests
+    /// row. `OciTokenExchangeUseCase::exchange` re-resolves the user
+    /// via `UserRepository::find_by_id` and seeds `roles: vec!["admin"]`
+    /// when the row is admin (mirroring `authenticate_pat`). The
+    /// full-grant / pull-push-delete tests
     /// pass `true`; the partial-grant test combines `is_admin = true`
     /// with a narrowed `declared_permissions` to exercise the cap
     /// leg's deny path.
@@ -1629,9 +1622,9 @@ mod tests {
     /// (so the cap leg admits Read/Write/Delete). Single `pull` scope
     /// → 1 requested, 1 granted → `ResultLabel::FullGrant`.
     ///
-    /// Pre-F2-followup this test went around `exchange()` because the
+    /// Previously this test went around `exchange()` because the
     /// synthetic principal carried `roles: Vec::new()` and could never
-    /// reach the FullGrant arm; the followup wires
+    /// reach the FullGrant arm; the fix wires
     /// `UserRepository::find_by_id` into the principal-construction
     /// step and seeds `roles: ["admin"]` from the live `is_admin` bit,
     /// making the arm reachable.
@@ -1679,9 +1672,9 @@ mod tests {
     /// granted but `push` denied → 2 requested, 1 granted →
     /// `ResultLabel::PartialGrant`.
     ///
-    /// Pre-F2-followup this test went around `exchange()` because the
+    /// Previously this test went around `exchange()` because the
     /// synthetic principal carried `roles: Vec::new()` and could never
-    /// reach the PartialGrant arm; the followup makes it reachable by
+    /// reach the PartialGrant arm; the fix makes it reachable by
     /// re-resolving roles from the live user row.
     #[test]
     fn oci_v2_auth_total_emits_partial_grant_when_some_actions_unauthorised() {
@@ -1764,9 +1757,9 @@ mod tests {
     /// granted subset and emits one increment on
     /// `hort_oci_v2_auth_scope_actions_granted_total`.
     ///
-    /// Pre-F2-followup this test went around `exchange()` because the
+    /// Previously this test went around `exchange()` because the
     /// synthetic principal carried `roles: Vec::new()` and could
-    /// never accumulate any granted actions; the followup re-resolves
+    /// never accumulate any granted actions; the fix re-resolves
     /// the user row and seeds `roles: ["admin"]` from `is_admin`,
     /// making every action reachable through `evaluate_scope`.
     #[test]
@@ -1956,7 +1949,7 @@ mod tests {
         signing.mint(&claims).expect("mint")
     }
 
-    // -- F-28 Step-0 predicate ---------------------------------------
+    // -- Step-0 service predicate ------------------------------------
 
     /// Exact host match → gate passes (mint proceeds). Control proving
     /// the gate is a precise equality, not a blanket reject.
@@ -1979,7 +1972,7 @@ mod tests {
                     client_ip: Some(ip()),
                 })
                 .await;
-            assert!(res.is_ok(), "exact host match must pass the F-28 gate");
+            assert!(res.is_ok(), "exact host match must pass the service gate");
         });
         // ok on the verify axis, never service_mismatch.
         assert_eq!(
@@ -2044,7 +2037,7 @@ mod tests {
     }
 
     /// A `service=` carrying a scheme or port is bare-host-unequal →
-    /// mismatch → 400 (spec §3.2 / open-question 2: NOT stripped).
+    /// mismatch → 400 (NOT stripped).
     #[test]
     fn f28_scheme_or_port_in_service_is_mismatch() {
         for s in ["https://hort.test", "hort.test:5000", "http://hort.test/v2"] {
@@ -2056,7 +2049,7 @@ mod tests {
         }
     }
 
-    /// The F-28 deny emits `hort_oci_auth_verify_total{result=service_mismatch}`
+    /// A service mismatch emits `hort_oci_auth_verify_total{result=service_mismatch}`
     /// exactly once and NOT `ok`/`denied`.
     #[test]
     fn f28_mismatch_emits_service_mismatch_metric_only() {
@@ -2119,7 +2112,7 @@ mod tests {
     }
 
     /// Mint-path failure (scope grammar violation, pre-PAT) emits
-    /// `hort_oci_auth_verify_total{result=denied}` (spec §6.1).
+    /// `hort_oci_auth_verify_total{result=denied}`.
     #[test]
     fn invalid_scope_emits_denied_on_verify_axis() {
         let snap = capture_async(|| async {
@@ -2201,7 +2194,7 @@ mod tests {
     }
 
     /// Garbage / not-our-signature → `NotOurToken`, NO metric (it is a
-    /// fall-through, not a denial — spec §6.1).
+    /// fall-through, not a denial).
     #[test]
     fn verify_inbound_foreign_token_is_not_our_token() {
         let snap = capture_async(|| async {
@@ -2291,7 +2284,7 @@ mod tests {
 
     /// Drive `exchange` with the given `service=` against the standard
     /// admin+full-cap fixture (so a passing gate yields `Ok`). Used by
-    /// the F-28 match/mismatch predicate tests above.
+    /// the service match/mismatch predicate tests above.
     fn run_exchange_with_service(
         service: &str,
     ) -> Result<OciTokenExchangeResponse, OciTokenExchangeError> {

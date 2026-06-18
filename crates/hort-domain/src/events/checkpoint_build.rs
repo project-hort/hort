@@ -2,10 +2,10 @@
 //! of the event-chain tamper-evidence design (ADR 0002).
 //!
 //! Zero-I/O, zero-`tracing` `hort-domain` logic that turns a consistent
-//! cut of the live event store into the spec §6.2 signed-checkpoint
+//! cut of the live event store into the signed-checkpoint
 //! *body shape*: the `stream_id`-sorted flat witness list
 //! `(stream_id, final_stream_position, head_event_hash)`, the next
-//! monotonic `checkpoint_seq`, and the §5 `backfill_baseline`
+//! monotonic `checkpoint_seq`, and the `backfill_baseline`
 //! first-checkpoint honesty caveat.
 //!
 //! **What the v1 signature covers (precisely).** The shipped v1
@@ -31,14 +31,14 @@
 //! Coverage Tiers): the witness sorting, the seq derivation, and the
 //! backfill-baseline first-only rule.
 //!
-//! Reuses the Item-2 [`Checkpoint`](super::Checkpoint) /
+//! Reuses the [`Checkpoint`](super::Checkpoint) /
 //! [`EventHash`](super::EventHash) / [`SealedStreamRecord`](super::SealedStreamRecord)
 //! types — no parallel struct that could drift.
 
 use super::{Checkpoint, EventHash, SealedStreamRecord};
 
 /// One live stream's head, as the emitter snapshots it from the runtime
-/// `events` table (the §6.2 leaf tuple). Pure data — the adapter builds
+/// `events` table (the leaf tuple). Pure data — the adapter builds
 /// these from a `SELECT`; this module never does I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamHead {
@@ -50,14 +50,14 @@ pub struct StreamHead {
     pub head_event_hash: EventHash,
 }
 
-/// The §5 backfill-baseline honesty caveat, set **only** on the first
+/// The backfill-baseline honesty caveat, set **only** on the first
 /// post-migration checkpoint. Carries the proof that "tamper-evident
 /// from `<migration_timestamp>`" is honest: the max `global_position`
 /// the in-migration backfill covered and the migration timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillBaseline {
     /// The max `events.global_position` the in-migration backfill
-    /// chained at trust-on-migrate (spec §5).
+    /// chained at trust-on-migrate.
     pub baseline_max_global_position: u64,
     /// The migration timestamp — the boundary the compliance wording
     /// ("tamper-evident from `<this>`") refers to.
@@ -65,7 +65,7 @@ pub struct BackfillBaseline {
 }
 
 /// The fully-assembled, *not-yet-signed* checkpoint the emitter will
-/// sign + anchor (spec §6.2). The pure builder produces this; the
+/// sign + anchor. The pure builder produces this; the
 /// adapter wraps it into the shared `SignedBody`, signs, and writes.
 ///
 /// The v1 `SignedBody` (`hort-evchain/v1`) signs the **flat sorted
@@ -76,15 +76,14 @@ pub struct BackfillBaseline {
 /// note on a future signed-root bump.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointToEmit {
-    /// `"hort-evchain/v1"` (selects the canonicalizer, §3.3).
+    /// `"hort-evchain/v1"` (selects the canonicalizer).
     pub chain_format_version: String,
-    /// Monotonic, gap-free sequence (next = prev max + 1, §6.4).
+    /// Monotonic, gap-free sequence (next = prev max + 1).
     pub checkpoint_seq: u64,
     /// Store-supplied emit time (RFC3339 UTC on the wire).
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// The `global_position` this checkpoint covers up to — a
-    /// consistent cut marker (§6.2; §13 divergence 6: a *marker*, not
-    /// a chain link).
+    /// consistent cut marker (a *marker*, not a chain link).
     pub max_global_position: u64,
     /// The flat, `stream_id`-sorted witness list — the v1 signature
     /// covers these entries directly (no Merkle root intermediary;
@@ -94,13 +93,13 @@ pub struct CheckpointToEmit {
     /// (may be empty when no stream was sealed since the previous
     /// checkpoint — valid).
     pub sealed_streams: Vec<SealedStreamRecord>,
-    /// The §5 honesty caveat — `Some` **only** on the first
+    /// The honesty caveat — `Some` **only** on the first
     /// post-migration checkpoint.
     pub backfill_baseline: Option<BackfillBaseline>,
 }
 
 /// Return the witness list sorted by `stream_id` (the on-wire order
-/// §6.2 mandates so the v1 reader reconstructs the same sorted sequence
+/// mandated so the v1 reader reconstructs the same sorted sequence
 /// the emitter signed).
 pub fn sorted_witness(heads: &[StreamHead]) -> Vec<StreamHead> {
     let mut v = heads.to_vec();
@@ -109,7 +108,7 @@ pub fn sorted_witness(heads: &[StreamHead]) -> Vec<StreamHead> {
 }
 
 /// Derive the next monotonic `checkpoint_seq` from the checkpoints
-/// already in the anchor store (spec §6.4 — gap-free; the reader treats
+/// already in the anchor store (gap-free; the reader treats
 /// a gap as `missing_checkpoint`). First checkpoint is seq `1`;
 /// otherwise `max(existing) + 1`. Pure.
 pub fn next_checkpoint_seq(existing: &[Checkpoint]) -> u64 {
@@ -121,15 +120,15 @@ pub fn next_checkpoint_seq(existing: &[Checkpoint]) -> u64 {
 }
 
 /// `true` iff this is the first post-migration checkpoint — i.e. the
-/// anchor store has no prior checkpoint (spec §5: "Determine 'is this
-/// the first checkpoint' deterministically — no prior `checkpoint_seq`
-/// in the anchor store"). The §5 `backfill_baseline` is attached
+/// anchor store has no prior checkpoint. Deterministically determined —
+/// no prior `checkpoint_seq`
+/// in the anchor store. The `backfill_baseline` is attached
 /// **only** when this is `true`.
 pub fn is_first_checkpoint(existing: &[Checkpoint]) -> bool {
     existing.is_empty()
 }
 
-/// Assemble the pure §6.2 checkpoint body from a consistent cut.
+/// Assemble the pure checkpoint body from a consistent cut.
 ///
 /// * `existing` — every checkpoint already in the anchor store (drives
 ///   `checkpoint_seq` monotonicity + the first-checkpoint test).
@@ -139,9 +138,9 @@ pub fn is_first_checkpoint(existing: &[Checkpoint]) -> bool {
 ///   checkpoint — valid).
 /// * `max_global_position` — the consistent-cut marker.
 /// * `created_at` — store-supplied emit time.
-/// * `backfill` — the §5 caveat; attached **only** on the first
+/// * `backfill` — the honesty caveat; attached **only** on the first
 ///   checkpoint. Passing `Some` on a non-first checkpoint is ignored
-///   (the §5 rule is "first post-migration checkpoint **only**"); the
+///   The rule is "first post-migration checkpoint **only**"; the
 ///   caller is expected to gate this, and the builder enforces it
 ///   defensively so a mis-wired caller cannot stamp every checkpoint
 ///   with a baseline (which would corrupt the honesty semantics).
@@ -167,7 +166,7 @@ pub fn build_checkpoint(
         max_global_position,
         stream_heads: witness,
         sealed_streams: sealed.to_vec(),
-        // §5: backfill_baseline is set ONLY on the first post-migration
+        // backfill_baseline is set ONLY on the first post-migration
         // checkpoint. Defensive: drop it on any non-first checkpoint
         // even if the caller passed Some.
         backfill_baseline: if first { backfill } else { None },
@@ -270,8 +269,7 @@ mod tests {
 
     #[test]
     fn build_second_checkpoint_has_no_backfill_baseline_even_if_passed() {
-        // §5 enforcement: a mis-wired caller passing Some on a non-first
-        // checkpoint must NOT stamp a baseline (honesty-semantics guard).
+        // A mis-wired caller passing Some on a non-first checkpoint must NOT stamp a baseline (honesty-semantics guard).
         let now = Utc.timestamp_opt(1_700_001_000, 0).unwrap();
         let c = build_checkpoint(
             "hort-evchain/v1",
@@ -285,7 +283,7 @@ mod tests {
         assert_eq!(c.checkpoint_seq, 2);
         assert_eq!(
             c.backfill_baseline, None,
-            "backfill_baseline is first-checkpoint-only (§5)"
+            "backfill_baseline is first-checkpoint-only"
         );
     }
 

@@ -298,8 +298,7 @@ async fn serve_tarball(
                 Ok(_artifact) => {
                     // The orchestrator minted the row; re-fetch via the
                     // same use case the local-CAS path uses. This keeps
-                    // the response body read-from-CAS path identical
-                    // (mirrors PyPI Item 5).
+                    // the response body read-from-CAS path identical.
                     ctx.artifact_use_case
                         .find_visible_by_path(repo_key, &artifact_path, actor)
                         .await?
@@ -511,12 +510,12 @@ async fn do_publish(
     // no double-pass over the tarball, no full buffer in memory.
     let sha1_hex = decoded.sha1_hex.clone();
 
-    // Spec 074 §2 — the canonical stored path comes from the single SSOT
-    // constructor (`{name}/-/{unscoped-basename}-{ver}.tgz`), the exact
-    // string `NpmFormatHandler::parse_download_path` produces on subsequent
-    // GETs. npm derives the filename from name+version, so `filename =
-    // None`. (Storing the raw `_attachments` filename — which includes the
-    // scope for scoped packages — would produce an unresolvable path.)
+    // The canonical stored path comes from the single SSOT constructor
+    // (`{name}/-/{unscoped-basename}-{ver}.tgz`), the exact string
+    // `NpmFormatHandler::parse_download_path` produces on subsequent GETs.
+    // npm derives the filename from name+version, so `filename = None`.
+    // (Storing the raw `_attachments` filename — which includes the scope for
+    // scoped packages — would produce an unresolvable path.)
     let path = handler
         .build_artifact_logical_path(pkg_name, &version, None)
         .map_err(ApiError::from)?;
@@ -681,9 +680,9 @@ mod tests {
             .build_recorder()
             .handle();
         let (ctx, mocks) = build_mock_ctx(metrics_handle);
-        // Post-Item-3 packument handlers pull the public URL from
-        // `RequestTrust`. Override the default pinned URL so F2 falls
-        // back to `Host` + `https` — keeps every
+        // Packument handlers pull the public URL from `RequestTrust`.
+        // Override the default pinned URL so the handler falls back to
+        // `Host` + `https` — keeps every
         // `host: registry.example.com` → `https://registry.example.com/...`
         // assertion in this module stable.
         let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
@@ -697,13 +696,13 @@ mod tests {
         }
     }
 
-    /// Build a router with the F2 request-trust layer attached.
+    /// Build a router with the request-trust layer attached.
     ///
-    /// Post-Item-3, every handler that emits absolute URLs extracts
-    /// `RequestTrust` from request extensions. Router helpers in this
-    /// test module therefore replicate the production wiring: attach
-    /// the same trust layer so handler tests exercise the same path as
-    /// the integration stack.
+    /// Every handler that emits absolute URLs extracts `RequestTrust`
+    /// from request extensions. Router helpers in this test module
+    /// therefore replicate the production wiring: attach the same trust
+    /// layer so handler tests exercise the same path as the integration
+    /// stack.
     fn router(ctx: Arc<AppContext>) -> Router {
         let trust_cfg = ctx.trust_config.clone();
         Router::new()
@@ -1668,12 +1667,12 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Normalisation-drift regression (arch findings Item 6). Ingest an
-    /// artifact whose stored `name = "legacy-name"` differs from the
-    /// current `NpmFormatHandler::normalize_name(raw)`. Request the
-    /// packument using the raw `name_as_published`. Fallback must recover
-    /// the row; emitted tarball URL and top-level `name` must carry the
-    /// STORED name; follow-up GET on the emitted URL must succeed.
+    /// Normalisation-drift regression. Ingest an artifact whose stored
+    /// `name = "legacy-name"` differs from the current
+    /// `NpmFormatHandler::normalize_name(raw)`. Request the packument using
+    /// the raw `name_as_published`. Fallback must recover the row; emitted
+    /// tarball URL and top-level `name` must carry the STORED name;
+    /// follow-up GET on the emitted URL must succeed.
     #[tokio::test]
     async fn packument_recovers_drift_era_artifact_and_follow_up_download_hits() {
         use sha2::{Digest, Sha256};
@@ -2145,11 +2144,10 @@ mod tests {
         /// Compare two `(StatusCode, Vec<u8>)` 404 responses for
         /// anti-enumeration equivalence: status MUST match and the
         /// JSON envelope shape (`{"error":"not found: Repository
-        /// <id>"}`) MUST be identical except for the id token. Per
-        /// design doc §5: "Both are the canonical
-        /// `not found: Repository <id>` envelope, differing only in
-        /// the id token. Format equality is what an operator-side
-        /// enumeration probe would observe."
+        /// <id>"}`) MUST be identical except for the id token. Both
+        /// are the canonical `not found: Repository <id>` envelope,
+        /// differing only in the id token — format equality is what
+        /// an operator-side enumeration probe would observe.
         fn assert_anti_enumeration_envelope(
             private: &(StatusCode, Vec<u8>),
             missing: &(StatusCode, Vec<u8>),
@@ -2238,7 +2236,7 @@ mod tests {
             assert_eq!(
                 private_resp.status(),
                 StatusCode::NOT_FOUND,
-                "anonymous read on private npm repo MUST be 404 (Init 15 / Init 11 C1)"
+                "anonymous read on private npm repo MUST be 404"
             );
             let private_status = private_resp.status();
             let private_body = to_bytes(private_resp.into_body(), 4 * 1024)
@@ -2613,12 +2611,12 @@ mod tests {
     // shape for each `UpstreamPullError` variant. Mirrors the PyPI prior
     // art at `crates/hort-http-pypi/src/lib.rs::tests::proxy_pull_through`.
     //
-    // The tests drive the FULL Item 4 orchestration through `MockPorts`
-    // rather than mocking the orchestrator directly — `try_upstream_tarball_pull`
-    // is not easily mockable, and the assertions here are wire-shape
-    // (status + body + `X-Hort-Reason`), so the integration shape is the
-    // right boundary to cover. Hosted/Staging/Virtual repos must NOT
-    // enter the Proxy branch — the
+    // The tests drive the full upstream-pull orchestration through
+    // `MockPorts` rather than mocking the orchestrator directly —
+    // `try_upstream_tarball_pull` is not easily mockable, and the
+    // assertions here are wire-shape (status + body + `X-Hort-Reason`),
+    // so the integration shape is the right boundary to cover.
+    // Hosted/Staging/Virtual repos must NOT enter the Proxy branch — the
     // `serve_tarball_local_repo_cache_miss_returns_404` test pins this.
     mod proxy_pull_through {
         use std::sync::Arc;
@@ -2837,7 +2835,7 @@ mod tests {
         /// SHA-1 path) → `parse_upstream_checksum` returns Validation,
         /// the orchestrator surfaces `MetadataMalformed`, and the wire-map
         /// renders 502 + `X-Hort-Reason: upstream-metadata-malformed`.
-        /// SHA-1 fallback is NOT accepted (design doc §16).
+        /// SHA-1 fallback is NOT accepted (collision-broken since 2017).
         #[tokio::test]
         async fn serve_tarball_proxy_cache_miss_legacy_no_integrity_returns_502_metadata_malformed()
         {
@@ -3010,8 +3008,7 @@ mod tests {
         //    the CAS at its computed (SHA-256) content hash. npm's
         //    upstream verification is SHA-512 (unique among v2 formats),
         //    but the CAS content hash is SHA-256 of the raw bytes —
-        //    these are independent layers (architect skill §
-        //    "Content-Addressable Storage").
+        //    these are independent layers.
         // 2. Tampered tarball emits exactly one `ChecksumMismatch` on
         //    the REPOSITORY stream (never the artifact stream — under
         //    mint-after-verify no artifact row exists for the
@@ -3035,13 +3032,13 @@ mod tests {
         /// Happy path: cache miss + Proxy + upstream serves the
         /// advertised tarball body.
         ///
-        /// Wire is already covered by Item 5's
-        /// `serve_tarball_proxy_cache_miss_pulls_through_and_serves`;
-        /// this test asserts the FRAMEWORK invariants:
+        /// Happy path: cache miss + Proxy + upstream serves the
+        /// advertised tarball body.
+        ///
+        /// Asserts the framework invariants:
         /// - `ArtifactIngested` and `ChecksumVerified` ride in the
-        ///   SAME `commit_transition` batch (atomic with the mint
-        ///   per design §13), and that batch lands on the
-        ///   `StreamCategory::Artifact` stream.
+        ///   SAME `commit_transition` batch (atomic with the mint),
+        ///   landing on the `StreamCategory::Artifact` stream.
         /// - The freshly-fetched body is present in the CAS at its
         ///   computed content hash (`storage.put` ran exactly once
         ///   and the bytes are recoverable). The CAS hash is SHA-256
@@ -3133,9 +3130,10 @@ mod tests {
         /// Tampered tarball: cache miss + Proxy + upstream serves bytes
         /// that disagree with the advertised `dist.integrity` SHA-512.
         ///
-        /// Wire is already covered by Item 5's
-        /// `serve_tarball_proxy_cache_miss_tampered_returns_502_checksum_mismatch`;
-        /// this test asserts the FRAMEWORK invariants from §13:
+        /// Tampered tarball: cache miss + Proxy + upstream serves bytes
+        /// that disagree with the advertised `dist.integrity` SHA-512.
+        ///
+        /// Asserts the framework invariants:
         /// - `ChecksumMismatch` is appended to the REPOSITORY stream
         ///   (never the artifact stream — there is no artifact yet
         ///   under mint-after-verify) with `algorithm = Sha512`.
@@ -3274,21 +3272,22 @@ mod tests {
         /// Legacy packument: `versions[ver].dist` advertises only
         /// `shasum` (SHA-1), no `integrity`.
         ///
-        /// Wire is already covered by Item 5's
-        /// `serve_tarball_proxy_cache_miss_legacy_no_integrity_returns_502_metadata_malformed`;
-        /// this test asserts the FRAMEWORK invariants:
+        /// Legacy packument: `versions[ver].dist` advertises only
+        /// `shasum` (SHA-1), no `integrity`.
+        ///
+        /// Asserts the framework invariants:
         /// - `parse_upstream_checksum` fails BEFORE `ingest_verified`
         ///   is called, so no event is ever emitted on either stream.
-        ///   Design doc §13 invariant: `ChecksumMismatch` only fires
-        ///   when bytes flowed; metadata-parse failures fire nothing.
+        ///   `ChecksumMismatch` only fires when bytes flowed; metadata-
+        ///   parse failures fire nothing.
         /// - `storage.put` is never called (the parser short-circuits
         ///   ahead of the tarball-fetch + storage.put sequence —
         ///   note `insert_artifact` is deliberately NOT seeded, so a
         ///   regression that reaches the tarball leg would surface
         ///   as `UpstreamUnavailable` rather than the expected
         ///   `MetadataMalformed`).
-        /// - SHA-1 fallback is rejected at the parser layer; design
-        ///   doc §16 forbids it as collision-broken since 2017.
+        /// - SHA-1 fallback is rejected at the parser layer
+        ///   (collision-broken since 2017).
         #[tokio::test]
         async fn framework_invariant_legacy_no_integrity_returns_502_with_no_events_or_cas_writes()
         {

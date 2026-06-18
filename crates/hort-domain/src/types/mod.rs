@@ -249,11 +249,11 @@ impl<T> StringPage<T> {
 /// `FormatHandler::normalize_name()`.
 ///
 /// `name_as_published` is the **exact** name the client supplied, before
-/// any normalisation. It is the drift-resilience safety net (arch
-/// findings Item 6): if a `FormatHandler::normalize_name` implementation
-/// ever changes output for the same input — deliberately, by "bug fix",
-/// or via a plugin hot-swap — artifacts ingested under the old algorithm
-/// remain reachable via `ArtifactRepository::find_by_name_as_published`.
+/// any normalisation. It is the drift-resilience safety net: if a
+/// `FormatHandler::normalize_name` implementation ever changes output for
+/// the same input — deliberately, by "bug fix", or via a plugin hot-swap —
+/// artifacts ingested under the old algorithm remain reachable via
+/// `ArtifactRepository::find_by_name_as_published`.
 ///
 /// `metadata` is the **opaque output of
 /// [`FormatHandler::parse_download_path`](crate::ports::format_handler::FormatHandler::parse_download_path)**

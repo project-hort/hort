@@ -39,9 +39,8 @@ pub enum BooleanOp {
 ///
 /// A retention predicate is operator-authored YAML; a pathologically
 /// deep tree is a misconfiguration (and a stack-recursion hazard for
-/// the B3 evaluator). Three levels is far more than the canonical
-/// single-level `Composite(And, [..])` operator pattern (§4/§1) ever
-/// needs.
+/// the evaluator). Three levels is far more than the canonical
+/// single-level `Composite(And, [..])` operator pattern ever needs.
 const MAX_COMPOSITE_DEPTH: usize = 8;
 
 /// Maximum number of direct children in a single `Composite`.
@@ -93,13 +92,13 @@ impl PolicyPredicate {
     /// `true` iff this predicate (or any descendant of a `Composite`)
     /// is one of the four scan-data variants.
     ///
-    /// The §6-invariant-7 freshness gate skips artifacts whose most
-    /// recent `ScanCompleted` is stale **only** for security-driven
-    /// predicates; the §6-invariant-8 apply warning fires **only** when
-    /// a security-driven predicate's scope does not exclude
-    /// `IngestSource(Direct)`. Both keys are this classification, so it
-    /// lives in the domain (pure) even though the gate and the warning
-    /// themselves live in the app/apply layers.
+    /// The scan-freshness gate skips artifacts whose most recent
+    /// `ScanCompleted` is stale **only** for security-driven predicates;
+    /// the apply warning fires **only** when a security-driven
+    /// predicate's scope does not exclude `IngestSource(Direct)`. Both
+    /// keys are this classification, so it lives in the domain (pure)
+    /// even though the gate and the warning themselves live in the
+    /// app/apply layers.
     pub fn is_security_driven(&self) -> bool {
         match self {
             Self::HasFindingAboveSeverity(_)

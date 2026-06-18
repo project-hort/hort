@@ -187,10 +187,10 @@ impl WheelMetadataBackfillHandler {
     ///   insert) failure. Counts as `errors` at the call site; the
     ///   batch continues with the next artifact.
     ///
-    /// This is the same shape as Item 3's ingest hook, factored as a
+    /// This is the same shape as the ingest hook, factored as a
     /// per-artifact method so the batch loop reads as a flat
     /// match-on-result. The two call sites share no code today —
-    /// Item 3's hook is wrapped in `InnerIngestError` and lives inside
+    /// the ingest hook is wrapped in `InnerIngestError` and lives inside
     /// the ingest transaction boundary; this handler returns plain
     /// `DomainError` and runs outside any transaction. Per the
     /// architect's no-3+-similar-blocks rule, two structurally
@@ -213,8 +213,8 @@ impl WheelMetadataBackfillHandler {
             .map_err(|e| DomainError::Invariant(format!("CAS re-read failed: {e}")))?;
 
         // Synthesise the minimum `ArtifactCoords` the trait method
-        // needs. The PyPI override (Item 2) reads `coords.path` to
-        // gate on the `.whl` suffix and the rest from `coords.format`
+        // needs. The PyPI format handler reads `coords.path` to gate
+        // on the `.whl` suffix and the rest from `coords.format`
         // — the candidacy SQL already filters to `.whl`, but we
         // populate the field anyway so the handler's gate fires
         // positive for sanity, not negative for a missing `.whl`.
@@ -259,7 +259,7 @@ impl WheelMetadataBackfillHandler {
             Ok(None) => {
                 // Non-wheel ZIP, missing METADATA member, sdist that
                 // somehow slipped past the candidacy SQL — all silent
-                // no-op per Item 2 / 3 contract. The SQL guards
+                // no-op by design. The SQL guards
                 // against sdists (`path LIKE '%.whl'`); a wheel that
                 // legitimately has no METADATA member is corrupt and
                 // we count it.
@@ -267,9 +267,9 @@ impl WheelMetadataBackfillHandler {
             }
             Err(DomainError::Validation(reason)) => {
                 // Oversized METADATA (the only production path
-                // surfacing `Err(Validation)` today). Item 3's ingest
-                // hook treats this as non-fatal; the backfill mirrors
-                // that posture — the wheel ingest succeeded, the PEP
+                // surfacing `Err(Validation)` today). The ingest hook
+                // treats this as non-fatal; the backfill mirrors that
+                // posture — the wheel ingest succeeded, the PEP
                 // 658 advertisement just stays unavailable for this
                 // wheel (pip's fallback applies, correct but slower).
                 tracing::debug!(
@@ -733,7 +733,7 @@ mod tests {
                 assert_eq!(
                     result_summary["skipped_no_metadata"], 1,
                     "Err(Validation) counts as `skipped_no_metadata`, NOT `errors` — \
-                     mirrors Item 3's hook posture"
+                     mirrors the ingest hook posture"
                 );
                 assert_eq!(result_summary["errors"], 0);
             }

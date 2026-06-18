@@ -8,13 +8,14 @@
 //! - `run_scan` — happy path (single + multi backend), no-backends
 //!   skip, advisory failure, single-backend failure (continue),
 //!   all-backend failure. (Blob-size cap is enforced by the consumer
-//!   per F4; coverage lives in `quarantine_use_case::tests`.)
+//!   blob-size cap is enforced by the consumer; coverage lives in
+//!   `quarantine_use_case::tests`.)
 //! - `record_outcome` — SkippedNoBackends, Completed first-ever scan,
 //!   Completed with prior clean, Completed with prior partial overlap,
 //!   Completed with identical findings, Failed before max attempts,
 //!   Failed at max attempts.
 //! - Path B regression: a Completed outcome with a prior produces TWO
-//!   separate event-store appends until Item 12 folds them.
+//!   separate event-store appends before the fold was introduced.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -652,7 +653,7 @@ async fn run_scan_completed_with_single_backend_returns_findings_without_writing
     assert_eq!(
         storage.put_call_count(),
         0,
-        "F4: run_scan must not write to CAS; the consumer owns the CAS write"
+        "run_scan must not write to CAS; the consumer owns the CAS write"
     );
 }
 
@@ -1293,9 +1294,9 @@ async fn record_outcome_failed_at_max_attempts_marks_failed_terminally() {
 
 /// The retry-exhausted Failed arm transitions a `Quarantined` artifact
 /// to `ScanIndeterminate` (fail-closed) AND still marks the job failed.
-/// Ordering (spec §6): the artifact transition lands before
-/// `mark_failed` so a crash between them leaves the job retryable
-/// rather than the artifact silently un-failed.
+/// The artifact transition lands before `mark_failed` so a crash
+/// between them leaves the job retryable rather than the artifact
+/// silently un-failed.
 #[tokio::test]
 async fn record_outcome_failed_at_max_attempts_transitions_artifact_scan_indeterminate() {
     let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
@@ -1344,7 +1345,7 @@ async fn record_outcome_failed_permissive_none_hard_blocks() {
 }
 
 /// Below max attempts: the Failed arm still reschedules (no artifact
-/// transition) — F-6 only fires on retry *exhaustion*.
+/// transition) — fail-closed only fires on retry *exhaustion*.
 #[tokio::test]
 async fn record_outcome_failed_below_max_does_not_transition_artifact() {
     let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
@@ -1583,7 +1584,7 @@ async fn scanner_label_for_failed_policy_list_error_yields_none_sentinel() {
     let label = scan_indeterminate_scanner_label(&lifecycle);
     assert_eq!(
         label, "(none)",
-        "policy list_active error must degrade to '(none)' sentinel (spec §2.2)"
+        "policy list_active error must degrade to '(none)' sentinel"
     );
 }
 
@@ -1614,11 +1615,9 @@ async fn scanner_label_for_failed_non_empty_backends_yields_joined_label() {
 }
 
 // ===========================================================================
-// Path A regression — ScanCompleted and
-// ArtifactBecameVulnerable land in a SINGLE atomic batch via
-// `commit_scan_result`. The previous Path B regression test
-// (`record_outcome_path_b_separate_batches_until_item_12`) was a
-// migration marker for this exact gap and is gone.
+// Regression: ScanCompleted and ArtifactBecameVulnerable now land
+// in a SINGLE atomic batch via `commit_scan_result`. The previous
+// separate-batch path was a migration marker and has been removed.
 // ===========================================================================
 
 #[tokio::test]
@@ -1686,7 +1685,7 @@ async fn record_outcome_path_a_single_batch_after_item_12() {
 }
 
 // ===========================================================================
-// F1 — `coords_for_artifact` must carry `ArtifactMetadata.metadata` so
+// `coords_for_artifact` must carry `ArtifactMetadata.metadata` so
 // Tier-A handlers (npm/PyPI/Cargo) can produce a non-empty SBOM. The
 // previous implementation hard-coded `Value::Null`, which made every
 // SBOM-driven scanner (OSV-scanner, the OSV `AdvisoryPort` query)
@@ -1696,12 +1695,14 @@ async fn record_outcome_path_a_single_batch_after_item_12() {
 // ===========================================================================
 
 /// Test double that mirrors `NpmFormatHandler::extract_sbom`'s shape
-/// just enough to drive F1: it reads `format_metadata.get("dependencies")`
-/// and emits a `pkg:npm/<name>@<ver>` component per entry.
+/// just enough to exercise metadata propagation: it reads
+/// `format_metadata.get("dependencies")` and emits a
+/// `pkg:npm/<name>@<ver>` component per entry.
 ///
 /// Lives here (not in `test_support.rs`) because it's only used by the
-/// F1 regression tests and the canonical impl in `hort-formats::npm` is
-/// unavailable to `hort-app` (no dep — that's the layering boundary).
+/// metadata-propagation regression tests and the canonical impl in
+/// `hort-formats::npm` is unavailable to `hort-app` (no dep — that's
+/// the layering boundary).
 struct NpmShapedSbomHandler;
 
 impl FormatHandler for NpmShapedSbomHandler {
@@ -1709,7 +1710,7 @@ impl FormatHandler for NpmShapedSbomHandler {
         "npm"
     }
     fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
-        unimplemented!("not needed for F1 tests")
+        unimplemented!("not needed for these tests")
     }
     fn normalize_name(&self, name: &str) -> String {
         name.to_string()
@@ -1721,9 +1722,9 @@ impl FormatHandler for NpmShapedSbomHandler {
         _payload: PayloadAccess<'_>,
     ) -> DomainResult<Option<Sbom>> {
         // Mirror the early-return invariant: a non-object payload
-        // produces an empty SBOM (NOT `None`). With the F1 bug present,
-        // `format_metadata` is `Value::Null` → the early return fires
-        // and every advisory query receives `&[]`.
+        // produces an empty SBOM (NOT `None`). When the bug was present,
+        // `format_metadata` was `Value::Null` → the early return fired
+        // and every advisory query received `&[]`.
         let Some(obj) = format_metadata.as_object() else {
             return Ok(Some(Sbom {
                 subject: None,
@@ -1758,7 +1759,7 @@ impl FormatHandler for NpmShapedSbomHandler {
 }
 
 /// Recording advisory that captures the `components` slice it last
-/// received from the orchestrator's pre-scan enrichment call. Lets F1
+/// received from the orchestrator's pre-scan enrichment call. Lets
 /// tests assert that `AdvisoryPort::query` was invoked with a
 /// non-empty SBOM — the observable failure mode of the bug is that
 /// the slice is always empty because the handler upstream returns
@@ -1824,7 +1825,7 @@ fn seed_npm_artifact_with_metadata(
 
 #[tokio::test]
 async fn try_extract_sbom_returns_non_empty_sbom_for_npm_metadata() {
-    // F1 regression. With `coords_for_artifact` hardcoded to
+    // Regression guard. With `coords_for_artifact` hardcoded to
     // `Value::Null`, the npm-shaped handler hits its early return
     // and the SBOM has zero components. With the fix, the metadata
     // row's `metadata` JSON flows through to the handler and we get
@@ -1856,7 +1857,7 @@ async fn try_extract_sbom_returns_non_empty_sbom_for_npm_metadata() {
         .expect("AdvisoryPort::query must have been invoked");
     assert!(
         !captured.is_empty(),
-        "F1 fix: metadata flows into format handler, SBOM must be non-empty; \
+        "metadata flows into format handler, SBOM must be non-empty; \
          got {} components",
         captured.len()
     );
@@ -1891,7 +1892,7 @@ async fn coords_for_artifact_uses_value_null_when_metadata_row_absent() {
 
 #[tokio::test]
 async fn coords_for_artifact_propagates_metadata_when_present() {
-    // F1: the metadata row's JSON must show up verbatim on
+    // The metadata row's JSON must show up verbatim on
     // `coords.metadata`. This is the load-bearing assertion the
     // `try_extract_sbom_*_npm_metadata` test hangs on; pin it
     // here too so a future regression hits this small-blast-radius
@@ -1914,15 +1915,15 @@ async fn coords_for_artifact_propagates_metadata_when_present() {
     let coords = uc.coords_for_artifact(&artifact).await.expect("coords");
     assert_eq!(
         coords.metadata, payload,
-        "F1: coords.metadata must equal the seeded ArtifactMetadata.metadata"
+        "coords.metadata must equal the seeded ArtifactMetadata.metadata"
     );
 }
 
 #[tokio::test]
 async fn run_scan_with_real_metadata_calls_advisory_with_non_empty_components() {
-    // Integration-level F1 fix: a full `run_scan` with real metadata
-    // results in `AdvisoryPort::query(&components)` being invoked
-    // with a non-empty slice. Pre-fix this slice is always empty
+    // Integration-level: a full `run_scan` with real metadata results
+    // in `AdvisoryPort::query(&components)` being invoked with a
+    // non-empty slice. Before the fix this slice was always empty
     // because the npm handler's early-return on `Value::Null`
     // produces `Sbom { subject: None, components: vec![] }`.
     let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
@@ -2579,9 +2580,9 @@ mod metrics_emission_tests {
     // hort_scan_record_outcome_failures_total{result=report_too_large}
     // ---------------------------------------------------------------
 
-    /// F-40 — when a scanner backend fails with the distinguishable
-    /// "report exceeded cap" error (the adapter killed the child after
-    /// the bounded drain tripped `HORT_SCANNER_MAX_REPORT_SIZE`),
+    /// When a scanner backend fails with the distinguishable "report
+    /// exceeded cap" error (the adapter killed the child after the
+    /// bounded drain tripped `HORT_SCANNER_MAX_REPORT_SIZE`),
     /// `run_scan` attributes
     /// `hort_scan_record_outcome_failures_total{result="report_too_large",
     /// scanner=<backend>}`. A non-cap backend error does NOT emit it.
@@ -2715,10 +2716,10 @@ mod metrics_emission_tests {
 
         let config = ScanOrchestrationConfig::defaults_for_worker("test-worker");
         let artifact_metadata = Arc::new(MockArtifactMetadataRepository::new());
-        // F4 — `storage` is no longer threaded through the orchestrator;
+        // `storage` is no longer threaded through the orchestrator;
         // the consumer (`QuarantineUseCase`) owns the CAS write site.
         let _ = storage;
-        // H3 — `events` is no longer held by the orchestrator either;
+        // `events` is no longer held by the orchestrator either;
         // the consumer owns the event-store reads.
         let _ = events;
         ScanOrchestrationUseCase::new(

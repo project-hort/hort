@@ -356,7 +356,7 @@ async fn run_device_flow_with_client(
 
     // Step 5 -- poll the token endpoint.
     let mut interval_secs = auth_resp.interval.unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
-    // Edge case 1 -- honour the IdP's expires_in, capped at the 15-minute
+    // Edge case: honour the IdP's expires_in, capped at the 15-minute
     // defensive ceiling so a misbehaving IdP can't extend the session forever.
     let expires_in = auth_resp
         .expires_in
@@ -399,7 +399,7 @@ async fn run_device_flow_with_client(
         let resp = match poll_result {
             Ok(r) => r,
             Err(e) => {
-                // Edge case 10 -- single network failure retries on next interval.
+                // Edge case: single network failure retries on next interval.
                 tracing::debug!(result_class = "network_error", error = %e, "poll network error, will retry");
                 continue;
             }
@@ -466,8 +466,8 @@ async fn run_device_flow_with_client(
 /// Validate the best available verification URL from the device auth response.
 ///
 /// Preference: `verification_uri_complete` first (pre-filled code); fall back
-/// to `verification_uri`. Per design §9 edge case 4: if `_complete` fails
-/// validation but `verification_uri` is safe, use `verification_uri`
+/// to `verification_uri`. If `_complete` fails validation but `verification_uri`
+/// is safe, use `verification_uri`
 /// (the user must type the code). If both fail, propagate the `_complete`
 /// error. If only `verification_uri` is available and it fails, propagate
 /// that error.

@@ -562,8 +562,8 @@ impl PromotionUseCase {
     /// `None` to the evaluator and `DefaultPolicy::block_on_critical`
     /// supplies the threshold. Mirrors
     /// [`QuarantineUseCase::resolve_active_policy_for_repo`](crate::use_cases::quarantine_use_case::QuarantineUseCase)
-    /// — the design doc §4 single source of truth becomes a shared
-    /// helper module in a future cleanup if a third caller appears.
+    /// — the two implementations share the same resolution logic and
+    /// should be extracted into a shared helper if a third caller appears.
     async fn resolve_active_policy_for_repo(
         &self,
         repo_id: Uuid,

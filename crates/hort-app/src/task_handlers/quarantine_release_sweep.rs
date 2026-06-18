@@ -174,10 +174,10 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
             };
 
             let released_count = released.len();
-            // `release_expired` returns a strict subset (F-6 fail-
-            // closed): a candidate without `ScanSucceeded`/`ScanWaived`
-            // authority is skipped, not released. The delta IS the
-            // F-6 deny-by-default observability signal.
+            // `release_expired` returns a strict subset (fail-closed): a
+            // candidate without `ScanSucceeded`/`ScanWaived` authority is
+            // skipped, not released. The delta is the deny-by-default
+            // observability signal.
             let skipped_no_authority = candidate_count.saturating_sub(released_count);
 
             tracing::info!(
@@ -303,12 +303,12 @@ mod tests {
     // ---------- mock QuarantineReleasePort -------------------------------
 
     /// Releaser mock. `released_subset` controls which ids the port
-    /// claims it released (F-6: returns a strict subset of input). An
+    /// claims it released (returns a strict subset of input). An
     /// `Internal` failure simulates a non-domain crash (the handler
     /// must surface this as `TaskOutcome::Failed { retry: true }`).
     struct MockReleaser {
         /// Ids the mock pretends to release. Anything in the input not
-        /// in this set is "skipped — no authority" (the F-6 path).
+        /// in this set is "skipped — no authority".
         released_subset: Mutex<Vec<Uuid>>,
         err: Mutex<Option<DomainError>>,
         last_input: Mutex<Vec<Uuid>>,
@@ -357,9 +357,9 @@ mod tests {
                 return Box::pin(async move { Err(err) });
             }
             let subset = self.released_subset.lock().unwrap().clone();
-            // Convention: empty subset means "release nothing" (F-6
-            // fail-closed path); otherwise the mock returns the ids
-            // that ALSO appear in the input (intersection).
+            // Convention: empty subset means "release nothing" (fail-closed
+            // path); otherwise the mock returns the ids that ALSO appear in
+            // the input (intersection).
             let result: Vec<Uuid> = if subset.is_empty() {
                 Vec::new()
             } else {
@@ -468,19 +468,17 @@ mod tests {
     }
 
     // =====================================================================
-    // F-6 fail-closed regression (Item 1b acceptance — MANDATORY)
+    // Fail-closed regression (MANDATORY)
     //
-    // Backlog item text: "An F-6 regression test: the sweep does NOT
-    // release a `Quarantined` artifact with no `ScanCompleted` (no
-    // `ScanSucceeded`/`ScanWaived` authority)."
+    // The sweep does NOT release a `Quarantined` artifact with no
+    // `ScanCompleted` (no `ScanSucceeded`/`ScanWaived` authority).
     //
     // The mock releaser models `QuarantineUseCase::release_expired`'s
     // fail-closed behaviour: when no authority is constructible per
     // artifact, the id is dropped from the returned `Vec` (NEVER
     // released). The handler's job is to honour that subset — it must
     // NOT auto-release based on candidacy alone, and the skipped count
-    // MUST appear in the result_summary as the F-6 deny-by-default
-    // signal.
+    // MUST appear in the result_summary as the deny-by-default signal.
     // =====================================================================
 
     #[tokio::test]
@@ -489,7 +487,7 @@ mod tests {
         let c2 = make_candidate();
         let candidates = Arc::new(MockCandidates::new(vec![c1.clone(), c2.clone()]));
         // Releaser returns the empty set: every candidate fails the
-        // F-6 authority check (no ScanCompleted, no scan_backends:[]).
+        // authority check (no ScanCompleted, no scan_backends:[]).
         let releaser = Arc::new(MockReleaser::releases_none());
 
         let releaser_for_assert = releaser.clone();
@@ -505,11 +503,11 @@ mod tests {
                 assert_eq!(result_summary["candidates"], 2);
                 assert_eq!(
                     result_summary["released"], 0,
-                    "F-6 fail-closed: NOTHING released when no authority is constructible",
+                    "fail-closed: NOTHING released when no authority is constructible",
                 );
                 assert_eq!(
                     result_summary["skipped_no_authority"], 2,
-                    "F-6 fail-closed: skipped-no-authority MUST equal candidates when none release",
+                    "fail-closed: skipped-no-authority MUST equal candidates when none release",
                 );
             }
             other => panic!("expected Completed, got {other:?}"),
@@ -517,12 +515,12 @@ mod tests {
         // The handler still HANDED the candidates to release_expired
         // — the authority check belongs there, not in the handler.
         // (The handler is a thin orchestration step; defending against
-        // a never-passes-to-use-case skip would silently break the F-6
-        // contract — the use case is the single source of truth.)
+        // a never-passes-to-use-case skip would silently break the
+        // fail-closed contract — the use case is the single source of truth.)
         assert_eq!(
             releaser_for_assert.last_input(),
             vec![c1.artifact_id, c2.artifact_id],
-            "handler must hand all candidates to release_expired; F-6 gate \
+            "handler must hand all candidates to release_expired; the gate \
              is inside release_expired, not in the handler",
         );
     }

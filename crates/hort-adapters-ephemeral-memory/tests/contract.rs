@@ -28,8 +28,7 @@ fn store() -> Arc<dyn EphemeralStore> {
         Arc::new(InMemoryEphemeralStore::new()),
         // TODO: replace with proper class assignment in composition rewire.
         // Contract tests do not care about the class label (they exercise the port
-        // semantics, not metric emission); `Durable` is the design-doc-recommended
-        // safer default (§4.2).
+        // semantics, not metric emission); `Durable` is the safer default.
         EphemeralKeyspaceClass::Durable,
     ))
 }

@@ -9,7 +9,7 @@
 //! (`hort_http_core::handlers::metrics::render_metrics`).
 //! See `docs/metrics-catalog.md` for the full metric catalog.
 //!
-//! # Security posture (design §3.6 / M1)
+//! # Security posture
 //!
 //! The endpoint reveals `repository` label values (repo names) and traffic
 //! shape — the same reconnaissance surface the server's admin `/metrics`
@@ -20,8 +20,8 @@
 //! set a pod-network address for a cluster Prometheus and restrict it with a
 //! NetworkPolicy. Unlike the server's admin `/metrics`, there is **no
 //! per-request auth** — the worker has no inbound-HTTP auth stack to reuse, so
-//! the network is the control (a declared deviation from design M1; see the
-//! `metrics_bind_addr` field doc). No new auth-catalog entry is introduced.
+//! the network is the control (see the `metrics_bind_addr` field doc). No new
+//! auth-catalog entry is introduced.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ pub fn router(handle: Arc<PrometheusHandle>) -> Router {
 /// best-effort observability, not a hard dependency of job dispatch).
 ///
 /// Boot `info!` "worker metrics listener bound on …" is emitted by the
-/// caller (composition / main) once the listener is bound, per design §6.
+/// caller (composition / main) once the listener is bound.
 pub async fn serve(
     addr: SocketAddr,
     handle: Arc<PrometheusHandle>,
@@ -90,16 +90,15 @@ mod tests {
     use tower::ServiceExt;
 
     /// Emit a worker metric against a local recorder, then scrape the
-    /// listener's router → the series is present in the rendered body. This
-    /// is the H15 acceptance: a worker metric is no longer write-only.
+    /// listener's router → the series is present in the rendered body.
+    /// A worker metric is no longer write-only.
     #[test]
     fn metrics_route_renders_emitted_series() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = Arc::new(recorder.handle());
 
         let body_text = metrics::with_local_recorder(&recorder, || {
-            // Emit a provenance verdict counter — the exact series H15
-            // makes observable.
+            // Emit a provenance verdict counter.
             hort_app::metrics::emit_provenance_verify(
                 "cosign",
                 hort_domain::entities::scan_policy::ProvenanceMode::VerifyIfPresent,

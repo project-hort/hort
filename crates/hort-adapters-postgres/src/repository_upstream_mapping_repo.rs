@@ -2,9 +2,9 @@
 //!
 //! Backed by `repository_upstream_mappings` (`007_upstream_mappings.sql`). The
 //! adapter is a thin CRUD wrapper — the longest-prefix-match
-//! resolution lives in [`hort_domain::ports::upstream_resolver`] (Item
-//! 9), not here. This adapter's job is to keep the on-disk shape of
-//! the table in sync with the domain port's contract.
+//! resolution lives in [`hort_domain::ports::upstream_resolver`], not
+//! here. This adapter's job is to keep the on-disk shape of the table
+//! in sync with the domain port's contract.
 //!
 //! # Auth-variant encoding
 //!
@@ -18,16 +18,14 @@
 //! | `Basic { username }` | `"basic"` (plus `secret_ref`) |
 //!
 //! `Basic.username` lives in a JSONB-shaped sidecar on the row?
-//! Currently NO — the schema does not carry a username column;
-//! the resolver/proxy items defer this
-//! decision. For now we read/write `username = ""` for `Basic`
-//! variants; a follow-up item adds the column when Item 10 wires
-//! actual username-bearing mappings. That keeps Item 8's surface
-//! correct without forcing schema churn before Item 10's design
-//! lands.
+//! Currently NO — the schema does not carry a username column.
+//! For now we read/write `username = ""` for `Basic` variants; a
+//! follow-up change adds the column when actual username-bearing
+//! mappings are wired. That keeps the surface correct without forcing
+//! schema churn before that design lands.
 //!
 //! Carried-forward — `UpstreamAuth::Basic` username schema gap: schema
-//! extension owed to a future initiative; the empty-string fallback is
+//! extension owed to a future change; the empty-string fallback is
 //! intentional until then.
 //!
 //! Unknown DB strings surface as [`DomainError::Invariant`] — the
@@ -93,12 +91,12 @@ fn auth_from_db(db: &str) -> DomainResult<UpstreamAuth> {
         AUTH_ANONYMOUS => Ok(UpstreamAuth::Anonymous),
         AUTH_BEARER_CHALLENGE => Ok(UpstreamAuth::BearerChallenge),
         // The username column is not yet on the schema — see module
-        // docs. Decode `Basic` with an empty username; Item 10 backs
-        // out this constraint when it adds the column.
+        // docs. Decode `Basic` with an empty username; a future change
+        // adds the column.
         //
         // Carried-forward — `UpstreamAuth::Basic` username schema gap:
-        // schema extension owed to a future initiative; the
-        // empty-string fallback is intentional until then.
+        // schema extension owed to a future change; the empty-string
+        // fallback is intentional until then.
         AUTH_BASIC => Ok(UpstreamAuth::Basic {
             username: String::new(),
         }),
@@ -599,7 +597,7 @@ mod tests {
     fn auth_codec_round_trips_basic_with_empty_username() {
         // Schema doesn't yet carry a username column — see module
         // docs. The decoded variant has an empty username; callers
-        // that rely on the username land in Item 10's territory.
+        // that rely on the username must wait for a future schema change.
         let s = auth_to_db(&UpstreamAuth::Basic {
             username: "alice".into(),
         });

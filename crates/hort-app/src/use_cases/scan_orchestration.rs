@@ -73,7 +73,7 @@ fn is_report_too_large_error(err: &DomainError) -> bool {
 }
 
 /// Default cap on the number of attempts before a job is moved to the
-/// terminal `failed` status. Mirrors `HORT_SCANNER_MAX_ATTEMPTS` (§6).
+/// terminal `failed` status. Mirrors `HORT_SCANNER_MAX_ATTEMPTS`.
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 // ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 // ---------------------------------------------------------------------------
 
 /// Composition-root configuration for the orchestrator. Built from
-/// `WorkerConfig::from_env` (§6) at boot time.
+/// `WorkerConfig::from_env` at boot time.
 ///
 /// Backend selection lives on
 /// the resolved `ScanPolicyProjection.scan_backends`, not on this
@@ -339,8 +339,8 @@ impl ScanOrchestrationUseCase {
         for backend in &backends {
             total_attempted += 1;
             let Some(scanner) = self.scanners.get(backend) else {
-                // Apply-time validation should have caught this
-                // (Item 16). Defensive at runtime.
+                // Apply-time validation should have caught this.
+                // Defensive at runtime.
                 tracing::warn!(
                     artifact_id = %artifact.id,
                     backend,
@@ -518,10 +518,9 @@ impl ScanOrchestrationUseCase {
             }
             ScanRunOutcome::Failed(err) => {
                 if job.attempts >= self.config.max_attempts {
-                    // Spec §13 R1 / design §4 — a dead scanner is a real
-                    // operational error operators should alert on; keep
-                    // the `error!`. The separate `info!` security-
-                    // transition line is emitted by
+                    // A dead scanner is a real operational error operators
+                    // should alert on; keep the `error!`. The separate
+                    // `info!` security-transition line is emitted by
                     // `QuarantineUseCase::record_scan_indeterminate`.
                     tracing::error!(
                         artifact_id = %job.artifact_id,
@@ -632,10 +631,9 @@ impl ScanOrchestrationUseCase {
     /// carried on `ScanRunOutcome::Failed` (it only holds the last
     /// error string), so resolve them from the artifact's policy chain
     /// the same way `run_scan` does. Any failure to resolve degrades to
-    /// the `"(none)"` sentinel (spec §2.2: "may be `(none)` if backend
-    /// resolution itself failed") — the label is audit-only, never an
-    /// invariant, so a degraded label must not abort the fail-closed
-    /// transition.
+    /// the `"(none)"` sentinel when backend resolution itself fails —
+    /// the label is audit-only, never an invariant, so a degraded label
+    /// must not abort the fail-closed transition.
     async fn scanner_label_for_failed(&self, job: &ScanJob) -> String {
         let repo_id = match self.artifacts.find_by_id(job.artifact_id).await {
             Ok(a) => a.repository_id,

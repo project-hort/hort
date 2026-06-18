@@ -7,8 +7,8 @@
 //! (leaked CI/k8s projected token, mTLS-terminating-proxy log) can be
 //! replayed to mint a fresh bearer on *every* call for the JWT's full
 //! validity window. The token-mint surface is **public by requirement**
-//! (audit T6 tier ii) — there is no network tier to fall back on, so
-//! the seen-set is a hard ship gate, not defense-in-depth.
+//! — there is no network tier to fall back on, so the seen-set is a
+//! hard ship gate, not defense-in-depth.
 //!
 //! This port is the standard RFC 8693 / OIDC token-exchange anti-replay
 //! control: before any token is minted, the token-exchange use case
@@ -46,8 +46,7 @@ use super::BoxFuture;
 
 /// The replay-claim key. The federation use case constructs exactly one
 /// of these per exchange attempt; the variant is chosen by the resolved
-/// `OidcIssuer.require_jti` flag + JWT `jti` presence (§5 behaviour
-/// matrix):
+/// `OidcIssuer.require_jti` flag + JWT `jti` presence:
 ///
 /// | `jti` present? | `require_jti` | key |
 /// |---|---|---|
@@ -89,7 +88,7 @@ impl ReplayKey {
     /// The `key_kind` discriminator written to / matched against the
     /// `jwt_replay_seen.key_kind` column. One value per variant; the
     /// PK includes it so a `jti` value can never collide with a
-    /// composite digest (§3 PK semantics).
+    /// composite digest.
     pub fn key_kind(&self) -> &'static str {
         match self {
             Self::Jti { .. } => "jti",
@@ -100,7 +99,7 @@ impl ReplayKey {
     /// The resolved `OidcIssuer.name` this key is scoped to (the
     /// `ValidatedClaims.issuer_name`, NOT the raw `iss` URL). Both
     /// variants carry it; it is the first PK column so the seen-set is
-    /// namespaced per trusted issuer exactly as §2.3 keys it.
+    /// namespaced per trusted issuer.
     pub fn issuer_name(&self) -> &str {
         match self {
             Self::Jti { issuer_name, .. } | Self::Composite { issuer_name, .. } => issuer_name,
@@ -128,7 +127,7 @@ impl ReplayKey {
                 use sha2::{Digest, Sha256};
                 let pre_image = format!("{iss}{US}{sub}{US}{iat}{US}{exp}");
                 let digest = Sha256::digest(pre_image.as_bytes());
-                // lowercase hex, matches the §3 schema note.
+                // lowercase hex, matches the schema note.
                 let mut out = String::with_capacity(64);
                 for byte in digest {
                     use std::fmt::Write as _;
@@ -140,10 +139,10 @@ impl ReplayKey {
     }
 
     /// Metric-label value for the `result` label of
-    /// `hort_jwt_replay_rejected_total` (§8) when [`ReplayClaim::Replayed`]
+    /// `hort_jwt_replay_rejected_total` when [`ReplayClaim::Replayed`]
     /// is returned for this key. `Jti` → `replayed_jti`, `Composite` →
     /// `replayed_composite`. The string is part of the public metrics +
-    /// deny-log contract (§7) — normative.
+    /// deny-log contract — normative.
     pub fn replay_result_label(&self) -> &'static str {
         match self {
             Self::Jti { .. } => "replayed_jti",
@@ -174,8 +173,8 @@ pub enum ReplayClaim {
 ///
 /// Distinct from [`ReplayClaim::Replayed`] — `Replayed` is an
 /// authorization fact, `Unavailable` is an outage. The use case maps
-/// `Unavailable` to a **fail-CLOSED** deny (§4): a replay guard that
-/// cannot answer must not let a possibly-replayed token mint. There is
+/// `Unavailable` to a **fail-CLOSED** deny: a replay guard that cannot
+/// answer must not let a possibly-replayed token mint. There is
 /// deliberately no `Ok`-with-unknown variant — the type forces the
 /// caller to handle the outage explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,8 +199,7 @@ pub enum ReplayGuardError {
 /// arbitrates the race.
 pub trait ReplayGuardPort: Send + Sync {
     /// Atomically claim `key` with the given `expires_at` (the row's
-    /// TTL horizon, already computed = `min(jwt_remaining, fed_max)`,
-    /// §3/§4).
+    /// TTL horizon, already computed = `min(jwt_remaining, fed_max)`).
     ///
     /// Returns [`ReplayClaim::FirstSeen`] iff this exact key was not
     /// present (and is now recorded), [`ReplayClaim::Replayed`] iff it
@@ -272,7 +270,7 @@ mod tests {
 
     #[test]
     fn key_id_jti_is_the_jti_verbatim() {
-        // §3: for jti rows key_id is the jti itself (already opaque).
+        // For jti rows key_id is the jti itself (already opaque).
         assert_eq!(jti_key().key_id(), "jti-abc-123");
     }
 

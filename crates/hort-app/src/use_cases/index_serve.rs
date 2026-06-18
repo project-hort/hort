@@ -43,7 +43,7 @@ use hort_domain::types::ContentHash;
 pub use crate::use_cases::index_serve_filter::VersionOrdering;
 
 /// One version's worth of data feeding the index-construction
-/// pipeline (design doc §2.2).
+/// pipeline.
 ///
 /// The spine — `version` + `status` — is what every filter operates
 /// on; the per-format `payload` is opaque to filters and consumed
@@ -72,38 +72,30 @@ pub struct VersionEntry {
     /// format-specific wire shape (npm `dist.tarball` / SRI /
     /// shasum, PyPI `files[]` row, Cargo NDJSON line, …).
     ///
-    /// Deliberately a closed sum type; variants land in Items 2/3/4
-    /// alongside each per-format builder. See [`PerVersionPayload`].
+    /// Deliberately a closed sum type; variants are added alongside each
+    /// per-format builder. See [`PerVersionPayload`].
     pub payload: PerVersionPayload,
 }
 
-/// Per-format payload — design doc §2.2.
-///
-/// **Item 1 shipped this as an empty enum**; **Item 2 (npm reference
-/// implementation)** adds the first concrete variant
-/// [`PerVersionPayload::Npm`]. Items 3/4 extend the sum with
-/// `Pypi(PypiVersionPayload)` and `Cargo(CargoVersionPayload)` when
-/// their respective per-format migrations land.
+/// Per-format payload.
 ///
 /// A closed sum type was chosen over `Box<dyn Payload>`: each builder
 /// needs concrete access to *its* variant's fields, and type-erasure
 /// would force every builder to downcast, defeating the type-system
 /// guarantee that a `NpmIndexBuilder` only ever sees
-/// `PerVersionPayload::Npm`. See design §2.2 "PerVersionPayload is a
-/// deliberately closed sum type."
+/// `PerVersionPayload::Npm`. "PerVersionPayload is a deliberately closed
+/// sum type."
 ///
 /// # Dep-graph note
 ///
 /// Per-format payload structs live **here** (in `hort-app`) rather than
-/// in `hort-formats::<format>::index` as the design doc §2.6 sketched.
-/// Reason: `hort-app` does not depend on `hort-formats` (the dep edge
-/// runs `hort-formats → hort-app`); defining a variant whose data type
-/// lives in `hort-formats` would require the impossible reverse edge.
-/// `hort-formats::npm::index` re-exports [`NpmVersionPayload`] so format-
-/// crate consumers see the design-doc's stated import path
-/// (`use hort_formats::npm::index::NpmVersionPayload;`) and the data
-/// type stays in the dep-graph layer that actually compiles. Mirrors
-/// Item 1's identical resolution for the trait skeleton.
+/// in `hort-formats::<format>::index`. Reason: `hort-app` does not depend
+/// on `hort-formats` (the dep edge runs `hort-formats → hort-app`);
+/// defining a variant whose data type lives in `hort-formats` would
+/// require the impossible reverse edge. `hort-formats::npm::index`
+/// re-exports [`NpmVersionPayload`] so format-crate consumers see the
+/// expected import path (`use hort_formats::npm::index::NpmVersionPayload;`)
+/// and the data type stays in the dep-graph layer that actually compiles.
 #[derive(Debug, Clone)]
 pub enum PerVersionPayload {
     /// npm packument per-version data. Carried by
@@ -382,7 +374,7 @@ pub struct CargoVersionPayload {
     pub features2: Option<serde_json::Value>,
 }
 
-/// Format-agnostic filter — design doc §2.3.
+/// Format-agnostic filter.
 ///
 /// Operates on the [`VersionEntry`] spine only. Implementations live
 /// in [`crate::use_cases::index_filters`] (`NonServableStatusFilter`
@@ -403,15 +395,14 @@ pub trait IndexFilter: Send + Sync {
     fn apply(&self, entries: Vec<VersionEntry>) -> Vec<VersionEntry>;
 }
 
-/// Per-call context passed to [`IndexBuilder::build`] — design doc
-/// §2.3.
+/// Per-call context passed to [`IndexBuilder::build`].
 ///
 /// Carries the inputs the builder needs that are *not* part of the
 /// per-version entries: the package's display name (for wire-shape
 /// fields the builder embeds — npm `name`, PyPI page title), the
 /// base URL the builder uses to compose tarball / download links,
 /// the repository's [`IndexMode`] (some builders embed the mode in
-/// served-document metadata; reserved for Items 2/3/4), and the
+/// served-document metadata), and the
 /// per-format [`VersionOrdering`] (used by builders that need to
 /// pick "the newest served version" for `dist-tags.latest`-shaped
 /// fields).
@@ -438,14 +429,13 @@ pub struct BuildContext<'a> {
     pub ordering: &'a dyn VersionOrdering,
 }
 
-/// Per-format wire-shape emitter — design doc §2.3.
+/// Per-format wire-shape emitter.
 ///
 /// Stateless; one impl per emitted document shape. PyPI's HTML
-/// (PEP 503) vs JSON (PEP 691) split lands in Item 3 as two
-/// distinct [`IndexBuilder`] implementations
-/// (`PypiHtmlIndexBuilder` / `PypiJsonIndexBuilder`) selected by the
-/// handler based on the request's `Accept` header — the trait stays
-/// content-type-agnostic.
+/// (PEP 503) vs JSON (PEP 691) split uses two distinct [`IndexBuilder`]
+/// implementations (`PypiHtmlIndexBuilder` / `PypiJsonIndexBuilder`)
+/// selected by the handler based on the request's `Accept` header —
+/// the trait stays content-type-agnostic.
 ///
 /// Returns `bytes::Bytes` so the caller can hand the buffer
 /// directly to `axum::body::Body::from`; the workspace already pins
@@ -491,8 +481,8 @@ mod tests {
         // Smoke: a `Vec<VersionEntry>` materialises empty and threads
         // through generic containers. Real value construction is
         // exercised in the per-format builder tests (`hort-formats::npm::index`
-        // and the Items 3/4 counterparts) where the source-shaped
-        // fixtures actually carry an `NpmVersionPayload`.
+        // and counterpart builders) where the source-shaped fixtures
+        // actually carry an `NpmVersionPayload`.
         let entries: Vec<VersionEntry> = Vec::new();
         assert!(entries.is_empty());
     }
@@ -547,10 +537,10 @@ mod tests {
             // tests; the npm test explicitly only exercises the `Npm`
             // arm. A mis-construction would be a test-side bug.
             PerVersionPayload::Pypi(_) => {
-                unreachable!("Item 2 fixture must produce an Npm payload")
+                unreachable!("npm fixture must produce an Npm payload")
             }
             PerVersionPayload::Cargo(_) => {
-                unreachable!("Item 2 fixture must produce an Npm payload")
+                unreachable!("npm fixture must produce an Npm payload")
             }
         }
         // Smoke: `Clone` is on the struct (consumed by source
@@ -584,10 +574,10 @@ mod tests {
                 assert_eq!(p.files[0].requires_python.as_deref(), Some(">=3.7"));
             }
             PerVersionPayload::Npm(_) => {
-                unreachable!("Item 3 fixture must produce a Pypi payload")
+                unreachable!("pypi fixture must produce a Pypi payload")
             }
             PerVersionPayload::Cargo(_) => {
-                unreachable!("Item 3 fixture must produce a Pypi payload")
+                unreachable!("pypi fixture must produce a Pypi payload")
             }
         }
         let _ = payload.clone();
@@ -628,7 +618,7 @@ mod tests {
                 assert!(p.features2.is_none());
             }
             PerVersionPayload::Npm(_) | PerVersionPayload::Pypi(_) => {
-                unreachable!("Item 4 fixture must produce a Cargo payload")
+                unreachable!("cargo fixture must produce a Cargo payload")
             }
         }
         let _ = payload.clone();

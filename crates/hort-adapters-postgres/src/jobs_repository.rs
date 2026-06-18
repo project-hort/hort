@@ -1490,8 +1490,8 @@ mod tests {
             .await
             .expect("enqueue_task failed");
 
-        // Item 1: None idempotency_key path returns Enqueued with a
-        // fresh non-nil UUID.
+        // None idempotency_key path returns Enqueued with a fresh
+        // non-nil UUID.
         let job_id = match outcome {
             EnqueueOutcome::Enqueued { job_id } => job_id,
             other => panic!("expected Enqueued for None-key path, got {other:?}"),
@@ -1693,7 +1693,7 @@ mod tests {
 
     /// `record_run_completion` inserts a terminal `completed` row whose
     /// `completed_at` is then the value `last_completed_at_by_kind`
-    /// returns — the F-52 producer→consumer contract. Exercises the real
+    /// returns. Exercises the real
     /// INSERT against migration-009's `kind` + `status` + `trigger_source`
     /// CHECK constraints (the row would be rejected if any literal were
     /// invalid) plus the `MAX(completed_at)` read.

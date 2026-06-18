@@ -192,9 +192,9 @@ trust anchors to be loaded:
    value is empty, the chart did not render `HORT_EXTRA_CA_BUNDLE` —
    for Recipe A/A-Secret, check that an auto-mount source
    (`extraCaBundle.configMapName` or `extraCaBundle.secretName`) **and**
-   `extraCaBundle.path` are both set (Backlog 078 Item 7: the chart only
-   sets the env when it also mounts the bundle). For the manual Recipe B,
-   check your `extraEnv` / `worker.extraEnv` entry.
+   `extraCaBundle.path` are both set (the chart only sets the env when it
+   also mounts the bundle). For the manual Recipe B, check your
+   `extraEnv` / `worker.extraEnv` entry.
 2. **Confirm the file is mounted.** Run
    `kubectl exec <pod> -- ls -l /etc/hort-server/ca-bundle/ca.crt` (or
    whichever path your values reference). If `ls` returns
@@ -221,7 +221,7 @@ trust anchors to be loaded:
 
 ---
 
-## Recipe A-Secret — Secret-projected PEM bundle (Backlog 078 Item 7)
+## Recipe A-Secret — Secret-projected PEM bundle
 
 Identical to Recipe A, but the bundle lives in a Kubernetes **Secret**
 instead of a ConfigMap. Use this when the PEM is produced by
@@ -318,9 +318,9 @@ both the volume **and** the env, on **both** Deployments.
 
 Leave **both** `extraCaBundle.configMapName` and
 `extraCaBundle.secretName` unset, set `extraCaBundle.path` to record the
-mount path, and wire everything else yourself. Backlog 078 Item 7: with
-no auto-mount source the chart sets **no** `HORT_EXTRA_CA_BUNDLE` env and
-mounts nothing — you supply the env via `extraEnv` (server) and
+mount path, and wire everything else yourself. With no auto-mount source
+the chart sets **no** `HORT_EXTRA_CA_BUNDLE` env and mounts nothing —
+you supply the env via `extraEnv` (server) and
 `worker.extraEnv` (worker), and the volume via `extraVolumes` /
 `extraVolumeMounts` and the `worker.*` equivalents:
 

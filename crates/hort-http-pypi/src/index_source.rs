@@ -8,9 +8,8 @@
 //!
 //! - [`HostedPypiSource`] — reads hort's local artifact projection via
 //!   [`ArtifactUseCase::list_by_raw_name_visible`] (threading the
-//!   caller principal so F-25 anti-enumeration applies — denied / no-
-//!   rows / missing-repo all collapse to `NotFound` at the unified
-//!   handler).
+//!   caller principal so anti-enumeration applies — denied / no-rows /
+//!   missing-repo all collapse to `NotFound` at the unified handler).
 //! - [`ProxyPypiSource`] — reuses the existing
 //!   [`crate::simple_index::fetch_with_cache`] port — which drives
 //!   `UpstreamProxy::fetch_metadata` through the established cache +
@@ -110,12 +109,12 @@ pub(crate) struct IndexSourceOutput {
     pub canonical_name: String,
 }
 
-/// Per-format index source. Stays `pub(crate)` per design §2.3 —
+/// Per-format index source. Stays `pub(crate)` —
 /// sources are an implementation detail of the format HTTP crate.
 #[async_trait]
 pub(crate) trait IndexSource: Send + Sync {
     /// Produce per-version entries for `package_name` on `repo`.
-    /// `caller` is threaded for F-25 anti-enumeration (the hosted
+    /// `caller` is threaded for anti-enumeration (the hosted
     /// source's use-case call requires it).
     async fn fetch(
         &self,
@@ -133,8 +132,8 @@ pub(crate) trait IndexSource: Send + Sync {
 /// `IndexSource` impl for hosted / staging / virtual repos.
 ///
 /// Reads the local artifact projection via
-/// [`ArtifactUseCase::list_by_raw_name_visible`] (the F-25-anti-
-/// enumeration-enforcing entry point) and groups artifacts by their
+/// [`ArtifactUseCase::list_by_raw_name_visible`] (the anti-enumeration-
+/// enforcing entry point) and groups artifacts by their
 /// `version` field to produce one [`VersionEntry`] per version with
 /// `payload.Pypi.files` carrying one [`PypiVersionFile`] per artifact
 /// row in that version's group: each artifact row → one `<a>`.
@@ -157,10 +156,10 @@ impl IndexSource for HostedPypiSource {
         package_name: &str,
         caller: Option<&CallerPrincipal>,
     ) -> Result<IndexSourceOutput, AppError> {
-        // F-25 + drift fallback — `list_by_raw_name_visible` resolves
-        // visibility first (anonymous/denied/invisible-repo collapses
-        // to `NotFound { entity: "Repository" }`), then runs the
-        // drift-resilient raw-name listing.
+        // Anti-enumeration + drift fallback — `list_by_raw_name_visible`
+        // resolves visibility first (anonymous/denied/invisible-repo
+        // collapses to `NotFound { entity: "Repository" }`), then runs
+        // the drift-resilient raw-name listing.
         let handler = PyPiFormatHandler;
         let (resolved_repo, artifact_list) = ctx
             .artifact_use_case
@@ -197,7 +196,7 @@ impl IndexSource for HostedPypiSource {
         // Goes via `ContentReferenceUseCase` — `ctx.content_references`
         // is `pub(crate)` on AppContext, off-limits to format crates
         // (ADR 0008). The caller's `source_artifact_ids` are already
-        // F-25 authz'd via `list_by_raw_name_visible`.
+        // authz'd via `list_by_raw_name_visible`.
         let wheel_metadata_map = ctx
             .content_reference_use_case
             .find_by_sources_and_kind_for_repo(repo.id, &ids, "wheel_metadata")
@@ -323,10 +322,10 @@ impl IndexSource for ProxyPypiSource {
         package_name: &str,
         caller: Option<&CallerPrincipal>,
     ) -> Result<IndexSourceOutput, AppError> {
-        // F-25 thread-through. Re-resolve here defensively so the
-        // anti-enumeration invariant holds even if a future caller
-        // bypasses the dispatch hop. Mirrors `ProxyNpmSource`'s same
-        // defensive re-resolve.
+        // Anti-enumeration thread-through. Re-resolve here defensively
+        // so the invariant holds even if a future caller bypasses the
+        // dispatch hop. Mirrors `ProxyNpmSource`'s same defensive
+        // re-resolve.
         let _ = ctx
             .repository_access_use_case
             .resolve(
@@ -395,7 +394,7 @@ impl IndexSource for ProxyPypiSource {
                 // A per-file-object cap trip fails closed (nothing cached).
                 // Emit the `version_object_too_large` metric so the
                 // rejection is observable, then surface as `Validation`
-                // → 400 (parse-class, NOT the network bucket — B5).
+                // → 400 (parse-class, NOT the network bucket).
                 // Mirrors npm's typed `VersionObjectTooLarge` arm; the
                 // discrimination is the projector's typed `cap_trip_flag`,
                 // not a brittle `cause.contains("too large")` substring
@@ -412,7 +411,7 @@ impl IndexSource for ProxyPypiSource {
             }
             Err(IndexFetchError::MetadataMalformed { cause }) => {
                 // A malformed upstream body surfaces as `result=parse_error`
-                // (a 4xx via the `Validation` → 400 mapping, B5), NEVER
+                // (a 4xx via the `Validation` → 400 mapping), NEVER
                 // the network / `upstream_unavailable` bucket. Fail-closed:
                 // nothing was cached or mirrored.
                 return Err(AppError::Domain(
@@ -550,7 +549,7 @@ pub(crate) fn projection_to_entries(
 /// path the production serve path runs (the helper streams via
 /// `fetch_and_project`; this drives the projector directly over a
 /// `Cursor`). Returns `(entries, cap_tripped)` — `cap_tripped` is `true`
-/// when a per-file-object cap trip aborted projection (I-6).
+/// when a per-file-object cap trip aborted projection.
 ///
 /// Retained for the in-crate `index_source` / `lib.rs` parser tests that
 /// pin the PEP 503 HTML + PEP 691 JSON → entry mapping (incl. PEP 658

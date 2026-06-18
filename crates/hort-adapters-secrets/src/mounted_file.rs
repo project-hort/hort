@@ -1,9 +1,9 @@
 //! `MountedFileSecretAdapter` — resolves `SecretRef { source: File, location }`
 //! by reading the file at `location` from the local filesystem.
 //!
-//! Per design doc §5.2: reads on every call (tmpfs is microseconds), strips
-//! exactly one trailing `\n` or `\r\n` to normalise the editor-vs-CSI wiring
-//! discrepancy without corrupting secrets whose terminating bytes matter.
+//! Reads on every call (tmpfs is microseconds), strips exactly one trailing
+//! `\n` or `\r\n` to normalise the editor-vs-CSI wiring discrepancy without
+//! corrupting secrets whose terminating bytes matter.
 //!
 //! # Defence-in-depth (see `docs/how-to/wire-secrets.md`)
 //!
@@ -187,8 +187,8 @@ impl SecretPort for MountedFileSecretAdapter {
                     Err(classify_to_domain_error(&err))
                 }
                 Err(e) => {
-                    // PermissionDenied + any other I/O kind. Per §5.2 these
-                    // all map to ReadFailure; the kind() distinction is
+                    // PermissionDenied + any other I/O kind. These all
+                    // map to ReadFailure; the kind() distinction is
                     // observable via the std::io::Error message inside the
                     // payload but not as a separate metric label.
                     emit_resolve(values::SOURCE_FILE, SecretResolveResult::ReadFailure);
@@ -288,8 +288,7 @@ async fn check_mode_warning(path: &std::path::Path) {
 /// Strip exactly one trailing `\n` or `\r\n` from the byte vector if
 /// present; never more. Operates on raw bytes — no UTF-8 validation.
 ///
-/// Pinned semantics per design doc §5.2 — see the table in the
-/// initiative-13 design doc / the mounted_file tests for the full
+/// Pinned semantics — see the mounted_file tests for the full
 /// expected-output matrix.
 pub(crate) fn strip_one_trailing_newline(mut bytes: Vec<u8>) -> Vec<u8> {
     if bytes.last() == Some(&b'\n') {
@@ -310,8 +309,8 @@ mod tests {
 
     #[test]
     fn strip_one_trailing_newline_table() {
-        // Pinned by design doc §5.2; touching this table is a deliberate
-        // contract change.
+        // Pinned semantics; touching this table is a deliberate contract
+        // change.
         let cases: &[(&[u8], &[u8])] = &[
             (b"", b""),
             (b"x", b"x"),

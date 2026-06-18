@@ -14,8 +14,8 @@
 //! we could construct, which yields better operator messages when a
 //! malformed DER blob slips through the PEM parser.
 //!
-//! This asymmetry is intentional — see design doc §3 ("Helper return-type
-//! asymmetry is intentional — three shapes, not two").
+//! This asymmetry is intentional ("Helper return-type asymmetry is
+//! intentional — three shapes, not two").
 //!
 //! ## Metric label decision (`result=tls_error` vs `result=network_error`)
 //!

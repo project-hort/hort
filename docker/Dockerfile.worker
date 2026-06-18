@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
-# hort-worker — image for the Init-32/33/34 worker (multi-kind job
-# dispatcher: scan, cron-rescan-tick, advisory-watch-tick,
-# staging-sweep, noop). Builds the `hort-worker` binary on top of
+# hort-worker — image for the worker (multi-kind job dispatcher:
+# scan, cron-rescan-tick, advisory-watch-tick, staging-sweep, noop).
+# Builds the `hort-worker` binary on top of
 # pinned Trivy + osv-scanner CLI binaries lifted from their official
 # GitHub releases.
 #
@@ -48,10 +48,10 @@ ARG RUST_VERSION=1.94
 ARG TRIVY_VERSION=0.70.0
 ARG OSV_SCANNER_VERSION=2.3.8
 
-# SHA256 hashes of the upstream binaries we install. Init-17 (mandatory
-# upstream verification, docs/plans/028-initiative-17-upstream-verification.md)
-# requires every external download to be checksum-verified against a value
-# pinned at the call site — Trivy and osv-scanner are no exception. When the
+# SHA256 hashes of the upstream binaries we install. Mandatory upstream
+# verification requires every external download to be checksum-verified
+# against a value pinned at the call site — Trivy and osv-scanner are
+# no exception. When the
 # `*_VERSION` ARG above is bumped, the matching `*_SHA256` ARG MUST be bumped
 # to the new release's published checksum. Find them at:
 #   Trivy:       https://github.com/aquasecurity/trivy/releases (look for
@@ -115,9 +115,9 @@ RUN apt-get update && \
 # the tarball (LICENSE, contrib/, etc.) is dropped to keep the runtime
 # image lean. `install` sets executable mode + 0755 in one shot.
 #
-# Init-17 doctrine: verify the tarball SHA256 against the value pinned
-# at the top of this file BEFORE extracting. `sha256sum -c -` exits
-# non-zero on mismatch, which fails the build under `set -e`.
+# Verify the tarball SHA256 against the value pinned at the top of
+# this file BEFORE extracting. `sha256sum -c -` exits non-zero on
+# mismatch, which fails the build under `set -e`.
 RUN set -eu && \
     if [ -z "${TRIVY_SHA256}" ] || [ "${TRIVY_SHA256}" = "__REPLACE_ME__" ]; then \
         echo "ERROR: TRIVY_SHA256 build-arg is unset or still set to __REPLACE_ME__." >&2; \
@@ -145,9 +145,9 @@ RUN apt-get update && \
 # under a stable URL pattern. No tarball — pull the binary directly
 # and chmod +x.
 #
-# Init-17 doctrine: verify the binary SHA256 against the value pinned
-# at the top of this file BEFORE chmod-ing. `sha256sum -c -` exits
-# non-zero on mismatch, which fails the build under `set -e`.
+# Verify the binary SHA256 against the value pinned at the top of
+# this file BEFORE chmod-ing. `sha256sum -c -` exits non-zero on
+# mismatch, which fails the build under `set -e`.
 RUN set -eu && \
     if [ -z "${OSV_SCANNER_SHA256}" ] || [ "${OSV_SCANNER_SHA256}" = "__REPLACE_ME__" ]; then \
         echo "ERROR: OSV_SCANNER_SHA256 build-arg is unset or still set to __REPLACE_ME__." >&2; \
@@ -191,14 +191,14 @@ RUN apt-get update && \
 #   - the `nonroot` user at UID 65532 / GID 65532 (default `USER`).
 # It does NOT ship: shell, package manager, `pgrep`, `ps`. Liveness
 # is therefore checked via the worker's own `healthcheck` subcommand
-# (Init-33 follow-up B) rather than `pgrep -f`.
+# rather than `pgrep -f`.
 #
 # Operator-supplied trust roots: the chart's `extraCaBundle` mount
 # lands the operator's CA at `.Values.extraCaBundle.path` (default
 # `/etc/ssl/certs/extra/ca.crt`) and sets `HORT_EXTRA_CA_BUNDLE` so the
 # Rust binary's reqwest builds layer it on. Trivy / osv-scanner
 # subprocesses pick up the same bundle via `SSL_CERT_FILE` at
-# spawn-time; see Init-33 follow-up Phase C for the in-process merge.
+# spawn-time.
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 
 # OCI Image Spec v1.1 labels. The two below are static; CI passes the

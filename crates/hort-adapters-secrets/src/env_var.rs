@@ -1,9 +1,8 @@
 //! `EnvVarSecretAdapter` — resolves `SecretRef { source: EnvVar, location }`
 //! by reading `std::env::var(location)`.
 //!
-//! Per design doc §5.1: no I/O beyond the syscall, no cache. Process env is
-//! immutable for the lifetime of the process; rotation requires the file
-//! source.
+//! No I/O beyond the syscall, no cache. Process env is immutable for the
+//! lifetime of the process; rotation requires the file source.
 
 use std::env::VarError;
 

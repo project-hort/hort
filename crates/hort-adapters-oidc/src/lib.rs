@@ -131,12 +131,12 @@ pub struct OidcProvider {
     event_store: Option<Arc<dyn EventStore>>,
 }
 
-/// Default per-kid signature-mismatch eviction cooldown (design doc §2.11
-/// — `HORT_JWKS_EVICTION_BACKOFF_SECS` default).
+/// Default per-kid signature-mismatch eviction cooldown
+/// (`HORT_JWKS_EVICTION_BACKOFF_SECS` default).
 pub const DEFAULT_EVICTION_BACKOFF: Duration = Duration::from_secs(10);
 
-/// Default discovery + JWKS response body cap (design doc §2.11 —
-/// `HORT_JWKS_RESP_BODY_MAX_SIZE` default, 1 MiB).
+/// Default discovery + JWKS response body cap
+/// (`HORT_JWKS_RESP_BODY_MAX_SIZE` default, 1 MiB).
 pub const DEFAULT_BODY_MAX_BYTES: usize = 1024 * 1024;
 
 /// Default per-request HTTP timeout for OIDC discovery + JWKS fetches.
@@ -167,7 +167,7 @@ const EVICTION_MAP_MAX_ENTRIES: usize = 1024;
 /// Reason for evicting a kid from the JWKS cache.
 ///
 /// Distinguishes the two eviction paths so the caller knows whether to
-/// apply the DoS-mitigation backoff (design doc §2.5 + §4).
+/// apply the DoS-mitigation backoff.
 ///
 /// - [`EvictionReason::SignatureMismatch`] — token signature failed against
 ///   a JWK currently in cache. Could be legitimate key rotation OR a
@@ -193,7 +193,7 @@ pub(crate) enum EvictionReason {
 /// Algorithms accepted on the production path.
 ///
 /// `HS*` is excluded — HMAC belongs to the registry-minted-JWT path in
-/// `/v2/token` (Item 9), not to IdP validation, where a symmetric secret
+/// `/v2/token`, not to IdP validation, where a symmetric secret
 /// would imply the adapter and the IdP share a signing key. `none` is not
 /// listed here either; `jsonwebtoken` 10.x has no `Algorithm::None`
 /// variant to begin with.
@@ -268,7 +268,7 @@ impl OidcProvider {
     /// - `eviction_backoff` — per-kid signature-mismatch cooldown. A
     ///   second same-kid signature-mismatch eviction within this window
     ///   is a no-op. Does NOT gate `KidNotInCache` evictions (legitimate
-    ///   key-rotation invariant — design doc §4).
+    ///   key-rotation invariant).
     /// - `body_max_bytes` — upper bound on discovery + JWKS response
     ///   body size. Responses exceeding this are rejected with
     ///   [`JwksRefreshResult::BodyTooLarge`] before parsing.
@@ -499,8 +499,8 @@ impl OidcProvider {
         } = rotation;
         let fetched_at = Utc::now();
 
-        // Per design-doc §6: structured log alongside the metric +
-        // event. `info` because rotation is a security-relevant state
+        // Structured log alongside the metric + event. `info` because
+        // rotation is a security-relevant state
         // transition operators want to see in the default-level log
         // stream without enabling debug.
         info!(
@@ -625,7 +625,7 @@ impl OidcProvider {
                 issuer = %self.issuer_url,
                 jwks_uri = %discovery.jwks_uri,
                 reason = ?e,
-                "jwks_uri rejected by same-host origin guard (F-48)"
+                "jwks_uri rejected by same-host origin guard"
             );
             return Err(OidcValidationError::IdpUnavailable);
         }
@@ -640,7 +640,7 @@ impl OidcProvider {
                 error = %e,
                 "jwks body parse failed"
             );
-            // M-3: same operator-actionable bucket as the discovery
+            // Same operator-actionable bucket as the discovery
             // parse failure above.
             OidcValidationError::IdpUnavailable
         })?;
@@ -697,8 +697,8 @@ impl OidcProvider {
                     cap,
                     "jwks fetch rejected: response body exceeded cap"
                 );
-                // M-3: oversize body is an availability / misconfig
-                // problem, not a forged-signature problem.
+                // Oversize body is an availability / misconfig problem,
+                // not a forged-signature problem.
                 return Err(OidcValidationError::IdpUnavailable);
             }
             buf.extend_from_slice(&chunk);
@@ -718,10 +718,10 @@ impl OidcProvider {
         // response body in the `to_string()` form (that would require
         // `.text().await` which we deliberately avoid). Safe to log.
         //
-        // Design doc §5.3 specifies `warn!` level for JWKS upstream
-        // failures (the request fails 401; the cache stays stale until
-        // TTL — stale-but-safe). No `error!` emission — reserving that
-        // level for operator-attention-required conditions.
+        // `warn!` level for JWKS upstream failures (the request fails
+        // 401; the cache stays stale until TTL — stale-but-safe).
+        // No `error!` emission — reserving that level for
+        // operator-attention-required conditions.
         warn!(
             issuer = %self.issuer_url,
             kind,
@@ -881,7 +881,7 @@ impl JwksCache {
     ///
     /// Invariants:
     /// - `KidNotInCache` ALWAYS evicts (legitimate key rotation must still
-    ///   trigger a refresh — design doc §4).
+    ///   trigger a refresh — this invariant must not be blocked by backoff).
     /// - `SignatureMismatch` evicts only if the previous same-kid
     ///   mismatch was > `backoff` ago (or first-ever).
     /// - The per-kid eviction map is bounded by
@@ -1544,8 +1544,7 @@ FtBmFfStik03XAfEPVCRWBMc
 
         // Two appends expected: one for the initial fetch (empty →
         // [DEFAULT_KID]), one for the rotation ([DEFAULT_KID] →
-        // [OTHER_KID]). Assert specifically on the rotation append
-        // — that is the I-A10 acceptance fact.
+        // [OTHER_KID]). Assert specifically on the rotation append.
         let appends = store.snapshot().await;
         let rotation_events: Vec<&DomainEvent> = appends
             .iter()
@@ -1761,10 +1760,8 @@ FtBmFfStik03XAfEPVCRWBMc
     #[tokio::test]
     async fn validate_token_accepts_hs256_when_explicitly_configured() {
         // Sanity check for the `with_algorithms` cfg(test) escape hatch —
-        // HS256 works when both parties share the secret. Used by Item 9's
-        // registry-minted-JWT path (HMAC-signed) when it lands; covered
-        // here to prove the gate is algorithm-list-driven, not a hardcoded
-        // check.
+        // HS256 works when both parties share the secret. Covered here to
+        // prove the gate is algorithm-list-driven, not a hardcoded check.
         let (_server, issuer) = start_idp(jwks_body_for(DEFAULT_KID, TEST_N)).await;
         // This provider is constructed for the test and accepts HS256 only,
         // plus the default production algs for good measure.
@@ -2163,7 +2160,7 @@ FtBmFfStik03XAfEPVCRWBMc
         // evicted this kid for signature-mismatch a moment ago), a
         // `KidNotInCache` eviction MUST still take effect. Legitimate
         // key rotation must not be suppressed by the DoS mitigation —
-        // design doc §4 invariant.
+        // this invariant must be upheld.
         let mut cache = JwksCache::new(Duration::from_secs(60));
         cache.fetched_at = Some(Instant::now());
         let _ = cache.evict(
@@ -2557,9 +2554,9 @@ FtBmFfStik03XAfEPVCRWBMc
             .validate_token_impl(&token)
             .await
             .expect_err("oversize discovery body must cause validation to fail");
-        // M-3: oversize discovery body is the same operator-actionable
-        // class as the JWKS oversize case — IdP availability problem,
-        // not a forged signature.
+        // Oversize discovery body is the same operator-actionable class
+        // as the JWKS oversize case — IdP availability problem, not a
+        // forged signature.
         assert_eq!(err, OidcValidationError::IdpUnavailable);
     }
 
@@ -2626,8 +2623,8 @@ FtBmFfStik03XAfEPVCRWBMc
 
     #[tokio::test]
     async fn parse_error_on_discovery_body_is_idp_unavailable() {
-        // M-3 sibling case — the discovery document parse error must
-        // also collapse to IdpUnavailable, not SignatureInvalid.
+        // Sibling case — the discovery document parse error must also
+        // collapse to IdpUnavailable, not SignatureInvalid.
         let server = MockServer::start().await;
         let base = server.uri();
         Mock::given(method("GET"))
@@ -2647,7 +2644,7 @@ FtBmFfStik03XAfEPVCRWBMc
 
     #[tokio::test]
     async fn upstream_5xx_on_jwks_is_idp_unavailable() {
-        // M-3: a 5xx from the IdP is not a forged-signature problem.
+        // A 5xx from the IdP is not a forged-signature problem.
         // get_capped_body uses error_for_status() which converts any
         // non-2xx into a transport-class reqwest error — must land on
         // IdpUnavailable.
@@ -2678,7 +2675,7 @@ FtBmFfStik03XAfEPVCRWBMc
 
     #[tokio::test]
     async fn signature_mismatch_remains_signature_invalid() {
-        // M-3 invariant the other way: a real forged-signature path —
+        // Invariant the other way: a real forged-signature path —
         // the JWKS fetch succeeds, the kid resolves, but the signature
         // verification itself fails — MUST still surface as
         // SignatureInvalid (not IdpUnavailable). The split has to be
@@ -2996,7 +2993,7 @@ FtBmFfStik03XAfEPVCRWBMc
             err,
             OidcValidationError::IdpUnavailable,
             "redirect-cap exceeded must surface as IdpUnavailable \
-             (transport failure, M-3 bucket — not a forged-signature signal)"
+             (transport failure — not a forged-signature signal)"
         );
     }
 }

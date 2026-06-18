@@ -207,9 +207,9 @@ impl PgEventStore {
     ///
     /// The privilege probe is **skipped** (logged, no refusal) when
     /// `current_user` is a Postgres superuser or owns the `events` table
-    /// — or is a member of the owning role `hort_admin` (finding F12). In
-    /// both cases the forbidden privileges are unrevokable, so the probe
-    /// cannot enforce H-7 against that role. Admin subcommands connect
+    /// — or is a member of the owning role `hort_admin`. In both cases
+    /// the forbidden privileges are unrevokable, so the probe
+    /// cannot enforce the immutability invariant against that role. Admin subcommands connect
     /// with the admin DSN and hit the owner skip; the runtime serve /
     /// worker role owns nothing and hits neither.
     pub async fn new(pool: PgPool) -> DomainResult<Self> {
@@ -286,11 +286,11 @@ impl PgEventStore {
             tracing::warn!(
                 "events table privilege probe SKIPPED: runtime is a Postgres \
                  superuser; superusers bypass ACL and the probe cannot enforce \
-                 the H-7 invariant. Move the runtime to a non-superuser role \
+                 the immutability invariant. Move the runtime to a non-superuser role \
                  that is a member of hort_app_role to enable the probe."
             );
         } else {
-            // Table-owner handling (finding F12). A role that owns
+            // Table-owner handling. A role that owns
             // `events` — or is a member of the owning role `hort_admin` —
             // implicitly holds UPDATE/DELETE/TRUNCATE; `has_table_privilege`
             // reports `true` regardless of any REVOKE, because ownership
@@ -324,7 +324,7 @@ impl PgEventStore {
                 tracing::info!(
                     "events table privilege probe SKIPPED: current role owns the \
                      events table (or is a member of the owner role hort_admin); \
-                     ownership privileges cannot be revoked, so the H-7 probe is \
+                     ownership privileges cannot be revoked, so the immutability probe is \
                      not meaningful here. Expected for admin subcommands using the \
                      admin DSN; the runtime serve/worker role must not own events."
                 );
@@ -575,15 +575,14 @@ impl EventStore for PgEventStore {
 }
 
 // ---------------------------------------------------------------------------
-// F-2 `StreamSealed` tombstone emitter (ADR 0004 + 0002)
+// `StreamSealed` tombstone emitter (ADR 0004 + 0002)
 //
 // `delete_stream` / `archive_stream` MUST NOT remove any row of a stream
 // without first appending — *through the normal chained append path* — a
 // `StreamSealed` tombstone to the never-deleted audit-meta stream
 // `StreamId::eventstore_retention()` (`admin-<v5-uuid>`). The tombstone
 // carries the deleted stream's chain head so the verifier can treat the
-// now-absent stream as a defined `SealedGap` rather than a `Broken` chain
-// (F-2 spec §2.3 / §14 R3).
+// now-absent stream as a defined `SealedGap` rather than a `Broken` chain.
 //
 // The ordering invariant is load-bearing and structural: the tombstone
 // append and the row removal happen in **one transaction**, tombstone
@@ -597,11 +596,9 @@ impl EventStore for PgEventStore {
 // The cold-storage archive target is future work; today both seal the
 // chain head and remove the live rows; only the trace differs.
 //
-// Row-removal mechanism (decided 2026-05-17 — design §10.2; F-2 spec
-// §2.3 reconciled in the same B9 change): the actual row removal past
+// Row-removal mechanism (decided 2026-05-17): the actual row removal past
 // the `events_immutable` BEFORE-DELETE trigger is NOT done by disabling
-// the trigger (`ALTER TABLE … DISABLE TRIGGER` is the exact attack
-// vector audit F-2 names). The removal here is a **plain `DELETE`**; the
+// the trigger. The removal here is a **plain `DELETE`**; the
 // trigger stays ENABLED at all times and is amended (migration
 // `004_events.sql`) to permit DELETE only when
 // `current_user = 'hort_retention_role'` — a dedicated, DELETE-capable
@@ -617,21 +614,20 @@ impl EventStore for PgEventStore {
 //
 // The `EventStore::delete_stream`/`archive_stream` port signature carries
 // neither a retention-policy id nor an actor (it is intentionally NOT
-// changed here — see the dispatch report). The adapter therefore records
-// the system/timer-driven retention sweep as the authority:
+// changed here). The adapter therefore records the system/timer-driven
+// retention sweep as the authority:
 // `retention_policy_id = Uuid::nil()` (no specific policy at this layer;
-// B5 `EventStoreRetentionUseCase`, when it lands, routes through this
-// same chokepoint and is the layer that knows the policy id) and
+// `EventStoreRetentionUseCase`, when it lands, routes through this same
+// chokepoint and is the layer that knows the policy id) and
 // `actor_id = None` (exactly what `StreamSealed.actor_id`'s contract
 // documents for "the system/timer-driven retention sweep"). The append
 // itself uses `timer_actor()`, the controlled retention-scheduler actor.
 //
-// Operator-provisioning contract (Option B, F-2 co-reviewed,
-// 2026-05-18 — closes the B9 trigger-vs-NOLOGIN defect): the
-// `events_immutable` trigger function (`004_events.sql`) permits DELETE
-// only on an *exact* `current_user = 'hort_retention_role'` match — not a
-// membership test (Option B deliberately keeps that exemption
-// maximally narrow). `seal_and_remove` therefore issues a
+// Operator-provisioning contract: the `events_immutable` trigger function
+// (`004_events.sql`) permits DELETE only on an *exact*
+// `current_user = 'hort_retention_role'` match — not a membership test
+// (this keeps the exemption maximally narrow). `seal_and_remove` therefore
+// issues a
 // transaction-scoped `SET LOCAL ROLE hort_retention_role` between the
 // tombstone append and the row removal. For that to work the
 // `HORT_RETENTION_DATABASE_URL` login user MUST be GRANTed membership in
@@ -658,13 +654,13 @@ impl EventStore for PgEventStore {
 // auto-reverting elevation (no `ALTER TABLE … DISABLE TRIGGER`, no
 // manual `RESET ROLE`). A runtime user that is NOT a member of
 // `hort_retention_role` (e.g. `HORT_RETENTION_DATABASE_URL` unset → the
-// `hort_app_role`-only pool, the documented Q5 path) makes the
+// `hort_app_role`-only pool) makes the
 // `SET LOCAL ROLE` raise `permission denied`, so every seal
 // fail-closes: zero rows removed, the staged tombstone rolled back, no
 // orphan — exactly the pre-fix fail-safe, just surfaced as a
-// not-assumable-role Err instead of a trigger RAISE. B5/B6 wire the
-// `hort_retention_role` DSN/pool; this contract is documented in
-// ADR 0020 §10.2.
+// not-assumable-role Err instead of a trigger RAISE. The
+// `hort_retention_role` DSN/pool is wired by the caller; this contract is
+// documented in ADR 0020 §10.2.
 // ---------------------------------------------------------------------------
 
 /// Whether the seal+removal chokepoint was reached via `delete_stream`
@@ -694,7 +690,7 @@ impl PgEventStore {
     /// tombstone first. No delete/archive code path may bypass this.
     ///
     /// Tracing-only (no metric — there is no `hort_*_seal*` metric in the
-    /// catalog and §10.2 does not mandate one; the security-relevant
+    /// catalog; the security-relevant
     /// state change is surfaced via the `info!` on emission and the
     /// `error!` on abort).
     #[tracing::instrument(skip(self))]
@@ -760,8 +756,8 @@ impl PgEventStore {
             event_count,
             // The port signature carries no policy id at this layer;
             // the nil sentinel records "system/timer retention sweep,
-            // no specific policy known here". B5 routes through this
-            // same chokepoint and is the layer that knows the policy.
+            // no specific policy known here". The retention use case
+            // routes through this chokepoint and knows the policy id.
             retention_policy_id: uuid::Uuid::nil(),
             // `None` == the system/timer-driven retention sweep, per
             // the `StreamSealed.actor_id` field contract.
@@ -769,7 +765,7 @@ impl PgEventStore {
         });
 
         // Append the tombstone THROUGH THE NORMAL CHAINED APPEND PATH
-        // (`append_with_conn`) so the tombstone is itself F-2-chained
+        // (`append_with_conn`) so the tombstone is itself chained
         // on the audit-meta stream. ExpectedVersion::Any: the
         // audit-meta stream is append-many (one tombstone per sealed
         // stream over time); the chain predecessor is read from its
@@ -800,14 +796,14 @@ impl PgEventStore {
         }
 
         // Tombstone is staged in this transaction. Only now may rows be
-        // removed. The `events_immutable` trigger (defense-in-depth,
-        // F-2 spec §7) stays ENABLED — it is NEVER disabled by app code
-        // (design §10.2: `DISABLE TRIGGER` is the exact F-2 attack
-        // vector). The trigger function (migration `004_events.sql`,
+        // removed. The `events_immutable` trigger stays ENABLED — it is
+        // NEVER disabled by app code (`DISABLE TRIGGER` is the exact
+        // attack vector the trigger guards against). The trigger function
+        // (migration `004_events.sql`,
         // verbatim and unchanged by this fix) permits DELETE ONLY when
         // `current_user = 'hort_retention_role'` (exact match, not a
-        // membership check — Option B keeps that exemption maximally
-        // narrow). The runtime/test connection logs in as a *member* of
+        // membership check — this keeps the exemption maximally narrow).
+        // The runtime/test connection logs in as a *member* of
         // `hort_retention_role`, so without an explicit role assumption
         // `current_user` is the login user, NOT the role, and the
         // trigger would raise. We therefore assume the role for the
@@ -830,8 +826,7 @@ impl PgEventStore {
         // RESET on the error path would be dead code since rollback
         // already reverts it).
         //
-        // Q5-unset / non-member fail-closed (design §10.2; Q5
-        // semantics preserved): when the connection's login role is NOT
+        // Non-member fail-closed: when the connection's login role is NOT
         // a member of `hort_retention_role` (the `hort_app_role`-only pool
         // used when `HORT_RETENTION_DATABASE_URL` is unset), this
         // statement raises `permission denied to set role
@@ -841,7 +836,7 @@ impl PgEventStore {
         // and returned — `tx` is dropped without commit, rolling back
         // the staged tombstone INSERT too: zero rows removed, no orphan
         // tombstone. Identical fail-safe to the pre-fix trigger-RAISE
-        // path; B5's `EventStoreRetentionUseCase::seal_one` absorbs this
+        // path; `EventStoreRetentionUseCase::seal_one` absorbs this
         // Err exactly as it absorbed the trigger-RAISE Err
         // (`summary.errors += 1` + `tracing::error!` + continue).
         sqlx::query("SET LOCAL ROLE hort_retention_role")
@@ -892,7 +887,7 @@ impl PgEventStore {
             .map_err(|e| DomainError::Invariant(format!("seal transaction commit failed: {e}")))?;
 
         // Security-relevant state change: stream id + final position
-        // only, never the payload (design §10.7).
+        // only, never the payload.
         tracing::info!(
             op = mode.op(),
             stream_id = %target_id,
@@ -950,9 +945,9 @@ async fn append_with_conn(
     //
     // The same tail query also returns the tail row's `event_hash` —
     // the predecessor for the first event of this batch's chain link.
-    // This rides the existing single round trip (spec §9: "carry the
-    // predecessor `event_hash` from the same per-stream tail query
-    // already executed ... no extra round trip").
+    // This rides the existing single round trip (the predecessor
+    // `event_hash` is read from the same per-stream tail query
+    // already executed — no extra round trip).
     let tail: Option<(i64, Vec<u8>)> = sqlx::query_as(
         r#"SELECT stream_position, event_hash
            FROM events
@@ -967,9 +962,9 @@ async fn append_with_conn(
 
     let (current_position, tail_event_hash): (i64, Option<EventHash>) = match tail {
         // Fresh stream — the first event chains from the genesis
-        // sentinel (spec §2.2). `-1` keeps the existing
-        // optimistic-concurrency arithmetic (`stream_position += 1`
-        // yields 0 for the first event) byte-identical.
+        // sentinel. `-1` keeps the existing optimistic-concurrency
+        // arithmetic (`stream_position += 1` yields 0 for the first
+        // event) byte-identical.
         None => (-1, None),
         Some((pos, hash_bytes)) => {
             // The tail row exists, so its `event_hash` must be the
@@ -977,8 +972,8 @@ async fn append_with_conn(
             // only reachable mid-backfill or against a pre-chain row,
             // which the `NOT NULL` + `CHECK` make unreachable in
             // steady state — surface it as the same `Invariant`
-            // "should be impossible" shape the file already uses
-            // (spec §10), never as a silent break.
+            // "should be impossible" shape the file already uses,
+            // never as a silent break.
             let arr: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
                 DomainError::Invariant(format!(
                     "event chain predecessor missing for stream {stream_id_str} at position {pos}"
@@ -1014,8 +1009,8 @@ async fn append_with_conn(
 
     // The running per-stream chain predecessor.
     // The first event of this batch chains from the stored tail's
-    // `event_hash`, or the genesis sentinel (spec §2.2) if the stream
-    // is new. Each subsequent event in the batch chains from the hash
+    // `event_hash`, or the genesis sentinel if the stream is new.
+    // Each subsequent event in the batch chains from the hash
     // we just computed, so a multi-event batch forms a contiguous
     // chain segment with no extra DB round trips.
     let mut prev_event_hash = tail_event_hash.unwrap_or_else(genesis_hash);
@@ -1024,18 +1019,18 @@ async fn append_with_conn(
         stream_position += 1;
         // Bind the caller-supplied event_id verbatim. The adapter never
         // mints — "adapter is pure persistence" extends from payload
-        // (Item 6) to identity (review B6).
+        // to identity.
         let event_id = to_append.event_id;
         let event = &to_append.event;
         let event_type = event.event_type();
         let event_data = &serialized[i];
 
         // Compute this event's hash over the canonical form of the
-        // typed event + the predecessor hash (spec §3/§9). Pure and
-        // infallible — `canonical_event_bytes` serializes an
-        // already-`validate()`d typed `DomainEvent`, so the append
-        // path gains NO new fallible step (spec §10). `event_version`
-        // is the literal `1` bound below; keep the two in lockstep.
+        // typed event + the predecessor hash. Pure and infallible —
+        // `canonical_event_bytes` serializes an already-`validate()`d
+        // typed `DomainEvent`, so the append path gains NO new fallible
+        // step. `event_version` is the literal `1` bound below; keep
+        // the two in lockstep.
         let event_version: u32 = 1;
         let chain_input = ChainInput {
             prev_event_hash,
@@ -1188,7 +1183,7 @@ mod tests {
         );
     }
 
-    /// Backlog-mandated coverage: a 1025-char `name` on `ArtifactIngested`
+    /// Regression guard: a 1025-char `name` on `ArtifactIngested`
     /// trips `MAX_NAME_LEN` (1024) from `ArtifactIngested::validate`. The
     /// per-field validation must run on every event type before the append
     /// path — this test is the regression guard that `validate_and_serialize`
@@ -1300,7 +1295,7 @@ mod tests {
         Some(pool)
     }
 
-    /// B6 regression guard: the `event_id` the caller supplied in
+    /// Regression guard: the `event_id` the caller supplied in
     /// [`EventToAppend`] MUST be the id persisted in `events.event_id`.
     /// Before the fix the adapter minted a fresh `Uuid::new_v4()`
     /// internally; any caller that threaded the pre-minted id as a
@@ -1421,21 +1416,20 @@ mod tests {
     /// (`event_id = Uuid::from_u128(0xE0 + pos)`,
     /// `correlation_id = Uuid::from_u128(0xC0FFEE)`,
     /// `stream_category = "artifact"`, `actor = system/None`). Because
-    /// `canonical_event_bytes` (spec §3.1, frozen field order) hashes
-    /// field 2 `event_id`, field 4 `stream_category`, field 9
-    /// `correlation_id`, and field 11 the actor tuple, a `row_view`
-    /// reconstruction of a row that was stored with a *real* envelope
-    /// (random `event_id` from `EventToAppend::new`, `Uuid::new_v4()`
-    /// correlation, the real `StreamId` category, `system_actor()`)
-    /// recomputed a hash that never matched the stored `event_hash` —
-    /// a spurious `Broken { at_position: 0, HashMismatch }` at the very
-    /// first row, masking whatever the test actually injected further
-    /// down the chain. Threading the *stored* envelope (the same
-    /// mechanism the production verifier uses —
+    /// `canonical_event_bytes` hashes field 2 `event_id`,
+    /// field 4 `stream_category`, field 9 `correlation_id`, and field 11
+    /// the actor tuple, a `row_view` reconstruction of a row that was
+    /// stored with a *real* envelope (random `event_id` from
+    /// `EventToAppend::new`, `Uuid::new_v4()` correlation, the real
+    /// `StreamId` category, `system_actor()`) recomputed a hash that
+    /// never matched the stored `event_hash` — a spurious
+    /// `Broken { at_position: 0, HashMismatch }` at the very first row,
+    /// masking whatever the test actually injected further down the chain.
+    /// Threading the *stored* envelope (the same mechanism the production
+    /// verifier uses —
     /// `hort-server::cli::verify_event_chain::OwnedRow::as_stream_row`,
     /// which builds `ChainInput` from the real `EventRow` columns) makes
     /// the recompute equal the stored hash for genuinely-appended rows.
-    /// Fixed under explicit architect+user F-2 co-review (design §10.1).
     #[derive(Clone, Copy)]
     struct RowEnvelope<'a> {
         event_id: Uuid,
@@ -1446,7 +1440,7 @@ mod tests {
     }
 
     /// The deterministic synthetic envelope the in-memory
-    /// (`chained_admin_rows`-based) F-2 tests stored their hashes with.
+    /// (`chained_admin_rows`-based) chain tests stored their hashes with.
     /// This is the *single source of truth* for those constants: both
     /// `chained_admin_rows` (which computes the stored hash) and the
     /// synthetic `row_view` call sites (which recompute it) take the
@@ -1543,8 +1537,8 @@ mod tests {
     /// `OwnedRow::as_stream_row` use. The owned envelope columns
     /// (`stream_category`, the four actor columns) are kept verbatim so
     /// `as_stream_row` borrows the *real* stored envelope into the
-    /// `RowEnvelope` — the Item-B15 fix that makes the recomputed hash
-    /// equal the stored `event_hash` for genuinely-appended rows.
+    /// `RowEnvelope` — this makes the recomputed hash equal the stored
+    /// `event_hash` for genuinely-appended rows.
     struct OwnedDbRow {
         persisted: PersistedEvent,
         stream_id: String,
@@ -1588,11 +1582,11 @@ mod tests {
     /// `TryFrom<EventRow> for PersistedEvent` path and pair each row
     /// with its stored `(prev_event_hash, event_hash)` columns. Two
     /// queries per stream (the `EventRow` columns, then the two `bytea`
-    /// chain columns) both ordered `stream_position ASC` — the F-2
-    /// chain columns are not part of `EventRow`'s `FromRow` shape, so
-    /// they are selected separately and zipped by position. Shared by
-    /// the two Tier-2 DB F-2 tests so the reconstruction is written
-    /// once and stays identical to the production verifier's mechanism.
+    /// chain columns) both ordered `stream_position ASC` — the chain
+    /// columns are not part of `EventRow`'s `FromRow` shape, so they
+    /// are selected separately and zipped by position. Shared by the
+    /// Tier-2 DB chain tests so the reconstruction is written once and
+    /// stays identical to the production verifier's mechanism.
     async fn read_back_owned_rows(pool: &PgPool, stream_id: &str) -> Vec<OwnedDbRow> {
         let event_rows: Vec<EventRow> = sqlx::query_as(&format!(
             r#"SELECT {EVENT_COLS}
@@ -1716,7 +1710,7 @@ mod tests {
     /// excising position 3 and leaving 0..=2 makes position 2 the tail,
     /// which still verifies — but excising a *middle* row breaks the
     /// position contiguity / prev linkage. Pins the "deletion is
-    /// detectable" half of invariant I1.
+    /// detectable" property.
     #[test]
     fn excised_middle_row_fails_verification() {
         let sid = "artifact-deadbeef";
@@ -1814,8 +1808,7 @@ mod tests {
 
         // Tamper as the table owner (privileged adversary). The
         // `events_immutable` trigger blocks UPDATE; disable it for the
-        // mutation, then restore — modelling a DBA with DISABLE
-        // TRIGGER, exactly the threat F-2 defends against.
+        // mutation, then restore — modelling a DBA with DISABLE TRIGGER.
         sqlx::query("ALTER TABLE events DISABLE TRIGGER events_immutable")
             .execute(&pool)
             .await
@@ -1838,23 +1831,22 @@ mod tests {
         // rows through the *production* `EventRow` +
         // `TryFrom<EventRow> for PersistedEvent` path (the exact
         // mechanism `verify_event_chain.rs` uses), threading the real
-        // stored envelope (Item-B15 `row_view` fix).
+        // stored envelope.
         let owned = read_back_owned_rows(&pool, &stream.to_string()).await;
         let rows2: Vec<StreamRow> = owned.iter().map(OwnedDbRow::as_stream_row).collect();
 
         // Why `at_position: 1` is the *provably correct* verdict for
-        // the injected tamper (Item-B15 reasoning):
+        // the injected tamper:
         //
         //   * Position 0 (`ArtifactIngested`) is UNtampered. With the
         //     fixed `row_view` threading the real `event_id` /
         //     `correlation_id` / `stream_category` ("artifact") /
         //     `system` actor, `compute_event_hash(reconstructed)` ==
         //     the stored `event_hash`, so position 0 verifies clean and
-        //     the verifier advances to position 1. (Before the B15 fix
-        //     the hardcoded-envelope `row_view` mismatched here first,
-        //     yielding a spurious `Broken { at_position: 0 }` that
-        //     masked the real detection — that masked failure is the
-        //     latent F-2-test defect this item fixes.)
+        //     the verifier advances to position 1. (Before the row_view
+        //     envelope fix, the hardcoded-envelope `row_view` mismatched
+        //     here first, yielding a spurious `Broken { at_position: 0 }`
+        //     that masked the real detection.)
         //   * Position 1 (`ArtifactRejected`) had its `event_data`
         //     `reason` rewritten to "exonerated" by the owner UPDATE
         //     above. Its stored `event_hash` was computed over the
@@ -1884,7 +1876,7 @@ mod tests {
         );
     }
 
-    /// F-2 × `ExpectedVersion::Any` per-stream-chain reconciliation
+    /// `ExpectedVersion::Any` per-stream-chain reconciliation
     /// (Tier 2, gated on `DATABASE_URL`).
     ///
     /// **The proven invariant.** A high-volume per-(scope,date) audit
@@ -1895,18 +1887,17 @@ mod tests {
     /// `match batch.expected_version` site in `append_with_conn`).
     /// Concurrency is *not* unserialised: the
     /// `UNIQUE (stream_id, stream_position)` index
-    /// (`migrations/004_events.sql`) is the load-bearing
-    /// serializer. Two concurrent appenders that both read the same tail
-    /// (the live tail read at `event_store.rs` ~800-833) and both target
-    /// position `k` are resolved by that unique index admitting exactly
-    /// one row; the loser's INSERT raises `23505`, mapped to
-    /// `DomainError::Conflict` (the `23505 → Conflict` arm at
-    /// ~944-959), and its row is never committed. On caller retry it
-    /// re-reads the new tail and rechains from the freshly-committed
-    /// predecessor. Therefore every *committed* row's `prev_event_hash`
-    /// equals the committed predecessor's `event_hash` and positions are
-    /// gapless — a healthy concurrent-`Any` stream is a normal
-    /// contiguous F-2 chain that `verify_stream_chain` returns `Ok` for.
+    /// (`migrations/004_events.sql`) is the load-bearing serializer.
+    /// Two concurrent appenders that both read the same tail and both
+    /// target position `k` are resolved by that unique index admitting
+    /// exactly one row; the loser's INSERT raises `23505`, mapped to
+    /// `DomainError::Conflict` (the `23505 → Conflict` arm), and its
+    /// row is never committed. On caller retry it re-reads the new tail
+    /// and rechains from the freshly-committed predecessor. Therefore
+    /// every *committed* row's `prev_event_hash` equals the committed
+    /// predecessor's `event_hash` and positions are gapless — a healthy
+    /// concurrent-`Any` stream is a normal contiguous chain that
+    /// `verify_stream_chain` returns `Ok` for.
     ///
     /// This test is the regression guard for that invariant: it drives
     /// the real `store.append` path under genuine concurrency, with the
@@ -1919,21 +1910,16 @@ mod tests {
     /// `roll_up`/`FixedAnchor` machinery lives in
     /// `hort-server::cli::verify_event_chain`; `hort-server` depends on
     /// `hort-adapters-postgres`, so importing it back here would be a
-    /// circular dependency. The spec-decision authorised the
-    /// minimal-sufficient assertion in that case:
+    /// circular dependency. The minimal-sufficient assertion is:
     /// `verify_stream_chain` over the read-back rows == `Ok` and
     /// `!= Broken`. The read-back itself uses the production
     /// `EventRow` + `TryFrom<EventRow> for PersistedEvent` path (the
     /// exact mechanism `verify_event_chain.rs::read_stream_rows` uses),
     /// mirroring the sibling `db_appended_chain_persists_and_detects_tamper`.
     ///
-    /// **Concurrency-join note.** The spec names
-    /// `futures::future::join_all`; `futures` is not a dev-dependency of
-    /// this crate and adding it would require a `Cargo.toml` edit
-    /// outside this item's single-file scope fence. `tokio::task::JoinSet`
-    /// (tokio is already a dev-dep with `full` features) has identical
-    /// semantics — spawn N, await every handle, fail on any task error —
-    /// and stays in-scope.
+    /// **Concurrency-join note.** `tokio::task::JoinSet` (tokio is already
+    /// a dev-dep with `full` features) is used here: spawn N, await every
+    /// handle, fail on any task error.
     #[tokio::test]
     #[serial(hort_pg_db)]
     #[ignore = "requires DATABASE_URL — runs in Tier 2 only"]
@@ -2127,8 +2113,7 @@ mod tests {
         // `TryFrom<EventRow> for PersistedEvent` path (the exact
         // mechanism the server-side verifier uses) via the shared
         // `read_back_owned_rows` helper, which threads the *real*
-        // stored envelope (Item-B15 `row_view` fix), and assert the
-        // pure core's verdict. ---
+        // stored envelope, and assert the pure core's verdict. ---
         let owned = read_back_owned_rows(&pool, &stream_str).await;
         let rows: Vec<StreamRow> = owned.iter().map(OwnedDbRow::as_stream_row).collect();
         let verdict = verify_stream_chain(&StreamRows::new(&rows));
@@ -2161,10 +2146,9 @@ mod tests {
     // appended a matching, anchored `StreamSealed` tombstone verifies
     // as a defined `SealedGap` (the anchor cross-check returns `Ok`);
     // the same absent stream WITHOUT a tombstone, or with a head-hash
-    // mismatch, is `Broken`. This is exactly the F-2 spec §2.3 / §14 R3
-    // verdict contract — consumed here, not re-implemented (the verdict
-    // logic lives in the pure `hort-domain` verifier core, byte-unchanged
-    // by B9).
+    // mismatch, is `Broken`. This is the verdict contract the emitter
+    // must satisfy — consumed here, not re-implemented (the verdict
+    // logic lives in the pure `hort-domain` verifier core).
     //
     // The no-DB tests run in Tier 1 (offline verifier model). The
     // DB-backed tests (`#[ignore]`, Tier 2 via `DATABASE_URL`) exercise
@@ -2198,7 +2182,7 @@ mod tests {
     /// CENTERPIECE (no DB, Tier 1): a deleted stream WITH a matching
     /// anchored `StreamSealed` is a `SealedGap`, not `Broken`; WITHOUT
     /// one (or with a head-hash mismatch) it is `Broken`. This is the
-    /// F-2 spec §2.3 verdict contract the emitter must satisfy.
+    /// verdict contract the emitter must satisfy.
     #[test]
     fn b9_no_db_deleted_stream_with_matching_streamsealed_is_sealedgap_not_broken() {
         let sealed_sid = "authorization-deadbeef";
@@ -2219,8 +2203,8 @@ mod tests {
         };
 
         // A checkpoint anchored AFTER the seal that covers the sealed
-        // stream's head (the §2.3 "anchored at-or-after the seal"
-        // condition). The deleted stream is absent from live_heads.
+        // stream's head ("anchored at-or-after the seal" condition).
+        // The deleted stream is absent from live_heads.
         let now = chrono::Utc::now();
         let checkpoint = Checkpoint {
             chain_format_version: "hort-evchain/v1".into(),
@@ -2288,8 +2272,8 @@ mod tests {
     /// The emitter's `StreamSealed` payload, serialized the way
     /// `append_with_conn` -> `serialize_event_data` stores it, MUST be
     /// exactly what `PgEventChainHeadReader::sealed_record_from_row`
-    /// projects. Pins the cross-adapter contract so B9's emitter and
-    /// B8's reader agree (no DB needed — pure serde shape).
+    /// projects. Pins the cross-adapter contract so the emitter and
+    /// reader agree (no DB needed — pure serde shape).
     #[test]
     fn b9_no_db_tombstone_payload_shape_matches_reader_projection() {
         let head = EventHash([0xab; 32]);
@@ -2465,11 +2449,11 @@ mod tests {
     /// is cause-agnostic, so a `lock_timeout` `Err` proves the invariant
     /// exactly as a committed-duplicate 23505 would. The bound is on
     /// THIS TEST's store pool only — never server-wide, never in
-    /// production `seal_and_remove` (that is an F-2-co-reviewed decision
-    /// on concurrent-append-to-`admin-eventstore-retention` semantics).
+    /// production `seal_and_remove` (that is a deliberate decision on
+    /// concurrent-append-to-`admin-eventstore-retention` semantics).
     /// NB: "commit the squatter" and "spawn the squatter rollback" both
     /// free/advance the slot, so the seal append then *succeeds* and the
-    /// test silently stops asserting the F-2 invariant (false-green); the
+    /// test silently stops asserting the chain-seal invariant (false-green); the
     /// bounded wait is the only fix that preserves the injected failure.
     /// The target stream MUST survive fully intact (zero rows removed) —
     /// proving removal never precedes a durable tombstone.

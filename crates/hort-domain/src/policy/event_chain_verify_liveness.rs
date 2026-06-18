@@ -1,6 +1,6 @@
 //! Event-chain-verifier liveness predicate (ADR 0030).
 //!
-//! Background: the F-2 tamper-evidence verifier
+//! Background: the tamper-evidence verifier
 //! (`hort-server verify-event-chain`) is correct crypto but ships
 //! CLI-only — there is no in-cluster scheduler that runs it, and nothing
 //! alerts when it stops running. Two
@@ -63,8 +63,8 @@ pub enum EventChainVerifyLiveness {
         threshold_secs: i64,
     },
     /// No `verify-event-chain` run has ever completed on this deployment.
-    /// Treated as overdue (gauge → 1) — the precise shape the audit calls
-    /// out: a verifier that ships CLI-only and was never scheduled.
+    /// Treated as overdue (gauge → 1): a verifier that ships CLI-only
+    /// and was never scheduled.
     NeverRan,
 }
 

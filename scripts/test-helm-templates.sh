@@ -48,24 +48,24 @@ fi
 # one of them.
 expectations() {
     cat <<'EOF'
-test-values-extra-ca-with-cm.yaml|HORT_EXTRA_CA_BUNDLE|2|Backlog 078 Item 7 Recipe A: env var rendered on BOTH server + worker (auto-mount source set ⇒ env set)
-test-values-extra-ca-with-cm.yaml|extra-ca-bundle|9|Backlog 078 Item 7 Recipe A: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + checksum annotation (1)
-test-values-extra-ca-with-cm.yaml|defaultMode: 0444|4|Backlog 078 Item 7 Recipe A: read-only 0444 ConfigMap volume on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-cm.yaml|HORT_EXTRA_CA_BUNDLE|2|Recipe A: env var rendered on BOTH server + worker (auto-mount source set ⇒ env set)
+test-values-extra-ca-with-cm.yaml|extra-ca-bundle|9|Recipe A: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + checksum annotation (1)
+test-values-extra-ca-with-cm.yaml|defaultMode: 0444|4|Recipe A: read-only 0444 ConfigMap volume on server + worker + scrub + quarantineReleaseSweep
 test-values-extra-ca-with-cm.yaml|checksum/extra-ca-bundle:|1|Pod-template checksum annotation rendered for the ConfigMap source
 test-values-extra-ca-unset.yaml|HORT_EXTRA_CA_BUNDLE|0|env var NOT rendered when no auto-mount source set
 test-values-extra-ca-unset.yaml|extra-ca-bundle|0|volume NOT rendered when no auto-mount source set
 test-values-extra-ca-unset.yaml|checksum/extra-ca-bundle:|0|annotation NOT rendered when extraCaBundle unset
 test-values-extra-ca-unset.yaml|defaultMode: 0444|0|extra-CA volume not rendered → no defaultMode
-test-values-extra-ca-path-only.yaml|HORT_EXTRA_CA_BUNDLE|0|Backlog 078 Item 7 manual recipe: chart sets NO env (no auto-mount source ⇒ no chart-set env; operator sets it via extraEnv)
-test-values-extra-ca-path-only.yaml|extra-ca-bundle|0|Backlog 078 Item 7 manual recipe: chart mounts NOTHING (no dangling volumeMount — the prior path-only cronjob volumeMount bug is fixed)
+test-values-extra-ca-path-only.yaml|HORT_EXTRA_CA_BUNDLE|0|manual recipe: chart sets NO env (no auto-mount source ⇒ no chart-set env; operator sets it via extraEnv)
+test-values-extra-ca-path-only.yaml|extra-ca-bundle|0|manual recipe: chart mounts NOTHING (no dangling volumeMount — the prior path-only cronjob volumeMount bug is fixed)
 test-values-extra-ca-path-only.yaml|checksum/extra-ca-bundle:|0|annotation NOT rendered when no auto-mount source is set
-test-values-extra-ca-with-secret.yaml|HORT_EXTRA_CA_BUNDLE|2|Backlog 078 Item 7 (a) Recipe B: env var rendered on BOTH server + worker (secretName auto-mount ⇒ env set), symmetric with configMapName
-test-values-extra-ca-with-secret.yaml|extra-ca-bundle|8|Backlog 078 Item 7 (a) Recipe B: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2); NO checksum annotation (Secret path)
-test-values-extra-ca-with-secret.yaml|defaultMode: 0444|4|Backlog 078 Item 7 (a) Recipe B: read-only 0444 Secret volume on server + worker + scrub + quarantineReleaseSweep
-test-values-extra-ca-with-secret.yaml|checksum/extra-ca-bundle:|0|Backlog 078 Item 7 (a) Recipe B: no checksum annotation for the Secret source (Secret updates propagate via Kubernetes, not via helm-upgrade re-render)
-test-values-extra-ca-with-secret.yaml|corporate-ca-bundle-secret|4|Backlog 078 Item 7 (a) Recipe B: the Secret name renders in the volume secretName on server + worker + scrub + quarantineReleaseSweep
-test-values-worker-extra-ca-recipe-b.yaml|HORT_EXTRA_CA_BUNDLE|1|Backlog 078 Item 7 manual recipe: ONLY the operator-supplied worker.extraEnv sets the env (chart sets none; server has no extraEnv ⇒ 0 there)
-test-values-worker-extra-ca-recipe-b.yaml|extra-ca-bundle|0|Backlog 078 Item 7 manual recipe: NO chart-managed extra-ca-bundle volume/mount
+test-values-extra-ca-with-secret.yaml|HORT_EXTRA_CA_BUNDLE|2|Recipe A-Secret: env var rendered on BOTH server + worker (secretName auto-mount ⇒ env set), symmetric with configMapName
+test-values-extra-ca-with-secret.yaml|extra-ca-bundle|8|Recipe A-Secret: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2); NO checksum annotation (Secret path)
+test-values-extra-ca-with-secret.yaml|defaultMode: 0444|4|Recipe A-Secret: read-only 0444 Secret volume on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-secret.yaml|checksum/extra-ca-bundle:|0|Recipe A-Secret: no checksum annotation for the Secret source (Secret updates propagate via Kubernetes, not via helm-upgrade re-render)
+test-values-extra-ca-with-secret.yaml|corporate-ca-bundle-secret|4|Recipe A-Secret: the Secret name renders in the volume secretName on server + worker + scrub + quarantineReleaseSweep
+test-values-worker-extra-ca-recipe-b.yaml|HORT_EXTRA_CA_BUNDLE|1|manual recipe: ONLY the operator-supplied worker.extraEnv sets the env (chart sets none; server has no extraEnv ⇒ 0 there)
+test-values-worker-extra-ca-recipe-b.yaml|extra-ca-bundle|0|manual recipe: NO chart-managed extra-ca-bundle volume/mount
 test-values-worker-extra-ca-recipe-b.yaml|recipe-b-worker-ca|2|operator-supplied worker.extraVolumes name renders as both volumeMount and volume
 test-values-worker-extra-ca-recipe-b.yaml|my-corporate-ca-secret|1|operator-supplied Secret name renders in the worker volume block
 test-values-token-exchange-happy.yaml|HORT_TOKEN_EXCHANGE_ENABLED|1|HORT_TOKEN_EXCHANGE_ENABLED rendered when tokenExchange.enabled
@@ -82,9 +82,9 @@ test-values-ephemeral-secret-split.yaml|name: "hort-redis-evictable"|2|evictable
 test-values-ephemeral-secret-split.yaml|key: "EVICTABLE_URL"|2|evictable secretKeyRef uses the configured key on server + worker
 test-values-ephemeral-secret-split.yaml|name: "hort-redis-durable"|1|durable secretKeyRef points at the configured Secret
 test-values-ephemeral-secret-split.yaml|key: "DURABLE_URL"|1|durable secretKeyRef uses the configured key
-test-values-rotation.yaml|name: .*-service-account-rotation|1|Backlog 078 Item 9: rotation CronJob renders from the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled (under scheduledTasks.adminTasksEnabled)
+test-values-rotation.yaml|name: .*-service-account-rotation|1|rotation CronJob renders from the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled (under scheduledTasks.adminTasksEnabled)
 test-values-rotation.yaml|name: hort-server-rotation-|6|per-namespace Role + RoleBinding render for both target namespaces (2 namespaces × 3 name refs each — Role metadata.name + RoleBinding metadata.name + RoleBinding roleRef.name)
-test-values-rotation.yaml|HORT_K8S_SECRET_WRITER_ENABLED|1|Backlog 078 Item 9: the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled ALSO drives the worker-side wiring — HORT_K8S_SECRET_WRITER_ENABLED renders on the worker (no separate worker.rotation.enabled)
+test-values-rotation.yaml|HORT_K8S_SECRET_WRITER_ENABLED|1|the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled ALSO drives the worker-side wiring — HORT_K8S_SECRET_WRITER_ENABLED renders on the worker (no separate worker.rotation.enabled)
 test-values-cronjobs.yaml|^kind: CronJob$|11|eleven CronJobs render — the nine scheduledTasks.adminTasksEnabled-gated admin-task entries (noop, staging-sweep, cron-rescan-tick, advisory-watch-tick, eventstore-checkpoint, replay-seen-prune, retention-evaluate, retention-purge, eventstore-archive) PLUS the always-on dsn-direct quarantineReleaseSweep (gated on scheduledTasks.quarantineReleaseSweep.enabled, default true) PLUS the always-on dsn-direct CAS scrub (gated on scheduledTasks.scrub.enabled, default true). wheelMetadataBackfill stays default-disabled and does NOT count.
 test-values-cronjobs.yaml|name: hort-server-cron-rescan-tick$|1|cron-rescan-tick CronJob renders with conventional release-name suffix
 test-values-cronjobs.yaml|name: hort-server-advisory-watch-tick$|1|advisory-watch-tick CronJob renders with conventional release-name suffix
@@ -128,9 +128,9 @@ expect_render_failure() {
     cat <<'EOF'
 test-values-ephemeral-broken.yaml|ephemeralStore.redis|per-class override set but main URL/secret empty must fail schema validation
 test-values-token-exchange-broken.yaml|nativeTokens|tokenExchange.enabled=true with nativeTokens.enabled=false must fail schema validation (chart-level mirror of ConfigError::TokenExchangeRequiresNativeTokens)
-test-values-rotation-half-on.yaml|scheduledTasks.adminTasksEnabled|Backlog 078 Item 9 (chart S4): the single rotation toggle scheduledTasks.serviceAccountRotation.enabled=true WITHOUT the scheduledTasks.adminTasksEnabled umbrella is a silent half-on — schema rule 9a must reject it at helm template (no bespoke fail helper any more)
-test-values-extra-ca-both-sources.yaml|extraCaBundle|Backlog 078 Item 7 / convention 9: configMapName AND secretName both set is mutually exclusive — schema oneOf + validateSources must fail the render
-test-values-strict-schema-typo.yaml|Additional property|Backlog 078 Item 11 (chart S1): the strict schema (additionalProperties:false on the top-level + every nested block) must REJECT mistyped / retired keys (replicaCountt, apiBindAddr, http.ociUploadTimeoutSeconds, worker.scanner.osvScanner, worker.scanner.osvv) at helm template instead of silently ignoring them
+test-values-rotation-half-on.yaml|scheduledTasks.adminTasksEnabled|the single rotation toggle scheduledTasks.serviceAccountRotation.enabled=true WITHOUT the scheduledTasks.adminTasksEnabled umbrella is a silent half-on — schema rule 9a must reject it at helm template
+test-values-extra-ca-both-sources.yaml|extraCaBundle|configMapName AND secretName both set is mutually exclusive — schema oneOf + validateSources must fail the render
+test-values-strict-schema-typo.yaml|Additional property|the strict schema (additionalProperties:false on the top-level + every nested block) must REJECT mistyped / retired keys (replicaCountt, apiBindAddr, http.ociUploadTimeoutSeconds, worker.scanner.osvScanner, worker.scanner.osvv) at helm template instead of silently ignoring them
 test-values-worker-metrics-no-scrapers.yaml|scrapeFrom|worker.metrics.enabled=true with an empty scrapeFrom must be rejected — an empty NetworkPolicy `from: []` means ALL sources (fail-OPEN) per the k8s spec, so the schema's `if enabled then scrapeFrom minItems 1` rule must fail the render rather than open the metrics port cluster-wide
 EOF
 }

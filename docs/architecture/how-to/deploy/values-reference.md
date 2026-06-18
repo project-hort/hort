@@ -32,7 +32,7 @@ nested object block the chart owns the shape of**, so an unknown,
 mistyped, or **retired** key fails `helm install`/`helm template` with a
 clear `Additional property <key> is not allowed` error instead of being
 silently accepted and ignored. A typo like `worker.scanner.osvv`, a
-pre-078 retired key like `apiBindAddr` / `worker.scanner.osvScanner` /
+retired key like `apiBindAddr` / `worker.scanner.osvScanner` /
 `http.ociUploadTimeoutSeconds`, or a top-level `replicaCountt` is caught
 at install time, not discovered at runtime when the intended setting
 turns out to have had no effect. Free-form passthrough blocks the
@@ -44,32 +44,32 @@ guards the chart's **own** config keys, not arbitrary pod-spec content.
 
 ---
 
-## 1. Security audit-code → values mapping
+## 1. Security-relevant values mapping
 
-The security audits introduced hardening knobs the chart
-exposes as values keys. Every audit-driven knob has a documented
-values-key home, and every security-relevant values key has a known
-audit origin (the audit codes below cross-walk to
-[`security-hardening-checklist.md`](./security-hardening-checklist.md)).
+The security hardening controls introduced knobs the chart exposes as
+values keys. The table below cross-walks each env var to its values key,
+chart default, and binary default; see
+[`security-hardening-checklist.md`](./security-hardening-checklist.md)
+for the full rationale behind each control.
 
-| audit code | env var(s) | values key | chart default | binary default |
+| control | env var(s) | values key | chart default | binary default |
 |---|---|---|---|---|
-| H-1 | `HORT_AUTH_PROVIDER` | `auth.provider` | `oidc` | `disabled` (see caveat) |
-| H-2 | `HORT_HTTP_REQUEST_TIMEOUT_SECS` | `http.requestTimeoutSeconds` | `300` | `300` |
-| H-2 | `HORT_HTTP_HEADER_READ_TIMEOUT_SECS` | `http.headerReadTimeoutSeconds` | `15` | `15` |
-| H-2 | `HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS` | `oci.uploadTimeoutSeconds` | `3600` | `3600` |
-| H-3 | `HORT_METRICS_REQUIRE_AUTH` | `metrics.requireAuth` | `true` | `true` |
-| H-3 | `HORT_METRICS_BIND` | `metrics.bindAddr` | `127.0.0.1:9090` | unset |
-| H-3 | `HORT_METRICS_PUBLIC_BIND` | `metrics.allowUnspecifiedBind` | `false` | `false` |
-| H-7 | `HORT_DATABASE_URL` (split by role; chart injects this canonical name, binary falls back to bare `DATABASE_URL`) | `postgres.app.existingSecret` + `postgres.admin.existingSecret` | (required) | (no default) |
-| M-8 | `HORT_MAX_INFLIGHT` | `http.maxInflight` | `0` (binary default) | `512` |
-| M-8 | `HORT_MAX_INFLIGHT_PER_IP` | `http.maxInflightPerIp` | `0` (binary default) | `32` |
-| M-10 | `HORT_API_BIND` | `api.bindAddr` | `0.0.0.0:8080` | `127.0.0.1:8080` |
-| M-10 | `HORT_REQUIRE_HTTPS` | `requireHttps` | `true` | `false` |
-| M-10 | `HORT_PUBLIC_BASE_URL` | `publicBaseUrl` | (required) | (no default) |
-| SECRET-low-1 | `HORT_SECRETS_FILE_ROOT` | `secrets.fileRoot` | `/etc/hort-server/secrets` | (none) |
-| DOS-low-1 | `HORT_SHUTDOWN_GRACE_SECS` | `shutdown.gracefulSeconds` | `60` | `60` |
-| DOS-low-2 | `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` | `oci.maxSessionsPerPrincipal` | `0` (binary default) | `32` |
+| Auth provider | `HORT_AUTH_PROVIDER` | `auth.provider` | `oidc` | `disabled` (see caveat) |
+| Request timeout | `HORT_HTTP_REQUEST_TIMEOUT_SECS` | `http.requestTimeoutSeconds` | `300` | `300` |
+| Header-read timeout | `HORT_HTTP_HEADER_READ_TIMEOUT_SECS` | `http.headerReadTimeoutSeconds` | `15` | `15` |
+| OCI upload timeout | `HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS` | `oci.uploadTimeoutSeconds` | `3600` | `3600` |
+| Metrics auth | `HORT_METRICS_REQUIRE_AUTH` | `metrics.requireAuth` | `true` | `true` |
+| Metrics bind | `HORT_METRICS_BIND` | `metrics.bindAddr` | `127.0.0.1:9090` | unset |
+| Metrics unspecified-bind guard | `HORT_METRICS_PUBLIC_BIND` | `metrics.allowUnspecifiedBind` | `false` | `false` |
+| Two-role Postgres | `HORT_DATABASE_URL` (split by role; chart injects this canonical name, binary falls back to bare `DATABASE_URL`) | `postgres.app.existingSecret` + `postgres.admin.existingSecret` | (required) | (no default) |
+| Concurrency cap | `HORT_MAX_INFLIGHT` | `http.maxInflight` | `0` (binary default) | `512` |
+| Per-IP concurrency cap | `HORT_MAX_INFLIGHT_PER_IP` | `http.maxInflightPerIp` | `0` (binary default) | `32` |
+| API bind | `HORT_API_BIND` | `api.bindAddr` | `0.0.0.0:8080` | `127.0.0.1:8080` |
+| Require HTTPS | `HORT_REQUIRE_HTTPS` | `requireHttps` | `true` | `false` |
+| Public base URL | `HORT_PUBLIC_BASE_URL` | `publicBaseUrl` | (required) | (no default) |
+| Secret file root | `HORT_SECRETS_FILE_ROOT` | `secrets.fileRoot` | `/etc/hort-server/secrets` | (none) |
+| Graceful shutdown | `HORT_SHUTDOWN_GRACE_SECS` | `shutdown.gracefulSeconds` | `60` | `60` |
+| OCI upload-session cap | `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` | `oci.maxSessionsPerPrincipal` | `0` (binary default) | `32` |
 
 Four caveats:
 
@@ -111,7 +111,7 @@ The chart surface is two values keys:
 - `secrets.fileRoot` — containment root the
   `MountedFileSecretAdapter` enforces. Anything resolved outside this
   root is rejected (symlink-escape protection,
-  SECRET-low-1).
+  symlink-escape protection).
 - `secrets.mounts` — operator-supplied projections of
   `Secret.data[<key>]` to a file under `secrets.fileRoot`. mTLS cert,
   mTLS key, CA bundle, and (when pinned) the pinned-SHA file all live
@@ -135,8 +135,6 @@ Subsections follow `values.yaml` order. For each key:
 - **Description** — one-line; expanded only when the *why* is
   non-obvious
 - **Example** — copy-pasteable override
-- **Initiative cross-reference** — present only for security-relevant
-  keys
 
 ### `image`
 
@@ -192,7 +190,7 @@ image:
   (HSTS only fires when this URL's scheme is `https`) and the OCI
   `WWW-Authenticate: Bearer realm=...` value.
 - **Example:** `https://hort.example.com`
-- **Audit cross-reference:** M-10; H-6
+- **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HTTPS-only realm + upstream URL scheme, HSTS.
 
 ### `api.bindAddr`
 
@@ -211,7 +209,7 @@ image:
   the binary; non-default ports (e.g. `0.0.0.0:9080`) work too,
   remember to raise `service.httpPort` to match.
 - **Example:** `"127.0.0.1:8080"`
-- **Audit cross-reference:** M-10
+- **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HSTS + bind-default + `HORT_REQUIRE_HTTPS`.
 
 ### `requireHttps`
 
@@ -226,7 +224,7 @@ image:
   diverges from the binary default (`false`) on the principle that
   production charts ship with the security gate enabled.
 - **Example:** `false`
-- **Audit cross-reference:** M-10
+- **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HSTS + bind-default + `HORT_REQUIRE_HTTPS`.
 
 ### `trustedProxyCidrs`
 
@@ -238,8 +236,8 @@ image:
   set `X-Forwarded-*`. Scope this to **the address range of the
   ingress-controller / gateway pods themselves** — not the cluster pod
   network. An empty list means no peer is trusted and `X-Forwarded-*`
-  is ignored regardless of source. A sentinel (AUTH-low-2)
-  covers misconfiguration: if the peer is trusted **and** `X-Forwarded-For`
+  is ignored regardless of source. A sentinel covers misconfiguration:
+  if the peer is trusted **and** `X-Forwarded-For`
   is absent, `client_ip` becomes `0.0.0.0` and a throttled `WARN`
   fires — proxy misconfiguration is detectable in dashboards without
   conflating attribution onto the proxy.
@@ -258,8 +256,8 @@ image:
   > **any pod in the cluster** — including a compromised or hostile
   > tenant workload — can spoof its source IP past rate-limiting,
   > fail2ban, and audit attribution. Scope the list to the
-  > gateway/ingress pods — see item **M-A3** in the
-  > [security hardening checklist](security-hardening-checklist.md)
+  > gateway/ingress pods — see the "Rightmost-untrusted `X-Forwarded-For`"
+  > section in the [security hardening checklist](security-hardening-checklist.md)
   > for the matching operator action.
   >
   > **The edge proxy MUST actually set `X-Forwarded-For`.** Trusting a
@@ -267,7 +265,6 @@ image:
   > binary *without* `X-Forwarded-For` (proxy not configured to add it,
   > or it is stripped en route), `client_ip` degrades to the
   > `0.0.0.0` **sentinel** and a throttled `WARN` is logged — the
-  > shipped AUTH-low-2 control
   > (`XFF_MISSING_SENTINEL` in
   > `crates/hort-http-core/src/middleware/trust.rs`). All callers through
   > that proxy then share the one sentinel bucket and per-client
@@ -275,8 +272,7 @@ image:
   > sets `X-Forwarded-For` (most controllers do by default; verify
   > after any custom `proxy_set_header` / header-rewrite config) and
   > watch for the `trusted peer with missing X-Forwarded-For` WARN.
-- **Audit cross-reference:** M-10 + AUTH-low-2 (consumed by HSTS gate
-  + sentinel)
+- **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HSTS, rightmost-untrusted `X-Forwarded-For`.
 
 ### `auth`
 
@@ -285,20 +281,20 @@ schema Rule 2) if `auth.oidc.issuerUrl` and `auth.oidc.audience` are
 unset when `provider: oidc`. `disabled` is allowed but emits a
 prominent post-install `NOTES.txt` warning.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `auth.provider` | `oidc` / `disabled` | `oidc` | yes | H-1 |
-| `auth.oidc.issuerUrl` | string | `""` | yes when `provider: oidc` | — |
-| `auth.oidc.audience` | string | `""` | yes when `provider: oidc` | — |
-| `auth.oidc.groupsClaim` | string | `groups` | no | — |
-| `auth.oidc.jwksCacheTtlSeconds` | integer | `600` | no | — (maps to `HORT_JWKS_CACHE_TTL_SECS`) |
-| `auth.tokenExchange.enabled` | boolean | `false` | no | — |
-| `auth.tokenExchange.cliClientId` | string | `""` | yes when `tokenExchange.enabled: true` | — |
-| `auth.nativeTokens.enabled` | boolean | `false` | no | — |
-| `auth.nativeTokens.signingKey.existingSecret` | string | `""` | yes when `nativeTokens.enabled: true` | — |
-| `auth.nativeTokens.signingKey.secretKey` | string | `hort-oci-token-signing-key.pem` | no | — |
-| `auth.nativeTokens.signingKey.prevExistingSecret` | string | `""` | no (rotation window) | — |
-| `auth.nativeTokens.signingKey.prevSecretKey` | string | `hort-oci-token-signing-key-prev.pem` | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `auth.provider` | `oidc` / `disabled` | `oidc` | yes |
+| `auth.oidc.issuerUrl` | string | `""` | yes when `provider: oidc` |
+| `auth.oidc.audience` | string | `""` | yes when `provider: oidc` |
+| `auth.oidc.groupsClaim` | string | `groups` | no |
+| `auth.oidc.jwksCacheTtlSeconds` | integer | `600` | no (maps to `HORT_JWKS_CACHE_TTL_SECS`) |
+| `auth.tokenExchange.enabled` | boolean | `false` | no |
+| `auth.tokenExchange.cliClientId` | string | `""` | yes when `tokenExchange.enabled: true` |
+| `auth.nativeTokens.enabled` | boolean | `false` | no |
+| `auth.nativeTokens.signingKey.existingSecret` | string | `""` | yes when `nativeTokens.enabled: true` |
+| `auth.nativeTokens.signingKey.secretKey` | string | `hort-oci-token-signing-key.pem` | no |
+| `auth.nativeTokens.signingKey.prevExistingSecret` | string | `""` | no (rotation window) |
+| `auth.nativeTokens.signingKey.prevSecretKey` | string | `hort-oci-token-signing-key-prev.pem` | no |
 
 `disabled` is fail-closed in OCI (no synthetic
 admin), so the binary is safe; but a chart that defaults `disabled` is
@@ -353,13 +349,13 @@ load-shed limits. See
 [`http-transport-timeouts.md`](../http-transport-timeouts.md) for
 operator-level depth on the timeout knobs.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `http.requestTimeoutSeconds` | integer | `300` | no | H-2 |
-| `http.headerReadTimeoutSeconds` | integer | `15` | no | H-2 |
-| `http.maxInflight` | integer | `0` (binary default `512`) | no | M-8 |
-| `http.maxInflightPerIp` | integer | `0` (binary default `32`) | no | M-8 |
-| `http.publishBodyMaxSize` | size string | `""` (binary default `300Mi`) | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `http.requestTimeoutSeconds` | integer | `300` | no |
+| `http.headerReadTimeoutSeconds` | integer | `15` | no |
+| `http.maxInflight` | integer | `0` (binary default `512`) | no |
+| `http.maxInflightPerIp` | integer | `0` (binary default `32`) | no |
+| `http.publishBodyMaxSize` | size string | `""` (binary default `300Mi`) | no |
 
 `headerReadTimeoutSeconds` closes Slowloris-style attacks at the
 connection layer. The OCI blob-upload per-route deadline lives
@@ -388,11 +384,11 @@ Each cap bounds the per-fetch on-disk write; a trip
 emits a structured `502` with `bytes_read` + `cap` and the
 `result=<metadata|manifest|version_object>_too_large` metric label.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `upstream.metadataCacheMaxSize` | size string | `64Mi` | no | — |
-| `upstream.manifestCacheMaxSize` | size string | `16Mi` | no | — |
-| `upstream.projectorVersionObjectMaxSize` | size string | `2Mi` | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `upstream.metadataCacheMaxSize` | size string | `64Mi` | no |
+| `upstream.manifestCacheMaxSize` | size string | `16Mi` | no |
+| `upstream.projectorVersionObjectMaxSize` | size string | `2Mi` | no |
 
 All three are **human-readable size strings** (`64Mi`, `1Gi`, `512Ki`,
 decimal `64M`, or a bare byte integer — quote them), not integers, for
@@ -412,15 +408,15 @@ streaming JSON projector.
 
 Prometheus scrape configuration.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `metrics.bindAddr` | string (host:port) | `127.0.0.1:9090` | no | H-3 |
-| `metrics.allowUnspecifiedBind` | boolean | `false` | no | H-3 |
-| `metrics.requireAuth` | boolean | `true` | no | H-3 |
-| `metrics.serviceMonitor.enabled` | boolean | `false` | no | — |
-| `metrics.serviceMonitor.interval` | duration | `30s` | no | — |
-| `metrics.serviceMonitor.scrapeTimeout` | duration | `10s` | no | — |
-| `metrics.serviceMonitor.namespace` | string | `""` (release ns) | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `metrics.bindAddr` | string (host:port) | `127.0.0.1:9090` | no |
+| `metrics.allowUnspecifiedBind` | boolean | `false` | no |
+| `metrics.requireAuth` | boolean | `true` | no |
+| `metrics.serviceMonitor.enabled` | boolean | `false` | no |
+| `metrics.serviceMonitor.interval` | duration | `30s` | no |
+| `metrics.serviceMonitor.scrapeTimeout` | duration | `10s` | no |
+| `metrics.serviceMonitor.namespace` | string | `""` (release ns) | no |
 
 `/metrics` is always served by the binary. `bindAddr` controls where:
 
@@ -430,7 +426,7 @@ Prometheus scrape configuration.
   exposed; sidecar-scrape pattern.
 - **`bindAddr: "0.0.0.0:9090"`** — dedicated listener on all
   interfaces. Requires `allowUnspecifiedBind: true` (the
-  H-3 safety gate); the binary refuses to start without the explicit
+  unspecified-bind guard); the binary refuses to start without the explicit
   opt-in. Operators take responsibility for restricting reach via
   NetworkPolicy / firewall.
 - **`bindAddr: ""`** — no separate listener. `/metrics` mounts on
@@ -451,17 +447,17 @@ install` with an explicit message if these conditions are not met.
 
 ### `control`
 
-Internal-only control-plane listener (audit code F-33). Moves
+Internal-only control-plane listener. Moves
 the `/admin` API, `/api/v1/admin/*`, and `/api/v1/subscriptions`
 management routes onto a dedicated pod-internal listener so a
 NetworkPolicy can restrict them to the operator network. Mirrors
 `metrics.bindAddr` exactly. See
 [`control-plane-tiers.md`](./control-plane-tiers.md).
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `control.bindAddr` | string (host:port) | `""` | no | F-33 |
-| `control.allowUnspecifiedBind` | boolean | `false` | no | F-33 |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `control.bindAddr` | string (host:port) | `""` | no |
+| `control.allowUnspecifiedBind` | boolean | `false` | no |
 
 `control.bindAddr` maps to `HORT_CONTROL_BIND`. Empty (default) keeps the
 control routes on the main `8080` router — byte-identical to the
@@ -477,11 +473,11 @@ are public by requirement.
 
 ### `oci`
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `oci.uploadTimeoutSeconds` | integer | `3600` | no | H-2 |
-| `oci.legacyCatalogEnabled` | boolean | `false` | no | — |
-| `oci.maxSessionsPerPrincipal` | integer | `0` (binary default `32`) | no | DOS-low-2 |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `oci.uploadTimeoutSeconds` | integer | `3600` | no |
+| `oci.legacyCatalogEnabled` | boolean | `false` | no |
+| `oci.maxSessionsPerPrincipal` | integer | `0` (binary default `32`) | no |
 
 `uploadTimeoutSeconds` maps to `HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS` and
 is applied as a per-route override on
@@ -501,9 +497,9 @@ upload sessions; beyond the cap, new session requests return
 
 ### `shutdown`
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `shutdown.gracefulSeconds` | integer | `60` | no | DOS-low-1 |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `shutdown.gracefulSeconds` | integer | `60` | no |
 
 Wraps `with_graceful_shutdown` in `tokio::time::timeout`. On timeout
 the runtime aborts outstanding join handles and emits a `WARN`
@@ -517,10 +513,10 @@ Surface for the mounted-file `SecretPort` adapter. See
 [`wire-secrets.md`](../wire-secrets.md) for the operator-side
 walk-through.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `secrets.fileRoot` | absolute path | `/etc/hort-server/secrets` | no | SECRET-low-1 |
-| `secrets.mounts` | list of `{name, secretName, key, path}` | `[]` | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `secrets.fileRoot` | absolute path | `/etc/hort-server/secrets` | no |
+| `secrets.mounts` | list of `{name, secretName, key, path}` | `[]` | no |
 
 `secrets.fileRoot` is the containment root for `secret_ref`
 resolution; anything resolved outside this root is rejected
@@ -554,7 +550,7 @@ secrets:
 
 ### `postgres`
 
-External-only Postgres. Two roles (H-7):
+External-only Postgres. Two roles:
 `admin` (DDL) used by the migrations Job at install/upgrade time only,
 `app` (DML) used by the runtime Deployment with `INSERT, SELECT` only
 on `events`. Startup-time `has_table_privilege` probes refuse to start
@@ -562,12 +558,12 @@ if the runtime role retains `UPDATE` / `DELETE` / `TRUNCATE` /
 `REFERENCES` on `events`. The chart does not bundle a Postgres
 subchart; eval/dev users use `deploy/compose/docker-compose.yml`.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `postgres.app.existingSecret` | string | `""` | yes (schema rule 5) | H-7 |
-| `postgres.app.secretKey` | string | `DATABASE_URL` | no | — |
-| `postgres.admin.existingSecret` | string | `""` | yes (schema rule 6) | H-7 |
-| `postgres.admin.secretKey` | string | `DATABASE_URL` | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `postgres.app.existingSecret` | string | `""` | yes (schema rule 5) |
+| `postgres.app.secretKey` | string | `DATABASE_URL` | no |
+| `postgres.admin.existingSecret` | string | `""` | yes (schema rule 6) |
+| `postgres.admin.secretKey` | string | `DATABASE_URL` | no |
 
 Both `existingSecret` references point at Kubernetes Secrets in the
 chart's namespace whose `secretKey` value is a full
@@ -586,21 +582,21 @@ not the env-var name the chart injects.
 
 Artifact CAS backend.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `storage.backend` | `filesystem` / `s3` | `filesystem` | yes | — |
-| `storage.filesystem.pvc.enabled` | boolean | `true` | no | — |
-| `storage.filesystem.pvc.size` | quantity | `50Gi` | no | — |
-| `storage.filesystem.pvc.storageClassName` | string | `""` (cluster default) | no | — |
-| `storage.filesystem.pvc.accessMode` | string | `ReadWriteOnce` | no | — |
-| `storage.s3.endpoint` | string | `""` | yes when `backend: s3` | — |
-| `storage.s3.region` | string | `""` | yes when `backend: s3` | — |
-| `storage.s3.bucket` | string | `""` | yes when `backend: s3` | — |
-| `storage.s3.pathStyle` | boolean | `true` | no | — |
-| `storage.s3.allowHttp` | boolean | `false` | no | — |
-| `storage.s3.sseMode` | `""` / `bucket-default` / `sse256` / `sse-kms` | `""` | no | L-A12 |
-| `storage.s3.sseKmsKeyArn` | string | `""` | yes when `sseMode: sse-kms` | L-A12 |
-| `storage.s3.existingSecret` | string | `""` | yes when `backend: s3` | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `storage.backend` | `filesystem` / `s3` | `filesystem` | yes |
+| `storage.filesystem.pvc.enabled` | boolean | `true` | no |
+| `storage.filesystem.pvc.size` | quantity | `50Gi` | no |
+| `storage.filesystem.pvc.storageClassName` | string | `""` (cluster default) | no |
+| `storage.filesystem.pvc.accessMode` | string | `ReadWriteOnce` | no |
+| `storage.s3.endpoint` | string | `""` | yes when `backend: s3` |
+| `storage.s3.region` | string | `""` | yes when `backend: s3` |
+| `storage.s3.bucket` | string | `""` | yes when `backend: s3` |
+| `storage.s3.pathStyle` | boolean | `true` | no |
+| `storage.s3.allowHttp` | boolean | `false` | no |
+| `storage.s3.sseMode` | `""` / `bucket-default` / `sse256` / `sse-kms` | `""` | no |
+| `storage.s3.sseKmsKeyArn` | string | `""` | yes when `sseMode: sse-kms` |
+| `storage.s3.existingSecret` | string | `""` | yes when `backend: s3` |
 
 `filesystem` uses an RWO PVC (single replica only). `s3` is required
 when `replicaCount > 1` (RWO PVC cannot multi-attach; schema rule
@@ -633,19 +629,19 @@ otherwise) and the KMS key must grant the S3 service
 Ephemeral state backend (auth lockout counters, OCI session counts,
 JWKS cache).
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `ephemeralStore.backend` | `memory` / `redis` | `memory` | yes | — |
-| `ephemeralStore.memory` | object | `{}` | no | reserved |
-| `ephemeralStore.redis.url` | string | `""` | yes when `backend: redis` and `existingSecret` empty | — |
-| `ephemeralStore.redis.existingSecret` | string | `""` | yes when `backend: redis` and `url` empty | — |
-| `ephemeralStore.redis.secretKey` | string | `REDIS_URL` | no | — |
-| `ephemeralStore.redis.evictableUrl` | string | `""` | no | — |
-| `ephemeralStore.redis.evictableExistingSecret` | string | `""` | no | — |
-| `ephemeralStore.redis.evictableSecretKey` | string | `REDIS_URL_EVICTABLE` | no | — |
-| `ephemeralStore.redis.durableUrl` | string | `""` | no | — |
-| `ephemeralStore.redis.durableExistingSecret` | string | `""` | no | — |
-| `ephemeralStore.redis.durableSecretKey` | string | `REDIS_URL_DURABLE` | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `ephemeralStore.backend` | `memory` / `redis` | `memory` | yes |
+| `ephemeralStore.memory` | object | `{}` | no |
+| `ephemeralStore.redis.url` | string | `""` | yes when `backend: redis` and `existingSecret` empty |
+| `ephemeralStore.redis.existingSecret` | string | `""` | yes when `backend: redis` and `url` empty |
+| `ephemeralStore.redis.secretKey` | string | `REDIS_URL` | no |
+| `ephemeralStore.redis.evictableUrl` | string | `""` | no |
+| `ephemeralStore.redis.evictableExistingSecret` | string | `""` | no |
+| `ephemeralStore.redis.evictableSecretKey` | string | `REDIS_URL_EVICTABLE` | no |
+| `ephemeralStore.redis.durableUrl` | string | `""` | no |
+| `ephemeralStore.redis.durableExistingSecret` | string | `""` | no |
+| `ephemeralStore.redis.durableSecretKey` | string | `REDIS_URL_DURABLE` | no |
 
 Multi-pod deployments **must** use Redis — `memory` cannot share state
 across pods. `values.schema.json` Rule 8a blocks `replicaCount > 1` +
@@ -784,8 +780,7 @@ typical single-replica deployments accept eviction).
 | `networkPolicy.ingress` | list (NetworkPolicy ingress rules) | `[]` | no |
 | `networkPolicy.egress` | list (NetworkPolicy egress rules) | `[]` | no |
 
-**Default-on** (F-33 flipped the previous default
-off). Set `networkPolicy.enabled: false` to opt out entirely (documented
+**Default-on** (flipped from the previous default off). Set `networkPolicy.enabled: false` to opt out entirely (documented
 escape hatch — e.g. a mesh `AuthorizationPolicy` already governs the
 namespace). With it enabled, an **empty** `ingress` / `egress` list
 renders a policy that selects the policyType with zero rules ⇒ stock
@@ -864,11 +859,11 @@ outbound TLS connections: upstream proxy requests, S3/MinIO storage,
 and OIDC discovery and JWKS. See
 [`extra-ca-bundle.md`](./extra-ca-bundle.md) for operator recipes.
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `extraCaBundle.path` | string (absolute path in container) | `""` | conditional | — |
-| `extraCaBundle.configMapName` | string (ConfigMap name) | `""` | conditional | — |
-| `extraCaBundle.secretName` | string (Secret name) | `""` | conditional | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `extraCaBundle.path` | string (absolute path in container) | `""` | conditional |
+| `extraCaBundle.configMapName` | string (ConfigMap name) | `""` | conditional |
+| `extraCaBundle.secretName` | string (Secret name) | `""` | conditional |
 
 **Failure semantics (fail-closed):** If `path` is set but the file is
 unreadable, malformed, or contains zero parseable certificates, the
@@ -972,11 +967,11 @@ Two execution paths:
 
 Top-level gating keys:
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `scheduledTasks.adminTasksEnabled` | boolean | `false` | no | — |
-| `scheduledTasks.svcTokenKubectlImage` | string | `bitnamilegacy/kubectl:1.30` | no | — |
-| `scheduledTasks.rotateSvcToken` | boolean | `false` | no | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `scheduledTasks.adminTasksEnabled` | boolean | `false` | no |
+| `scheduledTasks.svcTokenKubectlImage` | string | `bitnamilegacy/kubectl:1.30` | no |
+| `scheduledTasks.rotateSvcToken` | boolean | `false` | no |
 
 `adminTasksEnabled` is the single opt-in surface for every
 `executionPath: admin-task` task — it replaces the retired
@@ -1029,31 +1024,31 @@ separate pod from the server that claims `jobs` rows and dispatches each
 to its registered `TaskHandler` (scan, cron-rescan-tick,
 advisory-watch-tick, staging-sweep, etc.).
 
-| sub-key | type | default | required | audit code |
-|---|---|---|---|---|
-| `worker.enabled` | boolean | `true` | no | — |
-| `worker.replicas` | integer | `1` | no | — |
-| `worker.workerIdOverride` | string | `""` | no | — |
-| `worker.image.repository` | string | `hort/hort-worker` | no | — |
-| `worker.image.tag` | string | `""` | no | empty ⇒ `.Chart.appVersion` |
-| `worker.image.pullPolicy` | enum | `IfNotPresent` | no | — |
-| `worker.resources` | object | `{cpu, memory}` | no | — |
-| `worker.scanner.pollIntervalSecs` | integer | `5` | no | — |
-| `worker.scanner.batchSize` | integer | `4` | no | — |
-| `worker.scanner.maxAttempts` | integer | `5` | no | — |
-| `worker.scanner.lockDurationSecs` | integer | `900` | no | — |
-| `worker.scanner.trivy.enabled` | boolean | `true` | no | — |
-| `worker.scanner.trivy.binary` | string | `/usr/local/bin/trivy` | no | — |
-| `worker.scanner.trivy.dbDir` | string | `/var/cache/trivy` | no | — |
-| `worker.scanner.osv.enabled` | boolean | `true` | no | — |
-| `worker.scanner.osv.binary` | string | `/usr/local/bin/osv-scanner` | no | — |
-| `worker.advisory.osvUrl` | string | `https://api.osv.dev/v1/querybatch` | no | — |
-| `worker.db.lockTimeoutMs` | integer | `120000` | no | — |
-| `worker.serviceAccount.create` | boolean | `true` | no | — |
-| `worker.serviceAccount.name` | string | `""` | no | — |
-| `worker.serviceAccount.annotations` | map | `{}` | no | — |
-| `worker.rotation.targetNamespaces` | list | `[]` | no | — |
-| `worker.rotation.publicRegistryHost` | string | `""` | conditional | — |
+| sub-key | type | default | required |
+|---|---|---|---|
+| `worker.enabled` | boolean | `true` | no |
+| `worker.replicas` | integer | `1` | no |
+| `worker.workerIdOverride` | string | `""` | no |
+| `worker.image.repository` | string | `hort/hort-worker` | no |
+| `worker.image.tag` | string | `""` | no (empty ⇒ `.Chart.appVersion`) |
+| `worker.image.pullPolicy` | enum | `IfNotPresent` | no |
+| `worker.resources` | object | `{cpu, memory}` | no |
+| `worker.scanner.pollIntervalSecs` | integer | `5` | no |
+| `worker.scanner.batchSize` | integer | `4` | no |
+| `worker.scanner.maxAttempts` | integer | `5` | no |
+| `worker.scanner.lockDurationSecs` | integer | `900` | no |
+| `worker.scanner.trivy.enabled` | boolean | `true` | no |
+| `worker.scanner.trivy.binary` | string | `/usr/local/bin/trivy` | no |
+| `worker.scanner.trivy.dbDir` | string | `/var/cache/trivy` | no |
+| `worker.scanner.osv.enabled` | boolean | `true` | no |
+| `worker.scanner.osv.binary` | string | `/usr/local/bin/osv-scanner` | no |
+| `worker.advisory.osvUrl` | string | `https://api.osv.dev/v1/querybatch` | no |
+| `worker.db.lockTimeoutMs` | integer | `120000` | no |
+| `worker.serviceAccount.create` | boolean | `true` | no |
+| `worker.serviceAccount.name` | string | `""` | no |
+| `worker.serviceAccount.annotations` | map | `{}` | no |
+| `worker.rotation.targetNamespaces` | list | `[]` | no |
+| `worker.rotation.publicRegistryHost` | string | `""` | conditional |
 
 `worker.enabled: false` stops the worker rendering; dispatched
 `kind='scan'` jobs then accumulate with no progress. Under

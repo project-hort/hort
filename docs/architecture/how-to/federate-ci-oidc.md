@@ -108,7 +108,7 @@ concurrently.
 >   `<issuer>`) constrains only a repository/project claim without a
 >   discriminating ref/environment/workflow/aud — any workflow in
 >   that repo can assume this identity. Add a discriminating claim
->   (e.g. `ref`, `environment`, `workflow`) or pin `aud` (audit F-7).
+>   (e.g. `ref`, `environment`, `workflow`) or pin `aud`.
 > ```
 > (structured fields: `service_account`, `federated_identity_index`,
 > `issuer`).

@@ -14,29 +14,27 @@
 //!
 //! - POST `application/json; charset=utf-8` to the configured URL.
 //! - `X-Hort-Signature: sha256=<hex>` header with HMAC-SHA256 of the
-//!   canonical body (the exact bytes as transmitted, no normalisation —
-//!   design §8).
+//!   canonical body (the exact bytes as transmitted, no normalisation).
 //! - `X-Hort-Subscription-Id`, `X-Hort-Schema-Version`, `X-Hort-Delivery-Id`
 //!   headers; the delivery id is a fresh `Uuid::new_v4()` per call.
 //! - `Policy::limited(0)` redirect policy — webhook URLs must be
 //!   canonical. 3xx surfaces as
-//!   `DownstreamRejected { reason: RedirectAttempted }` per §11
-//!   invariant 11 (blocks the "compromised receiver redirects into
-//!   IMDS / RFC 1918" SSRF channel).
+//!   `DownstreamRejected { reason: RedirectAttempted }` (blocks the
+//!   "compromised receiver redirects into IMDS / RFC 1918" SSRF channel).
 //! - 5s connect timeout, 10s total. Single attempt — no retry; the
-//!   notifier is best-effort per §11 invariant 1.
+//!   notifier is best-effort.
 //!
 //! # SSRF guard
 //!
 //! [`WebhookTargetGuard::check`] is called at subscription create-time
-//! by `SubscriptionUseCase` (Item 4). IP-literal hosts call
+//! by `SubscriptionUseCase`. IP-literal hosts call
 //! [`hort_net_egress::is_routable`] directly; DNS-name hosts perform a
 //! single resolution attempt via [`tokio::net::lookup_host`] with a 5s
 //! timeout and check every returned IP. Operator opt-out
 //! (`HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS=true`) is consumed at the
 //! use-case layer; this adapter trusts the call site to gate.
 //!
-//! # HMAC key derivation — SecretPort-resolved shared secret (F-19)
+//! # HMAC key derivation — SecretPort-resolved shared secret
 //!
 //! `SubscriptionTarget::Webhook { secret_ref }` carries a
 //! [`SecretRef`] — an env-var / file **locator**, not the secret
@@ -96,14 +94,13 @@ mod extra_ca;
 use dns_guard::{GuardedDnsResolver, HostAllowlist};
 
 // ---------------------------------------------------------------------------
-// Constants — design doc §7 + §8
+// Constants
 // ---------------------------------------------------------------------------
 
-/// Connect timeout per design doc §7 ("Connect timeout 5s, total
-/// request timeout 10s").
+/// Connect timeout ("Connect timeout 5s, total request timeout 10s").
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Total request timeout per design doc §7.
+/// Total request timeout.
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// DNS resolution timeout for the SSRF guard. Same 5s as the HTTP
@@ -111,14 +108,13 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// downstream connect would.
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Wire-format `schema_version` per design doc §8. Bumped only on
-/// breaking changes; until then the wire shape is locked (§11
-/// invariant 7).
+/// Wire-format `schema_version`. Bumped only on breaking changes;
+/// until then the wire shape is locked (invariant 7).
 const SCHEMA_VERSION: u32 = 1;
 
 /// Forward-proxy environment variables reqwest's `system-proxy` feature
 /// consults. If any is set, the webhook delivery client routes through that
-/// proxy and the connect-time SSRF DNS-rebind guard (audit F-4) is delegated
+/// proxy and the connect-time SSRF DNS-rebind guard is delegated
 /// to the proxy's egress allowlist — surfaced by the `warn!` in
 /// [`WebhookNotifier::with_allowlist`].
 const PROXY_ENV_VARS: &[&str] = &[
@@ -142,12 +138,11 @@ fn configured_proxy_vars(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'stati
 }
 
 // ---------------------------------------------------------------------------
-// Wire body — design doc §8
+// Wire body
 // ---------------------------------------------------------------------------
 
-/// Wire-shape of the body POSTed to the webhook URL. Matches design
-/// doc §8 exactly. Receivers verify the signature against the raw
-/// bytes — they must NOT re-serialise (§8 "Signing canonicalisation").
+/// Wire-shape of the body POSTed to the webhook URL. Receivers verify
+/// the signature against the raw bytes — they must NOT re-serialise.
 #[derive(Serialize)]
 struct WebhookBody<'a> {
     schema_version: u32,
@@ -234,9 +229,9 @@ impl WebhookNotifier {
             // Policy::limited(0) — block redirects so a compromised
             // receiver cannot 3xx into IMDS / RFC 1918. 3xx responses
             // surface as `DownstreamRejected { RedirectAttempted }` via
-            // the adapter's response classifier (§11 invariant 11).
+            // the adapter's response classifier.
             .redirect(Policy::limited(0))
-            // Audit F-4 (refresh): we intentionally DO NOT call `.no_proxy()`.
+            // We intentionally DO NOT call `.no_proxy()`.
             // A forward/egress proxy is itself an operator security control
             // (egress allowlist, connection logging, DLP) and is frequently
             // the ONLY outbound route in hardened deployments — forcing direct
@@ -263,19 +258,18 @@ impl WebhookNotifier {
         let client = builder.build().map_err(|e| {
             DomainError::Invariant(format!("upstream:client_build:reqwest_build:{e}"))
         })?;
-        // Audit F-4 (refresh): if an egress proxy is configured, the
-        // connect-time GuardedDnsResolver SSRF guard above cannot see the
-        // dialed target (reqwest connects to the proxy; the proxy resolves the
-        // target), so SSRF filtering is DELEGATED to the proxy's egress
-        // allowlist. Surface that delegation loudly so it is not a silent
-        // bypass — the operator must ensure the proxy restricts webhook
-        // destinations (block link-local / RFC1918 / IMDS).
+        // If an egress proxy is configured, the connect-time GuardedDnsResolver
+        // SSRF guard above cannot see the dialed target (reqwest connects to the
+        // proxy; the proxy resolves the target), so SSRF filtering is DELEGATED
+        // to the proxy's egress allowlist. Surface that delegation loudly so it
+        // is not a silent bypass — the operator must ensure the proxy restricts
+        // webhook destinations (block link-local / RFC1918 / IMDS).
         let proxied = configured_proxy_vars(|k| std::env::var(k).ok());
         if !proxied.is_empty() {
             tracing::warn!(
                 proxy_env = ?proxied,
                 "webhook delivery routes through an egress proxy; the connect-time \
-                 SSRF DNS-rebind guard (audit F-4) inspects only the direct-connect \
+                 SSRF DNS-rebind guard inspects only the direct-connect \
                  address and is therefore DELEGATED to the proxy's egress allowlist \
                  — ensure the proxy blocks link-local/RFC1918/IMDS webhook targets. \
                  The in-process guard is fully effective only when no proxy is set."
@@ -284,7 +278,7 @@ impl WebhookNotifier {
         Ok(Self {
             client,
             secret_port,
-            // F-21: the create/update guard consults the SAME allowlist
+            // The create/update guard consults the SAME allowlist
             // the delivery `GuardedDnsResolver` above was built from.
             allowlist,
         })
@@ -321,7 +315,7 @@ impl EventNotifier for WebhookNotifier {
             // resolve failure is non-transient from this adapter's view
             // (the operator must fix the env var / mounted file); surface
             // it as a closed-enum `Other` failure WITHOUT panicking. No
-            // URL / secret in the log line (design §11 audit row).
+            // URL / secret in the log line.
             let secret = match self.secret_port.resolve(secret_ref).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -359,8 +353,8 @@ impl EventNotifier for WebhookNotifier {
 
 impl WebhookTargetGuard for WebhookNotifier {
     fn check<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<(), SsrfBlockReason>> {
-        // F-21: the create/update guard consults the SAME allowlist the
-        // delivery `GuardedDnsResolver` honours, so an operator-allowlisted
+        // The create/update guard consults the SAME allowlist the delivery
+        // `GuardedDnsResolver` honours, so an operator-allowlisted
         // internal/proxy-reached receiver passes create-time validation
         // by name (no direct resolve) instead of needing the blanket
         // `HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS` opt-out. The port
@@ -475,7 +469,7 @@ fn classify_response(status: reqwest::StatusCode) -> NotifyOutcome {
 /// 3xx response as a *redirect error* (not a successful response with
 /// a 3xx status). We special-case `e.is_redirect()` so the dispatcher
 /// sees `DownstreamRejected { RedirectAttempted }` — matching the
-/// design doc §7 contract that a 3xx is a downstream-side rejection,
+/// the contract that a 3xx is a downstream-side rejection,
 /// not a transport failure on our side.
 ///
 /// reqwest's other classifiers (`is_timeout`, `is_connect`) are not
@@ -512,7 +506,7 @@ fn classify_error(e: &reqwest::Error) -> NotifyOutcome {
 /// Check whether `url`'s host is a permitted webhook target at
 /// subscription create/update time.
 ///
-/// # Precedence (F-21 — additive over the original routability check)
+/// # Allowlist precedence
 ///
 /// The allowlist is the SAME `HORT_WEBHOOK_ALLOWLIST_HOSTS` set the
 /// delivery-path [`GuardedDnsResolver`] honours (threaded from
@@ -522,7 +516,7 @@ fn classify_error(e: &reqwest::Error) -> NotifyOutcome {
 /// not a re-implementation):
 ///
 /// 1. **DNS-name host explicitly on the allowlist BY NAME** → ACCEPT
-///    with NO resolve. This is the load-bearing F-21 behaviour: an
+///    with NO resolve. An
 ///    operator-allowlisted internal/proxy-reached receiver passes
 ///    create-time validation even on a proxy-only pod with no direct
 ///    DNS (the direct resolve below would otherwise fail / bypass the
@@ -547,7 +541,7 @@ fn classify_error(e: &reqwest::Error) -> NotifyOutcome {
 /// entirely.
 ///
 /// Never panics, never logs the resolved IP set (avoids leaking
-/// internal-network topology per design doc §11 audit logging row).
+/// internal-network topology).
 async fn check_url_routable(url: Url, allowlist: HostAllowlist) -> Result<(), SsrfBlockReason> {
     // No host → reject. Backstop; the use case already rejects URLs
     // without hosts as `InvalidWebhookUrl` before reaching the guard.
@@ -561,7 +555,7 @@ async fn check_url_routable(url: Url, allowlist: HostAllowlist) -> Result<(), Ss
     // `Ipv6` variant whose `to_ipv4()` projection is the v4 literal).
     // `Host::Domain` is the DNS-name path.
     //
-    // F-21 precedence step 2: a literal IP is accepted if it is inside an
+    // Allowlist precedence step 2: a literal IP is accepted if it is inside an
     // allowlisted CIDR OR routable — no DNS (it is already an IP), so a
     // literal IMDS / RFC1918 address not on the allowlist is still
     // rejected. Mirrors `GuardedDnsResolver::permit` (sans the host-name
@@ -586,7 +580,7 @@ async fn check_url_routable(url: Url, allowlist: HostAllowlist) -> Result<(), Ss
         url::Host::Domain(d) => d.to_owned(),
     };
 
-    // F-21 precedence step 1: a DNS name explicitly allowlisted BY NAME
+    // Allowlist precedence step 1: a DNS name explicitly allowlisted BY NAME
     // is accepted WITHOUT a resolve — so it works on a proxy-only pod
     // with no direct DNS, and never bypasses an egress proxy at create
     // time. Reuses `HostAllowlist::host_allowed` (the same match the
@@ -595,7 +589,7 @@ async fn check_url_routable(url: Url, allowlist: HostAllowlist) -> Result<(), Ss
         return Ok(());
     }
 
-    // F-21 precedence step 3: non-allowlisted DNS name → the EXISTING
+    // Allowlist precedence step 3: non-allowlisted DNS name → the EXISTING
     // single-shot resolve. (An allowlisted CIDR is still honoured per
     // address below, matching `permit`.)
     let port = url.port_or_known_default().unwrap_or(443);
@@ -635,7 +629,7 @@ mod tests {
     use super::*;
     use hort_domain::ports::secret_port::{SecretRef, SecretSource, SecretValue};
 
-    // -- Proxy-detection helper (audit F-4 refresh) -------------------------
+    // -- Proxy-detection helper -------------------------
     //
     // `configured_proxy_vars` is pure (takes the env lookup as a param) so
     // these assert the warn-trigger logic without mutating process-global env.
@@ -722,9 +716,9 @@ mod tests {
         assert_eq!(result, Err(SsrfBlockReason::IpLiteralNotRoutable));
     }
 
-    /// H-3 regression: IPv4-mapped IPv6 form of AWS IMDS must be
-    /// rejected. `hort_net_egress::is_routable` covers this in its IPv6
-    /// branch via `to_ipv4()`; this test pins the adapter wiring.
+    /// IPv4-mapped IPv6 form of AWS IMDS must be rejected.
+    /// `hort_net_egress::is_routable` covers this in its IPv6 branch via
+    /// `to_ipv4()`; this test pins the adapter wiring.
     #[tokio::test]
     async fn check_url_routable_rejects_ipv4_mapped_ipv6_imds() {
         let url = Url::parse("http://[::ffff:169.254.169.254]/x").unwrap();
@@ -770,18 +764,18 @@ mod tests {
         assert_eq!(result, Err(SsrfBlockReason::DnsResolutionFailed));
     }
 
-    // -- F-21: create/update guard consults the host-allowlist -------------
+    // -- Create/update guard consults the host-allowlist -------------------
     //
-    // These pin the F-21 precedence in the create/update guard
+    // These pin the allowlist precedence in the create/update guard
     // (`check_url_routable`), distinct from the delivery-path
     // `GuardedDnsResolver::permit` tests in `dns_guard.rs`. The
     // load-bearing assertion is precedence step 1: an allowlisted-BY-NAME
     // host is accepted WITHOUT any resolve.
 
-    /// F-21 (load-bearing): a host on the allowlist BY NAME is accepted at
-    /// create-time WITHOUT a resolve. Uses an RFC 2606 `.invalid` name
-    /// that CANNOT resolve — pre-F-21 this hit the direct-resolve path and
-    /// was rejected `DnsResolutionFailed`; post-F-21 the by-name allowlist
+    /// A host on the allowlist BY NAME is accepted at create-time WITHOUT
+    /// a resolve. Uses an RFC 2606 `.invalid` name that CANNOT resolve —
+    /// before the allowlist was introduced this hit the direct-resolve path
+    /// and was rejected `DnsResolutionFailed`; the by-name allowlist
     /// short-circuits before any resolve, so it is accepted. That the
     /// `.invalid` name is unresolvable is exactly what proves "no resolve
     /// happened": had the code resolved, it would have failed.
@@ -798,7 +792,7 @@ mod tests {
         );
     }
 
-    /// F-21: case-insensitive by-name match (mirrors `host_allowed`).
+    /// Case-insensitive by-name match (mirrors `host_allowed`).
     #[tokio::test]
     async fn check_url_routable_accepts_allowlisted_name_case_insensitive() {
         let url = Url::parse("https://INTERNAL-RECEIVER.invalid/hook").unwrap();
@@ -806,7 +800,7 @@ mod tests {
         assert_eq!(check_url_routable(url, allowlist).await, Ok(()));
     }
 
-    /// F-21: a NON-allowlisted, non-routable DNS name is STILL rejected —
+    /// A NON-allowlisted, non-routable DNS name is STILL rejected —
     /// existing behaviour preserved. `localhost` resolves to loopback
     /// (non-routable) and is not on the allowlist.
     #[tokio::test]
@@ -821,7 +815,7 @@ mod tests {
         );
     }
 
-    /// F-21: a literal IMDS IP NOT on the allowlist is still rejected,
+    /// A literal IMDS IP NOT on the allowlist is still rejected,
     /// with NO DNS (it is already an IP). `169.254.169.254` is AWS IMDS.
     #[tokio::test]
     async fn check_url_routable_rejects_literal_imds_not_allowlisted() {
@@ -834,7 +828,7 @@ mod tests {
         );
     }
 
-    /// F-21: a literal RFC1918 IP NOT on the allowlist is still rejected.
+    /// A literal RFC1918 IP NOT on the allowlist is still rejected.
     #[tokio::test]
     async fn check_url_routable_rejects_literal_rfc1918_not_allowlisted() {
         let url = Url::parse("http://10.0.0.1/x").unwrap();
@@ -845,7 +839,7 @@ mod tests {
         );
     }
 
-    /// F-21: a literal RFC1918 IP that IS inside an allowlisted CIDR is
+    /// A literal RFC1918 IP that IS inside an allowlisted CIDR is
     /// accepted — no DNS. Mirrors `ip_allowed`.
     #[tokio::test]
     async fn check_url_routable_accepts_literal_ip_in_allowlisted_cidr() {
@@ -854,7 +848,7 @@ mod tests {
         assert_eq!(check_url_routable(url, allowlist).await, Ok(()));
     }
 
-    /// F-21: a literal routable IP is still accepted even when the
+    /// A literal routable IP is still accepted even when the
     /// allowlist is non-empty and does not name it (the `is_routable`
     /// arm of the IP-literal decision is preserved).
     #[tokio::test]
@@ -864,7 +858,7 @@ mod tests {
         assert_eq!(check_url_routable(url, allowlist).await, Ok(()));
     }
 
-    // -- F-21: guard entry point (`WebhookTargetGuard::check`) -------------
+    // -- Guard entry point (`WebhookTargetGuard::check`) -------------------
     //
     // `SubscriptionUseCase::create` AND `::update` both invoke the guard
     // through `self.webhook_guard.check(url)` — the SAME trait method.
@@ -876,10 +870,9 @@ mod tests {
     // entry-point test per outcome covers both paths (the guard logic is
     // shared; see the use case's two call sites).
 
-    /// F-21 (load-bearing, guard entry point): an allowlisted-by-name
-    /// (unresolvable `.invalid`) host is ACCEPTED via the
-    /// `WebhookTargetGuard::check` trait method — without a resolve.
-    /// Pre-F-21 the notifier ignored its allowlist here and this rejected.
+    /// An allowlisted-by-name (unresolvable `.invalid`) host is ACCEPTED
+    /// via the `WebhookTargetGuard::check` trait method — without a
+    /// resolve.
     #[tokio::test]
     async fn guard_check_accepts_allowlisted_name_without_resolve() {
         let n = WebhookNotifier::with_allowlist(
@@ -897,8 +890,8 @@ mod tests {
         );
     }
 
-    /// F-21 (guard entry point): a non-allowlisted non-routable host is
-    /// still REJECTED through the trait method (existing behaviour).
+    /// A non-allowlisted non-routable host is still REJECTED through
+    /// the trait method (existing behaviour).
     #[tokio::test]
     async fn guard_check_rejects_nonallowlisted_nonroutable_host() {
         let n = WebhookNotifier::with_allowlist(
@@ -914,8 +907,8 @@ mod tests {
         );
     }
 
-    /// F-21 (guard entry point): a literal IMDS IP not on the allowlist is
-    /// still REJECTED through the trait method (no DNS).
+    /// A literal IMDS IP not on the allowlist is still REJECTED through
+    /// the trait method (no DNS).
     #[tokio::test]
     async fn guard_check_rejects_literal_imds_not_allowlisted() {
         let n = WebhookNotifier::with_allowlist(
@@ -1030,16 +1023,16 @@ mod tests {
         }
     }
 
-    // -- F-4 connect-time guard: end-to-end through the bound client -------
+    // -- Connect-time guard: end-to-end through the bound client ----------
     //
     // These two tests prove the `GuardedDnsResolver` is actually BOUND
     // to the webhook `reqwest::Client` (not merely unit-correct in
     // isolation): the same DNS-name webhook target is BLOCKED when the
     // resolved address is non-routable and not allowlisted, and ALLOWED
-    // when the host is allowlisted (F-21). The IP-literal SSRF cases are
+    // when the host is allowlisted. The IP-literal SSRF cases are
     // covered by the create-time `check_url_routable` tests above; the
     // resolver only fires for DNS names (reqwest skips DNS for IP
-    // literals), which is exactly the rebinding-TOCTOU surface (F-4).
+    // literals), which is exactly the rebinding-TOCTOU surface.
 
     fn webhook_target(url: &str) -> SubscriptionTarget {
         SubscriptionTarget::Webhook {
@@ -1050,13 +1043,13 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_to_rebound_nonroutable_dns_name_is_blocked_by_connect_guard() {
-        // Simulates the audit F-4 attack tail: a webhook registered on a
-        // DNS name that (post-create rebind) resolves to a non-routable
-        // address. `localhost` is the stable DNS name resolving to
-        // loopback on every system. With the default (empty) allowlist
-        // the guarded resolver filters every resolved address out, so
-        // reqwest gets an empty address set and the connect fails —
-        // the rebind target is NEVER dialed.
+        // Simulates the DNS-rebinding attack tail: a webhook registered on
+        // a DNS name that (post-create rebind) resolves to a non-routable
+        // address. `localhost` is the stable DNS name resolving to loopback
+        // on every system. With the default (empty) allowlist the guarded
+        // resolver filters every resolved address out, so reqwest gets an
+        // empty address set and the connect fails — the rebind target is
+        // NEVER dialed.
         let n = WebhookNotifier::with_allowlist(
             None,
             fixed_secret_port(b"s"),
@@ -1077,7 +1070,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_to_allowlisted_internal_host_is_permitted_by_connect_guard() {
-        // F-21: an operator-allowlisted internal receiver. A wiremock
+        // An operator-allowlisted internal receiver. A wiremock
         // server bound to loopback is a faithful stand-in for an
         // in-DMZ/in-cluster webhook receiver on a non-routable address.
         // With `localhost` allowlisted, the guarded resolver RETAINS the
@@ -1129,10 +1122,10 @@ mod tests {
 
         // The plaintext the operator provisioned behind the SecretRef.
         const KNOWN_PLAINTEXT: &[u8] = b"the-real-shared-secret-bytes";
-        // The string that the PRE-F-19 code would have used as the
-        // key: the Argon2id PHC string stored on the row. If the fix
-        // regressed and the at-rest value were used, the signature
-        // would match THIS — the test asserts it does NOT.
+        // The string that the old code would have used as the key:
+        // the Argon2id PHC string stored on the row. If this regressed
+        // and the at-rest value were used, the signature would match
+        // THIS — the test asserts it does NOT.
         const OLD_STORED_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA";
 
         let server = MockServer::start().await;
@@ -1180,7 +1173,7 @@ mod tests {
         good.update(body_bytes);
         let expected_hex = hex::encode(good.finalize().into_bytes());
 
-        // The pre-F-19 (vulnerable) key: the at-rest stored hash.
+        // The old (vulnerable) key: the at-rest stored hash.
         let mut bad = Hmac::<Sha256>::new_from_slice(OLD_STORED_HASH.as_bytes())
             .expect("any-length HMAC key");
         bad.update(body_bytes);
@@ -1188,12 +1181,12 @@ mod tests {
 
         assert_eq!(
             received_hex, expected_hex,
-            "signature MUST be HMAC-SHA256(resolved_plaintext, body) (F-19)"
+            "signature MUST be HMAC-SHA256(resolved_plaintext, body)"
         );
         assert_ne!(
             received_hex, stored_hash_hex,
             "signature MUST NOT be HMAC-SHA256(at-rest stored hash, body) — \
-             that was the F-19 vulnerability"
+             that was the old vulnerable key"
         );
     }
 

@@ -15,8 +15,8 @@
 #
 # Why a synthesised package (not real-world npm package): SHA-512 of
 # real-world tarballs drift over time as registries re-tar; pinning a
-# real npm package would make this script fragile. Item 8 (the design)
-# specifically directs synthesising a package at deploy time so the
+# real npm package would make this script fragile. The verification
+# design requires synthesising a package at deploy time so the
 # packument-vs-tarball SHA-512 alignment is deterministic. The wiremock
 # fixture under scripts/native-tests/fixtures/npm-upstream/ holds the
 # synthesised tarball + matching packument with a pre-computed

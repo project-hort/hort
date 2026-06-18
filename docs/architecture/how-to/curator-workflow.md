@@ -292,7 +292,7 @@ ArtifactReleased { released_by: PolicyReEvaluation, ... }   // × N
 
 The actor attribution rides the **event envelope**
 (`PersistedEvent.actor`), not the payload — `ExclusionAdded` /
-`ExclusionRemoved` payloads carry no actor field by design. Item 8's
+`ExclusionRemoved` payloads carry no actor field by design. The
 projector copies the envelope's actor `Uuid` into
 `exclusion_projections.added_by_actor_id` (the field the `hort-cli
 curation exclusions` listing surfaces).

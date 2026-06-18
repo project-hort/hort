@@ -57,7 +57,7 @@ use crate::{migrate, telemetry};
 
 /// Top-level container for the `admin` subcommand. Wraps a nested
 /// [`AdminSubcommand`] enum so future admin operations are discrete
-/// `clap` subcommands — each one an inbound adapter per §2.0.4.
+/// `clap` subcommands — each one an inbound adapter.
 #[derive(Debug, Args)]
 pub struct AdminCommand {
     #[command(subcommand)]

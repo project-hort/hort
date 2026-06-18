@@ -44,9 +44,9 @@
 //!
 //! - Parsing `HORT_TRUSTED_PROXY_CIDRS` — handled at startup by
 //!   `hort-server::config::Config`.
-//! - Rewriting `UrlResolver` to consume `RequestTrust` — Item 3's turf.
-//!   Today's `UrlResolver` still parses its own headers; this layer adds
-//!   the primitive. Item 3 wires them together.
+//! - Rewriting `UrlResolver` to consume `RequestTrust` — today's
+//!   `UrlResolver` still parses its own headers; this layer adds the
+//!   primitive.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -83,19 +83,19 @@ const XFF_WARN_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
 /// stashed in request extensions for every downstream consumer.
 ///
 /// Only two fields — no `peer_trusted: bool`. Speculative API without a
-/// named consumer is scope creep; if a future item needs the bool, add
-/// it with the consumer in the same PR (design doc §2.0.2).
+/// named consumer is scope creep; if a future change needs the bool,
+/// add it with the consumer in the same PR.
 #[derive(Debug, Clone)]
 pub struct RequestTrust {
     /// The real caller's IP. When the socket peer is listed in
     /// `HORT_TRUSTED_PROXY_CIDRS`, this is the rightmost-untrusted hop
-    /// of `X-Forwarded-For` (`rightmost_untrusted_forwarded_for`,
-    /// closes M-A3); otherwise the socket peer itself.
+    /// of `X-Forwarded-For` (`rightmost_untrusted_forwarded_for`);
+    /// otherwise the socket peer itself.
     pub client_ip: IpAddr,
     /// The public-facing base URL for absolute-URL emission. Always
-    /// populated (by construction) so Item 3's infallible
-    /// `UrlResolver::resolve() -> Url` holds. See the policy table
-    /// above for derivation rules.
+    /// populated (by construction) so the infallible
+    /// `UrlResolver::resolve() -> Url` contract holds. See the policy
+    /// table above for derivation rules.
     pub public_url: url::Url,
 }
 
@@ -319,7 +319,7 @@ pub(crate) fn evaluate_trust(
 }
 
 /// `public_url` derivation. The branches mirror the table in the module
-/// docstring and design doc §2.2.
+/// docstring.
 fn resolve_public_url(
     config: &TrustConfig,
     peer_trusted: bool,
@@ -350,7 +350,7 @@ fn resolve_public_url(
         return config.bind_addr_default.clone();
     }
 
-    // Branch 3: untrusted peer — ignore X-Forwarded-* entirely (§2.2),
+    // Branch 3: untrusted peer — ignore X-Forwarded-* entirely,
     // synthesise from `Host` + `https`. Matches today's `url_resolver.rs`
     // bare-host branch (the production-safe default a TLS-terminating
     // proxy would supply).
@@ -361,8 +361,8 @@ fn resolve_public_url(
     }
 
     // Branch 4: missing `Host` on an untrusted peer. Guarantees
-    // `public_url` is always populated so Item 3's infallible signature
-    // holds. Emit a `warn!` — legitimate HTTP/1.1 clients never omit
+    // `public_url` is always populated (infallible contract). Emit a
+    // `warn!` — legitimate HTTP/1.1 clients never omit
     // `Host`, so this branch is either a probe or a buggy client.
     tracing::warn!(
         ?peer_ip,
@@ -407,9 +407,9 @@ fn forwarded_host(headers: &HeaderMap) -> Option<&str> {
 /// boundary entry is the correct attribution (RFC 7239 §5.2 / OWASP
 /// proxy-headers guidance).
 ///
-/// Algorithm (design doc §3, with the trust-boundary edge case spelled
-/// out — the bare pseudocode misses the leftmost-untrusted-after-all-
-/// trusted-hops case):
+/// Algorithm (with the trust-boundary edge case spelled out — the bare
+/// pseudocode misses the leftmost-untrusted-after-all-trusted-hops
+/// case):
 /// - Parse the XFF header into a `Vec<IpAddr>`, dropping unparseable
 ///   entries silently (matches the previous parser's `.ok()` shape).
 /// - Maintain `prev_trusted`, initialised to `cidr_contains(peer_ip)`.
@@ -667,9 +667,9 @@ mod tests {
     }
 
     // Pre-existing-behaviour pin: trusted peer with a present XFF still
-    // resolves `client_ip` to the original client (now via the
-    // rightmost-untrusted walk — M-A3). The sentinel fallback is ONLY
-    // for the missing-XFF / all-trusted-chain case.
+    // resolves `client_ip` to the original client (via the
+    // rightmost-untrusted walk). The sentinel fallback is ONLY for the
+    // missing-XFF / all-trusted-chain case.
 
     #[test]
     fn trusted_peer_with_xff_unchanged() {
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn rightmost_untrusted_rejects_spoofed_leftmost_when_peer_untrusted() {
-        // Backlog test 3: XFF `<spoofed-1.2.3.4>, <real-5.6.7.8>`,
+        // XFF `<spoofed-1.2.3.4>, <real-5.6.7.8>`,
         // peer 5.6.7.8 (untrusted) → returns real client 5.6.7.8 (NOT
         // the spoofed 1.2.3.4). Function-level: prev_trusted starts
         // false (peer not in CIDRs); the first rev iteration is the
@@ -931,8 +931,8 @@ mod tests {
 
     // -- probe-order tests --
     //
-    // The two tests below are the load-bearing invariant pins from the
-    // F2 acceptance criteria. Both drive the same router shape with the
+    // The two tests below are load-bearing invariant pins. Both drive
+    // the same router shape with the
     // `.layer()` calls in OPPOSITE orders; the correct order must see
     // `Some(true)` from the probe; the inverted order must see
     // `Some(false)`. Both branches MUST be asserted — a test that only

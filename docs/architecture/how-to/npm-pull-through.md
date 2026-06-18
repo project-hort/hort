@@ -27,8 +27,7 @@ npm is the **only multi-algorithm format in v2**: every other v2
 format (Cargo, PyPI, OCI, Maven, etc.) verifies with SHA-256. npm
 publishes `dist.integrity` as an SRI string keyed on SHA-512, so the
 ingest pipeline wraps the upstream stream in `Sha512HashingRead`
-specifically for this format. See design doc §10 (multi-algorithm
-hashing strategy) and §11 (per-format checksum source contracts).
+specifically for this format.
 
 The audit invariant: every npm tarball that hort serves
 from a Proxy repo has exactly one `ChecksumVerified` event in its
@@ -55,8 +54,7 @@ collision substitute a different tarball under the legitimate
 metadata while preserving the published `dist.shasum`; the proxy
 would cache the colliding bytes and serve them to every subsequent
 client. That defeats the supply-chain integrity guarantee the
-verified-pull-through framework exists to provide. See design doc
-§16 for the full rejection rationale.
+verified-pull-through framework exists to provide.
 
 ---
 

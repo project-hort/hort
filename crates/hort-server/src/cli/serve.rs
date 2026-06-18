@@ -1,6 +1,6 @@
 //! `hort-server serve` (default) — runs the HTTP service.
 //!
-//! Body of this module is the pre-F3 `main.rs::main`: read config,
+//! Body of this module is the original `main.rs::main`: read config,
 //! install tracing + Prometheus, open the Postgres pool, apply
 //! migrations, build the storage + app context, bind listeners, serve.
 //! The runtime is constructed locally so `main.rs` stays synchronous
@@ -9,7 +9,7 @@
 //! Exit semantics: on success (clean SIGTERM) returns [`ExitCode::SUCCESS`].
 //! On any startup or serve failure, prints the `anyhow::Error` chain
 //! via its `Debug` impl (captures the full context chain) and returns
-//! [`ExitCode::FAILURE`] — matches the pre-F3 behaviour where
+//! [`ExitCode::FAILURE`] — matches the earlier behaviour where
 //! `main() -> anyhow::Result<()>` exited with code 1 on `Err`.
 
 use std::process::ExitCode;

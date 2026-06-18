@@ -49,11 +49,10 @@ spec:
           # DSN. HORT_STORAGE_FILESYSTEM_PATH / HORT_PUBLIC_BASE_URL /
           # HORT_CONFIG_DIR are NOT required here. The runtime Deployment
           # mounts them all — only the migrate path is slimmed.
-          # Backlog 078 Item 5 — canonical HORT_DATABASE_URL (sourced from the
-          # admin/migrate DDL secret, NOT the app role). The binary falls back
-          # to bare DATABASE_URL (sqlx-cli / Tier-2 / 12-factor) — the chart
-          # sets the canonical name. Only the env-var NAME changed; the secret
-          # reference (postgres.admin) is unchanged.
+          # Canonical HORT_DATABASE_URL (sourced from the admin/migrate DDL
+          # secret, NOT the app role). The binary falls back to bare
+          # DATABASE_URL (sqlx-cli / Tier-2 / 12-factor) — the chart sets
+          # the canonical name.
           env:
             - name: HORT_DATABASE_URL
               valueFrom:

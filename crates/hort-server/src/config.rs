@@ -5,7 +5,7 @@
 //! Postgres DSN or backend-specific storage fields so misconfiguration is
 //! a loud startup failure, not a quiet one.
 //!
-//! **DSN precedence (Backlog 078 Item 5):** the canonical operator var is
+//! **DSN precedence:** the canonical operator var is
 //! `HORT_DATABASE_URL`; bare `DATABASE_URL` is honored as a compat fallback
 //! for sqlx-cli, the Tier-2 `maybe_pool()` test helpers, and 12-factor
 //! tooling. `MinimalConfig::from_env` (and thus `Config::from_env` and every
@@ -75,7 +75,7 @@ pub struct Config {
     /// expose the scrape surface to every reachable network — the
     /// endpoint reveals repository names, error rates, and traffic
     /// shape, exactly the reconnaissance signal an attacker uses to
-    /// time probes around real traffic. See design doc §3.3.
+    /// time probes around real traffic.
     pub metrics_bind_addr: Option<SocketAddr>,
     /// When `true` (the default), the
     /// `/metrics` route requires admin authentication on both the
@@ -114,7 +114,7 @@ pub struct Config {
     /// listener, byte-identical to today (no migration). The
     /// token-generation plane (`/api/v1/auth/exchange`, `/api/v1/auth`,
     /// OCI `/v2/auth`) and the artifact-pull plane are **never** moved
-    /// here — they are public by requirement (F-33).
+    /// here — they are public by requirement.
     ///
     /// **Safety guard:** binding to the unspecified address (`0.0.0.0`
     /// / `[::]:port`) is refused unless [`Self::control_public_bind`]
@@ -208,8 +208,8 @@ pub struct Config {
     /// **Startup invariant:** when BOTH this list is empty AND
     /// `HORT_PUBLIC_BASE_URL` is unset, `from_env` fails with
     /// [`ConfigError::TrustUnconfigured`]. The check is NOT
-    /// auth-gated — the H1 vector (X-Forwarded-Host injection poisoning
-    /// package download URLs) is orthogonal to authentication.
+    /// auth-gated — X-Forwarded-Host injection poisoning package download
+    /// URLs is orthogonal to authentication.
     ///
     /// Individual malformed CIDR entries surface as
     /// [`ConfigError::InvalidCidr`] with the offending string.
@@ -243,7 +243,7 @@ pub struct Config {
     /// When `Some(_)`, the boot sequence in `cli::serve` calls
     /// `gitops_boot::apply_config_from_dir` BEFORE `build_app_context`,
     /// so the `Vec<GroupMapping>` consumed by `AuthenticateUseCase::new`
-    /// reflects the post-apply state. See design doc §1, §5.
+    /// reflects the post-apply state.
     pub config_dir: Option<PathBuf>,
     /// Optional operator override of the default
     /// per-publish body-size ceiling. Parsed from
@@ -254,7 +254,6 @@ pub struct Config {
     ///
     /// Only PyPI and npm consume this override; Cargo carries its own
     /// fixed 200 MiB ceiling per `hort_http_core::limits::CARGO_PUBLISH_BODY_LIMIT`.
-    /// See design doc §2.3 + §2.11.
     pub publish_body_limit_bytes: Option<usize>,
     /// Per-session Postgres statement timeout.
     /// Parsed from `PG_STATEMENT_TIMEOUT_MS`.
@@ -266,8 +265,7 @@ pub struct Config {
     /// timeout) applies. Non-integer values surface as
     /// [`ConfigError::InvalidInt`]; zero surfaces as
     /// [`ConfigError::ValueNotPositive`] (because `SET statement_timeout = 0`
-    /// silently disables the timeout — not what the operator meant). See
-    /// design doc §2.11.
+    /// silently disables the timeout — not what the operator meant).
     pub pg_statement_timeout_ms: Option<u64>,
     /// Maximum time to wait for a connection from
     /// the Postgres pool. Parsed from `PG_ACQUIRE_TIMEOUT_SECS`; defaults
@@ -278,11 +276,11 @@ pub struct Config {
     /// production deployment. Non-integer values surface as
     /// [`ConfigError::InvalidInt`]; zero surfaces as
     /// [`ConfigError::ValueNotPositive`] (would make every acquisition
-    /// fail immediately). See design doc §2.11.
+    /// fail immediately).
     pub pg_acquire_timeout_secs: u64,
     /// Per-kid JWKS signature-mismatch eviction
     /// cooldown, in seconds. Parsed from `HORT_JWKS_EVICTION_BACKOFF_SECS`;
-    /// defaults to `10`. See design doc §2.5 + §2.11.
+    /// defaults to `10`.
     ///
     /// A second `SignatureMismatch` eviction for the same kid within
     /// this window is a no-op (no JWKS refetch fires). Closes the
@@ -293,8 +291,7 @@ pub struct Config {
     pub jwks_eviction_backoff_secs: u64,
     /// Upper bound on discovery + JWKS response
     /// body size, in bytes. Parsed from `HORT_JWKS_RESP_BODY_MAX_SIZE`
-    /// (a size string, e.g. `1Mi`); defaults to `1048576` (1 MiB). See
-    /// design doc §2.5 + §2.11.
+    /// (a size string, e.g. `1Mi`); defaults to `1048576` (1 MiB).
     ///
     /// Responses exceeding this cap are rejected BEFORE parsing;
     /// prevents a malicious or misconfigured IdP from OOMing hort-server
@@ -304,7 +301,7 @@ pub struct Config {
     pub jwks_resp_body_max_bytes: usize,
     /// Per-IP auth-attempt rate-limit cap,
     /// in requests per minute. Parsed from `HORT_RATELIMIT_AUTH_PER_MIN`;
-    /// defaults to `60`. See design doc §2.4 + §2.11.
+    /// defaults to `60`.
     ///
     /// Applied by [`hort_http_core::middleware::rate_limit::auth_rate_limit_layer`]
     /// wrapping `require_principal`. Zero surfaces as
@@ -313,15 +310,14 @@ pub struct Config {
     pub ratelimit_auth_per_min: u32,
     /// Per-IP write-path rate-limit cap,
     /// in requests per minute. Parsed from `HORT_RATELIMIT_WRITE_PER_MIN`;
-    /// defaults to `300`. See design doc §2.4 + §2.11.
+    /// defaults to `300`.
     ///
     /// Applied by [`hort_http_core::middleware::rate_limit::write_rate_limit_layer`]
     /// wrapping the POST/PUT/DELETE sub-router. Zero surfaces as
     /// [`ConfigError::ValueNotPositive`].
     pub ratelimit_write_per_min: u32,
     /// Workspace-wide concurrent-request
-    /// cap. Parsed from `HORT_MAX_INFLIGHT`; defaults to `512`. See design
-    /// doc §6.
+    /// cap. Parsed from `HORT_MAX_INFLIGHT`; defaults to `512`.
     ///
     /// Backs [`hort_http_core::middleware::load_shed::global_load_shed_middleware`].
     /// Zero surfaces as [`ConfigError::ValueNotPositive`] — a zero cap
@@ -329,15 +325,13 @@ pub struct Config {
     /// `None` at the middleware constructor.
     pub max_inflight: usize,
     /// Per-IP concurrent-request cap.
-    /// Parsed from `HORT_MAX_INFLIGHT_PER_IP`; defaults to `32`. See design
-    /// doc §6.
+    /// Parsed from `HORT_MAX_INFLIGHT_PER_IP`; defaults to `32`.
     ///
     /// Backs [`hort_http_core::middleware::load_shed::per_ip_load_shed_middleware`].
     /// Zero surfaces as [`ConfigError::ValueNotPositive`].
     pub max_inflight_per_ip: usize,
     /// RBAC evaluator snapshot poll cadence,
     /// in seconds. Parsed from `HORT_RBAC_REFRESH_SECS`; defaults to `30`.
-    /// See design doc §2.9 + §2.11.
     ///
     /// The background task in [`crate::cli::serve`] polls
     /// `role_repo.list_all_roles() + list_grants_for_roles()` every
@@ -491,7 +485,7 @@ pub struct Config {
     /// the window). Zero surfaces as
     /// [`ConfigError::ValueNotPositive`] — disabling the slowloris
     /// defence entirely is almost certainly not what the operator
-    /// meant. See design doc §3.1.
+    /// meant.
     pub http_header_read_timeout_secs: u64,
     /// Global per-request deadline (in
     /// seconds). Parsed from `HORT_HTTP_REQUEST_TIMEOUT_SECS`; defaults
@@ -515,8 +509,7 @@ pub struct Config {
     /// minutes). Multi-GB OCI layer pushes legitimately exceed the
     /// global 5-minute deadline; this longer ceiling exists so a
     /// stuck push terminates instead of pinning a worker forever.
-    /// Zero surfaces as [`ConfigError::ValueNotPositive`]. See
-    /// design doc §3.1.
+    /// Zero surfaces as [`ConfigError::ValueNotPositive`].
     pub http_oci_upload_timeout_secs: u64,
     /// `Failed(NotFound)` negative-cache TTL
     /// for the pull-through deduplication service, in seconds.
@@ -563,9 +556,9 @@ pub struct Config {
     /// Wired into
     /// [`hort_app::pull_dedup::PullDedupConfig::follower_wait`]. On
     /// expiry the follower returns `503 + Retry-After: 30` rather
-    /// than falling through to an un-coalesced fetch (design doc §3
-    /// decision 4 — breaking coalescing on a stuck leader will not
-    /// speed up the underlying upstream). Zero surfaces as
+    /// than falling through to an un-coalesced fetch (breaking
+    /// coalescing on a stuck leader will not speed up the underlying
+    /// upstream). Zero surfaces as
     /// [`ConfigError::ValueNotPositive`].
     pub pull_dedup_follower_wait_secs: u64,
     /// Wall-clock cap on the
@@ -1247,11 +1240,11 @@ pub enum LogFormat {
 }
 
 // ---------------------------------------------------------------------------
-// Audit-retention floor config (C-1)
+// Audit-retention floor config
 // ---------------------------------------------------------------------------
 
 /// Per-event-category audit-retention floor — the documented GDPR
-/// retention schedule (see `docs/compliance/GDPR.md` §1). This is the
+/// retention schedule (see `docs/compliance/GDPR.md`). This is the
 /// **single place** the
 /// `StreamCategory → floor` mapping lives:
 /// new audited categories (`ApiTokenUsed`, `AuthenticationAttempted`)
@@ -1282,7 +1275,7 @@ pub struct AuditRetentionFloors {
     /// ≥ 6 months (NIS2 incident-investigation horizon). Default 180d.
     authentication: chrono::Duration,
     /// `Policy` / `Authorization` / `Admin`. Minimum: ≥ 36 months
-    /// (CRA Annex I §1(j) secure-default attestation). Default 1080d.
+    /// (CRA Annex I secure-default attestation). Default 1080d.
     policy_authz_admin: chrono::Duration,
     /// `ArtifactDownloaded` audit. `DownloadAudit` is
     /// a real `StreamCategory`; `floor_for(C::DownloadAudit)` routes
@@ -1322,7 +1315,7 @@ impl AuditRetentionFloors {
     /// sealable. The default is 36mo.
     pub const MIN_ARTIFACT_LIFECYCLE_DAYS: i64 = 1;
 
-    /// The C-1 defaults (every override unset). 6mo / 36mo / 90d /
+    /// The defaults (every override unset). 6mo / 36mo / 90d /
     /// 36mo / 36mo as documented above.
     pub fn c1_defaults() -> Self {
         Self {
@@ -1421,7 +1414,7 @@ impl AuditRetentionFloors {
 /// follow-on. No pre-v1 action expected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRetentionMode {
-    /// `delete_stream` — the stream's rows are removed (after the B9
+    /// `delete_stream` — the stream's rows are removed (after the
     /// `StreamSealed` tombstone). The v1 default.
     Delete,
     /// `archive_stream` — the stream is moved to a cold-storage target
@@ -1485,9 +1478,9 @@ pub enum ConfigError {
         source: ipnet::AddrParseError,
     },
     /// Unconditional startup failure when BOTH `HORT_PUBLIC_BASE_URL` AND
-    /// `HORT_TRUSTED_PROXY_CIDRS` are unset. NOT auth-gated — the H1 vector
-    /// (X-Forwarded-Host injection poisoning package download URLs) is
-    /// orthogonal to authentication. See design doc §2.0.2 + §2.2.
+    /// `HORT_TRUSTED_PROXY_CIDRS` are unset. NOT auth-gated —
+    /// X-Forwarded-Host injection poisoning package download URLs is
+    /// orthogonal to authentication.
     #[error(
         "trust configuration unset: set HORT_PUBLIC_BASE_URL \
         (e.g. https://hort.example.com) to pin the public URL, \
@@ -1617,7 +1610,7 @@ pub enum ConfigError {
     /// Boot-fail to prevent the operator from accidentally validating
     /// JWTs against the wrong half. Same shape as the
     /// `HORT_EXTRA_CA_BUNDLE` ambiguous-source guard would use if it
-    /// supported both forms (see design doc §6).
+    /// supported both forms.
     #[error(
         "ambiguous OCI signing key source: \
         both {file_var} and {inline_var} are set with non-empty \
@@ -1726,7 +1719,7 @@ pub enum ConfigError {
 /// split, that misconfig only surfaces when serve boots — same
 /// `helm install`, ~10s later. The serve pod fails loud either way;
 /// no silent failure mode is introduced. Do NOT add a "validation
-/// parity" mode — that re-creates the bug Item 3 is fixing.
+/// parity" mode.
 #[derive(Debug, Clone)]
 pub struct MinimalConfig {
     pub database_url: String,
@@ -1746,14 +1739,14 @@ impl MinimalConfig {
     /// [`parse_pg_statement_timeout_ms`], [`parse_pg_acquire_timeout_secs`].
     pub fn from_env() -> Result<Self, ConfigError> {
         Ok(Self {
-            // Backlog 078 Item 5 — `HORT_DATABASE_URL` is the canonical
-            // operator DSN var, with bare `DATABASE_URL` retained as the
-            // documented compat fallback. Mirrors `hort-worker`'s existing
-            // shape verbatim so the serve path and EVERY DB-only subcommand
-            // (migrate, reconcile-groups, verify-event-chain) resolve the
-            // DSN identically. Bare `DATABASE_URL` stays load-bearing because
-            // sqlx-cli, the Tier-2 `maybe_pool()` test helpers, and 12-factor
-            // tooling read it; the fallback is the reason it cannot be dropped.
+            // `HORT_DATABASE_URL` is the canonical operator DSN var, with
+            // bare `DATABASE_URL` retained as the documented compat fallback.
+            // Mirrors `hort-worker`'s shape so the serve path and EVERY
+            // DB-only subcommand (migrate, reconcile-groups,
+            // verify-event-chain) resolve the DSN identically. Bare
+            // `DATABASE_URL` stays load-bearing because sqlx-cli, the
+            // Tier-2 `maybe_pool()` test helpers, and 12-factor tooling read
+            // it; the fallback is the reason it cannot be dropped.
             database_url: require("HORT_DATABASE_URL").or_else(|_| require("DATABASE_URL"))?,
             log_format: parse_log_format()?,
             include_repository_label: parse_bool("METRICS_INCLUDE_REPOSITORY_LABEL", true)?,
@@ -1893,8 +1886,7 @@ impl Config {
 
         let ratelimit_write_per_min = parse_ratelimit_write_per_min()?;
 
-        // Workspace-wide + per-IP
-        // concurrency caps. Defaults from design doc §6: 512 / 32.
+        // Workspace-wide + per-IP concurrency caps. Defaults: 512 / 32.
         let max_inflight = parse_max_inflight()?;
         let max_inflight_per_ip = parse_max_inflight_per_ip()?;
 
@@ -1902,16 +1894,15 @@ impl Config {
         let event_chain_checkpoint_cadence_secs = parse_event_chain_checkpoint_cadence_secs()?;
 
         // HTTP transport timeouts.
-        // Defaults from design doc §3.1: 15s header-read,
-        // 5min request deadline, 60min OCI-upload ceiling.
+        // Defaults: 15s header-read, 5min request deadline,
+        // 60min OCI-upload ceiling.
         let http_header_read_timeout_secs = parse_http_header_read_timeout_secs()?;
         let http_request_timeout_secs = parse_http_request_timeout_secs()?;
         let http_oci_upload_timeout_secs = parse_http_oci_upload_timeout_secs()?;
 
-        // Pull-through deduplication TTL +
-        // follower-wait knobs. Defaults from design doc §6 (30 / 10
-        // / 10 / 60 secs negative-cache TTL spread; 300 secs follower
-        // wait ceiling). The four TTL knobs cluster every
+        // Pull-through deduplication TTL + follower-wait knobs.
+        // Defaults: 30 / 10 / 10 / 60 secs negative-cache TTL spread;
+        // 300 secs follower wait ceiling. The four TTL knobs cluster every
         // `UpstreamErrorKind` failure variant under one of four
         // operator-tunable durations; the follower-wait knob is the
         // 503 fall-through ceiling. None of these are
@@ -1970,8 +1961,8 @@ impl Config {
         };
         // Optional per-class Redis URL overrides.
         // Both fields are parsed UNCONDITIONALLY (independent of
-        // `HORT_EPHEMERAL_STORE_BACKEND`) per design doc §5.1: a future
-        // operator who runs the Memory backend in dev but pre-stages
+        // `HORT_EPHEMERAL_STORE_BACKEND`): a future operator who runs
+        // the Memory backend in dev but pre-stages
         // the per-class env vars for production parity should not trip
         // a parse error. Resolution / fallback to `redis_url` lives
         // at composition time; this layer only
@@ -2032,12 +2023,11 @@ impl Config {
             MIN_UPSTREAM_CAP_BYTES,
         )?;
 
-        // Audit-retention floors
-        // . Each `HORT_RETENTION_FLOOR_*_DAYS` override may
-        // only ever *raise* a floor: an override below its documented
-        // C-1 minimum is a hard startup failure (mirrors the
+        // Audit-retention floors. Each `HORT_RETENTION_FLOOR_*_DAYS`
+        // override may only ever *raise* a floor: an override below its
+        // documented minimum is a hard startup failure (mirrors the
         // `HORT_UPSTREAM_RESOLVER_REFRESH_SECS` `>= 5` reject pattern
-        // above). Unset → the C-1 default.
+        // above). Unset → the default.
         let audit_retention_floors = {
             let d = AuditRetentionFloors::c1_defaults();
             AuditRetentionFloors {
@@ -2101,12 +2091,11 @@ impl Config {
             _ => StreamRetentionMode::Delete,
         };
 
-        // Unconditional startup failure when the
-        // operator has pinned neither a public URL nor a trusted-proxy
-        // allowlist. Deliberately NOT auth-gated: the H1 vector is
-        // X-Forwarded-Host poisoning package download URLs, which works
-        // against any deployment that serves URLs to clients — auth or
-        // no auth. See design doc §2.0.2 + backlog line 56.
+        // Unconditional startup failure when the operator has pinned
+        // neither a public URL nor a trusted-proxy allowlist.
+        // Deliberately NOT auth-gated: X-Forwarded-Host poisoning of
+        // package download URLs works against any deployment that
+        // serves URLs to clients — auth or no auth.
         if public_base_url.is_none() && trusted_proxy_cidrs.is_empty() {
             return Err(ConfigError::TrustUnconfigured);
         }
@@ -2171,21 +2160,19 @@ impl Config {
             tracing::warn!("claim mappings empty — no users will receive claims via OIDC");
         }
 
-        // Native API token + PAT-cache +
-        // PAT-lockout knobs. Defaults match the design doc §5 / §7
-        // RC posture: feature flag OFF, plaintext-PAT refused, cache
-        // 10k entries, 30 misses / 5 min triggers a 15-min lockout.
+        // Native API token + PAT-cache + PAT-lockout knobs. Defaults:
+        // feature flag OFF, plaintext-PAT refused, cache 10k entries,
+        // 30 misses / 5 min triggers a 15-min lockout.
         let enable_native_tokens = parse_bool("HORT_NATIVE_TOKENS_ENABLED", false)?;
         // Event-notification substrate knobs.
         // Default-on for `HORT_NOTIFICATIONS_ENABLED` because the broadcast
-        // path is zero-cost without subscribers and the dispatcher (Item
-        // 6b) self-disables when no `Subscription` rows exist. Default
-        // `HORT_NOTIFY_CHANNEL_CAPACITY=1024` matches design doc §6.
+        // path is zero-cost without subscribers and the dispatcher
+        // self-disables when no `Subscription` rows exist. Default
+        // `HORT_NOTIFY_CHANNEL_CAPACITY=1024`.
         let enable_notifications = parse_bool("HORT_NOTIFICATIONS_ENABLED", true)?;
         let notify_channel_capacity = parse_notify_channel_capacity()?;
         // Webhook transport + SSRF flags.
-        // Both default `false` per design doc §3 / §7 / §11 invariants
-        // 8 + 11; when on, composition emits a paired
+        // Both default `false`; when on, composition emits a paired
         // `hort_unsafe_config_active{kind=...}` gauge so the misconfig is
         // visible on every dashboard.
         let allow_plaintext_webhooks = parse_bool("HORT_WEBHOOK_ALLOW_PLAINTEXT", false)?;
@@ -2203,9 +2190,8 @@ impl Config {
         let pat_lockout_threshold = parse_pat_lockout_threshold()?;
         let pat_lockout_window_secs = parse_pat_lockout_window_secs()?;
         let pat_lockout_duration_secs = parse_pat_lockout_duration_secs()?;
-        // Issuance feature flags. Both default
-        // to `false` per §4 / §8 invariant 5 (admin tokens off,
-        // unbounded service-account tokens off).
+        // Issuance feature flags. Both default to `false`
+        // (admin tokens off, unbounded service-account tokens off).
         let allow_admin_tokens = parse_bool("HORT_TOKEN_ALLOW_ADMIN", false)?;
         let allow_unbounded_svc_tokens = parse_bool("HORT_TOKEN_ALLOW_UNBOUNDED_SVC", false)?;
 
@@ -2379,7 +2365,7 @@ impl Config {
 
 /// Resolve one audit-retention floor
 /// from its `HORT_RETENTION_FLOOR_*_DAYS` env override, enforcing the
-/// documented minimum (`docs/compliance/GDPR.md` §1).
+/// documented minimum (`docs/compliance/GDPR.md`).
 ///
 /// Unset / empty → the documented `default`. Set → parsed as a positive day
 /// count; a non-integer is [`ConfigError::InvalidInt`]; a value below
@@ -2400,7 +2386,7 @@ fn resolve_retention_floor_days(
             if parsed < min_days {
                 return Err(ConfigError::InvalidValue {
                     var,
-                    reason: format!("must be >= {min_days} (C-1 minimum; got {parsed})"),
+                    reason: format!("must be >= {min_days} (minimum; got {parsed})"),
                 });
             }
             Ok(chrono::Duration::days(parsed))
@@ -2565,8 +2551,8 @@ fn parse_event_chain_checkpoint_cadence_secs() -> Result<u64, ConfigError> {
 
 /// Parse `HORT_HTTP_HEADER_READ_TIMEOUT_SECS`.
 ///
-/// Absent or empty env var → the 15-second default (design doc §3.1).
-/// Non-integer values surface as [`ConfigError::InvalidInt`]; zero
+/// Absent or empty env var → the 15-second default. Non-integer
+/// values surface as [`ConfigError::InvalidInt`]; zero
 /// surfaces as [`ConfigError::ValueNotPositive`] because zero would
 /// disable the slowloris defence — a hyper `header_read_timeout` of
 /// `Duration::ZERO` cuts every connection on the first byte, but the
@@ -2582,7 +2568,7 @@ fn parse_http_header_read_timeout_secs() -> Result<u64, ConfigError> {
 /// `tower_http::TimeoutLayer` cancels the inner Service future when
 /// the deadline elapses and returns `408 Request Timeout`. Zero
 /// surfaces as [`ConfigError::ValueNotPositive`] (would 408 every
-/// request). See design doc §3.1.
+/// request).
 fn parse_http_request_timeout_secs() -> Result<u64, ConfigError> {
     parse_positive::<u64>("HORT_HTTP_REQUEST_TIMEOUT_SECS", 300)
 }
@@ -2594,7 +2580,7 @@ fn parse_http_request_timeout_secs() -> Result<u64, ConfigError> {
 /// ceiling so a multi-GB layer push that legitimately exceeds the
 /// global 5-minute deadline is not killed mid-stream. Zero surfaces
 /// as [`ConfigError::ValueNotPositive`] (would defeat the purpose
-/// of the per-route override). See design doc §3.1.
+/// of the per-route override).
 fn parse_http_oci_upload_timeout_secs() -> Result<u64, ConfigError> {
     parse_positive::<u64>("HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS", 3600)
 }
@@ -2614,8 +2600,8 @@ fn parse_oci_max_sessions_per_principal() -> Result<u32, ConfigError> {
 
 /// Parse `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`.
 ///
-/// Absent or empty env var → 30 seconds (design doc §6). Non-integer
-/// values surface as [`ConfigError::InvalidInt`]; zero surfaces as
+/// Absent or empty env var → 30 seconds. Non-integer values surface
+/// as [`ConfigError::InvalidInt`]; zero surfaces as
 /// [`ConfigError::ValueNotPositive`] — a zero TTL would re-fetch on
 /// every retry within the negative-cache window, defeating coalescing
 /// on 404 storms.
@@ -2625,8 +2611,8 @@ fn parse_pull_dedup_ttl_not_found_secs() -> Result<u64, ConfigError> {
 
 /// Parse `HORT_PULL_DEDUP_TTL_UNAVAILABLE_SECS`.
 ///
-/// Absent or empty env var → 10 seconds (design doc §6). Clusters
-/// `RateLimited`, `Upstream5xx`, `Upstream4xx`, and `Unauthorized`.
+/// Absent or empty env var → 10 seconds. Clusters `RateLimited`,
+/// `Upstream5xx`, `Upstream4xx`, and `Unauthorized`.
 /// Non-integer values surface as [`ConfigError::InvalidInt`]; zero
 /// surfaces as [`ConfigError::ValueNotPositive`].
 fn parse_pull_dedup_ttl_unavailable_secs() -> Result<u64, ConfigError> {
@@ -2635,8 +2621,8 @@ fn parse_pull_dedup_ttl_unavailable_secs() -> Result<u64, ConfigError> {
 
 /// Parse `HORT_PULL_DEDUP_TTL_TIMEOUT_SECS`.
 ///
-/// Absent or empty env var → 10 seconds (design doc §6). Clusters
-/// `Timeout` and `NetworkError`. Same default as the unavailable
+/// Absent or empty env var → 10 seconds. Clusters `Timeout` and
+/// `NetworkError`. Same default as the unavailable
 /// cluster — transient transport failures resolve on a similar
 /// timescale to transient HTTP failures. Non-integer values surface
 /// as [`ConfigError::InvalidInt`]; zero surfaces as
@@ -2660,11 +2646,10 @@ fn parse_pull_dedup_ttl_checksum_mismatch_secs() -> Result<u64, ConfigError> {
 
 /// Parse `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS`.
 ///
-/// Absent or empty env var → 300 seconds, i.e. 5 minutes (design doc
-/// §6). On expiry the follower returns `503 + Retry-After: 30`
-/// rather than falling through to an un-coalesced fetch (design doc
-/// §3 decision 4 — breaking coalescing on a stuck leader will not
-/// speed up the underlying upstream). Non-integer values surface as
+/// Absent or empty env var → 300 seconds (5 minutes). On expiry
+/// the follower returns `503 + Retry-After: 30` rather than falling
+/// through to an un-coalesced fetch (breaking coalescing on a stuck
+/// leader will not speed up the underlying upstream). Non-integer values surface as
 /// [`ConfigError::InvalidInt`]; zero surfaces as
 /// [`ConfigError::ValueNotPositive`] — a zero ceiling would 503
 /// instantly on every concurrent follower request.
@@ -2674,8 +2659,7 @@ fn parse_pull_dedup_follower_wait_secs() -> Result<u64, ConfigError> {
 
 /// Parse `HORT_NOTIFY_CHANNEL_CAPACITY`.
 ///
-/// Absent or empty env var → the 1024 default per design doc §6
-/// ("`HORT_NOTIFY_CHANNEL_CAPACITY`, default 1024"). Non-integer values
+/// Absent or empty env var → the 1024 default. Non-integer values
 /// surface as [`ConfigError::InvalidInt`]; zero surfaces as
 /// [`ConfigError::ValueNotPositive`] — the `broadcast::channel(0)`
 /// shape is meaningless (no slot to hold even one in-flight event).
@@ -2697,8 +2681,8 @@ fn parse_pat_cache_size() -> Result<usize, ConfigError> {
 
 /// Parse `HORT_PAT_LOCKOUT_THRESHOLD`.
 ///
-/// Absent or empty env var → the 30-attempt default per design doc §5
-/// ("30 misses / 5 min triggers a 15-min lockout"). Non-integer values
+/// Absent or empty env var → the 30-attempt default ("30 misses /
+/// 5 min triggers a 15-min lockout"). Non-integer values
 /// surface as [`ConfigError::InvalidInt`]; zero surfaces as
 /// [`ConfigError::ValueNotPositive`] — a zero threshold would activate
 /// the gate on the first PAT validation, locking out every legitimate
@@ -2709,19 +2693,18 @@ fn parse_pat_lockout_threshold() -> Result<u32, ConfigError> {
 
 /// Parse `HORT_PAT_LOCKOUT_WINDOW_SECS`.
 ///
-/// Absent or empty env var → 300 seconds (5 min) per design doc §5.
-/// Non-integer values surface as [`ConfigError::InvalidInt`]; zero
-/// surfaces as [`ConfigError::ValueNotPositive`] — a zero window
-/// would mean the per-IP counter expires the moment it is written,
-/// defeating the gate.
+/// Absent or empty env var → 300 seconds (5 min). Non-integer values
+/// surface as [`ConfigError::InvalidInt`]; zero surfaces as
+/// [`ConfigError::ValueNotPositive`] — a zero window would mean the
+/// per-IP counter expires the moment it is written, defeating the gate.
 fn parse_pat_lockout_window_secs() -> Result<u64, ConfigError> {
     parse_positive::<u64>("HORT_PAT_LOCKOUT_WINDOW_SECS", 300)
 }
 
 /// Parse `HORT_PAT_LOCKOUT_DURATION_SECS`.
 ///
-/// Absent or empty env var → 900 seconds (15 min) per design doc §5.
-/// Non-integer values surface as [`ConfigError::InvalidInt`]; zero
+/// Absent or empty env var → 900 seconds (15 min). Non-integer
+/// values surface as [`ConfigError::InvalidInt`]; zero
 /// surfaces as [`ConfigError::ValueNotPositive`] — a zero duration
 /// would unlock the IP between the increment and the gate check,
 /// defeating the cooldown.
@@ -2842,11 +2825,11 @@ fn parse_positive_optional<T: PositiveInt>(var: &'static str) -> Result<Option<T
 /// — startup fails loudly rather than silently falling back to the
 /// default.
 ///
-/// Backlog 078 Item 4 — the operator surface is a human-readable size
-/// string ("300Mi", "1Gi") via [`parse_byte_size`], not a bare integer,
-/// so a multi-GiB body limit can never round-trip through Helm's float64
-/// coercion into scientific notation (the rc.3 boot-crash class). A bare
-/// byte integer is still accepted for backward shape.
+/// The operator surface is a human-readable size string ("300Mi", "1Gi")
+/// via [`parse_byte_size`], not a bare integer, so a multi-GiB body
+/// limit can never round-trip through Helm's float64 coercion into
+/// scientific notation. A bare byte integer is still accepted for
+/// backward shape.
 ///
 /// Note: unlike the other `Option<_>` parser this one does NOT reject
 /// zero — a zero publish-body-limit is an explicit "refuse all publishes"
@@ -2901,14 +2884,13 @@ fn parse_jwks_eviction_backoff_secs() -> Result<u64, ConfigError> {
 ///
 /// Absent or empty env var → the 1 MiB (1048576) default.
 ///
-/// Backlog 078 Item 4 — the operator surface is a human-readable size
-/// string ("1Mi", "4Mi") via [`parse_byte_size`], not a bare integer, so
-/// a multi-MiB cap can never round-trip through Helm's float64 coercion
-/// into scientific notation (the rc.3 boot-crash class). A bare byte
-/// integer is still accepted for backward shape. Malformed values surface
-/// as [`ConfigError::InvalidValue`]; a sub-1-byte value (including zero)
-/// is rejected because a zero cap would reject every JWKS response (every
-/// byte exceeds the cap).
+/// The operator surface is a human-readable size string ("1Mi", "4Mi")
+/// via [`parse_byte_size`], not a bare integer, so a multi-MiB cap
+/// can never round-trip through Helm's float64 coercion into scientific
+/// notation. A bare byte integer is still accepted for backward shape.
+/// Malformed values surface as [`ConfigError::InvalidValue`]; a sub-1-byte
+/// value (including zero) is rejected because a zero cap would reject
+/// every JWKS response (every byte exceeds the cap).
 fn parse_jwks_resp_body_max_bytes() -> Result<usize, ConfigError> {
     parse_byte_size_env("HORT_JWKS_RESP_BODY_MAX_SIZE", 1024 * 1024, 1).map(|b| b as usize)
 }
@@ -3160,12 +3142,12 @@ fn parse_byte_size(raw: &str) -> Result<u64, String> {
 /// Parse `HORT_METADATA_BLOB_MAX_SIZE`. Absent or empty → 10 MB default.
 /// `0` is permitted and means "accept anything" (see field docstring).
 ///
-/// Backlog 078 Item 4 — the operator surface is a human-readable size
-/// string ("10Mi", "64Mi") via [`parse_byte_size`], not a bare integer,
-/// so a multi-GiB cap can never round-trip through Helm's float64
-/// coercion into scientific notation (the rc.3 boot-crash class). A bare
-/// byte integer is still accepted for backward shape. Malformed values
-/// surface as [`ConfigError::InvalidValue`].
+/// The operator surface is a human-readable size string ("10Mi",
+/// "64Mi") via [`parse_byte_size`], not a bare integer, so a multi-GiB
+/// cap can never round-trip through Helm's float64 coercion into
+/// scientific notation. A bare byte integer is still accepted for
+/// backward shape. Malformed values surface as
+/// [`ConfigError::InvalidValue`].
 fn parse_metadata_blob_max_bytes() -> Result<usize, ConfigError> {
     const DEFAULT: u64 = 10 * 1024 * 1024;
     // Floor of 0 — `0` is the documented "accept anything" escape hatch,
@@ -3493,11 +3475,10 @@ mod tests {
 
     #[test]
     fn parse_byte_size_large_size_strings_are_exact() {
-        // Backlog 078 Item 4 — operator byte caps are size strings, not
-        // bare ints, precisely so a multi-GiB value survives. A small
-        // magnitude times a power-of-two multiplier is exactly
-        // representable, so the cap round-trips to the byte count an
-        // operator expects.
+        // Operator byte caps are size strings, not bare ints, precisely
+        // so a multi-GiB value survives. A small magnitude times a
+        // power-of-two multiplier is exactly representable, so the cap
+        // round-trips to the byte count an operator expects.
         assert_eq!(parse_byte_size("256Mi").unwrap(), 256 * 1024 * 1024);
         assert_eq!(parse_byte_size("8Gi").unwrap(), 8_u64 * 1024 * 1024 * 1024);
         assert_eq!(parse_byte_size("10Mi").unwrap(), 10 * 1024 * 1024);
@@ -3668,8 +3649,8 @@ mod tests {
             http_header_read_timeout_secs: 15,
             http_request_timeout_secs: 300,
             http_oci_upload_timeout_secs: 3600,
-            // Pull-through dedup defaults match the
-            // `from_env` parser defaults (design doc §6).
+            // Pull-through dedup defaults match the `from_env` parser
+            // defaults.
             pull_dedup_ttl_not_found_secs: 30,
             pull_dedup_ttl_unavailable_secs: 10,
             pull_dedup_ttl_timeout_secs: 10,
@@ -3696,8 +3677,8 @@ mod tests {
             pat_lockout_threshold: 30,
             pat_lockout_window_secs: 300,
             pat_lockout_duration_secs: 900,
-            // RC defaults: admin tokens off, unbounded
-            // service-account tokens off (per design §4 / §8 invariant 5).
+            // Defaults: admin tokens off, unbounded service-account
+            // tokens off.
             allow_admin_tokens: false,
             allow_unbounded_svc_tokens: false,
             // Token-exchange feature off by default.
@@ -3790,8 +3771,8 @@ mod tests {
             http_header_read_timeout_secs: 15,
             http_request_timeout_secs: 300,
             http_oci_upload_timeout_secs: 3600,
-            // Pull-through dedup defaults match the
-            // `from_env` parser defaults (design doc §6).
+            // Pull-through dedup defaults match the `from_env` parser
+            // defaults.
             pull_dedup_ttl_not_found_secs: 30,
             pull_dedup_ttl_unavailable_secs: 10,
             pull_dedup_ttl_timeout_secs: 10,
@@ -3817,8 +3798,8 @@ mod tests {
             pat_lockout_threshold: 30,
             pat_lockout_window_secs: 300,
             pat_lockout_duration_secs: 900,
-            // RC defaults: admin tokens off, unbounded
-            // service-account tokens off (per design §4 / §8 invariant 5).
+            // Defaults: admin tokens off, unbounded service-account
+            // tokens off.
             allow_admin_tokens: false,
             allow_unbounded_svc_tokens: false,
             // Token-exchange feature off by default.
@@ -4150,11 +4131,10 @@ mod tests {
             ("HORT_HTTP_HEADER_READ_TIMEOUT_SECS", None),
             ("HORT_HTTP_REQUEST_TIMEOUT_SECS", None),
             ("HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS", None),
-            // Pull-through dedup TTL +
-            // follower-wait knobs. Defaults from design doc §6
-            // (30 / 10 / 10 / 60 secs negative-cache TTL spread; 300s
-            // follower wait ceiling). Unset in default test env, fall
-            // through to defaults.
+            // Pull-through dedup TTL + follower-wait knobs.
+            // Defaults: 30 / 10 / 10 / 60 secs negative-cache TTL
+            // spread; 300s follower wait ceiling. Unset in default
+            // test env, fall through to defaults.
             ("HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS", None),
             ("HORT_PULL_DEDUP_TTL_UNAVAILABLE_SECS", None),
             ("HORT_PULL_DEDUP_TTL_TIMEOUT_SECS", None),
@@ -4189,7 +4169,7 @@ mod tests {
             // Native API token surface flags. Default
             // test env leaves them unset → defaults (feature off,
             // plaintext-PAT refused, 10k cache, 30/5min/15min
-            // lockout). The dedicated B5c tests below override these
+            // lockout). The dedicated tests below override these
             // slots to exercise the opt-in path.
             ("HORT_NATIVE_TOKENS_ENABLED", None),
             ("HORT_BEARER_ALLOW_OVER_HTTP", None),
@@ -4207,8 +4187,8 @@ mod tests {
             ("HORT_WEBHOOK_ALLOW_PLAINTEXT", None),
             ("HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS", None),
             ("HORT_NATS_URL", None),
-            // Backlog 078 Item 5 — `HORT_DATABASE_URL` is the canonical DSN
-            // var (bare `DATABASE_URL` at index 0 is the compat fallback).
+            // `HORT_DATABASE_URL` is the canonical DSN var (bare
+            // `DATABASE_URL` at index 0 is the compat fallback).
             // Pinned to None here so a developer's shell `HORT_DATABASE_URL`
             // can't leak in and shadow the `DATABASE_URL` slot the
             // positional `missing_database_url`/`s3_*` tests drive. Kept LAST
@@ -4254,10 +4234,10 @@ mod tests {
         let mut env = fs_env();
         env[0] = ("DATABASE_URL", None);
         // `HORT_DATABASE_URL` is already pinned to None by `fs_env()`, so
-        // with both absent the DSN read fails. Backlog 078 Item 5 — the
-        // parser tries `HORT_DATABASE_URL` first then falls back to
-        // `DATABASE_URL`, so the surfaced Missing variant names whichever
-        // was attempted last (`DATABASE_URL`). Accept either name.
+        // with both absent the DSN read fails. The parser tries
+        // `HORT_DATABASE_URL` first then falls back to `DATABASE_URL`,
+        // so the surfaced Missing variant names whichever was attempted
+        // last (`DATABASE_URL`). Accept either name.
         temp_env::with_vars(env, || {
             let err = Config::from_env().unwrap_err();
             assert!(
@@ -4979,8 +4959,6 @@ mod tests {
         });
     }
 
-    /// **RED → GREEN regression test for H-3, acceptance bar (d).**
-    ///
     /// `HORT_METRICS_BIND=0.0.0.0:9090` is refused at config-parse
     /// time unless `HORT_METRICS_PUBLIC_BIND=true` is set. The error
     /// names both env vars so an operator reading stderr finds the fix
@@ -5520,7 +5498,7 @@ mod tests {
 
     #[test]
     fn metadata_blob_max_bytes_size_string_override_parsed() {
-        // Backlog 078 Item 4 — the operator surface is a size string.
+        // The operator surface is a size string.
         let mut env = fs_env();
         env[14] = ("HORT_METADATA_BLOB_MAX_SIZE", Some("20Mi"));
         temp_env::with_vars(env, || {
@@ -5559,7 +5537,7 @@ mod tests {
     /// `HORT_UPSTREAM_RESOLVER_REFRESH_SECS` below the validated floor
     /// must abort startup with a clear error. Pinning this stops a
     /// future relaxation from silently dropping the floor — and
-    /// would have caught the Init 11-ext mirror smoke regression
+    /// would have caught the mirror smoke regression
     /// where the e2e compose set the var to `2`, the server died at
     /// boot, and the harness only saw "metrics endpoint never
     /// became ready" 120s later.
@@ -5622,8 +5600,8 @@ mod tests {
         });
     }
 
-    /// A below-C-1-minimum override is a hard startup failure, per
-    /// category (mirrors `upstream_resolver_refresh_secs_below_floor_rejected`).
+    /// A below-minimum override is a hard startup failure, per category
+    /// (mirrors `upstream_resolver_refresh_secs_below_floor_rejected`).
     #[test]
     fn retention_floor_below_c1_minimum_rejected_per_category() {
         let cases: &[(&'static str, &'static str)] = &[
@@ -5643,8 +5621,8 @@ mod tests {
                     ConfigError::InvalidValue { var: v, reason } => {
                         assert_eq!(v, *var, "wrong var named for {var}");
                         assert!(
-                            reason.contains("C-1 minimum"),
-                            "reason should name the C-1 minimum; got: {reason}"
+                            reason.contains("minimum"),
+                            "reason should name the minimum; got: {reason}"
                         );
                     }
                     other => panic!("expected InvalidValue for {var}, got {other:?}"),
@@ -5763,7 +5741,7 @@ mod tests {
     }
 
     /// `floor_for` maps **every** `StreamCategory` arm (the exhaustive
-    /// B13/B14 registration seam — a new variant would fail to compile
+    /// exhaustive registration seam — a new variant would fail to compile
     /// in `floor_for`, this asserts the runtime mapping for the ones
     /// that exist today).
     #[test]
@@ -5787,15 +5765,13 @@ mod tests {
         assert_eq!(f.floor_for(C::ArtifactGroup), chrono::Duration::days(1300));
         assert_eq!(f.floor_for(C::Curation), chrono::Duration::days(1300));
         assert_eq!(f.floor_for(C::Repository), chrono::Duration::days(1300));
-        // `DownloadAudit` is now a real
-        // StreamCategory; `floor_for` maps it to the ≥90d
-        // `artifact_downloaded` C-1 floor.
+        // `DownloadAudit` is now a real StreamCategory; `floor_for`
+        // maps it to the ≥90d `artifact_downloaded` retention floor.
         assert_eq!(f.floor_for(C::DownloadAudit), chrono::Duration::days(100));
-        // `TokenUse` is now a real
-        // StreamCategory; `floor_for` maps it to the ≥36mo
-        // `api_token_used` credential-audit C-1 floor (the SAME field
-        // `C::User` routes to — intentional, both are the
-        // credential-audit class; not a collision).
+        // `TokenUse` is now a real StreamCategory; `floor_for` maps
+        // it to the ≥36mo `api_token_used` credential-audit retention
+        // floor (the SAME field `C::User` routes to — intentional,
+        // both are the credential-audit class; not a collision).
         assert_eq!(f.floor_for(C::TokenUse), chrono::Duration::days(1200));
         assert_eq!(f.floor_for(C::User), f.floor_for(C::TokenUse));
         // The accessor still round-trips the same value.
@@ -6417,7 +6393,7 @@ mod tests {
         });
     }
 
-    // Backlog 078 Item 4 — the operator surface is a size string.
+    // The operator surface is a size string.
     #[test]
     fn publish_body_limit_bytes_size_string_parsed() {
         let mut env = fs_env();
@@ -6634,8 +6610,7 @@ mod tests {
         });
     }
 
-    // Unset env var falls back to the 30-second default — matches the
-    // design doc §2.11 baseline.
+    // Unset env var falls back to the 30-second default.
     #[test]
     fn pg_acquire_timeout_secs_unset_defaults_to_30() {
         temp_env::with_vars(fs_env(), || {
@@ -6744,7 +6719,7 @@ mod tests {
         });
     }
 
-    // Backlog 078 Item 4 — the operator surface is a size string.
+    // The operator surface is a size string.
     #[test]
     fn jwks_resp_body_max_bytes_size_string_parsed() {
         let mut env = fs_env();
@@ -7288,7 +7263,7 @@ mod tests {
     // `HORT_HTTP_REQUEST_TIMEOUT_SECS`, `HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS`),
     // each routed through `parse_positive::<u64>(...)`. The shared
     // parser is already exercised by the rbac/jwks/etc. test suites;
-    // here we cover the H-2-specific wiring per env var:
+    // here we cover the per-env-var wiring:
     //
     //   - default applied when unset (and when set to empty string)
     //   - explicit value parsed into the right Config field
@@ -7596,7 +7571,7 @@ mod tests {
     // The DB-only subset must parse with only DATABASE_URL set; the
     // serve-shaped vars (HORT_STORAGE_FILESYSTEM_PATH, HORT_PUBLIC_BASE_URL, OIDC_*,
     // HORT_TRUSTED_PROXY_CIDRS, …) MUST NOT be required. The four
-    // happy-path / error-path cases below cover §4's spec.
+    // happy-path / error-path cases below cover the spec.
     // -----------------------------------------------------------------
 
     /// Slot list that explicitly clears every var `MinimalConfig::from_env`
@@ -7604,9 +7579,9 @@ mod tests {
     /// from the developer's shell.
     fn minimal_env_slots() -> Vec<(&'static str, Option<&'static str>)> {
         vec![
-            // Backlog 078 Item 5 — `HORT_DATABASE_URL` is the canonical DSN
-            // var; bare `DATABASE_URL` is the compat fallback. Both pinned
-            // None here so neither leaks from the developer's shell.
+            // `HORT_DATABASE_URL` is the canonical DSN var; bare
+            // `DATABASE_URL` is the compat fallback. Both pinned to None
+            // here so neither leaks from the developer's shell.
             ("HORT_DATABASE_URL", None),
             ("DATABASE_URL", None),
             ("HORT_LOG_FORMAT", None),
@@ -7615,7 +7590,7 @@ mod tests {
             ("PG_ACQUIRE_TIMEOUT_SECS", None),
             // Slots `MinimalConfig` deliberately does NOT consult —
             // setting them to None proves the parser doesn't trip on
-            // their absence (regression: the whole point of Item 3).
+            // their absence.
             ("HORT_STORAGE_FILESYSTEM_PATH", None),
             ("HORT_STORAGE_BACKEND", None),
             ("HORT_PUBLIC_BASE_URL", None),
@@ -7665,9 +7640,9 @@ mod tests {
         // Both HORT_DATABASE_URL and DATABASE_URL stay None.
         temp_env::with_vars(env, || {
             let err = MinimalConfig::from_env().expect_err("MinimalConfig must require a DSN var");
-            // Backlog 078 Item 5 — the parser tries `HORT_DATABASE_URL`
-            // first then falls back to `DATABASE_URL`; the surfaced Missing
-            // variant names whichever was attempted last (`DATABASE_URL`).
+            // The parser tries `HORT_DATABASE_URL` first then falls back
+            // to `DATABASE_URL`; the surfaced Missing variant names
+            // whichever was attempted last (`DATABASE_URL`).
             // Accept either name, mirroring the worker's equivalent test.
             assert!(
                 matches!(err, ConfigError::Missing(var)
@@ -7679,8 +7654,8 @@ mod tests {
 
     #[test]
     fn minimal_config_hort_database_url_wins_when_both_set() {
-        // Backlog 078 Item 5 — `HORT_DATABASE_URL` is canonical and must
-        // win over bare `DATABASE_URL` when both are present.
+        // `HORT_DATABASE_URL` is canonical and must win over bare
+        // `DATABASE_URL` when both are present.
         let mut env = minimal_env_slots();
         set_env_slot(
             &mut env,
@@ -7699,8 +7674,8 @@ mod tests {
 
     #[test]
     fn minimal_config_database_url_fallback_when_hort_prefixed_absent() {
-        // Backlog 078 Item 5 — bare `DATABASE_URL` remains a load-bearing
-        // compat fallback (sqlx-cli / Tier-2 `maybe_pool()` / 12-factor).
+        // Bare `DATABASE_URL` remains a load-bearing compat fallback
+        // (sqlx-cli / Tier-2 `maybe_pool()` / 12-factor).
         let mut env = minimal_env_slots();
         set_env_slot(&mut env, "DATABASE_URL", Some("postgres://fallback/y"));
         temp_env::with_vars(env, || {
@@ -7744,8 +7719,8 @@ mod tests {
         });
     }
 
-    /// Regression test for Item 3's whole purpose — `MinimalConfig`
-    /// must NOT require any of the serve-shaped vars
+    /// Regression test — `MinimalConfig` must NOT require any of the
+    /// serve-shaped vars
     /// (`HORT_STORAGE_FILESYSTEM_PATH`, `HORT_PUBLIC_BASE_URL`, `HORT_AUTH_PROVIDER`,
     /// trust-policy fields). If a future refactor accidentally
     /// re-introduces a serve-side parser into the minimal path, this
@@ -7953,12 +7928,12 @@ mod tests {
             ("HORT_OIDC_AUDIENCE", Some("hort-server")),
             ("HORT_OIDC_CLI_CLIENT_ID", Some("hort-cli")),
             // Empty string: parse_public_base_url falls through to None.
-            // Explicit Some("") (rather than None) so the F2
+            // Explicit Some("") (rather than None) so the
             // "trust unconfigured" check tripped earlier in `from_env`
-            // is not what we observe — we want the B4 rule to fire.
+            // is not what we observe — we want the URL-validation rule to fire.
             // Trusted-proxy CIDRs are set as a defence-in-depth so the
-            // F2 check passes (`(false, true)` branch) and execution
-            // reaches the B4 validation.
+            // trust check passes (`(false, true)` branch) and execution
+            // reaches the URL validation.
             ("HORT_PUBLIC_BASE_URL", Some("")),
             ("HORT_TRUSTED_PROXY_CIDRS", Some("10.0.0.0/8")),
         ]);

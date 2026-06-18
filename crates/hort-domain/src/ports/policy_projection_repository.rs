@@ -7,15 +7,14 @@
 //!
 //! ## Write contract
 //!
-//! `PolicyUseCase` (Items 14a-2/3) calls `upsert` immediately after
-//! each successful event append, in the same DB transaction as the
-//! event-store `append_to_stream` call. `stream_version` on the
-//! supplied projection is the post-append
-//! `AppendResult.stream_position` — that field then drives
+//! `PolicyUseCase` calls `upsert` immediately after each successful event
+//! append, in the same DB transaction as the event-store
+//! `append_to_stream` call. `stream_version` on the supplied projection is
+//! the post-append `AppendResult.stream_position` — that field then drives
 //! [`ExpectedVersion::Exact`](crate::ports::event_store::ExpectedVersion::Exact)
 //! on the next mutation. A concurrent imperative-API write between
 //! projection-read and event-append fails the apply with a clear
-//! `ConcurrentModification` error (see design doc §3.3).
+//! `ConcurrentModification` error.
 //!
 //! Out-of-band rebuild from the event log is a future operational
 //! tool; this port only serves the synchronous-after-append path.

@@ -113,11 +113,11 @@ pub fn parse_retention_policy(
 ///   [`RetentionScope::validate`](hort_domain::retention::RetentionScope::validate)
 ///   (non-empty / bounded `Repos`, bounded `PackageNamePattern`)
 ///
-/// The §6-invariant-8 *security-predicate-does-not-exclude-direct-uploads*
-/// `info!` warning is **not** a validation reject — it fires at apply
-/// time in `ApplyConfigUseCase::apply_retention_policies` (B1
-/// acceptance bullet 4: it is operator-intent advisory, the policy
-/// still applies). This function only enforces structural validity.
+/// The *security-predicate-does-not-exclude-direct-uploads* `info!` warning
+/// is **not** a validation reject — it fires at apply time in
+/// `ApplyConfigUseCase::apply_retention_policies` (it is operator-intent
+/// advisory; the policy still applies). This function only enforces
+/// structural validity.
 pub fn validate_retention_policy(env: &Envelope<RetentionPolicySpec>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 

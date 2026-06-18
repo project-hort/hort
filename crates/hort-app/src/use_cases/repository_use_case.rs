@@ -150,9 +150,8 @@ impl RepositoryUseCase {
             created_at: now,
             updated_at: now,
             // Public CRUD path always writes Local. The gitops apply
-            // path (Item 8) bypasses this use case entirely and uses
-            // a managed-write port method that sets GitOps + digest
-            // in one statement.
+            // path bypasses this use case entirely and uses a managed-write
+            // port method that sets GitOps + digest in one statement.
             managed_by: ManagedBy::Local,
             managed_by_digest: None,
         };
@@ -232,10 +231,10 @@ impl RepositoryUseCase {
 
     /// Delete a repository by ID.
     ///
-    /// Same `ManagedByConfiguration` check as `update`. Item 8's
-    /// gitops apply uses `RepositoryRepository::delete_managed` —
-    /// a separate port method that does NOT route through this use
-    /// case and therefore is unaffected.
+    /// Same `ManagedByConfiguration` check as `update`. The gitops apply
+    /// path uses `RepositoryRepository::delete_managed` — a separate port
+    /// method that does NOT route through this use case and therefore is
+    /// unaffected.
     #[tracing::instrument(skip(self))]
     pub async fn delete(&self, id: Uuid) -> AppResult<()> {
         let repo = self.repos.find_by_id(id).await?;
@@ -268,9 +267,9 @@ mod tests {
 
     struct MockRepositoryRepository {
         repos: Mutex<HashMap<Uuid, Repository>>,
-        // Item 4 tests assert "save() must NOT be called on the reject
-        // branch". A counter is the cleanest way to pin that — checking
-        // for absence of state change leaves room for false positives
+        // The reject-branch tests assert "save() must NOT be called on the
+        // reject branch". A counter is the cleanest way to pin that —
+        // checking for absence of state change leaves room for false positives
         // (e.g. if save was called but happened to write the same data).
         save_calls: std::sync::atomic::AtomicUsize,
         delete_calls: std::sync::atomic::AtomicUsize,
@@ -418,9 +417,9 @@ mod tests {
             Box::pin(async { Ok(0) })
         }
 
-        // Item 8 — these mock-local impls aren't exercised by the
-        // RepositoryUseCase tests (which only touch the public CRUD
-        // path), but the trait now requires them.
+        // These mock-local impls aren't exercised by the RepositoryUseCase
+        // tests (which only touch the public CRUD path), but the trait
+        // requires them.
         fn save_managed(
             &self,
             _repository: &Repository,
@@ -441,8 +440,7 @@ mod tests {
     }
 
     /// Test variant that returns both the use case and a handle on the
-    /// shared mock so the new Item 4 reject-branch tests can assert
-    /// `save_call_count() == 0`.
+    /// shared mock so reject-branch tests can assert `save_call_count() == 0`.
     fn make_use_case_with_mock() -> (RepositoryUseCase, Arc<MockRepositoryRepository>) {
         let mock = Arc::new(MockRepositoryRepository::new());
         let uc = RepositoryUseCase::new(mock.clone());
@@ -715,7 +713,7 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
-    // -- Item 4: managed_by rejection ---------------------------------------
+    // -- managed_by rejection -----------------------------------------------
 
     #[tokio::test]
     async fn update_on_managed_repo_returns_managed_by_configuration() {

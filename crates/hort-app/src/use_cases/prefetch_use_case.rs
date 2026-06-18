@@ -169,7 +169,7 @@ impl SkipReason {
     }
 }
 
-/// Stateless prefetch planner. Lives on `AppContext` (Item 7 wires) as
+/// Stateless prefetch planner. Lives on `AppContext` as
 /// `Arc<PrefetchUseCase>`; format crates call
 /// [`Self::plan`] from their index/metadata serve sites.
 ///
@@ -207,8 +207,8 @@ impl PrefetchUseCase {
     ///   format-crate tests cheap (a mock that returns the seeded
     ///   list) and `hort-app` tests cheap (call `plan` directly with
     ///   inline data).
-    /// - `ordering` — per-format version ordering (Item 3's
-    ///   [`crate::use_cases::index_serve_filter::NpmSemverOrdering`] /
+    /// - `ordering` — per-format version ordering
+    ///   ([`crate::use_cases::index_serve_filter::NpmSemverOrdering`] /
     ///   `CargoSemverOrdering` / `Pep440Ordering`).
     ///
     /// Returns a [`PrefetchPlan`] — empty on every early-exit path so
@@ -235,13 +235,12 @@ impl PrefetchUseCase {
 
         // ----- Early-exit 1: policy disabled --------------------------
         // `debug!` not `info!` per the architect tracing-rules
-        // ("routine non-state-changing skips are `debug!`"). Per the
-        // catalog's F7.2 note this branch is unreachable from
-        // production today — every Item-7/Item-8 caller pre-checks
-        // `policy.enabled` — so the log line is a defense-in-depth
-        // signal only; promoting it to `info!` would flood logs from
-        // any future caller that wires the planner directly without
-        // the pre-check.
+        // ("routine non-state-changing skips are `debug!`"). This
+        // branch is unreachable from production today — every caller
+        // pre-checks `policy.enabled` — so the log line is a
+        // defense-in-depth signal only; promoting it to `info!` would
+        // flood logs from any future caller that wires the planner
+        // directly without the pre-check.
         if !policy.enabled {
             emit_skipped(&repo.key, SkipReason::Disabled, 1);
             tracing::debug!(
@@ -252,8 +251,7 @@ impl PrefetchUseCase {
         }
 
         // ----- Early-exit 2: trigger not subscribed -------------------
-        // Same `debug!` rationale as Early-exit 1 (architect review
-        // F7.3, F7.2 catalog note).
+        // Same `debug!` rationale as Early-exit 1.
         if !policy.triggers.contains(&trigger) {
             emit_skipped(&repo.key, SkipReason::TriggerNotEnabled, 1);
             tracing::debug!(
@@ -267,7 +265,7 @@ impl PrefetchUseCase {
         // enabled". The planner short-circuits before the per-version
         // walk so no spurious `already_held` / `not_newer` ticks fire.
         // `debug!` per the architect rule (routine non-state-changing
-        // skip — architect review F7.3).
+        // skip).
         if policy.depth == 0 {
             tracing::debug!(
                 depth = 0,
@@ -365,8 +363,8 @@ impl PrefetchUseCase {
 /// flag at the format-crate emission site for `enqueued`; the
 /// `skipped` counter ALWAYS carries the real repo key because
 /// `repo.key` is supplied verbatim. Operator visibility of the
-/// per-repo skip distribution is the reason §7 calls out this
-/// counter — collapsing it to `_all` would defeat the diagnostic.
+/// per-repo skip distribution matters here — collapsing it to `_all`
+/// would defeat the diagnostic.
 fn emit_skipped(repo_key: &str, reason: SkipReason, by: u64) {
     if by == 0 {
         return;

@@ -8,7 +8,7 @@
 //! [`ContentReferenceIndex`](hort_domain::ports::content_reference_index::ContentReferenceIndex))
 //! behind a causation-chain contract that the read path doesn't touch,
 //! so keeping them in one file would bloat both. The read/write split
-//! mirrors the separation in the OCI Distribution Spec §2.4 surface.
+//! mirrors the separation in the OCI Distribution Spec read/write surface.
 //!
 //! # Workflow summary (PUT)
 //!
@@ -17,7 +17,7 @@
 //! 2. Validate `Content-Type` against
 //!    [`SUPPORTED_MANIFEST_MEDIA_TYPES`]. Reject outside the allowlist
 //!    as `MANIFEST_INVALID` — index / manifest-list media types land on
-//!    the same 400 envelope per the deferral in §2.14.
+//!    the same 400 envelope per the index-support deferral.
 //! 3. Pre-compute the manifest body's SHA-256 **before** calling
 //!    [`IngestUseCase::ingest`]. On a digest-reference PUT the declared
 //!    digest is compared against the computed hash via
@@ -33,9 +33,9 @@
 //!    [`ArtifactRepository::find_by_checksum`]; enforce
 //!    `artifact.repository_id == repo` (cross-repo isolation). Any
 //!    missing blob returns 400 `MANIFEST_BLOB_UNKNOWN` with a
-//!    `detail.blobs` array. Per §2.14.3, the manifest artifact stays
-//!    committed so the client's retry-after-pushing-blobs path is
-//!    idempotent; the group is NOT created.
+//!    `detail.blobs` array. The manifest artifact stays committed so
+//!    the client's retry-after-pushing-blobs path is idempotent; the
+//!    group is NOT created.
 //! 5. Attach manifest + config + layers to the group via
 //!    [`ArtifactGroupUseCase::add_member`]. Shared per-request
 //!    `correlation_id`; every call threads `causation_id =
@@ -94,12 +94,12 @@ use super::name::validate_oci_name;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Manifest media-types accepted on `PUT`. §2.9 item 7 pins the
-/// allowlist; anything outside it is rejected as `MANIFEST_INVALID`.
+/// Manifest media-types accepted on `PUT`. Anything outside the
+/// allowlist is rejected as `MANIFEST_INVALID`.
 ///
 /// Manifest-index / manifest-list media types are in the allowlist
 /// (Docker Hub + OCI both accept them on PUT in production), but the
-/// JSON parser in this Item only understands the single-image shape
+/// JSON parser here only understands the single-image shape
 /// (`config`, `layers[]`). An index PUT therefore lands in the allowlist
 /// but fails at the JSON-parse step — see [`parse_manifest_blobs`] for
 /// the explicit deferral.
@@ -243,7 +243,7 @@ pub(crate) async fn put_manifest_dispatch(
     // Shared per-request correlation_id threaded through every call the
     // handler issues downstream (ingest, add_member × N, ref set,
     // content_references insert). Load-bearing audit contract — see
-    // backlog §Acceptance.
+    // audit-trail contract.
     let correlation_id = Uuid::new_v4();
 
     // Pull headers + body up front. Body reading is the one
@@ -266,7 +266,7 @@ pub(crate) async fn put_manifest_dispatch(
         }
     };
 
-    // Content-Type allowlist. §2.9 item 7.
+    // Content-Type allowlist.
     let media_type = match extract_media_type(&headers) {
         Ok(mt) => mt,
         Err(resp) => return *resp,
@@ -301,9 +301,9 @@ pub(crate) async fn put_manifest_dispatch(
 
     // Explicit deferral: the manifest-index / list shape is in the
     // supported media-type allowlist but the JSON parser only handles
-    // the single-image shape. §2.14 documents the deferral — index
-    // support needs a follow-up item that threads manifest-of-manifests
-    // membership into the group model.
+    // the single-image shape. Index support is deferred — it needs a
+    // follow-up that threads manifest-of-manifests membership into the
+    // group model.
     if MANIFEST_INDEX_MEDIA_TYPES.contains(&media_type.as_str()) {
         return OciError::ManifestInvalid {
             detail: Some(serde_json::json!({
@@ -397,10 +397,10 @@ pub(crate) async fn put_manifest_dispatch(
             }
             DigestParse::Unsupported { algorithm } => {
                 // Well-formed but non-sha256 algorithm. The OCI
-                // Distribution Spec §2.8 pins `UNSUPPORTED` for this
-                // specific case (a digest whose algorithm we recognise
-                // but can't process). This is the ONE path where
-                // UNSUPPORTED is correct (vs DIGEST_INVALID).
+                // The spec pins `UNSUPPORTED` for a digest whose
+                // algorithm is recognised but can't be processed.
+                // This is the ONE path where UNSUPPORTED is correct
+                // (vs DIGEST_INVALID).
                 return OciError::Unsupported {
                     message: format!("unsupported digest algorithm: {algorithm}"),
                 }
@@ -455,8 +455,7 @@ pub(crate) async fn put_manifest_dispatch(
     // EVERY layer is a Sigstore bundle (`is_pure_sigstore_bundle`). A mixed
     // manifest (a bundle layer plus a runnable `tar+gzip` layer) does NOT
     // match → it stays on `ingest_verified` and IS scanned. "Exempted" ⟺
-    // "carries no runnable content" — the anti-scan-evasion guard (§3.4c
-    // leg 1, §8.9).
+    // "carries no runnable content" — the anti-scan-evasion guard.
     //
     // `is_pure_sigstore_bundle` parses the manifest JSON; the body already
     // parsed cleanly above (`parsed_manifest`), so a parse error here is not
@@ -524,14 +523,14 @@ pub(crate) async fn put_manifest_dispatch(
     // above. A missing / malformed digest inside the blob list lands
     // as `MANIFEST_INVALID`; in the current contract the manifest is
     // already committed, and the client can retry with a corrected
-    // manifest (or push the blobs and retry). §2.14.3 allows the
-    // partially-attached state to persist.
+    // manifest (or push the blobs and retry). The partially-attached
+    // state is permitted to persist.
     let referenced = match parse_manifest_blobs(&parsed_manifest) {
         Ok(r) => r,
         Err(detail) => {
             tracing::warn!(
                 manifest_artifact_id = %manifest_artifact.id,
-                "manifest parse failed post-ingest; artifact stays committed per §2.14.3"
+                "manifest parse failed post-ingest; artifact stays committed for client retry"
             );
             return OciError::ManifestInvalid {
                 detail: Some(detail),
@@ -541,9 +540,9 @@ pub(crate) async fn put_manifest_dispatch(
     };
 
     // Resolve each referenced blob. Cross-repo isolation: a hash that
-    // exists in a foreign repo counts as missing — §2.14 requires the
-    // blob to live in the same repo as the manifest (mount it across
-    // explicitly via `POST /v2/.../blobs/uploads/?mount=...&from=...`).
+    // exists in a foreign repo counts as missing — the blob must live in
+    // the same repo as the manifest (mount it across explicitly via
+    // `POST /v2/.../blobs/uploads/?mount=...&from=...`).
     let (config_artifact, layer_artifacts, missing) =
         match resolve_referenced_blobs(&ctx, repo_id, &referenced).await {
             Ok(t) => t,
@@ -553,8 +552,8 @@ pub(crate) async fn put_manifest_dispatch(
             }
         };
     if !missing.is_empty() {
-        // §2.14.3: the manifest artifact stays committed so a client
-        // retry after pushing the missing blobs reconciles cleanly.
+        // The manifest artifact stays committed so a client retry after
+        // pushing the missing blobs reconciles cleanly.
         // We do NOT create the group on this path.
         //
         // Group-attachment retry path: the manifest stays committed so
@@ -744,8 +743,8 @@ pub(crate) async fn put_manifest_dispatch(
 /// Entry point for `DELETE /v2/:repo_key/*tail`.
 ///
 /// Tag references route through [`RefUseCase::retire`]; digest
-/// references delete the artifact + its content-reference rows. Per
-/// §2.4 the response is 202 (not 200) — OCI clients treat 200 and 202
+/// references delete the artifact + its content-reference rows. The
+/// response is 202 (not 200) — OCI clients treat 200 and 202
 /// identically here, but the spec prefers 202 for asynchronous cleanup
 /// semantics.
 ///
@@ -847,7 +846,7 @@ async fn delete_by_digest(
         DigestParse::Invalid { .. } => {
             // A malformed digest on DELETE surfaces as 404
             // `MANIFEST_UNKNOWN` — the reference-shape is unusable for
-            // a lookup and §2.8 pins the not-found envelope here.
+            // a lookup and the spec pins the not-found envelope here.
             return OciError::ManifestUnknown {
                 reference: digest_str.to_string(),
             }
@@ -1102,7 +1101,7 @@ async fn resolve_referenced_blobs(
 
 /// Extract the `Content-Type` header as an owned `String`. Missing or
 /// non-ASCII values land as `MANIFEST_INVALID` — the manifest push
-/// path REQUIRES a valid media-type per §2.9 item 7.
+/// path requires a valid media-type from the supported allowlist.
 fn extract_media_type(headers: &HeaderMap) -> Result<String, Box<Response>> {
     let Some(value) = headers.get(CONTENT_TYPE) else {
         return Err(Box::new(
@@ -1141,10 +1140,10 @@ fn compute_sha256(bytes: &[u8]) -> ContentHash {
         .expect("sha2::Sha256::digest produces valid 64-char lowercase hex")
 }
 
-/// Build the 201 response for a successful manifest PUT. §2.4:
-/// `Location` echoes the request URL with the client's reference
-/// form (tag or digest); `Docker-Content-Digest` carries the computed
-/// hash regardless of reference form.
+/// Build the 201 response for a successful manifest PUT. `Location`
+/// echoes the request URL with the client's reference form (tag or
+/// digest); `Docker-Content-Digest` carries the computed hash
+/// regardless of reference form.
 fn created_manifest_response(
     repo_key: &str,
     name: &str,
@@ -1585,8 +1584,8 @@ mod tests {
         //
         // 3. ArtifactGroupMemberAdded — adapter-level invariant via
         //    `INSERT ON CONFLICT DO NOTHING` in the postgres adapter
-        //    (9a §2.6a). The use case ALWAYS delegates to
-        //    `commit_member_added` and the mock's outcome path is
+        //    The use case ALWAYS delegates to `commit_member_added`
+        //    and the mock's outcome path is
         //    Committed-by-default (it does not model ON CONFLICT). At
         //    the mock-router-test layer we therefore CANNOT assert
         //    "member event count stable" — that's an integration-test
@@ -1787,9 +1786,8 @@ mod tests {
     #[test]
     fn put_with_subject_reference_carries_expected_metadata() {
         // Sanity-check the metadata shape stored — the Referrers API
-        // (Item 13) depends on `artifact_type` + `media_type` being
-        // present on the row so the response body can rebuild the
-        // descriptor.
+        // depends on `artifact_type` + `media_type` being present on
+        // the row so the response body can rebuild the descriptor.
         let (kind, artifact_type_ok, media_type_ok) = run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
@@ -2246,8 +2244,8 @@ mod tests {
             let resp = router.oneshot(put_request(uri, body)).await.unwrap();
             let status = resp.status();
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            // Assert the manifest artifact IS committed (§2.14.3
-            // policy) — the client retries after pushing the blob.
+            // Assert the manifest artifact IS committed — the client
+            // retries after pushing the blob.
             let manifest_path = format!("manifests/sha256:{manifest_hex}");
             let found = h
                 .artifacts
@@ -2737,7 +2735,7 @@ mod tests {
     // with a tightly-scoped RBAC evaluator and asserts which
     // permission was consulted.
     //
-    // Layout (mirrors the table in the design doc):
+    // Layout:
     //
     //   delete_manifest_dispatch + [read, write] (no delete) → 403
     //   delete_manifest_dispatch + [read, write, delete]     → 202
@@ -2885,7 +2883,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "principal with [read, write] but no `delete` grant must be denied (M-A5)"
+            "principal with [read, write] but no `delete` grant must be denied"
         );
     }
 
@@ -2930,7 +2928,7 @@ mod tests {
     /// without any explicit `permission_grants` rows succeeds at the
     /// manifest-delete endpoint via the role-name short-circuit in
     /// `RbacEvaluator::authorize` (rbac.rs:104). This pins the
-    /// "admin role is unaffected" line in the M-A5 CHANGELOG entry —
+    /// admin role short-circuits without an explicit `delete` grant —
     /// operators do NOT need to add a parallel `delete` grant for
     /// admin roles.
     #[test]

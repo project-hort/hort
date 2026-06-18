@@ -2038,8 +2038,8 @@ mod tests {
     /// store + disabled RBAC + `include_repository_label = true`. The
     /// store is empty so `metric_label(repo_id)` returns the `unknown`
     /// sentinel for any id — fine for existing exclusion tests that
-    /// don't assert the resolved-key shape (Item 14 adds dedicated
-    /// tests that seed a real repository).
+    /// don't assert the resolved-key shape (dedicated tests seed a real
+    /// repository for that assertion).
     fn default_repository_access() -> Arc<RepositoryAccessUseCase> {
         use crate::use_cases::repository_access::RbacAccess;
         Arc::new(RepositoryAccessUseCase::new(
@@ -2050,7 +2050,7 @@ mod tests {
     }
 
     /// Build a `RepositoryAccessUseCase` seeded with a single
-    /// repository so Item-14 exclusion tests can assert the
+    /// repository so exclusion tests can assert the
     /// `repository="<key>"` label resolution on the curation metric.
     fn repository_access_with_key(
         repo_id: Uuid,
@@ -2079,7 +2079,7 @@ mod tests {
     }
 
     /// Variant that lets the caller supply a pre-built
-    /// `RepositoryAccessUseCase` — used by Item 14 tests that pin the
+    /// `RepositoryAccessUseCase` — used by tests that pin the
     /// `hort_curation_decisions_total{repository=…}` label resolution.
     fn make_use_case_with_repo_access(
         repository_access: Arc<RepositoryAccessUseCase>,
@@ -3916,7 +3916,7 @@ mod tests {
     /// `add_exclusion` happy path with `PolicyScope::Global` →
     /// `{decision=exclude_finding, repository=_all, result=ok}`. Global
     /// scope is cross-repo by definition; `_all` is the canonical
-    /// label (design §7 — "cross-repo finding-exclusion").
+    /// label (cross-repo finding-exclusion).
     #[test]
     fn add_exclusion_global_scope_emits_exclude_finding_with_all_sentinel() {
         use metrics_util::debugging::DebuggingRecorder;

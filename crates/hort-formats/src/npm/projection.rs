@@ -10,7 +10,7 @@
 //!  - serde.rs/stream-array.html (`Visitor::visit_map` streaming pattern,
 //!    adapted to a JSON object instead of an array).
 //!  - serde.rs/ignored-any.html (the skip-without-allocating mechanism).
-//!  - Design doc §4.1 + §9.1 invariants I-1, I-2, I-3, I-6.
+//!  - ADR 0026 streaming projection contract.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -74,7 +74,7 @@ pub struct NpmVersionEntry {
 // ---------------------------------------------------------------------------
 
 /// Streaming projector instance. Carries the per-version-object cap
-/// (§10.3 default 2 MiB; configurable via
+/// (default 2 MiB; configurable via
 /// `HORT_UPSTREAM_PROJECTOR_VERSION_OBJECT_MAX_SIZE`).
 pub struct NpmPackumentProjector {
     per_version_object_max_bytes: u64,
@@ -109,7 +109,7 @@ impl MetadataProjector for NpmPackumentProjector {
     fn project<R: std::io::Read>(self, reader: R) -> DomainResult<NpmProjection> {
         // Wrap in `CountingReader` so the inner `versions{}` visitor
         // can sample `bytes_consumed()` before/after `next_value` and
-        // trip I-6 (per-version-object cap) without re-buffering.
+        // enforce the per-version-object cap without re-buffering.
         let counting = CountingReader::new(reader);
         let counter = counting.counter();
         let mut de = serde_json::Deserializer::from_reader(counting);
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn dist_tarball_integrity_round_trip_pins_init44_f11_invariant() {
-        // I-1 — `dist.tarball` must reach the consumer unmodified.
+        // `dist.tarball` must reach the consumer unmodified.
         let body = br#"{
             "versions": {
                 "1.0.0": {
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn per_version_object_cap_trips_on_oversize_value() {
-        // I-6 — single version object > cap → error. Synthesise a
+        // Single version object > cap → error. Synthesise a
         // version with a huge `_extra_field` (skipped via
         // IgnoredAny but its tokens still flow through CountingReader
         // and count against the per-value cap, which is the right

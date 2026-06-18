@@ -221,8 +221,8 @@ fn build_harness() -> Harness {
         // RbacEvaluator's two-leg AND. The cap value travels into
         // the JWT only via the `evaluate_scope` path, which AND-
         // composes against the user's RBAC grants. The JWT mint
-        // succeeds even if the granted subset is empty (per
-        // design doc §6 "empty granted subset is NOT an error").
+        // succeeds even if the granted subset is empty (an empty
+        // granted subset is NOT an error).
         declared_permissions: vec![Permission::Read],
         repository_ids: None,
         expires_at: None,
@@ -420,7 +420,7 @@ fn step2_v2_auth_with_valid_pat_mints_jwt() {
     // NOTE: scope is omitted (per the step3 explanation): a single
     // `scope=…` query value fails serde_urlencoded's `Vec<String>`
     // deserialise. Real `docker login` calls /v2/auth with no scope
-    // first ("ping-style anonymous-equivalent" per design doc §6),
+    // first (the "ping-style anonymous-equivalent" path),
     // so the empty-scope mint path is itself a Distribution-Spec
     // shape worth pinning here.
     let (status, body_json) = run(async {
@@ -522,7 +522,7 @@ fn step3_v2_auth_without_credentials_returns_401_with_challenge() {
 // Credential is valid — the gate fires BEFORE PAT validation, so a valid
 // credential still 400s when `service=` does not match the configured
 // `aud`. The body MUST be constant `"service mismatch"` — it never echoes
-// the requested/expected host (spec §3.3; values go to the audit log only).
+// the requested/expected host (values go to the audit log only).
 // ===========================================================================
 
 #[test]
@@ -536,7 +536,7 @@ fn v2_auth_service_mismatch_returns_400_unsupported_envelope() {
         let resp = router
             .oneshot(
                 // Configured aud is `hort.example.com`; the client sends a
-                // different host → F-28 Step-0 mismatch.
+                // different host → service= mismatch.
                 Request::get("/v2/auth?service=evil.attacker.example")
                     .header(header::AUTHORIZATION, format!("Basic {basic}"))
                     .body(Body::empty())
@@ -560,18 +560,15 @@ fn v2_auth_service_mismatch_returns_400_unsupported_envelope() {
     );
     // Byte-exact envelope: the SAME `UNSUPPORTED` wire shape
     // `OciError::Unsupported` already renders for the established
-    // `invalid scope` 400 (spec §3.3 / §7 — "the wire shape is
-    // identical to the established `invalid scope` 400, so OCI clients
-    // parse it with their existing error handling"). That shape carries
-    // `detail:null` (the `WireError.detail` field has no
-    // skip_serializing_if). The message is the CONSTANT `"service
-    // mismatch"` — NO reflected requested/expected value in the body
-    // (the spec §3.3 snippet abbreviates `detail`; the load-bearing
-    // contract is "identical to the existing invalid-scope 400").
+    // `invalid scope` 400. That shape carries `detail:null` (the
+    // `WireError.detail` field has no skip_serializing_if). The message
+    // is the CONSTANT `"service mismatch"` — NO reflected
+    // requested/expected value in the body (the load-bearing contract is
+    // "identical to the existing invalid-scope 400").
     assert_eq!(
         body_text,
         r#"{"errors":[{"code":"UNSUPPORTED","message":"service mismatch","detail":null}]}"#,
-        "F-28 400 body must be byte-identical to the established UNSUPPORTED \
+        "service-mismatch 400 body must be byte-identical to the established UNSUPPORTED \
          envelope and must NOT echo the host"
     );
     assert!(
@@ -581,7 +578,7 @@ fn v2_auth_service_mismatch_returns_400_unsupported_envelope() {
     assert_eq!(
         api_ver.as_deref(),
         Some("registry/2.0"),
-        "Docker-Distribution-API-Version header must be present on the F-28 400"
+        "Docker-Distribution-API-Version header must be present on the service-mismatch 400"
     );
 }
 
@@ -614,7 +611,7 @@ fn f28_v2_auth_matching_service_still_mints_200() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "case-insensitive host match must still mint (no spurious F-28 400)"
+        "case-insensitive host match must still mint (no spurious service-mismatch 400)"
     );
 }
 
@@ -676,8 +673,7 @@ fn step4_minted_jwt_passes_oci_auth_gate_on_subsequent_request() {
 // ===========================================================================
 // Step 5 — Full DOCKER LOGIN dance, hands-off: every step uses ONLY the
 // data the previous step's response handed back. This is the strongest
-// shape the test takes — the parent agent's instructions specifically
-// call this out as the "Distribution-Spec-conformant mock client" path.
+// shape the test takes — the "Distribution-Spec-conformant mock client" path.
 // ===========================================================================
 
 #[test]
@@ -717,8 +713,7 @@ fn step5_docker_login_dance_end_to_end_via_oneshot() {
         let realm = parse_challenge_param(&www, "realm").expect("realm");
         let service = parse_challenge_param(&www, "service").expect("service");
         // The realm is an absolute URL — production code should never
-        // hand a client a relative realm (that's the F6 boot-fail
-        // we just closed).
+        // hand a client a relative realm.
         assert!(
             realm.starts_with("https://"),
             "realm must be absolute: {realm}"

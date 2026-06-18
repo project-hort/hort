@@ -13,7 +13,7 @@
 //!      stale-while-error invariants byte-for-byte);
 //!    - anything else → [`HostedPypiSource`] (reads
 //!      [`ArtifactUseCase::list_by_raw_name_visible`] — the
-//!      F-25-anti-enumeration-enforcing entry point).
+//!      anti-enumeration-enforcing entry point).
 //! 2. **Filter pipeline.** `NonServableStatusFilter` then
 //!    `IndexModeFilter::new(repo.index_mode)`. Future operator-defined
 //!    exclusion filters append to this list.
@@ -23,7 +23,7 @@
 //!    (PEP 691) emits the wire bytes. Two builders, NOT one builder
 //!    with a content-type field on [`BuildContext`].
 //!
-//! # F-25 anti-enumeration shape
+//! # Anti-enumeration shape
 //!
 //! Anonymous / denied callers on a private repo receive `404`, not
 //! `403`. The hosted source's `list_by_raw_name_visible` already
@@ -112,7 +112,7 @@ pub(crate) async fn serve_simple_index_unified(
     caller: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
     // ---- Resolve the repo + access check -----------------------------
-    // F-25 anti-enumeration: anonymous on private collapses to
+    // Anti-enumeration: anonymous on private collapses to
     // `NotFound { entity: "Repository" }` (ADR 0008).
     let repo: Repository = ctx
         .repository_access_use_case
@@ -245,7 +245,7 @@ mod tests {
     //! 1. Quarantined artifact filtered from HTML and JSON output.
     //! 2. Rejected artifact filtered from HTML and JSON output.
     //! 3. Content-type negotiation preserved (HTML / JSON / default).
-    //! 4. F-25 anti-enumeration — anonymous on private repo gets
+    //! 4. Anti-enumeration — anonymous on private repo gets
     //!    `NotFound` (404), not 403. Both content types.
     //! 5. PEP 440 versions[] ordering (JSON).
     //! 6. Smoke for the truncation-`Warning` header propagation.
@@ -639,7 +639,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 5a. F-25 anti-enumeration — anonymous on private repo gets 404,
+    // 5a. Anti-enumeration — anonymous on private repo gets 404,
     // not 403 (HTML).
     // -----------------------------------------------------------------
 
@@ -686,12 +686,12 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "F-25 anti-enumeration: denied caller MUST receive 404 (HTML), NEVER 403",
+            "anti-enumeration: denied caller MUST receive 404 (HTML), NEVER 403",
         );
     }
 
     // -----------------------------------------------------------------
-    // 5b. F-25 anti-enumeration — JSON branch.
+    // 5b. Anti-enumeration — JSON branch.
     // -----------------------------------------------------------------
 
     #[tokio::test]
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "F-25 anti-enumeration: denied caller MUST receive 404 (JSON), NEVER 403",
+            "anti-enumeration: denied caller MUST receive 404 (JSON), NEVER 403",
         );
     }
 

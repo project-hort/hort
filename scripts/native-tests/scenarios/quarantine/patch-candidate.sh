@@ -141,7 +141,7 @@ seed_repository() {
 
 seed_vulnerable_artifact() {
     # pkg@1.0 — released, with one High finding. `created_at` is
-    # backdated 1 day so the self-join in §3.2 of the design doc
+    # backdated 1 day so the self-join
     # (`v.created_at < q.created_at`) admits this row.
     local out
     out="$(psql_exec "INSERT INTO artifacts (
@@ -252,9 +252,8 @@ log "repo_key : $REPO_KEY"
 log "pkg_name : $PKG_NAME"
 log ""
 
-# hort-cli is mandatory — the smoke is also a CLI surface check (per
-# §3.5 of the design doc). Falling back to raw curl would skip the
-# Item 4 surface.
+# hort-cli is mandatory — the smoke is also a CLI surface check.
+# Falling back to raw curl would skip the list-patch-candidates surface.
 command -v hort-cli >/dev/null 2>&1 || skip "hort-cli missing in image"
 HORT_CLI=hort-cli
 
@@ -404,7 +403,7 @@ fi
 # Server-side SeverityThreshold::Display renders lowercase ("high"); see
 # admin.rs:853 — the CLI passes it through unchanged.
 if [ "$SEV_VAL" = "high" ]; then
-    pass "candidate.vulnerable_max_severity == 'high' (High in design doc terms)"
+    pass "candidate.vulnerable_max_severity == 'high'"
 else
     fail "candidate.vulnerable_max_severity == 'high'" \
         "got '${SEV_VAL}'"

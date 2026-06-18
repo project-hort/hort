@@ -7,8 +7,7 @@
 //! the gate). The existing `/admin/*` admin routes keep their
 //! [`AdminPrincipal`](crate::authz::AdminPrincipal) gate unchanged —
 //! the curate-or-admin expansion is scoped to this sub-router ONLY
-//! (mirrors the Item 9 / Item 10 placement under
-//! `/api/v1/admin/curation/`).
+//! (mirrors the placement under `/api/v1/admin/curation/`).
 //!
 //! Routes:
 //! - `POST   /api/v1/admin/policies/:policy_id/exclusions`
@@ -28,10 +27,8 @@
 //! the user-driven exclusion surface: the `CurateOrAdminPrincipal`
 //! extractor enforces curate-or-admin BEFORE the handler body runs,
 //! then the handler constructs `Actor::Api(...)` from the validated
-//! principal. Item 11's scope revision (vs. the Item 11 design that
-//! proposed swapping `require_admin → require_curate_or_admin` inside
-//! the use case) keeps `apply_config_use_case` working with no port-
-//! contract change.
+//! principal. This approach keeps `apply_config_use_case` working with
+//! no port-contract change.
 //!
 //! See `docs/architecture/how-to/curator-workflow.md` for the operator
 //! workflow.
@@ -70,7 +67,7 @@ pub fn policies_routes() -> Router<Arc<AppContext>> {
 /// / `ArtifactRejected` domain event validators).
 ///
 /// The handler enforces this BEFORE the use-case call (defence in
-/// depth — design §3 acceptance criterion). The use case itself
+/// depth). The use case itself
 /// does not currently re-check this exact cap (the underlying
 /// `ExclusionAdded::validate` enforces a wider 4096-byte cap on
 /// `reason`), so the handler is the active gate at 512 bytes for the

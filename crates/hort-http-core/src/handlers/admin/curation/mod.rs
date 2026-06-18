@@ -10,14 +10,14 @@
 //! the curate-or-admin expansion is scoped to this sub-router ONLY.
 //!
 //! Routes:
-//! - **Decision endpoints (Item 9):**
+//! - **Decision endpoints:**
 //!   - `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`
 //!     ([`waive::post_waive`])
 //!   - `POST /api/v1/admin/curation/quarantine/:artifact_id/block`
 //!     ([`block::post_block`])
 //!   - `POST /api/v1/admin/curation/block-versions`
 //!     ([`block_versions::post_block_versions`])
-//! - **Read endpoints (Item 10):**
+//! - **Read endpoints:**
 //!   - `GET  /api/v1/admin/curation/queue`
 //!     ([`queue::get_queue`])
 //!   - `GET  /api/v1/admin/curation/decisions`
@@ -72,7 +72,7 @@ pub fn curation_routes() -> Router<Arc<AppContext>> {
         .route("/exclusions", get(exclusions::get_exclusions))
 }
 
-/// Maximum `limit` accepted by the three Item-10 list endpoints
+/// Maximum `limit` accepted by the three list endpoints
 /// (`/queue`, `/decisions`, `/exclusions`). Mirrors the use-case-side
 /// `MAX_QUEUE_LIMIT` private constant in `hort_app::use_cases::curation_use_case`
 /// — the handler boundary check fires FIRST so an oversize value never
@@ -82,26 +82,26 @@ pub fn curation_routes() -> Router<Arc<AppContext>> {
 pub(crate) const MAX_LIST_LIMIT: u32 = 500;
 
 /// Maximum byte length of the operator-supplied justification on every
-/// Item-9 decision endpoint. Mirrors the 512-byte cap enforced by
+/// decision endpoint. Mirrors the 512-byte cap enforced by
 /// `CurationUseCase::validate_justification` (also matched in the
 /// `ArtifactReleased` / `ArtifactRejected` domain event validators).
 ///
 /// The handler enforces this BEFORE the use-case call (defence in
-/// depth — design §3 acceptance criterion). A bypass that reached the
+/// depth). A bypass that reached the
 /// use case would still surface 400 via the same `DomainError::Validation`
 /// path, so the gate is fail-safe-by-construction at both layers.
 pub(crate) const MAX_JUSTIFICATION_BYTES: usize = 512;
 
 /// Maximum number of versions accepted per `POST /api/v1/admin/curation/block-versions`
-/// call. Mirrors `CurationUseCase::MAX_VERSIONS_PER_CALL` (design §2.7
-/// — bounded per-call work, same shape as the queue listing cap).
+/// call. Mirrors `CurationUseCase::MAX_VERSIONS_PER_CALL` (bounded
+/// per-call work, same shape as the queue listing cap).
 /// Empty `versions` is also rejected at the handler boundary (`< 1`).
 pub(crate) const MAX_VERSIONS_PER_CALL: usize = 100;
 
 #[cfg(test)]
 mod authz_scope_tests {
-    //! Item 9 acceptance — the curate-or-admin gate applies ONLY to the
-    //! three new routes; existing `/admin/*` routes keep their
+    //! The curate-or-admin gate applies ONLY to the three curation
+    //! routes; existing `/admin/*` routes keep their
     //! [`AdminPrincipal`] gate.
     //!
     //! These tests mount BOTH the curation sub-router (gated by

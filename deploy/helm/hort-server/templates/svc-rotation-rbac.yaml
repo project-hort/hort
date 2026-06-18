@@ -9,12 +9,11 @@ cross-namespace pattern for any controller-style workload that
 reconciles objects outside its own namespace.
 
 Design choice: per-namespace `Role`, not a single cluster-wide
-`ClusterRole` + `ClusterRoleBinding`. The design doc deliberately
-keeps authorization granular — every namespace the operator opts
-into is an explicit YAML line in `worker.rotation.targetNamespaces`.
-A ClusterRole would let the worker write Secrets in every namespace
-once enabled, which is exactly the blast radius the per-namespace
-shape exists to bound.
+`ClusterRole` + `ClusterRoleBinding`. Authorization is kept granular —
+every namespace the operator opts into is an explicit YAML line in
+`worker.rotation.targetNamespaces`. A ClusterRole would let the worker
+write Secrets in every namespace once enabled, which is exactly the blast
+radius the per-namespace shape exists to bound.
 
 The `svc-bootstrap-rbac.yaml` template is the closest precedent — it
 also locks down Secret-writing permission tightly, though for a
@@ -28,18 +27,16 @@ Required verbs (from the writer adapter):
   to read the `project-hort.de/last-rotated` freshness label.
 - `create`: the very first reconcile on a new Secret name.
 - `update`: SSA ownership-transfer edge cases on some k8s versions.
-- `patch`: the steady-state SSA path (`Patch::Apply`, chosen in
-  Item 6 §4) requires `patch` verb authorization.
+- `patch`: the steady-state SSA path (`Patch::Apply`) requires
+  `patch` verb authorization.
 
 Empty `worker.rotation.targetNamespaces` renders zero Roles — the
 rotation handler then logs `namespace_not_authorized` for every
-SA whose `fallbackRotation.targetSecret.namespace` is unmatched
-(documented behaviour in Item 7).
+SA whose `fallbackRotation.targetSecret.namespace` is unmatched.
 
-Backlog 078 Item 9 (chart S4): this template is gated on the SINGLE
-rotation source-of-truth toggle `scheduledTasks.serviceAccountRotation.enabled`
-(the same flag that gates the CronJob + the worker rotation env). The
-pre-078 `worker.rotation.enabled` second switch was collapsed.
+This template is gated on the SINGLE rotation source-of-truth toggle
+`scheduledTasks.serviceAccountRotation.enabled` (the same flag that
+gates the CronJob + the worker rotation env).
 `worker.enabled` is still required because the RoleBinding binds the
 worker ServiceAccount, which is meaningless without the worker
 Deployment.

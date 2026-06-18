@@ -59,10 +59,10 @@ pub enum GitopsBootError {
     Parse(String),
 
     /// Provably **pre-write** validation/lint failure, surfaced by
-    /// `ApplyConfigUseCase::preflight_validate` BEFORE `apply()` runs (H14
-    /// / Spec 076 §5). No DB write has occurred, so the caller PARKS
-    /// not-ready instead of crashlooping — distinct from [`Self::Validate`]
-    /// (the in-stage, mid-write-capable validation that must still crash).
+    /// `ApplyConfigUseCase::preflight_validate` BEFORE `apply()` runs.
+    /// No DB write has occurred, so the caller PARKS not-ready instead of
+    /// crashlooping — distinct from [`Self::Validate`] (the in-stage,
+    /// mid-write-capable validation that must still crash).
     #[error("gitops preflight validation failed:\n{0}")]
     PreflightValidate(String),
 
@@ -70,10 +70,10 @@ pub enum GitopsBootError {
     /// (e.g. a Stage-2/3 RetentionPolicy predicate/scope resolve, an
     /// upstream-mapping construction). This is mid-write-capable — a
     /// Stage-1 `save_managed` may already have run — so it MUST crash, not
-    /// park (Spec 076 §5.3). Pre-write cross-spec validation (duplicate
-    /// names, dangling virtual members, HORT_AUTH_PROVIDER conflict,
-    /// managed-vs-Local conflict) is caught earlier by the preflight pass
-    /// and surfaces as [`Self::PreflightValidate`] instead.
+    /// park. Pre-write cross-spec validation (duplicate names, dangling
+    /// virtual members, HORT_AUTH_PROVIDER conflict, managed-vs-Local
+    /// conflict) is caught earlier by the preflight pass and surfaces as
+    /// [`Self::PreflightValidate`] instead.
     #[error("gitops validation failed:\n{0}")]
     Validate(String),
 
@@ -392,12 +392,12 @@ async fn apply_inner(
         },
     };
 
-    // H14 / Spec 076 §5 — provably pre-write validation/lint pass FIRST, so a
-    // config error that cannot have written anything PARKS not-ready
-    // (`PreflightValidate`) instead of crashlooping. `apply()` re-runs the
-    // same checks (emitting the advisories) on the write path; reaching
-    // `apply()` at all means preflight passed, so any `Validation` it then
-    // returns is in-stage (mid-write-capable) and correctly crashes.
+    // Provably pre-write validation/lint pass FIRST, so a config error that
+    // cannot have written anything PARKS not-ready (`PreflightValidate`)
+    // instead of crashlooping. `apply()` re-runs the same checks (emitting
+    // the advisories) on the write path; reaching `apply()` at all means
+    // preflight passed, so any `Validation` it then returns is in-stage
+    // (mid-write-capable) and correctly crashes.
     if let Err(e) = apply_uc.preflight_validate(&desired, &env_snapshot).await {
         return match e {
             AppError::Domain(hort_domain::error::DomainError::Validation(msg)) => {
@@ -529,8 +529,7 @@ fn record_duration_metric(seconds: f64) {
 /// fire before `apply_uc.apply()` (the first DB write, `apply_inner`
 /// stage 4)?
 ///
-/// Spec 076 §5.2 / §5.3 (+ H14). Only the provably-pre-write classes are
-/// park-eligible:
+/// Only the provably-pre-write classes are park-eligible:
 ///
 /// - `Parse` — fails in the `DesiredState::parse_files` branch of
 ///   `apply_inner`, before any apply-only adapter is even constructed, so
@@ -541,9 +540,9 @@ fn record_duration_metric(seconds: f64) {
 ///   `apply_inner` runs BEFORE `apply()`. That pass performs only reads
 ///   (snapshot + `scanner_registry.list_live`) and the in-memory
 ///   validation/lint checks — zero writes — so a failure here is provably
-///   pre-write and parks (H14). This is the validation/lint that operators
-///   most commonly trip (a typo'd `scanBackends`, a bad lint/provenance
-///   config, a duplicate name, a dangling FK); it no longer crashloops.
+///   pre-write and parks. This is the validation/lint that operators most
+///   commonly trip (a typo'd `scanBackends`, a bad lint/provenance config,
+///   a duplicate name, a dangling FK); it no longer crashloops.
 ///
 /// `Validate` and `Apply` originate from `apply_uc.apply()` (or the
 /// adapter / event-store-probe construction that immediately precedes it),
@@ -553,9 +552,8 @@ fn record_duration_metric(seconds: f64) {
 /// Stage-1 `save_managed`. `ApplyConfigUseCase` ships **no rollback** on
 /// purpose; its safety rests on "boot exits non-zero on a possibly-half-
 /// applied state". So these classes MUST still crash — parking them would
-/// silently erode that inherited rationale (Spec 076 §5.3, architect T1).
-/// This is the item's safety-critical invariant; the `is_park_eligible_*`
-/// unit tests pin it per-variant.
+/// silently erode that invariant. The `is_park_eligible_*` unit tests pin
+/// it per-variant.
 pub fn is_park_eligible(err: &GitopsBootError) -> bool {
     match err {
         GitopsBootError::Parse(_)
@@ -760,8 +758,8 @@ spec:
     /// required — the boot path's `apply_uc.apply(desired, …)` already
     /// threads `desired.lint_config` into the resolver. A bundle with
     /// NO lint-config kind parses to `lint_config: None`, which the
-    /// resolver maps to the secure composition-root default (§6
-    /// invariant 1 — a missing kind is not a downgrade).
+    /// resolver maps to the secure composition-root default
+    /// (a missing kind is not a downgrade).
     #[test]
     fn boot_parse_path_absent_lint_config_kind_is_none() {
         let dir = TempDir::new().unwrap();
@@ -795,19 +793,19 @@ spec:
     // gating in adapter integration suites. The unit-level coverage
     // above pins the directory-walk + parse-into-`desired` semantics
     // (the boot-path wiring this item introduces); full apply against
-    // a live DB lands in Item 10's E2E smoke (test-gitops.sh).
+    // a live DB lands in the E2E smoke (test-gitops.sh).
 
-    // ---- Spec 076 §5.2 / §5.8 (+ H14) — `is_park_eligible` per-variant ----
+    // ---- `is_park_eligible` per-variant ---------------------------------
     //
-    // The park boundary is THE safety-critical invariant of the boot-
-    // hardening item: park ONLY on provably-pre-write failures
-    // (`Parse | Read | Walk | PreflightValidate`); `Validate | Apply` MUST
-    // still crash because `ApplyConfigUseCase` has no rollback and its
-    // safety rests on "boot exits non-zero on a half-applied state" (§5.3).
-    // `PreflightValidate` is the H14 addition: the pre-write validation/lint
-    // pass that `apply_inner` runs (via `preflight_validate`) before the
-    // first write, so it parks; `Validate` is the in-stage (mid-write)
-    // validation that survives into `apply()`'s stages, so it still crashes.
+    // The park boundary is THE safety-critical invariant: park ONLY on
+    // provably-pre-write failures (`Parse | Read | Walk |
+    // PreflightValidate`); `Validate | Apply` MUST still crash because
+    // `ApplyConfigUseCase` has no rollback and its safety rests on "boot
+    // exits non-zero on a half-applied state". `PreflightValidate` is the
+    // pre-write validation/lint pass that `apply_inner` runs (via
+    // `preflight_validate`) before the first write, so it parks; `Validate`
+    // is the in-stage (mid-write) validation that survives into `apply()`'s
+    // stages, so it still crashes.
 
     /// Construct a representative `Walk` variant. `walkdir::Error` has no
     /// public constructor, so we provoke a real one by walking a path
@@ -845,10 +843,9 @@ spec:
 
     #[test]
     fn is_park_eligible_preflight_validate_parks() {
-        // H14 — a pre-write validation/lint failure surfaced by
-        // `preflight_validate` (before `apply()`/the first `save_managed`)
-        // is provably pre-write, so it parks not-ready rather than
-        // crashlooping. This is the inconsistency H14 fixed.
+        // A pre-write validation/lint failure surfaced by `preflight_validate`
+        // (before `apply()`/the first `save_managed`) is provably pre-write,
+        // so it parks not-ready rather than crashlooping.
         assert!(
             is_park_eligible(&GitopsBootError::PreflightValidate(
                 "scanBackends `bogus` not registered".into()

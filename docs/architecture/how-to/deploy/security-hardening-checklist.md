@@ -27,8 +27,7 @@ them post-install.
 
 Each entry has the same shape:
 
-- **Control** — what the security audit found (the per-round audit
-  code: H-N / M-N / L-N, M-A-N, or F-N).
+- **Control** — what the security audit found.
 - **Chart default** — what the chart ships out of the box.
 - **Operator action required** — `yes`, `no`, or `conditional`, and on
   what condition.
@@ -48,9 +47,9 @@ public hostname of the operator's edge.
 
 ---
 
-## First-audit controls — H-* / M-* / *-low-* codes (deployment-side surface)
+## First-audit controls (deployment-side surface)
 
-### H-1 (Item 1) — `AuthContext::Disabled` is fail-closed in OCI
+### `AuthContext::Disabled` is fail-closed in OCI
 
 - **Control:** When `auth.provider: disabled`, no synthetic admin
   principal is injected by the OCI middleware. Anonymous OCI requests
@@ -69,7 +68,7 @@ public hostname of the operator's edge.
   re-introduce the synthetic admin; it only suppresses authentication
   on routes that voluntarily skip `authorize()`.
 
-### H-2 (Item 2) — Per-request deadline + slowloris timeout
+### Per-request deadline + slowloris timeout
 
 - **Control:** HTTP/1 header-read timeout (15s default), request
   deadline (300s default, 3600s for OCI blob uploads), keep-alive
@@ -87,7 +86,7 @@ public hostname of the operator's edge.
   set them to 0. The OCI upload timeout is the upper bound on a single
   blob PUT — sized for multi-GB image layers.
 
-### H-3 (Item 3) — `/metrics` requires authentication
+### `/metrics` requires authentication
 
 - **Control:** `/metrics` is bound on a separate listener by default
   (chart binds it to loopback inside the pod) and requires admin
@@ -137,7 +136,7 @@ public hostname of the operator's edge.
   clusters where NP is not part of the versioned deployment
   artefact.
 
-### H-4 (Item 4) — SSRF redirect-hop revalidation
+### SSRF redirect-hop revalidation
 
 - **Control:** Outbound `reqwest::Client` revalidates each redirect
   hop's resolved IP against the SSRF predicate before following.
@@ -148,20 +147,19 @@ public hostname of the operator's edge.
   image tag is the proof of inclusion.
 - **Relaxation:** none.
 
-### M-9 — connect-time DNS pinning (removed)
+### Connect-time DNS pinning (removed)
 
 - **Status:** **No longer enforced.** The `GuardedDnsResolver` was
   removed from `hort-adapters-upstream-http`,
   matching the earlier revert in `hort-adapters-oidc`. S3 was
-  never wired. M-9's disposition has shifted from
-  "closed by code" to **"accept with layered-defence
-  rationale"**.
+  never wired. The disposition has shifted from "closed by code"
+  to **"accept with layered-defence rationale"**.
 - **Why the reversal:** the guard false-positived on every internal-
   mirror topology resolving to RFC 1918 / ULA / link-local — internal
   Artifactory, in-cluster verdaccio, on-prem npm proxy. The threat it
   closed (DNS-rebind to IMDS during a redirect chain) is gated by
   three load-bearing layers that remain in force:
-  1. **Cross-origin Authorization-strip** (H-6 / Item 6) — credentials
+  1. **Cross-origin Authorization-strip** — credentials
      do not leak to a rebound target.
   2. **Upstream checksum verification** (ADR 0006) — content
      returned by a rebound target does not match the expected digest;
@@ -179,7 +177,7 @@ public hostname of the operator's edge.
 - **Relaxation:** N/A — the guard is gone. Re-introducing it is an
   architecture-level decision, not a values toggle.
 
-### H-6 + M-1 (Item 6) — HTTPS-only realm + upstream URL scheme
+### HTTPS-only realm + upstream URL scheme
 
 - **Control:** `WWW-Authenticate: Bearer realm=...` URLs and
   `RepositoryUpstreamMapping.upstream_url` reject any scheme other
@@ -199,7 +197,7 @@ public hostname of the operator's edge.
   gitops YAML. Every fetch then emits `WARN` and increments
   `hort_upstream_insecure_total`.
 
-### Operating behind an egress (forward) proxy (audit F-4)
+### Operating behind an egress (forward) proxy
 
 - **What uses the proxy:** Hort builds every outbound `reqwest` client
   with the `system-proxy` feature, so **all** outbound HTTP(S) — upstream
@@ -211,7 +209,7 @@ public hostname of the operator's edge.
   often the only route out, so Hort defers to the operator's proxy config.
 - **SSRF guards are delegated to the proxy when one is set (load-bearing).**
   Hort's in-process connect-time SSRF checks — the webhook
-  `GuardedDnsResolver` (F-4), the realm-fetch routability check (F-38), and
+  `GuardedDnsResolver`, the realm-fetch routability check, and
   the JWKS host check — can only inspect the address Hort *dials*. Behind a
   proxy, Hort dials the **proxy** and the proxy resolves/connects to the
   real target, so these in-process guards no longer see the destination.
@@ -229,8 +227,8 @@ public hostname of the operator's edge.
   kubectl logs -n <ns> deploy/<release>-hort-server \
     | grep -i 'routes through an egress proxy'
   ```
-- **Webhook subscription *create/update* and `HORT_WEBHOOK_ALLOWLIST_HOSTS`
-  (audit F-21).** The create-time SSRF guard (`WebhookTargetGuard::check`,
+- **Webhook subscription *create/update* and `HORT_WEBHOOK_ALLOWLIST_HOSTS`.**
+  The create-time SSRF guard (`WebhookTargetGuard::check`,
   run when a subscription is created or its target is changed) consults the
   **same** `HORT_WEBHOOK_ALLOWLIST_HOSTS` allowlist the delivery-path
   `GuardedDnsResolver` honours. A host (or CIDR) explicitly on the allowlist
@@ -249,20 +247,20 @@ public hostname of the operator's edge.
   the routability resolve. **Hort does NOT auto-skip this guard when a proxy
   env var is present** — proxy *presence* does not imply the proxy *filters*,
   and `NO_PROXY` hosts still egress directly, so an auto-skip would re-create
-  the silent SSRF bypass the F-4 fix removed.
+  the silent SSRF bypass the egress proxy fix removed.
 - **Exclude in-cluster service traffic via `NO_PROXY`.** Postgres, Redis,
   an in-cluster Keycloak/OIDC issuer, and internal S3/MinIO are reached
   directly, not through an internet egress proxy. Put their hosts/CIDRs in
   `NO_PROXY` (e.g. `.svc`, `.svc.cluster.local`, the cluster pod/service
   CIDRs) so they are not misrouted — otherwise OIDC/JWKS or storage calls
   to internal endpoints will fail or be sent to the proxy.
-- **TLS-intercepting proxies + `HORT_EXTRA_CA_BUNDLE` (see F-11).** If the
+- **TLS-intercepting proxies + `HORT_EXTRA_CA_BUNDLE`.** If the
   proxy terminates and re-issues TLS (inspection), its signing CA must be
   added to `HORT_EXTRA_CA_BUNDLE` or every outbound TLS handshake fails
   (the system trust store will not contain it). **Be aware** that
   `HORT_EXTRA_CA_BUNDLE` is process-wide *additive* trust applied to **all**
-  outbound TLS surfaces at once (upstream, OIDC/JWKS, storage, NATS, webhook
-  — audit F-11), so adding the proxy's CA widens trust on every surface,
+  outbound TLS surfaces at once (upstream, OIDC/JWKS, storage, NATS, webhook),
+  so adding the proxy's CA widens trust on every surface,
   not just the proxied path. Prefer a proxy that does **not** intercept TLS
   for the registry's egress where possible; if interception is mandatory,
   scope the proxy CA tightly and treat it as a high-value trust anchor.
@@ -270,7 +268,7 @@ public hostname of the operator's edge.
   `HORT_WEBHOOK_NO_PROXY` knob — with no proxy configured the in-process
   guard already applies; with a proxy configured the proxy is the control.
 
-### H-7 (Item 7) — Two-role Postgres model
+### Two-role Postgres model
 
 - **Control:** `hort-server` runs migrations as `hort_admin` (DDL allowed)
   and runtime as `hort_app_role` (`INSERT, SELECT` only on `events`).
@@ -297,7 +295,7 @@ public hostname of the operator's edge.
   satisfied by the wrong role. The chart does not currently warn on
   this; that's a known, recorded limitation.
 
-### M-5 (Item 10) — Per-username brute-force lockout — **REMOVED**
+### Per-username brute-force lockout — **REMOVED**
 
 The `authenticate_local` per-username + per-IP lockout was removed
 along with the HTTP-Basic-against-local-admin-row
@@ -306,7 +304,7 @@ The PAT-side bearer-path brute-force
 protection (`PatValidationUseCase::pat_lockout` via `HORT_PAT_LOCKOUT_*`,
 distinct mechanism) is unchanged.
 
-### M-8 (Item 13) — Concurrency limit + load-shed
+### Concurrency limit + load-shed
 
 - **Control:** Tower `ConcurrencyLimitLayer` + `LoadShedLayer` cap
   total in-flight requests; per-IP cap prevents single-source
@@ -326,7 +324,7 @@ distinct mechanism) is unchanged.
   for high-throughput deployments. Lowering below ~64 will cause
   legitimate-looking CI workloads to shed.
 
-### M-10 (Item 14) — HSTS + bind-default + `HORT_REQUIRE_HTTPS`
+### HSTS + bind-default + `HORT_REQUIRE_HTTPS`
 
 - **Control:** `Strict-Transport-Security: max-age=15552000; includeSubDomains`
   emitted only when `RequestTrust::public_url.scheme() == "https"`.
@@ -351,7 +349,7 @@ distinct mechanism) is unchanged.
   this is intended only for in-cluster eval where the operator owns
   the entire path between client and Service.
 
-### SECRET-low-1 (Item 24) — Mounted-file secret containment + mode
+### Mounted-file secret containment + mode
 
 - **Control:** `MountedFileSecretAdapter` rejects any resolved secret
   path outside `HORT_SECRETS_FILE_ROOT`; refuses files with overly
@@ -372,7 +370,7 @@ distinct mechanism) is unchanged.
   pre-existing volume conventions. The containment check itself is
   unconditional.
 
-### DOS-low-1 (Item 25a) — Graceful shutdown deadline
+### Graceful shutdown deadline
 
 - **Control:** `with_graceful_shutdown` wrapped in
   `tokio::time::timeout(HORT_SHUTDOWN_GRACE_SECS)`. On timeout, in-flight
@@ -392,7 +390,7 @@ distinct mechanism) is unchanged.
   deployments that legitimately push multi-GB image layers; otherwise
   rolling restarts will abort uploads in flight.
 
-### DOS-low-2 (Item 25b) — Per-principal OCI upload-session cap
+### Per-principal OCI upload-session cap
 
 - **Control:** Per-`(repo_id, principal)` outstanding-session counter
   in the ephemeral store; new sessions beyond the cap return 429.
@@ -406,7 +404,7 @@ distinct mechanism) is unchanged.
   populations that legitimately parallelise pushes from one service
   account.
 
-### Item 14 / Item 24 (CIS K8s alignment) — Pod-level securityContext
+### Pod-level securityContext (CIS K8s alignment)
 
 - **Control:** Pod runs as non-root UID 65532 (distroless `nonroot`);
   read-only root filesystem; capabilities `drop: [ALL]`;
@@ -430,9 +428,9 @@ distinct mechanism) is unchanged.
 
 ---
 
-## Second-audit controls (2026-04-30) — H-* / M-* / L-* codes (deployment-side surface)
+## Second-audit controls (2026-04-30) — deployment-side surface
 
-### H-3 (Item 1) — IPv4-mapped IPv6 in SSRF predicate
+### IPv4-mapped IPv6 in SSRF predicate
 
 - **Control:** `is_routable()` recurses into the v4 routability filter
   for `::ffff:a.b.c.d` and `::a.b.c.d` forms. Closes a redirect-policy
@@ -445,7 +443,7 @@ distinct mechanism) is unchanged.
   release that includes the fix.
 - **Relaxation:** none.
 
-### H-1 (Items 4 + 5) — Authz audit events on gitops apply
+### Authz audit events on gitops apply
 
 - **Control:** Every `apply_*` use case (Role, GroupMapping,
   PermissionGrant, RepositoryUpstreamMapping) appends a domain event
@@ -465,7 +463,7 @@ distinct mechanism) is unchanged.
   kind without emitting these events are explicitly out of scope for
   this release; if/when added they MUST emit the matching event.
 
-### H-2 (Item 3) — `ArtifactReleased` carries `admin_id` + justification
+### `ArtifactReleased` carries `admin_id` + justification
 
 - **Control:** Manual quarantine release requires a `justification`
   body field (≤ 512 bytes) and stamps the `admin_id` of the releasing
@@ -484,7 +482,7 @@ distinct mechanism) is unchanged.
 - **Relaxation:** none. The validator rejects empty / oversize
   justifications at the use-case boundary.
 
-### M-3 + H-7 (Items 6 + 9) — Streaming metadata fetch + parse-bomb cap
+### Streaming metadata fetch + parse-bomb cap
 
 - **Control:** `do_fetch_metadata` streams the upstream body and bails
   mid-stream when over `METADATA_BODY_CAP_BYTES`. Pre-parse size
@@ -497,7 +495,7 @@ distinct mechanism) is unchanged.
   surface).
 - **Relaxation:** none.
 
-### M-2 (Item 2) — OCI manifest blob-reference cap
+### OCI manifest blob-reference cap
 
 - **Control:** `parse_manifest_blobs` rejects manifests referencing
   more than 1024 distinct blob digests. The 1 MiB body cap admits
@@ -510,7 +508,7 @@ distinct mechanism) is unchanged.
   `MANIFEST_INVALID`.
 - **Relaxation:** none.
 
-### M-4 (Item 11) — mTLS / custom CA / cert pinning per upstream
+### mTLS / custom CA / cert pinning per upstream
 
 - **Control:** `RepositoryUpstreamMapping` carries optional fields for
   client cert + key (`mtls_cert_ref`, `mtls_key_ref`), custom CA bundle
@@ -534,7 +532,7 @@ distinct mechanism) is unchanged.
   intended cert; auto-rotation is not wired — operator updates the
   pin via gitops apply on cert rollover.
 
-### M-6 (Item 12) — Upstream allowlist policy
+### Upstream allowlist policy
 
 - **Control:** `HORT_UPSTREAM_ALLOWLIST_HOSTS` env var is parsed at gitops
   apply time. Three modes: unset (no enforcement, default), literal
@@ -558,7 +556,7 @@ distinct mechanism) is unchanged.
   existing mappings — only diff entries are rechecked. Operators
   wanting a strict refresh must touch every mapping.
 
-### L-1 (Item 13) — OIDC algorithm gate
+### OIDC algorithm gate
 
 - **Control:** OIDC adapter constructor refuses HMAC-family (`HS*`)
   and `none` algorithms. Adapter-level test pins this in CI; port
@@ -573,7 +571,7 @@ distinct mechanism) is unchanged.
   `OidcConfigError`; the pod will `CrashLoopBackOff`.
 - **Relaxation:** none — switch the IdP, do not loosen the gate.
 
-### L-6 / L-7 / L-8 (Item 7) — CI advisory gating + workspace MSRV
+### CI advisory gating + workspace MSRV
 
 - **Control:** `cargo audit` is a blocking CI check; advisory ignore
   list is single-source-of-truth in `.cargo/audit.toml`; workspace
@@ -589,14 +587,14 @@ distinct mechanism) is unchanged.
 
 ---
 
-## 2026-05-03 audit controls — M-A* codes (deployment-side surface)
+## 2026-05-03 audit controls — deployment-side surface
 
-This round closed the nine Medium-severity findings (M-A1..M-A9) from
-the 2026-05-03 audit. M-A2 is documented above as part of the M-9
-disposition flip; the remaining items appear below. M-A6/A7/A8/A9 are
-in-binary correctness gates with no operator-tunable surface.
+This round closed nine Medium-severity findings from the 2026-05-03 audit.
+The connect-time DNS pinning disposition flip is documented above under
+"Connect-time DNS pinning (removed)"; the remaining items appear below.
+Several are in-binary correctness gates with no operator-tunable surface.
 
-### M-A1 (Item 1) — `is_routable` range extension
+### `is_routable` range extension
 
 - **Control:** `is_routable()` (`crates/hort-net-egress/src/ssrf.rs`) now
   rejects RFC 6598 CGNAT (`100.64.0.0/10`), RFC 5737 documentation
@@ -613,7 +611,7 @@ in-binary correctness gates with no operator-tunable surface.
 - **Verify post-install:** no observable signal — predicate is internal.
 - **Relaxation:** none.
 
-### M-A3 (Item 3) — Rightmost-untrusted `X-Forwarded-For`
+### Rightmost-untrusted `X-Forwarded-For`
 
 - **Control:** The trust middleware
   (`crates/hort-http-core/src/middleware/trust.rs`) replaces the
@@ -651,8 +649,7 @@ in-binary correctness gates with no operator-tunable surface.
   2. **Ensure the edge proxy actually sets `X-Forwarded-For`.**
      Trusting a peer does not synthesise the header. A trusted peer
      reaching the binary without `X-Forwarded-For` degrades `client_ip`
-     to the `0.0.0.0` **sentinel** (`XFF_MISSING_SENTINEL`,
-     AUTH-low-2) with a throttled `WARN` —
+     to the `0.0.0.0` **sentinel** (`XFF_MISSING_SENTINEL`) with a throttled `WARN` —
      all callers through that proxy then share one attribution bucket.
      Confirm the ingress sets `X-Forwarded-For` (most controllers do
      by default; re-verify after any custom `proxy_set_header` /
@@ -663,7 +660,7 @@ in-binary correctness gates with no operator-tunable surface.
   records the external IP, not a proxy-hop IP.
 - **Relaxation:** none.
 
-### M-A4 (Item 5) — `GroupMappingUpdated` audit event
+### `GroupMappingUpdated` audit event
 
 - **Control:** Closes the authz-audit-event framework's gap where
   in-place
@@ -683,7 +680,7 @@ in-binary correctness gates with no operator-tunable surface.
   ```
 - **Relaxation:** none.
 
-### M-A5 (Item 6) — `Permission::Delete` separated from `Write`
+### `Permission::Delete` separated from `Write`
 
 - **Control:** New permission variant + new `DeleteRepoAccess`
   inbound extractor. The OCI manifest-delete endpoint (`DELETE
@@ -704,9 +701,9 @@ in-binary correctness gates with no operator-tunable surface.
 
 ---
 
-## 2026-05-15 audit controls — F-* codes (deployment-side surface)
+## 2026-05-15 audit controls — deployment-side surface
 
-### F-33 (Item 15) — three-tier topology + control-plane listener + default-on NetworkPolicy
+### Three-tier topology + control-plane listener + default-on NetworkPolicy
 
 - **Control:** the intended three-tier topology (public artifact
   plane / public token-gen plane / internal-only control plane) is now
@@ -714,13 +711,13 @@ in-binary correctness gates with no operator-tunable surface.
   assumption. (1) An optional internal-only control-plane listener
   (`HORT_CONTROL_BIND`) carries the `/admin`, `/api/v1/admin/*`, and
   `/api/v1/subscriptions` management routes and removes them from the
-  public listener, mirroring the H-3 metrics-listener split exactly
+  public listener, mirroring the metrics-listener split exactly
   (same middleware stack, same 0.0.0.0-footgun guard via
   `HORT_CONTROL_PUBLIC_BIND`). (2) The Helm `networkPolicy` defaults
   **on** (previously off) with a documented escape hatch. The
   token-generation and artifact-pull planes are **never** moved onto
   the control tier — they are public by requirement and hardened
-  app-side (F-1/F-7).
+  at the application layer.
 - **Chart default:** `control.bindAddr: ""` (control on the main
   listener — **byte-identical to the no-split behaviour, no migration**),
   `control.allowUnspecifiedBind: false`, `service.controlPort: 9443`,
@@ -743,12 +740,12 @@ in-binary correctness gates with no operator-tunable surface.
   hatch); `control.bindAddr: ""` keeps control on the main listener
   (acceptable for single-tier dev clusters; not recommended for
   multi-tenant / internet-exposed production). This control is
-  **defense-in-depth on top of — never instead of** — the F-3
-  admin-gate (claim-based RBAC) and the F-4/F-21 webhook
-  allowlist. Network position never substitutes for authz. Full model:
+  **defense-in-depth on top of — never instead of** — the
+  admin-gate (claim-based RBAC) and the webhook allowlist.
+  Network position never substitutes for authz. Full model:
   [`control-plane-tiers.md`](./control-plane-tiers.md).
 
-### F-11 (Item 12) — `HORT_EXTRA_CA_BUNDLE` is an auth-critical asset
+### `HORT_EXTRA_CA_BUNDLE` is an auth-critical asset
 
 - **Control:** `HORT_EXTRA_CA_BUNDLE` is additive across all four TLS
   surfaces **including OIDC discovery + JWKS**, with no per-surface
@@ -770,14 +767,13 @@ in-binary correctness gates with no operator-tunable surface.
 - **Reference:**
   [ADR 0010](../../../adr/0010-tls-builder-no-insecure-knobs.md) and
   [`extra-ca-bundle.md`](./extra-ca-bundle.md); rating
-  recorded in `docs/auth-catalog.md` Entry 11 (including the F-35
-  conditional re-rate analysis pointer).
+  recorded in `docs/auth-catalog.md` Entry 11.
 
-## 2026-06-02 audit controls — F-* codes (deployment-side surface)
+## 2026-06-02 audit controls — deployment-side surface
 
-### F-51 + F-52 (Item 7) — schedule + observe the event-chain verifier
+### Schedule + observe the event-chain verifier
 
-- **Control:** the F-2 event-chain tamper-evidence verifier
+- **Control:** the event-chain tamper-evidence verifier
   (`hort-server verify-event-chain`) is correct crypto but ships
   CLI-only — without a schedule it never runs, so audit-log tamper
   **detection** never happens by default. The chart closes that with
@@ -839,10 +835,10 @@ kubectl get job -n <ns> <release>-hort-server-migrate \
 curl -fsS http://<svc-or-ingress>/healthz
 curl -fsS http://<svc-or-ingress>/readyz
 
-# 3. /metrics requires auth (H-3) — expect 401.
+# 3. /metrics requires auth — expect 401.
 curl -i http://<svc-or-ingress>/metrics | head -1
 
-# 4. Two-role Postgres (H-7) — expect hort_app_role.
+# 4. Two-role Postgres — expect hort_app_role.
 # The chart injects the DSN as HORT_DATABASE_URL.
 kubectl exec -n <ns> deploy/<release>-hort-server -- \
   sh -c 'echo $HORT_DATABASE_URL' | grep -E '^postgres://hort_app_role@'
@@ -851,15 +847,15 @@ kubectl exec -n <ns> deploy/<release>-hort-server -- \
 kubectl get pod -n <ns> -l app.kubernetes.io/name=hort-server \
   -o jsonpath='{.items[0].spec.containers[0].securityContext}{"\n"}'
 
-# 6. HSTS conditional emission (M-10).
+# 6. HSTS conditional emission.
 curl -sI -H 'X-Forwarded-Proto: https' http://<svc-or-ingress>/healthz \
   | grep -i strict-transport-security
 
-# 7. HTTP timeouts plumbed (H-2).
+# 7. HTTP timeouts plumbed.
 kubectl exec -n <ns> deploy/<release>-hort-server -- env \
   | grep -E '^HORT_HTTP_(HEADER_READ|REQUEST|OCI_UPLOAD)_TIMEOUT'
 
-# 8. Mounted-file secrets (SECRET-low-1).
+# 8. Mounted-file secrets.
 kubectl exec -n <ns> deploy/<release>-hort-server -- \
   ls -la /etc/hort-server/secrets/ 2>/dev/null || echo "(no secrets mounted)"
 

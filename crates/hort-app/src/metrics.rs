@@ -1464,13 +1464,13 @@ pub enum DedupOutcomeLabel {
     /// Follower waited on either layer and then observed a `Failed`
     /// outcome from the leader (4xx, 5xx, timeout, checksum mismatch,
     /// …). The follower returned the same error to its client without
-    /// contacting the upstream — the negative-cache property the
-    /// design doc §3 decision 3 names load-bearing.
+    /// contacting the upstream — the load-bearing negative-cache
+    /// property.
     FollowerWaitedFailure,
     /// Follower waited up to `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS` and
     /// the leader still had not produced a terminal outcome. Fall-
-    /// through is a `503 + Retry-After: 30` response per design doc
-    /// §3 decision 4 — *not* an un-coalesced fetch.
+    /// through is a `503 + Retry-After: 30` response — *not* an
+    /// un-coalesced fetch.
     FollowerFellthrough503,
     /// Caller arrived during a `Failed`-with-future-`expires_at`
     /// window and short-circuited on the cached failure WITHOUT
@@ -1487,12 +1487,12 @@ pub enum DedupOutcomeLabel {
     /// Layer-A `broadcast::Receiver` returned `Lagged(_)` because the
     /// channel capacity (64) was exceeded. The follower fell through
     /// to a Layer-B `get` on the same key — correctness is
-    /// preserved, the metric exists for visibility into a path the
-    /// design doc §9 case 7 names "implausible but defended".
+    /// preserved, the metric exists for visibility into this
+    /// implausible-but-defended path.
     FollowerLagged,
     /// `EphemeralStore::put_if_absent` (or any other Layer-B call)
     /// returned an error. Caller proceeded as the leader anyway
-    /// (fail-open per design doc §9 case 8); Layer A still provides
+    /// (fail-open); Layer A still provides
     /// per-replica coalescing for any other concurrent caller on the
     /// same pod. Cluster-wide coalescing is degraded; correctness is
     /// preserved by the existing CAS + path-conflict short-circuit.
@@ -2845,15 +2845,14 @@ impl CurationDecisionResult {
 
 /// Emit `hort_curation_decisions_total{decision, repository, result}` —
 /// one tick per attempted append. For `BlockTarget::VersionList` calls
-/// the helper is invoked PER appended event (design §7 — "per-append
-/// per call"), not once per call. This lets operators dashboard
-/// per-append error rates on bulk operations.
+/// the helper is invoked PER appended event, not once per call. This
+/// lets operators dashboard per-append error rates on bulk operations.
 ///
-/// `repository` follows the catalog convention (Item 14 — M-2):
+/// `repository` follows the catalog convention:
 /// - `None` from the caller → emit [`values::REPOSITORY_ALL`]
 ///   (used pre-lookup, e.g. privilege denials / validation failures
 ///   that fire before any artifact load resolves the repo id; also
-///   the `PolicyScope::Global` exclusion path — design §7's
+///   the `PolicyScope::Global` exclusion path —
 ///   "cross-repo finding-exclusion").
 /// - `Some(key)` → emit the resolved key verbatim. Callers obtain the
 ///   string from `RepositoryAccessUseCase::metric_label(repo_id)`,
@@ -3478,17 +3477,16 @@ pub enum RetentionEvaluationResult {
     Matched,
     /// The predicate was evaluated and did not match.
     NoMatch,
-    /// §6 invariant 7 — a security-driven predicate could not evaluate
-    /// because the artifact's most recent scan is stale
+    /// A security-driven predicate could not evaluate because the
+    /// artifact's most recent scan is stale
     /// (`> 2 × resolved_rescan_interval`). NOT an error; the sweep
     /// proceeds, the artifact becomes eligible again after the next
     /// scan.
     SkippedStaleScan,
-    /// §6 invariant 1 — the artifact is `quarantined`; GC-protected,
-    /// not evaluated.
+    /// The artifact is `quarantined`; GC-protected, not evaluated.
     SkippedQuarantined,
-    /// §6 invariant 1 — the artifact is `rejected` (evidence); content
-    /// stays until manual admin override, not evaluated.
+    /// The artifact is `rejected` (evidence); content stays until
+    /// manual admin override, not evaluated.
     SkippedRejected,
     /// A read against a port failed for this (policy, artifact) pair;
     /// the sweep records the error and continues with the next
@@ -4040,7 +4038,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // UpstreamErrorKind — all 10 variants per design doc §4.
+    // UpstreamErrorKind — all 10 variants.
     // -------------------------------------------------------------------
 
     #[test]
@@ -6388,7 +6386,7 @@ mod tests {
             other => panic!("expected Counter, got {other:?}"),
         }
         // The duration histogram must also fire, with the category
-        // label only (no result label per design doc §12).
+        // label only (no result label).
         let histogram = entries
             .iter()
             .find(|(k, _, _, _)| k.key().name() == "hort_events_pull_duration_seconds")
@@ -6713,7 +6711,7 @@ mod tests {
     // Every variant is constructable in isolation, equality holds (Clone +
     // PartialEq + Eq + Debug are derived), and `as_upstream_error_kind`
     // maps the eight upstream-fetch variants 1:1 onto the matching
-    // `UpstreamErrorKind` label values per §3.2 + §7. The out-of-band
+    // `UpstreamErrorKind` label values. The out-of-band
     // `UnsupportedFormat` variant returns `None` — the use case emits
     // `result = "oci_unsupported"`, NOT one of the
     // `UpstreamErrorKind` label values.
@@ -6863,8 +6861,8 @@ mod tests {
     fn upstream_fetch_error_kind_alignment_is_complete() {
         // Pinned-set assertion: the eight fetch variants MUST map to
         // exactly the eight upstream-fetch `UpstreamErrorKind` label
-        // values listed in §3.2. Adding or removing a variant without
-        // updating both ends breaks this test.
+        // values. Adding or removing a variant without updating both
+        // ends breaks this test.
         //
         // `UpstreamErrorKind` is `Copy + Eq` but deliberately NOT
         // `Hash` (it is a label-value enum, not a map key), so we

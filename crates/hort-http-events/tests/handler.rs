@@ -212,7 +212,7 @@ fn policy_event(global_pos: u64) -> PersistedEvent {
 }
 
 /// Repo-scoped `PermissionGrantApplied` on the `StreamCategory::Repository`
-/// stream — the audit F-39 read-path leak shape. The category is non-admin
+/// stream — the read-path leak shape. The category is non-admin
 /// and the payload carries `Some(repo)`, so without the type-not-category
 /// gate a `Read`-on-repo caller would clear the upfront gate AND step 5's
 /// per-repo `Read` filter and receive the grant topology.
@@ -562,7 +562,7 @@ async fn get_events_returns_next_after_as_unfiltered_max_position() {
 
     // repo_a at position 5, repo_b at position 10. Caller has Read on
     // repo_a only, so only the position-5 event appears, but
-    // `next_after` MUST be 10 (the unfiltered max) per design doc §9.
+    // `next_after` MUST be 10 (the unfiltered max).
     mocks.events.set_category(
         StreamCategory::Artifact,
         vec![artifact_event(repo_a, 5), artifact_event(repo_b, 10)],
@@ -730,7 +730,7 @@ async fn get_events_long_poll_wakes_up_on_published_event() {
 async fn get_events_under_disabled_auth_admin_only_category_passes() {
     // Default `build_mock_ctx` is `AuthContext::Disabled`; the handler
     // skips the admin gate under Disabled (same contract every other
-    // F1 extractor uses). This pins that contract so a future
+    // auth extractor uses). This pins that contract so a future
     // refactor doesn't tighten the gate without an explicit decision.
     let (ctx, mocks) = new_ctx();
     mocks
@@ -796,7 +796,7 @@ async fn get_events_forbidden_response_includes_message_field() {
 
 // ---------------------------------------------------------------------------
 // 18 — `hort_events_pull_total` fires with the expected labels on success.
-// (design doc §12 metric.)
+
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -876,7 +876,7 @@ fn get_events_emits_hort_events_pull_total_with_success_label() {
 // Read-path leg.
 // ---------------------------------------------------------------------------
 
-// F-39: a repo-scoped `PermissionGrantApplied` rides the NON-admin
+// A repo-scoped `PermissionGrantApplied` rides the NON-admin
 // `Repository` category, so a `Read`-on-repo caller cleared the upfront
 // admin-category gate AND step 5's per-repo `Read` filter — leaking RBAC
 // topology. The type gate must now drop it for a non-admin caller.
@@ -907,11 +907,11 @@ async fn get_events_denies_repo_scoped_permission_grant_to_read_only_caller() {
     let events = body["events"].as_array().unwrap();
     assert!(
         events.is_empty(),
-        "Read-only caller must NOT see repo-scoped grant topology (F-39); got {events:?}"
+        "Read-only caller must NOT see repo-scoped grant topology; got {events:?}"
     );
 }
 
-// F-39 no-regression: an admin caller IS served the repo-scoped
+// No-regression: an admin caller IS served the repo-scoped
 // `PermissionGrantApplied` (legitimate admin read).
 #[tokio::test]
 async fn get_events_serves_repo_scoped_permission_grant_to_admin_caller() {

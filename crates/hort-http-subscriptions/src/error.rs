@@ -1,6 +1,6 @@
 //! Maps `SubscriptionError` from the use case to HTTP responses.
 //!
-//! Mapping table mirrors design doc §5 reject paths verbatim:
+//! Mapping table:
 //!
 //! | `SubscriptionError` variant | HTTP status | Body `error` |
 //! |---|---|---|

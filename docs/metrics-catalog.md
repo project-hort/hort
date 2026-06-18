@@ -1501,8 +1501,8 @@ Cardinality: 4 results × `repository` cardinality = well under ceilings.
 | `hort_content_reference_queries_total` | counter | `format`, `repository`, `result` | — | `success`, `not_found`, `digest_invalid`, `error` |
 
 Emitted exactly once per call by the OCI Referrers-API handler
-(`hort-http-oci::referrers::serve` — `GET /v2/<name>/referrers/<digest>`,
-spec §referrers-api). The metric is generic (the table backing it
+(`hort-http-oci::referrers::serve` — `GET /v2/<name>/referrers/<digest>`).
+The metric is generic (the table backing it
 serves any future hash-reference query path), but the only emitter
 today is the OCI handler — hence the `format="oci"` label value.
 
@@ -1541,7 +1541,7 @@ The `repository` label honours the workspace-wide
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_stateful_upload_sessions_total` | counter | `format`, `repository`, `result` | — | `created` (Item 1); `aborted` (Items 2, 3); `finalized` (Item 3) |
+| `hort_stateful_upload_sessions_total` | counter | `format`, `repository`, `result` | — | `created`, `aborted`, `finalized` |
 | `hort_stateful_upload_session_bytes` | histogram | `format`, `repository` | bytes | — |
 | `hort_stateful_upload_finalize_duration_seconds` | histogram | `format`, `repository` | seconds | — |
 
@@ -1790,7 +1790,7 @@ emission site genuinely carries cross-format meaning
 Emitted once per upstream version the planner adds to its return list.
 The increment is `1` per planned version, not `1` per call — operators
 read versions/sec at the rate the planner is selecting them for
-warming. The format crate (npm / cargo in Item 7; PyPI in Item 7b)
+warming. The format crate (npm, cargo, and PyPI)
 iterates the returned plan and spawns
 `tokio::spawn(try_upstream_<format>_pull(...))` per version; the spawn
 itself rides `PullDedup`, so a concurrent client pull of the

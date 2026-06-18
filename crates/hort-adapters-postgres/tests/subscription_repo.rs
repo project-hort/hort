@@ -14,14 +14,14 @@
 //! 4. `list_for_owner_orders_by_created_at_desc` — three rows surface
 //!    in descending `created_at` order; `total` is 3.
 //! 5. `list_active_returns_only_active_subscriptions` — partial index
-//!    bounds the dispatcher's cache-refresh hot path (design §6).
+//!    bounds the dispatcher's cache-refresh hot path.
 //! 6. `unique_constraint_on_owner_user_id_and_name` — second insert
 //!    surfaces as `DomainError::Conflict` via `map_sqlx_error`.
 //! 7. `users_id_delete_cascades` — `users(id) ON DELETE CASCADE`
 //!    drops the subscription row.
 //! 8. `api_tokens_id_delete_sets_null_on_created_by_token_id` —
 //!    `api_tokens(id) ON DELETE SET NULL` keeps the subscription
-//!    alive (audit attribution only — design §3 / §11 invariant 6).
+//!    alive (audit attribution only).
 //! 9. `update_last_delivered_persists_position_and_failure` — the
 //!    debounced dispatcher hot path writes only the two columns.
 //! 10. `update_persists_state_and_disable_reason` — state transition
@@ -231,7 +231,7 @@ async fn snapshot_claims_round_trips_and_update_full_replaces() {
         "snapshot_claims must round-trip through create + read"
     );
 
-    // §5.5: update re-captures the authority floor unconditionally,
+    // update re-captures the authority floor unconditionally,
     // fully replacing the prior value (full-replace semantics).
     let mut updated = fetched.clone();
     updated.snapshot_claims = vec!["admin".to_string()];

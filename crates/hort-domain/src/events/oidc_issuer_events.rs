@@ -4,10 +4,9 @@
 //! when the gitops apply path creates, updates, or deletes an
 //! [`OidcIssuer`](crate::entities::oidc_issuer::OidcIssuer). The
 //! aggregate is CRUD — these events are audit-only attribution, not a
-//! state-reconstruction stream (§2).
+//! state-reconstruction stream.
 //!
-//! Streams: the design doc leaves stream placement to Item 3's apply
-//! path; the natural fit is the global
+//! Streams: the natural fit is the global
 //! [`StreamCategory::Authorization`](super::StreamCategory::Authorization)
 //! stream where the other apply-time authz mutations already land.
 //! This module's scope ends at the payload struct; the
@@ -88,7 +87,7 @@ impl OidcIssuerCreated {
 /// — issuer URL, audiences, refresh interval, or allowed algorithms
 /// changed for the matching `metadata.name`.
 ///
-/// Identity is `name` (§3 — issuer-URL changes are treated as Updated,
+/// Identity is `name` (issuer-URL changes are treated as Updated,
 /// not Created+Deleted, to preserve audit continuity). The before/after
 /// values stay out of the payload by design — see the module docstring
 /// (recoverable via the row + future `events` row's `at` join).

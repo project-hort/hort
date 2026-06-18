@@ -1,4 +1,4 @@
-//! Routability predicate — the canonical SSRF block-list (audit H-3 close).
+//! Routability predicate — the canonical SSRF block-list.
 //!
 //! Consumed at the URL-input-validation layer:
 //! `hort-adapters-upstream-http::check_ssrf_safe` calls
@@ -26,11 +26,11 @@ use std::net::IpAddr;
 /// (0.0.0.0), broadcast (255.255.255.255), multicast, RFC 6598 CGNAT
 /// (100.64.0.0/10), RFC 5737 documentation (192.0.2.0/24,
 /// 198.51.100.0/24, 203.0.113.0/24), and the entire 0.0.0.0/8 "this
-/// network" range (ADR 0010, audit L-A1).
+/// network" range (ADR 0010).
 ///
 /// IPv6 rejects: loopback, unspecified, multicast, unicast link-local
 /// (fe80::/10), unique-local (fc00::/7), RFC 3849 documentation
-/// (2001:db8::/32 — ADR 0010, audit L-A1), and anything whose
+/// (2001:db8::/32 — ADR 0010), and anything whose
 /// IPv4 projection (mapped or compatible) would itself fail this
 /// filter.
 pub fn is_routable(ip: IpAddr) -> bool {
@@ -42,8 +42,8 @@ pub fn is_routable(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_multicast()
-                // ADR 0010 (audit L-A1) — additional non-routable
-                // prefixes the stdlib predicates do not cover.
+                // ADR 0010 — additional non-routable prefixes the
+                // stdlib predicates do not cover.
                 || is_ipv4_cgnat(v4)
                 || is_ipv4_documentation(v4)
                 || is_ipv4_this_network(v4))
@@ -52,7 +52,7 @@ pub fn is_routable(ip: IpAddr) -> bool {
             // `to_ipv4()` matches BOTH `::ffff:a.b.c.d` (IPv4-mapped,
             // RFC 4291 §2.5.5.2) and `::a.b.c.d` (IPv4-compatible,
             // RFC 4291 §2.5.5.1); both forms must inherit the IPv4
-            // routability filter to close audit H-3. `to_ipv4_mapped()`
+            // routability filter. `to_ipv4_mapped()`
             // would only match `::ffff:` and re-open the IPv4-compatible
             // bypass — kept on `to_ipv4` deliberately.
             #[allow(deprecated)]
@@ -63,7 +63,7 @@ pub fn is_routable(ip: IpAddr) -> bool {
                 || v6.is_unicast_link_local()
                 // RFC 4193 unique-local (`fc00::/7`).
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
-                // ADR 0010 (audit L-A1) — RFC 3849 documentation
+                // ADR 0010 — RFC 3849 documentation
                 // (`2001:db8::/32`); first 32 bits = `2001:0db8`.
                 || is_ipv6_documentation(v6)
                 || mapped_v4.is_some_and(|v4| !is_routable(IpAddr::V4(v4))))
@@ -155,9 +155,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // H-3 regression: IPv4-mapped IPv6 (`::ffff:a.b.c.d`) and
-    // IPv4-compatible IPv6 (`::a.b.c.d`, RFC 4291 §2.5.5) must inherit
-    // the IPv4 routability filter. Audit doc §H-3.
+    // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) and IPv4-compatible IPv6
+    // (`::a.b.c.d`, RFC 4291 §2.5.5) must inherit the IPv4 routability
+    // filter.
     // -----------------------------------------------------------------
 
     #[test]
@@ -214,12 +214,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ADR 0010 (audit L-A1) — additional non-routable prefixes.
+    // ADR 0010 — additional non-routable prefixes.
     // The stdlib `Ipv4Addr::is_private` only covers RFC 1918, and
-    // `is_unspecified` only matches the literal `0.0.0.0`. The audit
-    // identified four IPv4 prefixes (RFC 6598 CGNAT, RFC 5737 TEST-NET-
-    // {1,2,3}, the entire 0.0.0.0/8 range) and one IPv6 prefix (RFC
-    // 3849 documentation) that must be rejected as well.
+    // `is_unspecified` only matches the literal `0.0.0.0`. Four IPv4
+    // prefixes (RFC 6598 CGNAT, RFC 5737 TEST-NET-{1,2,3}, the entire
+    // 0.0.0.0/8 range) and one IPv6 prefix (RFC 3849 documentation)
+    // must be rejected as well.
     //
     // Each test pins one prefix with a non-boundary sample so an
     // implementation that special-cases only the network address
@@ -269,9 +269,9 @@ mod tests {
 
     #[test]
     fn public_addresses_remain_routable_after_l_a1() {
-        // Positive coverage — the L-A1 additions must not over-block.
+        // Positive coverage — the ADR 0010 additions must not over-block.
         // Repeats the public-address assertions from the IPv4/IPv6
-        // classification tests but lives next to the L-A1 negatives
+        // classification tests but lives next to those negatives
         // so a regression that flipped a prefix bit too far would
         // light up here at the same time.
         assert!(is_routable(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));

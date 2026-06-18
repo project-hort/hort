@@ -417,10 +417,10 @@ async fn block_versions_oversize_justification_does_not_call_server() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9 (extra per backlog Item 12) — partial-success response renders
-// the FAILED + NOT_FOUND_VERSIONS sections in red. The operator must
-// see which artifacts didn't land so they can retry the failed subset
-// with the same correlation_id (continue-on-error per design §2.3).
+// Test 9 — partial-success response renders the FAILED + NOT_FOUND_VERSIONS
+// sections in red. The operator must see which artifacts didn't land so
+// they can retry the failed subset with the same correlation_id
+// (continue-on-error).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

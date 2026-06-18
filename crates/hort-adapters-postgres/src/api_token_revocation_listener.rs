@@ -18,8 +18,8 @@
 //! | anything else                      | `tracing::warn!` and ignore             |
 //!
 //! Distinguishing the two payload shapes by prefix lets the same
-//! channel carry both per-token revocations (the B4 `revoke` path)
-//! and the future per-user deactivation broadcast (a User entity
+//! channel carry both per-token revocations and the future per-user
+//! deactivation broadcast (a User entity
 //! deactivation flips `is_active = false` AND fires `NOTIFY
 //! api_token_revocation, 'user:<uuid>'` so every replica drops the
 //! cache for THAT user's tokens). Per-user is documented here so the
@@ -76,7 +76,7 @@ const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// User-prefix discriminator for the `user:<uuid>` payload shape. Kept
 /// as a `pub const` so the future user-deactivation NOTIFY emitter
-/// (planned per the design-doc §5 broadcast) can re-import the same
+/// can re-import the same
 /// constant rather than duplicating the literal.
 pub const USER_PREFIX: &str = "user:";
 
@@ -85,7 +85,7 @@ pub const USER_PREFIX: &str = "user:";
 /// composition can abort the task on shutdown.
 ///
 /// Production callers pass [`REVOCATION_CHANNEL`] — the contract pinned
-/// against the B4 emitter and the user-deactivation NOTIFY in
+/// against the revoke emitter and the user-deactivation NOTIFY in
 /// `user_repo::PgUserRepository::save`. The channel is a parameter
 /// rather than a hardcoded constant so DB-gated integration tests can
 /// isolate each test's listener on a unique per-test channel — without

@@ -4,7 +4,7 @@
 //! constants, the `JwksRefreshResult` enum, and a small emission helper.
 //! The canonical catalog entry lives at `docs/metrics-catalog.md`.
 //!
-//! Layering (design doc §2.5 + architect rules): the result enum lives in the
+//! Layering (architect rules): the result enum lives in the
 //! adapter that emits the metric, NOT in `hort-domain` (zero-I/O) or any
 //! inbound-HTTP crate. Every new label value requires a catalog update in
 //! the same PR.
@@ -44,7 +44,7 @@ pub(crate) enum JwksRefreshResult {
     Success,
     /// Signature-mismatch eviction suppressed by the per-kid backoff
     /// window. No network I/O; the cache entry stays as-is. This fires
-    /// on the DoS-mitigation path (design doc §2.5).
+    /// on the DoS-mitigation path.
     Throttled,
     /// Discovery or JWKS HTTP request failed (timeout, DNS, non-2xx).
     /// The cache stays stale; the triggering request 401s.

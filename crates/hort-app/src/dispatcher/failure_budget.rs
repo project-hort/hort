@@ -1,9 +1,8 @@
 //! Sliding-window failure budget for one subscription.
 //!
-//! Design doc §6 paragraph 3: 100 consecutive failures across a 1h
-//! window → transition the subscription to `Disabled { reason:
-//! DeliveryFailureBudgetExhausted }`. First successful delivery resets
-//! the counter.
+//! 100 consecutive failures across a 1h window → transition the
+//! subscription to `Disabled { reason: DeliveryFailureBudgetExhausted }`.
+//! First successful delivery resets the counter.
 //!
 //! Implemented as a small ring buffer of failure timestamps.
 //! [`FailureBudget::record_failure`] appends and ages out entries older

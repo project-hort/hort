@@ -9,22 +9,21 @@
 //! every threshold boundary, and every `Composite` combination.
 //!
 //! The app layer ([`hort-app`'s `RetentionUseCase`]) owns the I/O:
-//! reading the projection rows, the §6-invariant-7 freshness gate, the
-//! `(policy_id, artifact_id)` idempotency check, the §6-invariant-1
-//! quarantine/rejected filter, the `HasFindingDetectedFor` stream
-//! anchor, and event append + metrics. It calls [`evaluate`] with the
-//! already-resolved inputs.
+//! reading the projection rows, the scan-freshness gate, the
+//! `(policy_id, artifact_id)` idempotency check, the quarantine/rejected
+//! filter, the `HasFindingDetectedFor` stream anchor, and event append +
+//! metrics. It calls [`evaluate`] with the already-resolved inputs.
 //!
-//! ## §4-vs-code divergence — `HasFixAvailable`
+//! ## `HasFixAvailable` precision note
 //!
-//! §4 sources `HasFixAvailable` from "a non-empty `fixed_versions`
+//! `HasFixAvailable` is sourced from "a non-empty `fixed_versions`
 //! array on its source advisory". The v1 `scan_findings` projection
 //! does not carry `fixed_versions` (see
 //! [`crate::ports::retention_scan_reader`] module docs), so with the
 //! projection-only adapter every [`Finding::fixed_versions`] is empty
 //! and `HasFixAvailable` never matches. The predicate logic here is
 //! still written against `fixed_versions` so a future blob-sourced
-//! adapter makes it correct unchanged. Recorded in the B3 report.
+//! adapter makes it correct unchanged.
 
 use chrono::{DateTime, Utc};
 
@@ -87,7 +86,7 @@ pub fn severity_at_or_above(have: SeverityThreshold, threshold: SeverityThreshol
 /// `true` iff this predicate (or, for a `Composite`, the subtree that
 /// actually fired) is one of the four scan-data variants — i.e. the
 /// match was security-driven and the reason must be
-/// [`ExpirationReason::SecurityFinding`]. Delegates to the B1
+/// [`ExpirationReason::SecurityFinding`]. Delegates to
 /// [`PolicyPredicate::is_security_driven`] classification, but only for
 /// the *matching* arm so a `Composite(Or, [AgeExceeds, HasFix..])`
 /// that matched purely on age yields an age reason.
@@ -166,7 +165,7 @@ fn elapsed_at_least(anchor: DateTime<Utc>, now: DateTime<Utc>, secs: u64) -> boo
 }
 
 /// Snapshot the matched security findings into the
-/// [`ExpirationReason::SecurityFinding`] payload (§4). `max_severity`
+/// [`ExpirationReason::SecurityFinding`] payload. `max_severity`
 /// is the strongest tier present; `max_cvss` the highest non-null
 /// score (or `None`); `fix_available` whether any finding has a
 /// non-empty `fixed_versions`.
@@ -212,7 +211,7 @@ pub enum EvaluationOutcome {
 /// fires on a mix prefers the security reason (the operator's
 /// canonical pattern `Composite(And, [HasFindingAboveSeverity,
 /// HasFixAvailable, HasFindingDetectedFor])` must record the security
-/// snapshot, §1/§4).
+/// snapshot).
 pub fn evaluate(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> EvaluationOutcome {
     if !matches_bool(pred, inputs) {
         return EvaluationOutcome::NoMatch;
@@ -602,7 +601,7 @@ mod tests {
         let mut i = inputs(&f);
         i.first_detected_at = ts(0);
         i.now = ts(700_000); // 7d+ since detection
-                             // Canonical operator pattern (§1/§4).
+                             // Canonical operator pattern.
         let p = PolicyPredicate::Composite(
             BooleanOp::And,
             vec![

@@ -59,12 +59,12 @@
 //!    chain head.
 //!
 //! Only when every applicable precondition passes does the use case
-//! call the B9 chokepoint per the one global [`StreamRetentionModeRef`]
+//! call the retention chokepoint per the one global [`StreamRetentionModeRef`]
 //! (`Delete` → `delete_stream`, `Archive` → `archive_stream` with a
 //! target of `format!("{prefix}/{stream_id}")` — opaque per
-//! `event_store.rs:191-199`; designing the cold-storage *write* is the
-//! §9 follow-on, NOT B5). A chokepoint `Err` is per-stream:
-//! `summary.errors += 1`, `tracing::error!`, **continue** (mirrors B4
+//! `event_store.rs:191-199`; designing the cold-storage *write* is
+//! future work). A chokepoint `Err` is per-stream:
+//! `summary.errors += 1`, `tracing::error!`, **continue** (mirrors
 //! `purge_use_case.rs` per-artifact handling). A `list_*` enumeration
 //! error aborts the whole sweep (`Err`) — distinct from per-stream
 //! continuation.
@@ -108,7 +108,7 @@ pub enum SealMode {
 /// The artifact-lifecycle terminal event type. A `TerminalGated`
 /// artifact-category stream is sealed only when its **last** event's
 /// [`hort_domain::events::DomainEvent::event_type`] equals this — i.e.
-/// the artifact has been purged (`backlog` Item B5 §5; the terminal of
+/// the artifact has been purged (the terminal of
 /// [`hort_domain::events::StreamCategory::Artifact`]).
 const ARTIFACT_LIFECYCLE_TERMINAL: &str = "ArtifactPurged";
 
@@ -188,7 +188,7 @@ pub fn canonical_retention_rules(
             floor: authentication_floor,
             mode: SealMode::AgeGated,
         },
-        // B5 §5 core path: artifact-lifecycle terminal-gated rule.
+        // Artifact-lifecycle terminal-gated rule.
         CategoryRetentionRule {
             category: hort_domain::events::StreamCategory::Artifact,
             floor: artifact_lifecycle_floor,
@@ -196,24 +196,21 @@ pub fn canonical_retention_rules(
                 terminal_event_type: ARTIFACT_LIFECYCLE_TERMINAL,
             },
         },
-        // ── B12/B13 extension point ──────────────────────────────────
-        // B12 registration: opt-in per-(repo, UTC-date) download-audit
-        // streams seal on the ≥90d `artifact_downloaded`
-        // floor. Rotated audit streams — no terminal event, AgeGated
-        // (same shape as the AuthAttempts rule above). The B6
-        // composition root resolves this `Duration` from
-        // `AuditRetentionFloors::floor_for(C::DownloadAudit)`.
+        // Extension point: opt-in per-(repo, UTC-date) download-audit
+        // streams seal on the ≥90d `artifact_downloaded` floor. Rotated
+        // audit streams — no terminal event, AgeGated (same shape as the
+        // AuthAttempts rule above). The composition root resolves this
+        // `Duration` from `AuditRetentionFloors::floor_for(C::DownloadAudit)`.
         CategoryRetentionRule {
             category: hort_domain::events::StreamCategory::DownloadAudit,
             floor: download_audit_floor,
             mode: SealMode::AgeGated,
         },
-        // B13 registration: throttled per-(token_id, UTC-date)
-        // token-use audit streams seal on the ≥36mo
-        // `api_token_used` credential-audit floor. Rotated audit
-        // streams — no terminal event, AgeGated (same shape as the
-        // AuthAttempts / DownloadAudit rules above). The B6
-        // composition root resolves this `Duration` from
+        // Throttled per-(token_id, UTC-date) token-use audit streams seal
+        // on the ≥36mo `api_token_used` credential-audit floor. Rotated
+        // audit streams — no terminal event, AgeGated (same shape as the
+        // AuthAttempts / DownloadAudit rules above). The composition root
+        // resolves this `Duration` from
         // `AuditRetentionFloors::floor_for(C::TokenUse)` (which routes
         // to the same `api_token_used` field as `C::User`).
         CategoryRetentionRule {
@@ -226,8 +223,8 @@ pub fn canonical_retention_rules(
 
 /// One registered per-category retention rule: the C-1 floor and the
 /// seal mode for a [`hort_domain::events::StreamCategory`]. The use case
-/// holds a `Vec` of these — the B13/B14 registration seam. B13/B14
-/// only push a new rule; they do not modify the use-case logic.
+/// holds a `Vec` of these — the registration seam. Adding a new
+/// category only pushes a new rule; it does not modify the use-case logic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryRetentionRule {
     pub category: hort_domain::events::StreamCategory,
@@ -240,8 +237,8 @@ pub struct CategoryRetentionRule {
 /// The ONE global stream-retention mode threaded into the use case
 /// (the `hort-app` mirror of `hort-server::config::StreamRetentionMode` —
 /// `hort-app` must not depend on `hort-server`, so the resolved mode is
-/// passed in as this small value). Per-stream-granular config needs
-/// the §2-deferred DSL — explicitly out of v1 scope.
+/// passed in as this small value). Per-stream-granular config is
+/// explicitly out of v1 scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRetentionModeRef {
     /// `EventStore::delete_stream` (the v1 default).
@@ -252,7 +249,7 @@ pub enum StreamRetentionModeRef {
 }
 
 /// Outcome summary of one `archive_terminal_streams` pass — the
-/// `result_summary` JSON shape Item B6's `TaskHandler` surfaces.
+/// `result_summary` JSON shape the task handler surfaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionArchiveSummary {
     /// Candidate streams the sweep visited.
@@ -273,20 +270,20 @@ pub struct RetentionArchiveSummary {
     pub skipped_already_sealed: u64,
     /// Candidate whose category has no registered retention rule.
     pub skipped_unregistered_category: u64,
-    /// Per-stream failures (terminal-proof read / B9 chokepoint). The
+    /// Per-stream failures (terminal-proof read / seal chokepoint). The
     /// stream is NOT sealed; the next sweep retries it (fail-safe).
     pub errors: u64,
 }
 
 /// The audit-retention stream sweep. Pure orchestration
 /// over the additive [`TerminalStreamReader`] and the event store
-/// (B9 chokepoint via [`EventStorePublisher`]). 100% mock-testable
+/// via [`EventStorePublisher`]. 100% mock-testable
 /// per the `hort-app` coverage tier.
 pub struct EventStoreRetentionUseCase {
     reader: Arc<dyn TerminalStreamReader>,
     events: Arc<EventStorePublisher>,
-    /// The per-category registration (B13/B14 seam). Looked up by
-    /// candidate category; an unregistered category is skipped.
+    /// The per-category registration. Looked up by candidate category;
+    /// an unregistered category is skipped.
     rules: Vec<CategoryRetentionRule>,
     /// The one global v1 retention mode.
     mode: StreamRetentionModeRef,
@@ -294,7 +291,7 @@ pub struct EventStoreRetentionUseCase {
 
 impl EventStoreRetentionUseCase {
     /// Construct the use case. `rules` is the per-category retention
-    /// registration the composition root (B6) builds from
+    /// registration the composition root builds from
     /// `AuditRetentionFloors::floor_for`; `mode` is the one global v1
     /// retention mode resolved from `hort-server` config.
     pub fn new(
@@ -311,11 +308,10 @@ impl EventStoreRetentionUseCase {
         }
     }
 
-    /// Run the §4 audit-retention sweep at wall-clock `now` (`now` is
-    /// injected so it is coherent across retries and pinnable in tests
-    /// — the B3/B4 convention).
+    /// Run the audit-retention sweep at wall-clock `now` (`now` is
+    /// injected so it is coherent across retries and pinnable in tests).
     ///
-    /// One bad candidate (terminal-proof read / B9 chokepoint failure)
+    /// One bad candidate (terminal-proof read / seal chokepoint failure)
     /// is recorded in [`RetentionArchiveSummary::errors`] and the sweep
     /// continues — the stream is not sealed and the next sweep retries
     /// (fail-safe; this also covers the unprivileged-role DELETE block
@@ -450,7 +446,7 @@ impl EventStoreRetentionUseCase {
             return;
         }
 
-        // -- all preconditions passed: route through the B9 chokepoint -
+        // -- all preconditions passed: route through the seal chokepoint -
         self.seal_one(candidate, summary).await;
     }
 
@@ -505,12 +501,12 @@ impl EventStoreRetentionUseCase {
         }
     }
 
-    /// Route the proven candidate through the B9 chokepoint per the
+    /// Route the proven candidate through the seal chokepoint per the
     /// one global retention mode. A chokepoint `Err` is per-stream:
     /// `errors += 1`, `error!`, continue (fail-safe — covers the
     /// unprivileged-role DELETE block when the retention role is not
-    /// configured). B5 NEVER reimplements the `StreamSealed`
-    /// tombstone — the adapter's `seal_and_remove` does that.
+    /// configured). The `StreamSealed` tombstone is emitted by the
+    /// adapter's `seal_and_remove`, not here.
     async fn seal_one(
         &self,
         candidate: &TerminalStreamCandidate,
@@ -537,7 +533,7 @@ impl EventStoreRetentionUseCase {
                     tracing::info!(
                         stream_id = %candidate.stream_id,
                         target = "delete",
-                        "stream sealed + deleted (B9 chokepoint emitted \
+                        "stream sealed + deleted (adapter emitted \
                          the StreamSealed tombstone)"
                     );
                 }
@@ -546,8 +542,8 @@ impl EventStoreRetentionUseCase {
                     tracing::error!(
                         stream_id = %candidate.stream_id,
                         error = %e,
-                        "delete_stream (B9 chokepoint) failed — stream \
-                         NOT sealed, retried next sweep. Expected & \
+                        "delete_stream failed — stream NOT sealed, retried \
+                         next sweep. Expected & \
                          fail-safe when the retention role is not \
                          configured (the events_immutable trigger blocks \
                          the unprivileged-role DELETE; zero rows removed, \
@@ -564,7 +560,7 @@ impl EventStoreRetentionUseCase {
                         tracing::info!(
                             stream_id = %candidate.stream_id,
                             target = %target,
-                            "stream sealed + archived (B9 chokepoint emitted \
+                            "stream sealed + archived (adapter emitted \
                              the StreamSealed tombstone)"
                         );
                     }
@@ -574,7 +570,7 @@ impl EventStoreRetentionUseCase {
                             stream_id = %candidate.stream_id,
                             target = %target,
                             error = %e,
-                            "archive_stream (B9 chokepoint) failed — stream \
+                            "archive_stream failed — stream \
                              NOT sealed, retried next sweep (fail-safe; see \
                              the delete_stream note re: hort_retention_role)."
                         );

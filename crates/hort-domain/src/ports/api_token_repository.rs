@@ -8,18 +8,16 @@
 //! - `update_last_used` MUST persist a **bucketed** IP (`/24` IPv4, `/48`
 //!   IPv6 — `hort_app::metrics::client_ip_bucket`) and MUST truncate the
 //!   user-agent to **256 chars** at write — both are GDPR Art 5(1)(c) data
-//!   minimisation requirements (§3 last_used retention paragraph). A
-//!   malformed input IP that fails to parse as `std::net::IpAddr` is
-//!   stored verbatim — the validator (B5) is the upstream layer that
-//!   filters those, and the adapter MUST NOT crash on a bad string.
+//!   minimisation requirements. A malformed input IP that fails to parse as
+//!   `std::net::IpAddr` is stored verbatim — the validator is the upstream
+//!   layer that filters those, and the adapter MUST NOT crash on a bad string.
 //! - `revoke` is the natural transactional home for the
-//!   `NOTIFY api_token_revocation, '<token_id>'` emission (§5
-//!   multi-replica revocation invalidation). The LISTEN side lives in
-//!   B5; the NOTIFY emission is a B4 adapter concern.
+//!   `NOTIFY api_token_revocation, '<token_id>'` emission for
+//!   multi-replica revocation invalidation. The LISTEN side lives in
+//!   the token-validation use case; the NOTIFY emission is an adapter concern.
 //! - `find_by_prefix` returns `Option<ApiToken>` on miss — the
-//!   constant-time invariant lives in the use case (B5), not in the
-//!   adapter. A miss here MUST NOT log the prefix at WARN; DEBUG-level
-//!   per the §9 observability table.
+//!   constant-time invariant lives in the use case, not in the
+//!   adapter. A miss here MUST NOT log the prefix at WARN; DEBUG-level.
 
 use uuid::Uuid;
 
@@ -41,7 +39,7 @@ pub trait ApiTokenRepository: Send + Sync {
     /// Look up by 8-char body prefix.
     ///
     /// Returns `None` on miss — the constant-time-on-prefix-not-found
-    /// invariant is the use case's concern (B5), not the adapter's. A
+    /// invariant is the use case's concern, not the adapter's. A
     /// miss is `Ok(None)`, not `Err(NotFound)`.
     fn find_by_prefix(&self, prefix: &str) -> BoxFuture<'_, DomainResult<Option<ApiToken>>>;
 
@@ -63,7 +61,7 @@ pub trait ApiTokenRepository: Send + Sync {
     /// (`/24` IPv4, `/48` IPv6) and truncates `user_agent` to 256 chars
     /// before writing. Implementations MUST NOT log the raw IP or UA.
     /// Inputs that fail to parse as `std::net::IpAddr` are written
-    /// verbatim — the validator (B5) is the layer that rejects malformed
+    /// verbatim — the validator is the layer that rejects malformed
     /// strings; the adapter is best-effort and MUST NOT crash.
     fn update_last_used(
         &self,
@@ -79,7 +77,7 @@ pub trait ApiTokenRepository: Send + Sync {
     /// (the use case treats double-revoke as a no-op). The adapter is
     /// the natural home for the
     /// `NOTIFY api_token_revocation, '<token_id>'` emission used by
-    /// B5's multi-replica cache invalidation; the NOTIFY happens
+    /// multi-replica cache invalidation; the NOTIFY happens
     /// inside the same transaction as the UPDATE so cache drops cannot
     /// race with the revocation row.
     fn revoke(&self, token_id: Uuid) -> BoxFuture<'_, DomainResult<()>>;

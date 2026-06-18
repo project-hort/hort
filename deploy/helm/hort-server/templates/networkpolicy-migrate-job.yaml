@@ -11,8 +11,8 @@ WHY THIS EXISTS
   discriminator). So the deny-all also catches the pre-install `migrate`
   Helm hook Job, which must reach Postgres before the app is ever created
   → `helm install` aborts at the pre-install hook. The app-pod posture is
-  deliberately secure-by-default (a shipped CRA Annex I (1) control) and
-  is NOT weakened here: "default the policy off" was explicitly rejected.
+  deliberately secure-by-default and is NOT weakened here: "default the
+  policy off" was explicitly rejected.
   Instead this is an ADDITIVE policy.
 
   Kubernetes NetworkPolicies are purely additive (the effective allow
@@ -27,7 +27,7 @@ SELECTOR
   svc-token-bootstrap-job.yaml pod template sets this label). The app
   Deployment pods do NOT carry an `hort-server.io/job` label (they carry
   `app.kubernetes.io/component: server` instead), so this policy never
-  selects an app pod — F-33's app-pod deny-all is untouched.
+  selects an app pod — the app-pod deny-all is untouched.
 
 EGRESS SHAPE — why unrestricted egress + explicit DNS, not an ipBlock
   The DB endpoint is inside the operator-supplied opaque Secret DSN
@@ -53,7 +53,7 @@ EGRESS SHAPE — why unrestricted egress + explicit DNS, not an ipBlock
 PER-PRE-APP-HOOK-JOB VERDICT (audit table)
   | Template                       | Kind | Helm hook / trigger          | Needs net before app readiness?              | Disposition |
   |--------------------------------|------|------------------------------|----------------------------------------------|-------------|
-  | job-migrate.yaml               | Job  | pre-install,pre-upgrade (-5) | YES — Postgres before the Deployment exists   | CARVE-OUT (the F4 defect; this policy fixes it) |
+  | job-migrate.yaml               | Job  | pre-install,pre-upgrade (-5) | YES — Postgres before the Deployment exists   | CARVE-OUT (this policy fixes it) |
   | svc-token-bootstrap-job.yaml   | Job  | post-install,post-upgrade(5) | YES — init-ctr → Postgres (admin DSN); main-ctr → kube-apiserver (kubectl). Runs while the deny-all is active. | CARVE-OUT (same scoped allowance; covered by this policy's `hort-server.io/job` selector) |
   | cronjob-noop.yaml              | CronJob | schedule (scheduledTasks.adminTasksEnabled, default OFF) | NO — scheduled, never on the install critical path; not a pre-app hook | not pre-app; covered defensively by the same selector (cheap, correct, identical deny-all problem) |
   | cronjob-staging-sweep.yaml     | CronJob | schedule                  | NO — scheduled task, post-readiness            | not pre-app; covered defensively |
@@ -76,9 +76,9 @@ PER-PRE-APP-HOOK-JOB VERDICT (audit table)
 
 ESCAPE HATCH PARITY
   Gated on the SAME `.Values.networkPolicy.enabled` as the app-pod
-  policy. `networkPolicy.enabled: false` disables BOTH (the F-33 escape
-  hatch is unchanged): no app-pod policy, no Job-scoped policy, stock
-  cluster default applies to everything.
+  policy. `networkPolicy.enabled: false` disables BOTH: no app-pod
+  policy, no Job-scoped policy, stock cluster default applies to
+  everything.
 */}}
 {{- if .Values.networkPolicy.enabled -}}
 apiVersion: networking.k8s.io/v1
@@ -110,9 +110,8 @@ spec:
     # svc-token-bootstrap Job — the kube-apiserver) is not known to the
     # chart and MUST NOT be guessed (the chart deliberately keeps
     # CIDR auto-discovery out of scope). This is an ADDITIVE
-    # allowance on the Job pods only; the app-pod F-33 deny-all is
-    # unchanged. Operators who know their CIDRs can layer a tighter
-    # policy — this one only guarantees the default install is not
-    # bricked.
+    # allowance on the Job pods only; the app-pod deny-all is unchanged.
+    # Operators who know their CIDRs can layer a tighter policy — this
+    # one only guarantees the default install is not bricked.
     - {}
 {{- end -}}

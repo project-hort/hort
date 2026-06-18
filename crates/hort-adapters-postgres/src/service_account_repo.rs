@@ -1,5 +1,4 @@
-//! Postgres implementation of `ServiceAccountRepository` (Initiative
-//! 39 Item 3).
+//! Postgres implementation of `ServiceAccountRepository`.
 //!
 //! CRUD against three tables (migration 011): `service_accounts`,
 //! `service_account_federated_identities`, and

@@ -10,13 +10,12 @@
 //! `crates/hort-app/src/task_handlers/cron_rescan_tick.rs` shape, where
 //! every task handler depends only on ports.
 //!
-//! **Authority discipline (design §2.5 invariant 9).** The implementer
-//! re-evaluates the F-6 release predicate (`ScanSucceeded` /
-//! `ScanWaived` only) per artifact, so a window-expired candidate
-//! without a clean scan stays quarantined and falls out of the returned
-//! `Vec`. The window deadline is **never** evidence of release
-//! authority — the candidacy filter is the *caller's* concern, the
-//! authority check is this port's.
+//! **Authority discipline.** The implementer re-evaluates the fail-closed
+//! release predicate (`ScanSucceeded` / `ScanWaived` only) per artifact,
+//! so a window-expired candidate without a clean scan stays quarantined
+//! and falls out of the returned `Vec`. The window deadline is **never**
+//! evidence of release authority — the candidacy filter is the *caller's*
+//! concern, the authority check is this port's.
 
 use uuid::Uuid;
 
@@ -26,25 +25,23 @@ use super::BoxFuture;
 
 /// Outbound port: release a batch of artifact ids whose quarantine
 /// observation window has elapsed (candidacy-only — every release goes
-/// through the F-6 fail-closed authority check inside the
-/// implementation).
+/// through the fail-closed authority check inside the implementation).
 ///
-/// Returns the ids that were *actually* released — a strict subset of
-/// the input on the fail-closed path. A candidate with no
-/// `ScanCompleted` on its stream AND no `scan_backends: []` waiver is
-/// skipped (no authority is constructible); the sweep loop continues.
+/// Returns the ids that were *actually* released — a strict subset of the
+/// input on the fail-closed path. A candidate with no `ScanCompleted` on
+/// its stream AND no `scan_backends: []` waiver is skipped (no authority
+/// is constructible); the sweep loop continues.
 pub trait QuarantineReleasePort: Send + Sync {
-    /// Drive the per-artifact release-authority check (F-6) over
-    /// `artifact_ids` and append `ArtifactReleased` for each candidate
-    /// whose authority resolves. Returns the ids that were released.
+    /// Drive the per-artifact release-authority check over `artifact_ids`
+    /// and append `ArtifactReleased` for each candidate whose authority
+    /// resolves. Returns the ids that were released.
     ///
-    /// Per design §2.4 / Item 1b acceptance: `release_expired` itself
-    /// is unchanged — the candidacy filter
+    /// `release_expired` itself is unchanged — the candidacy filter
     /// (`quarantine_window_start + effective_duration <= now()`) is the
-    /// *caller's* concern; this port re-evaluates authority per
-    /// artifact and is the place a defective candidacy filter is
-    /// caught (it falls through to "no authority ⇒ skip", never to
-    /// "released without authority").
+    /// *caller's* concern; this port re-evaluates authority per artifact
+    /// and is where a defective candidacy filter is caught (it falls
+    /// through to "no authority ⇒ skip", never to "released without
+    /// authority").
     fn release_expired<'a>(
         &'a self,
         artifact_ids: Vec<Uuid>,

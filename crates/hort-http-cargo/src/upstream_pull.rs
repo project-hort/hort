@@ -16,13 +16,11 @@
 //!    `VerifiedIngestRequest::UpstreamPublished(Sha256)`.
 //!
 //! `try_upstream_crate_pull` lives in this inbound-HTTP crate (NOT a
-//! use case) — keeps the orchestration close to the route. Item 5
-//! wires the dispatch from `download` / `serve_index`; this item only
-//! lands the orchestrator + its branch tests.
+//! use case) — keeps the orchestration close to the route.
 //!
-//! Wire-mapping ([`UpstreamPullError`] → HTTP status / body) is also
-//! deferred to Item 5; the discrimination here only needs to surface
-//! the failure modes cleanly.
+//! Wire-mapping ([`UpstreamPullError`] → HTTP status / body) is
+//! performed by the route handler; the discrimination here only needs
+//! to surface the failure modes cleanly.
 //!
 //! Wire-mapping for upstream errors is performed by the route handler;
 //! the orchestrator only surfaces *what* went wrong, not *how to render
@@ -31,9 +29,9 @@
 //! # Cache strategy
 //!
 //! The `config.json` cache key is `cargo_index_config:{mapping.id}`.
-//! The same key shape is reserved for Item 4's per-crate index cache
-//! work (`cargo_index_entry:{mapping.id}:{name}`) so a single review
-//! can confirm consistency across the two callers.
+//! The same key shape is reserved for per-crate index cache entries
+//! (`cargo_index_entry:{mapping.id}:{name}`) so a single review can
+//! confirm consistency across callers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,8 +61,8 @@ use hort_formats::cargo::CargoFormatHandler;
 use hort_http_core::context::AppContext;
 
 /// Discriminated failure modes for [`try_upstream_crate_pull`]. Wire
-/// mapping (HTTP status + envelope body) is performed by Item 5 in the
-/// route handler; the orchestrator itself only surfaces *what* went
+/// mapping (HTTP status + envelope body) is performed by the route
+/// handler; the orchestrator itself only surfaces *what* went
 /// wrong, not *how to render it*.
 ///
 /// `MetadataFetchFailed.stage` is one of the three string literals
@@ -80,9 +78,9 @@ use hort_http_core::context::AppContext;
 /// for tracing — the wire-map renders a stable client-facing envelope
 /// regardless of the specific message, so the inner string is only
 /// consumed via `tracing::warn!` in the orchestrator. Same applies to
-/// the `err` field of `MetadataFetchFailed`. Item 5 wired the wire-map
-/// helper [`map_upstream_pull_error`] which reads `stage` (but not
-/// `err`) — the `err` text stays opaque on the wire by design (no
+/// the `err` field of `MetadataFetchFailed`. The wire-map helper
+/// [`map_upstream_pull_error`] reads `stage` (but not `err`) — the
+/// `err` text stays opaque on the wire by design (no
 /// upstream details surfaced beyond the typed reason).
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -129,10 +127,10 @@ pub(crate) enum UpstreamPullError {
 ///
 /// See the module-level docstring for the cache strategy.
 ///
-/// Item 5 wires this from the `download` handler — Proxy-repo cache
-/// misses route here.
+/// Called from the `download` handler — Proxy-repo cache misses route
+/// here.
 ///
-/// ## Index URL override (Item 11)
+/// ## Index URL override
 ///
 /// When `repo.index_upstream_url` is `Some`, the metadata-leg fetches
 /// (`config.json` + per-crate NDJSON) target that URL instead of the
@@ -188,8 +186,8 @@ pub(crate) async fn try_upstream_crate_pull(
     //    Uses index_mapping so that the override URL is honoured when set.
     let registry_config = resolve_registry_config(ctx, &index_mapping).await?;
 
-    // 3. Fetch the sparse-index NDJSON (NOT cached — Item 4 reserves
-    //    a separate cache key for per-crate index entries).
+    // 3. Fetch the sparse-index NDJSON (NOT cached — a separate cache
+    //    key is reserved for per-crate index entries).
     let coords = match CargoFormatHandler
         .parse_download_path(&format!("api/v1/crates/{name}/{version}/download"))
     {
@@ -319,8 +317,8 @@ pub(crate) async fn try_upstream_crate_pull(
         }
     };
 
-    // 5. Compose the download URL via Item 2's helper. The composer
-    //    handles all four spec-defined placeholder shapes plus the
+    // 5. Compose the download URL. The composer handles all four
+    //    spec-defined placeholder shapes plus the
     //    no-placeholder default (crates.io's `dl` falls into that
     //    bucket).
     let download_url = compose_download_url(
@@ -333,7 +331,7 @@ pub(crate) async fn try_upstream_crate_pull(
     // 6. Stream the artifact body through ingest_verified. The use
     //    case rehashes while streaming and returns Conflict on a
     //    cksum mismatch — our security primitive against upstream
-    //    tampering (see §15 of the upstream-verification design).
+    //    tampering.
     //
     //    Wrap the `fetch_artifact + ingest_verified` pair in
     //    `coalesce_blob` so N parallel callers for the same `.crate`
@@ -362,7 +360,7 @@ pub(crate) async fn try_upstream_crate_pull(
     // `mapping`. Threaded into `VerifiedIngestRequest` so `ingest_inner`
     // can gate the publish-anchored quarantine resolution on it.
     let blob_trust_publish_time = mapping.trust_upstream_publish_time;
-    // F-14: keep a clone for the cross-repo follower-registration
+    // Keep a clone for the cross-repo follower-registration
     // fallback below (the closure consumes `blob_coords`).
     let follower_coords = coords.clone();
     let blob_coords = coords;
@@ -416,8 +414,7 @@ pub(crate) async fn try_upstream_crate_pull(
         // ChecksumMismatch / CurationBlocked arms cover the post-
         // hash-rejection cases. Follower-side errors arrive as
         // `AppError::External("pull-dedup follower: ...")` and route
-        // to `Internal` per the design's leader-only-discrimination
-        // contract (§4).
+        // to `Internal` per the leader-only-discrimination contract.
         Err(AppError::Domain(DomainError::Conflict(msg))) => {
             tracing::warn!(conflict = %msg, "Cargo upstream checksum mismatch");
             return Err(UpstreamPullError::ChecksumMismatch);
@@ -497,8 +494,8 @@ pub(crate) async fn try_upstream_crate_pull(
     };
 
     // hort_upstream_checksum_total{format="cargo",result="verified"} emission
-    // lives in IngestUseCase::ingest_verified per 17.0 Item 11; no
-    // per-Cargo emission needed here. Same for hort_upstream_fetch_total
+    // lives in IngestUseCase::ingest_verified; no per-Cargo emission
+    // needed here. Same for hort_upstream_fetch_total
     // (UpstreamProxy adapter).
     tracing::info!(
         artifact_id = %artifact.id,
@@ -557,8 +554,7 @@ fn checksum_from_entry(
 ///
 /// TTL: 24 h backend TTL — operators don't change `dl` URLs in
 /// practice, so a stale entry surviving an upstream blip is preferred
-/// to a hot-path freshness check. Item 4 will revisit if the per-
-/// crate index cache wants tighter freshness.
+/// to a hot-path freshness check.
 ///
 async fn resolve_registry_config(
     ctx: &Arc<AppContext>,
@@ -653,8 +649,7 @@ async fn resolve_registry_config(
     })?;
 
     // Store raw bytes — cheap, re-parsable, and avoids inventing an
-    // envelope that Item 4 will need to design more carefully when
-    // it adds the per-crate index cache.
+    // envelope format before the per-crate index cache is designed.
     if let Err(e) = ctx
         .ephemeral_evictable
         .put(&cache_key, Bytes::from(body), CONFIG_TTL)
@@ -1372,7 +1367,7 @@ mod tests {
         });
     }
 
-    // ---- Item 7: warn-capture test for the checksum-mismatch branch ---------
+    // ---- warn-capture test for the checksum-mismatch branch ---------
 
     /// Assert that `try_upstream_crate_pull` emits a `WARN`-level tracing
     /// event mentioning "checksum mismatch" when `ingest_verified` returns
@@ -1503,7 +1498,7 @@ mod tests {
         assert_eq!(artifact.name, "serde");
     }
 
-    // ---- Item 11: index_upstream_url override tests -------------------------
+    // ---- index_upstream_url override tests -------------------------
 
     /// Override happy path: `repo.index_upstream_url = Some(...)` is set.
     /// The mock cannot distinguish which `upstream_url` was used because
@@ -1644,7 +1639,7 @@ mod tests {
 
     /// No-override regression: when `repo.index_upstream_url = None`, the
     /// orchestrator uses the default mapping URL and succeeds. This pins the
-    /// invariant that Item 11 is purely additive — existing Cargo proxy
+    /// invariant that the index URL override is purely additive — existing Cargo proxy
     /// repos without the field set continue to behave identically.
     #[tokio::test]
     async fn no_override_uses_mapping_host_regression() {
@@ -1653,7 +1648,7 @@ mod tests {
         // Explicitly assert the no-override state is canonical.
         assert!(
             repo.index_upstream_url.is_none(),
-            "sample_repository should initialise index_upstream_url = None (Item 10 default)"
+            "sample_repository should initialise index_upstream_url = None"
         );
         repo.index_upstream_url = None;
         mocks.repositories.insert(repo.clone());

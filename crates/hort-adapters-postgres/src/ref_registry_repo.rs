@@ -426,7 +426,7 @@ mod tests {
             .await;
     }
 
-    /// Insert a `mutable_refs` row directly (no write port yet — Item 3).
+    /// Insert a `mutable_refs` row directly (no write port yet).
     async fn insert_ref(
         pool: &PgPool,
         repo: Uuid,

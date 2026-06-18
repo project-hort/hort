@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn service_account_federation_only_shape() {
-        // §2: federation-only is a valid shape (no fallback Secret).
+        // Federation-only is a valid shape (no fallback Secret).
         let sa = ServiceAccount {
             fallback_rotation: None,
             ..sample_sa()
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn service_account_rotation_only_shape() {
-        // §2: rotation-only is a valid shape (PAT for legacy CI that
+        // Rotation-only is a valid shape (PAT for legacy CI that
         // can't do OIDC).
         let sa = ServiceAccount {
             federated_identities: vec![],
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn service_account_neither_block_shape() {
-        // §2: "neither" is a valid shape — a PAT-only SA the operator
+        // "Neither" is a valid shape — a PAT-only SA the operator
         // mints via `hort-cli admin token issue`.
         let sa = ServiceAccount {
             federated_identities: vec![],

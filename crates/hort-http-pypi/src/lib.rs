@@ -265,8 +265,7 @@ async fn upload(
     // downstream consumption (`handler.normalize_name`), not a security
     // boundary. Errors map to `DomainError::Validation` → 400 via the
     // existing `validation_error` helper; the structured
-    // `pypi.<field>` shape never echoes the offending input (design
-    // §5).
+    // `pypi.<field>` shape never echoes the offending input.
     hort_formats::pypi::validate_pep_503_name(&pkg_name)
         .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
     hort_formats::pypi::validate_pypi_version(&pkg_version)
@@ -312,8 +311,7 @@ async fn upload(
     let coords = ArtifactCoords {
         name: normalized,
         // Raw name as the client supplied it on the `name` multipart field,
-        // before PEP 503 normalisation. Drift-resilience safety net — see
-        // arch findings Item 6.
+        // before PEP 503 normalisation. Drift-resilience safety net.
         name_as_published: pkg_name.clone(),
         version: Some(pkg_version),
         path,
@@ -364,9 +362,9 @@ async fn upload(
                 // METADATA fields. Wrapped under `pkg_info` so the top level
                 // of `payload_metadata` stays reserved for sibling namespaces
                 // (scan findings, registry annotations, upstream manifests)
-                // — flat would lock us into a subset of nested. Read path
-                // (simple index data-requires-python) traverses the same
-                // path in Item 4.
+                // — flat would lock us into a subset of nested. The read
+                // path (simple index data-requires-python) traverses the
+                // same path.
                 payload_metadata: serde_json::json!({ "pkg_info": metadata_fields }),
                 upstream_digest,
                 // Direct upload carries no upstream publish hint.
@@ -528,7 +526,7 @@ async fn download(
     // active at ingest), so the URL segment the client follows is already
     // the stored form. Re-normalising here would break drift resilience
     // when a plugin update's `normalize_name` is not idempotent on old
-    // stored names (arch findings Item 6).
+    // stored names.
     let artifact_path = format!("simple/{project}/{filename}");
 
     // `find_visible_by_path` resolves the repo via
@@ -818,7 +816,7 @@ mod tests {
     fn insert_repo(h: &TestHarness, key: &str) -> Repository {
         let mut repo = sample_repository();
         repo.key = key.to_string();
-        // Arch findings Item 1: ingest requires coords.format == repo.format.
+        // Ingest requires coords.format == repo.format.
         // Align with what the PyPI handler sets in coords.
         repo.format = RepositoryFormat::Pypi;
         h.repositories.insert(repo.clone());
@@ -1437,13 +1435,13 @@ mod tests {
         /// Happy path: cache miss + Proxy + upstream serves the
         /// advertised sdist body.
         ///
-        /// Wire is already covered by Item 5's
+        /// Wire is already covered by
         /// `download_proxy_repo_cache_miss_success_returns_200`; this
         /// test asserts the FRAMEWORK invariants:
         /// - `ArtifactIngested` and `ChecksumVerified` ride in the
-        ///   SAME `commit_transition` batch (atomic with the mint
-        ///   per design §13), and that batch lands on the
-        ///   `StreamCategory::Artifact` stream.
+        ///   SAME `commit_transition` batch (atomic with the mint),
+        ///   and that batch lands on the `StreamCategory::Artifact`
+        ///   stream.
         /// - The freshly-fetched body is present in the CAS at its
         ///   computed hash (`storage.put` ran exactly once and the
         ///   bytes are recoverable).
@@ -1529,9 +1527,9 @@ mod tests {
         /// Tampered file: cache miss + Proxy + upstream serves bytes
         /// that disagree with the advertised `digests.sha256`.
         ///
-        /// Wire is already covered by Item 5's
+        /// Wire is already covered by
         /// `download_proxy_repo_cache_miss_checksum_mismatch_returns_502`;
-        /// this test asserts the FRAMEWORK invariants from §13:
+        /// this test asserts the FRAMEWORK invariants:
         /// - `ChecksumMismatch` is appended to the REPOSITORY stream
         ///   (never the artifact stream — there is no artifact yet
         ///   under mint-after-verify).
@@ -1654,7 +1652,7 @@ mod tests {
         /// Missing sha256: per-version JSON body advertises only `md5`
         /// in `digests` (legacy release).
         ///
-        /// Wire is already covered by Item 5's
+        /// Wire is already covered by
         /// `download_proxy_repo_cache_miss_md5_only_returns_502`; this
         /// test asserts the FRAMEWORK invariants:
         /// - `parse_upstream_checksum` fails BEFORE `ingest_verified`
@@ -1822,7 +1820,7 @@ mod tests {
         //    existing wheel-pull dedup keys — pinned via the
         //    `hort_pull_dedup_total{outcome="follower_waited_hit"}` metric
         //    (the same evidence the upstream_pull test uses).
-        // 6. F-25 anti-enumeration on private proxy — anonymous → 404
+        // 6. Anti-enumeration on private proxy — anonymous → 404
         //    (Repository NotFound), not 403.
         // 7. Quarantined wheel that DID ingest on the proxy → 503 +
         //    Retry-After (the status filter runs in the use case so
@@ -1883,8 +1881,8 @@ mod tests {
             }
 
             /// Test 1 — cache hit on a proxy: wheel + `wheel_metadata`
-            /// ContentReference both present in CAS (Item 3 ran during
-            /// a previous ingest). The strategy-2 dispatch's first
+            /// ContentReference both present in CAS (the ingest hook ran
+            /// during a previous ingest). The strategy-2 dispatch's first
             /// `WheelMetadataUseCase::serve` call returns `Available`
             /// and the response is 200 + bytes + Content-Digest with
             /// no upstream side-effect.
@@ -1948,7 +1946,7 @@ mod tests {
 
             /// Test 2 — cache miss → strategy-2 pull-through →
             /// re-serve. The wheel is constructed as a real ZIP with
-            /// a `<dist-info>/METADATA` member; Item 3's ingest hook
+            /// a `<dist-info>/METADATA` member; the ingest hook
             /// extracts those bytes during `try_upstream_file_pull`
             /// and writes them to CAS + a `wheel_metadata`
             /// ContentReference. The re-serve returns 200 + the
@@ -2000,8 +1998,8 @@ mod tests {
                 assert_eq!(body.as_ref(), metadata_bytes);
                 // Content-Digest carries the SHA-256 of those bytes —
                 // the load-bearing PEP 658 + RFC 9530 client-verification
-                // invariant Item 6's simple-index advertisement will
-                // also publish.
+                // invariant the simple-index advertisement will also
+                // publish.
                 let expected_metadata_hex = format!("{:x}", Sha256::digest(metadata_bytes));
                 let inner = cd
                     .strip_prefix("sha256=:")
@@ -2316,7 +2314,7 @@ mod tests {
                 );
             }
 
-            /// Test 6 — F-25 anti-enumeration on a private proxy.
+            /// Test 6 — anti-enumeration on a private proxy.
             /// Anonymous caller → 404 (Repository NotFound),
             /// byte-identical to a missing-repo response. The visibility
             /// hop in `repository_access_use_case.resolve` runs BEFORE
@@ -2636,7 +2634,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
-        // Audit invariant (§5): validator short-circuits before the
+        // Audit invariant: validator short-circuits before the
         // ingest use case is awaited, so no storage write is ever
         // attempted.
         assert_eq!(
@@ -3073,9 +3071,8 @@ mod tests {
         body
     }
 
-    /// 101 multipart fields → 400 + the exact JSON body the design doc
-    /// pins. The body shape is load-bearing; native clients may match
-    /// on the string `"too many multipart fields"`.
+    /// 101 multipart fields → 400 + the exact JSON body (load-bearing;
+    /// native clients may match on the string `"too many multipart fields"`).
     #[tokio::test]
     async fn publish_rejects_multipart_field_count_over_cap() {
         let h = harness();
@@ -3714,8 +3711,8 @@ mod tests {
         );
     }
 
-    /// Normalisation-drift regression (arch findings Item 6). Exercises
-    /// the **non-idempotent** drift case: a stored `name = "legacy.name"`
+    /// Normalisation-drift regression. Exercises the **non-idempotent**
+    /// drift case: a stored `name = "legacy.name"`
     /// (containing a dot — impossible under current PEP 503 normalise,
     /// only reachable by assuming ingestion under an older plugin) would
     /// be further transformed by `PyPiFormatHandler::normalize_name`
@@ -3806,10 +3803,10 @@ mod tests {
     /// Drives upload → download → `/metrics` through the real `build_router`
     /// stack with a **local** Prometheus recorder (no global install) and a
     /// real `FilesystemStorage` adapter backed by a tempdir. Asserts that a
-    /// counter from every observability layer — HTTP middleware (Item 5),
-    /// ingest use case (Item 2), download use case (Item 2), storage adapter
-    /// put (Item 3), and storage adapter get (Item 3) — appears in the scrape
-    /// output with the expected label shape.
+    /// counter from every observability layer — HTTP middleware,
+    /// ingest use case, download use case, storage adapter put, and
+    /// storage adapter get — appears in the scrape output with the
+    /// expected label shape.
     ///
     /// Forbidden-label regression: the scrape body must not contain any of
     /// the high-cardinality label keys `artifact_id`, `user_id`,
@@ -3932,7 +3929,7 @@ mod tests {
         // Assertions — every layer's counter fired.
         // ============================================================
 
-        // HTTP middleware (Item 5): hort_http_responses_total with a path
+        // HTTP middleware: hort_http_responses_total with a path
         // label that is a route template — not the concrete URL.
         assert!(
             scrape_body.contains("hort_http_responses_total{"),
@@ -3958,21 +3955,21 @@ mod tests {
             "concrete URL leaked into /metrics:\n{scrape_body}"
         );
 
-        // Ingest use case (Item 2): hort_ingest_total{format="pypi",...,result="success"} >= 1.
+        // Ingest use case: hort_ingest_total{format="pypi",...,result="success"} >= 1.
         assert_counter_fired(
             &scrape_body,
             "hort_ingest_total",
             &["format=\"pypi\"", "result=\"success\""],
         );
 
-        // Download use case (Item 2): hort_download_total{format="pypi",...,result="success"} >= 1.
+        // Download use case: hort_download_total{format="pypi",...,result="success"} >= 1.
         assert_counter_fired(
             &scrape_body,
             "hort_download_total",
             &["format=\"pypi\"", "result=\"success\""],
         );
 
-        // Storage adapter (Item 3): PUT fired with filesystem backend.
+        // Storage adapter: PUT fired with filesystem backend.
         assert_counter_fired(
             &scrape_body,
             "hort_storage_operations_total",
@@ -3983,7 +3980,7 @@ mod tests {
             ],
         );
 
-        // Storage adapter (Item 3): GET fired with filesystem backend.
+        // Storage adapter: GET fired with filesystem backend.
         assert_counter_fired(
             &scrape_body,
             "hort_storage_operations_total",
@@ -4148,7 +4145,7 @@ mod tests {
     // matches the simple-index's advertised hash, and the synthesizer (an
     // approximation) could not satisfy that invariant.
     // The test matrix below pins the PEP 658 §"Specification" contract:
-    // happy-path CAS-backed serve, F-25 anti-enumeration on private repos,
+    // happy-path CAS-backed serve, anti-enumeration on private repos,
     // quarantine status filter (Quarantined → 503,
     // Rejected/ScanIndeterminate → 404), sdist → 404, un-backfilled
     // wheel → 404, and hash round-trip.
@@ -4263,14 +4260,14 @@ mod tests {
         assert_eq!(body.as_ref(), payload);
     }
 
-    /// F-25 anti-enumeration on the `.metadata` endpoint. Anonymous caller
+    /// Anti-enumeration on the `.metadata` endpoint. Anonymous caller
     /// on a private repo's wheel `.metadata` URL → 404. Reuses the same
     /// `enabled_rbac_harness()` + `insert_private_repo()` setup as
     /// the `anti_enumeration::anonymous_get_pep658_metadata_on_private_repo_returns_404`
     /// regression below (which exercises the sdist short-circuit branch);
     /// this test pins the WHEEL branch — the one that reaches
     /// `WheelMetadataUseCase::serve` and therefore depends on the
-    /// `find_visible_by_path` F-25 hop inside the use case.
+    /// `find_visible_by_path` anti-enumeration hop inside the use case.
     #[tokio::test]
     async fn metadata_endpoint_anonymous_caller_on_private_repo_wheel_returns_404() {
         use hort_app::rbac::RbacEvaluator;
@@ -4284,7 +4281,7 @@ mod tests {
         h.repositories.insert(repo.clone());
         // Seed a wheel + its wheel_metadata CAS row inside the
         // private repo so the only thing standing between an
-        // anonymous caller and the bytes is the F-25 hop.
+        // anonymous caller and the bytes is the visibility check.
         let _ = seed_wheel_with_cas_metadata(
             &h,
             repo.id,
@@ -5406,7 +5403,7 @@ mod tests {
                     })
             });
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-            // Item 10: 5xx responses must never leak internal paths /
+            // 5xx responses must never leak internal paths /
             // crate identifiers.
             hort_http_core::error::assert_no_internal_leakage(status, &body);
         }
@@ -5433,7 +5430,7 @@ mod tests {
         }
     }
 
-    // -- Read-side anti-enumeration (F-25) ------------------------------------------
+    // -- Read-side anti-enumeration --------------------------------------------------
     //
     // Mirrors the Cargo + npm anti-enumeration regression tests
     // (`tests::anti_enumeration` in `crates/hort-http-cargo/src/lib.rs` &
@@ -5520,11 +5517,10 @@ mod tests {
         /// Compare two `(StatusCode, Vec<u8>)` 404 responses for
         /// anti-enumeration equivalence: status MUST match and the
         /// JSON envelope shape (`{"error":"not found: Repository
-        /// <id>"}`) MUST be identical except for the id token. Per
-        /// design doc §5: "Both are the canonical
-        /// `not found: Repository <id>` envelope, differing only in
-        /// the id token. Format equality is what an operator-side
-        /// enumeration probe would observe."
+        /// <id>"}`) MUST be identical except for the id token. Both
+        /// are the canonical `not found: Repository <id>` envelope,
+        /// differing only in the id token. Format equality is what
+        /// an operator-side enumeration probe would observe.
         fn assert_anti_enumeration_envelope(
             private: &(StatusCode, Vec<u8>),
             missing: &(StatusCode, Vec<u8>),

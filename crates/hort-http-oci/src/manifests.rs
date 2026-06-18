@@ -1,4 +1,4 @@
-//! OCI manifest pull (Item 7).
+//! OCI manifest pull.
 //!
 //! Wires `GET` + `HEAD /v2/<repo_key>/<name>/manifests/<reference>`.
 //! Dispatch on `reference` shape: a `:` (digest form) resolves via
@@ -9,8 +9,8 @@
 //!
 //! ## `RefTarget::Version` invariant
 //!
-//! OCI tags are ALWAYS written as `RefTarget::ContentHash` by Item 12's
-//! manifest PUT. A `RefTarget::Version(_)` on an OCI tag lookup is a
+//! OCI tags are ALWAYS written as `RefTarget::ContentHash` by the
+//! manifest PUT handler. A `RefTarget::Version(_)` on an OCI tag lookup is a
 //! data-integrity bug (cross-format writer wrote into the shared
 //! `mutable_refs` table with the wrong variant). The handler returns
 //! `DomainError::Invariant` → 500 INTERNAL and logs the bug; hiding it
@@ -25,16 +25,15 @@
 //! ## Content negotiation
 //!
 //! `Accept` header must include the manifest's stored media-type (read
-//! from `artifact_metadata.metadata.oci_media_type`, set by Item 12 on
-//! PUT), `*/*`, or a `<type>/*` subtype-wildcard matching the media-
+//! from `artifact_metadata.metadata.oci_media_type`, set at push time), `*/*`, or a `<type>/*` subtype-wildcard matching the media-
 //! type's type half (e.g. `application/*`). A missing `Accept` header
 //! is treated as `*/*` per RFC 9110 §12.5.1. Any other non-matching
 //! type returns 406 `MANIFEST_UNKNOWN` with `detail.media_type`. The
 //! backlog pins 406 over 404 so clients that hard-code a single
 //! `Accept` back off gracefully instead of looping on 404.
 //!
-//! When the artifact has no metadata row (the artifact pre-dates Item
-//! 12's metadata population), the manifest is served with the default
+//! When the artifact has no metadata row (the artifact pre-dates
+//! metadata population), the manifest is served with the default
 //! `application/vnd.oci.image.manifest.v1+json` — the common case that
 //! covers Docker-style single-image manifests.
 //!
@@ -142,8 +141,7 @@ pub(super) async fn serve(
     //      malformed digest). The artifact lookup in step 3 may
     //      still try upstream pull-through if the digest parsed but
     //      no local artifact exists.
-    //    - tag: look up via RefUseCase. Three outcomes (Init 11-ext
-    //      §2.2):
+    //    - tag: look up via RefUseCase. Three outcomes:
     //        Resolved(hash) → continue with hash.
     //        NotFound       → try upstream pull-through (the new
     //                         path; mirror discovery flow).
@@ -184,7 +182,7 @@ pub(super) async fn serve(
     //    via the visibility-aware artifact use case. Repo visibility
     //    has already been confirmed in step 1; we re-use the same
     //    enforcement here to keep the call shape uniform across the
-    //    crate (Item 5 will compile-error any direct port access).
+    //    crate (direct port access is a compile error per ADR 0008).
     //
     //    The tag-pull-through branch above already returned the
     //    freshly-ingested `Artifact` — skip the round-trip and use
@@ -201,12 +199,11 @@ pub(super) async fn serve(
         {
             Ok((_repo, a)) => a,
             Err(AppError::Domain(DomainError::NotFound { .. })) => {
-                // Init 11-ext Item 3: digest reference resolved
-                // (parsed cleanly) but no local artifact. Try the
-                // upstream by digest. The Ingested.hash matches the
-                // request digest by construction (`declared_sha256`
-                // is set in the IngestRequest); use the returned
-                // artifact directly.
+                // Digest reference resolved (parsed cleanly) but
+                // no local artifact. Try the upstream by digest.
+                // The Ingested.hash matches the request digest by
+                // construction (`declared_sha256` is set in the
+                // IngestRequest); use the returned artifact directly.
                 match try_upstream_manifest_pull(
                     &ctx,
                     &repo,
@@ -247,14 +244,12 @@ pub(super) async fn serve(
     }
 
     // 5. Media-type + content negotiation. The stored type comes from
-    //    `ArtifactMetadata.metadata.oci_media_type` set by Item 12;
+    //    `ArtifactMetadata.metadata.oci_media_type`;
     //    fall back to the OCI v1 single-image default when absent.
     let media_type = resolve_media_type(&ctx, artifact.id).await;
     if !accept_matches(headers, &media_type) {
-        // Tracing on the 406 branch: this fired in the Init 11-ext
-        // mirror smoke without enough context to diagnose. Logging
-        // both sides of the comparison makes future operator
-        // bug-reports self-describing.
+        // Tracing on the 406 branch: logging both sides of the
+        // comparison makes future operator bug-reports self-describing.
         let accept_header = headers
             .get(ACCEPT)
             .and_then(|v| v.to_str().ok())
@@ -324,9 +319,9 @@ fn resolve_digest_reference(reference: &str) -> Result<ContentHash, Box<Response
 
 /// Outcome of a tag-reference resolution.
 ///
-/// Splits "tag missing locally" (Init 11-ext: try upstream pull-
-/// through) from "data integrity bug or transport failure" (must
-/// surface immediately, the upstream can't recover from these).
+/// Splits "tag missing locally" (try upstream pull-through) from
+/// "data integrity bug or transport failure" (must surface
+/// immediately, the upstream can't recover from these).
 pub(super) enum TagResolveOutcome {
     /// Tag → digest mapping found locally with the right variant.
     Resolved(ContentHash),
@@ -350,14 +345,14 @@ async fn resolve_tag_reference(
         Ok(mref) => match mref.target {
             RefTarget::ContentHash(h) => TagResolveOutcome::Resolved(h),
             RefTarget::Version(v) => {
-                // OCI tags are ALWAYS ContentHash — Item 12's manifest
-                // PUT is the only writer for OCI namespaces and it
-                // emits ContentHash exclusively. A Version here is a
-                // cross-format contamination of the shared
-                // `mutable_refs` table and surfaces as 500. Init
-                // 11-ext explicitly does NOT route this to upstream
-                // pull-through — masking a data-integrity bug behind
-                // a 404 would hide the problem.
+                // OCI tags are ALWAYS ContentHash — the manifest PUT
+                // handler is the only writer for OCI namespaces and
+                // it emits ContentHash exclusively. A Version here is
+                // a cross-format contamination of the shared
+                // `mutable_refs` table and surfaces as 500. This does
+                // NOT route to upstream pull-through — masking a
+                // data-integrity bug behind a 404 would hide the
+                // problem.
                 tracing::error!(
                     %repo_id,
                     namespace = %name,
@@ -387,8 +382,8 @@ async fn resolve_tag_reference(
 // ---------------------------------------------------------------------------
 
 /// Fetch the manifest's stored media-type from the
-/// `artifact_metadata.metadata.oci_media_type` field (set by Item 12's
-/// manifest PUT). Falls back to [`DEFAULT_MEDIA_TYPE`] when the
+/// `artifact_metadata.metadata.oci_media_type` field. Falls back to
+/// [`DEFAULT_MEDIA_TYPE`] when the
 /// metadata row is absent or the field is missing — legitimate for
 /// artifacts that pre-date the metadata write (migration path) and for
 /// the adapter returning an error (we degrade gracefully rather than
@@ -1183,8 +1178,8 @@ fn map_manifest_pull_error(
             // from 5xx / network (`UpstreamUnavailable`) by
             // string-matching the rendered error. Followers see
             // `AppError::External("pull-dedup follower: ...")` and
-            // route to `Internal` — leader-only discrimination per
-            // the design doc §4.
+            // route to `Internal` per the leader-only discrimination
+            // contract.
             let msg = err.to_string();
             if msg.contains("404") || msg.contains("not_found") {
                 tracing::info!(
@@ -1234,7 +1229,7 @@ fn map_manifest_tag_pull_error(
             // Leader-side sentinel for the missing-Docker-Content-Digest
             // case. The leader already emitted the
             // `hort_upstream_checksum_total{result="checksum_missing"}`
-            // metric inside the closure (audit H-5). Followers re-emit
+            // metric inside the closure. Followers re-emit
             // would double-count, so the metric stays leader-only.
             Err(UpstreamManifestPullOutcome::UpstreamDigestMissing)
         }
@@ -1255,7 +1250,7 @@ fn map_manifest_tag_pull_error(
 }
 
 /// Final post-coalesce step: recover the artifact row via
-/// `find_in_repo_by_hash` (per the §5.2 contract). Both leader and
+/// `find_in_repo_by_hash`. Both leader and
 /// follower take this path; the leader's `ingest_verified` (inside
 /// the closure) wrote the row, the follower reads it.
 ///
@@ -1958,7 +1953,7 @@ mod tests {
         let retry_after = retry_after.expect("Retry-After header missing");
         let secs: i64 = retry_after.parse().unwrap();
         assert!((1..=120).contains(&secs));
-        // F8: assert body shape so a regression to TOOMANYREQUESTS /
+        // Assert body shape so a regression to TOOMANYREQUESTS /
         // mis-aligned status+code pair would be caught.
         assert_eq!(content_type.as_deref(), Some("application/json"));
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2048,7 +2043,7 @@ mod tests {
         );
     }
 
-    // -- F6: subtype wildcard --------------------------------------------
+    // -- Subtype wildcard ------------------------------------------------
 
     #[test]
     fn accept_application_wildcard_matches_manifest_media_type() {
@@ -2347,9 +2342,9 @@ mod tests {
         assert_eq!(body, content);
     }
 
-    /// F46.4.2 — manifest pull-through threads `ManifestFetch.last_modified`
+    /// Manifest pull-through threads `ManifestFetch.last_modified`
     /// onto the minted `Artifact.upstream_published_at`. Symmetric with
-    /// the OCI blob path tested in `blobs.rs`; without this, Item 6's
+    /// the OCI blob path tested in `blobs.rs`; without this,
     /// `trust_upstream_publish_time = true` would release every
     /// layer/config blob in an image on its own upstream age while the
     /// manifest stayed anchored on `ingested_at` and 503'd `docker pull`
@@ -2420,7 +2415,7 @@ mod tests {
         );
     }
 
-    /// F46.4.2 — `None` `Last-Modified` on the manifest fetch yields a
+    /// `None` `Last-Modified` on the manifest fetch yields a
     /// `None` artifact hint. Common case (Docker Hub's `Last-Modified`
     /// is often on the blob, not the manifest); must not error or
     /// silently substitute `ingested_at`.
@@ -2603,7 +2598,7 @@ mod tests {
         );
     }
 
-    /// Init 11-ext e2e regression: skopeo pulls a multi-arch tag like
+    /// Regression guard: skopeo pulls a multi-arch tag like
     /// `alpine:3.19`, the upstream returns
     /// `application/vnd.oci.image.index.v1+json`, the pull-through
     /// ingests it cleanly, and skopeo's request carries the standard
@@ -2612,11 +2607,11 @@ mod tests {
     /// with the index body and `Content-Type` echoing the index media
     /// type so docker / skopeo dispatch correctly.
     ///
-    /// First seen during the OCI mirror smoke: the pull-through
-    /// ingested the index but the immediate serve-back returned 406
-    /// `MANIFEST_UNKNOWN` (`manifest media type not acceptable`). Pin
-    /// the multi-Accept skopeo flow so a regression that re-breaks
-    /// index serving is caught here, not in the e2e.
+    /// Previously the pull-through ingested the index but the immediate
+    /// serve-back returned 406 `MANIFEST_UNKNOWN` (`manifest media type
+    /// not acceptable`). Pin the multi-Accept skopeo flow so a
+    /// regression that re-breaks index serving is caught here, not in
+    /// the e2e.
     #[test]
     fn pull_through_by_tag_serves_oci_image_index_to_skopeo_multi_accept() {
         use hort_domain::ports::upstream_proxy::ManifestFetch;
@@ -2690,8 +2685,7 @@ mod tests {
         assert_eq!(body, content);
     }
 
-    /// Init 11-ext mirror smoke regression #2 (smoking-gun observed
-    /// in production e2e log): skopeo's default `skopeo copy` (no
+    /// Mirror smoke regression: skopeo's default `skopeo copy` (no
     /// `--all`) sends `Accept: application/vnd.oci.image.manifest.v1+json`
     /// only — index types are NOT in the Accept set. Docker Hub's
     /// `alpine:3.19` is multi-arch and the upstream returns an
@@ -3019,7 +3013,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::BAD_GATEWAY,
-            "tag pull whose upstream omits Docker-Content-Digest MUST 502 (audit H-5)"
+            "tag pull whose upstream omits Docker-Content-Digest MUST 502"
         );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_INVALID");
@@ -3078,7 +3072,7 @@ mod tests {
         );
     }
 
-    // -- F3: DB-error collapse guard --------------------------------------
+    // -- DB-error collapse guard ------------------------------------------
 
     #[test]
     fn get_manifest_returns_500_on_repo_lookup_infra_error() {

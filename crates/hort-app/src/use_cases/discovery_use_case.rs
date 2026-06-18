@@ -23,7 +23,7 @@
 //! package-manager-client serve path; these are different consumers with
 //! deliberately divergent shapes.
 //!
-//! # Gate order (§2.6, §7)
+//! # Gate order
 //!
 //! 1. **Token-kind gate** — `caller.token_kind == Some(TokenKind::CliSession)`
 //!    is required. PATs and service-account tokens are rejected with
@@ -33,7 +33,7 @@
 //!    emits `result="permission_denied"`.
 //! 3. **OCI rejection** — if the upstream call returns
 //!    [`UpstreamFetchError::UnsupportedFormat`], the use case maps to
-//!    `result="oci_unsupported"` and returns the §8 exact wording wrapped
+//!    `result="oci_unsupported"` and returns the exact wording wrapped
 //!    in [`DomainError::Validation`].
 //!
 //! All ticks emit from this layer (per the architect-doc *"Emission by
@@ -41,7 +41,7 @@
 //! wrapper that maps `AppError` → `ApiError` and emits no business
 //! metric.
 //!
-//! # Status overlay (§6.8)
+//! # Status overlay
 //!
 //! Per AK-held version `(version, status, quarantine_until)`:
 //!
@@ -70,7 +70,7 @@
 //!   elapsed" — the operator cannot rely on the timer firing.
 //! - Operators dashboarding "stuck quarantines" should see this row in
 //!   the awaiting-release bucket, not the active-window bucket.
-//! - The §3.1 [`DiscoveryVersionStatus::Quarantined`] arm carries a
+//! - The [`DiscoveryVersionStatus::Quarantined`] arm carries a
 //!   `DateTime<Utc>` payload; synthesising `Utc::now()` for a missing
 //!   deadline would be a lie about the policy state.
 //!
@@ -167,24 +167,24 @@ impl DiscoveryUseCase {
         package_name: &str,
         caller: Option<&CallerPrincipal>,
     ) -> AppResult<DiscoveryListing> {
-        // -------- Gate 0: anonymous (F-25 read-endpoint pattern) ------
+        // -------- Gate 0: anonymous read-endpoint pattern ------
         //
         // The discovery GET routes through `extract_optional_principal`
         // (`hort-http-core::router.rs:313-318` — GET/HEAD/OPTIONS), so the
         // caller arrives as `Option`. A `None` here means no token, or a
         // token the read-path middleware could not validate. Reject with
         // 401 (`AppError::Unauthorized`). This returns BEFORE any metric
-        // tick, so §8.7's "anonymous → 401 + NO tick" invariant holds: an
+        // tick, so the "anonymous → 401 + NO tick" invariant holds: an
         // unauthenticated request never reaches the emission sites below.
         let caller = caller
             .ok_or_else(|| AppError::Unauthorized("discovery requires authentication".into()))?;
 
-        // -------- Gate 1: token-kind (cheapest first per §2.6) --------
+        // -------- Gate 1: token-kind (cheapest first) -----------------
         //
         // Pre-repo-resolution — fires before any port I/O. The `format`
         // label is unknown here because we have not resolved the repo
         // yet; emit `FORMAT_UNKNOWN` per the catalog's missing-format
-        // sentinel rule. Per §7 the `repository` label collapses to
+        // sentinel rule. The `repository` label collapses to
         // `REPOSITORY_ALL` for pre-resolution gate ticks.
         if caller.token_kind != Some(TokenKind::CliSession) {
             tracing::info!(
@@ -258,7 +258,7 @@ impl DiscoveryUseCase {
 
         // -------- Fetch AK-held versions + quarantine anchors ---------
         //
-        // F27: discovery reads the immutable `quarantine_window_start`
+        // Discovery reads the immutable `quarantine_window_start`
         // anchor via the dedicated `package_version_anchors` query — NOT
         // the hot `package_version_status` serve path (which returns no
         // deadline and stays an index-only scan). The live deadline is
@@ -295,7 +295,7 @@ impl DiscoveryUseCase {
 
         // -------- Fetch upstream-advertised versions ------------------
         //
-        // §6.2: a repo with no upstream mapping (hosted-only) yields an
+        // A repo with no upstream mapping (hosted-only) yields an
         // empty `unknown` set. The mapping resolver here mirrors every
         // other prefetch / proxy call site (longest-prefix not relevant
         // — discovery is repo-scoped, not path-scoped): pick the
@@ -316,7 +316,7 @@ impl DiscoveryUseCase {
             {
                 Ok(v) => v,
                 Err(UpstreamFetchError::UnsupportedFormat) => {
-                    // §8 — OCI / unknown format. Emit
+                    // OCI / unknown format. Emit
                     // `oci_unsupported` and return Validation.
                     tracing::info!(
                         repository = %repository.key,
@@ -356,12 +356,11 @@ impl DiscoveryUseCase {
                         "discovery list_versions: upstream-fetch failed, returning AK-held set only",
                     );
                     emit_discovery_list_versions(&format_label, &repository_label, result);
-                    // §7 catalog row — the upstream-fetch outcome is the
-                    // single point of taxonomic alignment with
-                    // `UpstreamErrorKind`; the response still serializes
-                    // with an empty unknown-set (per §7 the *metric*
-                    // distinguishes upstream-call cleanliness, not
-                    // listing emptiness).
+                    // The upstream-fetch outcome is the single point of
+                    // taxonomic alignment with `UpstreamErrorKind`; the
+                    // response still serializes with an empty unknown-set
+                    // (the metric distinguishes upstream-call cleanliness,
+                    // not listing emptiness).
                     return Ok(build_listing(
                         package_name,
                         &format_label,
@@ -372,7 +371,7 @@ impl DiscoveryUseCase {
                 }
             }
         } else {
-            // §6.2: no upstream mapping → empty unknown set; we still
+            // No upstream mapping → empty unknown set; we still
             // tick `Success` (the call assembled a listing cleanly).
             Vec::new()
         };
@@ -419,7 +418,7 @@ impl DiscoveryUseCase {
 }
 
 /// Pure status-overlay assembly — separate function so unit tests can
-/// exercise every §6.8 arm without wiring the full use case.
+/// exercise every status-overlay arm without wiring the full use case.
 ///
 /// `held` is the AK-side projection (`version, status, quarantine_until`);
 /// `upstream` is the upstream-advertised set. HORT rows win when both sets
@@ -689,7 +688,7 @@ mod tests {
                 );
             })
         });
-        // §8.7: anonymous → 401 + NO metric tick. The Gate 0 guard returns
+        // Anonymous → 401 + NO metric tick. The Gate 0 guard returns
         // before any `emit_discovery_list_versions` call, so the counter
         // must be entirely absent (no result label of any kind).
         assert_eq!(
@@ -829,7 +828,7 @@ mod tests {
         ));
     }
 
-    // --- §6.2: no upstream mapping ---------------------------------------
+    // --- no upstream mapping ---------------------------------------------
 
     #[test]
     fn no_upstream_mapping_yields_hort_held_only_and_ticks_success() {
@@ -840,7 +839,7 @@ mod tests {
                 let repo_key = repo.key.clone();
                 let h = wire(repo, evaluator_with_read_grant("dev", repo_id));
                 // Seed two AK-held versions; no upstream mapping seeded
-                // ⇒ §6.2 unknown set is empty.
+                // ⇒ unknown set is empty (no upstream mapping).
                 h.artifacts.seed_package_version_status(
                     repo_id,
                     "left-pad",
@@ -871,7 +870,7 @@ mod tests {
         );
     }
 
-    // --- F27: deadline computed from anchor + resolved policy duration ---
+    // --- deadline computed from anchor + resolved policy duration ---
 
     /// A `Quarantined` artifact carrying a `quarantine_window_start`
     /// anchor — exercises the `package_version_anchors` → deadline path.
@@ -1050,7 +1049,7 @@ mod tests {
         assert!(matches!(err, AppError::Domain(DomainError::Invariant(_))));
     }
 
-    // --- §6.8 status overlay arms ----------------------------------------
+    // --- status overlay arms ---------------------------------------------
 
     #[test]
     fn overlay_released_arm() {
@@ -1209,8 +1208,8 @@ mod tests {
 
     #[test]
     fn overlay_hort_held_wins_over_upstream() {
-        // §6.8 contract: HORT rows are not demoted to `Unknown` just
-        // because upstream also lists them.
+        // HORT rows are not demoted to `Unknown` just because upstream
+        // also lists them.
         let now = Utc::now();
         let listing = build_listing(
             "p",
@@ -1269,7 +1268,7 @@ mod tests {
         ));
     }
 
-    // --- §8 OCI rejection -------------------------------------------------
+    // --- OCI rejection ----------------------------------------------------
 
     #[test]
     fn oci_format_returns_validation_with_exact_message_and_ticks_oci_unsupported() {
@@ -1373,7 +1372,7 @@ mod tests {
                 let listing =
                     h.uc.list_versions(&repo_key, "p", Some(&actor))
                         .await
-                        .expect("upstream error returns Ok envelope (per §7)");
+                        .expect("upstream error returns Ok envelope");
                 // Empty unknown set when the upstream call failed.
                 assert!(listing
                     .versions
@@ -1526,9 +1525,9 @@ mod tests {
         }
     }
 
-    // --- §6.9 invariant guard --------------------------------------------
+    // --- invariant guard -------------------------------------------------
 
-    /// Smoke-pin the §6.9 invariant at the source level. The pre-merge
+    /// Smoke-pin the dep-graph invariant at the source level. The pre-merge
     /// verification gate runs `git grep` on the same set of identifiers;
     /// this in-source assertion catches an early stray import or a
     /// future refactor that wires in the unified index pipeline.
@@ -1609,9 +1608,9 @@ mod tests {
 
     #[test]
     fn success_path_serializes_mixed_arms() {
-        // Smoke check that the listing's outer envelope is shaped per
-        // §2.2's JSON example — `package`, `format`, `versions` —
-        // through Serialize. The arm-level coverage lives upstream in
+        // Smoke check that the listing's outer envelope is shaped as
+        // expected — `package`, `format`, `versions` — through Serialize.
+        // The arm-level coverage lives upstream in
         // `entities/discovery.rs` Serialize tests; this is the
         // use-case-level check.
         let now = Utc::now();

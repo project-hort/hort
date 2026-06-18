@@ -55,10 +55,10 @@ pub enum RetentionScope {
     PackageNamePattern(String),
     /// Restrict to artifacts whose `ArtifactIngested.source` matches.
     ///
-    /// The §4 default for security-driven retention. `IngestSource(Proxied)`
-    /// is safe to auto-delete (re-pull restores it); `IngestSource(Direct)`
-    /// is not — the artifact may be the only build of that version in
-    /// production (§6 invariant 8).
+    /// The recommended default scope for security-driven retention.
+    /// `IngestSource(Proxied)` is safe to auto-delete (re-pull restores
+    /// it); `IngestSource(Direct)` is not — the artifact may be the only
+    /// build of that version in production.
     IngestSource(IngestSource),
 }
 
@@ -72,10 +72,10 @@ impl RetentionScope {
     /// every pulled-through artifact is restorable by re-pull. Every
     /// other scope (`AllRepos`, `Repos`, `Format`, `PackageNamePattern`,
     /// and `IngestSource(Direct)` itself) *can* match a direct upload,
-    /// so the apply pipeline must surface the §6-invariant-8 warning
-    /// for them (that warning lands in the B3 apply-path follow-on, not
-    /// here — the domain layer is zero-`tracing`). This predicate is
-    /// the pure decision the warning is keyed off.
+    /// so the apply pipeline surfaces a warning for them (that warning
+    /// lives in the app/apply layer, not here — the domain layer is
+    /// zero-`tracing`). This predicate is the pure decision the warning
+    /// is keyed off.
     pub fn excludes_direct_uploads(&self) -> bool {
         matches!(self, Self::IngestSource(IngestSource::Proxied))
     }

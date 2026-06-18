@@ -25,7 +25,7 @@
 //! — **NO `#[instrument(err)]`** per CLAUDE.md observability rule:
 //! denials are audit signals (`tracing::info!`), not errors. SSRF
 //! denials log the URL host but NEVER the resolved IPs (topology
-//! disclosure — design doc §12).
+//! disclosure).
 
 use std::sync::Arc;
 
@@ -65,8 +65,7 @@ use crate::use_cases::read_expected_version;
 // SubscriptionUseCaseConfig
 // ---------------------------------------------------------------------------
 
-/// Composition-root configuration for the use case (design doc §10 +
-/// §11 invariant 11).
+/// Composition-root configuration for the use case.
 ///
 /// Both flags are operator-set via env vars (`HORT_WEBHOOK_ALLOW_PLAINTEXT`,
 /// `HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS`) in the composition
@@ -125,7 +124,7 @@ pub struct UpdateSubscriptionRequest {
 // ---------------------------------------------------------------------------
 
 /// Typed errors surfaced by [`SubscriptionUseCase`]. Mapped to HTTP
-/// envelopes by the handler crate per the §5 reject-path table.
+/// envelopes by the handler crate.
 ///
 /// **`InvalidWebhookUrl` is intentionally absent** from this enum — the
 /// HTTP layer parses the URL into [`url::Url`] before constructing
@@ -136,8 +135,8 @@ pub struct UpdateSubscriptionRequest {
 /// never produces it.
 #[derive(Debug, thiserror::Error)]
 pub enum SubscriptionError {
-    /// 400 — filter requested high-volume event type from the §3
-    /// exclusion list.
+    /// 400 — filter requested high-volume event type that is excluded
+    /// from subscriptions.
     #[error("filter requested unsupported event type: {0:?}")]
     UnsupportedEventType(hort_domain::entities::subscription::EventTypeKind),
 
@@ -252,8 +251,7 @@ impl SubscriptionUseCase {
     /// Validate + persist a new subscription, emitting `SubscriptionCreated`
     /// on success or `SubscriptionCreationDenied` on every reject path.
     ///
-    /// Order of operations follows design doc §5 + §11 invariant 11
-    /// exactly: name/description structural → high-volume event filter
+    /// Order of operations: name/description structural → high-volume event filter
     /// → target-specific validation (incl. SSRF when applicable) →
     /// repository-scope authz under the token-cap matrix → uniqueness
     /// → persist → audit event.
@@ -273,7 +271,7 @@ impl SubscriptionUseCase {
 
         // 1a. Privileged-category authority gate.
         //     Fail-fast — evaluated BEFORE the high-volume filter, the
-        //     SSRF check, and the §5.5 snapshot capture so a denied
+        //     SSRF check, and the snapshot capture so a denied
         //     privileged-category request never writes a row and never
         //     reaches the (more expensive) target/SSRF validation. The
         //     acting principal's authority is evaluated LIVE here, never
@@ -393,7 +391,7 @@ impl SubscriptionUseCase {
             }
         }
 
-        // 4. Repository-scope authz under the §5 token-cap matrix.
+        // 4. Repository-scope authz under the token-cap matrix.
         //    Take one rbac snapshot so the loop walks a consistent
         //    evaluator (same precedent as `ApiTokenUseCase::issue_inner`).
         let rbac_guard = self.rbac.load();
@@ -451,7 +449,7 @@ impl SubscriptionUseCase {
             }
 
             // Some(filter_ids), capped — cap check first (cap is the
-            // strict outer bound per design §5), then grants check.
+            // strict outer bound), then grants check.
             (RepositoryScope::Some(filter_ids), Some(cap_ids)) => {
                 let offending: Vec<Uuid> = filter_ids
                     .iter()
@@ -573,7 +571,7 @@ impl SubscriptionUseCase {
             // claims as the subscription's authority floor. The
             // privileged-category gate above already ran (fail-fast,
             // before this point). The dispatcher re-derives authority
-            // against live owner state at delivery (Item 9), so this
+            // against live owner state at delivery, so this
             // snapshot is the floor, never the sole control.
             snapshot_claims: principal.claims.clone(),
             state: SubscriptionState::Active,
@@ -644,7 +642,7 @@ impl SubscriptionUseCase {
 
     /// Compute the union of "doesn't authorize Read" and "doesn't exist"
     /// repository ids — non-existent ids collapse into the unauthorized
-    /// list per design §5 (never leak existence-vs-permission).
+    /// list (never leak existence-vs-permission).
     async fn scan_unauthorized_or_missing(
         &self,
         principal: &CallerPrincipal,
@@ -683,13 +681,13 @@ impl SubscriptionUseCase {
     /// `hort-domain` source of truth — it is **not** re-encoded here, and
     /// `hort-app` does not (cannot) import `hort-http-events` (circular crate
     /// dependency; the events-read gate delegates to the same domain
-    /// predicate — see §5.5b, §11 anti-pattern). Drift between the read
-    /// gate and this gate is the F-3 bug class.
+    /// predicate). Drift between the read gate and this gate is the
+    /// primary privileged-category bug class.
     ///
     /// Authority is evaluated **live** against the current RBAC snapshot,
     /// never read from `snapshot_claims` (the snapshot is the dispatch
-    /// authority floor, re-checked at delivery in Item 9 — defence in
-    /// depth; this is the create/update leg).
+    /// authority floor, re-checked at delivery — defence in depth; this is
+    /// the create/update leg).
     fn privileged_category_denied(
         &self,
         principal: &CallerPrincipal,
@@ -801,7 +799,7 @@ impl SubscriptionUseCase {
     // -- update -------------------------------------------------------------
 
     /// Apply per-field updates with the cap-never-widens rule on
-    /// `filter.repositories` (design §5 update-call rule).
+    /// `filter.repositories`.
     #[tracing::instrument(skip(self, principal, request))]
     pub async fn update(
         &self,
@@ -942,7 +940,7 @@ impl SubscriptionUseCase {
         if changed_fields.is_empty() {
             // Nothing to do — no state change, no event. Idempotent.
             // (A no-op PATCH does not persist, so it does not re-snapshot
-            // either — §6 invariant 2 is "re-set on every update", and a
+            // either — the rule is "re-set on every update", and a
             // no-op is not an update.)
             return Ok(sub);
         }
@@ -953,10 +951,10 @@ impl SubscriptionUseCase {
         // shrink-only cap): the new value fully replaces the prior one,
         // including the PATCH-via-PAT-clears wrinkle (a PAT principal's
         // `[]` / `["admin"]` overwrites a previously-rich snapshot). The
-        // dispatch-time gate (Item 9) re-checks privileged-category
-        // delivery against live owner authority, so a snapshot elevated
-        // to `["admin"]` cannot retroactively unlock a category — F-37
-        // is closed by that leg, not by trusting this floor.
+        // The dispatch-time gate re-checks privileged-category delivery
+        // against live owner authority, so a snapshot elevated to
+        // `["admin"]` cannot retroactively unlock a category — that gate,
+        // not this floor, closes the race.
         sub.snapshot_claims = principal.claims.clone();
         let snapshot_claims_count = sub.snapshot_claims.len() as u32;
 
@@ -1217,7 +1215,7 @@ impl SubscriptionUseCase {
 // ---------------------------------------------------------------------------
 
 /// Compute the audit-event filter summary from a domain filter
-/// (design doc §5: no PII, no URLs, no repo-id list).
+/// (no PII, no URLs, no repo-id list).
 fn compute_filter_summary(filter: &SubscriptionFilter) -> FilterSummary {
     FilterSummary {
         categories: filter.categories.iter().map(category_to_string).collect(),
@@ -1234,7 +1232,7 @@ fn compute_filter_summary(filter: &SubscriptionFilter) -> FilterSummary {
             RepositoryScope::All => RepositoryScopeKind::All,
         },
         // v1 ships zero `NamedPredicate` variants — the canonical hash
-        // for "no predicates" is the zero array (design doc §5).
+        // for "no predicates" is the zero array.
         predicate_hash: [0u8; 32],
     }
 }
@@ -1261,7 +1259,7 @@ fn category_to_string(c: &StreamCategory) -> String {
     }
 }
 
-/// Project the target enum to its wire-form discriminator (design §5).
+/// Project the target enum to its wire-form discriminator.
 fn target_kind_wire(target: &SubscriptionTarget) -> TargetKindWire {
     match target {
         SubscriptionTarget::Webhook { .. } => TargetKindWire::Webhook,
@@ -2031,7 +2029,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_admin_scope_requires_uncapped_token() {
-        // Admin role BUT capped — design §5: capped token cannot create
+        // Admin role but capped — a capped token cannot create
         // an `All` scope subscription even if the caller has admin role.
         let actor = {
             let mut p = caller_with_roles(&["admin"]);
@@ -3308,8 +3306,8 @@ mod tests {
     // ====================================================================
 
     /// `filter` over a single non-privileged category — used by the
-    /// snapshot-capture tests so the §5.5a gate never short-circuits
-    /// the path before the capture is reached.
+    /// snapshot-capture tests so the privileged-category gate never
+    /// short-circuits the path before the capture is reached.
     fn filter_owned_repo_category() -> SubscriptionFilter {
         SubscriptionFilter {
             categories: vec![StreamCategory::Repository],
@@ -3320,7 +3318,7 @@ mod tests {
     }
 
     /// `filter` whose `categories` includes a privileged
-    /// (`ADMIN_CATEGORIES`) member — the §5.5a gate input.
+    /// (`ADMIN_CATEGORIES`) member — the privileged-category gate input.
     fn filter_privileged_category(cat: StreamCategory) -> SubscriptionFilter {
         SubscriptionFilter {
             categories: vec![cat],
@@ -3403,7 +3401,7 @@ mod tests {
     async fn update_via_oidc_after_pat_create_replaces_snapshot() {
         // Created via PAT principal (claims=[]), then PATCHed via an
         // OIDC principal — snapshot is fully replaced with the OIDC
-        // principal's claims (full-replace authority floor, §5.5).
+        // principal's claims (full-replace authority floor).
         let pat_actor = caller_with_roles(&[]);
         let fx = wire(
             empty_eval(),
@@ -3439,7 +3437,7 @@ mod tests {
     async fn update_via_pat_nonadmin_clears_previously_rich_snapshot() {
         // Created via OIDC (rich claims), PATCHed via a PAT non-admin
         // principal (claims=[]) — snapshot replaced with [] (the
-        // PATCH-via-PAT-clears wrinkle, §5.5).
+        // PATCH-via-PAT-clears wrinkle).
         let oidc_actor = caller_with_roles(&["developer", "team-alpha"]);
         let fx = wire(
             empty_eval(),

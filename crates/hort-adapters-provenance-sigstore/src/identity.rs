@@ -23,8 +23,8 @@ use x509_cert::Certificate;
 /// (`1.3.6.1.4.1.57264.1.1`). The newer `…1.1.8` (issuer V2, DER-encoded
 /// UTF8String) is intentionally not consulted here: the V1 extension is
 /// the raw-string form every current Fulcio cert still carries and is
-/// what `sigstore`'s own `OIDCIssuer` policy reads. A future Tier-2
-/// initiative can add V2 if a deployed IdP drops the V1 extension.
+/// what `sigstore`'s own `OIDCIssuer` policy reads. V2 support can be
+/// added in a future change if a deployed IdP drops the V1 extension.
 const OIDC_ISSUER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57264.1.1");
 
 /// The Sigstore "other name" SAN OID (`1.3.6.1.4.1.57264.1.7`) — used for

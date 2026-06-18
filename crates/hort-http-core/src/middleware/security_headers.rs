@@ -697,7 +697,7 @@ mod tests {
 
     /// HSTS value is exactly the expected string — locks against
     /// drift. If anyone tightens the value (e.g. adds `preload`)
-    /// without touching the design doc + CHANGELOG, this test fails.
+    /// without updating the CHANGELOG, this test fails.
     #[test]
     fn hsts_value_is_exactly_180_days_with_includesubdomains() {
         let resp = drive_with_trust("https", "/json");

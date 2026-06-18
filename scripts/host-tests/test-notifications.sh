@@ -17,9 +17,9 @@
 # NOT run this smoke; operators run it manually after deploy stack
 # bring-up.
 #
-# Why not the full 7-step happy-path? Steps 1-7 of the design doc (webhook
-# receiver, HMAC verification, restart-catch-up, in-band delivery within
-# 5s) require an out-of-process webhook receiver running on a fixed port
+# Why not the full happy-path? The full flow (webhook receiver, HMAC
+# verification, restart-catch-up, in-band delivery within 5s) requires
+# an out-of-process webhook receiver running on a fixed port
 # (an axum side-car or python http.server) AND a way to trigger an
 # ArtifactPromoted event (which requires either a full publish+promote
 # round-trip or a direct admin API). Both depend on fixtures the v2
@@ -186,7 +186,7 @@ assert_pass "issue-svc-token returned a non-empty token (name=$TOKEN_NAME)"
 # create-time. The default `HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS=false`
 # posture is the gate.
 #
-# Backlog acceptance line: "attempt to create a subscription with
+# Acceptance: "attempt to create a subscription with
 # url = http://127.0.0.1:9999/x returns 400 with denial_reason =
 # WebhookTargetNotRoutable". We use https:// here so the plaintext-
 # check doesn't trip first; the SSRF check is what we want to assert.

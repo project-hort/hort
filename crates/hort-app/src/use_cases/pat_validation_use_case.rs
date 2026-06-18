@@ -27,8 +27,7 @@
 //!    d. ALWAYS call Argon2 verify exactly ONCE — with the looked-up
 //!    hash on prefix-found, with the precomputed
 //!    [`crate::argon2_hash::sentinel_hash`] on prefix-not-found.
-//!    This is design doc §8 invariant 1 and the architect's
-//!    constant-time-on-prefix-not-found rule.
+//!    This is the constant-time-on-prefix-not-found invariant.
 //!    e. After verify: classify (`PrefixNotFound`, `HashMismatch`),
 //!    then check `expires_at`, `revoked_at`, `user.is_active` in that
 //!    order, each with its own [`PatValidationError`] variant on miss.
@@ -41,29 +40,26 @@
 //!    [`PatLockoutConfig::duration`].
 //! 5. **Metric emission** is the LAST step before returning on EVERY
 //!    code path (cache hit, lockout short-circuit, every miss-path
-//!    outcome). Per design doc §9 ("Metric-emission timing vs
-//!    constant-time invariant") the increment must come *after* the
-//!    Argon2 verify on the miss path so the counter call itself
-//!    cannot become a covert timing oracle.
+//!    outcome). The increment must come *after* the Argon2 verify on the
+//!    miss path so the counter call itself cannot become a covert timing
+//!    oracle.
 //!
-//! # Scope of B5b
+//! # Scope of this use case
 //!
-//! B5b emits an [`ApiTokenValidation`] only. Building the
+//! This module emits an [`ApiTokenValidation`] only. Building the
 //! [`hort_domain::entities::caller::CallerPrincipal`] (with role
-//! re-resolution per design §5 step 3) and integrating with the auth
-//! middleware happens in B5c. This module deliberately stops at the
+//! re-resolution) and integrating with the auth middleware happens
+//! at the middleware boundary. This module deliberately stops at the
 //! validation payload so the validator can be unit-tested in isolation
 //! against the counter spy + metric spy harness.
 //!
 //! # What is NOT here
 //!
-//! - Plaintext-PAT-over-HTTP refusal (design §8 invariant 10) — that
-//!   is a middleware concern (B5c).
-//! - PgListener wiring of `ApiTokenCacheInvalidator` (B5c).
+//! - Plaintext-PAT-over-HTTP refusal — that is a middleware concern.
+//! - PgListener wiring of `ApiTokenCacheInvalidator`.
 //! - `last_used_at` debounced bookkeeping — the fire-and-forget update
-//!   spawn lives at the middleware boundary (B5c) so the validator
-//!   stays free of `tokio::spawn` and side effects beyond the cache
-//!   write.
+//!   spawn lives at the middleware boundary so the validator stays free
+//!   of `tokio::spawn` and side effects beyond the cache write.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -90,7 +86,7 @@ use crate::metrics::{
 use crate::use_cases::pat_cache::{ApiTokenValidation, CacheKey, Clock, PatCache};
 
 // ---------------------------------------------------------------------------
-// Lockout key prefixes (design doc §5)
+// Lockout key prefixes
 // ---------------------------------------------------------------------------
 
 /// Per-IP active-lockout flag prefix. Full key:
@@ -167,8 +163,8 @@ struct ApiTokenUsedGate {
 /// failures, mirroring the password-login `LockoutConfig`); a paced
 /// attacker staying just under threshold per window is throttled
 /// rather than locked. The composition root reads operator
-/// overrides from `HORT_PAT_LOCKOUT_*` env vars; that wiring is out of
-/// scope for B5b.
+/// overrides from `HORT_PAT_LOCKOUT_*` env vars; that wiring lives in
+/// the composition root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatLockoutConfig {
     /// Number of failed PAT validations within `window` from one
@@ -185,7 +181,7 @@ pub struct PatLockoutConfig {
 }
 
 impl PatLockoutConfig {
-    /// Design-doc default: 30 misses / 5-min window / 15-min lockout.
+    /// Default: 30 misses / 5-min window / 15-min lockout.
     pub const DEFAULT: Self = Self {
         threshold: 30,
         window: Duration::from_secs(300),
@@ -206,16 +202,15 @@ impl Default for PatLockoutConfig {
 /// Outcome enum for a single PAT validation attempt.
 ///
 /// Each variant maps 1:1 to a `result` label on
-/// `hort_api_token_validation_total` (design doc §9). The middleware in
-/// B5c projects every variant — except `Infrastructure` — to a `401`
-/// response; `Infrastructure` propagates as `500`.
+/// `hort_api_token_validation_total`. The auth middleware projects every
+/// variant — except `Infrastructure` — to a `401` response;
+/// `Infrastructure` propagates as `500`.
 #[derive(Debug, thiserror::Error)]
 pub enum PatValidationError {
     /// Per-IP brute-force lockout flag was set; Argon2 verify was NOT
-    /// called. Maps to `result="rate_limited", cache="miss"` per
-    /// design doc §9 — the catalog explicitly notes lockout decisions
-    /// use `cache="miss"` since they never come from the validation
-    /// cache.
+    /// called. Maps to `result="rate_limited", cache="miss"` — lockout
+    /// decisions use `cache="miss"` since they never come from the
+    /// validation cache.
     #[error("rate limited")]
     RateLimited,
     /// Argon2 verify ran (against the sentinel hash) and returned
@@ -241,8 +236,8 @@ pub enum PatValidationError {
     #[error("user deactivated")]
     UserDeactivated,
     /// Database / ephemeral-store / repository error. Wraps a
-    /// [`DomainError`] verbatim; B5c maps this to the existing
-    /// `AppError::Domain` envelope at the middleware boundary.
+    /// [`DomainError`] verbatim; the auth middleware maps this to the
+    /// existing `AppError::Domain` envelope.
     #[error("infrastructure error: {0}")]
     Infrastructure(#[from] DomainError),
 }
@@ -257,7 +252,7 @@ pub enum PatValidationError {
 /// the in-process [`PatCache`] (concrete `Arc<PatCache>` because the
 /// cache is owned by `hort-app` and the validator is the only writer
 /// — a `dyn` cache port would only buy us decoupling we don't need).
-/// `Arc<dyn Argon2Verifier>` is the swap-point that lets B5b's tests
+/// `Arc<dyn Argon2Verifier>` is the swap-point that lets tests
 /// substitute a counter spy without forcing the production verifier
 /// to run during unit tests.
 pub struct PatValidationUseCase {
@@ -516,11 +511,11 @@ impl PatValidationUseCase {
         // ----------------------------------------------------------------
         let cache_key = compute_cache_key(token_plaintext);
         if let Some(cached) = self.cache.get(&cache_key) {
-            // Mid-cache-TTL freshness re-checks per design §5 step 2.
-            // Negative-result paths bypass `cache.insert` so a hit here
-            // means the entry was once-valid; we only need to revisit
-            // expiry / revocation / deactivation in case any of them
-            // flipped while the entry was warm.
+            // Mid-cache-TTL freshness re-checks: negative-result paths
+            // bypass `cache.insert` so a hit here means the entry was
+            // once-valid; we only need to revisit expiry / revocation /
+            // deactivation in case any of them flipped while the entry
+            // was warm.
             let now = self.clock.now();
             if let Some(exp) = cached.expires_at {
                 if exp <= now {
@@ -535,8 +530,8 @@ impl PatValidationUseCase {
                 return Err(PatValidationError::Revoked);
             }
             // User-deactivation check on cache hit re-resolves the
-            // user row. The LISTEN/NOTIFY path (B5c) is the fast
-            // invalidator; this re-check is the fallback.
+            // user row. Cache invalidation via LISTEN/NOTIFY is the
+            // fast path; this re-check is the fallback.
             let user = self
                 .users
                 .find_by_id(cached.user_id)
@@ -592,8 +587,9 @@ impl PatValidationUseCase {
         if !verify_ok {
             // Distinguish prefix-not-found from hash-mismatch ONLY at
             // the metric / tracing layer; both surface as the same
-            // generic 401 in B5c. The wall-clock cost is identical —
-            // the sentinel branch above ran the same Argon2 cycles.
+            // generic 401 to the caller. The wall-clock cost is
+            // identical — the sentinel branch above ran the same Argon2
+            // cycles.
             self.bookkeep_failure(lockout_keys.as_ref()).await?;
             let metric = if found_token.is_some() {
                 ValidationMetric::HashMismatch
@@ -756,9 +752,8 @@ fn decode_count(b: &[u8]) -> Option<u64> {
 /// All three variants surface to the caller as the same
 /// `PatValidationError::PrefixNotFound` after the sentinel-verify
 /// branch runs — the format-failure shape is structurally
-/// indistinguishable from "no row matched" by design (design doc §5
-/// F14 token-shape note: prefix-shape routing is observable, the body
-/// is not).
+/// indistinguishable from "no row matched" by design (prefix-shape
+/// routing is observable, the body is not).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenFormatError {
     /// Total length not exactly `9 + 32 = 41` bytes.
@@ -829,15 +824,15 @@ pub fn compute_cache_key(token_plaintext: &str) -> CacheKey {
 // Metric emission
 // ---------------------------------------------------------------------------
 
-/// `result` label values on `hort_api_token_validation_total` per
-/// design doc §9. Closed taxonomy — every variant maps to exactly one
-/// catalog row. Adding a variant requires a `docs/metrics-catalog.md`
-/// edit in the same PR.
+/// `result` label values on `hort_api_token_validation_total`.
+/// Closed taxonomy — every variant maps to exactly one catalog row.
+/// Adding a variant requires a `docs/metrics-catalog.md` edit in the
+/// same PR.
 ///
 /// The pair of `Success*` variants encodes the `cache` label too:
 /// `cache="hit"` for [`Self::SuccessHit`], `cache="miss"` for the rest
-/// (per the §9 catalog entry that pins `rate_limited` to `cache="miss"`
-/// because lockout decisions never come from the validation cache).
+/// (`rate_limited` is always `cache="miss"` because lockout decisions
+/// never come from the validation cache).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValidationMetric {
     SuccessHit,
@@ -874,7 +869,7 @@ impl ValidationMetric {
 /// Emit `hort_api_token_validation_total{result, cache}` once per
 /// validation attempt. MUST be the LAST step before returning on
 /// every code path so the increment cannot become a covert timing
-/// oracle (design doc §9).
+/// oracle.
 fn emit_validation_metric(m: ValidationMetric) {
     metrics::counter!(
         "hort_api_token_validation_total",
@@ -917,8 +912,7 @@ fn validation_duration_result_label(
 /// Emit `hort_api_token_validation_duration_seconds{result}` once per
 /// validation attempt. Records the elapsed time of the ENTIRE
 /// validation closure including the constant-time Argon2 verify, the
-/// counter increment, and any cache writes — design doc §9 paragraph
-/// "Metric-emission timing vs constant-time invariant".
+/// counter increment, and any cache writes.
 ///
 /// Default histogram buckets apply (the `metrics` crate exposes them
 /// to the recorder; hort-app does not override them per existing
@@ -1073,7 +1067,7 @@ mod tests {
             _client_ip: Option<&str>,
             _user_agent: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<()>> {
-            unreachable!("update_last_used is the middleware's job (B5c)")
+            unreachable!("update_last_used is the middleware's job")
         }
         fn revoke(&self, _token_id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
             unreachable!("validator does not revoke")
@@ -1383,8 +1377,8 @@ mod tests {
     #[test]
     fn validate_pat_prefix_not_found_calls_verify_exactly_once() {
         // No row planted → sentinel branch. Verify must run exactly
-        // once with the spy verifier (the architectural invariant
-        // from design §8 invariant 1; counter-spy proof).
+        // once with the spy verifier (constant-time-on-prefix-not-found
+        // invariant; counter-spy proof).
         let spy = CountingVerifier::new(false);
         let (uc, _tokens, _users, _store, _cache, _clock) =
             make_uc(spy.clone() as Arc<dyn Argon2Verifier>);
@@ -1881,7 +1875,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Cache-hit revocation/deactivation re-checks (design §5 step 2)
+    // Cache-hit revocation/deactivation re-checks
     // -----------------------------------------------------------------
 
     #[test]
@@ -2113,11 +2107,11 @@ mod tests {
             "success",
         );
         assert_eq!(samples.len(), 1, "histogram MUST record exactly one sample");
-        // The architectural invariant from §9: the histogram is
-        // recorded around the entire closure. If the histogram had
-        // recorded BEFORE the verify, the duration would be ~0 (just
-        // the timer-Start + record overhead). Asserting non-zero
-        // proves the closure body ran past the verify before record.
+        // The histogram is recorded around the entire closure. If the
+        // histogram had recorded BEFORE the verify, the duration would
+        // be ~0 (just the timer-Start + record overhead). Asserting
+        // non-zero proves the closure body ran past the verify before
+        // record.
         assert!(
             samples[0] > 0.0,
             "histogram duration on success path MUST be > 0 (proves the closure ran \
@@ -2157,11 +2151,11 @@ mod tests {
 
     #[test]
     fn validation_duration_records_sample_on_rate_limited() {
-        // Per design doc §9: the histogram is recorded around the
-        // ENTIRE closure on every code path including the lockout
-        // short-circuit. The sample MUST land on result=rate_limited
-        // and MUST be non-zero (the closure walks the ephemeral-store
-        // get + counter-increment before returning).
+        // The histogram is recorded around the ENTIRE closure on every
+        // code path including the lockout short-circuit. The sample
+        // MUST land on result=rate_limited and MUST be non-zero (the
+        // closure walks the ephemeral-store get + counter-increment
+        // before returning).
         let spy = CountingVerifier::new(true);
         let snap = capture_async({
             let spy = spy.clone();
@@ -2199,16 +2193,14 @@ mod tests {
 
     #[test]
     fn validation_duration_nonzero_on_every_code_path() {
-        // Design doc §9: "the histogram is recorded around the entire
-        // validation closure, not just the verify call, so it
-        // includes the metric increment itself — but every code path
-        // increments exactly one counter, so the path lengths are
-        // equal." The architectural invariant: every code path's
-        // histogram sample is > 0, which proves the closure body ran
-        // past the verify (or the deliberate short-circuit) before
-        // the record() call. If a future refactor moved record() to
-        // the front of the closure, the duration would be ~0 and
-        // this test would fail.
+        // The histogram is recorded around the entire validation closure,
+        // not just the verify call, so it includes the metric increment
+        // itself — but every code path increments exactly one counter,
+        // so the path lengths are equal. Every code path's histogram
+        // sample is > 0, which proves the closure body ran past the
+        // verify (or the deliberate short-circuit) before the record()
+        // call. If a future refactor moved record() to the front of the
+        // closure, the duration would be ~0 and this test would fail.
 
         // hash_mismatch
         let spy = CountingVerifier::new(false);
@@ -2447,7 +2439,7 @@ mod tests {
         /// Counter value of `hort_api_token_used_audit_dropped{result}`
         /// in a `metrics_util` snapshot (0 if absent). `DebugValue`
         /// is not `Clone`, so we read the count out by reference —
-        /// same shape as the B5b `snap_value` helper above.
+        /// same shape as the `snap_value` helper above.
         fn dropped_count(
             snap: &[(
                 CompositeKey,

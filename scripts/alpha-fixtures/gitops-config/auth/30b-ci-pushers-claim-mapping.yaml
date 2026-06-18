@@ -2,7 +2,7 @@
 # resolves to the `ci-pusher` scope claim, so a `test-developers`
 # member's resolved claim set is [developer, ci-pusher] — the two-claim
 # subject the PermissionGrants in this directory require to clear the
-# §8.1 `single-claim-grant` rule.
+# `single-claim-grant` rule.
 #
 # Mirrors `deploy/compose/example-config/auth/ci-pushers.yaml`.
 #

@@ -22,7 +22,7 @@
 #      `PermissionGrant kind=User permission=curate` envelope targeting
 #      the admin user's UUID via the existing gitops apply path, then
 #      restores the canonical config tree on EXIT. Justification: the
-#      curator-workflow.md §1.1 grant flow is the only audited path
+#      curator-workflow.md grant flow is the only audited path
 #      (direct DB inserts are forbidden), and "claim-based" grants
 #      against the dev realm's `test-developers` group conflict with the
 #      single-claim-grant linter unless paired with another
@@ -30,8 +30,8 @@
 #      granting curate to a known user UUID. We grant curate to the
 #      `admin` user (which already short-circuits authorize via the
 #      `admin` claim — the grant adds Curate without removing Admin) AND
-#      separately to a `developer` user (Curate-only, used by Scenarios
-#      1-7 + 9 so the assertions distinguish curator-attribution from
+#      separately to a `developer` user (Curate-only, used by several
+#      scenarios so the assertions distinguish curator-attribution from
 #      admin-attribution).
 #
 # Exit-code contract (mirrors test-task-framework.sh + test-rescanning.sh):

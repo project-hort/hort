@@ -90,8 +90,7 @@ pub enum ScanOutcome {
 
 /// Default-policy fallback used when the artifact's repository has no
 /// active policy resolved. Lives next to [`evaluate_scan_result`] for
-/// now — promote to a shared module if Item 8 (curation gate) needs
-/// it too.
+/// now — promote to a shared module if the curation gate needs it too.
 ///
 /// The policy-name for log/audit attribution is "default" — there is
 /// no [`crate::events::PolicyEvaluated::policy_id`] when the default
@@ -148,8 +147,8 @@ impl DefaultPolicy {
     /// no resolved `ScanPolicy` is held for 24 hours while the scan
     /// pipeline runs. The window starts at the immutable ingest-time
     /// anchor stamped on the artifact; the live deadline is computed
-    /// via [`effective_quarantine_deadline`] (§2.5 — anchor is
-    /// persisted, deadline is never persisted).
+    /// via [`effective_quarantine_deadline`] — the anchor is persisted,
+    /// the deadline is never persisted.
     ///
     /// Operators who want a different window declare a `ScanPolicy`
     /// with `quarantineDuration: <secs>`; operators who want
@@ -446,8 +445,7 @@ mod tests {
 
     #[test]
     fn effective_quarantine_deadline_adds_duration_to_anchor() {
-        // §2.5 — the deadline is `window_start + duration`, computed
-        // live, never stored.
+        // The deadline is `window_start + duration`, computed live, never stored.
         let anchor = ts(1_000_000);
         let deadline = effective_quarantine_deadline(anchor, chrono::Duration::hours(24));
         assert_eq!(deadline, ts(1_000_000 + 24 * 3600));
@@ -681,7 +679,7 @@ mod tests {
 
     #[test]
     fn empty_license_policy_object_is_skipped_no_warn_violation() {
-        // Per backlog: `Value::Null` and empty object both mean
+        // `Value::Null` and empty object both mean
         // "no license policy" and the license evaluator must not be
         // called. This guards against the `license::evaluate_license_policy`
         // empty-object path returning `(vec![], Warn)` and accidentally

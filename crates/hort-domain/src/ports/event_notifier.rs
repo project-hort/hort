@@ -105,19 +105,18 @@ pub enum NotifyFailureReason {
 
 /// Best-effort delivery of newly-appended events to one subscription's target.
 ///
-/// Per design §7 + §11 invariant 1, implementations MUST NOT retry, MUST NOT
-/// buffer, and MUST NOT block the caller on downstream unavailability. The
-/// dispatcher records failures and moves on; consumers reconcile via pull
-/// (design §9, `GET /api/v1/events`).
+/// Implementations MUST NOT retry, MUST NOT buffer, and MUST NOT block the
+/// caller on downstream unavailability. The dispatcher records failures and
+/// moves on; consumers reconcile via pull (`GET /api/v1/events`).
 pub trait EventNotifier: Send + Sync {
     /// Dispatch one batch of events to one subscription's target.
     ///
     /// The `subscription_id` is threaded through so adapters that surface
     /// the id on the wire (webhook `X-Ak-Subscription-Id` header + JSON
-    /// body `subscription_id` field per design doc §8; NATS JetStream
-    /// JSON body `subscription_id` field) do not need to ferry it via a
-    /// separate channel. Adapters that do not need it (test stubs,
-    /// future fire-and-forget transports) ignore the parameter.
+    /// body `subscription_id` field; NATS JetStream JSON body
+    /// `subscription_id` field) do not need to ferry it via a separate
+    /// channel. Adapters that do not need it (test stubs, future
+    /// fire-and-forget transports) ignore the parameter.
     ///
     /// Returns [`NotifyOutcome`] for observability. The dispatcher does not
     /// branch on the variant beyond updating metrics + the failure-budget

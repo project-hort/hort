@@ -135,8 +135,8 @@ fail-closed — the proxy stays available on upstream flakiness).
 > `.sig`) is **not** verified: it yields `no_attestation` (allowed under
 > `verify_if_present`; rejected `Unsigned` under `required`). This is a
 > real, named limitation — reconstructing a v0.3 bundle from the legacy
-> `.sig` annotations is explicitly out of scope (design
-> `080-...` §7). A `verified` verdict requires the upstream to publish a
+> `.sig` annotations is explicitly out of scope. A `verified` verdict
+> requires the upstream to publish a
 > v0.3 bundle.
 
 ```yaml
@@ -187,7 +187,7 @@ upstream signature when present and emits `ProvenanceRejected{Unsigned}`
 (terminal) when the upstream genuinely ships no Sigstore v0.3 bundle —
 which is exactly what `required` asks for. There is **no** apply-time
 "reject `required` on a proxy" guard: now that the fetch capability ships,
-the mode is correct on a proxy, not a footgun (design `080-...` §3.5). An
+the mode is correct on a proxy, not a footgun. An
 image carrying only a legacy `simplesigning` signature is **not** verified
 (see the limitation above) and is therefore rejected `Unsigned` under
 `required`.
@@ -224,7 +224,7 @@ that is a *pure* Sigstore-bundle referrer (a `subject` plus layers that are
 with status `None`: immediately servable, never scanned, and with no
 self-referential provenance job. So `cosign verify $HORT/image` against a
 hosted repo works **on day one** — there is no 24h quarantine wait for the
-signature (design `080-...` §3.4b).
+signature.
 
 This exemption is **narrow and safe**: a *mixed* manifest (a bundle layer
 **plus** a runnable `tar+gzip` layer) does **not** match the
@@ -306,8 +306,7 @@ Why this is structured as one knob, not two:
   unauthenticated. The `repository` metric labels carry repo names, so a
   world-reachable worker `/metrics` is a minor info-leak + cardinality
   surface. The **NetworkPolicy is the access control** that replaces
-  per-request auth (the standard pod-metrics pattern; design `080-...`
-  §3.6).
+  per-request auth (the standard pod-metrics pattern).
 - **The default-on server NetworkPolicy already DENIES this port.** With
   `networkPolicy.enabled: true` (the chart default), the shipped app-pod
   policy selects the worker pods too and renders a deny-all-ingress — so the
@@ -321,7 +320,7 @@ Why this is structured as one knob, not two:
   renders no listener, no container port, and no NetworkPolicy. A malformed
   bind is a **loud boot-path config error**, never a silent fallback.
 
-> If you run with `networkPolicy.enabled: false` (the F-33 escape hatch),
+> If you run with `networkPolicy.enabled: false` (the documented escape hatch),
 > the worker NetworkPolicy is **not** rendered and the server policy's
 > deny-all is also gone — you then own the metrics port's reachability via
 > your own L3/L4 or mesh controls.

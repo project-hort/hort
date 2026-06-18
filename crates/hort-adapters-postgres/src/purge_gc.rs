@@ -1,12 +1,11 @@
 //! PostgreSQL adapter for [`PurgeGcPort`] — the storage-GC walk
 //! (`PurgeUseCase::process_expired`, ADR 0020 §4 + §5).
 //!
-//! Runs the §5 algorithm against the eventually-authoritative
+//! Runs the refcount-GC algorithm against the eventually-authoritative
 //! `content_references` refcount projection (safe only behind the
-//! Item-B3.5 `RefcountReconcileUseCase` convergence gate the use case
+//! `RefcountReconcileUseCase` convergence gate the use case
 //! enforces — see the port module docs
-//! (`hort-domain/src/ports/purge_gc.rs`) and §3 G1 ¶5 / §5 F-26 for the
-//! posture this consumes).
+//! (`hort-domain/src/ports/purge_gc.rs`) for the posture this consumes).
 //!
 //! Purely additive: a brand-new adapter for a brand-new (additive)
 //! port. No existing adapter or port signature is touched. The
@@ -18,13 +17,13 @@
 //!
 //! Every artifact whose stream (`stream_id = 'artifact-' || a.id`) has
 //! an `ArtifactExpired` event and **no** `ArtifactPurged` event — the
-//! §5 "pending purge" work set. `quarantine_status ∈ {quarantined,
-//! rejected, scan_indeterminate}` is excluded (§6 invariant 1 —
-//! evidence is GC-protected); the use case re-asserts the same
-//! invariant defence-in-depth, but the adapter never hands a protected
-//! artifact to the destructive path in the first place.
+//! pending purge work set. `quarantine_status ∈ {quarantined,
+//! rejected, scan_indeterminate}` is excluded (evidence is
+//! GC-protected); the use case re-asserts the same invariant
+//! defence-in-depth, but the adapter never hands a protected artifact
+//! to the destructive path in the first place.
 //!
-//! # `purge_artifact_refs` — §5 steps 1–3 in one committed tx
+//! # `purge_artifact_refs` — three steps in one committed tx
 //!
 //! 1. `SELECT … FROM artifacts WHERE id = $1 FOR UPDATE` — lock the
 //!    artifact row so a concurrent ingest/promote cannot race the
@@ -47,8 +46,7 @@
 //! `artifacts.checksum_sha256` (locked in step 1) and
 //! `artifact_metadata.metadata_blob` — and the now-stable cross-`kind`
 //! count is recomputed, so the retry still yields the decisions the
-//! use case needs to finish the purge (two-stage idempotency, §6
-//! invariant 4).
+//! use case needs to finish the purge.
 //!
 //! `metadata_blob` is stored as `character(64)` (blank-padded) on
 //! `artifact_metadata`; it is trimmed at the boundary before parsing,
@@ -91,7 +89,7 @@ struct PendingRow {
     quarantine_status: Option<String>,
 }
 
-/// One `(target_content_hash, kind)` row removed by the §5 step-2
+/// One `(target_content_hash, kind)` row removed by the step-2
 /// `DELETE … RETURNING`, or recovered from the authoritative columns
 /// on an idempotent retry.
 #[derive(Debug, FromRow)]
@@ -100,10 +98,10 @@ struct DeletedRefRow {
 }
 
 /// Map the persisted `artifacts.quarantine_status` text to the domain
-/// [`QuarantineStatus`]. The §6-invariant-1 protected set is filtered
-/// in SQL, so any value the use case re-checks must round-trip; an
-/// unknown value is a data-integrity error rather than a silent
-/// mis-classification of a destructive decision.
+/// [`QuarantineStatus`]. The GC-protected set is filtered in SQL, so
+/// any value the use case re-checks must round-trip; an unknown value
+/// is a data-integrity error rather than a silent mis-classification of
+/// a destructive decision.
 fn map_status(raw: Option<&str>) -> DomainResult<QuarantineStatus> {
     match raw {
         // `unscanned` / `clean` / `flagged` are non-terminal scan
@@ -133,9 +131,9 @@ fn parse_hash(raw: &str, ctx: &str) -> DomainResult<ContentHash> {
 }
 
 impl PgPurgeGcPort {
-    /// §5 step 3: cross-`kind` remaining `content_references` count for
-    /// one hash, run inside the open transaction so it observes the
-    /// step-2 `DELETE`. Counts **every** kind (incl. `oci_subject`).
+    /// Cross-`kind` remaining `content_references` count for one hash,
+    /// run inside the open transaction so it observes the step-2
+    /// `DELETE`. Counts **every** kind (incl. `oci_subject`).
     async fn remaining_refs(
         tx: &mut Transaction<'_, Postgres>,
         hash: &ContentHash,
@@ -158,9 +156,9 @@ impl PurgeGcPort for PgPurgeGcPort {
             // (`StreamId::Display`). The pending-purge set is every
             // artifact whose stream has an `ArtifactExpired` and no
             // `ArtifactPurged`. Protected quarantine states are
-            // excluded here (§6 invariant 1) — the destructive path is
-            // never even offered an evidence artifact; the use case
-            // re-asserts the same filter defence-in-depth.
+            // excluded here (GC-protected invariant) — the destructive
+            // path is never even offered an evidence artifact; the use
+            // case re-asserts the same filter defence-in-depth.
             let rows: Vec<PendingRow> = sqlx::query_as(
                 r#"
                 SELECT a.id                AS artifact_id,
@@ -206,7 +204,7 @@ impl PurgeGcPort for PgPurgeGcPort {
                 DomainError::Invariant(format!("purge_gc purge_artifact_refs begin: {e}"))
             })?;
 
-            // -- §5 step 1: lock the artifact row FOR UPDATE ----------
+            // -- Step 1: lock the artifact row FOR UPDATE -------------
             //
             // Also yields the authoritative `checksum_sha256` for the
             // idempotent-retry recovery path. A missing row means the
@@ -227,7 +225,7 @@ impl PurgeGcPort for PgPurgeGcPort {
                 return Ok(Vec::new());
             };
 
-            // -- §5 step 2: DELETE this artifact's own refs -----------
+            // -- Step 2: DELETE this artifact's own refs --------------
             let deleted: Vec<DeletedRefRow> = sqlx::query_as(
                 r#"
                 DELETE FROM content_references
@@ -279,7 +277,7 @@ impl PurgeGcPort for PgPurgeGcPort {
                 }
             }
 
-            // -- §5 step 3: cross-`kind` remaining count per hash -----
+            // -- Step 3: cross-`kind` remaining count per hash --------
             let mut out = Vec::with_capacity(hashes.len());
             for hash in hashes.into_values() {
                 let refs_remaining = Self::remaining_refs(&mut tx, &hash).await?;
@@ -289,7 +287,7 @@ impl PurgeGcPort for PgPurgeGcPort {
                 });
             }
 
-            // -- §5 step 4: commit ------------------------------------
+            // -- Step 4: commit ---------------------------------------
             tx.commit().await.map_err(|e| {
                 DomainError::Invariant(format!("purge_gc purge_artifact_refs commit: {e}"))
             })?;
@@ -479,8 +477,8 @@ mod tests {
     }
 
     /// Append a minimal artifact-stream event. `prev`/`event_hash` are
-    /// 32-byte fillers — these tests exercise the §5 GC SQL, not the
-    /// F-2 chain verifier, so any 32-byte value satisfies the width
+    /// 32-byte fillers — these tests exercise the GC SQL, not the
+    /// chain verifier, so any 32-byte value satisfies the width
     /// CHECK. `stream_position` is supplied by the caller.
     async fn append_event(pool: &PgPool, artifact: Uuid, event_type: &str, stream_position: i64) {
         sqlx::query(
@@ -531,8 +529,8 @@ mod tests {
     }
 
     /// The pending set includes an artifact with `ArtifactExpired` and
-    /// no `ArtifactPurged`, and EXCLUDES the §6-invariant-1 protected
-    /// states even when they have a pending `ArtifactExpired`.
+    /// no `ArtifactPurged`, and EXCLUDES GC-protected quarantine states
+    /// even when they have a pending `ArtifactExpired`.
     #[tokio::test]
     #[serial(hort_pg_db)]
     #[ignore = "requires DATABASE_URL"]

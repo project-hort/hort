@@ -701,7 +701,7 @@ mod tests {
         assert_eq!(token.len(), 41);
         assert_eq!(v["kind"], "pat");
         assert!(v["expires_at"].is_string());
-        // F5: design doc §4 requires `name` on the issuance response.
+        // `name` is required on the issuance response.
         // The request body sets `"name":"ci"`; the response echoes it.
         assert_eq!(v["name"], "ci");
         // Inserted into mock repo.

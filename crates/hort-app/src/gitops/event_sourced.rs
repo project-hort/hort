@@ -8,22 +8,22 @@
 //! - perform no I/O (no event-store, no projection-repo, no tracing
 //!   spans),
 //! - never attach an [`hort_domain::events::Actor`] — the apply pipeline
-//!   (Item 14b-9) wraps the events with the [`hort_domain::events::Actor::GitOps`]
+//!   wraps the events with the [`hort_domain::events::Actor::GitOps`]
 //!   actor when it routes them through the event store,
 //! - never write to the projection — the use case that consumes the
 //!   events is responsible for projection upsert.
 //!
-//! ## Design-doc anchors
+//! ## Design anchors
 //!
 //! Idempotency: re-applying the same YAML must produce zero events.
-//! Strict-atomic: §3.5 — the trait emits events; transactional ordering
-//! across streams is the pipeline's concern.
+//! Strict-atomic: the trait emits events; transactional ordering across
+//! streams is the pipeline's concern.
 //!
 //! ## Scope of the trait
 //!
 //! The trait covers the "given desired + projection, what events?"
 //! direction only. The "desired absent → archive" branch lives in the
-//! pipeline (Item 14b-9), which calls [`crate::use_cases::PolicyUseCase::archive_policy`]
+//! pipeline, which calls [`crate::use_cases::PolicyUseCase::archive_policy`]
 //! directly when the projection exists but no envelope was declared.
 //! Putting archive emission inside the trait would force every call
 //! site to thread an `Option<&Envelope<Spec>>`, which collapses the
@@ -37,9 +37,8 @@
 //!   payload before constructing the [`hort_domain::events::StreamId::policy`]
 //!   for the append. This mirrors how
 //!   [`crate::use_cases::PolicyUseCase::create_policy`] already mints
-//!   server-side and keeps the trait signature exactly as the design
-//!   doc §3.3 specifies (`fn diff(&self, desired, projection)` — no
-//!   extra context parameter).
+//!   server-side and keeps the trait signature as `fn diff(&self,
+//!   desired, projection)` — no extra context parameter.
 //! - **Exclusion id minting (`ExclusionAdded`):** [`ExclusionsApplier`]
 //!   carries the parent `policy_id` as a struct field — the pipeline
 //!   constructs one applier per parent policy (it already knows the id
@@ -90,9 +89,8 @@ use hort_domain::events::{
 /// - perform I/O.
 ///
 /// The trait does **not** handle the "desired absent, projection
-/// exists" archive branch — that lives in the apply pipeline (Item
-/// 14b-9), which calls
-/// [`crate::use_cases::PolicyUseCase::archive_policy`] directly.
+/// exists" archive branch — that lives in the apply pipeline, which
+/// calls [`crate::use_cases::PolicyUseCase::archive_policy`] directly.
 pub trait ApplyEventSourcedKind: Send + Sync {
     type Spec;
     type Projection;
@@ -177,9 +175,9 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
     /// [`crate::use_cases::PolicyUseCase::create_policy`], which mints
     /// the `policy_id` itself — so this applier is consulted only on
     /// the update path where a projection already exists. The `None`
-    /// branch is retained as part of the trait's contract per the
-    /// design doc §3.4 and may become reachable from a future caller
-    /// that wants the bare event vec without the use-case wrapping.
+    /// branch is retained as part of the trait's contract and may become
+    /// reachable from a future caller that wants the bare event vec
+    /// without the use-case wrapping.
     fn diff(
         &self,
         desired: &Envelope<ScanPolicySpec>,
@@ -1021,7 +1019,7 @@ mod tests {
         let mut spec = baseline_spec();
         spec.provenance_mode = "required".into();
         // Required needs identities to be a valid policy, but the diff
-        // path only computes change events — apply-time linting is Item 5.
+        // path only computes change events — apply-time linting is a separate concern.
         spec.provenance_identities = vec![SignerIdentitySpec {
             issuer: "iss".into(),
             san: "san".into(),

@@ -86,8 +86,8 @@ pub struct ServiceAccountSpec {
 /// One federation trust relationship.
 ///
 /// `claims` is `BTreeMap` — wire shape matches the domain entity's
-/// `BTreeMap<String, String>` (Item 1), and the order-stable
-/// serialisation simplifies the apply-pass digest.
+/// `BTreeMap<String, String>`, and the order-stable serialisation
+/// simplifies the apply-pass digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FederatedIdentitySpec {
@@ -255,7 +255,7 @@ pub fn validate_service_account(env: &Envelope<ServiceAccountSpec>) -> Vec<Valid
 }
 
 // ---------------------------------------------------------------------------
-// Under-constrained federated-issuer warning (audit F-7)
+// Under-constrained federated-issuer warning
 // ---------------------------------------------------------------------------
 
 /// Claim keys that, on a GitHub/GitLab-Actions-shaped issuer, identify
@@ -268,7 +268,7 @@ const REPO_SCOPE_ONLY_CLAIMS: &[&str] = &["repository", "project_path"];
 /// Claim keys that discriminate *which* workflow run / branch /
 /// environment / relying party the token was minted for. At least one
 /// (or an explicit `aud`) must accompany a repo-scope claim for the
-/// trust policy to be meaningfully narrow (audit F-7 recommendation).
+/// trust policy to be meaningfully narrow.
 const DISCRIMINATING_CLAIMS: &[&str] = &["ref", "environment", "workflow", "aud"];
 
 /// One under-constrained `federatedIdentities[]` entry. The boot
@@ -290,8 +290,8 @@ pub struct UnderConstrainedFederatedIdentity {
     pub message: String,
 }
 
-/// Detect under-constrained `federatedIdentities[]` entries (audit
-/// F-7). Two distinct, mutually-exclusive warning classes:
+/// Detect under-constrained `federatedIdentities[]` entries.
+/// Two distinct, mutually-exclusive warning classes:
 ///
 /// 1. **Repo-scope without discriminator**: the FI names a
 ///    `repository`/`project_path` but pins no discriminating
@@ -341,7 +341,7 @@ pub fn detect_under_constrained_federated_identities(
                          no scope-narrowing claim (no repo/project + no \
                          ref/environment/workflow/aud) — any JWT from this issuer matching the \
                          declared sub can assume this identity. Add a scope-narrowing claim or \
-                         pin `aud` (audit F-7, Jun-02 residual).",
+                         pin `aud`.",
                         env.metadata.name, fi.issuer
                     ),
                 });
@@ -361,7 +361,7 @@ pub fn detect_under_constrained_federated_identities(
                 "ServiceAccount `{}` federatedIdentities[{idx}] (issuer `{}`) constrains only \
                  a repository/project claim without a discriminating ref/environment/workflow/aud \
                  — any workflow in that repo can assume this identity. Add a discriminating \
-                 claim (e.g. `ref`, `environment`, `workflow`) or pin `aud` (audit F-7).",
+                 claim (e.g. `ref`, `environment`, `workflow`) or pin `aud`.",
                 env.metadata.name, fi.issuer
             ),
         });
@@ -751,7 +751,7 @@ mod tests {
         );
     }
 
-    // -- Under-constrained-issuer warning (audit F-7) --
+    // -- Under-constrained-issuer warning --
 
     #[test]
     fn under_constrained_warning_fires_on_repo_only_fi() {
@@ -777,8 +777,8 @@ mod tests {
         assert_eq!(findings[0].issuer, "github-actions");
         assert_eq!(findings[0].service_account, "ci-loose");
         assert!(
-            findings[0].message.contains("F-7") && findings[0].message.contains("discriminating"),
-            "message must explain the F-7 risk, got: {:?}",
+            findings[0].message.contains("discriminating"),
+            "message must explain the discriminating-claim risk, got: {:?}",
             findings[0].message
         );
     }
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn under_constrained_warning_silent_when_aud_pins_it() {
-        // repository + aud ⇒ the F-7-recommended discriminator ⇒ silent.
+        // repository + aud ⇒ a discriminating claim ⇒ silent.
         let body = "
   role: developer
   repositories: [pypi-internal]
@@ -845,9 +845,8 @@ mod tests {
         assert_eq!(findings[0].issuer, "github-actions");
         assert_eq!(findings[0].service_account, "ci-sub");
         assert!(
-            findings[0].message.contains("no scope-narrowing claim")
-                && findings[0].message.contains("(audit F-7, Jun-02 residual)"),
-            "message must describe the sub-only F-7 residual + carry the greppable tag, got: {:?}",
+            findings[0].message.contains("no scope-narrowing claim"),
+            "message must describe the sub-only no-scope-narrowing risk, got: {:?}",
             findings[0].message
         );
     }
@@ -856,8 +855,9 @@ mod tests {
     fn under_constrained_repo_only_class_fires_its_original_warning() {
         // (test b) The EXISTING class — a repo-scope claim with no
         // discriminator — must STILL fire its original warning (no
-        // regression). The original message ends in `(audit F-7).`,
-        // NOT the Jun-02 residual tag.
+        // regression). The class-1 message is the "constrains only a
+        // repository/project claim" shape, distinct from the sub-only
+        // class-2 "no scope-narrowing claim" message.
         let body = "
   role: developer
   repositories: [pypi-internal]
@@ -875,7 +875,7 @@ mod tests {
         );
         assert!(
             findings[0].message.contains("discriminating")
-                && !findings[0].message.contains("Jun-02 residual"),
+                && !findings[0].message.contains("no scope-narrowing claim"),
             "must be the EXISTING repo-only-without-discriminator message, got: {:?}",
             findings[0].message
         );

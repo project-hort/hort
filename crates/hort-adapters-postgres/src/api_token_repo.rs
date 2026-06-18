@@ -3,10 +3,10 @@
 //! Implements ADR 0012 §3 (schema), §4 (issuance), §5 (validator path +
 //! multi-replica revocation invalidation via `LISTEN/NOTIFY`).
 //!
-//! # GDPR data minimisation (Item B4 acceptance bullet 4)
+//! # GDPR data minimisation
 //!
 //! [`PgApiTokenRepository::update_last_used`] is the sole writer of the
-//! `last_used_*` columns. Per design doc §3 last_used retention paragraph:
+//! `last_used_*` columns. `last_used` retention:
 //!
 //! - The `last_used_ip` column is **bucketed at adapter write** —
 //!   `/24` for IPv4, `/48` for IPv6 — by funnelling through
@@ -15,7 +15,7 @@
 //!   write. Truncation respects UTF-8 boundaries: a multi-byte char that
 //!   straddles the 256-byte boundary is dropped wholly rather than split.
 //! - Inputs that fail to parse as `std::net::IpAddr` are stored verbatim
-//!   — the validator (B5) is the upstream filter; this adapter MUST NOT
+//!   — the upstream filter rejects malformed input; this adapter MUST NOT
 //!   crash on malformed input.
 //!
 //! # Multi-replica revocation invalidation
@@ -23,7 +23,7 @@
 //! [`PgApiTokenRepository::revoke`] emits
 //! `NOTIFY api_token_revocation, '<token_id>'` inside the same transaction
 //! as the `UPDATE api_tokens SET revoked_at = NOW()`. Every replica
-//! `LISTEN`s on this channel from B5; the in-transaction emission means
+//! `LISTEN`s on this channel; the in-transaction emission means
 //! cache drops cannot race ahead of the revocation row's visibility.
 
 use chrono::{DateTime, Utc};
@@ -40,8 +40,8 @@ use crate::{map_sqlx_error, BoxFuture};
 
 /// Cap on the persisted `last_used_user_agent` length.
 ///
-/// Design doc §3 last_used retention paragraph: UA strings longer than
-/// 256 chars are common fingerprinting signals and are not
+/// UA strings longer than 256 chars are common fingerprinting signals
+/// and are not
 /// security-useful; persist the prefix only.
 pub(crate) const USER_AGENT_MAX_BYTES: usize = 256;
 
@@ -75,7 +75,7 @@ const SELECT_COLS: &str = r#"
 /// Bucket a raw client-IP string for the `last_used_ip` column.
 ///
 /// Strings that fail to parse as [`std::net::IpAddr`] round-trip
-/// unchanged — the upstream validator (B5) is the layer that rejects
+/// unchanged — the upstream validator is the layer that rejects
 /// malformed input; this adapter is best-effort and MUST NOT crash on a
 /// bad string. Strings that DO parse are funnelled through
 /// `hort_app::metrics::client_ip_bucket` (`/24` IPv4, `/48` IPv6) — the
@@ -179,7 +179,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
     fn find_by_prefix(&self, prefix: &str) -> BoxFuture<'_, DomainResult<Option<ApiToken>>> {
         let prefix = prefix.to_string();
         Box::pin(async move {
-            // Per §9 observability: prefix lookups are debug-level only,
+            // Prefix lookups are debug-level only,
             // and miss is NOT a warn (no token-shape oracle in logs).
             tracing::debug!(entity = "ApiToken", "find_by_prefix");
             let sql =
@@ -290,10 +290,9 @@ impl ApiTokenRepository for PgApiTokenRepository {
 
             // Run the UPDATE and the NOTIFY inside the same transaction so
             // listeners on `api_token_revocation` cannot observe the
-            // invalidation BEFORE the `revoked_at` row is visible. (B5
-            // wires the LISTEN side; the in-tx NOTIFY is B4's
-            // multi-replica-cache-invalidation contribution per design
-            // doc §5.)
+            // invalidation BEFORE the `revoked_at` row is visible. The
+            // multi-replica cache invalidation relies on the LISTEN side
+            // wiring in the revocation listener.
             let mut tx = self
                 .pool
                 .begin()
@@ -339,8 +338,7 @@ mod tests {
     // Pure tests — no database required.
     // -----------------------------------------------------------------------
 
-    /// IPv4 `203.0.113.42` buckets to `203.0.113.0/24` per the §3
-    /// last_used retention paragraph (acceptance bullet 4 sub-bullet a).
+    /// IPv4 `203.0.113.42` buckets to `203.0.113.0/24`.
     #[test]
     fn bucket_or_passthrough_ip_v4_truncates_to_24() {
         assert_eq!(bucket_or_passthrough_ip("203.0.113.42"), "203.0.113.0/24");

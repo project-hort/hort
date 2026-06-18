@@ -1064,13 +1064,13 @@ pub struct MockRepositoryRepository {
     /// the apply use case only needs whole-membership-set semantics
     /// (compute the diff between declared and current).
     virtual_members: Mutex<HashMap<Uuid, Vec<Uuid>>>,
-    /// Item 8 also asserts call ordering — the in-mock counters let
+    /// Call ordering is also asserted by tests — the in-mock counters let
     /// tests confirm "save_managed was called before
     /// add_virtual_member" without needing a separate spy crate.
     /// `Mutex<Vec<...>>` records every event in order.
     pub call_log: Mutex<Vec<MockCall>>,
-    /// One-shot failure injection for `save_managed`. Used by Item 8
-    /// to verify strict-atomic abort: if the second managed write
+    /// One-shot failure injection for `save_managed`. Used to
+    /// verify strict-atomic abort: if the second managed write
     /// fails, the first one is NOT rolled back (no rollback in v1)
     /// but the use case still returns Err.
     next_save_managed_error: Mutex<Option<DomainError>>,
@@ -1111,7 +1111,7 @@ impl MockRepositoryRepository {
         *self.next_find_by_key_error.lock().unwrap() = Some(err);
     }
 
-    /// Seed a managed virtual-member edge. Used by Item 8 tests that
+    /// Seed a managed virtual-member edge. Used by tests that
     /// start from a non-empty membership set.
     pub fn seed_virtual_member(&self, virtual_id: Uuid, member_id: Uuid) {
         self.virtual_members
@@ -1174,13 +1174,12 @@ impl RepositoryRepository for MockRepositoryRepository {
         page: PageRequest,
         search: Option<&str>,
     ) -> BoxFut<'_, DomainResult<Page<Repository>>> {
-        // Item 8: the OCI global-catalog handler enumerates
-        // all repositories via this method and filters by visibility
-        // downstream. Returning an empty page silently hid every repo
-        // from the catalog output, which was fine while no test
-        // depended on `list` — now Item 8's tests do. Implement the
-        // same shape as the Postgres adapter: substring match on
-        // `key`, alphabetical by `key`, `offset`/`limit` paginated.
+        // The OCI global-catalog handler enumerates all repositories via
+        // this method and filters by visibility downstream. Returning an
+        // empty page silently hid every repo from the catalog output, which
+        // was fine while no test depended on `list`. Implement the same
+        // shape as the Postgres adapter: substring match on `key`,
+        // alphabetical by `key`, `offset`/`limit` paginated.
         let search = search.unwrap_or("").to_string();
         let all = self.repositories.lock().unwrap();
         let mut filtered: Vec<Repository> = all
@@ -1197,10 +1196,10 @@ impl RepositoryRepository for MockRepositoryRepository {
     }
 
     fn save(&self, repository: &Repository) -> BoxFut<'_, DomainResult<()>> {
-        // Item 8 tests assert the public CRUD path is NOT touched by
-        // the apply pipeline. Recording the call lets a test confirm
-        // "save was never called during apply" rather than relying on
-        // state-equality, which can pass for the wrong reason.
+        // Tests assert the public CRUD path is NOT touched by the apply
+        // pipeline. Recording the call lets a test confirm "save was never
+        // called during apply" rather than relying on state-equality, which
+        // can pass for the wrong reason.
         self.call_log
             .lock()
             .unwrap()
@@ -1792,7 +1791,7 @@ impl MockEventStore {
     /// pointer matches the target after the page that yielded that
     /// event. The mock returns one event (the trigger), the sweep
     /// processes it, advances `from`, then the next page fails once
-    /// and is consumed from the queue. This shape lets Item 8 tests
+    /// and is consumed from the queue. This shape lets tests
     /// seed 3 events where the middle event's post-read fails; events
     /// 1 and 3 still flow through.
     pub fn inject_category_error_after_global_position(&self, trigger_after_global_position: u64) {
@@ -1906,9 +1905,9 @@ impl EventStore for MockEventStore {
 /// Records each `commit_transition` call and applies the artifact save
 /// to a shared `MockArtifactRepository` so assertions can inspect final state.
 ///
-/// The recorded tuple carries the optional `ArtifactMetadata` too —
-/// Item 2 adds tests that inspect it. Existing tests destructure with
-/// `(artifact, events, _)` or read the first two tuple fields directly.
+/// The recorded tuple carries the optional `ArtifactMetadata` too.
+/// Existing tests destructure with `(artifact, events, _)` or read
+/// the first two tuple fields directly.
 pub struct MockArtifactLifecycle {
     transitions: Mutex<Vec<(Artifact, AppendEvents, Option<ArtifactMetadata>)>>,
     artifacts: Arc<MockArtifactRepository>,
@@ -2015,7 +2014,7 @@ impl MockArtifactLifecycle {
 
     /// Every `commit_scan_result` call's
     /// `(artifact_id, last_scan_at)` pair, in call order. Tests
-    /// asserting the §3.6a denorm write happened use this snapshot.
+    /// asserting the denorm write happened use this snapshot.
     pub fn last_scan_at_writes(&self) -> Vec<(Uuid, DateTime<Utc>)> {
         self.last_scan_at_writes.lock().unwrap().clone()
     }
@@ -4132,7 +4131,7 @@ impl RepositoryUpstreamMappingRepository for MockRepositoryUpstreamMappingReposi
         // Mirror the adapter's "id stays stable across upsert" rule —
         // when a row already exists at the (repo, prefix) key, keep
         // its id and bump only the mutable fields. The cache-
-        // invalidation contract in Item 9 relies on this.
+        // invalidation contract relies on this.
         let key = (mapping.repository_id, mapping.path_prefix.clone());
         let mut guard = self.entries.lock().unwrap();
         if let Some(existing) = guard.get(&key) {
@@ -4221,8 +4220,7 @@ impl RepositoryUpstreamMappingRepository for MockRepositoryUpstreamMappingReposi
 }
 
 // ---------------------------------------------------------------------------
-// MockUpstreamResolver — synchronous static-table mock for Initiative
-// 11 Item 9.
+// MockUpstreamResolver — synchronous static-table mock.
 // ---------------------------------------------------------------------------
 
 /// In-memory mock for [`UpstreamResolver`]. Holds a list of mappings
@@ -4497,7 +4495,7 @@ impl MockUpstreamProxy {
 
     /// Seed the referrer descriptors returned by
     /// [`UpstreamProxy::fetch_referrers`] for `(path_prefix,
-    /// upstream_name, digest)`. Item 4's proxy-provenance test seeds a
+    /// upstream_name, digest)`. Proxy-provenance tests seed a
     /// Sigstore-bundle referrer here; an unseeded key inherits the
     /// empty default (no upstream signature).
     pub fn insert_referrers(
@@ -4583,16 +4581,15 @@ impl UpstreamProxy for MockUpstreamProxy {
     ) -> BoxFuture<'_, DomainResult<ManifestFetchOutcome>> {
         // The mock keys on (path_prefix, upstream_name, reference)
         // and ignores Accept — production tests don't currently
-        // assert on Accept negotiation. Init 11-ext Item 1 added
-        // the parameter for the real adapter; mocks accept it for
-        // signature conformance.
+        // assert on Accept negotiation. Mocks accept the parameter
+        // for signature conformance with the real adapter.
         //
         // Fixtures are still seeded as `ManifestFetch`
         // for back-compat with every test in the workspace; the mock
         // shape-converts to the new `ManifestFetchOutcome` here,
         // writing the body to a tempfile so consumers can stream it
         // (the OCI manifest pull-through opens `cache_handle.path`
-        // directly; `manifest_body_bytes` was retired in the §7 sibling).
+        // directly; `manifest_body_bytes` was retired in favour of streaming).
         let injected = self.next_manifest_error.lock().unwrap().take();
         // One-shot "no cached body" outcome.
         // Consumed before the fixture lookup so it dominates.
@@ -4823,7 +4820,7 @@ impl crate::ports::upstream_metadata::UpstreamMetadataPort for MockUpstreamMetad
             .cloned();
         Box::pin(async move {
             // Unseeded `format` → production OCI / unknown-format
-            // short-circuit (§8). The default policy is critical for
+            // short-circuit. The default policy is critical for
             // tests that want to assert the OCI rejection without
             // having to seed the "negative" case.
             response.unwrap_or(Err(UpstreamFetchError::UnsupportedFormat))
@@ -5341,8 +5338,7 @@ impl MockJobsRepository {
     /// Recorded `idempotency_key` arguments
     /// from `enqueue_task` calls, in lock-step with [`enqueue_calls`].
     /// Each entry is `Some(_)` when the caller passed a key (the
-    /// destructive-kind path in Item 2) or `None` for the
-    /// non-destructive path.
+    /// destructive-kind path) or `None` for the non-destructive path.
     pub fn enqueue_idem_keys(&self) -> Vec<Option<hort_domain::types::IdempotencyKey>> {
         self.enqueue_idem_keys.lock().unwrap().clone()
     }
@@ -5956,7 +5952,7 @@ impl ServiceAccountRepository for MockServiceAccountRepository {
 // ===========================================================================
 // Mock implementation for KubernetesSecretWriter.
 //
-// Drives the `ServiceAccountRotationHandler` (Item 7) tests. Records every
+// Drives the `ServiceAccountRotationHandler` tests. Records every
 // `upsert_managed` call so tests can assert ordering + format + labels.
 // The plaintext PAT bytes from the spec are intentionally NOT stored on the
 // mock — the spec is consumed by value and the buffer is zeroed when this
@@ -5988,8 +5984,8 @@ pub struct MockSecretState {
 ///
 /// `seed_existing` lets tests pre-populate state (covers the collision
 /// and stale paths). Call counters expose idempotency assertions for
-/// Item 7's "second tick is a no-op when fresh" test (the reconciler
-/// reads first, decides freshness, and skips the upsert call entirely).
+/// the "second tick is a no-op when fresh" test (the reconciler reads
+/// first, decides freshness, and skips the upsert call entirely).
 pub struct MockKubernetesSecretWriter {
     state: Arc<Mutex<HashMap<(String, String), MockSecretState>>>,
     read_call_count: Arc<AtomicUsize>,
@@ -6818,7 +6814,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_k8s_writer_seed_existing_drives_read_path() {
-        // Tests that exercise the freshness check on Item 7 will
+        // Tests that exercise the freshness check will
         // pre-seed via this surface rather than chaining upserts.
         let writer = MockKubernetesSecretWriter::new();
         let state = MockSecretState {

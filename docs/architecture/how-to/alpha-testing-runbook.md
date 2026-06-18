@@ -790,7 +790,7 @@ permission, so all task kinds are Track A+B.
 | `scan` | automatic per §8 | `ScanCompleted` event |
 | `cron-rescan-tick` | `hort-cli admin task invoke cron-rescan-tick` | worker iterates held artifacts |
 | `advisory-watch-tick` | `hort-cli admin task invoke advisory-watch-tick` | OSV diff fetched |
-| `quarantine-release-sweep` | `hort-server enqueue-quarantine-release-sweep` | F-6 release sweep |
+| `quarantine-release-sweep` | `hort-server enqueue-quarantine-release-sweep` | quarantine release sweep |
 | `prefetch-tick` | `hort-server enqueue-prefetch-tick` | per-repo upstream walk |
 | `prefetch-row-retention-sweep` | `hort-server enqueue-prefetch-row-retention-sweep` | terminal prefetch rows deleted |
 | `seed-import` | `hort-server seed-import --tsv path/to/seed.tsv` | bulk-register pre-vetted artifacts |

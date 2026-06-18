@@ -36,7 +36,7 @@
 //! spot per extractor (the shared [`emit_authz_decision`] helper). No
 //! per-handler duplication. The existing `handlers/pypi.rs:696`
 //! `emit_authz_metric` helper stays in place until Sprint 3 migrates its
-//! call sites to these extractors — F1 ships the primitive only.
+//! call sites to these extractors — this change ships the primitive only.
 
 pub mod extractors;
 pub mod write;

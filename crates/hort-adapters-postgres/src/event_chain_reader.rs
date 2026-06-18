@@ -14,7 +14,7 @@
 //! The shared chain-read helpers (`retention_stream_id`, `to_event_hash`,
 //! `sealed_record_from_row`) are reused from
 //! [`crate::event_chain_head_reader`] — the same parsing the emitter and
-//! the rest of the read path use, so the two F-2 read adapters agree
+//! the rest of the read path use, so the two read adapters agree
 //! byte-for-byte on the `StreamSealed` shape and the 32-byte hash check.
 
 use sqlx::{PgPool, Row};
@@ -27,9 +27,8 @@ use hort_domain::ports::BoxFuture;
 use crate::event_chain_head_reader::{retention_stream_id, sealed_record_from_row, to_event_hash};
 use crate::mappers::EventRow;
 
-/// Bounded page size for per-stream reads (the prior in-CLI value —
-/// streams are paged so the verifier never buffers the whole table;
-/// spec §8.2 "bounded memory").
+/// Bounded page size for per-stream reads — streams are paged so the
+/// verifier never buffers the whole table.
 const STREAM_PAGE: i64 = 1024;
 
 /// `EventChainReaderPort` over a runtime-DML `PgPool`.
@@ -52,7 +51,7 @@ impl EventChainReaderPort for PgEventChainReader {
     ) -> BoxFuture<'_, DomainResult<Vec<String>>> {
         Box::pin(async move {
             // `--since-global N` selects every stream with any activity at
-            // `global_position >= N` (spec §8.2: `>=`, not `>`). Absent ⇒
+            // `global_position >= N` (`>=`, not `>`). Absent ⇒
             // no predicate ⇒ all streams (the predicate is omitted, not
             // faked with `>= 0`, so the "verify all" path is index-clean).
             let rows = match since_global {
@@ -212,8 +211,8 @@ mod tests {
 
     // ---- DB-backed (gated on DATABASE_URL; green locally without a DB) --
     //
-    // Mirrors the `PgEventChainHeadReader` / Item-3 verifier `maybe_pool()`
-    // idiom: no DATABASE_URL ⇒ silent early return so `cargo test --lib`
+    // Mirrors the `PgEventChainHeadReader` `maybe_pool()` idiom: no
+    // DATABASE_URL ⇒ silent early return so `cargo test --lib`
     // stays green locally; Tier-2/CI sets DATABASE_URL and the body runs.
     // The shared CI DB carries rows other suites seeded, so the assertions
     // are structural invariants that always hold, not exact emptiness.

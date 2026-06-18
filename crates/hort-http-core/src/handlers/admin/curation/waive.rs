@@ -5,11 +5,11 @@
 //! (the admin override) but emits the curator-attributed
 //! [`ArtifactReleased`](hort_domain::events::ArtifactReleased) variant
 //! (`authority = CuratorWaiver`, `reason = Curator`) rather than the
-//! admin variant. Source-state guard is `Quarantined` ONLY (design
-//! §2.2 — curator does NOT clear `ScanIndeterminate` artifacts; that
-//! authority stays admin-only).
+//! admin variant. Source-state guard is `Quarantined` ONLY — curator
+//! does NOT clear `ScanIndeterminate` artifacts; that authority stays
+//! admin-only.
 //!
-//! Status-code mapping (design §3):
+//! Status-code mapping:
 //! - `200 OK` — success
 //! - `400 Bad Request` — justification empty / oversize (handler enforces
 //!   BEFORE the use-case call as defence-in-depth; use case re-checks),
@@ -127,7 +127,7 @@ pub async fn post_waive(
 
 #[cfg(test)]
 mod tests {
-    //! Item 9 acceptance: handler-layer assertions for each status code.
+    //! Handler-layer assertions for each status code.
     //! Tests use [`build_mock_ctx`] (mock harness from `test_support`) —
     //! the architect anti-pattern forbids hand-rolling `AppContext` here.
     //!

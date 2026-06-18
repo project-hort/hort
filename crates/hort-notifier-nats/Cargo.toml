@@ -33,7 +33,7 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 
 # Async runtime — `tokio::time::timeout` wraps the publish-ack future
-# with a 2s deadline per design doc §7.
+# with a 2s deadline.
 tokio = { workspace = true }
 
 # `Bytes` is the payload type `Context::publish` accepts; the adapter
@@ -41,12 +41,12 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 
 # Structured logging — adapter does not emit a metric directly (the
-# dispatcher owns `hort_notify_delivery_*` per design doc §12; cardinality
+# dispatcher owns `hort_notify_delivery_*`; cardinality
 # discipline). `warn!` on publish/ack failure with truncated subject
-# only per design doc §11 audit logging row.
+# only.
 tracing = { workspace = true }
 
-# F-20: OS native root CA store for the `tls://`-with-internal-CA path.
+# OS native root CA store for the `tls://`-with-internal-CA path.
 # async-nats re-exports `rustls` (= `tokio_rustls::rustls`) but does NOT
 # re-export `rustls-native-certs`, so it is declared here. Version `0.8`
 # matches `hort-adapters-upstream-http` (and async-nats' own `0.8`
@@ -69,7 +69,7 @@ url = { workspace = true }
 # dev environments without Docker keep the suite green — same gating
 # discipline as `hort-adapters-postgres`'s `DATABASE_URL` tests.
 testcontainers = { workspace = true }
-# F-20: generate a fully-valid self-signed X.509 CA in-process so the
+# Generate a fully-valid self-signed X.509 CA in-process so the
 # extra-CA root-store tests exercise a cert rustls actually accepts as a
 # trust anchor (a static truncated PEM parses but fails
 # `RootCertStore::add`). Same generator + version as

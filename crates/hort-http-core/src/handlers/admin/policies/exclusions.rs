@@ -13,13 +13,13 @@
 //! use-case signature is `(cmd, actor: Actor)` and contains NO
 //! permission check — the gitops apply pipeline continues to call the
 //! same methods with `Actor::Gitops`. The HTTP layer is the single
-//! permission source of truth for the user-driven surface (Item 11
-//! scope revision; see module docs in the parent `mod.rs`).
+//! permission source of truth for the user-driven surface (see module
+//! docs in the parent `mod.rs`).
 //!
 //! ## DELETE `:cve_id` resolution
 //!
-//! The URL carries `:cve_id` (e.g. `CVE-2026-0001`) per the design
-//! doc §2.7. The use case takes an `exclusion_id` (UUID) — the
+//! The URL carries `:cve_id` (e.g. `CVE-2026-0001`). The use case
+//! takes an `exclusion_id` (UUID) — the
 //! curator-facing identifier is the CVE, the internal projection-key
 //! is the exclusion_id. The handler resolves CVE → exclusion_id by
 //! reading `policy_projections.list_exclusions_for_policy(policy_id)`
@@ -28,7 +28,7 @@
 //! `Validation(policy not exist)` 400 (from the use case) that would
 //! fire if a caller URL-encoded a stale policy id.
 //!
-//! Status-code mapping (design §3):
+//! Status-code mapping:
 //! - **POST** — `201 Created` with `{ "exclusion_id": "<uuid>" }` on
 //!   success; `400` (validation — empty reason / oversize / bad
 //!   cve_id format / policy id mis-parsed); `403` (extractor); `404`
@@ -43,7 +43,7 @@
 //! **`#[tracing::instrument]` deliberately WITHOUT `err`** — denial
 //! and validation outcomes are info-level events (architect rule);
 //! promoting them to `err` would surface every 4xx as ERROR in
-//! operator logs. Mirrors Item 9 / Item 10's handlers.
+//! operator logs. Mirrors the curation decision handlers.
 
 use std::sync::Arc;
 
@@ -83,9 +83,9 @@ use super::MAX_JUSTIFICATION_BYTES;
 /// { "kind": "repository", "repository_id": "<uuid>" }
 /// ```
 ///
-/// Mirrors the Item 10 read DTO's `scope` projection (handlers/admin/
-/// curation/exclusions.rs `CurationExclusionEntryDto`), so the read
-/// and write surfaces are byte-symmetric.
+/// Mirrors the `scope` projection in handlers/admin/curation/exclusions.rs
+/// (`CurationExclusionEntryDto`), so the read and write surfaces are
+/// byte-symmetric.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScopeDto {
@@ -170,7 +170,7 @@ pub async fn post_exclusion(
     Path(policy_id): Path<Uuid>,
     Json(body): Json<AddExclusionRequestDto>,
 ) -> Result<Response, ApiError> {
-    // Justification cap — same 512-byte gate as Item 9 / Item 10. The
+    // Justification cap — 512-byte, same as the curation decision endpoints. The
     // domain `ExclusionAdded::validate` enforces a wider 4096-byte
     // cap on the underlying `reason`; this handler tightens the HTTP
     // bound to 512 to match every other curator-facing justification
@@ -275,7 +275,7 @@ pub async fn delete_exclusion(
     // projection port's contract is `list_exclusions_for_policy`
     // returns ONLY rows for `policy_id`, so the linear scan here is
     // bounded by the number of exclusions on the policy (typically
-    // single digits; design §2.4 carries this assumption).
+    // single digits in typical deployments).
     let exclusions = ctx
         .policy_projections
         .list_exclusions_for_policy(policy_id)
@@ -304,16 +304,15 @@ pub async fn delete_exclusion(
 
 #[cfg(test)]
 mod tests {
-    //! Item 11 acceptance — handler-layer assertions for each status
-    //! code on both endpoints, plus a regression test pinning that a
-    //! curator-driven POST calls the use case with the same shape an
-    //! admin-driven POST would (the use-case-side re-evaluation
-    //! cascade is itself exercised by `policy_use_case.rs::tests`;
-    //! the HTTP wiring just must not drop attribution).
+    //! Handler-layer assertions for each status code on both endpoints,
+    //! plus a regression test pinning that a curator-driven POST calls
+    //! the use case with the same shape an admin-driven POST would (the
+    //! use-case-side re-evaluation cascade is itself exercised by
+    //! `policy_use_case.rs::tests`; the HTTP wiring just must not drop
+    //! attribution).
     //!
     //! All tests use [`build_mock_ctx`] (architect rule — no
-    //! hand-rolled `AppContext`). Principal injection mirrors Item 9 /
-    //! Item 10's pattern.
+    //! hand-rolled `AppContext`).
 
     use super::*;
     use axum::body::{to_bytes, Body};
@@ -543,8 +542,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
-    /// Regression test (Item 11 acceptance) — a curator-driven POST
-    /// and an admin-driven POST produce the same use-case effect: one
+    /// Regression test — a curator-driven POST and an admin-driven POST
+    /// produce the same use-case effect: one
     /// exclusion row appended to the projection, with the body's
     /// reason verbatim. The use-case-side re-evaluation cascade is
     /// exercised by `policy_use_case.rs::tests`; the HTTP wiring just
@@ -673,7 +672,7 @@ mod tests {
 
     /// Unauthorised caller (no curate, no admin) → 403 via the
     /// `CurateOrAdminPrincipal` extractor short-circuit; the use case
-    /// is never reached. Body shape matches the F1 extractor's denial.
+    /// is never reached. Body shape matches the extractor's 403 denial.
     #[tokio::test]
     async fn post_exclusion_unauthorized_returns_403() {
         let (router, mocks) = harness();

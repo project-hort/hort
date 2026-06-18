@@ -10,8 +10,8 @@
 //! Secure-by-default: [`LintConfig::default`] encodes the reject
 //! posture. An operator may only *downgrade* a rule via explicit,
 //! audited gitops config (visible in the apply diff) — there is no
-//! env-var and no global `warn` switch (F-34 framing: "rejects by
-//! default; operators allowlist known-good shapes").
+//! env-var and no global `warn` switch — the posture rejects by default;
+//! operators allowlist known-good shapes.
 
 use std::collections::HashSet;
 
@@ -44,8 +44,8 @@ use crate::metrics::{emit_apply_config_linter, LinterResult};
 pub const RESERVED_CLAIM_NAMES: &[&str] = &["service_account", "cli_session"];
 
 /// Permissions conferring admin-class authority. A wildcard
-/// (repository-unscoped) direct `User` grant of any of these is the
-/// F-36 escalation shape (audit 2026-06-02). Maintained set — a new
+/// (repository-unscoped) direct `User` grant of any of these is a
+/// privilege-escalation shape. Maintained set — a new
 /// `Permission` variant must be classified here (admin-class) or left
 /// out (ordinary); the exhaustiveness guard test below enforces that
 /// every variant is consciously classified.
@@ -92,14 +92,15 @@ impl RuleAction {
 }
 
 /// Operator-tunable strictness knobs. **Defaults encode the
-/// secure-by-default reject posture** (F-34); every field is an
-/// opt-*out*, never an opt-in.
+/// secure-by-default reject posture**; every field is an opt-*out*,
+/// never an opt-in.
 ///
 /// Loaded from operator gitops config at composition time. The
 /// production constructor path
 /// ([`ApplyConfigUseCase::new`](crate::use_cases::apply_config_use_case::ApplyConfigUseCase::new))
 /// defaults this to [`LintConfig::default`] — i.e. an apply with **no
-/// operator config at all** rejects the F-34/F-36 grant shapes.
+/// operator config at all** rejects single-claim grants and wildcard
+/// privilege-escalation grant shapes.
 ///
 /// An operator downgrade is itself a config mutation: it lands in the
 /// gitops repo, is visible in the apply diff, and is therefore
@@ -124,7 +125,7 @@ pub struct LintConfig {
     /// relaxation). Absent → the rule's computed default applies.
     ///
     /// Not exhaustive over the rule set: `claim-name-collision` has
-    /// no downgrade (always `reject` — §8.1).
+    /// no downgrade (always `reject`).
     pub rule_overrides: RuleOverrides,
 }
 
@@ -171,9 +172,8 @@ impl From<hort_config::lint_config::RuleActionSpec> for RuleAction {
 /// downgrade-only policy (`hort-config`'s `validate_lint_config` owns
 /// that, run before apply; duplicating it here would be a silent
 /// second policy surface). An empty spec maps to
-/// [`LintConfig::default`] (the secure posture), which is the property
-/// Item 3 relies on for "absent kind ⇒ default" (design doc §6
-/// invariant 1: a missing kind is not a downgrade).
+/// [`LintConfig::default`] (the secure posture), preserving the
+/// invariant that a missing kind is not a downgrade.
 ///
 /// Borrows the spec (`&Spec`) rather than consuming it so the apply
 /// pipeline can keep the parsed envelope for diff/audit.
@@ -194,11 +194,10 @@ impl From<&hort_config::lint_config::PermissionGrantLintConfigSpec> for LintConf
 }
 
 impl Default for LintConfig {
-    /// Secure-by-default (F-34): empty allowlist, no downgrades. An
-    /// apply with this config rejects every single-claim grant, every
-    /// wildcard non-admin claims grant, every unjustified
-    /// high-privilege direct-user grant, and every reserved-name
-    /// claim collision.
+    /// Secure-by-default: empty allowlist, no downgrades. An apply with
+    /// this config rejects every single-claim grant, every wildcard
+    /// non-admin claims grant, every unjustified high-privilege
+    /// direct-user grant, and every reserved-name claim collision.
     fn default() -> Self {
         Self {
             single_claim_allowlist: Vec::new(),
@@ -214,8 +213,8 @@ impl LintConfig {
     /// exercise grant diff/idempotence and must not be perturbed by
     /// the linter (the exact analogue of
     /// `UpstreamHostAllowlist::Disabled` in the apply-config tests).
-    /// `claim-name-collision` still rejects (no downgrade knob —
-    /// §8.1), so harnesses must not declare a reserved-name mapping.
+    /// `claim-name-collision` still rejects (no downgrade knob),
+    /// so harnesses must not declare a reserved-name mapping.
     /// The production composition root never calls this — it
     /// constructs through `ApplyConfigUseCase::new` →
     /// [`LintConfig::default`] (secure-by-default).
@@ -270,9 +269,9 @@ fn strictest(a: RuleAction, b: RuleAction) -> RuleAction {
 }
 
 /// A single rule firing against a single grant or claim-mapping row.
-/// Carries only audit-safe scalars — **no claim names** (§7: claim
-/// names are operator-authored topology, never logged or surfaced;
-/// counts only).
+/// Carries only audit-safe scalars — **no claim names** (claim names
+/// are operator-authored topology, never logged or surfaced; counts
+/// only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintViolation {
     /// Fixed v1 rule key (`&'static str` — bounded metric label).
@@ -312,24 +311,24 @@ impl LintOutcome {
 /// `direct-user-grant-without-justification` rule treats SA-owned
 /// `User` grants as **justified by provenance** and exempts them; an
 /// operator-hand-declared `GrantSubjectSpec::User` envelope grant
-/// whose user-id is NOT in this set is the F-36 escalation shape and
-/// triggers the rule.
+/// whose user-id is NOT in this set is a privilege-escalation shape
+/// and triggers the rule.
 ///
-/// **Design-doc-vs-as-built reconciliation (recorded divergence).**
-/// §8.1 phrases the rule as "a `User(_)` grant has no
+/// **As-built reconciliation (recorded divergence).**
+/// An earlier draft phrased the rule as "a `User(_)` grant has no
 /// `managed_by_digest` annotation explaining the override". In the
 /// as-built apply path *every* gitops-declared grant is written with
 /// `managed_by_digest = Some(spec_hash)` unconditionally (it is the
 /// diff-stability digest, not a justification signal), so keying the
 /// rule on `managed_by_digest.is_none()` makes it dead for gitops
-/// grants — which contradicts F-36's entire purpose ("an unjustified
-/// direct-admin grant slipping through gitops review"). v1's
-/// `PermissionGrantSpec` carries no justification field. The faithful
-/// reading of F-36's intent is therefore: the *justification* for a
-/// direct-`User` grant is **provenance** — auto-synthesised SA-owned
-/// grants (§5.8) are the legitimate path and are exempt; a bare
-/// operator-declared `User` grant has no justification mechanism in
-/// v1 and is exactly the shape F-36 wants blocked.
+/// grants — which contradicts the rule's entire purpose (catching
+/// unjustified direct-admin grants slipping through gitops review).
+/// v1's `PermissionGrantSpec` carries no justification field. The
+/// faithful reading of the rule's intent is therefore: the
+/// *justification* for a direct-`User` grant is **provenance** —
+/// auto-synthesised SA-owned grants are the legitimate path and are
+/// exempt; a bare operator-declared `User` grant has no justification
+/// mechanism in v1 and is exactly the shape the rule wants blocked.
 ///
 /// Pure over its inputs (no I/O) — the caller
 /// ([`apply_permission_grants`](crate::use_cases::apply_config_use_case))
@@ -392,8 +391,7 @@ fn evaluate_single_claim_grant(
 
 /// `wildcard-repo-non-admin` — a `Claims` grant with `repository_id
 /// IS NULL` and a non-`Admin` permission is an effectively
-/// instance-wide write/read/delete grant. Reject by default (F-34:
-/// this is the canonical "a grant slipped past structure" shape).
+/// instance-wide write/read/delete grant. Reject by default.
 fn evaluate_wildcard_repo_non_admin(
     grant: &PermissionGrant,
     cfg: &LintConfig,
@@ -421,17 +419,16 @@ fn evaluate_wildcard_repo_non_admin(
 /// `direct-user-grant-without-justification` — a `User`-subject grant
 /// that is **not** SA-owned (the legitimate, auto-
 /// synthesised direct-user path). Provenance is the v1 justification
-/// signal (see [`lint_permission_grants`] for the
-/// design-doc-vs-as-built reconciliation: every gitops grant carries
-/// a `managed_by_digest`, so it cannot be the discriminator). An
-/// SA-owned grant is exempt (justified by provenance → `Pass`). An
-/// operator-hand-declared bare `User` grant rejects when
-/// high-privilege (`Admin` always, or a wildcard-repo grant of any
-/// [`ADMIN_CLASS_PERMISSIONS`] member — `AdminTaskInvoke`/`Curate`/
-/// `Prefetch` — or wildcard-repo write/delete; F-36 audit 2026-06-02)
-/// and warns otherwise (keep break-glass / low-priv direct grants
-/// non-blocking — F-36). A *repo-scoped* admin-class grant stays
-/// `Warn`: §3.2 scopes the reject to the wildcard case.
+/// signal (see [`lint_permission_grants`] for the as-built
+/// reconciliation: every gitops grant carries a `managed_by_digest`,
+/// so it cannot be the discriminator). An SA-owned grant is exempt
+/// (justified by provenance → `Pass`). An operator-hand-declared bare
+/// `User` grant rejects when high-privilege (`Admin` always, or a
+/// wildcard-repo grant of any [`ADMIN_CLASS_PERMISSIONS`] member —
+/// `AdminTaskInvoke`/`Curate`/`Prefetch` — or wildcard-repo
+/// write/delete) and warns otherwise (break-glass / low-priv direct
+/// grants remain non-blocking). A *repo-scoped* admin-class grant
+/// stays `Warn`: the reject is scoped to the wildcard case.
 fn evaluate_direct_user_grant(
     grant: &PermissionGrant,
     sa_owned_user_ids: &HashSet<Uuid>,
@@ -457,9 +454,9 @@ fn evaluate_direct_user_grant(
         LintConfig::downgrade(RuleAction::Reject, cfg.rule_overrides.direct_user_grant)
     } else {
         // Low-privilege unjustified direct grant: warn, never reject
-        // (F-36 — keep break-glass / low-priv direct grants
-        // non-blocking). The low-priv arm has no downgrade knob: it
-        // is already the loosest non-pass action.
+        // (break-glass / low-priv direct grants remain non-blocking).
+        // The low-priv arm has no downgrade knob: it is already the
+        // loosest non-pass action.
         RuleAction::Warn
     };
     emit_and_record(RULE_DIRECT_USER, action, grant, outcome);
@@ -467,7 +464,7 @@ fn evaluate_direct_user_grant(
 
 /// `claim-name-collision` — a `claim_mappings` row resolving an IdP
 /// group onto a reserved name (`admin`, `service_account`). Always
-/// `reject` (no downgrade knob — §8.1 unchanged).
+/// `reject` (no downgrade knob).
 fn evaluate_claim_name_collision(mapping: &ClaimMapping, outcome: &mut LintOutcome) {
     let collides = RESERVED_CLAIM_NAMES
         .iter()
@@ -508,10 +505,9 @@ fn evaluate_claim_name_collision(mapping: &ClaimMapping, outcome: &mut LintOutco
 }
 
 /// Emit the metric for one (grant, rule) evaluation and, for a
-/// non-`Pass` action, log per the §7 Observability table and record
-/// the violation. **Never logs claim names** — only the rule key, the
-/// `repository_id` (when grant-scoped), and the required-claims
-/// *count*.
+/// non-`Pass` action, log and record the violation. **Never logs claim
+/// names** — only the rule key, the `repository_id` (when
+/// grant-scoped), and the required-claims *count*.
 fn emit_and_record(
     rule: &'static str,
     action: RuleAction,
@@ -587,9 +583,8 @@ mod tests {
     #[test]
     fn from_default_spec_equals_lint_config_default() {
         // An empty spec (absent allowlist + absent overrides) maps to
-        // the secure default — a missing kind is NOT a downgrade
-        // (design doc §6 invariant 1). This is the property Item 3
-        // relies on for "absent kind ⇒ LintConfig::default()".
+        // the secure default — a missing kind is NOT a downgrade.
+        // This preserves the invariant that absent kind ⇒ default.
         use hort_config::lint_config::PermissionGrantLintConfigSpec;
         let cfg = LintConfig::from(&PermissionGrantLintConfigSpec::default());
         assert_eq!(cfg, LintConfig::default());
@@ -884,7 +879,7 @@ mod tests {
         let out = lint_sa(&[g], &sa_owned, &LintConfig::default());
         assert!(
             !out.rejected(),
-            "an SA-owned User grant is justified by provenance (§5.8)"
+            "an SA-owned User grant is justified by provenance"
         );
         assert!(out.violations.is_empty());
     }
@@ -917,7 +912,7 @@ mod tests {
         assert_eq!(out.violations[0].action, RuleAction::Warn);
     }
 
-    // --- F-36: wildcard direct-User grants of admin-class permissions ------
+    // --- wildcard direct-User grants of admin-class permissions ------------
     // AdminTaskInvoke / Curate / Prefetch were added after the high_privilege
     // predicate was written. A wildcard (repository_id IS NULL) hand-declared
     // `User` grant of any of them is admin-class authority and must Reject
@@ -930,7 +925,7 @@ mod tests {
         assert!(
             out.rejected(),
             "a wildcard direct-User AdminTaskInvoke grant is admin-class \
-             authority — must reject (F-36)"
+             authority — must reject"
         );
         assert!(out
             .violations
@@ -944,8 +939,7 @@ mod tests {
         let out = lint(&[g], &[], &LintConfig::default());
         assert!(
             out.rejected(),
-            "a wildcard direct-User Curate grant is admin-class authority \
-             — must reject (F-36)"
+            "a wildcard direct-User Curate grant is admin-class authority — must reject"
         );
     }
 
@@ -955,14 +949,13 @@ mod tests {
         let out = lint(&[g], &[], &LintConfig::default());
         assert!(
             out.rejected(),
-            "a wildcard direct-User Prefetch grant is admin-class authority \
-             — must reject (F-36)"
+            "a wildcard direct-User Prefetch grant is admin-class authority — must reject"
         );
     }
 
     #[test]
     fn direct_user_repo_scoped_admin_class_warns() {
-        // §3.2 scopes the reject to the WILDCARD case: a repo-scoped
+        // The reject is scoped to the WILDCARD case: a repo-scoped
         // admin-class direct grant stays Warn (do not over-reach beyond the
         // design). This pins the wildcard scoping.
         let g = user_grant(Permission::Curate, Some(Uuid::new_v4()));
@@ -978,7 +971,7 @@ mod tests {
     #[test]
     fn direct_user_sa_owned_admin_class_is_exempt() {
         // Provenance exemption holds for admin-class perms too: an SA-owned
-        // wildcard admin-class `User` grant is justified by provenance (§5.8)
+        // wildcard admin-class `User` grant is justified by provenance
         // → Pass (mirrors `direct_user_sa_owned_admin_is_exempt`).
         let sa_uid = Uuid::new_v4();
         let g = user_grant_for(sa_uid, Permission::AdminTaskInvoke, None);
@@ -987,7 +980,7 @@ mod tests {
         let out = lint_sa(&[g], &sa_owned, &LintConfig::default());
         assert!(
             !out.rejected(),
-            "an SA-owned admin-class User grant is justified by provenance (§5.8)"
+            "an SA-owned admin-class User grant is justified by provenance"
         );
         assert!(out.violations.is_empty());
     }
@@ -1046,14 +1039,14 @@ mod tests {
 
     #[test]
     fn claim_name_collision_admin_is_allowed() {
-        // §5.2 reconciliation: an IdP-admin-group → `admin` mapping is
-        // the documented OIDC-admin onboarding path (§6 invariant 3).
-        // `admin` is deliberately NOT in the reserved set.
+        // An IdP-admin-group → `admin` mapping is the documented
+        // OIDC-admin onboarding path. `admin` is deliberately NOT in
+        // the reserved set.
         let m = claim_mapping("admin");
         let out = lint(&[], &[m], &LintConfig::default());
         assert!(
             !out.rejected(),
-            "mapping a group to `admin` is the §5.2 OIDC-admin path — must pass"
+            "mapping a group to `admin` is the documented OIDC-admin path — must pass"
         );
         assert!(out.violations.is_empty());
     }
@@ -1079,7 +1072,7 @@ mod tests {
     #[test]
     fn claim_name_collision_has_no_downgrade_knob() {
         // Even with every downgrade set, the collision rule still
-        // rejects (no operator escape hatch — §8.1 unchanged).
+        // rejects (no operator escape hatch).
         let m = claim_mapping("service_account");
         let cfg = LintConfig {
             single_claim_allowlist: vec!["service_account".into()],

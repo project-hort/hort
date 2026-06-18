@@ -1,4 +1,4 @@
-//! OCI `_catalog` endpoints (Item 8).
+//! OCI `_catalog` endpoints.
 //!
 //! Two distinct handlers share this file:
 //!
@@ -27,7 +27,7 @@
 //! # Visibility
 //!
 //! Per-repo catalog: callers must already be able to read the repo
-//! (enforced by a future RBAC check; Phase 1 is anonymous-pass-through
+//! (enforced by a future RBAC check; currently anonymous-pass-through
 //! under `AuthContext::Disabled`).
 //!
 //! Global catalog: the handler enumerates all repos, filters to those

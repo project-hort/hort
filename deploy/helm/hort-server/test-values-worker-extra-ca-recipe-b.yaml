@@ -1,4 +1,4 @@
-# Fully-manual worker CA recipe fixture (Backlog 078 Item 7).
+# Fully-manual worker CA recipe fixture.
 #
 # This exercises the MANUAL path: extraCaBundle.path set, but NEITHER
 # configMapName NOR secretName (no chart auto-mount). The operator wires
@@ -7,12 +7,11 @@
 # ClusterTrustBundle is the other common case) AND sets
 # HORT_EXTRA_CA_BUNDLE themselves via worker.extraEnv, pointed at `path`.
 #
-# Post-Item-7 the chart NEVER sets HORT_EXTRA_CA_BUNDLE for the manual
-# recipe (convention 9: no env pointing at a file the chart did not
-# mount). So for the manual recipe to work, the operator supplies the env
-# explicitly — that is what `worker.extraEnv` does below. If they had
-# instead set `secretName`, the chart would auto-mount + set the env on
-# both pods (see test-values-extra-ca-with-secret.yaml).
+# The chart NEVER sets HORT_EXTRA_CA_BUNDLE for the manual recipe (no env
+# pointing at a file the chart did not mount). The operator supplies the
+# env explicitly via `worker.extraEnv`. If they had instead set
+# `secretName`, the chart would auto-mount + set the env on both pods
+# (see test-values-extra-ca-with-secret.yaml).
 #
 # The chart must:
 #   - NOT render a chart-managed HORT_EXTRA_CA_BUNDLE env (manual recipe)

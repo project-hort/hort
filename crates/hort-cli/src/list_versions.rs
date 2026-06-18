@@ -118,7 +118,7 @@ pub enum DiscoveryVersionStatusDto {
 /// `npm-proxy`) — NOT a UUID; the server resolves it via
 /// `RepositoryUseCase::get_by_key` (404 on unknown key). Positional
 /// `package` is the format-native spelling (the server preserves case;
-/// it does NOT canonicalise — design §3.1 echo-back).
+/// it does NOT canonicalise — design echo-back).
 #[derive(Args, Debug)]
 pub struct ListVersionsArgs {
     /// Repository stable key (e.g. `npm-proxy`).
@@ -239,7 +239,7 @@ fn render(listing: &DiscoveryListingDto, output: OutputFormat) -> String {
 
 /// Render as a two-column table: `VERSION` + `STATUS`.
 ///
-/// Status column text per acceptance §3 / design §2.2:
+/// Status column text:
 /// - `released`
 /// - `quarantined (until YYYY-MM-DDTHH:MM:SSZ)` with the deadline in
 ///   RFC 3339 UTC
@@ -626,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_403_token_kind_denied_surfaces_as_error() {
-        // Per §2.6 the use case returns Forbidden with the message
+        // The use case returns Forbidden with the message
         // "this endpoint requires a CLI session token" when the caller's
         // `token_kind != Some(CliSession)`. The CLI surfaces the upstream
         // body verbatim via `response_to_error`.

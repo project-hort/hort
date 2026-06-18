@@ -259,8 +259,7 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
                 .iter()
                 .find_map(|sv| label_to_severity(&sv.score))
         })
-        // Final fallback: §4.3 of the design doc — missing severity
-        // maps to Medium.
+        // Final fallback: missing severity maps to Medium.
         .unwrap_or(SeverityThreshold::Medium);
 
     let title = vuln

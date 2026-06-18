@@ -3,9 +3,9 @@
 //!
 //! Distinct from the content-addressed [`StoragePort`](super::storage::StoragePort):
 //! metadata is MUTABLE (overwritten when upstream publishes a new version),
-//! so an immutable CAS would orphan-grow (audit F-26) and collide with a
-//! future CAS orphan-reaper. This port is logical-keyed + overwrite — less
-//! machinery than CAS (no hashing, no refcount).
+//! so an immutable CAS would orphan-grow and collide with a future CAS
+//! orphan-reaper. This port is logical-keyed + overwrite — less machinery
+//! than CAS (no hashing, no refcount).
 
 use tokio::io::AsyncRead;
 

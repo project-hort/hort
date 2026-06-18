@@ -2,13 +2,11 @@
 //! eligible for purge.
 //!
 //! This value object is carried by the `ArtifactExpired` event. That
-//! event lands on the **artifact** stream and is defined + wired by
-//! Item B2; B1 owns only the reason value object the `RetentionPolicy`
-//! aggregate's evaluation produces. The `metric_label` strings are the
-//! exact `hort_retention_expired_total{reason}` label set from §7
+//! event lands on the **artifact** stream. The `metric_label` strings
+//! are the exact `hort_retention_expired_total{reason}` label set
 //! (`age_exceeded`, `unused_ttl`, `keep_last_n`, `manual`,
-//! `security_finding`) so the B7 metrics-catalog item has one
-//! authoritative source for the label vocabulary.
+//! `security_finding`) — one authoritative source for the label
+//! vocabulary.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -66,10 +64,10 @@ pub enum ExpirationReason {
 
 impl ExpirationReason {
     /// The exact `hort_retention_expired_total{reason}` Prometheus label
-    /// for this variant (§7). Pure — the metric *emission* is the
+    /// for this variant. Pure — the metric *emission* is the
     /// app-layer use case's job; the domain only owns the canonical
     /// label vocabulary so it cannot drift between the emitter and the
-    /// B7 catalog.
+    /// metrics catalog.
     pub fn metric_label(&self) -> &'static str {
         match self {
             Self::AgeExceeded { .. } => "age_exceeded",

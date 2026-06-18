@@ -1,13 +1,12 @@
 //! `PgApiTokenRepository` integration tests.
 //!
-//! Asserts the §3 / §4 / §5 contract the adapter ships with:
+//! Asserts the adapter contract:
 //!
 //! 1. `insert_then_find_by_id_round_trips` — a `pat` token round-trips
 //!    through the adapter (insert → find_by_id) without losing fields.
 //! 2. `find_by_prefix_returns_some_on_hit_none_on_miss` — the hot
-//!    validator path (§5 step 2). Miss is `Ok(None)`, NOT
-//!    `Err(NotFound)` — the constant-time invariant lives in the use
-//!    case, not the adapter.
+//!    validator path. Miss is `Ok(None)`, NOT `Err(NotFound)` — the
+//!    constant-time invariant lives in the use case, not the adapter.
 //! 3. `list_for_user_orders_by_created_at_desc` — list paginates with
 //!    descending `created_at`, total count matches.
 //! 4. `update_last_used_buckets_ipv4_to_24` — write `203.0.113.42`,
@@ -152,7 +151,7 @@ async fn find_by_prefix_returns_some_on_hit_none_on_miss() {
     assert!(hit.is_some(), "prefix lookup must surface inserted token");
     assert_eq!(hit.unwrap().id, token.id);
 
-    // Miss — the constant-time invariant lives in the use case (B5);
+    // Miss — the constant-time invariant lives in the use case;
     // the adapter MUST NOT raise NotFound here, just `Ok(None)`.
     let miss = repo
         .find_by_prefix("ffffffff")
@@ -334,9 +333,9 @@ async fn update_last_used_passes_through_malformed_ip() {
     let token = sample_token(user_id, "malforip");
     repo.insert(&token).await.expect("insert");
 
-    // Validator (B5) is the layer that filters bad IP strings; the
-    // adapter MUST NOT crash on one. The garbage round-trips
-    // verbatim — operators can grep for it as a debug signal.
+    // The validation layer filters bad IP strings; the adapter MUST
+    // NOT crash on one. The garbage round-trips verbatim — operators
+    // can grep for it as a debug signal.
     let garbage = "not-an-ip-string";
     repo.update_last_used(token.id, Utc::now(), Some(garbage), None)
         .await

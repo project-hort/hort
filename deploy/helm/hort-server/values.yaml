@@ -42,11 +42,10 @@ replicaCount: 1
 publicBaseUrl: ""
 
 # -------------------- API listener --------------------
-# Backlog 078 Item 10 (chart N3) — the API bind key now follows the
-# `<subsystem>.bindAddr` shape shared by `metrics.bindAddr` and
-# `control.bindAddr` (the pre-078 top-level `apiBindAddr` is retired —
-# HARD rename, no alias). The env var it maps to (`HORT_API_BIND`) is
-# unchanged.
+# The API bind key follows the `<subsystem>.bindAddr` shape shared by
+# `metrics.bindAddr` and `control.bindAddr` (the top-level `apiBindAddr`
+# key is retired — HARD rename, no alias). The env var it maps to
+# (`HORT_API_BIND`) is unchanged.
 api:
   # HORT_API_BIND — bind address for the main API listener. Mirrors the
   # explicit-address shape of `metrics.bindAddr`: one value, one mental
@@ -301,8 +300,8 @@ metrics:
 #   `controlPort` are exposed and the NetworkPolicy gains a control-port
 #   ingress rule (see `networkPolicy` below).
 #
-# This is DEFENSE-IN-DEPTH on top of — never instead of — the F-3
-# admin authz gate and the F-4/F-21 webhook allowlist. Network position
+# This is DEFENSE-IN-DEPTH on top of — never instead of — the
+# admin authz gate and the webhook allowlist. Network position
 # never substitutes for authz. See
 # `docs/architecture/how-to/deploy/control-plane-tiers.md`.
 control:
@@ -449,15 +448,15 @@ storage:
 # always wins over the binary default.
 
 # -------------------- Scheduled tasks --------------------
-# Backlog 078 Item 8 (chart N1) — ALL periodic/scheduled tasks now live
-# under the single `scheduledTasks.*` tree (below, just before `worker:`),
-# regardless of execution path. The pre-078 split — five tasks at the top
-# level (`scrub`, `quarantineReleaseSweep`, `prefetchTick`,
-# `prefetchRowRetentionSweep`, `wheelMetadataBackfill`) and the rest nested
-# under `cronJobs.*` — leaked an implementation detail (DSN-direct vs
-# admin-task-HTTP) into the config-tree location. Each task now carries an
-# `executionPath` attribute instead. See the `scheduledTasks:` block for
-# the full set, the global admin-task gate, and the per-task gating notes.
+# ALL periodic/scheduled tasks now live under the single `scheduledTasks.*`
+# tree (below, just before `worker:`), regardless of execution path. The
+# prior split — five tasks at the top level (`scrub`, `quarantineReleaseSweep`,
+# `prefetchTick`, `prefetchRowRetentionSweep`, `wheelMetadataBackfill`) and
+# the rest nested under `cronJobs.*` — leaked an implementation detail
+# (DSN-direct vs admin-task-HTTP) into the config-tree location. Each task
+# now carries an `executionPath` attribute instead. See the `scheduledTasks:`
+# block for the full set, the global admin-task gate, and the per-task gating
+# notes.
 #
 # NOTE: `scrub.actionOnMismatch` (the HORT_CAS_SCRUB_ACTION_ON_MISMATCH env
 # read by the main Deployment) is now `scheduledTasks.scrub.actionOnMismatch`.
@@ -540,7 +539,7 @@ resources:
     memory: 1Gi
 
 # -------------------- Probes --------------------
-# Wired to Item 1's /healthz + /readyz endpoints.
+# Wired to the binary's /healthz + /readyz endpoints.
 #
 # Lifecycle semantics: the startup probe runs first; while it has
 # not yet succeeded, K8s disables the liveness and readiness probes.
@@ -626,7 +625,7 @@ podDisruptionBudget:
 # default 9443) ONLY from the operator/admin namespace, and keep the
 # public 8080 ingress open to the artifact + token-gen clients. The
 # egress posture should restrict HORT to the known webhook-forwarder
-# set (cross-ref F-4/F-21, already shipped) plus Postgres / S3 /
+# set plus Postgres / S3 /
 # Redis / OIDC issuer / upstream registries. See
 # `docs/architecture/how-to/deploy/control-plane-tiers.md` for a
 # worked three-tier example.
@@ -652,8 +651,8 @@ podDisruptionBudget:
 # docstring in `templates/networkpolicy-migrate-job.yaml` for the full
 # per-Job verdict table.
 networkPolicy:
-  # Default ON (F-33). Flip to `false` to opt out (documented escape
-  # hatch — see the section comment above).
+  # Default ON. Flip to `false` to opt out (documented escape hatch —
+  # see the section comment above).
   enabled: true
   # Operator-supplied ingress rules. See K8s NetworkPolicy spec.
   # With networkPolicy enabled, an EMPTY list renders a policy that
@@ -668,7 +667,7 @@ networkPolicy:
   # list ⇒ DENY ALL egress (no namespace baseline) — the pod cannot
   # reach Postgres / S3 / Redis / OIDC / upstreams until you open them.
   # Open up to those plus the known webhook-forwarder set ONLY
-  # (F-4/F-21 egress posture).
+  # (egress allowlist posture).
   egress: []
 
 # -------------------- Extra surface --------------------
@@ -738,8 +737,8 @@ extraCaBundle:
   # `configMapName` (a pod can mount only one `ca.crt` at `path`); the
   # chart fails the render at `helm install` if both are set.
   #
-  # Backlog 078 Item 7 / convention 9 — mount/secret symmetry: the
-  # chart NEVER sets HORT_EXTRA_CA_BUNDLE on a pod unless it also mounts
+  # Mount/secret symmetry: the chart NEVER sets HORT_EXTRA_CA_BUNDLE on a
+  # pod unless it also mounts
   # the bundle on that pod. With NEITHER `configMapName` NOR
   # `secretName` set (the fully-manual recipe — e.g. a CSI-projected
   # ClusterTrustBundle), the chart mounts NOTHING and sets NO env: the
@@ -828,8 +827,8 @@ worker:
     # another worker re-claims the row.
     lockDurationSecs: 900
     trivy:
-      # HORT_SCANNER_TRIVY_ENABLED — load-bearing (Backlog 078 Item 6).
-      # When false, the worker does NOT register the Trivy backend, even
+      # HORT_SCANNER_TRIVY_ENABLED — load-bearing. When false, the worker
+      # does NOT register the Trivy backend, even
       # if the binary's `--version` probe would pass: the flag is the
       # enabling gate; the probe is a secondary health check that only
       # runs on flag-enabled backends. (Disabling BOTH backends is a
@@ -843,8 +842,8 @@ worker:
       # within the pod's lifetime.
       dbDir: /var/cache/trivy
     osv:
-      # HORT_SCANNER_OSV_ENABLED — load-bearing (Backlog 078 Item 6),
-      # same contract as trivy.enabled above.
+      # HORT_SCANNER_OSV_ENABLED — load-bearing; same contract as
+      # trivy.enabled above.
       enabled: true
       # HORT_SCANNER_OSV_BIN — path inside the container.
       binary: /usr/local/bin/osv-scanner
@@ -907,20 +906,19 @@ worker:
   #
   # `eventstore-archive`'s `seal_and_remove` appends a `StreamSealed`
   # tombstone to `admin-eventstore-retention` with NO internal wait
-  # bound. That is safe ONLY under the §10.2-INV single-flight
-  # precondition — at most one `seal_and_remove` in flight cluster-wide
-  # — which is delivered by three layers: the eventstore-archive
-  # CronJob's `concurrencyPolicy: Forbid`, the worker per-kind
-  # semaphore (concurrency=1), and the per-UTC-day idempotency key.
+  # bound. That is safe ONLY under the single-flight precondition — at
+  # most one `seal_and_remove` in flight cluster-wide — which is
+  # delivered by three layers: the eventstore-archive CronJob's
+  # `concurrencyPolicy: Forbid`, the worker per-kind semaphore
+  # (concurrency=1), and the per-UTC-day idempotency key.
   #
   # `lockTimeoutMs` is the connection-level backstop applied (via
   # `.after_connect`) to BOTH worker Postgres pools — the main pool and
   # the optional dedicated `hort_retention_role` retention pool. If the
   # single-flight precondition is ever violated (e.g. a manual
   # `hort-cli admin task invoke eventstore-archive` racing the CronJob),
-  # a contended row-lock wait degrades to the §10.2 fail-safe
-  # (`Err` → `errors += 1` → retried next sweep) instead of an
-  # unbounded sweep stall.
+  # a contended row-lock wait degrades gracefully (`Err` → `errors += 1`
+  # → retried next sweep) instead of an unbounded sweep stall.
   #
   # `lock_timeout`, NOT `statement_timeout`: it bounds only
   # lock-acquisition wait, so it fires on the pathological "blocked on
@@ -929,17 +927,14 @@ worker:
   # huge sealed audit stream is correct work).
   db:
     # HORT_WORKER_LOCK_TIMEOUT_MS — default 120000 (2 min). Generous on
-    # purpose: under §10.2-INV single-flight it must NEVER fire in
+    # purpose: under the single-flight invariant it must NEVER fire in
     # correct operation; a small value risks a false abort if
     # single-flight is ever deliberately relaxed.
     #
     # 0 disables the backstop (Postgres default; the composition root
     # skips the `SET lock_timeout` entirely). Only set 0 if you have an
     # alternative single-flight enforcement; doing so re-opens the
-    # unbounded-block failure mode this backstop covers. Relaxing any
-    # single-flight layer (this knob, `concurrencyPolicy: Allow`, a
-    # second `StreamSealed` emitter) requires F-2 co-review per
-    # §10.2-INV.
+    # unbounded-block failure mode this backstop covers.
     lockTimeoutMs: 120000
   # Exec-based liveness probe — the worker has no HTTP surface. The probe
   # invokes the worker binary's own `healthcheck` subcommand: the runtime
@@ -982,8 +977,8 @@ worker:
   # extraVolumes / extraVolumeMounts — worker-scoped equivalents of the
   # top-level keys (which apply to the server Deployment only).
   #
-  # Backlog 078 Item 7 — CA-bundle mount symmetry: you only need these
-  # for the FULLY-MANUAL trust recipe (neither `extraCaBundle.configMapName`
+  # CA-bundle mount symmetry: you only need these for the FULLY-MANUAL
+  # trust recipe (neither `extraCaBundle.configMapName`
   # nor `extraCaBundle.secretName` set — e.g. a CSI-projected
   # ClusterTrustBundle). In that case wire the volume + mount here AND on
   # the top-level `extraVolumes`/`extraVolumeMounts`, point
@@ -1017,14 +1012,13 @@ worker:
   # The ServiceAccountRotationHandler mints fresh PATs on a CronJob
   # cadence and writes them into operator-declared k8s Secrets.
   #
-  # Backlog 078 Item 9 (chart S4) — SINGLE-SOURCE TOGGLE. Fallback PAT
-  # rotation is enabled end-to-end by exactly ONE knob:
-  # `scheduledTasks.serviceAccountRotation.enabled`. That one flag drives
-  # BOTH the CronJob trigger AND the worker-side wiring (the
-  # KubernetesSecretWriter env block in templates/worker-deployment.yaml
-  # + the per-namespace RBAC in templates/svc-rotation-rbac.yaml). There
-  # is no separate `worker.rotation.enabled` switch any more — the
-  # pre-078 two-place switch (where forgetting one half silently
+  # SINGLE-SOURCE TOGGLE. Fallback PAT rotation is enabled end-to-end by
+  # exactly ONE knob: `scheduledTasks.serviceAccountRotation.enabled`. That
+  # one flag drives BOTH the CronJob trigger AND the worker-side wiring (the
+  # KubernetesSecretWriter env block in templates/worker-deployment.yaml + the
+  # per-namespace RBAC in templates/svc-rotation-rbac.yaml). There is no
+  # separate `worker.rotation.enabled` switch any more — the prior two-place
+  # switch (where forgetting one half silently
   # half-enabled rotation) has been collapsed. The keys under
   # `worker.rotation.*` below are PARAMETERS of that one toggle (which
   # namespaces to write into, what registry the dockerconfigjson points
@@ -1083,13 +1077,13 @@ worker:
 #           role: admin
 gitopsConfig: {}
 
-# -------------------- Scheduled tasks (Backlog 078 Item 8 — chart N1) --------------------
+# -------------------- Scheduled tasks --------------------
 # ALL periodic/scheduled tasks live under this single tree. Before 078 the
 # set was split by execution path: five DSN-direct tasks at the top level
 # and the admin-task-HTTP tasks nested under `cronJobs.*`. That leaked an
 # implementation detail (HOW a task is invoked) into the config-tree
-# *location*. Item 8 makes the execution path a per-task `executionPath`
-# attribute instead, so every task is found in one place.
+# *location*. Each task now carries a per-task `executionPath` attribute
+# instead, so every task is found in one place.
 #
 # Two execution paths (the `executionPath` attribute records which):
 #
@@ -1163,7 +1157,7 @@ scheduledTasks:
   # Default `false` — routine helm upgrades are idempotent (the
   # bootstrap Job's main container detects "token row exists in DB AND
   # Secret already exists in cluster" and exits 0 without writing
-  # anything; see F15). Set true once to rotate, then back to false.
+  # anything). Set true once to rotate, then back to false.
   #
   # Recovery from "DB row exists, plaintext lost (no Secret in
   # cluster)": set `rotateSvcToken: true` and re-run helm upgrade.
@@ -1181,9 +1175,9 @@ scheduledTasks:
   scrub:
     executionPath: dsn-direct
     # Whether to render the CronJob at all. Default true — the scrub is a
-    # cheap defence-in-depth backstop for at-rest corruption (M-5 carry-
-    # forward limitation: range-reads cannot be verified against a
-    # whole-object hash). Set false if an external integrity backstop
+    # cheap defence-in-depth backstop for at-rest corruption (range-reads
+    # cannot be verified against a whole-object hash). Set false if an
+    # external integrity backstop
     # already exists (e.g. ZFS scrub, S3 inventory + checksum batch job).
     enabled: true
     # Cron schedule. Default: daily at 03:00 UTC. Operators with
@@ -1221,12 +1215,12 @@ scheduledTasks:
   # Inserts ONE `kind='quarantine-release-sweep'` row into `public.jobs`
   # every tick using the RUNTIME DSN; the always-on worker picks it up
   # and runs `QuarantineReleaseSweepHandler`, which feeds the
-  # §2.5 candidacy query (one indexed range scan per distinct effective
-  # `ScanPolicy.quarantineDuration`) into the F-6 fail-closed
-  # `QuarantineUseCase::release_expired` (UNCHANGED).
+  # the candidacy query (one indexed range scan per distinct effective
+  # `ScanPolicy.quarantineDuration`) into `QuarantineUseCase::release_expired`
+  # (UNCHANGED).
   #
-  # Design rationale (§2.4 finding 2): this CronJob deliberately does
-  # NOT use the `hort-cli` admin-task HTTP path / svc-token chain — a
+  # This CronJob deliberately does NOT use the `hort-cli` admin-task HTTP
+  # path / svc-token chain — a
   # default-enabled sweep would otherwise drag the whole
   # `adminTasksEnabled` + `svc-token-bootstrap` Job machinery to
   # default-on. The runtime DSN is least-privilege (it owns nothing
@@ -1236,15 +1230,14 @@ scheduledTasks:
   # default scheduled path only.
   quarantineReleaseSweep:
     executionPath: dsn-direct
-    # Render the CronJob. **Default true.** Phase 1 ships the sweep
-    # ON by default; an operator who has not yet flipped Item 2's
-    # quarantine-by-default posture sees a no-op sweep until they
+    # Render the CronJob. **Default true.** An operator who has not yet
+    # configured quarantine-by-default sees a no-op sweep until they
     # configure a `ScanPolicy` with a non-zero `quarantineDuration`,
     # at which point the sweep is the ONLY path that releases those
     # artifacts (without it they strand in `Quarantined` indefinitely).
     enabled: true
-    # Cron schedule. Default: every 5 minutes (design §2.4 finding 3).
-    # Bounds both window-gate latency and how fast a
+    # Cron schedule. Default: every 5 minutes. Bounds both window-gate
+    # latency and how fast a
     # `quarantineDuration` policy change takes effect, on an hours-
     # scale window. Operators tightening below 5 minutes should also
     # tighten the 5-minute Idempotency-Key floor that the admin-task
@@ -1254,7 +1247,7 @@ scheduledTasks:
     schedule: "*/5 * * * *"
 
   # -- Prefetch scheduled tick ------------------------
-  # Periodic prefetch-tick CronJob (design §2.3 + §8). Inserts ONE
+  # Periodic prefetch-tick CronJob. Inserts ONE
   # `kind='prefetch-tick'` row into `public.jobs` every tick using the
   # RUNTIME DSN; the worker picks it up and runs `PrefetchTickHandler`,
   # which walks every repository whose `prefetch_policy.enabled = true`
@@ -1263,7 +1256,7 @@ scheduledTasks:
   # extracts the published version set via the format handler's
   # `extract_upstream_versions` (npm packument keys / cargo sparse-index
   # `vers` per line / pypi PEP 503 HTML or PEP 691 JSON), and invokes
-  # the Item-7 `PrefetchUseCase::plan` planner per tracked package.
+  # the `PrefetchUseCase::plan` planner per tracked package.
   #
   # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
   # umbrella. Manual operator invocation still works via the
@@ -1279,8 +1272,7 @@ scheduledTasks:
     # operator-control surface here is "do you want ticks at all", not
     # "are any repos opted in".
     enabled: false
-    # Cron schedule. Default: every 15 minutes. Design §2.3 calls
-    # prefetch jobs "low priority"; the cadence is conservative
+    # Cron schedule. Default: every 15 minutes. The cadence is conservative
     # compared to the quarantine-release-sweep 5-minute cadence (that
     # sweep has tighter window-gate latency needs). The 5-minute floor
     # on the chart's CronJob ladder still applies — tightening below it
@@ -1288,7 +1280,7 @@ scheduledTasks:
     schedule: "*/15 * * * *"
 
   # -- Prefetch-row retention sweep -----------------
-  # Periodic prefetch-row retention-sweep CronJob (design §9). Inserts
+  # Periodic prefetch-row retention-sweep CronJob. Inserts
   # ONE `kind='prefetch-row-retention-sweep'` row into `public.jobs`
   # every tick using the RUNTIME DSN; the worker picks it up and runs
   # `PrefetchRowRetentionSweepHandler`, which deletes terminal
@@ -1321,7 +1313,7 @@ scheduledTasks:
     schedule: "0 2 * * *"
 
   # -- Wheel-metadata backfill -----------------------------
-  # Periodic wheel-metadata-backfill CronJob (design §2.8). Inserts ONE
+  # Periodic wheel-metadata-backfill CronJob. Inserts ONE
   # `kind='wheel-metadata-backfill'` row into `public.jobs` every tick
   # using the RUNTIME DSN; the worker picks it up and runs
   # `WheelMetadataBackfillHandler`, which walks PyPI wheel artifacts
@@ -1423,14 +1415,14 @@ scheduledTasks:
     executionPath: admin-task
     enabled: false
     schedule: "0 3 * * *"
-  # retention-purge: the destructive §5 storage-GC walk. Refuses until
+  # retention-purge: the destructive storage-GC walk. Refuses until
   # the worker boot refcount-reconcile sweep converged. Daily, after
   # retention-evaluate.
   retentionPurge:
     executionPath: admin-task
     enabled: false
     schedule: "0 4 * * *"
-  # eventstore-archive: §4 audit-retention stream sweep (seal terminal
+  # eventstore-archive: audit-retention stream sweep (seal terminal
   # / age-gated streams past the configured retention floor, via the
   # StreamSealed tombstone chokepoint). Weekly (Sunday) — lowest frequency.
   eventstoreArchive:
@@ -1444,8 +1436,8 @@ scheduledTasks:
   # `ServiceAccountRotationHandler`, which mints and writes fresh PATs
   # into the operator-declared target Secrets.
   #
-  # Backlog 078 Item 9 (chart S4) — this `enabled` flag is the SINGLE
-  # source of truth for fallback PAT rotation. Flipping it true (with
+  # This `enabled` flag is the SINGLE source of truth for fallback PAT
+  # rotation. Flipping it true (with
   # the `adminTasksEnabled` umbrella, which the schema requires) drives
   # BOTH this CronJob trigger AND the worker-side wiring
   # (templates/worker-deployment.yaml rotation env + the per-namespace
@@ -1466,14 +1458,14 @@ scheduledTasks:
   # -- Event-chain checkpoint -----------------------------
 
   # Event-chain checkpoint emission: trigger the worker's
-  # `EventstoreCheckpointHandler`, which assembles the spec §6.2 signed
-  # checkpoint, Ed25519-signs it, and S3-Object-Lock-WORM-anchors it —
-  # closing the external-anchor half of F-2 so `verify-event-chain`
-  # attests anchoring instead of `missing_checkpoint`.
+  # `EventstoreCheckpointHandler`, which assembles a signed checkpoint,
+  # Ed25519-signs it, and S3-Object-Lock-WORM-anchors it — so
+  # `verify-event-chain` attests anchoring instead of
+  # `missing_checkpoint`.
   #
   # The worker side ALSO requires S3 storage +
   # `HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE` (operator Ed25519 PKCS#8
-  # private key, §14 R2) + `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE` (matching
+  # private key) + `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE` (matching
   # SPKI public key), and the anchor bucket MUST be created with S3
   # Object Lock enabled + a COMPLIANCE-mode default retention (object_store
   # cannot set per-object retention on PUT — WORM is the bucket default;
@@ -1482,20 +1474,19 @@ scheduledTasks:
   eventstoreCheckpoint:
     executionPath: admin-task
     enabled: false
-    # Default cadence — hourly (spec §6.3 / §14 R6: bounds the
-    # worst-case undetected whole-stream-truncation/rollback window to
-    # ≤ 1h, well inside NIS2 Art. 23 incident-reporting horizons).
-    # Operators with a tighter compliance window may shorten it.
+    # Default cadence — hourly. Bounds the worst-case undetected
+    # whole-stream-truncation/rollback window to ≤ 1h, well inside
+    # NIS2 Art. 23 incident-reporting horizons. Operators with a
+    # tighter compliance window may shorten it.
     schedule: "0 * * * *"
 
   # -- Replay-guard seen-set TTL cleanup ---------------
 
   # Replay-seen prune: trigger the worker's `ReplaySeenPruneHandler`,
   # which runs one `DELETE FROM jwt_replay_seen WHERE expires_at <
-  # now()` tick — the periodic delete-expired cleanup the F-1 spec §4
-  # selected over delete-on-write / DB-side TTL.
+  # now()` tick — the periodic delete-expired cleanup.
   #
-  # DEFAULT-ENABLED (spec §12 R4) — the *only* admin-task CronJob template
+  # DEFAULT-ENABLED — the *only* admin-task CronJob template
   # in this chart that defaults to `true`. Justified divergence from
   # The default-disabled `hort_svc_*` admin-task convention: a never-pruned
   # `jwt_replay_seen` is a pure storage-growth liability and the prune
@@ -1517,16 +1508,16 @@ scheduledTasks:
   replaySeenPrune:
     executionPath: admin-task
     enabled: true
-    # Default cadence — hourly (spec §4: "interval ≈ the federation max
-    # (hourly)"; the table grows by one row per distinct federated
-    # exchange per hour, so an hourly prune keeps it bounded). The
+    # Default cadence — hourly (the table grows by one row per distinct
+    # federated exchange per hour, so an hourly prune keeps it bounded).
+    # The
     # 5-minute Idempotency-Key window floor (see section header)
     # applies here too.
     schedule: "0 * * * *"
 
   # -- Event-chain verifier -------------------------------------
 
-  # Event-chain verifier: run the F-2 offline tamper-evidence verifier
+  # Event-chain verifier: run the offline tamper-evidence verifier
   # `hort-server verify-event-chain --format json`, which recomputes every
   # event stream's per-stream hash chain and cross-checks it against the
   # externally-anchored checkpoints, and records a liveness breadcrumb on
@@ -1539,7 +1530,7 @@ scheduledTasks:
   # object store), not a worker `TaskHandler`. It reuses the standard
   # runtime env (HORT_DATABASE_URL + storage) and needs no svc-token PAT.
   #
-  # The boot-time `hort_event_chain_verify_overdue` gauge (F-52) reads the
+  # The boot-time `hort_event_chain_verify_overdue` gauge reads the
   # newest completed run and flips to 1 when none is within
   # `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS ×
   # HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` (defaults 86400 s × 3),
@@ -1553,7 +1544,7 @@ scheduledTasks:
   verifyEventChain:
     executionPath: admin-task
     enabled: false
-    # Default cadence — daily, matching the F-52 boot gauge's
+    # Default cadence — daily, matching the boot gauge's
     # HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS default (86400 s).
     # Operators with a tighter compliance window may shorten both in
     # lock-step.

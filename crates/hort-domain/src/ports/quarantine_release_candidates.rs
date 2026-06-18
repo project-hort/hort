@@ -17,14 +17,13 @@
 //! WHERE quarantine_status='quarantined'` supports
 //! the range scan.
 //!
-//! **Authority discipline.** The candidacy query
-//! filters by the *computed* window deadline only. It is **never**
-//! evidence of release authority — `QuarantineUseCase::release_expired`
-//! enforces the F-6 fail-closed predicate (`ScanSucceeded` /
-//! `ScanWaived`) per artifact and skips candidates that lack one. A
-//! window-expired candidate with no clean scan stays quarantined; the
-//! sweep loop continues. See `release_expired` (~L979 of
-//! `crates/hort-app/src/use_cases/quarantine_use_case.rs`) for the
+//! **Authority discipline.** The candidacy query filters by the *computed*
+//! window deadline only. It is **never** evidence of release authority —
+//! `QuarantineUseCase::release_expired` enforces the fail-closed release
+//! predicate (`ScanSucceeded` / `ScanWaived`) per artifact and skips
+//! candidates that lack one. A window-expired candidate with no clean scan
+//! stays quarantined; the sweep loop continues. See `release_expired` in
+//! `crates/hort-app/src/use_cases/quarantine_use_case.rs` for the
 //! per-artifact authority resolution.
 
 use uuid::Uuid;
@@ -48,7 +47,7 @@ pub struct QuarantineReleaseCandidate {
     pub artifact_id: Uuid,
 }
 
-/// Outbound port for the §2.4 candidacy query.
+/// Outbound port for the quarantine-release candidacy query.
 ///
 /// The Postgres adapter implements this by:
 ///
@@ -65,8 +64,7 @@ pub struct QuarantineReleaseCandidate {
 ///    `repository_id = ANY($repos_for_D)` AND
 ///    `quarantine_status = 'quarantined'` AND `is_deleted = false`).
 /// 4. Union-ing the per-duration result sets and applying the
-///    global `LIMIT $batch_size` (the handler pins this — design
-///    §2.4 / Item 1b acceptance — to bound per-tick load).
+///    global `LIMIT $batch_size` to bound per-tick load.
 pub trait QuarantineReleaseCandidatesRepository: Send + Sync {
     /// Return up to `batch_size` quarantined artifacts whose computed
     /// per-repo deadline `quarantine_window_start + effective_duration`

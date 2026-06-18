@@ -152,8 +152,8 @@ fires.
 Gateway-API mechanism for re-encrypting traffic to backend pods. For
 v2 it is **not applicable** — the binary does not terminate TLS in
 itself; in-binary TLS is deferred.
-`BackendTLSPolicy` becomes relevant once a future "in-binary
-TLS" initiative ships and the chart's Service grows an HTTPS port.
+`BackendTLSPolicy` becomes relevant once a future "in-binary TLS"
+change ships and the chart's Service grows an HTTPS port.
 Until then, the Gateway terminates and forwards HTTP plaintext.
 
 ### Pitfalls

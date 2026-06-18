@@ -1,5 +1,5 @@
 # Minimal-OIDC test values. Used for `helm template` smoke and the
-# Item 11 kind-cluster verification. Single replica, filesystem PVC,
+# kind-cluster verification. Single replica, filesystem PVC,
 # memory ephemeral store, OIDC against a placeholder Keycloak realm.
 publicBaseUrl: https://hort.example.com
 

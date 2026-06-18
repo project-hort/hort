@@ -573,10 +573,9 @@ right uid.
 
 ### 3.1 Trailing-newline rule
 
-The file adapter strips exactly one trailing `\n` or `\r\n` (design
-doc §5.2). Multi-line secrets retain their interior newlines; only
-the final one is removed. The strip is byte-level — secrets need
-not be valid UTF-8.
+The file adapter strips exactly one trailing `\n` or `\r\n`. Multi-line
+secrets retain their interior newlines; only the final one is removed.
+The strip is byte-level — secrets need not be valid UTF-8.
 
 How tools differ when writing the underlying file:
 

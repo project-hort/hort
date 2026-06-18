@@ -90,18 +90,18 @@ spec:
             - --permission=admin_task_invoke
             - --output=file:/run/bootstrap/token
             {{- if .Values.scheduledTasks.rotateSvcToken }}
-            # F15 Option B (scheduledTasks.rotateSvcToken=true): operator
-            # requested rotation. issue-svc-token revokes the existing
-            # token + mints a new one + writes the plaintext to the
-            # output file. write-secret then updates the cluster Secret
-            # with the fresh value. Routine upgrades leave this off and
-            # rely on the write-secret idempotent path (F15 Option A).
+            # scheduledTasks.rotateSvcToken=true: operator requested
+            # rotation. issue-svc-token revokes the existing token +
+            # mints a new one + writes the plaintext to the output file.
+            # write-secret then updates the cluster Secret with the
+            # fresh value. Routine upgrades leave this off and rely on
+            # the write-secret idempotent path.
             - --rotate
             {{- end }}
           env:
-            # Backlog 078 Item 5 — canonical HORT_DATABASE_URL (the binary
-            # falls back to bare DATABASE_URL for sqlx-cli / Tier-2 / 12-factor).
-            # Only the env-var NAME changed; the admin-secret reference is unchanged.
+            # Canonical HORT_DATABASE_URL (the binary falls back to bare
+            # DATABASE_URL for sqlx-cli / Tier-2 / 12-factor). The
+            # admin-secret reference is unchanged.
             - name: HORT_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -128,7 +128,7 @@ spec:
             - /bin/sh
             - -c
             - |
-              # F15 Option A — tolerate the idempotent issue-svc-token skip path.
+              # Tolerate the idempotent issue-svc-token skip path.
               #
               # issue-svc-token exits 0 WITHOUT writing the output file when the
               # token row already exists in the database and --rotate was not
@@ -138,7 +138,7 @@ spec:
               # was created at first install, and there is nothing to do.
               #
               # Without this branch, the post-upgrade hook fails on every
-              # subsequent upgrade with "no such file or directory" — see F15.
+              # subsequent upgrade with "no such file or directory".
               set -eu
               SECRET={{ include "hort-server.fullname" . }}-svc-token
               if [ ! -f /run/bootstrap/token ]; then

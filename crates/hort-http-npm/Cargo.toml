@@ -60,6 +60,5 @@ mime                        = "0.3"
 tower                       = { workspace = true }
 arc-swap                    = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-# Item 3: tracing-warn capture test for the stale-while-error branch;
-# mirrors the PyPI crate's adoption in 17.2 Item 6.
+# Tracing-warn capture test for the stale-while-error branch.
 tracing-subscriber          = { workspace = true }

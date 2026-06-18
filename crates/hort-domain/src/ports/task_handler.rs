@@ -50,7 +50,7 @@ pub struct TaskContext {
 
 /// Outcome of a single [`TaskHandler::run`] invocation.
 ///
-/// Serialised to `jobs.result_summary JSONB` by the dispatcher (Item 12).
+/// Serialised to `jobs.result_summary JSONB` by the dispatcher.
 /// The `#[serde(tag = "outcome")]` discriminant makes the DB row self-describing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -138,7 +138,7 @@ mod tests {
     use crate::ports::jobs_repository::JobRow;
 
     // -----------------------------------------------------------------------
-    // Dyn-compatibility compile check (Item 2 acceptance criterion)
+    // Dyn-compatibility compile check
     // -----------------------------------------------------------------------
 
     fn _task_handler_is_dyn_compatible() {

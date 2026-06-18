@@ -5,7 +5,7 @@
 //! `PolicyCreated` / `PolicyUpdated` / `PolicyArchived` domain events.
 //! This module supplies only the schema + per-envelope validation;
 //! the `ApplyEventSourcedKind` trait that owns the diff-and-emit
-//! machinery lives in Item 14b-8.
+//! machinery lives in a separate crate.
 //!
 //! See `docs/architecture/how-to/declare-gitops-config.md` for the
 //! canonical YAML.
@@ -489,7 +489,7 @@ mod tests {
     fn parse_round_trips_provenance_mode_off_with_empty_backends() {
         // mode: off is the only state that legitimately carries empty
         // backends; the per-spec validator does not reject the shape
-        // (the mode↔backends combination rule is the Item-5 apply linter).
+        // (the mode↔backends combination rule is enforced by the apply linter).
         let body = "
   scope: global
   severityThreshold: high

@@ -13,7 +13,7 @@
 //! # Load-bearing design constraints
 //!
 //! Two constraints shape this module and MUST NOT be relaxed without
-//! amending the relevant design doc:
+//! revisiting the architecture decision:
 //!
 //! 1. **No silent substitution.** A quarantined-new OCI manifest is
 //!    NEVER served as a stand-in for the previous tag target. The
@@ -639,7 +639,7 @@ mod tests {
 
     /// Divergence between held and upstream digests → counter ticks
     /// with `trigger=on_dist_tag_move` and the repository key.
-    /// Mirrors Item 7 (npm/cargo) + Item 7b (pypi) metric assertions.
+    /// Divergence between held and upstream digests → counter ticks.
     #[test]
     fn divergent_upstream_digest_emits_on_dist_tag_move_counter() {
         let recorder = DebuggingRecorder::new();
@@ -833,7 +833,7 @@ mod tests {
         // The four read-path source files. The write paths
         // (`manifests_write.rs`, `uploads.rs`) are out of scope —
         // index-mode is a *serve* concept and a write-path mention
-        // would be just as wrong but not part of the §2.5 surface.
+        // would be just as wrong but is out of scope for this guard.
         let read_path_files: &[(&str, &str)] = &[
             ("manifests.rs", include_str!("manifests.rs")),
             ("blobs.rs", include_str!("blobs.rs")),
@@ -860,7 +860,7 @@ mod tests {
     }
 
     /// Strip Rust `//`-line and `/* … */`-block comments from `src`
-    /// for the purposes of the §2.5 guardrail scan. NOT a complete
+    /// for the purposes of the index-mode guardrail scan. NOT a complete
     /// Rust lexer — does not handle string literals, raw strings, or
     /// nested block comments correctly. For the constrained
     /// keyword-presence scan here those edge cases don't matter:

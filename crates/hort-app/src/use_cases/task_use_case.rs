@@ -40,7 +40,7 @@
 //! The `EventStore` port does not expose a way to share a `sqlx` transaction
 //! with the `JobsRepository` port. The honest v1 contract is therefore:
 //! insert the row → append the event. Failure of the append triggers a
-//! compensating delete (best-effort). A future initiative that adds shared-
+//! compensating delete (best-effort). A future change that adds shared-
 //! transaction support to the event-store port can replace this with a true
 //! atomic two-phase write.
 
@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(calls[0].actor_id, Some(actor.user_id));
         assert!(
             calls[0].idempotency_key.is_none(),
-            "Item 1: non-destructive caller passes None"
+            "non-destructive caller passes None"
         );
 
         // Event store received exactly one TaskInvoked on Authorization stream.
@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(events.append_calls().len(), 1);
     }
 
-    // -- B10: F-9 Part 3 — destructive-kind TaskInvoked audit-stream routing --
+    // -- Destructive-kind TaskInvoked audit-stream routing --
 
     /// `task_audit_stream`: each of the three destructive kinds — the
     /// closed `DESTRUCTIVE_TASK_KINDS` set from the domain helper — routes
@@ -1323,12 +1323,12 @@ mod tests {
             "use case must pass through the Duplicate outcome verbatim"
         );
 
-        // TaskInvoked IS emitted on the Duplicate branch (Item 2).
+        // TaskInvoked IS emitted on the Duplicate branch.
         let append_calls = events.append_calls();
         assert_eq!(
             append_calls.len(),
             1,
-            "Duplicate branch must emit TaskInvoked (Item 2)"
+            "Duplicate branch must emit TaskInvoked"
         );
         let batch = &append_calls[0].batch;
         let DomainEvent::TaskInvoked(payload) = &batch.events[0].event else {

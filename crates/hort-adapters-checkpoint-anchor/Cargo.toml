@@ -32,8 +32,8 @@ chrono = { workspace = true }
 hex = { workspace = true }
 
 # Detached-signature verification with the operator-provisioned anchor
-# public key (spec §6.2 `signature`, §14 R2). Ed25519, PEM SPKI public
-# key — same primitive + parsing path as `hort-app::oci_token_signing`.
+# public key. Ed25519, PEM SPKI public key — same primitive + parsing
+# path as `hort-app::oci_token_signing`.
 ed25519-dalek = { workspace = true }
 
 thiserror = { workspace = true }

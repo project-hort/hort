@@ -35,7 +35,7 @@
 # This test is intentionally NOT CI-required: the existing CI lane doesn't
 # have a kind cluster, and the runtime budget exceeds the smoke-profile
 # target. It exists for local operator verification and for a future
-# hardening initiative that adds kind to CI.
+# addition of kind to CI.
 #
 # Per CLAUDE.md memory rule: host ports in the 25xxx range.
 
@@ -589,7 +589,7 @@ worker:
     repository: ${HORT_WORKER_IMAGE_REPO}
     tag: ${HORT_WORKER_IMAGE_TAG}
     pullPolicy: Never
-  # Backlog 078 Item 9 (chart S4): rotation is enabled by the SINGLE
+  # Rotation is enabled by the SINGLE
   # toggle scheduledTasks.serviceAccountRotation.enabled (below). There
   # is no worker.rotation.enabled any more — worker.rotation.* carries
   # only the worker-side PARAMETERS.

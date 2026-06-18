@@ -21,7 +21,7 @@
 //! Mirrors the closed-set walker shape from
 //! `crates/hort-server/tests/task_use_case_enqueue_real_db.rs:154,165-185`
 //! (the `VALID_TASK_KINDS` walker) but stays at the HTTP layer (mocked
-//! ports — no real DB) because Item 2's contract is between the handler
+//! ports — no real DB) because the contract here is between the handler
 //! and the use-case port, not between the use case and Postgres.
 //!
 //! # What this does NOT guard
@@ -209,9 +209,9 @@ async fn destructive_kinds_carry_db_idempotency() {
         assert!(
             acceptable_keys.iter().any(|k| k == key.as_str()),
             "destructive kind {kind:?}: key shape mismatch. Expected one of {acceptable_keys:?}, \
-             got {key_str:?}. The shape `cron:<kind>:<YYYY-MM-DD>` is required by design §3.4 — \
-             distinct from the client's `<window>:<kind>` shape so the Redis and DB layers \
-             cannot collide on a key.",
+             got {key_str:?}. The shape `cron:<kind>:<YYYY-MM-DD>` is required \
+             to be distinct from the client's `<window>:<kind>` shape so the \
+             Redis and DB layers cannot collide on a key.",
             key_str = key.as_str(),
         );
     }
@@ -259,8 +259,7 @@ async fn invoke_noop_passes_none_db_idempotency_key() {
 
 /// On `EnqueueOutcome::Duplicate { existing_job_id }`, the handler
 /// returns 200 + `task_job_id == existing_job_id` and emits the same
-/// `result="ok"` metric the Redis fast-path hit produces. Pins the
-/// per design §2 decision 6 + §5 shape — the DB-layer dedup is
+/// `result="ok"` metric the Redis fast-path hit produces. The DB-layer dedup is
 /// semantically equivalent to a Redis cache-hit from the operator's
 /// perspective; only the audit log distinguishes them
 /// (`TaskInvoked.duplicate_of = Some(_)`).

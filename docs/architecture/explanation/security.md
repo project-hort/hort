@@ -239,8 +239,7 @@ walks the comma-separated `X-Forwarded-For` header **right-to-left**
 and returns the rightmost hop that is **not** in the trusted-CIDRs
 allowlist (`rightmost_untrusted_forwarded_for` in
 `crates/hort-http-core/src/middleware/trust.rs`). The naive "leftmost"
-reading is forgeable — any client can prepend an arbitrary IP — and
-was the original M-A3 finding. The rightmost-untrusted reading walks
+reading is forgeable — any client can prepend an arbitrary IP. The rightmost-untrusted reading walks
 the proxy chain backwards and stops at the first hop your trust
 configuration says could be a client, which is the only honest
 answer when the chain length isn't fixed. CIDR membership uses

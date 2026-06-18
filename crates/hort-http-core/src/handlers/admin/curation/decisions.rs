@@ -5,7 +5,7 @@
 //! layer optionally collapses correlated rows server-side via the
 //! `?by_correlation=true` flag.
 //!
-//! Query parameters (design §2.7 + §2.9):
+//! Query parameters:
 //! - `type` — one of `waive | block | exclude_finding | unexclude_finding`
 //!   (closed set). Invalid value → 400.
 //! - `actor` — actor user_id (UUID); the use case forwards verbatim.
@@ -19,11 +19,11 @@
 //! - `limit` — 1..=500. Default 100. Invalid range → 400.
 //! - `by_correlation` — bool. When `true`, the handler groups the port's
 //!   one-row-per-event result by `correlation_id` and emits ONE rollup
-//!   DTO per group (operator surface — design §2.9 "collapses
-//!   correlated events into the operator's intent"). Default `false`
-//!   (events-first; matches the audit-log mental model).
+//!   DTO per group (operator surface — "collapses correlated events into
+//!   the operator's intent"). Default `false` (events-first; matches the
+//!   audit-log mental model).
 //!
-//! Status-code map (design §3):
+//! Status-code map:
 //! - `200 OK` — body is [`CurationDecisionsResponseDto`]
 //! - `400 Bad Request` — any param fails validation (closed-set,
 //!   UUID, RFC-3339, limit window)
@@ -33,19 +33,19 @@
 //!
 //! # `by_correlation` rollup shape
 //!
-//! The design §2.7/§2.9 does not pin the exact rollup shape — it names
-//! the affordance ("collapses correlated events into the curator's
-//! intent") and lists candidate fields. We pick the **low-payload**
+//! The rollup shape is not externally pinned — the affordance is
+//! "collapses correlated events into the curator's intent". We pick
+//! the **low-payload**
 //! shape (one rollup DTO per `correlation_id`, no inner event list)
 //! because:
 //!
-//! 1. The task spec leans this way ("lean toward 'one DTO per group
+//! 1. The design leans this way ("lean toward 'one DTO per group
 //!    with metadata + a count, not the underlying event list' for low
 //!    payload size").
 //! 2. Operator tooling that needs the events drills in via
 //!    `?by_correlation=false` on the same endpoint with a matching
 //!    filter — there's no information loss, just deferral.
-//! 3. The shared-justification invariant (Item 5: every event in a
+//! 3. The shared-justification invariant (every event in a
 //!    `VersionList` block carries the SAME justification) means a
 //!    single string suffices; rolling up does not lose audit content.
 //!
@@ -137,22 +137,22 @@ pub struct CurationDecisionRowDto {
     pub occurred_at: DateTime<Utc>,
 }
 
-/// Wire-format per-correlation-group rollup row (Item 10 design
-/// choice — see module docs for the shape rationale).
+/// Wire-format per-correlation-group rollup row (see module docs for
+/// the shape rationale).
 ///
 /// Fields:
 /// - `correlation_id` — shared across every event in the group
 /// - `kind` — taken from the first event in the group; in practice
 ///   every event in a single `VersionList` block has the same kind
-///   (Item 5 invariant: the bulk call emits only `ArtifactRejected`)
-/// - `actor_id` — taken from the first event in the group; Item 5
-///   ensures one actor per correlation
+///   (the bulk call emits only `ArtifactRejected`)
+/// - `actor_id` — taken from the first event in the group (one actor
+///   per correlation)
 /// - `event_count` — number of events grouped under this correlation
 /// - `first_occurred_at` / `last_occurred_at` — temporal span of the
 ///   group (typically tightly clustered for a `VersionList` block,
 ///   but the rollup preserves the range)
-/// - `justification` — shared across the group (Item 5 invariant —
-///   every event in a `VersionList` call carries the same string)
+/// - `justification` — shared across the group (every event in a
+///   `VersionList` call carries the same string)
 #[derive(Debug, Serialize)]
 pub struct CurationDecisionGroupDto {
     pub correlation_id: Uuid,
@@ -630,7 +630,7 @@ mod tests {
         crate::error::assert_no_internal_leakage(StatusCode::INTERNAL_SERVER_ERROR, &bytes);
     }
 
-    /// **Load-bearing rollup test (task spec).** `by_correlation=true`
+    /// **Load-bearing rollup test.** `by_correlation=true`
     /// collapses two events sharing a `correlation_id` into ONE group
     /// DTO carrying `event_count = 2` and the temporal span. Two
     /// events with DISTINCT correlation_ids stay in separate groups.

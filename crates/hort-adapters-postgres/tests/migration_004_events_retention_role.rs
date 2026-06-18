@@ -9,12 +9,12 @@
 //! - blocks **UPDATE for every role** (including `hort_retention_role`),
 //! - blocks **DELETE for every role except `current_user =
 //!   'hort_retention_role'`** — an **exact `current_user` match, NOT a
-//!   membership test**. This exact-match is Option B's defining
-//!   property: the exemption is maximally narrow, reachable only via an
-//!   explicit, transaction-scoped role assumption.
+//!   membership test**. This exact-match is the defining property: the
+//!   exemption is maximally narrow, reachable only via an explicit,
+//!   transaction-scoped role assumption.
 //!
-//! Option B consequence (the production pattern these tests pin): a
-//! runtime/test connection logs in as a *member* of `hort_retention_role`.
+//! Production pattern (which these tests pin): a runtime/test connection
+//! logs in as a *member* of `hort_retention_role`.
 //! A bare member `DELETE FROM events` (no role assumption) has
 //! `current_user` = the login user, **not** `'hort_retention_role'`, so
 //! the trigger still refuses it — that least-privilege property is
@@ -27,11 +27,10 @@
 //! (`004_events.sql:313-314`), the retention-DSN login user must be a
 //! member of BOTH `hort_app_role` (the tombstone `append_with_conn`
 //! INSERT) AND `hort_retention_role` (the `SET LOCAL ROLE`'d DELETE). This
-//! is an operator-provisioning fact (design §10.2); the both-membership
-//! helper below documents it.
+//! is an operator-provisioning fact; the both-membership helper below
+//! documents it.
 //!
-//! This is the single most security-sensitive edit in B9 (co-reviewed
-//! with the F-2 owner), so the contract is pinned with explicit tests:
+//! The contract is pinned with explicit tests:
 //!
 //! 1. `hort_app_role_member_cannot_delete_events` — a non-superuser
 //!    member of `hort_app_role` (the runtime role) attempting
@@ -53,7 +52,7 @@
 //!    the **preserved least-privilege invariant**: a member of
 //!    `hort_retention_role` running `DELETE FROM events` **without**
 //!    `SET ROLE` is STILL refused (`current_user` = the login user ≠
-//!    `'hort_retention_role'`). Option B intentionally keeps this
+//!    `'hort_retention_role'`). The design intentionally keeps this
 //!    forbidden.
 //!
 //! Tier-2 (DB) only — every test early-returns when `DATABASE_URL` is
@@ -116,7 +115,7 @@ async fn admin_pool() -> Option<PgPool> {
 /// `SET LOCAL ROLE`'d DELETE) — `hort_retention_role` alone has no INSERT
 /// (`004_events.sql:314`), so a single-role grant cannot exercise the
 /// real seal path. This two-membership requirement is the
-/// operator-provisioning contract documented in design §10.2.
+/// operator-provisioning contract (both memberships required).
 async fn create_user(admin: &PgPool, roles: &[&str]) -> (String, String) {
     let suffix = Uuid::new_v4().simple().to_string();
     let user = format!("hort_test_b9_{suffix}");
@@ -408,10 +407,10 @@ async fn set_role_member_can_delete_events() {
         return;
     };
     let stream_id = seed_event(&admin).await;
-    // BOTH memberships: the operator-provisioning contract (design
-    // §10.2). hort_app_role would carry the tombstone INSERT in the real
-    // seal; hort_retention_role is what makes `current_user` the role
-    // after SET ROLE so the (unchanged) trigger lets the DELETE through.
+    // BOTH memberships: the operator-provisioning contract.
+    // hort_app_role would carry the tombstone INSERT in the real seal;
+    // hort_retention_role is what makes `current_user` the role after
+    // SET ROLE so the (unchanged) trigger lets the DELETE through.
     let (user, password) = create_user(&admin, &["hort_app_role", "hort_retention_role"]).await;
 
     let mut conn = PgConnection::connect(
@@ -461,9 +460,9 @@ async fn set_role_member_can_delete_events() {
 
 // ---------------------------------------------------------------------------
 // 5. The preserved least-privilege invariant: a bare member of
-//    hort_retention_role that does NOT SET ROLE is STILL refused. Option B
-//    intentionally keeps the trigger exemption an exact `current_user`
-//    match, not a membership test.
+//    hort_retention_role that does NOT SET ROLE is STILL refused. The
+//    design intentionally keeps the trigger exemption an exact
+//    `current_user` match, not a membership test.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -486,7 +485,7 @@ async fn bare_hort_retention_role_member_cannot_delete_without_set_role() {
     // No SET ROLE: `current_user` is the login user, NOT
     // 'hort_retention_role'. The (unchanged) trigger function checks an
     // EXACT match, so it raises P0001 here — this is the least-privilege
-    // property Option B preserves on purpose.
+    // property the design preserves.
     let err = sqlx::query("DELETE FROM events WHERE stream_id = $1")
         .bind(&stream_id)
         .execute(&mut conn)
@@ -566,8 +565,8 @@ async fn e2e_seal_and_remove_both_memberships_succeeds_and_tombstones() {
     let Some(admin) = admin_pool().await else {
         return;
     };
-    // The retention-DSN login user: BOTH memberships, per the §10.2
-    // operator-provisioning contract.
+    // The retention-DSN login user: BOTH memberships are required
+    // (operator-provisioning contract).
     let (user, password) = create_user(&admin, &["hort_app_role", "hort_retention_role"]).await;
     let url = user_url(&admin, &user, &password)
         .await

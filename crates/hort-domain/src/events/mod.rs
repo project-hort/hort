@@ -132,7 +132,7 @@ pub enum StreamCategory {
     /// other variant that fits. `User` is the smallest
     /// well-justified deviation: it mirrors `Admin`'s shape (one
     /// stream per `users.id`), keeps every other category distinct,
-    /// and is required by the B7 events `ApiTokenIssued` /
+    /// and is required by the `ApiTokenIssued` /
     /// `ApiTokenRevoked` (token-owner stream) and
     /// `ApiTokenIssuanceDenied` (requesting-actor stream).
     User,
@@ -169,7 +169,7 @@ pub enum StreamCategory {
     /// `"artifact_group"` / `"download_audit"` / `"token_use"`.
     /// [`StreamId::retention_policy`] produces one stream per
     /// retention-policy id. Carries
-    /// [`DomainEvent::RetentionPolicyChanged`] (B1's
+    /// [`DomainEvent::RetentionPolicyChanged`] (the
     /// `RetentionPolicyEvent` `Created` / `Updated` / `Archived` /
     /// `Evaluated`). A **dedicated** category, NOT a reuse of
     /// [`Self::Policy`] (scan-policy): retention and scan policy are a
@@ -198,8 +198,8 @@ impl StreamCategory {
     /// — `hort-http-events` depends on `hort-app`, so the reverse import
     /// would be a circular crate dependency *and* an
     /// application→inbound-adapter layering inversion. Drift between
-    /// the events-read gate and the subscription gate IS the F-3 bug
-    /// class; with one definition there is nothing to drift.
+    /// the events-read gate and the subscription gate is the bug class
+    /// this single definition prevents.
     /// `hort-http-events::category_requires_admin` is now a thin
     /// delegator to this method (pinned by a delegation test).
     ///
@@ -226,13 +226,13 @@ impl StreamCategory {
             // not apply (the whole stream is one repo's pull history,
             // but the read gate is admin-only audit access).
             | StreamCategory::DownloadAudit
-            // B13: a token-use stream is the per-token credential-
+            // A token-use stream is the per-token credential-
             // exercise history — reading or subscribing to it is a
             // privileged audit operation, grouped with AuthAttempts /
             // User / DownloadAudit (no per-event repo scope: token use
             // has no repository association).
             | StreamCategory::TokenUse
-            // B6: a retention-policy stream is RBAC/policy-mutation
+            // A retention-policy stream is RBAC/policy-mutation
             // history (predicate + scope changes that govern
             // destructive GC) — grouped with Policy / Authorization /
             // Admin. Reading or subscribing to it is a privileged
@@ -277,7 +277,7 @@ impl StreamId {
     ///
     /// Used by `RetentionPolicyUseCase` (the gitops-authored
     /// create/update/archive path) to append
-    /// [`DomainEvent::RetentionPolicyChanged`] (B1's
+    /// [`DomainEvent::RetentionPolicyChanged`] (the
     /// `RetentionPolicyEvent`) under a per-policy stream. The wire
     /// form is `"retention_policy-<uuid>"`; the underscore in the
     /// category prefix keeps `StreamId::FromStr`'s `split_once('-')`
@@ -406,7 +406,7 @@ impl StreamId {
     /// the OID namespace, so the same global stream id resolves
     /// across replicas and restarts. The wire form is therefore
     /// `authorization-<uuid>`, with the canonical "authz:gitops"
-    /// shorthand from design §2.1 corresponding to this single id.
+    /// shorthand corresponding to this single id.
     ///
     /// Used by `ApplyConfigUseCase::apply_claim_mappings` /
     /// `apply_permission_grants` to append `ClaimMappingApplied` /
@@ -423,7 +423,7 @@ impl StreamId {
         }
     }
 
-    /// F-2 `StreamSealed` / F-9 Part-3 destructive-task audit-meta stream.
+    /// `StreamSealed` / destructive-task audit-meta stream.
     /// Stable v5-derived UUID over a fixed label — same shape as the
     /// shipped `StreamId::authorization()` / daily-rotation ctors.
     /// Wire form: `admin-<stable-uuid>`.
@@ -685,7 +685,7 @@ impl fmt::Display for InternalActor {
 ///
 /// Like the other actor structs in this module, `GitOpsActor` does
 /// **not** derive `Deserialize` — actors are server-constructed in
-/// `hort-app::ApplyConfigUseCase` (Item 8), never read from API input.
+/// `hort-app::ApplyConfigUseCase`, never read from API input.
 /// The persisted-storage round-trip goes through
 /// [`Actor::from_persisted_gitops`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -816,7 +816,7 @@ pub fn timer_actor() -> Actor {
 /// Create a RetentionScheduler actor for the
 /// retention task handlers (`RetentionEvaluateHandler` /
 /// `RetentionPurgeHandler` `ArtifactExpired` / `ArtifactPurged`
-/// appends + the F-9 destructive-task audit).
+/// appends + the destructive-task audit).
 ///
 /// Same security model as [`system_actor`]: the sealed
 /// [`InternalActorToken`] is the controlled construction surface; an

@@ -146,7 +146,7 @@ e.g. `"0.1"` on an hourly schedule, then keep a weekly full sweep
 event, no `ScrubReport` line — so a sampled run produces a clean
 exit code unless it specifically hits a mismatch.
 
-**Range-read integrity caveat (M-5 carry-forward).** The
+**Range-read integrity caveat.** The
 `VerifyingReader` hashes the *whole object* and compares at EOF. A
 range request (`Range: bytes=…`) cannot be verified against the
 whole-object hash without Merkle chunking — the adapter today serves

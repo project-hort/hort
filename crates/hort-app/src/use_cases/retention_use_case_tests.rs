@@ -1,9 +1,10 @@
 //! `RetentionUseCase::evaluate_policies` unit tests.
 //!
 //! `hort-app` is the 100%-coverage tier (mock all ports). Every branch
-//! of the use case is pinned here: inv1 (quarantined / rejected /
-//! scan_indeterminate / none / released), inv7 freshness gate (fresh /
-//! stale / no-row / no-last-scan / score-read-error / disabled-rescan),
+//! of the use case is pinned here: the quarantine/rejected GC-protection
+//! filter (quarantined / rejected / scan_indeterminate / none / released),
+//! the scan-data freshness gate (fresh / stale / no-row / no-last-scan /
+//! score-read-error / disabled-rescan),
 //! idempotency (already-expired no-op), the `HasFindingDetectedFor`
 //! anchor ladder (ABV → earliest ScanCompleted → created_at cold-data
 //! fallback), the archived-policy skip, the per-pair port-error path,
@@ -209,7 +210,7 @@ fn scan_completed(artifact_id: Uuid) -> DomainEvent {
 
 /// `ArtifactIngested` genesis event for `artifact_id` with the given
 /// `source`. Every real artifact stream starts with this event — the
-/// §4 scope gate resolves `IngestSource` from it, so the retention
+/// scope gate resolves `IngestSource` from it, so the retention
 /// fixtures seed a realistic stream rather than an empty one.
 fn ingested(artifact_id: Uuid, source: IngestSource) -> DomainEvent {
     DomainEvent::ArtifactIngested(hort_domain::events::ArtifactIngested {
@@ -246,7 +247,7 @@ fn candidate(status: QuarantineStatus, created_at: DateTime<Utc>) -> RetentionCa
 }
 
 /// Seed the candidate's artifact stream with a realistic genesis
-/// `ArtifactIngested` (the §4 scope gate needs it) followed by any
+/// `ArtifactIngested` (the scope gate needs it) followed by any
 /// `extra` events, renumbering stream positions from 0. Returns the
 /// `StreamId` for convenience. Use `IngestSource::Proxied` for the
 /// genesis unless a scope test needs a specific source.
@@ -277,12 +278,12 @@ fn seed_stream(
 
 /// Seed a realistic security-driven-retention stream: genesis
 /// `ArtifactIngested` then a `ScanCompleted` that is **fresh** for
-/// `now` (1h old, well inside the default 2×24h window). §6 invariant
-/// 7 is per-artifact, so a security predicate only evaluates against
-/// an artifact whose own most-recent scan is fresh — every
-/// security-predicate fixture must therefore put a recent
-/// `ScanCompleted` on the artifact's own stream. `extra` events follow
-/// the scan (positions renumbered from 0).
+/// `now` (1h old, well inside the default 2×24h window). The
+/// scan-data freshness gate is per-artifact, so a security predicate
+/// only evaluates against an artifact whose own most-recent scan is
+/// fresh — every security-predicate fixture must therefore put a
+/// recent `ScanCompleted` on the artifact's own stream. `extra` events
+/// follow the scan (positions renumbered from 0).
 fn seed_fresh_scanned_stream(
     store: &MockEventStore,
     c: &RetentionCandidate,
@@ -317,7 +318,7 @@ fn seed_fresh_scanned_stream(
 }
 
 // ===========================================================================
-// §6 invariant 1 — quarantine / rejected GC-protection
+// Quarantine / rejected GC-protection
 // ===========================================================================
 
 #[tokio::test]
@@ -378,7 +379,7 @@ async fn inv1_none_and_released_are_eligible() {
 }
 
 // ===========================================================================
-// §6 invariant 7 — scan-data freshness gate
+// Scan-data freshness gate
 // ===========================================================================
 
 #[tokio::test]
@@ -388,7 +389,7 @@ async fn inv7_fresh_scan_allows_security_predicate() {
         c.artifact.repository_id
     };
     // This artifact's own ScanCompleted is 1h ago, 24h interval → 48h
-    // window → fresh (per-artifact §6-inv-7).
+    // window → fresh (per-artifact freshness gate).
     let reader = MockRetentionScanReader::new().with_findings(vec![finding(
         SeverityThreshold::Critical,
         Some(9.8),
@@ -528,7 +529,7 @@ async fn inv7_does_not_gate_non_security_predicate() {
 }
 
 // ===========================================================================
-// §6 invariant 7 is PER-ARTIFACT (Finding #2). The repo_security_score
+// The scan-data freshness gate is PER-ARTIFACT. The repo_security_score
 // .last_scan_at is a per-repo MAX — a fresh scan on a *different*
 // artifact in the same repo must NOT make THIS artifact look fresh.
 // The freshness signal is this artifact's most-recent ScanCompleted
@@ -666,11 +667,11 @@ async fn inv7_per_artifact_no_scan_on_stream_is_stale_fail_safe() {
 }
 
 // ===========================================================================
-// §4 scope gate (Finding #1 — scoped policies must not apply
-// cluster-wide). The data-loss blocker: before this gate, a
-// `Repos([other])` / `Format(other)` / `IngestSource(other)` /
-// `PackageNamePattern(non-match)` policy expired EVERY artifact the
-// candidate-reader returned, ignoring its declared scope.
+// Scope gate: scoped policies must not apply cluster-wide. The
+// data-loss blocker — a `Repos([other])` / `Format(other)` /
+// `IngestSource(other)` / `PackageNamePattern(non-match)` policy must
+// NOT expire every artifact the candidate-reader returns, ignoring its
+// declared scope.
 // ===========================================================================
 
 #[tokio::test]
@@ -944,7 +945,7 @@ async fn idempotency_is_scoped_per_policy_id() {
 }
 
 // ===========================================================================
-// HasFindingDetectedFor anchor ladder (§4)
+// HasFindingDetectedFor anchor ladder
 // ===========================================================================
 
 #[tokio::test]
@@ -961,7 +962,7 @@ async fn detected_for_uses_artifact_became_vulnerable_anchor_o1() {
     // ABV says "previously clean at" ts(0) — well past the 7d grace.
     // The anchor ladder prefers ABV (step 1) over the fresh
     // ScanCompleted the per-artifact freshness gate requires (step 2),
-    // so the fresh scan satisfies §6-inv-7 without moving the anchor.
+    // so the fresh scan satisfies the per-artifact freshness gate without moving the anchor.
     let abv = DomainEvent::ArtifactBecameVulnerable(ArtifactBecameVulnerable {
         artifact_id: c.artifact.id,
         new_findings: vec![finding(SeverityThreshold::High, Some(7.0), vec![])],
@@ -1026,11 +1027,11 @@ async fn detected_for_never_scanned_artifact_is_skipped_per_inv7() {
     // Was `detected_for_falls_back_to_created_at_cold_data`: under the
     // weaker per-repo freshness reading a never-scanned artifact with a
     // fresh repo-score MAX would reach the `resolve_first_detected_at`
-    // step-3 created_at fallback and EXPIRE. Per-artifact §6-inv-7
-    // (Finding #2) correctly blocks first: an artifact with NO
-    // ScanCompleted on its own stream cannot prove freshness for a
-    // security-driven predicate, so it is skipped_stale_scan (fail-safe
-    // — never expire on an unprovable security predicate). The
+    // step-3 created_at fallback and EXPIRE. The per-artifact freshness
+    // gate correctly blocks first: an artifact with NO ScanCompleted on
+    // its own stream cannot prove freshness for a security-driven
+    // predicate, so it is skipped_stale_scan (fail-safe — never expire
+    // on an unprovable security predicate). The
     // `resolve_first_detected_at` cold-data fallback stays in the code
     // as defense-in-depth but is no longer reachable for a
     // security-driven predicate on a never-scanned artifact.
@@ -1053,7 +1054,7 @@ async fn detected_for_never_scanned_artifact_is_skipped_per_inv7() {
         .unwrap();
     assert_eq!(
         s.skipped_stale_scan, 1,
-        "never-scanned artifact: per-artifact §6-inv-7 fail-safe skip \
+        "never-scanned artifact: per-artifact freshness gate fail-safe skip \
          (a fresh repo-score MAX must not rescue it)"
     );
     assert_eq!(s.expired, 0, "never-scanned → must NOT expire");
@@ -1070,8 +1071,8 @@ async fn expire_with_security_predicate(p: PolicyPredicate, findings: Vec<Findin
     let (uc, store) = build(reader);
     let mut c = candidate(QuarantineStatus::Released, ts(0));
     c.artifact.repository_id = repo_id;
-    // Per-artifact §6-inv-7: security predicates only evaluate against
-    // an artifact whose own most-recent scan is fresh.
+    // Per-artifact freshness gate: security predicates only evaluate
+    // against an artifact whose own most-recent scan is fresh.
     seed_fresh_scanned_stream(&store, &c, ts(1_000_000), vec![]);
     let pol = policy(p, RetentionScope::AllRepos);
     uc.evaluate_policies(ts(1_000_000), &[pol], &[c])
@@ -1173,7 +1174,7 @@ async fn variant_canonical_composite_and_pattern() {
     // Genesis (Proxied → IngestSource(Proxied) scope matches), then an
     // OLD ScanCompleted (> 7d ago → HasFindingDetectedFor anchor is
     // past the 7d grace) AND a FRESH ScanCompleted (1h ago → per-artifact
-    // §6-inv-7 freshness gate passes). `latest_scan_at` = the fresh one;
+    // freshness gate passes). `latest_scan_at` = the fresh one;
     // the `HasFindingDetectedFor` anchor = the earliest (old) one.
     let stream_id = StreamId::artifact(c.artifact.id);
     store.set_stream(
@@ -1216,7 +1217,7 @@ async fn variant_canonical_composite_and_pattern() {
 }
 
 // ===========================================================================
-// inv8 — direct-upload scope proceeds (does NOT block at runtime)
+// Direct-upload scope proceeds (does NOT block at runtime)
 // ===========================================================================
 
 #[tokio::test]
@@ -1234,9 +1235,9 @@ async fn inv8_direct_upload_scope_proceeds_not_blocked() {
     let mut c = candidate(QuarantineStatus::Released, ts(0));
     c.artifact.repository_id = repo_id;
     // The artifact was a direct upload (genesis source = Direct) so the
-    // IngestSource(Direct) §4 scope gate matches; plus a fresh
-    // ScanCompleted so the per-artifact §6-inv-7 gate passes — the inv8
-    // concern is the apply-pipeline warning, not a runtime block.
+    // IngestSource(Direct) scope gate matches; plus a fresh
+    // ScanCompleted so the per-artifact freshness gate passes — the
+    // concern here is the apply-pipeline warning, not a runtime block.
     let stream_id = StreamId::artifact(c.artifact.id);
     store.set_stream(
         &stream_id,
@@ -1263,7 +1264,10 @@ async fn inv8_direct_upload_scope_proceeds_not_blocked() {
         .evaluate_policies(ts(1_000_000), &[pol], &[c])
         .await
         .unwrap();
-    assert_eq!(s.expired, 1, "runtime evaluator does not block on inv8");
+    assert_eq!(
+        s.expired, 1,
+        "runtime evaluator does not block direct-upload artifacts"
+    );
     assert_eq!(store.appended_batches().len(), 1);
 }
 
@@ -1323,7 +1327,7 @@ async fn empty_policy_set_is_a_noop() {
 }
 
 // ===========================================================================
-// Metrics — DebuggingRecorder label assertions (B7-shaped, B3-scoped)
+// Metrics — DebuggingRecorder label assertions
 // ===========================================================================
 
 mod metrics {
@@ -1565,7 +1569,7 @@ mod metrics {
     }
 
     // -----------------------------------------------------------------------
-    // B7 §7 metric-label completeness — the residual `result` / `reason`
+    // Metric-label completeness — the residual `result` / `reason`
     // arms not asserted by the four tests above. The summary-struct tests
     // (`inv1_rejected_is_skipped_no_event`, the `s.errors` cases) already
     // cover the *behaviour*; these add the missing `DebuggingRecorder`
@@ -1574,8 +1578,7 @@ mod metrics {
     // catalogued label *value* — the hort-app 100%-coverage tier requires
     // every `RetentionEvaluationResult` arm and the `security_finding`
     // reason to be pinned at the metric layer, not only via the summary
-    // counter. No emission code is changed by B7; this is test-only
-    // closure of the §7 catalog↔code label set.
+    // counter. This is test-only closure of the catalog↔code label set.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1615,7 +1618,7 @@ mod metrics {
                     .unwrap();
             })
         });
-        // §6 invariant 1: both `rejected` and `scan_indeterminate`
+        // GC-protection: both `rejected` and `scan_indeterminate`
         // (terminal evidence) collapse to the same bounded label value.
         assert_eq!(
             counter(

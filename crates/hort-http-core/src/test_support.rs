@@ -1796,7 +1796,7 @@ pub fn with_repository_access(
         ));
         // Same invariant for the wheel-metadata
         // use case. The use case composes the freshly-rebuilt
-        // `ArtifactUseCase` (via `find_visible_by_path` for the F-25
+        // `ArtifactUseCase` (via `find_visible_by_path` for the
         // anti-enumeration hop); without rebuilding here the new
         // access would not propagate into the metadata serve path and
         // the anonymous-on-private metadata regression test (in the

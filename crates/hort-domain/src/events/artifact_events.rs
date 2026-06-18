@@ -93,11 +93,11 @@ pub struct ArtifactIngested {
     /// A projection-only field would leave the event stream unable to
     /// reproduce it — the event is the source of truth.
     ///
-    /// `#[serde(default)]` so pre-Item-3/4 persisted events — which
-    /// never wrote this key — deserialise as `None`. That matches the
-    /// projection state of those same artifacts (the `artifacts` column
-    /// was likewise `NULL` before Item 3) so a rebuild stays
-    /// bit-identical to the live materialised row.
+    /// `#[serde(default)]` so older persisted events that never wrote this
+    /// key deserialise as `None`. That matches the projection state of those
+    /// same artifacts (the `artifacts` column was likewise `NULL` before the
+    /// field was introduced) so a rebuild stays bit-identical to the live
+    /// materialised row.
     #[serde(default)]
     pub upstream_published_at: Option<DateTime<Utc>>,
 }
@@ -392,7 +392,7 @@ impl ArtifactBecameVulnerable {
 ///   both fields `None` (system-driven transitions carry no operator
 ///   attribution; the actor is on the persisted-event envelope).
 ///
-/// `justification` is capped at 512 bytes (§2.3) — any longer is a
+/// `justification` is capped at 512 bytes — any longer is a
 /// validation error. The HTTP boundary additionally rejects empty
 /// strings with 400 before reaching the use case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -538,7 +538,7 @@ impl ArtifactRejected {
 /// **Not a reuse of [`ScanCompleted`].** A terminal-failure event has no
 /// findings and no scanner verdict; forcing it through `ScanCompleted(0)`
 /// would be indistinguishable from a clean scan (the audit/metrics
-/// conflation §2.3 forbids) and would poison the consumer's prior-scan
+/// conflation this design forbids) and would poison the consumer's prior-scan
 /// reverse index. A distinct event drives the distinct
 /// [`QuarantineStatus::ScanIndeterminate`](crate::entities::artifact::QuarantineStatus::ScanIndeterminate)
 /// state.
@@ -575,7 +575,7 @@ impl ScanIndeterminate {
 /// `StreamCategory::Artifact` alongside the artifact's lifecycle stream.
 /// Like `ScanCompleted(clean)` it is a *success record only* — it does
 /// **NOT** release the artifact early. Under `Required` mode the release
-/// sweep (Item 4) reads "a `ProvenanceVerified` exists" to compute
+/// sweep reads "a `ProvenanceVerified` exists" to compute
 /// [`ProvenanceClearance::Cleared`](crate::entities::artifact::ProvenanceClearance::Cleared);
 /// the timer/scan gate is otherwise unchanged.
 ///
@@ -608,8 +608,8 @@ impl ProvenanceVerified {
     }
 }
 
-/// A supply-chain provenance check **rejected** the artifact (Initiative
-/// 59, design §2.2). Drives `QuarantineStatus -> Rejected`
+/// A supply-chain provenance check **rejected** the artifact (ADR 0027).
+/// Drives `QuarantineStatus -> Rejected`
 /// (`quarantine_status = 'rejected'`), terminal under the release
 /// surfaces — like `ScanCompleted(findings)`.
 ///
@@ -659,7 +659,7 @@ impl ProvenanceRejected {
 /// `StreamCategory::Artifact` stream alongside the `quarantine_status`
 /// transition recorded by [`crate::ports::artifact_lifecycle::ArtifactLifecyclePort::commit_transition`].
 ///
-/// **Quarantine state vocabulary reuse (design doc §3, lines 320-334):**
+/// **Quarantine state vocabulary reuse:**
 /// corruption is structurally identical to a disqualifying scan finding —
 /// permanently bad content, time does not reverse it. The state machine
 /// transitions the artifact to
@@ -941,29 +941,29 @@ impl PromotionRejected {
 /// Lands on the **artifact** stream
 /// ([`StreamCategory::Artifact`](super::StreamCategory::Artifact)). The
 /// decision is recorded **before** any storage deletion so policy
-/// evaluation is auditable independently of purge success (§4 — the
-/// `RetentionUseCase` / `PurgeUseCase` two-stage split). The companion
+/// evaluation is auditable independently of purge success — the
+/// `RetentionUseCase` / `PurgeUseCase` two-stage split. The companion
 /// terminal event is [`ArtifactPurged`]; an `ArtifactExpired` with no
-/// following `ArtifactPurged` is the pending-purge work item the §5 GC
+/// following `ArtifactPurged` is the pending-purge work item the GC
 /// algorithm consumes.
 ///
-/// # §4-vs-code divergences (intentional, spec-checked)
+/// # Design-vs-code divergences (intentional)
 ///
 /// - **`policy_id` / `actor` are `Uuid`, not `PolicyId` / `ActorId`.**
-///   §4 writes `policy_id: PolicyId` and `Manual { actor: ActorId }`,
+///   The design writes `policy_id: PolicyId` and `Manual { actor: ActorId }`,
 ///   but no `PolicyId` / `ActorId` newtype exists anywhere in the
-///   shipped codebase — every event payload (incl. the Item-B1
+///   shipped codebase — every event payload (incl. the
 ///   [`ExpirationReason`], and `StreamSealed.retention_policy_id` /
 ///   `actor_id`) carries raw `Uuid`. Matching the shipped convention.
-/// - **`reason` reuses the Item-B1 [`ExpirationReason`]** value object
+/// - **`reason` reuses [`ExpirationReason`]** value object
 ///   from `crate::retention` rather than re-declaring the inline enum
-///   §4 sketches. B1 already shipped `ExpirationReason` (its module
+///   the design sketches. `ExpirationReason` already shipped (its module
 ///   docstring explicitly states "the event type itself lands on the
-///   artifact stream and is wired in Item B2"); re-declaring it would
-///   duplicate the variant set and its validation. The B1 reason object
-///   already carries the §4 `SecurityFinding` snapshot
+///   artifact stream and is wired in the retention use case"); re-declaring
+///   it would duplicate the variant set and its validation. The reason
+///   object already carries the `SecurityFinding` snapshot
 ///   (`first_detected_at` / `latest_scan_at`), so the only payload-level
-///   timestamp this event adds is `eligible_at` (§4).
+///   timestamp this event adds is `eligible_at`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactExpired {
     /// The artifact this expiry decision applies to. Same UUID as the
@@ -973,11 +973,10 @@ pub struct ArtifactExpired {
     /// the CRUD retention-policy store).
     pub policy_id: Uuid,
     /// Denormalised policy name captured at decision time — the policy
-    /// row may be archived/renamed before an auditor reads this event
-    /// (§4: "denormalised — policy may be archived later").
+    /// row may be archived or renamed before an auditor reads this event.
     pub policy_name: String,
     /// The discriminated reason the policy marked this artifact eligible
-    /// (Item-B1 [`ExpirationReason`]). Snapshots the inputs that drove
+    /// ([`ExpirationReason`]). Snapshots the inputs that drove
     /// the decision so an audit query never re-resolves projection rows
     /// that may have shifted since.
     pub reason: ExpirationReason,
@@ -996,7 +995,7 @@ impl ArtifactExpired {
     ///   emitter; reuses the shared `MAX_NAME_LEN` the rest of the
     ///   artifact-event vocabulary uses for denormalised names).
     /// - `reason` delegates to [`ExpirationReason::validate`] so the
-    ///   B1 reason invariants (non-empty `Manual` reason, self-consistent
+    ///   reason invariants (non-empty `Manual` reason, self-consistent
     ///   `KeepLastN`, finite in-range `SecurityFinding` CVSS, …) are
     ///   enforced uniformly through the [`super::DomainEvent::validate`]
     ///   dispatch table.
@@ -1016,14 +1015,14 @@ impl ArtifactExpired {
 /// ([`StreamCategory::Artifact`](super::StreamCategory::Artifact))
 /// terminating an [`ArtifactExpired`] work item.
 ///
-/// `refs_remaining` is the §5 GC algorithm's post-decrement
-/// cross-`kind` refcount for `content_hash` (§10 ties it to
+/// `refs_remaining` is the GC algorithm's post-decrement
+/// cross-`kind` refcount for `content_hash` (tied to
 /// `content_references`): `0` means the blob itself was deleted;
 /// `> 0` means a still-live reference (e.g. a promoted ref or an OCI
 /// `oci_subject` row) keeps the blob alive and only **this** artifact's
 /// reference was removed.
 ///
-/// # §6 invariant 4 — idempotent
+/// # Idempotency
 ///
 /// Re-emitting `ArtifactPurged` on a storage-already-absent path is
 /// **correct, not an error** (the storage adapter's `delete(H)` returns
@@ -1043,7 +1042,7 @@ pub struct ArtifactPurged {
     /// extra string bound is needed.
     pub content_hash: ContentHash,
     /// Cross-`kind` `content_references` count for `content_hash`
-    /// **after** this artifact's reference was removed (§5 step 3). `0`
+    /// **after** this artifact's reference was removed. `0`
     /// ⇒ the blob was deleted; `> 0` ⇒ the blob stays, this ref is gone.
     pub refs_remaining: u32,
     /// Wall-clock at which the purge (or already-absent confirmation)
@@ -1144,7 +1143,7 @@ mod retention_event_tests {
 
     #[test]
     fn expired_validate_delegates_to_reason_validate() {
-        // A structurally-invalid B1 reason (empty Manual reason) must
+        // A structurally-invalid reason (empty Manual reason) must
         // surface through ArtifactExpired::validate — proving the
         // delegation arm is wired, not just the policy_name check.
         let mut e = valid_expired();
@@ -1159,7 +1158,7 @@ mod retention_event_tests {
     #[test]
     fn expired_validate_propagates_security_finding_reason_invariant() {
         // Second reason-delegation path: a SecurityFinding with zero
-        // findings is a B1 contradiction; it must bubble up here too.
+        // findings violates the reason invariant; it must bubble up here too.
         let mut e = valid_expired();
         e.reason = ExpirationReason::SecurityFinding {
             max_severity: SeverityThreshold::High,
@@ -1283,7 +1282,7 @@ mod retention_event_tests {
 
     // -- Replay / projection over a fixture artifact stream --------------
     //
-    // §6 invariant 4: `ArtifactPurged` is idempotent — re-emitting on a
+    // Idempotency: `ArtifactPurged` is idempotent — re-emitting on a
     // storage-already-absent path is correct, not an error. Modelled as
     // a minimal pure fold (test-only; production projection is the
     // deferred app/adapter layer's job) over a stream that contains
@@ -1295,7 +1294,7 @@ mod retention_event_tests {
     enum RetentionState {
         /// No retention event seen yet.
         Live,
-        /// `ArtifactExpired` seen; pending purge (a §5 GC work item).
+        /// `ArtifactExpired` seen; pending purge (a GC work item).
         Expired,
         /// `ArtifactPurged` seen; terminal. `blob_deleted` records
         /// whether the last purge reported `refs_remaining == 0`.
@@ -1303,7 +1302,7 @@ mod retention_event_tests {
     }
 
     /// Pure replay fold for the retention slice of an artifact stream.
-    /// Idempotent on `ArtifactPurged` (§6 inv 4): applying it to an
+    /// Idempotent on `ArtifactPurged`: applying it to an
     /// already-`Purged` state is a no-op-shaped transition that keeps
     /// the terminal state rather than erroring.
     fn project(events: &[DomainEvent]) -> RetentionState {
@@ -1351,7 +1350,7 @@ mod retention_event_tests {
 
     #[test]
     fn replay_duplicate_purged_is_idempotent() {
-        // §6 invariant 4 — a second ArtifactPurged (storage already
+        // Idempotency — a second ArtifactPurged (storage already
         // absent on a retried sweep) must not corrupt the terminal
         // state. The projection stays Purged.
         let stream = vec![

@@ -16,7 +16,7 @@ Design: [`docs/architecture/explanation/layers.md`](../../docs/architecture/expl
 
 ## What it is NOT (yet)
 
-The following are **out of scope** and will land as separate initiatives:
+The following are **out of scope** and not yet implemented:
 
 - **Format handlers beyond PyPI, cargo, npm, and OCI.** Those four
   formats are wired; every other URL is a 404. Repositories for any
@@ -25,8 +25,7 @@ The following are **out of scope** and will land as separate initiatives:
 - **WASM host.** No `$WASM_PLUGIN_DIR`, no dynamic module loading.
 - **Hot config reload.** A `SIGHUP` is not handled; restart the process
   to pick up new env vars.
-- **Scanner integration, gRPC, CLI surfaces.** Each is its own
-  initiative.
+- **Scanner integration, gRPC, CLI surfaces.**
 - **Readiness / liveness probe split.** Kubernetes deployments can
   point probes at `/metrics` (when on the main listener in dev mode)
   or the root 404 until a dedicated endpoint lands.
@@ -51,7 +50,7 @@ The following are **out of scope** and will land as separate initiatives:
 | `METRICS_INCLUDE_REPOSITORY_LABEL` | no (default `true`) | Set `false` at scale to emit the `_all` sentinel and keep series cardinality bounded |
 | `RUST_LOG` | no (default `info`) | `EnvFilter` directive — e.g. `hort_server=debug,hort_app=info` |
 
-¹ Backlog 078 Item 5 — `HORT_DATABASE_URL` is the canonical operator DSN var;
+¹ `HORT_DATABASE_URL` is the canonical operator DSN var;
 bare `DATABASE_URL` is honored as a compat fallback (for sqlx-cli, the Tier-2
 `maybe_pool()` test helpers, and 12-factor tooling). Exactly one is required;
 the server prefers `HORT_DATABASE_URL`, identical to `hort-worker`. The Helm

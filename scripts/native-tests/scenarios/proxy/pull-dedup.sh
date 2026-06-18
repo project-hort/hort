@@ -128,7 +128,7 @@ read_upstream_fetch_metric() {
 # Snapshot baseline. Captures both "packument" (format="npm") and
 # "blob" (format="_any") entries because the npm tarball coalesce
 # uses DedupKey::blob_by_hash → format="_any" sentinel
-# (crates/hort-app/src/pull_dedup.rs:260, design doc §3).
+# (crates/hort-app/src/pull_dedup.rs:260).
 # ---------------------------------------------------------------------
 log ""
 log "--- Capturing baseline metric snapshot"

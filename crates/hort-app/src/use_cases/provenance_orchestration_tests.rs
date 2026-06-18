@@ -1,11 +1,11 @@
 //! Unit tests for `ProvenanceOrchestrationUseCase`.
 //!
 //! Acceptance cases:
-//! - (c-half) `VerifyIfPresent` + forged sig → `ProvenanceRejected`
-//!   (`rejected`); a verified sig under `VerifyIfPresent` → no status change.
-//! - (e) `VerifyIfPresent` + fetch-failure → `NoAttestation` (allow, not
+//! - `VerifyIfPresent` + forged sig → `ProvenanceRejected` (`rejected`);
+//!   a verified sig under `VerifyIfPresent` → no status change.
+//! - `VerifyIfPresent` + fetch-failure → `NoAttestation` (allow, not
 //!   fail-closed: no event, status unchanged).
-//! - (f) `Required` + fetch-exhausted → fail-closed
+//! - `Required` + fetch-exhausted → fail-closed
 //!   `ProvenanceRejected{RekorNotFound}` (status → `rejected`).
 //! - `Off` policy → no verifier runs (skip).
 //! - No applicable verifier (non-OCI) → skip.
@@ -311,7 +311,7 @@ async fn no_applicable_verifier_skips() {
 }
 
 // ===========================================================================
-// (c-half) VerifyIfPresent + forged/untrusted sig → rejected.
+// VerifyIfPresent + forged/untrusted sig → rejected.
 // ===========================================================================
 
 #[tokio::test]
@@ -355,7 +355,7 @@ async fn verify_if_present_forged_signature_rejects() {
 }
 
 // ===========================================================================
-// (c-half) VerifyIfPresent + verified sig → ProvenanceVerified, status
+// VerifyIfPresent + verified sig → ProvenanceVerified, status
 // UNCHANGED (a Verified must NOT release early).
 // ===========================================================================
 
@@ -399,7 +399,7 @@ async fn verify_if_present_verified_signature_records_but_does_not_change_status
 }
 
 // ===========================================================================
-// (e) VerifyIfPresent + bundle-fetch failure → NoAttestation (allow), NOT
+// VerifyIfPresent + bundle-fetch failure → NoAttestation (allow), NOT
 // fail-closed. No event, status unchanged.
 // ===========================================================================
 
@@ -458,7 +458,7 @@ async fn verify_if_present_fetch_failure_degrades_to_no_attestation_allow() {
 }
 
 // ===========================================================================
-// (f) Required + bundle-fetch exhausted → fail-closed
+// Required + bundle-fetch exhausted → fail-closed
 // ProvenanceRejected{RekorNotFound}, status → rejected.
 // ===========================================================================
 
@@ -1515,9 +1515,9 @@ fn seed_upstream_referrer(f: &Fixture, bundle_bytes: &[u8]) -> (String, ContentH
 }
 
 // ---------------------------------------------------------------------------
-// (a) proxy repo + empty local bundles + upstream Sigstore referrer →
-//     oci_subject row written, NO scan/provenance job enqueued, verdict
-//     reached (the capturing port receives the bundle blob).
+// Proxy repo + empty local bundles + upstream Sigstore referrer →
+// oci_subject row written, NO scan/provenance job enqueued, verdict
+// reached (the capturing port receives the bundle blob).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1613,8 +1613,8 @@ async fn proxy_fetches_upstream_referrer_writes_oci_subject_and_reaches_verdict(
 }
 
 // ---------------------------------------------------------------------------
-// (b) hosted repo (resolver → None) + empty local bundle → no upstream
-//     fetch, NoAttestation.
+// Hosted repo (resolver → None) + empty local bundle → no upstream
+// fetch, NoAttestation.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1670,9 +1670,8 @@ async fn hosted_repo_with_no_local_bundle_does_not_fetch_upstream() {
 }
 
 // ---------------------------------------------------------------------------
-// (c) Required on a proxy whose upstream returns NO Sigstore bundle (empty
-//     referrers) → ProvenanceRejected{Unsigned} (proves no apply guard is
-//     needed — design §3.5).
+// Required on a proxy whose upstream returns NO Sigstore bundle (empty
+// referrers) → ProvenanceRejected{Unsigned}.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1723,8 +1722,8 @@ async fn required_on_proxy_with_no_upstream_bundle_rejects_unsigned() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) VerifyIfPresent + an upstream fetch error → degrade to NoAttestation
-//     (the existing `apply_fetch_failure` arm; never fail-closed on a proxy).
+// VerifyIfPresent + an upstream fetch error → degrade to NoAttestation
+// (the existing `apply_fetch_failure` arm; never fail-closed on a proxy).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1777,8 +1776,8 @@ async fn verify_if_present_upstream_fetch_error_degrades_to_no_attestation() {
 }
 
 // ---------------------------------------------------------------------------
-// (e) §8.7 blob integrity — the put-returned hash != the manifest-declared
-//     digest → that referrer is SKIPPED (read blobs back by DECLARED digest).
+// Blob integrity: the put-returned hash != the manifest-declared
+// digest → that referrer is SKIPPED (read blobs back by DECLARED digest).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1796,7 +1795,7 @@ async fn put_returned_hash_mismatch_skips_referrer_blob_integrity() {
     // The referrer manifest DECLARES a bundle-layer digest, but the bytes the
     // upstream serves for that blob hash to a DIFFERENT value — so the
     // `put`-returned hash (sha256 of the served bytes) != the declared digest.
-    // §8.7 requires the referrer be SKIPPED on that mismatch.
+    // The declared-digest integrity check requires the referrer be SKIPPED on mismatch.
     let declared_blob_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(b"DECLARED-bytes"))
         .parse()
         .unwrap();
@@ -1857,16 +1856,16 @@ async fn put_returned_hash_mismatch_skips_referrer_blob_integrity() {
         .unwrap();
     assert!(
         rows.is_empty(),
-        "a referrer skipped on the §8.7 integrity check writes no oci_subject row",
+        "a referrer skipped on the declared-digest integrity check writes no oci_subject row",
     );
     let saved = f.artifacts.get(f.artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
 }
 
 // ---------------------------------------------------------------------------
-// (f) a referrer descriptor whose digest is NOT a sha256 CAS digest →
-//     skipped (the `parse_sha256_digest` None arm — §8.7 the manifest is
-//     content-addressed; a non-sha256 reference is not landable).
+// A referrer descriptor whose digest is NOT a sha256 CAS digest →
+// skipped (the `parse_sha256_digest` None arm — the manifest is
+// content-addressed; a non-sha256 reference is not landable).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1914,10 +1913,10 @@ async fn non_sha256_referrer_digest_is_skipped() {
 }
 
 // ---------------------------------------------------------------------------
-// (g) a Sigstore descriptor (matched via `media_type`, NOT `artifact_type`)
-//     whose fetched manifest carries NO bundle layer → contributes nothing
-//     (the `blob_hashes.is_empty()` skip arm). Also covers the `media_type`
-//     leg of the is-Sigstore filter.
+// A Sigstore descriptor (matched via `media_type`, NOT `artifact_type`)
+// whose fetched manifest carries NO bundle layer → contributes nothing
+// (the `blob_hashes.is_empty()` skip arm). Also covers the `media_type`
+// leg of the is-Sigstore filter.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1990,11 +1989,11 @@ async fn referrer_manifest_with_no_bundle_layer_is_skipped() {
 }
 
 // ---------------------------------------------------------------------------
-// (h) §8.7 — the REFERRER MANIFEST's put-returned hash != the descriptor's
-//     declared digest → skipped (the manifest-mismatch arm). The upstream
-//     lies about the referrer manifest's own digest: a valid bundle blob is
-//     served (step c passes) but the manifest bytes do not hash to the
-//     descriptor digest.
+// The REFERRER MANIFEST's put-returned hash != the descriptor's declared
+// digest → skipped (the manifest-mismatch arm). The upstream lies about
+// the referrer manifest's own digest: a valid bundle blob is served
+// (step c passes) but the manifest bytes do not hash to the descriptor
+// digest.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2062,7 +2061,7 @@ async fn referrer_manifest_digest_mismatch_is_skipped() {
             event_appended: false,
             verdict: ProvenanceVerdictSummary::NoAttestation,
         },
-        "a referrer-manifest digest mismatch skips the referrer (§8.7) → NoAttestation",
+        "a referrer-manifest digest mismatch skips the referrer → NoAttestation",
     );
     // The referrer was skipped at step d (after the blob put) — so no
     // oci_subject row was written and no verdict reached.
@@ -2145,14 +2144,14 @@ async fn verify_if_present_upstream_referrer_discovery_error_degrades_to_no_atte
 }
 
 // ---------------------------------------------------------------------------
-// (j) the post-proxy bundle RE-READ errors. The upstream referrer is landed
-//     successfully (oci_subject row written, referrer manifest committed),
-//     but the immediately-following local `fetch_bundles` re-read fails on
-//     EVERY retry attempt (the landed referrer manifest's CAS bytes are
-//     unreadable) → the caller's "post-proxy bundle re-read"
-//     `apply_fetch_failure` arm fires. Under VerifyIfPresent that degrades
-//     to NoAttestation (allow). Drives the `Err(e)` re-read arm inside
-//     `verify_artifact`'s proxy block (the second `fetch_bundles` match).
+// The post-proxy bundle RE-READ errors. The upstream referrer is landed
+// successfully (oci_subject row written, referrer manifest committed),
+// but the immediately-following local `fetch_bundles` re-read fails on
+// EVERY retry attempt (the landed referrer manifest's CAS bytes are
+// unreadable) → the caller's "post-proxy bundle re-read"
+// `apply_fetch_failure` arm fires. Under VerifyIfPresent that degrades
+// to NoAttestation (allow). Drives the `Err(e)` re-read arm inside
+// `verify_artifact`'s proxy block (the second `fetch_bundles` match).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

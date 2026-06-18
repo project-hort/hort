@@ -81,7 +81,7 @@ pub fn run(args: ScrubArgs) -> ExitCode {
 }
 
 async fn run_async(args: ScrubArgs) -> anyhow::Result<ScrubReport> {
-    // `Config::from_env` enforces the F2 trust-policy check. Running
+    // `Config::from_env` enforces the trust-policy check. Running
     // the scrub in an environment that wouldn't serve reports that
     // early — avoids the "scrub ran clean against an empty DB because
     // DATABASE_URL was wrong" surprise.

@@ -5,7 +5,7 @@
 //! **Pure boundary, zero I/O.** This module only *defines* the
 //! emission contract; it performs no I/O, no `tracing`, no signing.
 //! The S3 Object-Lock **write** adapter
-//! (`hort-adapters-checkpoint-anchor`, the same crate as the Item-3
+//! (`hort-adapters-checkpoint-anchor`, the same crate as the checkpoint
 //! *read* adapter so the `SignedBody` signature shape is a single
 //! shared source of truth — the verifier↔emitter contract pin) implements
 //! it; the `eventstore-checkpoint` `TaskHandler`
@@ -13,31 +13,31 @@
 //!
 //! ## Why a *sibling* port, not a method on `CheckpointAnchorPort`
 //!
-//! `CheckpointAnchorPort` (the Item-3 *read* trait) is **shipped** and
-//! its surface is byte-frozen (governance: no existing port signature
-//! change without confirmation). Adding a `write`/`emit` method to it
-//! would change every implementor's required surface. The capability
-//! is therefore **additive**: a new, independent one-method port. The
-//! verifier-side read path (`read_all`) stays exactly as shipped; the
-//! transparency-log alternative (§14 R5) remains a drop-in behind both
-//! thin boundaries.
+//! `CheckpointAnchorPort` (the *read* trait) is **shipped** and its
+//! surface is byte-frozen (no existing port signature change without
+//! confirmation). Adding a `write`/`emit` method to it would change every
+//! implementor's required surface. The capability is therefore
+//! **additive**: a new, independent one-method port. The verifier-side
+//! read path (`read_all`) stays exactly as shipped; the
+//! transparency-log alternative remains a drop-in behind both thin
+//! boundaries.
 //!
 //! ## What the adapter does (the I/O this port forbids)
 //!
 //! Given the pure, builder-assembled
-//! [`CheckpointToEmit`](crate::events::CheckpointToEmit) (the §6.2
-//! body: Merkle root + sorted witness + monotonic seq + the §5
-//! first-checkpoint `backfill_baseline`), the adapter:
+//! [`CheckpointToEmit`](crate::events::CheckpointToEmit) (Merkle root +
+//! sorted witness + monotonic seq + the first-checkpoint
+//! `backfill_baseline`), the adapter:
 //!
-//! 1. wraps it in the **shared `SignedBody`** shape the Item-3 reader
+//! 1. wraps it in the **shared `SignedBody`** shape the read adapter
 //!    verifies (Ed25519 over `serde_json::to_vec(&SignedBody)`, exactly
 //!    those fields — the contract pin),
 //! 2. signs that with the **operator-provisioned** anchor signing key
-//!    (spec §14 R2 — a file under the existing `HORT_*` posture, the
-//!    private counterpart of the SPKI PEM the reader verifies;
-//!    **distinct from any runtime credential**, never embedded /
-//!    derived / generated-at-runtime; a missing/malformed key fails the
-//!    task, never a silent unsigned checkpoint),
+//!    (a file under the existing `HORT_*` posture, the private counterpart
+//!    of the SPKI PEM the reader verifies; **distinct from any runtime
+//!    credential**, never embedded / derived / generated-at-runtime; a
+//!    missing/malformed key fails the task, never a silent unsigned
+//!    checkpoint),
 //! 3. writes `<bucket>/hort-event-chain-checkpoints/<RFC3339-utc>-<seq>.json`
 //!    into the operator-provisioned **S3 Object-Lock** bucket (WORM —
 //!    see the adapter's hardening note for the exact guarantee + the
@@ -53,11 +53,10 @@ use crate::events::CheckpointToEmit;
 
 use super::BoxFuture;
 
-/// Outbound port: sign + WORM-anchor one assembled checkpoint
-/// (spec §6/§9).
+/// Outbound port: sign + WORM-anchor one assembled checkpoint.
 ///
 /// The adapter owns the verifier↔emitter signature contract: it MUST
-/// sign exactly the bytes the shipped Item-3 reader verifies
+/// sign exactly the bytes the read adapter verifies
 /// (`serde_json::to_vec(&SignedBody)` over the shared `SignedBody`
 /// fields) so a checkpoint this port emits round-trips to
 /// `AnchorVerdict::Ok` through the existing read adapter. A divergence

@@ -431,7 +431,7 @@ struct CachedToken {
 /// Cache lookup key. Includes `cred_identity` so cross-credential
 /// reuse is impossible — a private-PAT mapping and an anonymous
 /// mapping on the same realm/service/scope triple get separate
-/// entries (§2.6).
+/// entries.
 #[derive(Clone, Hash, Eq, PartialEq)]
 struct CacheKey {
     realm: String,
@@ -538,9 +538,9 @@ pub struct HttpUpstreamProxy {
     bearer_cache: Arc<BearerCache>,
     /// Per-`upstream_url` last-seen `Challenge`. Lets
     /// `authorization_header` reconstruct the bearer-cache lookup
-    /// key without re-running the 401 dance, satisfying §2.5's
-    /// "Optimistic-first" invariant: a cached token avoids the 401
-    /// round-trip on every subsequent request to the same realm.
+    /// key without re-running the 401 dance — a cached token avoids
+    /// the 401 round-trip on every subsequent request to the same
+    /// realm ("Optimistic-first" invariant).
     /// Populated when a 401 → exchange completes.
     challenge_memo: Arc<tokio::sync::RwLock<HashMap<String, Challenge>>>,
     /// Per-mapping `reqwest::Client` cache (ADR 0010). Mappings without
@@ -953,7 +953,7 @@ fn build_redirect_policy(
                 tracing::warn!(
                     blocked_host = %host,
                     "upstream redirect hop blocked: host did not resolve \
-                     (fail-closed; audit F-10)"
+                     (fail-closed)"
                 );
                 return attempt.error(format!(
                     "{REDIRECT_SSRF_SENTINEL}: redirect target host \
@@ -969,7 +969,7 @@ fn build_redirect_policy(
                 tracing::warn!(
                     blocked_host = %host,
                     "upstream redirect hop blocked: resolves to a \
-                     non-routable address (audit F-10)"
+                     non-routable address (fail-closed)"
                 );
                 return attempt.error(format!(
                     "{REDIRECT_SSRF_SENTINEL}: redirect target {host} \
@@ -1279,8 +1279,8 @@ impl HttpUpstreamProxy {
             tracing::error!(error = %e, realm = %challenge.realm, "realm response JSON parse failed");
             classified_error(UpstreamErrorKind::ParseError, &format!("realm token JSON: {e}"))
         })?;
-        // Per §2.4: prefer `access_token` over `token` when both
-        // present. Empty strings are a parse error.
+        // Prefer `access_token` over `token` when both present.
+        // Empty strings are a parse error.
         let token = body
             .access_token
             .filter(|s| !s.is_empty())
@@ -1315,8 +1315,8 @@ impl HttpUpstreamProxy {
 /// Map a `reqwest::Error` from a `send()` call to a domain error
 /// classified by [`UpstreamErrorKind`]. The kind is encoded in the
 /// returned `DomainError::Invariant` message prefix; the proxy
-/// caller (Item 11) parses it back to fire the metric. Crude but
-/// keeps the trait surface generic.
+/// caller parses it back to fire the metric. Crude but keeps the
+/// trait surface generic.
 ///
 /// **TLS classification (ADR 0010):** before the timeout /
 /// network-error fallback we walk the error chain for rustls-level
@@ -2480,7 +2480,7 @@ impl UpstreamProxy for HttpUpstreamProxy {
 /// architect-skill cardinality rule forbids emitting the UUID. The
 /// `_all` sentinel is the documented collapse-target the
 /// `METRICS_INCLUDE_REPOSITORY_LABEL=false` toggle produces; the proxy
-/// inherits it without a separate switch (design doc §4.2).
+/// inherits it without a separate switch.
 fn emit_tls_handshake_metric(err: &DomainError) {
     let Some(kind) = classify_error(err) else {
         return;
@@ -2489,10 +2489,10 @@ fn emit_tls_handshake_metric(err: &DomainError) {
         UpstreamErrorKind::PinMismatch => UpstreamTlsHandshakeResult::PinMismatch,
         UpstreamErrorKind::CaUnknown => UpstreamTlsHandshakeResult::CaUnknown,
         UpstreamErrorKind::Unauthorized => {
-            // Per design doc §3.9: server-demands-cert-but-we-have-none
-            // surfaces as Unauthorized at fetch level. Map it to
-            // `mtls_required` on the TLS metric so the operator can
-            // distinguish "auth failed" from "TLS posture missing".
+            // Server-demands-cert-but-we-have-none surfaces as
+            // Unauthorized at fetch level. Map it to `mtls_required`
+            // on the TLS metric so the operator can distinguish
+            // "auth failed" from "TLS posture missing".
             // Note: this conflates 401-after-handshake with mTLS-required.
             // Operators wanting precise discrimination read the
             // accompanying tracing line at the application layer.
@@ -2536,7 +2536,7 @@ pub(crate) fn classify_tls_handshake_error(err: &reqwest::Error) -> Option<Upstr
     let mut source: Option<&dyn std::error::Error> = Some(err);
     while let Some(s) = source {
         let s_msg = s.to_string();
-        // Pin sentinel (custom verifier — Item 11d).
+        // Pin sentinel (custom verifier).
         if s_msg.contains(PIN_MISMATCH_SENTINEL) {
             return Some(UpstreamErrorKind::PinMismatch);
         }
@@ -3680,8 +3680,8 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_bearer_token_rejects_nonroutable_realm_before_sending_credential() {
-        // Audit F-38: the realm host is upstream-controlled (verbatim
-        // from the `WWW-Authenticate` header). The scheme guard blocks a
+        // The realm host is upstream-controlled (verbatim from the
+        // `WWW-Authenticate` header). The scheme guard blocks a
         // plaintext-`http` credential leak, but an `https` realm whose
         // host is a non-routable internal address (cloud IMDS
         // 169.254.169.254, RFC1918, …) would otherwise still receive the
@@ -3720,7 +3720,7 @@ mod tests {
     async fn fetch_bearer_token_accepts_https_realm() {
         // Sanity check the inverse: an https:// realm is accepted (any
         // existing positive test would prove this; the assertion lives
-        // here so the H-6 invariant has both branches in one place).
+        // here so both branches are in one place).
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/realm"))
@@ -5983,9 +5983,9 @@ mod tests {
         HttpUpstreamProxy::new(cfg, Arc::new(secrets)).unwrap()
     }
 
-    /// Test A (Item 11b — custom CA): mapping carries `ca_bundle_ref`
-    /// pointing at the test CA. The fetch must succeed because the
-    /// augmented root store accepts the leaf signed by that CA.
+    /// Test A (custom CA): mapping carries `ca_bundle_ref` pointing at
+    /// the test CA. The fetch must succeed because the augmented root
+    /// store accepts the leaf signed by that CA.
     #[tokio::test]
     async fn fetch_artifact_with_custom_ca_bundle_succeeds() {
         let fixture = make_tls_fixture("127.0.0.1");
@@ -6014,7 +6014,7 @@ mod tests {
         assert_eq!(bytes, b"tls-ok");
     }
 
-    /// Test B (Item 11b — no CA augmentation): default mapping with no
+    /// Test B (no CA augmentation): default mapping with no
     /// `ca_bundle_ref` against the same self-signed test server. The
     /// system trust store does not include the test CA, so the
     /// handshake fails and the result classifies as `CaUnknown`.
@@ -6042,10 +6042,10 @@ mod tests {
         );
     }
 
-    /// Test C (Item 11d — pinning success): mapping carries the correct
-    /// SHA-256 thumbprint of the leaf cert. The fetch succeeds; the
-    /// pinning verifier runs the thumbprint check and delegates name +
-    /// chain validation to WebPKI.
+    /// Test C (pinning success): mapping carries the correct SHA-256
+    /// thumbprint of the leaf cert. The fetch succeeds; the pinning
+    /// verifier runs the thumbprint check and delegates name + chain
+    /// validation to WebPKI.
     #[tokio::test]
     async fn fetch_artifact_with_correct_pin_succeeds() {
         let fixture = make_tls_fixture("127.0.0.1");
@@ -6075,8 +6075,8 @@ mod tests {
         assert_eq!(bytes, b"tls-ok");
     }
 
-    /// Test D (Item 11d — pinning mismatch): mapping carries a pin that
-    /// is the correct shape (64 hex chars, value-object accepts it) but
+    /// Test D (pinning mismatch): mapping carries a pin that is the
+    /// correct shape (64 hex chars, value-object accepts it) but
     /// disagrees with the leaf cert's actual thumbprint by one byte.
     /// The handshake fails and classifies as `PinMismatch`.
     #[tokio::test]
@@ -6117,11 +6117,11 @@ mod tests {
         );
     }
 
-    /// Item 11 metric collapse test: every TLS-handshake metric emission
-    /// goes out with `repository="_all"` because the proxy operates at
-    /// the mapping layer (no resolved repository key) and inherits the
-    /// `METRICS_INCLUDE_REPOSITORY_LABEL=false` collapse semantics by
-    /// always emitting the sentinel.
+    /// TLS-handshake metric collapse test: every TLS-handshake metric
+    /// emission goes out with `repository="_all"` because the proxy
+    /// operates at the mapping layer (no resolved repository key) and
+    /// inherits the `METRICS_INCLUDE_REPOSITORY_LABEL=false` collapse
+    /// semantics by always emitting the sentinel.
     #[test]
     fn fetch_emits_tls_handshake_metric_with_repository_all_sentinel() {
         use metrics::Key;
@@ -6179,10 +6179,10 @@ mod tests {
         );
     }
 
-    /// Item 11d metric mapping: a pin mismatch fires
+    /// Pin mismatch metric mapping: a pin mismatch fires
     /// `hort_upstream_tls_handshake_total{result=pin_mismatch}` and the
     /// fetch metric `hort_upstream_fetch_total{result=pin_mismatch}` —
-    /// both sides of the M-4 taxonomy stay consistent.
+    /// both sides of the taxonomy stay consistent.
     #[test]
     fn pin_mismatch_emits_pin_mismatch_label_on_both_metrics() {
         use metrics::Key;
@@ -6298,11 +6298,10 @@ mod tests {
     /// (`SecretPort::resolve` for cert + key, PEM parse, rustls
     /// `with_client_auth_cert`) is exercised by
     /// [`tls_config::tests::pinning_verifier_accepts_valid_lowercase_pin`]
-    /// and the Item 11a value-object pairing tests in
+    /// and the value-object pairing tests in
     /// `crates/hort-domain/src/ports/repository_upstream_mapping_repository.rs`.
-    /// A full mTLS-required E2E test is a separate item; the audit's
-    /// Decision §3.9 explicitly invites splitting Item 11 by slice and
-    /// this slice's scope ends at the unit-level mTLS resolution.
+    /// A full mTLS-required E2E test is a future work item; this
+    /// slice's scope ends at the unit-level mTLS resolution.
     #[test]
     fn mtls_required_e2e_test_documented_as_skipped() {
         // No assertion — the doc-comment on this test is the test:
@@ -6809,7 +6808,7 @@ mod tests {
         .unwrap()
     }
 
-    /// F-10 case 1: a 302 `Location:` to a non-routable host
+    /// Case 1: a 302 `Location:` to a non-routable host
     /// (169.254.169.254 — AWS IMDS) is BLOCKED. The internal target's
     /// body must NOT be streamed back; the fetch surfaces as a
     /// content-validation refusal classified `ParseError` (the same
@@ -6850,8 +6849,8 @@ mod tests {
         );
     }
 
-    /// F-10 case 1b: a 302 to an RFC1918 private host is likewise
-    /// blocked (the same refusal class as IMDS).
+    /// Case 1b: a 302 to an RFC1918 private host is likewise blocked
+    /// (the same refusal class as IMDS).
     #[tokio::test]
     async fn redirect_hop_to_rfc1918_is_blocked() {
         let redirector = MockServer::start().await;
@@ -6877,8 +6876,8 @@ mod tests {
         );
     }
 
-    /// F-10 case 2: a 302 to a *routable* host is ALLOWED — legitimate
-    /// CDN redirect still works (no false-positive). npm / PyPI / crates
+    /// Case 2: a 302 to a *routable* host is ALLOWED — legitimate CDN
+    /// redirect still works (no false-positive). npm / PyPI / crates
     /// routinely 302 to a CDN; this must not break. Both wiremock
     /// servers are in the test allowlist (they stand in for "routable"
     /// public hosts since wiremock can only bind loopback); the policy
@@ -6920,10 +6919,10 @@ mod tests {
         );
     }
 
-    /// F-10 case 3: the hop CAP is still enforced. A redirect chain
-    /// longer than `max_redirect_hops` is rejected as before — the
-    /// custom policy must still enforce the limit (it does not silently
-    /// follow forever once the per-hop SSRF check is added).
+    /// Case 3: the hop CAP is still enforced. A redirect chain longer
+    /// than `max_redirect_hops` is rejected as before — the custom
+    /// policy must still enforce the limit (it does not silently follow
+    /// forever once the per-hop SSRF check is added).
     #[tokio::test]
     async fn redirect_chain_exceeding_hop_cap_is_rejected() {
         // A single server that always 302s back to a path on itself,

@@ -16,10 +16,9 @@
 //! - `QuarantineUseCase::new` — the consumer side of the orchestrator's
 //!   findings flow.
 //! - `ScanOrchestrationUseCase` wiring.
-//! - `scanner_registry` handle for the heartbeat task — M14 review
-//!   finding: the row's `upsert_self` happens on the heartbeat
-//!   loop's first tick, NOT here, so the row's existence and the
-//!   loop's liveness are inseparable.
+//! - `scanner_registry` handle for the heartbeat task — the row's
+//!   `upsert_self` happens on the heartbeat loop's first tick, NOT here,
+//!   so the row's existence and the loop's liveness are inseparable.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -157,7 +156,7 @@ pub struct WorkerContext {
     /// orchestrator's `default_scan_backends` is set from this list so
     /// every claimed job runs exactly the backends this worker has
     /// wired. Moving the scan-backend source onto `ScanPolicy.scan_backends`
-    /// is tracked as a future backlog item; no separate work here.
+    /// is tracked as a future change; no separate work here.
     pub scanners: Vec<String>,
     pub config: WorkerConfig,
     /// Held so the heartbeat loop can query `hort_scan_queue_depth` from
@@ -209,14 +208,14 @@ pub async fn build_app_context(
     //
     // The main pool also carries the defense-in-depth `lock_timeout`
     // backstop (ADR 0020): the retention/archive `EventStorePublisher`
-    // rides THIS pool when `HORT_RETENTION_DATABASE_URL` is unset (Q5
-    // branch below), so `seal_and_remove`'s unbounded `StreamSealed`
+    // rides THIS pool when `HORT_RETENTION_DATABASE_URL` is unset (the
+    // unset branch below), so `seal_and_remove`'s unbounded `StreamSealed`
     // append must be lock-wait-bounded here too.
     // -----------------------------------------------------------------
     tracing::info!(
         lock_timeout_ms = cfg.lock_timeout_ms,
         "worker pool lock_timeout backstop \
-         (0 = disabled; default 120000 = §10.2-INV single-flight \
+         (0 = disabled; default 120000 ms — single-flight \
          defense-in-depth, not reachable by a healthy sweep)"
     );
     let pool = apply_lock_timeout(
@@ -268,10 +267,9 @@ pub async fn build_app_context(
     // The worker process does NOT run the `NotificationDispatcher`
     // (that lives in `hort-server`). Wrap in a no-broadcast publisher
     // so use cases see the same trait shape and worker-side appends
-    // remain pure pass-through. If a future initiative wants the worker
-    // to broadcast scan-completion events, this is the slot to construct
-    // a `broadcast::Sender` and hand it to the (then-co-located)
-    // dispatcher.
+    // remain pure pass-through. If a future change wants the worker to
+    // broadcast scan-completion events, this is the slot to construct a
+    // `broadcast::Sender` and hand it to the (then-co-located) dispatcher.
     let event_publisher = Arc::new(EventStorePublisher::without_broadcast(event_store.clone()));
 
     let artifacts_concrete: Arc<PgArtifactRepository> =
@@ -309,11 +307,11 @@ pub async fn build_app_context(
     let _scan_findings: Arc<dyn ScanFindingsRepository> =
         Arc::new(PgScanFindingsRepository::new(pool.clone()));
 
-    // M8 review finding: previous code constructed an
-    // `Arc<dyn RepoSecurityScoreRepository>` here and dropped it
-    // immediately via a wildcard bind, which suggested the use case
-    // would consume it. It does not — `QuarantineUseCase::new_for_scan_results`
-    // does not take a `RepoSecurityScoreRepository` argument
+    // Previous code constructed an `Arc<dyn RepoSecurityScoreRepository>`
+    // here and dropped it immediately via a wildcard bind, which suggested
+    // the use case would consume it. It does not —
+    // `QuarantineUseCase::new_for_scan_results` does not take a
+    // `RepoSecurityScoreRepository` argument
     // The projection write happens inside
     // `PgArtifactLifecycle::commit_scan_result_with_score` via the
     // `apply_delta_in_tx` helper that owns its own transaction
@@ -356,11 +354,11 @@ pub async fn build_app_context(
     };
 
     // -----------------------------------------------------------------
-    // 6. Scanner adapters — health-check each at startup. H1 review
-    //    finding + spec §4.2: a health-check failure on ANY configured
-    //    backend means that backend is "not deployable" and the worker
-    //    "logs and exits non-zero." Earlier the worker tolerated a
-    //    degraded boot as long as at least one backend remained
+    // 6. Scanner adapters — health-check each at startup. A health-check
+    //    failure on ANY configured backend means that backend is "not
+    //    deployable" and the worker "logs and exits non-zero." Earlier
+    //    the worker tolerated a degraded boot as long as at least one
+    //    backend remained
     //    healthy; that flexibility silently hid misconfigured runtime
     //    images. The strict fail-fast policy below matches the spec.
     // -----------------------------------------------------------------
@@ -375,13 +373,13 @@ pub async fn build_app_context(
     // default (256 MiB). Read once, applied to both
     // `trivy_cfg.max_report_size` and `osv_cfg.max_report_size`.
     //
-    // Backlog 078 Item 4 — both caps are human-readable SIZE strings
-    // ("256Mi", "8Gi") via `config::parse_byte_size`, not bare integers,
-    // so a multi-GiB value can never round-trip through Helm's float64
-    // coercion into scientific notation (the rc.3 boot-crash class). A
-    // bare byte integer is still accepted for backward shape.
+    // Both caps are human-readable SIZE strings ("256Mi", "8Gi") via
+    // `config::parse_byte_size`, not bare integers, so a multi-GiB value
+    // can never round-trip through Helm's float64 coercion into scientific
+    // notation (the rc.3 boot-crash class). A bare byte integer is still
+    // accepted for backward shape.
     let trivy: Arc<dyn ScannerPort> = {
-        // F-15 — the artifact-size cap is operator-tunable via
+        // The artifact-size cap is operator-tunable via
         // `HORT_SCANNER_TRIVY_MAX_ARTIFACT_SIZE`; an unset/invalid
         // value falls back to `TrivyConfig::default().max_artifact_size`
         // (8 GiB), mirroring how `timeout` flows through the default.
@@ -417,14 +415,13 @@ pub async fn build_app_context(
         Arc::new(OsvScannerAdapter::new(osv_cfg))
     };
 
-    // Backlog 078 Item 6 (chart S3) — the `enabled` flags are
-    // load-bearing: a flag-DISABLED backend is dropped here, BEFORE the
-    // `--version` health probe runs, so a disabled backend is never
-    // registered regardless of whether its binary is present. The probe
-    // (`health_check_all_or_fail`) is a secondary health check that only
-    // sees the flag-enabled subset. This closes the pre-078 footgun
-    // where `scanner.trivy.enabled: false` was "cosmetic only" and the
-    // probe was the real gate.
+    // The `enabled` flags are load-bearing: a flag-DISABLED backend is
+    // dropped here, BEFORE the `--version` health probe runs, so a
+    // disabled backend is never registered regardless of whether its
+    // binary is present. The probe (`health_check_all_or_fail`) is a
+    // secondary health check that only sees the flag-enabled subset. This
+    // closes the pre-release footgun where `scanner.trivy.enabled: false`
+    // was "cosmetic only" and the probe was the real gate.
     let configured = select_enabled_scanners(&[(cfg.trivy_enabled, trivy), (cfg.osv_enabled, osv)]);
     if configured.is_empty() {
         return Err(anyhow!(
@@ -477,7 +474,7 @@ pub async fn build_app_context(
     // -----------------------------------------------------------------
     // 9. ScanOrchestrationUseCase. Default backends come from the wired
     //    scanner names; moving the source onto `ScanPolicy.scan_backends`
-    //    is tracked as a future backlog item.
+    //    is tracked as a future change.
     // -----------------------------------------------------------------
     let mut orch_cfg = ScanOrchestrationConfig::defaults_for_worker(cfg.worker_id.clone());
     orch_cfg.max_attempts = cfg.max_attempts;
@@ -485,7 +482,7 @@ pub async fn build_app_context(
 
     let artifact_metadata: Arc<dyn ArtifactMetadataRepository> = metadata_concrete.clone();
 
-    // H3 — the orchestrator no longer holds an EventStore handle; the
+    // The orchestrator no longer holds an EventStore handle; the
     // consumer (`QuarantineUseCase::record_scan_result`) owns the
     // event-store reads.
     let orchestration = Arc::new(ScanOrchestrationUseCase::new(
@@ -510,11 +507,10 @@ pub async fn build_app_context(
     ));
 
     // -----------------------------------------------------------------
-    // 10. (Removed in M14 — composition root no longer writes the
-    //     scanner_registry row. The heartbeat loop's first tick now
-    //     owns `upsert_self` so the registry row's existence and
-    //     the loop's liveness are inseparable. See
-    //     `heartbeat::refresh_registry` for the new write site.)
+    // 10. (Removed — composition root no longer writes the scanner_registry
+    //     row. The heartbeat loop's first tick now owns `upsert_self` so
+    //     the registry row's existence and the loop's liveness are
+    //     inseparable. See `heartbeat::refresh_registry` for the write site.)
     // -----------------------------------------------------------------
 
     // -----------------------------------------------------------------
@@ -704,7 +700,7 @@ pub async fn build_app_context(
             repositories.clone(),
             artifacts.clone(),
             Arc::new(PrefetchUseCase::new()),
-            // Spec 077 §3.1 — the tick now enqueues `prefetch` leaf rows via
+            // The tick now enqueues `prefetch` leaf rows via
             // `enqueue_prefetch_batch`; reuse the same jobs pool the cascade
             // triad uses.
             jobs.clone(),
@@ -783,7 +779,7 @@ pub async fn build_app_context(
     // below, so it survives to the resolver-prime + refresh-task wiring at
     // the `register_provenance_verify` call site.
     let upstream_mappings_for_provenance = upstream_mappings_for_prefetch.clone();
-    // Item 12b — share the upstream-proxy + mapping-repo handles
+    // Share the upstream-proxy + mapping-repo handles
     // across BOTH the cascade driver and the leaf-pull handler.
     let prefetch_proxy_for_leaf = upstream_proxy_for_prefetch.clone();
     let prefetch_mappings_for_leaf = upstream_mappings_for_prefetch.clone();
@@ -856,10 +852,9 @@ pub async fn build_app_context(
     //
     //       Dependency subtree (mirrors `hort-server::composition::
     //       build_app_context`'s ingest wiring; no new ports, no port
-    //       contract changes — every adapter here already had a peer
-    //       in the worker before Item 5b):
+    //       contract changes):
     //         - `IngestUseCase` (the `register_existing_cas_blob` path
-    //           the use case calls into) — needs the new
+    //           the use case calls into) — needs the
     //           `CurationRuleRepository` + `ArtifactGroupUseCase`
     //           deps for full constructor parity, plus a few
     //           operator-cardinality defaults (see below).
@@ -969,9 +964,9 @@ pub async fn build_app_context(
     );
 
     // -----------------------------------------------------------------
-    // 12.a. Register the ServiceAccountRotationHandler when the optional
-    //       `KubernetesSecretWriter` adapter wires successfully AND
-    //       `HORT_PUBLIC_REGISTRY_HOST` is set.
+    // Register the ServiceAccountRotationHandler when the optional
+    // `KubernetesSecretWriter` adapter wires successfully AND
+    // `HORT_PUBLIC_REGISTRY_HOST` is set.
     //
     //      The adapter's `try_in_cluster` falls back to a kubeconfig
     //      so dev-laptop runs ALSO succeed when ~/.kube/config exists;
@@ -986,9 +981,9 @@ pub async fn build_app_context(
     register_service_account_rotation(&mut dispatcher, &pool, &event_store, cfg).await;
 
     // -----------------------------------------------------------------
-    // 12.b. Register the EventstoreCheckpointHandler when storage is S3
-    //       AND both anchor key files are present (the operator-
-    //       provisioned signing/verifying keypair, §14 R2).
+    // Register the EventstoreCheckpointHandler when storage is S3
+    // AND both anchor key files are present (the operator-
+    // provisioned signing/verifying keypair).
     //
     //       Concurrency = 1 — checkpoint emission is single-active; the
     //       external CronJob uses `concurrencyPolicy: Forbid` as layer 1.
@@ -1000,8 +995,8 @@ pub async fn build_app_context(
     register_eventstore_checkpoint(&mut dispatcher, &pool, cfg, extra_ca).await;
 
     // -----------------------------------------------------------------
-    // 12.c. Register the ReplaySeenPruneHandler (federated-JWT
-    //       replay-guard seen-set TTL cleanup, ADR 0018 §4 / §12 R4).
+    // Register the ReplaySeenPruneHandler (federated-JWT
+    // replay-guard seen-set TTL cleanup, ADR 0018 §4).
     //
     //       Unconditional: unlike eventstore-checkpoint (which needs S3
     //       + operator anchor keys) the prune only needs the Postgres
@@ -1017,11 +1012,11 @@ pub async fn build_app_context(
     //       external CronJob uses `concurrencyPolicy: Forbid` as the
     //       first layer.
     //
-    //       The handler degrades SAFE on a prune failure (spec §4): a
-    //       missed prune only grows the table — the seen-set never
-    //       forgets a recorded replay within TTL — so the handler
-    //       returns `Failed { retry: true }` (warn!, retried next tick),
-    //       never a hard worker failure.
+    //       The handler degrades SAFE on a prune failure: a missed prune
+    //       only grows the table — the seen-set never forgets a recorded
+    //       replay within TTL — so the handler returns
+    //       `Failed { retry: true }` (warn!, retried next tick), never a
+    //       hard worker failure.
     // -----------------------------------------------------------------
     let replay_seen_prune: Arc<dyn ReplaySeenPrunePort> =
         Arc::new(PgReplayGuardRepository::new(pool.clone()));
@@ -1031,16 +1026,15 @@ pub async fn build_app_context(
     );
     tracing::info!(
         "ReplaySeenPruneHandler registered (single-active per worker replica) \
-         — F-1 jwt_replay_seen TTL cleanup is now wired (spec §12 R4, \
-         default-ENABLED CronJob)"
+         — jwt_replay_seen TTL cleanup wired (default-ENABLED CronJob)"
     );
 
     // -----------------------------------------------------------------
-    // 12.d. Register the three retention TaskHandlers + boot sweep +
-    //       in-process RefcountReconcileGate + optional hort_retention_role
-    //       pool (ADR 0020). Registered unconditionally: a handler whose
-    //       Helm CronJob is `enabled:false` is simply never invoked —
-    //       the volume control is Helm, not composition.
+    // Register the three retention TaskHandlers + boot sweep +
+    // in-process RefcountReconcileGate + optional hort_retention_role
+    // pool (ADR 0020). Registered unconditionally: a handler whose
+    // Helm CronJob is `enabled:false` is simply never invoked —
+    // the volume control is Helm, not composition.
     //
     //       Concurrency = 1 for all three: destructive sweeps, single-
     //       active per worker replica. k8s `concurrencyPolicy: Forbid`
@@ -1064,9 +1058,9 @@ pub async fn build_app_context(
         use hort_domain::ports::retention_scan_reader::RetentionScanReader;
         use hort_domain::ports::terminal_stream_reader::TerminalStreamReader;
 
-        // -- BLOCKER-2-D boot sweep + in-process gate -----------------
-        // Run the Item-B3.5 reconcile sweep exactly as hort-server's
-        // serve.rs does (inline from the pool — a one-shot boot step,
+        // -- Boot sweep + in-process gate -----------------------------
+        // Run the reconcile sweep exactly as hort-server's serve.rs does
+        // (inline from the pool — a one-shot boot step,
         // no serving-path coupling). Flip the gate true ONLY on a
         // successful sweep (or when the operator opted out of the
         // sweep on an upgrade install with authoritative state — the
@@ -1139,7 +1133,7 @@ pub async fn build_app_context(
             1,
         );
 
-        // -- RetentionPurgeHandler (BLOCKER-2-D gate injected) --------
+        // -- RetentionPurgeHandler (reconcile gate injected) ----------
         let purge_gc: Arc<dyn PurgeGcPort> = Arc::new(PgPurgeGcPort::new(pool.clone()));
         let purge_uc = Arc::new(PurgeUseCase::new(
             purge_gc,
@@ -1149,19 +1143,19 @@ pub async fn build_app_context(
         ));
         dispatcher.register(Arc::new(RetentionPurgeHandler::new(purge_uc)), 1);
 
-        // -- EventStoreArchiveHandler (Q5 hort_retention_role pool) -----
+        // -- EventStoreArchiveHandler (hort_retention_role pool) ---------
         // When HORT_RETENTION_DATABASE_URL is set, build a second pool
-        // connected as hort_retention_role (the DELETE-capable role per
-        // §10.2) and route the archive use case's EventStorePublisher
-        // over it so delete_stream can actually remove sealed rows.
-        // When unset (Q5): use the hort_app_role event_publisher — every
+        // connected as hort_retention_role (the DELETE-capable role) and
+        // route the archive use case's EventStorePublisher over it so
+        // delete_stream can actually remove sealed rows.
+        // When unset: use the hort_app_role event_publisher — every
         // delete_stream fails fail-safe via the still-active
-        // events_immutable trigger (the B9 seal-tombstone-first
-        // transaction rolls back, zero rows removed; one fewer branch).
+        // events_immutable trigger (seal-tombstone-first transaction
+        // rolls back, zero rows removed; one fewer branch).
         let archive_publisher: Arc<EventStorePublisher> =
             if let Some(retention_dsn) = cfg.retention_database_url.as_deref() {
-                // The Q5-set branch: this pool actually runs
-                // `seal_and_remove`'s DELETE as `hort_retention_role`.
+                // This pool actually runs `seal_and_remove`'s DELETE as
+                // `hort_retention_role`.
                 // The `lock_timeout` backstop (ADR 0020) is most
                 // load-bearing here (the unset branch fails fail-safe
                 // on the trigger before any row-lock wait), so apply
@@ -1197,13 +1191,12 @@ pub async fn build_app_context(
             };
         let terminal_reader: Arc<dyn TerminalStreamReader> =
             Arc::new(PgTerminalStreamReader::new(pool.clone()));
-        // Q6 — the C-1 floors resolved in WorkerConfig (same env vars +
-        // MIN clamps as hort-server), fed positionally into the B14
-        // canonical builder (AuthAttempts, Artifact, DownloadAudit,
-        // TokenUse). The other artifact-lifecycle categories share the
-        // artifact_lifecycle floor (B14 scope note); RetentionPolicy
-        // streams are unregistered (skipped) in v1 — low-volume policy
-        // audit, never sealed.
+        // The retention floors resolved in WorkerConfig (same env vars +
+        // MIN clamps as hort-server) fed positionally into the canonical
+        // builder (AuthAttempts, Artifact, DownloadAudit, TokenUse). The
+        // other artifact-lifecycle categories share the artifact_lifecycle
+        // floor; RetentionPolicy streams are unregistered (skipped) in
+        // v1 — low-volume policy audit, never sealed.
         let floors = &cfg.audit_retention_floors;
         let rules = canonical_retention_rules(
             chrono_duration(floors.authentication),
@@ -1235,9 +1228,9 @@ pub async fn build_app_context(
     }
 
     // -----------------------------------------------------------------
-    // 12.e.quater Register the ProvenanceVerifyHandler (kind
-    //          `provenance-verify`), gated on the load-bearing
-    //          `worker.provenance.cosign.enabled` flag (ADR 0027).
+    // Register the ProvenanceVerifyHandler (kind `provenance-verify`),
+    // gated on the load-bearing `worker.provenance.cosign.enabled`
+    // flag (ADR 0027).
     //
     //          The flag is the enabling gate, NOT a probe. When off:
     //          no `ProvenancePort` is constructed, the handler is NOT
@@ -1355,16 +1348,16 @@ pub async fn build_app_context(
 // Helpers
 // -----------------------------------------------------------------
 
-/// Backlog 078 Item 6 (chart S3) — apply the load-bearing scanner
-/// `enabled` flags BEFORE the `--version` health probe.
+/// Apply the load-bearing scanner `enabled` flags BEFORE the `--version`
+/// health probe.
 ///
 /// Takes the `(enabled, adapter)` pairs in declared order and returns
 /// only the flag-enabled adapters, preserving order. A flag-disabled
 /// backend is dropped here so it is never health-probed and never
-/// registered — the flag is the enabling gate, not the probe. This is
-/// the structural close for the pre-078 "cosmetic only" `enabled` flag
-/// (the probe used to be the real gate, so `enabled: false` did not
-/// reliably disable a backend whose binary was present).
+/// registered — the flag is the enabling gate, not the probe. This
+/// closes the pre-release "cosmetic only" `enabled` flag footgun (the
+/// probe used to be the real gate, so `enabled: false` did not reliably
+/// disable a backend whose binary was present).
 ///
 /// Pure (no I/O, no probe) so the flag-gates-registration invariant is
 /// unit-testable without a live Postgres connection or a real Trivy /
@@ -1478,7 +1471,7 @@ async fn register_provenance_verify(
     }
 
     // Flag is ON — the pinned trust-root path is REQUIRED. A missing /
-    // unset / unreadable path is a hard boot failure (design §6).
+    // unset / unreadable path is a hard boot failure.
     let trusted_root_path = cfg.provenance_trusted_root_file.as_ref().ok_or_else(|| {
         anyhow!(
             "HORT_PROVENANCE_COSIGN_ENABLED is true but HORT_PROVENANCE_TRUSTED_ROOT_FILE is \
@@ -1511,7 +1504,7 @@ async fn register_provenance_verify(
 
     // Startup health check (mirrors the scanner `health_check_all_or_fail`
     // posture): the trust root must be loaded + fresh, else refuse to
-    // start. Offline only — never probes live Rekor/Fulcio (design §6).
+    // start. Offline only — never probes live Rekor/Fulcio.
     provenance_port.health_check().await.map_err(|e| {
         anyhow!(
             "cosign provenance verifier {:?} failed its startup health check: {e}. \
@@ -1578,9 +1571,9 @@ fn worker_resolver_refresh_interval() -> Duration {
 /// worker pool builder via `.after_connect` (ADR 0020).
 ///
 /// `seal_and_remove`'s chained `StreamSealed` append has *no internal
-/// wait bound*, safe only under the §10.2-INV single-flight precondition.
+/// wait bound*, safe only under the single-flight precondition.
 /// This connection-level `lock_timeout` is the backstop: if single-flight
-/// is violated, a contended-slot wait degrades to the §10.2 fail-safe
+/// is violated, a contended-slot wait degrades to a fail-safe
 /// (`Err` → `errors += 1` → retry next sweep) rather than an unbounded
 /// sweep stall.
 ///
@@ -1620,8 +1613,8 @@ fn apply_lock_timeout(pool_options: PgPoolOptions, ms: u64) -> PgPoolOptions {
 
 /// `std::time::Duration` → `chrono::Duration` for
 /// `canonical_retention_rules` (which takes `chrono::Duration`s). The
-/// worker config holds the C-1 floors as `std::time::Duration` (env
-/// parsing); the canonical builder is `chrono`-typed. The day-count
+/// Worker config holds the retention floors as `std::time::Duration`
+/// (env parsing); the canonical builder is `chrono`-typed. The day-count
 /// floors are far below `i64::MAX` milliseconds, so the conversion is
 /// lossless; a pathological overflow saturates rather than panics.
 fn chrono_duration(d: Duration) -> chrono::Duration {
@@ -1744,8 +1737,7 @@ async fn register_service_account_rotation(
     );
 }
 
-/// Wire the `EventstoreCheckpointHandler` (F-2 external-anchor I2) into
-/// the dispatcher.
+/// Wire the `EventstoreCheckpointHandler` into the dispatcher.
 ///
 /// Registers only when **all** of the following hold; otherwise logs an
 /// `info!` and returns without registering (the
@@ -1754,19 +1746,19 @@ async fn register_service_account_rotation(
 ///
 /// 1. Storage is S3 — Object-Lock WORM anchoring requires an S3-
 ///    compatible object store (a filesystem deployment has no WORM
-///    anchor; spec §6.1). The store is built via `build_s3_object_store`
-///    so ADR 0010 TLS posture applies (no `reqwest::Client::new()`).
+///    anchor). The store is built via `build_s3_object_store` so ADR 0010
+///    TLS posture applies (no `reqwest::Client::new()`).
 /// 2. `HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE` points to the
-///    operator-provisioned Ed25519 PKCS#8 PEM **private** key (§14 R2 —
-///    distinct from any runtime credential, never embedded/derived). A
+///    operator-provisioned Ed25519 PKCS#8 PEM **private** key (distinct
+///    from any runtime credential, never embedded/derived). A
 ///    missing/malformed key fails adapter construction here, loudly —
 ///    never a silent unsigned checkpoint.
 /// 3. `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE` points to the matching SPKI
 ///    PEM **public** key (the same file `hort-server verify-event-chain`
 ///    reads) — used to derive the next monotonic `checkpoint_seq` +
-///    the first-post-migration test via the shipped Item-3 read adapter.
+///    the first-post-migration test via the read adapter.
 ///
-/// The §5 `backfill_baseline` honesty caveat is sourced from
+/// The `backfill_baseline` honesty caveat is sourced from
 /// `HORT_EVENT_CHAIN_BACKFILL_MAX_GLOBAL_POSITION` +
 /// `HORT_EVENT_CHAIN_MIGRATION_TIMESTAMP` (operator-provisioned — the
 /// in-migration backfill recorded these). Absent ⇒ no baseline is
@@ -1789,7 +1781,7 @@ async fn register_eventstore_checkpoint(
     else {
         tracing::info!(
             "EventstoreCheckpointHandler not registered: storage is filesystem, not S3 \
-             — S3 Object-Lock WORM is required to anchor checkpoints (F-2 spec §6.1). \
+             — S3 Object-Lock WORM is required to anchor checkpoints. \
              The /api/v1/admin/tasks/eventstore-checkpoint route will 404 until an \
              S3 anchor bucket is configured.",
         );
@@ -1804,7 +1796,7 @@ async fn register_eventstore_checkpoint(
                     error = %e,
                     "EventstoreCheckpointHandler not registered: \
                      HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE is set but unreadable. \
-                     Provision the operator Ed25519 PKCS#8 PEM private key (§14 R2).",
+                     Provision the operator Ed25519 PKCS#8 PEM private key.",
                 );
                 return;
             }
@@ -1814,8 +1806,8 @@ async fn register_eventstore_checkpoint(
                 "EventstoreCheckpointHandler not registered: \
                  HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE is unset. Set it to the \
                  operator-provisioned Ed25519 PKCS#8 PEM private key (the private \
-                 counterpart of HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE) to enable F-2 \
-                 checkpoint emission (§14 R2).",
+                 counterpart of HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE) to enable \
+                 checkpoint emission.",
             );
             return;
         }
@@ -1837,7 +1829,7 @@ async fn register_eventstore_checkpoint(
             tracing::info!(
                 "EventstoreCheckpointHandler not registered: \
                  HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE is unset (needed to derive the \
-                 next checkpoint_seq via the shipped Item-3 read adapter).",
+                 next checkpoint_seq).",
             );
             return;
         }
@@ -1872,7 +1864,7 @@ async fn register_eventstore_checkpoint(
             tracing::info!(
                 error = %e,
                 "EventstoreCheckpointHandler not registered: the anchor public-key \
-                 PEM did not parse as an Ed25519 SPKI key (§14 R2).",
+                 PEM did not parse as an Ed25519 SPKI key.",
             );
             return;
         }
@@ -1881,11 +1873,11 @@ async fn register_eventstore_checkpoint(
         Ok(e) => Arc::new(e),
         Err(e) => {
             // A malformed signing key fails HERE (loudly), never a
-            // silent unsigned checkpoint (§14 R2).
+            // silent unsigned checkpoint.
             tracing::info!(
                 error = %e,
                 "EventstoreCheckpointHandler not registered: the anchor signing-key \
-                 PEM did not parse as an Ed25519 PKCS#8 private key (§14 R2).",
+                 PEM did not parse as an Ed25519 PKCS#8 private key.",
             );
             return;
         }
@@ -1893,11 +1885,11 @@ async fn register_eventstore_checkpoint(
 
     let heads = Arc::new(PgEventChainHeadReader::new(pool.clone()));
 
-    // §5 honesty caveat — operator-provisioned. Both env vars must be
-    // present together; a malformed value disables the baseline (the
-    // first checkpoint then carries none) but still registers the
-    // handler — the chain is still emitted, only the honesty caveat is
-    // omitted, which a startup `info!` surfaces.
+    // Backfill-baseline honesty caveat — operator-provisioned. Both env
+    // vars must be present together; a malformed value disables the
+    // baseline (the first checkpoint then carries none) but still
+    // registers the handler — the chain is still emitted, only the
+    // honesty caveat is omitted, which a startup `info!` surfaces.
     let backfill_baseline = read_backfill_baseline();
 
     dispatcher.register(
@@ -1913,16 +1905,15 @@ async fn register_eventstore_checkpoint(
         bucket = %bucket,
         backfill_baseline = backfill_baseline.is_some(),
         "EventstoreCheckpointHandler registered (single-active per worker replica) \
-         — F-2 external-anchor (I2) emission is now wired",
+         — checkpoint emission wired",
     );
 }
 
-/// Read the §5 backfill-baseline honesty-caveat inputs from the
-/// operator env. Returns `None` (no baseline stamped on the first
-/// checkpoint) when either var is absent or unparseable — a green-field
-/// deploy with no pre-chain history, or a misconfiguration the caller
-/// surfaces via `info!`. The values were recorded by the in-migration
-/// backfill (spec §5).
+/// Read the backfill-baseline honesty-caveat inputs from the operator
+/// env. Returns `None` (no baseline stamped on the first checkpoint)
+/// when either var is absent or unparseable — a green-field deploy with
+/// no pre-chain history, or a misconfiguration the caller surfaces via
+/// `info!`. The values were recorded by the in-migration backfill.
 fn read_backfill_baseline() -> Option<BackfillBaselineConfig> {
     let max_gp: u64 = std::env::var("HORT_EVENT_CHAIN_BACKFILL_MAX_GLOBAL_POSITION")
         .ok()?
@@ -2008,7 +1999,7 @@ mod tests {
 
     /// `MockScanner` — minimal `ScannerPort` carrying a name + a
     /// programmable health-check outcome. `scan` is unused for the
-    /// H1 tests below.
+    /// health-check tests below.
     struct MockScanner {
         name: String,
         healthy: bool,
@@ -2040,7 +2031,7 @@ mod tests {
         }
     }
 
-    /// H1: every backend healthy → returns the full ordered name list.
+    /// Every backend healthy → returns the full ordered name list.
     #[tokio::test]
     async fn health_check_all_or_fail_returns_all_names_when_healthy() {
         let scanners: Vec<Arc<dyn ScannerPort>> = vec![
@@ -2059,10 +2050,9 @@ mod tests {
         assert_eq!(names, vec!["trivy".to_string(), "osv".to_string()]);
     }
 
-    /// H1: even a SINGLE unhealthy backend must propagate `Err` —
-    /// the spec (§4.2) says "the worker logs and exits non-zero."
-    /// The previous "tolerate degraded boot if at least one is
-    /// healthy" behaviour is removed.
+    /// Even a SINGLE unhealthy backend must propagate `Err` — the worker
+    /// logs and exits non-zero. The previous "tolerate degraded boot if
+    /// at least one is healthy" behaviour is removed.
     #[tokio::test]
     async fn health_check_all_or_fail_propagates_err_when_any_backend_unhealthy() {
         let scanners: Vec<Arc<dyn ScannerPort>> = vec![
@@ -2091,8 +2081,8 @@ mod tests {
         );
     }
 
-    /// H1: every backend unhealthy is also fatal (was the prior
-    /// boundary case — kept to lock the regression).
+    /// Every backend unhealthy is also fatal (was the prior boundary
+    /// case — kept to lock the regression).
     #[tokio::test]
     async fn health_check_all_or_fail_propagates_err_when_all_backends_unhealthy() {
         let scanners: Vec<Arc<dyn ScannerPort>> = vec![
@@ -2116,7 +2106,7 @@ mod tests {
         );
     }
 
-    /// H1: empty backend list returns `Ok(empty)` — purely structural;
+    /// Empty backend list returns `Ok(empty)` — purely structural;
     /// the orchestrator's downstream "no backends" path is the right
     /// place to handle "no backends configured."
     #[tokio::test]
@@ -2128,7 +2118,7 @@ mod tests {
         assert!(names.is_empty());
     }
 
-    // -- Backlog 078 Item 6 (chart S3) — load-bearing `enabled` flag -------
+    // -- Load-bearing scanner `enabled` flag tests ------------------------
     //
     // The flag gates registration BEFORE the probe; a flag-disabled
     // backend is dropped even when its binary probe would pass. These

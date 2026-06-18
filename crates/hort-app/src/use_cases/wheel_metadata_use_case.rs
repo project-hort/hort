@@ -54,8 +54,8 @@
 //! # Observability
 //!
 //! `#[tracing::instrument(skip(self), fields(endpoint_kind = "wheel_metadata"))]`
-//! per design doc §4 — operators dashboard the metadata-vs-wheel-download
-//! breakdown from the tracing field (no new metric). The download metric
+//! operators dashboard the metadata-vs-wheel-download breakdown from
+//! the tracing field (no new metric). The download metric
 //! `hort_download_total{format="pypi", result=...}` is *not* incremented
 //! here — this surface is per-source-attribute serve, not a primary
 //! artifact download. (Re-using the metric would conflate cardinality
@@ -231,10 +231,10 @@ impl WheelMetadataUseCase {
                 });
             }
             QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate => {
-                // **404, not 403** — see module doc §2 — anti-enumeration
-                // for the metadata surface; the wheel's existence stays
-                // hidden. Anti-enumeration log envelope on the use-case
-                // side; the handler emits no additional log.
+                // **404, not 403** — anti-enumeration for the metadata
+                // surface; the wheel's existence stays hidden.
+                // Anti-enumeration log envelope on the use-case side;
+                // the handler emits no additional log.
                 tracing::info!(
                     artifact_id = %artifact.id,
                     repository = %repo_key,
@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(buf, METADATA_BYTES);
     }
 
-    // -- F-25 anti-enumeration on private repo -------------------------
+    // -- Anti-enumeration on private repo -------------------------
 
     #[tokio::test]
     async fn serve_anonymous_on_private_repo_returns_notfound() {

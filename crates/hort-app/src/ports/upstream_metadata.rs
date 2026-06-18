@@ -153,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn dyn_dispatch_returns_seeded_versions_on_happy_path() {
         // The trait MUST be object-safe — composing through `Arc<dyn _>`
-        // is how `AppContext` will hold the impl in Item 8.
+        // is how `AppContext` holds the impl.
         let mock = MockUpstreamMetadataPort::new();
         mock.insert_versions("npm", "left-pad", Ok(vec!["1.0.0".into(), "1.1.0".into()]));
         let port: Arc<dyn UpstreamMetadataPort> = Arc::new(mock);
@@ -167,9 +167,8 @@ mod tests {
 
     #[tokio::test]
     async fn dyn_dispatch_propagates_unsupported_format_for_oci() {
-        // §8 non-goal — OCI dispatch returns `UnsupportedFormat`
-        // straight from the port; the use case maps to
-        // `result = "oci_unsupported"`.
+        // OCI dispatch returns `UnsupportedFormat` straight from the
+        // port; the use case maps to `result = "oci_unsupported"`.
         let mock = MockUpstreamMetadataPort::new();
         // No insert for "oci" — the default policy in the mock returns
         // `UnsupportedFormat` for any unseeded format string.

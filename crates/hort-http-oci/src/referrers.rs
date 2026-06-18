@@ -101,7 +101,7 @@ pub async fn serve(
     actor: Option<&CallerPrincipal>,
 ) -> Response {
     // 1. Resolve + visibility-check the repository through the new
-    //    use case (Init 15 §3.1). Missing OR invisible-to-actor
+    //    use case. Missing OR invisible-to-actor
     //    private repo collapse to NAME_UNKNOWN (anti-enumeration);
     //    transient errors → 500 INTERNAL so an operator who collapses
     //    the DB doesn't see 404s on every request.
@@ -140,7 +140,7 @@ pub async fn serve(
 
     // 2. Parse the path digest. Malformed → DIGEST_INVALID; non-sha256
     //    well-formed → UNSUPPORTED. Both surface as 400 but on
-    //    different OCI codes per §2.8.
+    //    different OCI codes.
     let target_hash: ContentHash = match parse_digest(digest_str) {
         DigestParse::Ok(h) => h,
         DigestParse::Unsupported { algorithm } => {

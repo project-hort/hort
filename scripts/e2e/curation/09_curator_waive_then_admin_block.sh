@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scenario 9: Curator-waive then admin-block sequence.
 #
-# Spec (design §6 edge case): ingest an artifact; quarantine-default →
+# Ingest an artifact; quarantine-default →
 # `hort-cli curation waive` → confirm `Released`; admin-block via the
 # existing admin path → confirm `Rejected`; assert the stream carries
 # `[ArtifactReleased{CuratorWaiver, …}, ArtifactRejected{rejected_by:
@@ -27,7 +27,7 @@
 # scenario only verifies the event-ordering invariant — that the stream
 # carries Released-then-Rejected in the persisted order). When two
 # distinct users (curator + admin) are available, the actor_ids differ
-# and the full §6 edge case fires.
+# and the full event-ordering edge case fires.
 
 set -uo pipefail
 

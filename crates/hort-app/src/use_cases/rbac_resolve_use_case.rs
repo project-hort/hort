@@ -452,7 +452,7 @@ mod tests {
         }));
     }
 
-    // ---- §5 edge case 1: empty groups → empty resolution ----------------
+    // ---- Edge case: empty groups → empty resolution ----------------
 
     #[tokio::test]
     async fn empty_groups_yields_empty_resolution_not_an_error() {
@@ -472,7 +472,7 @@ mod tests {
         assert!(!out.global_admin);
     }
 
-    // ---- §5 edge case 2: groups mapping to no claim → empty -------------
+    // ---- Edge case: groups mapping to no claim → empty -------------
 
     #[tokio::test]
     async fn groups_mapping_to_no_claim_yields_empty_resolution() {
@@ -496,7 +496,7 @@ mod tests {
         assert!(!out.global_admin);
     }
 
-    // ---- §5 edge case 3: a group mapped to `admin` → global_admin -------
+    // ---- Edge case: a group mapped to `admin` → global_admin -------
 
     #[tokio::test]
     async fn group_mapped_to_admin_claim_yields_global_admin_marker() {
@@ -529,7 +529,7 @@ mod tests {
         );
     }
 
-    // ---- §5 edge case 3: `is_admin` NOT synthesised from groups ---------
+    // ---- Edge case: `is_admin` NOT synthesised from groups ---------
 
     #[tokio::test]
     async fn unmapped_admin_like_group_does_not_synthesize_admin() {

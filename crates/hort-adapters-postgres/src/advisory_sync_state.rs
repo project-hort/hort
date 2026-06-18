@@ -53,7 +53,7 @@ impl AdvisorySyncStateRepository for PgAdvisorySyncStateRepository {
             // `updated_at`. `last_error` is preserved across UPSERTs
             // because v1 doesn't yet write it from the handler (the
             // table column exists for a future per-tick error
-            // breadcrumb — see migration 010 / §3.7).
+            // breadcrumb — see migration 010).
             sqlx::query(
                 "INSERT INTO advisory_sync_state (feed, last_sync_at, updated_at) \
                  VALUES ($1, $2, now()) \

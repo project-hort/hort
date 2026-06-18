@@ -189,7 +189,7 @@ const SELECT_MEMBER_COLS: &str = r#"
 "#;
 
 /// Fetch all members of a single group, ordered by `added_at` so
-/// consumers that care about arrival order (§2.5) get deterministic output.
+/// consumers that care about arrival order get deterministic output.
 async fn fetch_members_for_group(
     pool: &PgPool,
     group_id: Uuid,
@@ -333,7 +333,7 @@ impl ArtifactGroupRepository for PgArtifactGroupRepository {
             // The JSONB `->>` operator returns NULL if the key is missing.
             // Under the canonicalisation contract `name` is required; a
             // row lacking it is corrupt — drop NULLs silently here and
-            // let the DB schema (and Item 6's write path) be the
+            // let the DB schema and write path be the
             // enforcement boundary. (Alternative: bubble up Invariant —
             // but the enumeration endpoint should stay robust when one
             // row is corrupt.)
@@ -635,7 +635,7 @@ mod tests {
         id
     }
 
-    /// Seed an `artifact_groups` row directly (no write port yet — Item 6).
+    /// Seed an `artifact_groups` row directly (no write port yet).
     async fn seed_group(
         pool: &PgPool,
         repo: Uuid,

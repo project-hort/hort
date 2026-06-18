@@ -161,8 +161,7 @@ not json at all
     fn malformed_line_in_middle_is_rejected_not_truncated() {
         use hort_domain::error::DomainError;
         // line1 ok, line2 malformed, line3 ok — fail-closed rejects the
-        // whole projection (operator decision, spec §6) rather than
-        // returning a truncated partial.
+        // whole projection rather than returning a truncated partial.
         let body = b"{\"name\":\"a\",\"vers\":\"1.0.0\",\"cksum\":\"x\",\"yanked\":false}\n{ not json \n{\"name\":\"a\",\"vers\":\"2.0.0\",\"cksum\":\"y\",\"yanked\":false}\n";
         let err = project(&body[..]).unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
@@ -178,9 +177,8 @@ not json at all
 
     #[test]
     fn large_multiline_index_streams_every_line() {
-        // Backlog Item 5 "large index" acceptance: the streaming
-        // `into_iter` walks many root-level NDJSON objects without
-        // materialising the whole body as a single value tree.
+        // The streaming `into_iter` walks many root-level NDJSON objects
+        // without materialising the whole body as a single value tree.
         let mut body = String::new();
         for i in 0..2000 {
             body.push_str(&format!(

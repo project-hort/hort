@@ -34,7 +34,7 @@ struct ProvenanceVerifyParams {
 }
 
 /// [`TaskHandler`] impl for `kind = "provenance-verify"`. Constructed at
-/// worker composition time (Item 6) with the orchestration use case.
+/// worker composition time with the orchestration use case.
 pub struct ProvenanceVerifyHandler {
     orchestration: Arc<ProvenanceOrchestrationUseCase>,
 }
@@ -76,10 +76,10 @@ impl TaskHandler for ProvenanceVerifyHandler {
             // the verdict was applied (or skipped) cleanly.
             match self.orchestration.verify_artifact(parsed.artifact_id).await {
                 Ok(outcome) => {
-                    // H15 (design §3.6) — record the compact per-artifact
-                    // verdict on the job's `result_summary`, including the
-                    // previously-silent `no_attestation` case. Closed
-                    // taxonomy: `verified` / `rejected:<reason>` /
+                    // Record the compact per-artifact verdict on the job's
+                    // `result_summary`, including the previously-silent
+                    // `no_attestation` case. Closed taxonomy:
+                    // `verified` / `rejected:<reason>` /
                     // `no_attestation` / `skipped:<why>`.
                     let result = result_summary_label(&outcome);
                     // A single `debug!` on the silent path is the most that
@@ -349,8 +349,8 @@ mod tests {
         }
     }
 
-    /// H15 — the previously-silent `no_attestation` path now writes a
-    /// compact `result_summary` on the job row (the literal H15 close).
+    /// The previously-silent `no_attestation` path now writes a compact
+    /// `result_summary` on the job row.
     #[tokio::test]
     async fn no_attestation_writes_result_summary() {
         // VerifyIfPresent + no seeded signature → verifier sees no bundle →

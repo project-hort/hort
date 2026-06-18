@@ -122,10 +122,10 @@ other helper.
 */}}
 {{- define "hort-server.runtimeEnv" -}}
 # ----- Postgres (app-role DSN, NOT admin) -----
-# Backlog 078 Item 5 — inject the canonical HORT_DATABASE_URL var.
-# The binary prefers HORT_DATABASE_URL and falls back to bare
-# DATABASE_URL (sqlx-cli / Tier-2 / 12-factor compat), so bare
-# DATABASE_URL is still honored — the chart just sets the canonical name.
+# Inject the canonical HORT_DATABASE_URL var. The binary prefers
+# HORT_DATABASE_URL and falls back to bare DATABASE_URL (sqlx-cli /
+# Tier-2 / 12-factor compat), so bare DATABASE_URL is still honored —
+# the chart just sets the canonical name.
 - name: HORT_DATABASE_URL
   valueFrom:
     secretKeyRef:
@@ -203,8 +203,7 @@ other helper.
 {{- end -}}
 
 {{/*
-Backlog 078 Item 7 (chart S2 / convention 9) — CA-bundle auto-mount
-source resolution + the no-env-without-mount guard.
+CA-bundle auto-mount source resolution and the no-env-without-mount guard.
 
 Two trust-bundle *auto-mount* sources are supported, and they are
 mutually exclusive (a pod cannot mount two different `ca.crt` files at
@@ -244,20 +243,20 @@ true
 
 {{- define "hort-server.extraCaBundle.validateSources" -}}
 {{- if and .Values.extraCaBundle.configMapName .Values.extraCaBundle.secretName -}}
-  {{- fail "Backlog 078 Item 7: extraCaBundle.configMapName and extraCaBundle.secretName are mutually exclusive — a pod can mount only one ca.crt source at extraCaBundle.path. Set exactly one (or neither, for the manual extraVolumes recipe)." -}}
+  {{- fail "extraCaBundle.configMapName and extraCaBundle.secretName are mutually exclusive — a pod can mount only one ca.crt source at extraCaBundle.path. Set exactly one (or neither, for the manual extraVolumes recipe)." -}}
 {{- end -}}
 {{- if and (or .Values.extraCaBundle.configMapName .Values.extraCaBundle.secretName) (not .Values.extraCaBundle.path) -}}
-  {{- fail "Backlog 078 Item 7: extraCaBundle.configMapName/secretName is set but extraCaBundle.path is empty — set extraCaBundle.path to the in-container mount path for the bundle." -}}
+  {{- fail "extraCaBundle.configMapName/secretName is set but extraCaBundle.path is empty — set extraCaBundle.path to the in-container mount path for the bundle." -}}
 {{- end -}}
 {{- end -}}
 
 {{/*
-Backlog 078 Item 7 — the auto-mount `volumeMount` for the CA bundle.
-Emitted by the server Deployment, worker Deployment, and the
-server-runtime CronJobs whenever `hort-server.extraCaBundle.autoMounted`
-is true. Mounting at `extraCaBundle.path` with `subPath: ca.crt` matches
-the shape used by both ConfigMap- and Secret-backed volumes (the volume
-itself projects `ca.crt`). Callers nest the output at the right indent.
+The auto-mount `volumeMount` for the CA bundle. Emitted by the server
+Deployment, worker Deployment, and the server-runtime CronJobs whenever
+`hort-server.extraCaBundle.autoMounted` is true. Mounting at
+`extraCaBundle.path` with `subPath: ca.crt` matches the shape used by
+both ConfigMap- and Secret-backed volumes (the volume itself projects
+`ca.crt`). Callers nest the output at the right indent.
 */}}
 {{- define "hort-server.extraCaBundle.volumeMount" -}}
 - name: extra-ca-bundle
@@ -267,8 +266,8 @@ itself projects `ca.crt`). Callers nest the output at the right indent.
 {{- end -}}
 
 {{/*
-Backlog 078 Item 7 — the auto-mount `volume` for the CA bundle. Selects
-the ConfigMap or Secret projection from whichever of
+The auto-mount `volume` for the CA bundle. Selects the ConfigMap or
+Secret projection from whichever of
 `extraCaBundle.{configMapName,secretName}` is set (the two are mutually
 exclusive — see `validateSources`). Both project the single `ca.crt`
 key read-only (0444). Callers nest the output at the right indent.
@@ -287,8 +286,8 @@ key read-only (0444). Callers nest the output at the right indent.
         path: ca.crt
 {{- else if .Values.extraCaBundle.secretName }}
   secret:
-    # Backlog 078 Item 7 (a) — Secret-backed auto-mount, symmetric with
-    # the ConfigMap path above. Same 0444 read-only trust-anchor posture.
+    # Secret-backed auto-mount, symmetric with the ConfigMap path above.
+    # Same 0444 read-only trust-anchor posture.
     secretName: {{ .Values.extraCaBundle.secretName | quote }}
     defaultMode: 0444
     items:
@@ -342,21 +341,13 @@ value. Empty when extraCaBundle is not configured (caller gates on
 {{- end -}}
 
 {{/*
-Backlog 078 Item 9 (chart S4) — the rotation switch pair is collapsed.
-
-Pre-078 there were TWO toggles — `worker.rotation.enabled` (worker-side
-wiring) and `scheduledTasks.serviceAccountRotation.enabled` (CronJob
-trigger) — cross-validated here by a bespoke `fail` directive so a
-half-on config (one switch set, the other not) was rejected.
-
-Item 9 collapsed this to a SINGLE source-of-truth toggle:
-`scheduledTasks.serviceAccountRotation.enabled` now drives BOTH the
-CronJob AND the worker-side rotation env + RBAC. The two pieces that
-must still physically agree — the `adminTasksEnabled` umbrella, the
-worker Deployment being enabled, and a non-empty
-`worker.rotation.publicRegistryHost` — are enforced by `values.schema.json`
-`if/then` couplings (mirroring the `replicaCount ⇒ ephemeralStore/storage`
-couplings), so this bespoke template helper is no longer needed and was
-removed. The schema is the single validation style for cross-field
-couplings in this chart.
+The rotation switch pair is collapsed to a SINGLE source-of-truth toggle:
+`scheduledTasks.serviceAccountRotation.enabled` drives BOTH the CronJob
+AND the worker-side rotation env + RBAC. The pieces that must physically
+agree — the `adminTasksEnabled` umbrella, the worker Deployment being
+enabled, and a non-empty `worker.rotation.publicRegistryHost` — are
+enforced by `values.schema.json` `if/then` couplings, so the bespoke
+template helper that previously cross-validated them was removed. The
+schema is the single validation style for cross-field couplings in this
+chart.
 */}}

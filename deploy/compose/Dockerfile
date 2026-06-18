@@ -2,8 +2,8 @@
 #
 # hort-server — v2 service binary image.
 #
-# Scope: unblock the Phase-B compose stack. Not the production image — that
-# lands as part of the deploy initiative. Uses debian:bookworm-slim at
+# Scope: the compose stack for development and E2E testing. Not the
+# production image. Uses debian:bookworm-slim at
 # runtime instead of distroless so `sh`/`ls` are available for live
 # debugging during early E2E shake-out.
 

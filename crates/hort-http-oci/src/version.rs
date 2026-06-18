@@ -68,7 +68,7 @@ pub async fn get_version(State(ctx): State<Arc<AppContext>>, req: Request) -> Re
     // branch below would fire and the OCI version probe would be
     // unreachable in Disabled mode. The probe is harmless (it merely
     // advertises that an OCI registry exists); actual operations still
-    // fail closed at the F1 extractors.
+    // fail closed at the extractors.
     if matches!(ctx.auth, AuthContext::Disabled) {
         return ok_response();
     }

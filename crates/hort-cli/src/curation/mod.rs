@@ -15,7 +15,7 @@
 //! - `block versions --repo <key> --package <name> --versions <v1>,<v2>,…
 //!   --justification <text>` →
 //!   POST `/api/v1/admin/curation/block-versions`
-//!   (bulk-by-version-list curator block; continue-on-error per §2.3).
+//!   (bulk-by-version-list curator block; continue-on-error).
 //! - `exclude-finding --policy <id> --cve <id> --justification <text>` →
 //!   POST `/api/v1/admin/policies/:policy_id/exclusions`
 //!   (policy-scoped CVE exclusion).
@@ -23,9 +23,9 @@
 //!   DELETE `/api/v1/admin/policies/:policy_id/exclusions/:cve_id`
 //!   (remove a policy-scoped CVE exclusion).
 //!
-//! # Single vs bulk `block` (deviation from §2.7 literal shape)
+//! # Single vs bulk `block`
 //!
-//! Design §2.7 lists `block <artifact_id>` AND `block --repo ... --package
+//! The original design lists `block <artifact_id>` AND `block --repo ... --package
 //! ... --versions ...` as two variants of the same `block` command. Clap's
 //! XOR-between-positional-and-flag-group story produces vague error
 //! messages on misuse (e.g. "the following required arguments were not
@@ -83,8 +83,8 @@ pub enum CurationCommand {
     ///
     /// Emits `ArtifactReleased { authority: CuratorWaiver, reason:
     /// Curator }`. Source-state guard: `Quarantined` only (the use case
-    /// rejects `ScanIndeterminate`; that authority stays admin-only —
-    /// design §2.2). `--justification` is required (≤ 512 bytes).
+    /// rejects `ScanIndeterminate`; that authority stays admin-only).
+    /// `--justification` is required (≤ 512 bytes).
     Waive(waive::WaiveArgs),
 
     /// Block one or more artifacts — `Quarantined`/`Released` →
@@ -92,9 +92,8 @@ pub enum CurationCommand {
     ///
     /// Two modes: `block artifact <id>` (single) and `block versions
     /// --repo ... --package ... --versions ...` (bulk-by-version-list,
-    /// continue-on-error per §2.3). See module-level docs for the
-    /// rationale on the sub-subcommand split vs the design §2.7 literal
-    /// shape.
+    /// continue-on-error). See module-level docs for the
+    /// rationale on the sub-subcommand split vs the original design.
     Block(block::BlockArgs),
 
     /// Exclude a CVE finding for a scan policy.
@@ -102,8 +101,8 @@ pub enum CurationCommand {
     /// POST `/api/v1/admin/policies/:policy_id/exclusions`. Triggers the
     /// existing post-exclusion re-evaluation cascade — operators should
     /// be aware that one exclusion can release multiple artifacts whose
-    /// only blocking findings were the now-excluded CVE (design §2.4
-    /// blast-radius warning).
+    /// only blocking findings were the now-excluded CVE (blast-radius
+    /// consideration).
     ExcludeFinding(exclude_finding::ExcludeFindingArgs),
 
     /// Remove a CVE exclusion from a scan policy.

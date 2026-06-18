@@ -1,8 +1,7 @@
 //! npm `IndexBuilder` — the reference implementation for the Source →
 //! Filter → Builder pipeline (see explanation/index-construction.md).
 //!
-//! This module ships the npm-side of the pipeline
-//! (design doc §2.1 / §2.2 / §2.6):
+//! This module ships the npm-side of the pipeline:
 //!
 //! - [`NpmVersionPayload`] (re-exported from
 //!   [`hort_app::use_cases::index_serve`] — defined there for dep-graph
@@ -70,10 +69,10 @@
 //! declares — no upstream `time`, no `maintainers`, no `bugs`, no
 //! README. Two reasons:
 //!
-//! 1. The design doc §2.2 makes the closed-payload-sum the spine of
-//!    the format-agnostic pipeline. Carrying extras would force them
-//!    onto every payload variant or force a passthrough-blob escape
-//!    hatch that defeats the structural contract.
+//! 1. The closed-payload-sum is the spine of the format-agnostic
+//!    pipeline. Carrying extras would force them onto every payload
+//!    variant or force a passthrough-blob escape hatch that defeats
+//!    the structural contract.
 //! 2. No npm test (router-level or otherwise) checks any upstream
 //!    extra. Both legacy paths (hosted local-CAS, proxy-rewrite) emit
 //!    only what the unified builder now emits or fewer (the hosted
@@ -95,7 +94,7 @@
 //! Source-adapter tests live in `hort-http-npm/src/index_source.rs`
 //! (they need `AppContext` + mocks and so cannot live in `hort-formats`).
 //! Anti-enumeration tests live in `hort-http-npm/src/serve.rs`
-//! (the unified handler is what F-25 caller-threading is asserted at).
+//! (the unified handler is the anti-enumeration assertion site).
 
 use bytes::Bytes;
 use hort_app::use_cases::index_serve::{

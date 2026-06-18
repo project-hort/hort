@@ -174,7 +174,7 @@ async fn migration_010_creates_sbom_components() {
         "expected SQLSTATE 23505 (unique_violation), got {dup_code}: {dup_err}"
     );
 
-    // `version` is NULL-able per design §3.3.
+    // `version` is NULL-able.
     sqlx::query(
         "INSERT INTO public.sbom_components (artifact_id, purl, ecosystem, name, version) \
          VALUES ($1, 'pkg:npm/bar', 'npm', 'bar', NULL)",
@@ -269,8 +269,8 @@ async fn migration_010_creates_advisory_sync_state_with_seed_row() {
     );
 
     // The 'osv' seed row must exist with last_sync_at < now() - 23h.
-    // Per design §3.7 the migration seeds at `now() - 24h` so the first
-    // tick has a meaningful backfill window. We assert ">= 23h" rather
+    // The migration seeds at `now() - 24h` so the first tick has a
+    // meaningful backfill window. We assert ">= 23h" rather
     // than "exactly 24h" to tolerate clock skew between INSERT time and
     // test time.
     let row = sqlx::query(
@@ -307,7 +307,7 @@ async fn migration_010_creates_advisory_sync_state_with_seed_row() {
     );
 
     // INSERT + SELECT for an additional feed (extensibility — future
-    // GitHub Advisory feed lands as its own row per design §3.7).
+    // GitHub Advisory feed lands as its own row).
     let feed_name = format!("test-feed-{}", Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO public.advisory_sync_state (feed, last_sync_at, updated_at) \

@@ -160,7 +160,7 @@ if command -v python3 >/dev/null 2>&1; then
     py_major="$(echo "$py_version" | cut -d. -f1)"
     py_minor="$(echo "$py_version" | cut -d. -f2)"
     if [[ "$py_major" -lt 3 ]] || [[ "$py_major" -eq 3 && "$py_minor" -lt 11 ]]; then
-        warn "python3 $py_version is older than 3.11 — pip + twine flows in §7.2 may misbehave."
+        warn "python3 $py_version is older than 3.11 — pip + twine flows may misbehave."
     fi
 fi
 

@@ -140,9 +140,9 @@ pub struct EvaluateSummary {
     /// Pairs skipped because the artifact was already expired by this
     /// policy (idempotent no-op).
     pub already_expired: u64,
-    /// Pairs skipped by the §6-invariant-1 quarantine/rejected filter.
+    /// Pairs skipped by the quarantine/rejected GC-protection filter.
     pub skipped_protected: u64,
-    /// Pairs skipped by the §6-invariant-7 stale-scan freshness gate.
+    /// Pairs skipped by the stale-scan freshness gate.
     pub skipped_stale_scan: u64,
     /// Pairs where a port read failed (sweep continued).
     pub errors: u64,
@@ -181,7 +181,7 @@ impl RetentionUseCase {
     ///
     /// Returns the aggregate [`EvaluateSummary`]. One bad (policy,
     /// artifact) pair (a port read error) is recorded and skipped; it
-    /// never aborts the whole sweep (§7 — "Policy evaluation rejected …
+    /// never aborts the whole sweep ("Policy evaluation rejected …
     /// `error!` … retried on next sweep" is per-pair, not fatal).
     #[tracing::instrument(skip(self, policies, candidates), fields(
         policy_count = policies.len(),
@@ -259,7 +259,7 @@ impl RetentionUseCase {
     ) -> EvalStep {
         let artifact = &candidate.artifact;
 
-        // -- §6 invariant 1: quarantine / rejected GC-protection ----------
+        // -- quarantine / rejected GC-protection ----------
         match artifact.quarantine_status {
             QuarantineStatus::Quarantined => {
                 emit_retention_evaluation(
@@ -307,18 +307,18 @@ impl RetentionUseCase {
             return EvalStep::AlreadyExpired;
         }
 
-        // -- §4 scope gate ------------------------------------------------
+        // -- Scope gate ------------------------------------------------
         // A scoped policy must never expire an artifact it does not
-        // cover. `RetentionScope::matches` is the pure §4 decision; the
-        // candidate-reader does NO scope SQL pre-filter (see the
+        // cover. `RetentionScope::matches` is the pure scope decision;
+        // the candidate-reader does NO scope SQL pre-filter (see the
         // `RetentionCandidateReader` port docstring), so the gate lives
         // here, before the predicate `evaluate()` call. `ingest_source`
         // is the `ArtifactIngested.source` — the genesis event on every
         // artifact stream. If it is somehow absent (it cannot be: it is
         // the first event of the aggregate), fail SAFE: treat the scope
         // as a non-match so the artifact is never expired, and `warn!`
-        // — the same fail-safe posture inv7 takes when it cannot prove
-        // scan freshness.
+        // — the same fail-safe posture the freshness gate takes when
+        // it cannot prove scan freshness.
         let Some(ingest_source) = stream.iter().find_map(|ev| match &ev.event {
             DomainEvent::ArtifactIngested(e) => Some(e.source),
             _ => None,
@@ -359,20 +359,20 @@ impl RetentionUseCase {
         };
 
         // This artifact's most-recent `ScanCompleted` on its OWN stream
-        // — the per-artifact §6-inv-7 freshness signal (Finding #2;
-        // tightened from the per-repo `repo_security_scores.last_scan_at`
-        // MAX). `None` = no scan on this artifact's stream.
+        // — the per-artifact freshness signal (tightened from the
+        // per-repo `repo_security_scores.last_scan_at` MAX).
+        // `None` = no scan on this artifact's stream.
         let latest_scan_at_opt = self.latest_scan_at(&stream);
 
-        // -- §6 invariant 7: scan-data freshness gate (PER ARTIFACT) ------
+        // -- Scan-data freshness gate (PER ARTIFACT) ------
         if policy.predicate.is_security_driven()
             && !self.scan_is_fresh(now, candidate, latest_scan_at_opt)
         {
             emit_retention_evaluation(policy_id_label, RetentionEvaluationResult::SkippedStaleScan);
             tracing::debug!(
                 policy_id = %policy.id, artifact_id = %artifact.id,
-                "inv7: this artifact's scan data stale (> 2x rescan \
-                 interval) or absent — security predicate skipped this pass"
+                "scan data stale (> 2x rescan interval) or absent \
+                 — security predicate skipped this pass"
             );
             return EvalStep::SkippedStaleScan;
         }
@@ -441,24 +441,23 @@ impl RetentionUseCase {
         }
     }
 
-    /// §6-invariant-7 freshness gate, evaluated **per artifact** (not
-    /// per repo). `true` = fresh, evaluate the security predicate;
-    /// `false` = stale, skip it (NOT an error — the predicate just does
-    /// not run this pass; the artifact becomes eligible again when its
-    /// next scan completes).
+    /// Scan-data freshness gate, evaluated **per artifact** (not per
+    /// repo). `true` = fresh, evaluate the security predicate; `false` =
+    /// stale, skip it (NOT an error — the predicate just does not run
+    /// this pass; the artifact becomes eligible again when its next scan
+    /// completes).
     ///
     /// `latest_scan_at` is this artifact's most-recent
     /// `ScanCompleted.stored_at` on its **own** stream
-    /// (`self.latest_scan_at(&stream)`), per §6 invariant 7 ("most
-    /// recent `ScanCompleted`" — of *this* artifact). This is tightened
-    /// from the weaker `repo_security_scores.last_scan_at` reading,
-    /// which is a per-repo MAX: a fresh scan on a *different* artifact
-    /// in the same repo would otherwise wrongly rescue a stale one
-    /// (Finding #2). `None` (no `ScanCompleted` on the artifact's
-    /// stream) ⇒ cannot prove per-artifact freshness ⇒ stale
-    /// (fail-safe: a security predicate must never expire an artifact
-    /// whose scan freshness is unprovable). No port read here — the
-    /// signal is already on the stream the caller read.
+    /// (`self.latest_scan_at(&stream)`). This is tightened from the
+    /// weaker `repo_security_scores.last_scan_at` reading, which is a
+    /// per-repo MAX: a fresh scan on a *different* artifact in the same
+    /// repo would otherwise wrongly rescue a stale one.
+    /// `None` (no `ScanCompleted` on the artifact's stream) ⇒ cannot
+    /// prove per-artifact freshness ⇒ stale (fail-safe: a security
+    /// predicate must never expire an artifact whose scan freshness is
+    /// unprovable). No port read here — the signal is already on the
+    /// stream the caller read.
     fn scan_is_fresh(
         &self,
         now: DateTime<Utc>,
@@ -482,7 +481,7 @@ impl RetentionUseCase {
 
     /// Earliest `ScanCompleted.stored_at` on the stream is the
     /// most-conservative "finding present since" anchor for
-    /// `HasFindingDetectedFor`. The §4 ladder:
+    /// `HasFindingDetectedFor`. The resolution ladder:
     /// 1. `ArtifactBecameVulnerable.previously_clean_at` (O(1), exact)
     ///    if such an event exists for the matched findings;
     /// 2. else the earliest `ScanCompleted` on the stream;

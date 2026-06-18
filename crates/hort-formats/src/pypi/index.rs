@@ -1,6 +1,5 @@
 //! PyPI `IndexBuilder` impls — the PyPI side of the Source → Filter →
-//! Builder pipeline (see explanation/index-construction.md,
-//! design doc §2.1 / §2.3 / §2.6).
+//! Builder pipeline (see explanation/index-construction.md).
 //!
 //! PyPI's simple index emits **two content types** off the same
 //! per-version data:
@@ -10,13 +9,13 @@
 //! - PEP 691 JSON — `files[]` rows of the form
 //!   `{ "filename": …, "url": …, "hashes": {"sha256": …}, "requires-python": … }`.
 //!
-//! Per design doc §2.3 the trait stays content-type-agnostic and PyPI
-//! ships **two distinct builder impls** ([`PypiHtmlIndexBuilder`] and
-//! [`PypiJsonIndexBuilder`]); the per-format serve handler picks one
-//! based on the request's `Accept` header via `SimpleIndexFormat::from_accept`.
-//! The alternative (adding a `content_type` field to [`BuildContext`] +
-//! runtime branching inside a single builder) was explicitly rejected:
-//! builder selection is a handler-tier decision.
+//! The trait stays content-type-agnostic and PyPI ships **two distinct
+//! builder impls** ([`PypiHtmlIndexBuilder`] and [`PypiJsonIndexBuilder`]);
+//! the per-format serve handler picks one based on the request's `Accept`
+//! header via `SimpleIndexFormat::from_accept`. The alternative (adding a
+//! `content_type` field to [`BuildContext`] + runtime branching inside a
+//! single builder) was explicitly rejected: builder selection is a
+//! handler-tier decision.
 //!
 //! # What the builders emit
 //!
@@ -58,7 +57,7 @@
 //!
 //! # Why two impls instead of an arm on one impl
 //!
-//! Design §2.3 explicit instruction. Splitting also keeps the
+//! Splitting also keeps the
 //! per-content-type emission cost honest: the HTML arm pays string
 //! concatenation; the JSON arm pays a `serde_json::Value` build +
 //! `serde_json::to_vec`. Each is the right tool for its wire shape.
@@ -69,7 +68,7 @@
 //! both impls: empty set, single-version single-file, multi-file
 //! within a version (sdist + wheel), absent `hash_sha256`, absent
 //! `requires_python`, multi-version ordering. Source-adapter tests
-//! live in `hort-http-pypi/src/index_source.rs`; F-25 anti-enumeration
+//! live in `hort-http-pypi/src/index_source.rs`; anti-enumeration
 //! tests live in `hort-http-pypi/src/serve.rs`.
 
 use bytes::Bytes;
@@ -812,8 +811,8 @@ mod tests {
         // declare a `.dist-info/METADATA` file the endpoint could
         // serve, so the attribute is meaningless. Defence-in-depth
         // would skip it; in this codebase the source ALWAYS leaves
-        // sdists with `None` (Item 6's HostedPypiSource batched
-        // lookup keys on the wheel-only ContentReference rows), so
+        // sdists with `None` (the HostedPypiSource batched lookup
+        // keys on the wheel-only ContentReference rows), so
         // the no-attribute branch is what fires for sdists in
         // production. Test the production path: sdist with default
         // None → no attribute.

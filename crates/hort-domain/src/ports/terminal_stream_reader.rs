@@ -7,18 +7,16 @@
 //!
 //! # Why this exists
 //!
-//! `EventStoreRetentionUseCase::archive_terminal_streams` is
-//! the third retention use case (after B3 `evaluate_policies` and B4
-//! `process_expired`). It seals whole **terminal** streams once their
-//! audit-retention floor has elapsed — `delete_stream` for the global
-//! `StreamRetentionMode::Delete`, `archive_stream` for
-//! `StreamRetentionMode::Archive`. Both route through the B9
-//! `seal_and_remove` chokepoint, which auto-emits the F-2 `StreamSealed`
-//! tombstone; B5 never reimplements the tombstone.
+//! `EventStoreRetentionUseCase::archive_terminal_streams` seals whole
+//! **terminal** streams once their audit-retention floor has elapsed —
+//! `delete_stream` for the global `StreamRetentionMode::Delete`,
+//! `archive_stream` for `StreamRetentionMode::Archive`. Both route
+//! through the `seal_and_remove` chokepoint, which auto-emits the
+//! `StreamSealed` tombstone.
 //!
 //! The use case needs, per candidate stream: the rendered stream id,
-//! its [`StreamCategory`], the oldest event's `stored_at` (the C-1
-//! floor anchor — every later event is at-or-after it), the newest
+//! its [`StreamCategory`], the oldest event's `stored_at` (the floor
+//! anchor — every later event is at-or-after it), the newest
 //! event's `stored_at`, and the tail event's
 //! [`DomainEvent::event_type`](crate::events::DomainEvent::event_type)
 //! (the terminal-gate input). That is exactly
@@ -27,12 +25,6 @@
 //! # Why a *new, separate* additive port (not extra methods on
 //! [`EventStore`](super::event_store::EventStore))
 //!
-//! Identical reasoning to the B3
-//! [`RetentionScanReader`](super::retention_scan_reader::RetentionScanReader),
-//! B3.5
-//! [`RefcountReconcilePort`](super::refcount_reconcile::RefcountReconcilePort),
-//! and B4 [`PurgeGcPort`](super::purge_gc::PurgeGcPort) splits. The B5
-//! scope contract forbids changing any existing port/trait signature;
 //! `EventStore` is frozen (an EventStoreDB adapter must remain
 //! implementable against it unchanged). Adding a stream-enumeration
 //! surface to `EventStore` would mutate that signature. So the
@@ -46,13 +38,12 @@
 //! Keeping enumeration and the per-category seal decision as separate
 //! concerns that exchange typed candidate data lets the `hort-app`
 //! `EventStoreRetentionUseCase` stay pure orchestration (100%
-//! mock-testable per the `hort-app` coverage tier — the two seal modes,
-//! the meta-stream guard, the C-1 floor proof, the
-//! `info!`/`warn!`/`debug!`/`error!` policy, the summary) while the SQL
-//! (the set-based per-stream aggregate over `events`) stays in the
-//! Postgres adapter (≥85% integration-tested). The use case never
-//! embeds SQL; the adapter never embeds the seal-policy / floor /
-//! tracing / summary orchestration.
+//! mock-testable — the two seal modes, the meta-stream guard, the
+//! floor proof, the `info!`/`warn!`/`debug!`/`error!` policy, the
+//! summary) while the SQL (the set-based per-stream aggregate over
+//! `events`) stays in the Postgres adapter (≥85% integration-tested).
+//! The use case never embeds SQL; the adapter never embeds the
+//! seal-policy / floor / tracing / summary orchestration.
 
 use crate::error::DomainResult;
 use crate::events::StreamCategory;
@@ -67,17 +58,17 @@ use super::BoxFuture;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalStreamCandidate {
     /// Wire form `"{category}-{uuid}"` (`StreamId::Display`). The use
-    /// case parses it back via `StreamId::from_str` to call the B9
+    /// case parses it back via `StreamId::from_str` to call the seal
     /// chokepoint; carried as the already-rendered string so the
-    /// adapter's set-based enumeration query does not re-stringify and
+    /// the adapter's set-based enumeration query does not re-stringify and
     /// the use case's meta-stream guard is a cheap string compare
     /// against `StreamId::eventstore_retention().to_string()`.
     pub stream_id: String,
     /// The aggregate category of the stream — selects the per-category
     /// retention rule (floor + seal mode) in the use case.
     pub category: StreamCategory,
-    /// Min `events.stored_at` over the stream — the retention-floor
-    /// anchor. Every later event is at-or-after this, so proving
+    /// Min `events.stored_at` over the stream — the retention-floor anchor.
+    /// Every later event is at-or-after this, so proving
     /// `now - first_event_at >= floor` proves the floor for the whole
     /// stream. Never a payload timestamp, never the chain head.
     pub first_event_at: chrono::DateTime<chrono::Utc>,

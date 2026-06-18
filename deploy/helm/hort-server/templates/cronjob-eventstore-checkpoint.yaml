@@ -9,14 +9,13 @@ worker's dispatcher hands to the `EventstoreCheckpointHandler`
 operator anchor key files are provisioned).
 
 The handler snapshots every live stream's chain head, builds the
-spec §6.2 signed checkpoint (Merkle root over the stream-id-sorted
-witness + monotonic checkpoint_seq + the §5 first-checkpoint
-backfill_baseline honesty caveat), Ed25519-signs the SignedBody with
+signed checkpoint (Merkle root over the stream-id-sorted witness +
+monotonic checkpoint_seq + the first-checkpoint backfill_baseline
+honesty caveat), Ed25519-signs the SignedBody with
 the operator-provisioned anchor signing key, and writes it to the
 S3-Object-Lock-WORM-anchored `<bucket>/hort-event-chain-checkpoints/`
-prefix. This closes the external-anchor half (I2) of F-2: the
-`hort-server verify-event-chain` reader can now attest external
-anchoring instead of resolving to `missing_checkpoint`.
+prefix. The `hort-server verify-event-chain` reader can then attest
+external anchoring instead of resolving to `missing_checkpoint`.
 
 Architectural note: this CronJob is a *trigger* only. The actual
 sign + WORM-write happens in the worker pod via the
@@ -24,9 +23,9 @@ sign + WORM-write happens in the worker pod via the
 The CronJob pod only calls the hort-server admin-task HTTP endpoint
 with a service-account PAT.
 
-Default schedule: **hourly** (spec §6.3 / §14 R6 — hourly bounds the
-worst-case undetected whole-stream-truncation/rollback window to
-≤ 1h, well inside NIS2 Art. 23 incident-reporting horizons).
+Default schedule: **hourly** — hourly bounds the worst-case
+undetected whole-stream-truncation/rollback window to ≤ 1h, well
+inside NIS2 Art. 23 incident-reporting horizons.
 Operators with a tighter compliance window may shorten it.
 
 Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents a

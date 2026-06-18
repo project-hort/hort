@@ -7,7 +7,7 @@
 //!
 //! # Handler shape (thin wrapper)
 //!
-//! 1. Extract `Option<`[`AuthenticatedPrincipal`]`>` (the F-25 read-endpoint
+//! 1. Extract `Option<`[`AuthenticatedPrincipal`]`>` (read-endpoint
 //!    shape). This GET routes through `extract_optional_principal`
 //!    (`hort-http-core::router.rs:313-318` dispatches GET/HEAD/OPTIONS to the
 //!    optional layer), so the principal arrives wrapped in `Option` —
@@ -21,7 +21,7 @@
 //!    [`hort_http_core::error::ApiError`] mapping handles `Forbidden →
 //!    403`, `Validation → 400`, `NotFound → 404` verbatim).
 //!
-//! The token-kind gate (§2.6) and the `Permission::Read` gate live INSIDE
+//! The token-kind gate and the `Permission::Read` gate live INSIDE
 //! the use case, NOT here. Per the architect-doc *"Emission by layer"*
 //! rule, business metrics (`hort_discovery_list_versions_total`) emit at
 //! the `hort-app` layer; a handler-level short-circuit would either emit
@@ -69,15 +69,13 @@ pub async fn list_versions(
     Path((repo_key, package_name)): Path<(String, String)>,
     Extension(principal): Extension<Option<AuthenticatedPrincipal>>,
 ) -> Result<(StatusCode, Json<DiscoveryListing>), ApiError> {
-    // The Item 7 → Item 8 split: composition (Item 8) populates the
-    // use case slot; the router is also mounted in Item 8. Until both
-    // land, the slot is `None` in production. Test harness wires it
-    // unconditionally via `AppContext::with_discovery_use_cases`. The
-    // `.expect(_)` is a structural invariant — the only way to reach
-    // this handler is through the (Item-8-mounted) router, which the
-    // composition discipline guarantees is only mounted after the slot
-    // is populated. A panic here would surface a composition bug, not
-    // an operator-driven outage.
+    // The use case slot is populated by composition before the router
+    // is mounted. Test harness wires it unconditionally via
+    // `AppContext::with_discovery_use_cases`. The `.expect(_)` is a
+    // structural invariant — the only way to reach this handler is
+    // through the router, which composition guarantees is only mounted
+    // after the slot is populated. A panic here would surface a
+    // composition bug, not an operator-driven outage.
     let use_case = ctx
         .discovery_use_case
         .as_ref()

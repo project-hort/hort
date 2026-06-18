@@ -161,14 +161,14 @@ impl FilesystemStatefulUploadStaging {
     /// concern — session UUIDs must not appear in error messages).
     pub async fn verify_writable_and_ownable(&self) -> DomainResult<()> {
         // (1) The directory must exist / be creatable. This is the
-        // EROFS-on-read-only-rootfs case the F5 finding describes.
+        // EROFS-on-read-only-rootfs case.
         fs::create_dir_all(&self.root)
             .await
             .map_err(|e| staging_root_unwritable("create_dir_all", &e))?;
 
         // (2) On Unix, pin 0o700 and treat a chmod failure as fatal at
-        // the gate (the F5 secondary symptom: a writable-but-unownable
-        // root leaks session-UUID existence to other local users).
+        // the gate (a writable-but-unownable root leaks session-UUID
+        // existence to other local users).
         // `new()`'s post-create chmod stays a warn for the transient
         // case; here it is part of the loud boot contract.
         #[cfg(unix)]
@@ -1020,7 +1020,7 @@ mod tests {
             Err(other) => panic!("expected Invariant, got {other:?}"),
             Ok(()) => panic!(
                 "boot gate must FAIL on an uncreatable staging root \
-                 (F5: was a silent warn-then-retry-forever)"
+                 (was a silent warn-then-retry-forever)"
             ),
         }
     }
@@ -1037,9 +1037,9 @@ mod tests {
     ///
     /// Note: a *locally-chmod-able* 0o500 dir is intentionally NOT a
     /// failure case — the gate (like `new()`'s post-create chmod) heals
-    /// the mode to 0o700, which is the correct outcome. The genuine F5
-    /// scenario is a *read-only filesystem* (EROFS) where chmod and
-    /// file-create themselves fail; that is covered by
+    /// the mode to 0o700, which is the correct outcome. The genuine
+    /// failure scenario is a *read-only filesystem* (EROFS) where chmod
+    /// and file-create themselves fail; that is covered by
     /// `verify_writable_and_ownable_fails_on_uncreatable_root` (the
     /// `/dev/null/...` EROFS analogue).
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! OCI blob upload — `POST /v2/<repo>/<name>/blobs/uploads/` (Item 1).
+//! OCI blob upload — `POST /v2/<repo>/<name>/blobs/uploads/`.
 //!
 //! Three branches driven by query parameters:
 //!
@@ -15,11 +15,11 @@
 //! the event commits.  Three-phase initiate creates a session row in
 //! [`EphemeralStore`] via [`super::upload_session::initiate`] and
 //! returns `Location` / `Docker-Upload-UUID` / `Range: 0-0` for the
-//! client's PATCH chunking loop (Item 2) + PUT finalize (Item 3).
+//! client's PATCH chunking loop + PUT finalize.
 //!
-//! Design authority: OCI Distribution Spec §2.3 (upload lifecycle),
-//! §2.8 (error envelope), §2.9 items 5 + 6, §2.10 (response headers);
-//! see `how-to/oci-pull-through.md` §5 on why this module lives in
+//! Design authority: OCI Distribution Spec (upload lifecycle, error
+//! envelope, response headers); see
+//! `how-to/oci-pull-through.md` §5 on why this module lives in
 //! `hort-http-oci` not `hort-app`.
 
 use std::sync::Arc;
@@ -59,7 +59,7 @@ use super::OciHttpConfig;
 // Router
 // ---------------------------------------------------------------------------
 
-/// Build the Item 1 upload router.
+/// Build the OCI blob upload router.
 ///
 /// A single `POST /v2/:repo_key/*tail` route drives all three branches;
 /// tail parsing (via [`super::tail`]) extracts the `<name>` segment
@@ -93,7 +93,7 @@ pub fn router() -> Router<Arc<AppContext>> {
         .layer(Extension(OciHttpConfig::default()))
 }
 
-/// Tail-parse output specialised for Item 1's upload routes.
+/// Tail-parse output specialised for blob upload routes.
 ///
 /// Kept separate from [`super::tail::TailKind`] because the upload
 /// shape is method-specific (POST-only).  Adding a `BlobUploadInit`
@@ -188,8 +188,8 @@ pub(crate) async fn post_upload_dispatch(
         user_id: principal.user_id,
     };
 
-    // Query-branch selection.  `mount XOR from` is invalid (spec §2.3
-    // requires both).  After that: `digest` -> monolithic; else ->
+    // Query-branch selection. `mount XOR from` is invalid (the spec
+    // requires both). After that: `digest` -> monolithic; else ->
     // three-phase initiate.
     match (query.mount, query.from, query.digest) {
         (Some(mount), Some(from), _) => {
@@ -261,8 +261,8 @@ async fn handle_cross_mount(
     from: &str,
     actor: ApiActor,
     principal: &hort_domain::entities::caller::CallerPrincipal,
-    // Needed by the §2.3 fallthrough path where an unauthorized source
-    // repo collapses to standard initiate semantics. The per-`(repo,
+    // Needed by the cross-mount fallthrough path where an unauthorized
+    // source repo collapses to standard initiate semantics. The per-`(repo,
     // principal)` cap still applies on that fall-through.
     max_sessions_per_principal: u32,
 ) -> Response {
@@ -281,7 +281,7 @@ async fn handle_cross_mount(
 
     // Read-authz check on the source repo (ADR 0008). NotFound
     // (missing OR invisible) collapses to "fall through to initiate"
-    // per OCI §2.3. Any other error surfaces as 500.
+    // per the OCI spec. Any other error surfaces as 500.
     let src_repo = match ctx
         .repository_access_use_case
         .resolve(from, Some(principal), AccessLevel::Read)
@@ -293,7 +293,7 @@ async fn handle_cross_mount(
                 from = %from,
                 target_repo_id = %target_repo_id,
                 actor = %principal.external_id,
-                "OCI cross-mount denied (source missing or invisible) — falling through to initiate per spec §2.3"
+                "OCI cross-mount denied (source missing or invisible) — falling through to initiate per OCI spec"
             );
             return handle_initiate(
                 ctx,
@@ -402,8 +402,8 @@ async fn handle_monolithic(
     let reader = StreamReader::new(body_stream.map_err(std::io::Error::other));
     let stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(reader);
 
-    // OCI direct upload — digest comes from the request URL (ADR 0006
-    // §9). ProtocolNative covers both pull-through and direct.
+    // OCI direct upload — digest comes from the request URL (ADR 0006).
+    // ProtocolNative covers both pull-through and direct.
     let req = VerifiedIngestRequest::ProtocolNative {
         repository_id: repo_id,
         coords,
@@ -441,14 +441,12 @@ async fn handle_monolithic(
 }
 
 // ---------------------------------------------------------------------------
-// PATCH (Item 2 — append chunk)
+// PATCH (append chunk)
 // ---------------------------------------------------------------------------
 
 /// Fallback max-blob-bytes cap used when `ctx.publish_body_limit_bytes`
-/// is `None`.  Matches the Docker Registry V2 reference deployment and
-/// keeps a single-PATCH runaway to a reasonable upper bound.  Item 15
-/// will replace this with an OCI-specific config field threaded from
-/// `hort-server::Config`.
+/// is `None`. Matches the Docker Registry V2 reference deployment and
+/// keeps a single-PATCH runaway to a reasonable upper bound.
 const DEFAULT_MAX_BLOB_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
 
 /// Parse error for `Content-Range: bytes <start>-<end>`.  Crate-private —
@@ -462,9 +460,9 @@ struct ContentRangeParseError {
 
 /// Parse a `Content-Range` header value of the form `bytes <start>-<end>`.
 ///
-/// OCI Distribution §2.3 pins this exact shape for chunked uploads —
-/// the HTTP `Content-Range: bytes a-b/*` form from RFC 7233 is what
-/// spec-compliant clients send.  We accept both forms (with and
+/// The OCI Distribution Spec requires this exact shape for chunked
+/// uploads — the HTTP `Content-Range: bytes a-b/*` form from RFC 7233
+/// is what spec-compliant clients send.  We accept both forms (with and
 /// without a `/` total suffix) because the Docker CLI sometimes emits
 /// `bytes a-b/*` and sometimes plain `bytes a-b` — the spec-minimum
 /// is the bare `a-b`; we tolerate the `/…` suffix by discarding it.
@@ -524,8 +522,8 @@ fn parse_patch_tail(tail: &str) -> Option<PatchTail<'_>> {
 /// Dispatch `PATCH /v2/:repo_key/*tail`.  Validates auth via
 /// `WriteRepoAccess`, parses the Content-Range + Content-Length
 /// headers, streams the body through `append_chunk`, and emits the
-/// §2.10 202 + `Range` + `Location` + `Docker-Upload-UUID` triple on
-/// success.  Error mapping is strict §2.8.
+/// 202 + `Range` + `Location` + `Docker-Upload-UUID` triple on
+/// success per the OCI spec.
 pub(crate) async fn patch_upload_dispatch(
     access: WriteRepoAccess,
     State(ctx): State<Arc<AppContext>>,
@@ -550,8 +548,8 @@ pub(crate) async fn patch_upload_dispatch(
 
     let repo_id = access.repository.id;
     // Actor is carried for log / audit fields; `append_chunk` does not
-    // persist events (the session itself is the only state).  Future
-    // Item 3 finalize threads this actor into `IngestUseCase::ingest`.
+    // persist events (the session itself is the only state). The PUT
+    // finalize handler threads this actor into `IngestUseCase::ingest`.
     let _actor = ApiActor {
         user_id: access.principal.user_id,
     };
@@ -559,7 +557,7 @@ pub(crate) async fn patch_upload_dispatch(
     // Pull headers BEFORE decomposing the request — the body consumer
     // below moves `request`.
     let headers = request.headers().clone();
-    // `Content-Range` is OPTIONAL on PATCH.  The OCI v1.1 spec §5.3
+    // `Content-Range` is OPTIONAL on PATCH. The OCI v1.1 spec
     // recommends it but the dominant client (containers/image —
     // skopeo, podman, buildah) omits it on streaming chunked uploads,
     // and the Docker Registry V2 reference implementation accepts
@@ -637,9 +635,9 @@ pub(crate) async fn patch_upload_dispatch(
     }
 }
 
-/// Build the 202 response on a successful PATCH.  §2.10 + backlog
-/// review-finding C3: the `Location` header MUST include `repo_key`
-/// and `name` so the client's next PATCH reaches a routable path.
+/// Build the 202 response on a successful PATCH. The `Location` header
+/// MUST include `repo_key` and `name` so the client's next PATCH
+/// reaches a routable path.
 fn patch_success_response(
     repo_key: &str,
     name: &str,
@@ -679,9 +677,7 @@ fn patch_success_response(
     (StatusCode::ACCEPTED, headers, Body::empty()).into_response()
 }
 
-/// Map an [`AppError`] from `append_chunk` to the §2.8-compliant
-/// envelope.  The design doc's error table is authoritative here —
-/// drift from it will break spec-strict clients.
+/// Map an [`AppError`] from `append_chunk` to the OCI error envelope.
 fn map_patch_error(err: AppError, session_id: Uuid) -> Response {
     match err {
         AppError::Domain(DomainError::NotFound { .. }) => OciError::BlobUploadUnknown {
@@ -715,12 +711,12 @@ fn map_patch_error(err: AppError, session_id: Uuid) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// PUT (Item 3 — finalize)
+// PUT (finalize)
 // ---------------------------------------------------------------------------
 
 /// Query parameters on `PUT /v2/…/blobs/uploads/:session_id`.
 ///
-/// `digest` is REQUIRED per §2.3 — the finalize handler rejects a
+/// `digest` is REQUIRED per the OCI spec — the finalize handler rejects a
 /// missing / malformed value as 400 `DIGEST_INVALID` (or
 /// `UNSUPPORTED` for a well-formed but non-sha256 algorithm prefix,
 /// matching the POST monolithic branch's semantics).
@@ -736,15 +732,14 @@ pub struct PutQuery {
 
 /// Dispatch `PUT /v2/:repo_key/*tail`.
 ///
-/// The handler's flow (backlog Item 3 §5):
+/// The handler's flow:
 /// 1. Extract + parse the session UUID from the tail.
 /// 2. Parse the required `?digest=<sha256:hex>` query param.
 /// 3. If `Content-Length > 0`, parse the trailing `Content-Range`
 ///    header + body into a tuple for [`finalize`] to forward to
 ///    `append_chunk`.
 /// 4. Call [`upload_session::finalize`] and map the result to the
-///    §2.10 response envelope (201 + `Location` +
-///    `Docker-Content-Digest`) or a §2.8 error.
+///    201 + `Location` + `Docker-Content-Digest` response.
 pub(crate) async fn put_upload_dispatch(
     access: WriteRepoAccess,
     State(ctx): State<Arc<AppContext>>,
@@ -755,8 +750,8 @@ pub(crate) async fn put_upload_dispatch(
     let (name, session_id) = match parse_patch_tail(&tail) {
         // PUT and PATCH share the `<name>/blobs/uploads/<uuid>` tail
         // shape; reusing `parse_patch_tail` keeps the grammar in one
-        // place.  A future divergence (e.g. manifest PUT landing on
-        // the same dispatcher) would fork the parser — Item 4.
+        // place. A future divergence (e.g. manifest PUT landing on
+        // the same dispatcher) would fork the parser.
         Some(PatchTail::AppendChunk { name, session_id }) => (name.to_string(), session_id),
         None => {
             return OciError::NameUnknown {
@@ -822,8 +817,8 @@ pub(crate) async fn put_upload_dispatch(
     // the finalize request.
     //
     // `Content-Range` is OPTIONAL on a non-empty PUT body. The OCI
-    // distribution spec requires it on chunked PATCH (§5.3) but does
-    // not require it on the two-phase finalize PUT (§5.4) — and in
+    // The OCI distribution spec requires `Content-Range` on chunked
+    // PATCH but not on the two-phase finalize PUT — and in
     // practice none of the major clients send it. When absent the
     // server treats the body as a chunk anchored at the session's
     // current `bytes_received`; `upload_session::finalize_core`
@@ -883,14 +878,14 @@ pub(crate) async fn put_upload_dispatch(
     }
 }
 
-/// Map an [`AppError`] returned by [`finalize`] to the §2.8 envelope.
+/// Map an [`AppError`] returned by [`finalize`] to the OCI error envelope.
 ///
 /// Most variants overlap with `map_patch_error` (`finalize` forwards
 /// the trailing-body PATCH verbatim), but the `Conflict` arm diverges:
 /// on PATCH a Conflict is a CAS miss (concurrent PATCH won) and maps
 /// to `BLOB_UPLOAD_INVALID`; on PUT a Conflict is the declared-hash
 /// mismatch raised by `IngestUseCase::ingest` and MUST map to
-/// `DIGEST_INVALID` (backlog review-finding C5).
+/// `DIGEST_INVALID`.
 fn map_put_error(err: AppError, session_id: Uuid) -> Response {
     match err {
         AppError::Domain(DomainError::NotFound { .. }) => OciError::BlobUploadUnknown {
@@ -928,8 +923,7 @@ fn map_put_error(err: AppError, session_id: Uuid) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Three-phase initiate — creates a session row and hands the client a
-/// URL to PATCH chunks into.  Item 2 lands the PATCH handler, Item 3
-/// lands the PUT finalize.
+/// URL to PATCH chunks into.
 ///
 /// Passes the `max_sessions_per_principal` cap through to
 /// [`super::upload_session::initiate`]. A
@@ -973,7 +967,7 @@ async fn handle_initiate(
 // ---------------------------------------------------------------------------
 
 /// Build the 201 response for a successful cross-mount or monolithic
-/// push.  Per §2.10: `Location` points at the final blob URL,
+/// push. `Location` points at the final blob URL,
 /// `Docker-Content-Digest` echoes the content hash, body is empty.
 fn created_blob_response(repo_key: &str, name: &str, hash: &ContentHash) -> Response {
     let location = format!("/v2/{repo_key}/{name}/blobs/sha256:{}", hash.as_ref());
@@ -992,11 +986,11 @@ fn created_blob_response(repo_key: &str, name: &str, hash: &ContentHash) -> Resp
     (StatusCode::CREATED, headers, Body::empty()).into_response()
 }
 
-/// Build the 202 response for the three-phase initiate.  Per §2.10:
-/// `Location` is the session-specific URL (no digest yet — that comes
-/// from the PUT finalize), `Range: 0-0` signals "no bytes received",
-/// and `Docker-Upload-UUID` echoes the session id for clients that
-/// don't parse `Location`.
+/// Build the 202 response for the three-phase initiate. `Location` is
+/// the session-specific URL (no digest yet — that comes from the PUT
+/// finalize), `Range: 0-0` signals "no bytes received", and
+/// `Docker-Upload-UUID` echoes the session id for clients that don't
+/// parse `Location`.
 fn initiate_response(repo_key: &str, name: &str, session_id: Uuid) -> Response {
     let location = format!("/v2/{repo_key}/{name}/blobs/uploads/{session_id}");
     // See `patch_success_response` — CRLF-in-capture guard.
@@ -1093,7 +1087,7 @@ mod tests {
             external_id: "test:sub".into(),
             username: "alice".into(),
             email: "alice@example.com".into(),
-            // Single resolved `claims` set (ADR 0012 §4); empty by
+            // Single resolved `claims` set (ADR 0012); empty by
             // default, overridden per-case below.
             claims: Vec::new(),
             token_kind: None,
@@ -1489,7 +1483,7 @@ mod tests {
             h.repositories.insert(oci_repo("target-repo"));
             // No "src-repo" seeded — the source-repo Read check
             // returns NotFound, which the cross-mount handler treats
-            // as "fall through to initiate" per OCI §2.3.
+            // as "fall through to initiate" per the OCI spec.
             let router = router().with_state(h.ctx);
             let uri =
                 format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=ghost-src");
@@ -1665,7 +1659,7 @@ mod tests {
                     issuer_url: None,
                 },
             );
-            // `ctx.repositories` is `pub(crate)` (ADR 0008 §4); pull
+            // `ctx.repositories` is `pub(crate)` (ADR 0008); pull
             // the `Arc<MockRepositoryRepository>` off the harness's
             // MockPorts handle (same `Arc` wired into the ctx).
             let access = Arc::new(RepositoryAccessUseCase::new(
@@ -2159,7 +2153,7 @@ mod tests {
             let (base_ctx, mocks) = build_mock_ctx(handle);
             let mut base = Arc::try_unwrap(base_ctx)
                 .unwrap_or_else(|_| panic!("mock ctx must have single Arc owner"));
-            // `AppContext`'s data ports are `pub(crate)` (ADR 0008 §4)
+            // `AppContext`'s data ports are `pub(crate)` (ADR 0008)
             // so the `..base` struct-update syntax is unreachable across
             // crates. Mutating the `pub` field in place keeps the
             // override intent intact.
@@ -2296,7 +2290,7 @@ mod tests {
     fn patch_wrong_repo_returns_404_blob_upload_unknown() {
         // Session opened in repo_A.  Client PATCHes to /v2/repo_B/...
         // with the same session id → tenant isolation must refuse.
-        // §2.9 item 9: envelope is `BLOB_UPLOAD_UNKNOWN` (NOT
+        // Anti-enumeration: envelope is `BLOB_UPLOAD_UNKNOWN` (NOT
         // `DENIED` / 403) to prevent cross-tenant enumeration.
         let (status, body) = run(async {
             let h = harness();
@@ -2463,7 +2457,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    // -------------------- PUT — router-level (Item 3) --------------------
+    // -------------------- PUT — router-level (finalize) --------------------
 
     /// Hash `content` as hex — handy wrapper around `sha2::Sha256`
     /// for building finalize request URIs.

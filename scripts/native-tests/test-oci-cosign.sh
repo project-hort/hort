@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# cosign sign + verify round-trip against hort-server (Init 11 Item 14).
+# cosign sign + verify round-trip against hort-server.
 #
 # Generates an ephemeral keypair, pushes an image, signs it with the
 # private key, verifies with the public key. Idempotency: signs twice
 # and asserts the Referrers response stays well-formed OCI
 # image-index JSON. Cosign's signing path itself drives the OCI
-# Referrers API write side (Item 4) and the read side (Item 13).
+# Referrers API write side and the read side.
 #
 # Why explicit-key (keyless-OFF):
 #   Sigstore's keyless flow depends on Fulcio + Rekor + an OIDC
@@ -15,8 +15,8 @@
 #
 # Why SKIP-on-missing-cosign:
 #   cosign is not always available in CI sidecars. The local-OCI
-#   phase (Item 5) already covers the core registry path; this
-#   smoke is additive Phase-5 acceptance for the Referrers API.
+#   phase already covers the core registry path; this smoke is
+#   additive acceptance for the Referrers API.
 #   Mirrors the SKIP-on-prereq idiom used by test-oci-mirror.sh.
 #
 # Deferred: will become a scenarios/provenance/* scenario once cosign and a
@@ -208,7 +208,7 @@ echo "  ok: first verify succeeded"
 # invocation (each signature is its own descriptor in the Referrers
 # response). The registry MUST keep the response well-formed; a buggy
 # implementation might double-write, corrupt JSON, or 500 on the
-# duplicate. This is the load-bearing assertion for Item 14.
+# duplicate. This is the load-bearing idempotency assertion.
 # ---------------------------------------------------------------------
 echo ""
 echo "[7/9] Second sign (idempotency): cosign sign --key cosign.key ${DEST_IMAGE}"
@@ -226,7 +226,7 @@ echo "  ok: second signature pushed"
 # cosign verify on its own confirms at least one valid signature
 # exists. We then hit the Referrers API directly to confirm the
 # response is OCI-image-index JSON with a manifests array — that's
-# Item 13's contract, and the second sign must not have broken it.
+# The Referrers API contract requires this, and the second sign must not have broken it.
 # ---------------------------------------------------------------------
 echo ""
 echo "[8/9] Verify (second) + Referrers API integrity"

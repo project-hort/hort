@@ -5,29 +5,28 @@
 //! stream's `(stream_id, final_stream_position, head_event_hash)`, the
 //! consistent-cut `max_global_position`, and the `StreamSealed` records
 //! on the never-deleted `StreamId::eventstore_retention()` audit-meta
-//! stream (the derived `admin-<v5-uuid>` id; B8 decision a2) since the
+//! stream (the derived `admin-<v5-uuid>` id) since the
 //! previous checkpoint.
 //!
-//! ## Read posture (spec §8.2 + governance)
+//! ## Read posture
 //!
 //! `SELECT`-only on the **runtime DML DSN** (the `hort_app_role`
 //! equivalent that holds only `SELECT`/`INSERT` on `events`) — never
-//! DDL, never a write to `events`. This mirrors exactly the Item-3
-//! verifier's own read posture
-//! (`crates/hort-server/src/cli/verify_event_chain.rs`) and reuses the
-//! same bounded per-stream head shape. The `EventStore` port is
-//! **neither used nor widened** (spec §14 R4 / governance) — this
-//! adapter issues its own bounded `SELECT` that additionally returns the
-//! `event_hash` chain column `PersistedEvent` cannot carry, exactly as
-//! the verifier does. Reading one more column in this adapter's own
-//! query widens no port and changes no trait.
+//! DDL, never a write to `events`. This mirrors the verifier's own read
+//! posture (`crates/hort-server/src/cli/verify_event_chain.rs`) and
+//! reuses the same bounded per-stream head shape. The `EventStore` port
+//! is **neither used nor widened** — this adapter issues its own bounded
+//! `SELECT` that additionally returns the `event_hash` chain column
+//! `PersistedEvent` cannot carry, exactly as the verifier does. Reading
+//! one more column in this adapter's own query widens no port and
+//! changes no trait.
 //!
 //! ## Consistent cut
 //!
 //! The head snapshot + `max_global_position` + the `StreamSealed` scan
 //! are taken inside one read transaction (`REPEATABLE READ`) so the
-//! checkpoint binds a coherent point-in-time (spec §6.2 "a consistent
-//! cut"); a stream that grew a row between the head read and the
+//! checkpoint binds a coherent point-in-time; a stream that grew a
+//! row between the head read and the
 //! global-position read cannot smear the cut.
 //!
 //! ## `StreamSealed`
@@ -46,16 +45,15 @@ use hort_domain::events::{DomainEvent, EventHash, SealedStreamRecord, StreamHead
 use hort_domain::ports::event_chain_head_reader::{EventChainHeadReaderPort, LiveChainSnapshot};
 use hort_domain::ports::BoxFuture;
 
-/// The never-deleted audit-meta stream id the §2.3 `StreamSealed`
-/// tombstones (and F-9 Part-3 destructive-task audit) live on.
+/// The never-deleted audit-meta stream id the `StreamSealed` tombstones
+/// live on.
 ///
 /// Derives from [`StreamId::eventstore_retention`] — not a hand-pinned
 /// literal. The wire form is `admin-<v5-uuid>` (`StreamCategory::Admin`,
-/// the deterministic UUIDv5 over the `"eventstore-retention"` label),
-/// which is exactly what the F-2 chained-append emitter (B9) /
-/// destructive-task router (B10) produces. The verifier verdict
-/// logic, chain computation, and `SealedGap`-vs-`Broken` rule are
-/// byte-unchanged — only the stream-identity value is derived.
+/// the deterministic UUIDv5 over the `"eventstore-retention"` label).
+/// The verifier verdict logic, chain computation, and
+/// `SealedGap`-vs-`Broken` rule are byte-unchanged — only the
+/// stream-identity value is derived.
 pub(crate) fn retention_stream_id() -> String {
     StreamId::eventstore_retention().to_string()
 }
@@ -123,8 +121,8 @@ pub(crate) fn sealed_record_from_row(
 impl EventChainHeadReaderPort for PgEventChainHeadReader {
     fn snapshot_live_chain(&self) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>> {
         Box::pin(async move {
-            // One REPEATABLE READ transaction → a consistent cut
-            // (spec §6.2). All three reads see the same snapshot.
+            // One REPEATABLE READ transaction → a consistent cut.
+            // All three reads see the same snapshot.
             let mut tx =
                 self.pool.begin().await.map_err(|e| {
                     DomainError::Invariant(format!("begin snapshot tx failed: {e}"))
@@ -136,9 +134,9 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
 
             // (1) Per-stream head: the row with the max stream_position
             //     for each stream_id, and that row's event_hash. Same
-            //     bounded shape the Item-3 verifier uses (DISTINCT ON +
+            //     bounded shape the verifier uses (DISTINCT ON +
             //     ORDER BY stream_position DESC). The id set is small
-            //     (thousands of streams, spec §6.2) — one query.
+            //     (thousands of streams) — one query.
             let head_rows = sqlx::query(
                 r#"SELECT DISTINCT ON (stream_id)
                        stream_id, stream_position, event_hash
@@ -284,7 +282,7 @@ mod tests {
 
     // ---- DB-backed (gated on DATABASE_URL; green locally without a DB) --
     //
-    // Mirrors the Item-3 verifier's `maybe_pool()` early-return idiom
+    // Mirrors the `maybe_pool()` early-return idiom used by the verifier
     // (`crates/hort-server/src/cli/verify_event_chain.rs`): no DATABASE_URL
     // ⇒ silent early return so `cargo test --workspace --lib` stays
     // green locally; Tier-2/CI sets DATABASE_URL and the body runs.
@@ -315,8 +313,8 @@ mod tests {
         let reader = PgEventChainHeadReader::new(pool);
         let snap = reader.snapshot_live_chain().await.unwrap();
         assert!(snap.max_global_position >= snap.heads.len() as u64 || snap.heads.is_empty());
-        // Post-Phase-B `sealed_since_previous` is NOT empty in a shared
-        // DB. The invariant that still always holds: every record the
+        // `sealed_since_previous` is NOT empty in a shared DB that has
+        // had sealing activity. The invariant that still always holds: every record the
         // adapter returned parsed cleanly into a well-formed
         // `SealedStreamRecord` (non-empty `sealed_stream_id`) — the
         // StreamSealed read+parse path is exercised whether the stream

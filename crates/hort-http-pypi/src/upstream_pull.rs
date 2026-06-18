@@ -7,7 +7,7 @@
 //!    (PEP 491 wheel or PEP 625 sdist shape) and fetch the
 //!    `/pypi/{normalized}/{version}/json` body via
 //!    [`UpstreamProxy::fetch_metadata`]. Not cached at this layer —
-//!    the simple-index proxy has its own pull-through cache (Item 3).
+//!    the simple-index proxy has its own pull-through cache.
 //! 3. Recover the upstream `digests.sha256` via
 //!    [`PyPiFormatHandler::parse_upstream_checksum`] and the absolute
 //!    file URL via the local URL-extraction helper, then stream the
@@ -15,12 +15,10 @@
 //!    `VerifiedIngestRequest::UpstreamPublished(Sha256)`.
 //!
 //! `try_upstream_file_pull` lives in this inbound-HTTP crate (NOT a
-//! use case) — keeps the orchestration close to the route. Item 5
-//! wires the dispatch from `download`; this item only lands the
-//! orchestrator + its branch tests.
+//! use case) — keeps the orchestration close to the route.
 //!
 //! Wire-mapping ([`UpstreamPullError`] → HTTP status / body) lives
-//! alongside the orchestrator in [`map_upstream_pull_error`] (Item 5),
+//! alongside the orchestrator in [`map_upstream_pull_error`],
 //! mirroring the Cargo precedent at
 //! `crates/hort-http-cargo/src/upstream_pull.rs::map_upstream_pull_error`.
 
@@ -54,9 +52,9 @@ use hort_formats::pypi::PyPiFormatHandler;
 use hort_http_core::context::AppContext;
 
 /// Discriminated failure modes for [`try_upstream_file_pull`]. Wire
-/// mapping (HTTP status + envelope body) is performed by Item 5 in the
-/// route handler; the orchestrator itself only surfaces *what* went
-/// wrong, not *how to render it*.
+/// mapping (HTTP status + envelope body) is performed by the route
+/// handler; the orchestrator itself only surfaces *what* went wrong,
+/// not *how to render it*.
 ///
 /// `MetadataFetchFailed.stage` is one of the two string literals
 /// `"json"` or `"file"` — the wire-map can match on the stage to
@@ -72,7 +70,7 @@ use hort_http_core::context::AppContext;
 /// preferable to inventing a route the use case can't actually reach.
 ///
 /// `ParseError(String)` / `IngestFailed(String)` / `Internal(String)`
-/// carry the inner detail for tracing — the wire-map (Item 5) renders
+/// carry the inner detail for tracing — the wire-map renders
 /// a stable client-facing envelope regardless of the specific message,
 /// so the inner string is only consumed via `tracing::warn!` here.
 /// Same applies to the `err` field of `MetadataFetchFailed`.
@@ -183,7 +181,7 @@ pub(crate) async fn try_upstream_file_pull(
     // checksum parsing. `coords.path` MUST contain the filename in its
     // basename position because `parse_upstream_checksum` extracts the
     // basename via `coords.path.rsplit('/').next()` to look up the
-    // matching `urls[]` entry. Spec 074 §2 (H10 fix) — the path comes
+    // matching `urls[]` entry. The path comes
     // from the single SSOT constructor, which embeds the PEP 503 NORMALIZED
     // project segment (was the raw `project_name` — a PEP 503 violation
     // that split variant spellings into separate projection rows). pypi
@@ -307,7 +305,7 @@ pub(crate) async fn try_upstream_file_pull(
         )));
     };
 
-    // 4. Recover the upstream sha256 from the projection entry (I-3). The
+    // 4. Recover the upstream sha256 from the projection entry. The
     //    SHA-256 length/hex validation is driven through the SAME audited
     //    `PyPiFormatHandler::parse_upstream_checksum` against a minimal
     //    synthetic body holding only the requested file's `digests.sha256`,
@@ -339,7 +337,7 @@ pub(crate) async fn try_upstream_file_pull(
     //    (`files.pythonhosted.org`) than the index (`pypi.org`).
     //    `ingest_verified` rehashes while streaming and returns Conflict
     //    on a checksum mismatch — our security primitive against upstream
-    //    tampering (§15 of the upstream-verification design).
+    //    tampering (see ADR 0006).
     //
     //    Wrap the `fetch_artifact + ingest_verified` pair in
     //    `coalesce_blob` so N parallel callers for the same wheel/sdist
@@ -378,7 +376,7 @@ pub(crate) async fn try_upstream_file_pull(
     let blob_absolute_url = absolute_url;
     let blob_ingest = ctx.ingest_use_case.clone();
     let blob_repo_id = repo.id;
-    // F-14: keep a clone for the cross-repo follower-registration
+    // Keep a clone for the cross-repo follower-registration
     // fallback below (the closure consumes `blob_coords`).
     let follower_coords = coords.clone();
     let blob_coords = coords;
@@ -434,7 +432,7 @@ pub(crate) async fn try_upstream_file_pull(
         // discriminators — preserve the existing wire-mapping. Follower-
         // side errors arrive as `AppError::External("pull-dedup
         // follower: ...")` and route to `IngestFailed` per the design's
-        // leader-only-discrimination contract (§4).
+        // leader-only-discrimination contract.
         Err(AppError::Domain(DomainError::Conflict(msg))) => {
             tracing::warn!(conflict = %msg, "PyPI upstream checksum mismatch");
             return Err(UpstreamPullError::ChecksumMismatch);
@@ -587,7 +585,7 @@ fn parse_pypi_filename(filename: &str) -> DomainResult<(String, String)> {
 
 /// Recover the upstream SHA-256 [`UpstreamPublishedChecksum`] from a
 /// per-version JSON projection [`PypiVersionFileInfo`]'s verbatim
-/// `digests.sha256` (`entry.sha256` — I-3).
+/// `digests.sha256` (`entry.sha256`).
 ///
 /// Recover the upstream SHA-256 [`UpstreamPublishedChecksum`] from a
 /// [`PypiVersionFileInfo`] entry's `digests.sha256`. To keep the
@@ -648,7 +646,7 @@ fn url_from_entry(entry: &PypiVersionFileInfo, filename: &str) -> DomainResult<S
 }
 
 /// Wire-mapping for [`UpstreamPullError`] used by the `download`
-/// handler's Proxy-cache-miss branch (Item 5).
+/// handler's Proxy-cache-miss branch.
 ///
 /// Mapping rationale (see `docs/architecture/how-to/pypi-pull-through.md`):
 ///
@@ -918,7 +916,7 @@ mod tests {
     #[test]
     fn checksum_from_entry_happy_path_returns_sha256() {
         // A valid 64-hex sha256 round-trips through the audited
-        // `parse_upstream_checksum` synthetic-body path (I-3).
+        // `parse_upstream_checksum` synthetic-body path.
         let sha = sha256_hex(b"some wheel bytes");
         let entry = PypiVersionFileInfo {
             filename: Some("requests-2.31.0-py3-none-any.whl".into()),
@@ -962,7 +960,7 @@ mod tests {
 
     #[test]
     fn url_from_entry_https_passes_non_https_rejected() {
-        // I-1 — the genuine absolute upstream URL passes; the `https://`
+        // The genuine absolute upstream URL passes; the `https://`
         // guard rejects a downgrade target.
         let ok = PypiVersionFileInfo {
             filename: Some("x.whl".into()),
@@ -1373,7 +1371,7 @@ mod tests {
         assert_eq!(
             artifact.upstream_published_at,
             Some(want),
-            "I-2: the wheel's filename-matched upload_time must reach upstream_published_at"
+            "the wheel's filename-matched upload_time must reach upstream_published_at"
         );
     }
 
@@ -1411,9 +1409,9 @@ mod tests {
         assert_eq!(artifact.sha256_checksum.as_ref(), sha);
     }
 
-    // ---- Item 6: audit invariant — exactly one ChecksumVerified ------------
+    // ---- Audit invariant — exactly one ChecksumVerified -----------------
 
-    /// Design doc §13: every successful proxy ingest produces exactly one
+    /// Every successful proxy ingest produces exactly one
     /// `ChecksumVerified` event in the artifact's stream.
     ///
     /// Drives a happy-path pull through `try_upstream_file_pull` end-to-end
@@ -1485,11 +1483,11 @@ mod tests {
         );
     }
 
-    // ---- Tracing infrastructure for warn-capture test (Item 6) -------------
+    // ---- Tracing infrastructure for warn-capture test -------------------
 
     /// Custom tracing layer that captures emitted events into a shared
     /// vector. Mirrors the pattern in
-    /// `crates/hort-http-cargo/src/upstream_pull.rs` (Item 7) — see that
+    /// `crates/hort-http-cargo/src/upstream_pull.rs` — see that
     /// module for the detailed rationale on `Interest::sometimes()`,
     /// per-callsite caching, and the global-passthrough seeding.
     #[derive(Clone, Default)]
@@ -1566,7 +1564,7 @@ mod tests {
         });
     }
 
-    /// Item 6: assert that `try_upstream_file_pull` emits a `WARN`-level
+    /// Assert that `try_upstream_file_pull` emits a `WARN`-level
     /// tracing event with structured fields when a non-success branch
     /// fires. The `NoUpstreamMapping` branch is the cleanest target —
     /// it short-circuits before any I/O, requires no fixtures beyond an

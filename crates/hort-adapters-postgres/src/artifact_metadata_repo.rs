@@ -124,7 +124,7 @@ impl PgArtifactMetadataRepository {
 
 // ---------------------------------------------------------------------------
 // Tests — row mapping + error mapping. Integration tests against real
-// Postgres run under Item 4's E2E harness; here we cover the pure pieces.
+// Postgres require a live database; here we cover the pure pieces.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

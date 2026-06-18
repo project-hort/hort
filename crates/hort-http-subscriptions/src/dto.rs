@@ -74,7 +74,7 @@ pub struct CreateSubscriptionRequest {
 }
 
 /// Wire shape for [`SubscriptionTarget`] — the `Webhook` variant carries
-/// a **`secret_ref`** locator (mirrors upstream-mapping; F-19), NOT the
+/// a **`secret_ref`** locator (mirrors upstream-mapping), NOT the
 /// secret material. The response variant
 /// ([`SubscriptionTargetResponseDto`]) omits the `secret_ref` entirely.
 ///
@@ -176,7 +176,7 @@ impl SubscriptionStateDto {
 
 /// Wire shape for a single subscription. Omits the webhook `secret_ref`
 /// locator entirely — read paths never echo any secret-derived field
-/// (F-19: there is no plaintext or hash anywhere to echo).
+/// (there is no plaintext or hash anywhere to echo).
 #[derive(Debug, Clone, Serialize)]
 pub struct SubscriptionResponse {
     pub id: Uuid,
@@ -190,11 +190,11 @@ pub struct SubscriptionResponse {
 }
 
 // `POST /api/v1/subscriptions` returns the canonical
-// [`SubscriptionResponse`] directly. F-19 removed the former
-// `CreateSubscriptionResponse` wrapper and its `secret_plaintext`
-// "shown once" field: the request now references an already-provisioned
-// secret via `secret_ref` (mirroring upstream-mapping), so the create
-// path never handles plaintext and has nothing one-shot to echo.
+// [`SubscriptionResponse`] directly. The former `CreateSubscriptionResponse`
+// wrapper and its `secret_plaintext` "shown once" field have been removed:
+// the request now references an already-provisioned secret via `secret_ref`
+// (mirroring upstream-mapping), so the create path never handles plaintext
+// and has nothing one-shot to echo.
 
 /// Response shape for [`SubscriptionTarget`].
 ///
@@ -274,7 +274,7 @@ pub enum DtoMapError {
 /// Map a [`CreateSubscriptionRequest`] to the use-case-facing
 /// [`hort_app::use_cases::subscription_use_case::CreateSubscriptionRequest`].
 ///
-/// The webhook `secret_ref` is a locator only (F-19) — no secret
+/// The webhook `secret_ref` is a locator only — no secret
 /// material is read or hashed here; the locator format is validated at
 /// this wire boundary by [`validate_webhook_secret_ref`].
 pub fn map_create_request_to_domain(
@@ -296,7 +296,7 @@ pub fn map_create_request_to_domain(
 /// [`hort_app::use_cases::subscription_use_case::UpdateSubscriptionRequest`].
 ///
 /// A new webhook target (if supplied) carries a `secret_ref` locator
-/// only (F-19) — no plaintext is produced, so there is nothing for the
+/// only — no plaintext is produced, so there is nothing for the
 /// handler to echo.
 pub fn map_update_request_to_domain(
     req: UpdateSubscriptionRequest,
@@ -357,7 +357,7 @@ pub fn map_filter_to_domain(f: SubscriptionFilterDto) -> Result<SubscriptionFilt
 /// [`SubscriptionTarget`].
 ///
 /// The webhook `secret_ref` is carried through verbatim (it is a
-/// locator, not secret material; F-19) after its `(source, location)`
+/// locator, not secret material) after its `(source, location)`
 /// shape is validated at this boundary by
 /// [`validate_webhook_secret_ref`].
 fn map_target_to_domain(t: SubscriptionTargetDto) -> Result<SubscriptionTarget, DtoMapError> {
@@ -712,8 +712,7 @@ fn subscription_state_wire(s: &SubscriptionState) -> &'static str {
 
 /// Returns `true` when the PATCH body sets ONLY the `state` field
 /// (every other field is `None`). Used by the handler to dispatch to
-/// `pause()` / `resume()` instead of `update()` — matches the design
-/// doc §3 "PATCH /:id" surface.
+/// `pause()` / `resume()` instead of `update()`.
 pub fn is_state_only_update(req: &UpdateSubscriptionRequest) -> bool {
     req.state.is_some()
         && req.name.is_none()

@@ -10,40 +10,37 @@
 //! [`verify_against_checkpoint`](crate::events::verify_against_checkpoint)
 //! core.
 //!
-//! Per spec §6.1 the port is deliberately thin: the only operation the
-//! verifier needs is "give me every signature-verified checkpoint from
-//! the anchor store" — a *read*. Checkpoint *emission* (the S3
-//! Object-Lock **write** adapter + the `eventstore-checkpoint`
-//! `TaskHandler`, spec §6/§12) is a separate, not-yet-scheduled item; it
+//! The port is deliberately thin: the only operation the verifier needs
+//! is "give me every signature-verified checkpoint from the anchor store"
+//! — a *read*. Checkpoint *emission* (the S3 Object-Lock **write** adapter
+//! plus the `eventstore-checkpoint` `TaskHandler`) is a separate concern; it
 //! is NOT part of this port's v1 surface. With no emitter deployed the
 //! store is legitimately empty and the verifier resolves the anchor
-//! verdict to `missing_checkpoint` — a correct, spec-defined verdict
-//! (§6.4(a)), not an error.
+//! verdict to `missing_checkpoint` — a correct, expected verdict, not an
+//! error.
 //!
 //! `#[non_exhaustive]` is not needed on the trait (traits are extended
 //! by adding methods with default impls); keeping the surface minimal
-//! (one read method) matches spec §14 R5 — the transparency-log
-//! alternative stays a drop-in adapter behind this same boundary.
+//! (one read method) ensures the transparency-log alternative stays a
+//! drop-in adapter behind this same boundary.
 
 use crate::error::DomainResult;
 use crate::events::Checkpoint;
 
 use super::BoxFuture;
 
-/// Outbound port: read signature-verified, externally-anchored
-/// checkpoints (spec §6.1/§6.2).
+/// Outbound port: read signature-verified, externally-anchored checkpoints.
 ///
 /// The adapter is responsible for the I/O the verifier core forbids:
 /// listing the WORM-locked object-store prefix
 /// (`<bucket>/hort-event-chain-checkpoints/…`), fetching each object,
 /// deserializing the JSON to a [`Checkpoint`], and **verifying the
 /// detached signature** against the operator-provisioned anchor public
-/// key (spec §6.2 `signature`, §14 R2 — key is an operator-provisioned
-/// file under the existing `HORT_*` posture). A checkpoint whose signature
-/// does not verify MUST NOT be returned (a forged checkpoint is
-/// indistinguishable from no checkpoint as far as the integrity
-/// attestation is concerned — surfacing it would let an attacker who can
-/// write the object store but not forge the key fabricate a passing
+/// key (an operator-provisioned file under the existing `HORT_*` posture).
+/// A checkpoint whose signature does not verify MUST NOT be returned (a
+/// forged checkpoint is indistinguishable from no checkpoint as far as the
+/// integrity attestation is concerned — surfacing it would let an attacker
+/// who can write the object store but not forge the key fabricate a passing
 /// anchor verdict).
 ///
 /// Returns the verified checkpoints in no particular order; the pure
@@ -62,8 +59,7 @@ pub trait CheckpointAnchorPort: Send + Sync {
     /// Read and signature-verify every checkpoint in the anchor store.
     ///
     /// Read-only and side-effect-free: the verifier never writes the
-    /// anchor store (spec §8.2 — "does not touch the anchor store for
-    /// writes"). Verified-checkpoints-only contract: see the trait doc.
+    /// anchor store. Verified-checkpoints-only contract: see the trait doc.
     fn read_all(&self) -> BoxFuture<'_, DomainResult<Vec<Checkpoint>>>;
 }
 

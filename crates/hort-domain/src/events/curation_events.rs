@@ -32,7 +32,7 @@ const MAX_REASON_LEN: usize = 4096;
 /// Typed action carried by [`CurationApplied`].
 ///
 /// Only `Warn` and `Block` exist — `Allow` decisions are not recorded
-/// (per §3.6: too high-volume, no information value). The discriminant
+/// (too high-volume, no information value). The discriminant
 /// is the audit query's primary filter ("show me every block in this
 /// repo this week").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

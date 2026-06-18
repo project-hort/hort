@@ -225,7 +225,7 @@ pub struct RegisterExistingCasBlobRequest {
 /// design rejects an `Unverified` variant: the type system records at
 /// compile time which paths verify, and "ingest with a digest field
 /// but skip the comparison" is unrepresentable. There is no operator
-/// opt-in (§8).
+/// opt-in.
 ///
 /// The variant name reflects what the request expresses (verification
 /// target present), not the byte source — both pull-through fetches
@@ -526,8 +526,8 @@ pub struct IngestUseCase {
     /// some registered `ProvenancePort` `applies_to`. Drives the
     /// ingest-time `provenance-verify` enqueue gate: a job is enqueued
     /// **only when** the resolved `ScanPolicy.provenance_mode != Off` AND
-    /// `provenance_capable_formats.contains(format)`. This is the §3.2
-    /// review fix — gating on `mode != Off` alone would enqueue a no-op
+    /// `provenance_capable_formats.contains(format)`. Gating on
+    /// `mode != Off` alone would enqueue a no-op
     /// `provenance-verify` job for every non-OCI ingest under the default
     /// `VerifyIfPresent` (the Tier-1 cosign verifier applies only to
     /// `"oci"`), which the gate avoids: non-applicable ingests are
@@ -535,11 +535,11 @@ pub struct IngestUseCase {
     /// Tier-2 verifier later registers (no migration).
     ///
     /// **Default empty** (set by [`Self::new`]) so the composition root
-    /// compiles unchanged until Item 6 wires the real capability set via
+    /// compiles unchanged until the real capability set is wired via
     /// [`Self::with_provenance_capable_formats`]. An empty set means "no
     /// verifier applies to anything" → no `provenance-verify` is ever
     /// enqueued, which is fail-safe: a `Required` policy on a no-verifier
-    /// format is already apply-rejected (Item 5), and a runtime
+    /// format is already apply-rejected, and a runtime
     /// mis-registration leaves the artifact `Pending` → never timer-releases
     /// (fail-closed at the release gate).
     provenance_capable_formats: Arc<HashSet<String>>,
@@ -659,7 +659,7 @@ impl IngestUseCase {
     /// Compute the effective upload-payload metadata cap for the given
     /// handler, honouring the operator override when present and falling
     /// back to the format-declared expected max otherwise (three-layer
-    /// model §6). The DB absolute ceiling is not enforced here — the
+    /// model). The DB absolute ceiling is not enforced here — the
     /// event-payload column's `CHECK` catches that as a defence-in-depth
     /// layer regardless of whatever operator value was configured.
     fn effective_metadata_cap(&self, handler: &dyn FormatHandler) -> usize {
@@ -763,7 +763,7 @@ impl IngestUseCase {
             payload_metadata,
         } = request;
         // Direct ingest never carries a verification target — that's
-        // what `ingest_verified` (Item 10) is for. The internal
+        // what `ingest_verified` is for. The internal
         // pipeline keeps the `declared_sha256` parameter so the same
         // helper serves both public entry points.
         let declared_sha256: Option<ContentHash> = None;
@@ -781,8 +781,8 @@ impl IngestUseCase {
         // `Block` returns `DomainError::CurationBlocked`; the per-format
         // inbound HTTP layer maps it to 403 by default and to 404 on
         // pull-through fetch handlers. `Warn` logs `tracing::warn!` and
-        // continues — no event emission yet (Item 7's
-        // `CurationApplied` covers the audit surface for v2). `Allow`
+        // continues — no event emission yet (`CurationApplied` covers
+        // the audit surface for v2). `Allow`
         // is silent so the high-volume happy path stays log-free.
         let rules = self
             .curation_rules
@@ -856,7 +856,7 @@ impl IngestUseCase {
             }
         }
 
-        // Spec 075 — registration-collision gate (publish path only).
+        // Registration-collision gate (publish path only).
         //
         // `ingest_direct` is the DIRECT-upload/publish path; pull-through
         // goes through `ingest_verified`, where the upstream registry has
@@ -1101,8 +1101,8 @@ impl IngestUseCase {
                 // Pull-through paths thread the flag via
                 // `ingest_with_verification`.
                 false,
-                // H8 sibling — direct uploads are a SEED (never a
-                // cascade-internal leaf), so never suppress the seed hook.
+                // Direct uploads are a SEED (never a cascade-internal leaf),
+                // so never suppress the seed hook.
                 false,
             )
             .await
@@ -1112,7 +1112,7 @@ impl IngestUseCase {
 
         // Emit metrics on every exit path. The `repository` label must stay
         // bounded cardinality — use REPOSITORY_UNKNOWN when the repo lookup
-        // failed (see catalog §Sentinel label values).
+        // failed (the sentinel label value is REPOSITORY_UNKNOWN).
         let elapsed = started.elapsed().as_secs_f64();
         let (result_label, repository_label, size_emitted): (&'static str, String, Option<u64>) =
             match &result {
@@ -1192,7 +1192,7 @@ impl IngestUseCase {
     ///   [`super::multi_hash::Sha512HashingRead::finalize`] (sha512)
     ///   against `upstream_checksum.hex`.
     ///
-    /// Mint-after-verify (design decision §3.4): the `Artifact` row is
+    /// Mint-after-verify: the `Artifact` row is
     /// minted only on the success path. The mismatch path appends
     /// `ChecksumMismatch` to the repository stream
     /// (`StreamId::repository(repo_id)` — never the artifact stream;
@@ -1695,11 +1695,11 @@ impl IngestUseCase {
         let metadata_decision = MetadataDecision::Inline(payload_metadata.clone());
         let had_payload_metadata = !matches!(payload_metadata, serde_json::Value::Null);
 
-        // H8 sibling — a CASCADE-INTERNAL leaf-ingest tags its
-        // payload_metadata with `cascade_internal: true` so `ingest_inner`
-        // skips the depth-0 seed hook (its parent's depth-carrying child
-        // row already walks this artifact). Absent / non-leaf / seed
-        // ingests leave it unset → `false` → the seed hook fires as before.
+        // A CASCADE-INTERNAL leaf-ingest tags its payload_metadata with
+        // `cascade_internal: true` so `ingest_inner` skips the depth-0 seed
+        // hook (its parent's depth-carrying child row already walks this
+        // artifact). Absent / non-leaf / seed ingests leave it unset →
+        // `false` → the seed hook fires as before.
         let suppress_cascade_seed = payload_metadata
             .get("cascade_internal")
             .and_then(serde_json::Value::as_bool)
@@ -1838,7 +1838,7 @@ impl IngestUseCase {
                             // event for audit; the warn line carries the
                             // labels needed to grep across stream-store and
                             // tracing. NEVER `artifact_id` — none was
-                            // minted (mint-after-verify, §3 decision 4).
+                            // minted (mint-after-verify).
                             tracing::warn!(
                                 repo_id = %repository_id,
                                 format = %format,
@@ -1960,7 +1960,7 @@ impl IngestUseCase {
         // events). Capping the audit stream silently drops
         // `ChecksumMismatch` events past the 200th — exactly when an
         // audit trail matters most (sustained tampering = many events).
-        // §13's "auditors run … get zero rows by design" invariant
+        // The "auditors run … get zero rows by design" invariant
         // requires uncapped emission on the repository aggregate, so
         // this caller passes `enforce_cap=false`.
         let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
@@ -2063,7 +2063,7 @@ impl IngestUseCase {
         // disambiguation into a single signal that `ingest_inner`
         // consumes without having to inspect the request's byte source.
         trust_upstream_publish_time: bool,
-        // H8 sibling — when `true`, skip the post-commit transitive-prefetch
+        // When `true`, skip the post-commit transitive-prefetch
         // *seed* hook (the depth-0 `prefetch-dependencies` enqueue). Set by a
         // CASCADE-INTERNAL `prefetch` leaf-ingest, whose artifact is already
         // walked by its parent's depth-carrying child row; firing the seed
@@ -2342,7 +2342,7 @@ impl IngestUseCase {
         let correlation_id = Uuid::new_v4();
         // Pre-mint the ArtifactIngested event_id locally so it doubles
         // as the `causation_id` on the post-commit
-        // `ArtifactGroupMemberAdded`. Since review B6 the adapter binds
+        // `ArtifactGroupMemberAdded`. The adapter binds
         // this id verbatim (via `EventToAppend`), so the value landed
         // here is the same value persisted in `events.event_id` — the
         // ingest-path causation chain now resolves.
@@ -2454,7 +2454,7 @@ impl IngestUseCase {
                 // operator can manually rescan once the projection is
                 // back. Aborting the ingest on a projection-read
                 // failure would make scanning a hard dependency of
-                // ingest, which §3 explicitly avoids.
+                // ingest, which the design explicitly avoids.
                 tracing::warn!(
                     artifact_id = %artifact_id,
                     repository_id = %repository_id,
@@ -2823,14 +2823,12 @@ impl IngestUseCase {
         // separate transactions. If the group commit fails here, the
         // artifact is already persisted-and-valid; it is just unlinked
         // from any group. We log `warn!` and return `Ok` from `ingest`
-        // (the ingest itself succeeded). Item 8's reconciliation sweep
-        // heals orphaned-membership artifacts at rest by replaying
+        // (the ingest itself succeeded). The group-reconcile sweep heals
+        // orphaned-membership artifacts at rest by replaying
         // `ArtifactIngested` events and re-running `classify_group_member`.
         //
         // Do NOT try to merge the two transactions or compensate on
-        // failure. Cross-aggregate atomicity is not worth the coupling
-        // cost — see design doc §2.9 atomicity paragraph and Initiative
-        // 9a backlog Item 7 acceptance.
+        // failure. Cross-aggregate atomicity is not worth the coupling cost.
         if let Some(membership) = handler.classify_group_member(&coords, &coords.path) {
             let group_result = self
                 .group_use_case
@@ -3075,7 +3073,7 @@ impl IngestUseCase {
         // strictly after `commit_transition` so a failed commit does
         // not leak a cascade enqueue).
         //
-        // H8 sibling — `suppress_cascade_seed` is set by a CASCADE-INTERNAL
+        // `suppress_cascade_seed` is set by a CASCADE-INTERNAL
         // `prefetch` leaf-ingest (trigger_source "prefetch"): the artifact
         // it just ingested is already covered by its parent walk's
         // depth-carrying child `prefetch-dependencies` row, so firing this
@@ -3313,8 +3311,8 @@ impl IngestUseCase {
     /// receives only the post-verification `content_hash`; its
     /// post-coalesce repo-scoped lookup
     /// (`ArtifactUseCase::find_in_repo_by_hash(repo, hash)`) returns
-    /// `None` because the leader only minted *its* repo's row. Before
-    /// F-14 that `None` was mapped to a hard `Internal` and the
+    /// `None` because the leader only minted *its* repo's row. Previously
+    /// that `None` was mapped to a hard `Internal` and the
     /// follower's pull failed closed. This method is what the
     /// follower calls instead: it idempotently mints the follower's
     /// OWN per-repo row pointing at the already-CAS-present hash.
@@ -3352,8 +3350,8 @@ impl IngestUseCase {
     /// are skipped, mirroring [`Self::register_by_hash`]'s
     /// `skip(self, handler)`.
     ///
-    /// Tracked follow-up (F-14 post-review, NOT a data-integrity or
-    /// security risk — do not block on it): two concurrent same-repo-B
+    /// Tracked follow-up (NOT a data-integrity or security risk — do not
+    /// block on it): two concurrent same-repo-B
     /// followers cannot create duplicate rows — the DB constraint
     /// `artifacts_repository_id_path_key UNIQUE (repository_id, path)`
     /// (`migrations/003_artifacts_cas.sql`) structurally
@@ -3657,7 +3655,7 @@ impl IngestUseCase {
             // already in CAS owned by the source; the per-artifact
             // payload_metadata stays inline.
             metadata_blob: None,
-            // F46.4.3 — `register_by_hash` mints a per-repo row over
+            // `register_by_hash` mints a per-repo row over
             // a CAS blob that already exists; there is no upstream
             // fetch on this path, so no Last-Modified hint to thread.
             // `None` matches the artifact row above; event + projection
@@ -3720,7 +3718,7 @@ impl IngestUseCase {
         //
         // **Not** `ScanWaived`, **not** permissive. A dirty scan still
         // transitions the artifact to `Rejected` via
-        // `Artifact::reject_from_scan`; the F-6 release authority gate
+        // `Artifact::reject_from_scan`; the release authority gate
         // is unchanged. This path stamps only the *time* anchor.
         //
         // Every existing non-seed caller passes
@@ -4360,7 +4358,7 @@ mod tests {
     /// format with [`sample_coords`] (both Pypi). Every ingest-success path
     /// in this module needs the two to match — without this helper every
     /// test would have to remember `repo.format = RepositoryFormat::Pypi`
-    /// after the format-mismatch check (arch findings Item 1) was added.
+    /// after the format-mismatch check was added.
     fn pypi_repository() -> Repository {
         let mut repo = sample_repository();
         repo.format = RepositoryFormat::Pypi;
@@ -4596,7 +4594,7 @@ mod tests {
         });
     }
 
-    // -- Spec 075: cargo registration-collision gate --------------------------
+    // -- Cargo registration-collision gate ------------------------------------
 
     /// Build a cargo `DirectIngestRequest` for `name`@`version` with an
     /// explicit canonical cargo path. `name` doubles as the published name.
@@ -4924,8 +4922,8 @@ mod tests {
         assert_metric_absent(&entries, "hort_ingest_size_bytes");
     }
 
-    /// Arch findings Item 1: coords.format must match repo.format, and the
-    /// check must fire BEFORE `storage.put` so a mis-routed request cannot
+    /// coords.format must match repo.format, and the check must fire BEFORE
+    /// `storage.put` so a mis-routed request cannot
     /// create a CAS orphan. The `put_call_count` assertion is the
     /// load-bearing check — merely returning `Err` would be satisfied by any
     /// number of later error paths.
@@ -5042,7 +5040,7 @@ mod tests {
 
                 assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
                 // Anchor is `now` (the ingest time stamped inside
-                // `ingest_inner`), NOT a precomputed deadline (§2.5).
+                // `ingest_inner`), NOT a precomputed deadline.
                 let anchor = artifact
                     .quarantine_window_start
                     .expect("quarantine_window_start set under Default policy");
@@ -5084,7 +5082,7 @@ mod tests {
         // Matched ScanPolicy with quarantine_duration_secs = 7200 (2h)
         // → artifact quarantined; anchor is the ingest timestamp; the
         // duration is NOT persisted (no `quarantine_deadline` on the
-        // event — §2.5).
+        // event).
         let repo = pypi_repository();
         let repo_id = repo.id;
         let repo_key = repo.key.clone();
@@ -5160,7 +5158,7 @@ mod tests {
                 // Critical assertion: an explicit operator zero MUST
                 // stay permissive. A regression here would mean an
                 // operator's deliberate permissive opt-out got
-                // overridden by the Default — the bug Item 2's
+                // overridden by the Default — the bug whose
                 // resolution shape (`map().unwrap_or_else`) is
                 // designed to prevent.
                 assert_eq!(artifact.quarantine_status, QuarantineStatus::None);
@@ -5469,7 +5467,7 @@ mod tests {
         );
     }
 
-    // -- declared_sha256 early-decision (Item 3b) --------------------------
+    // -- declared_sha256 early-decision ------------------------------------
 
     const SAMPLE_PATH: &str = "my-package/1.0.0/my-package-1.0.0.tar.gz";
 
@@ -5496,16 +5494,14 @@ mod tests {
     // (`ingest_declared_hash_matches_computed_on_fresh_insert_succeeds`,
     // `ingest_declared_hash_mismatch_on_fresh_insert_returns_conflict`,
     // `ingest_declared_hash_mismatch_rolls_back_cas_blob_when_not_referenced`)
-    // moved to `ingest_verified` in Item 10 — they exercise the
-    // declared-hash verification path that is now owned by
-    // `VerifiedIngestRequest::ProtocolNative`. See backlog
-    // 028-initiative-17-0 §"Item 9".
+    // moved to `ingest_verified` — they exercise the declared-hash
+    // verification path owned by `VerifiedIngestRequest::ProtocolNative`.
 
     // The remaining declared-hash branch tests
     // (`ingest_declared_hash_matches_existing_short_circuits_put` and
     // `ingest_declared_hash_differs_from_existing_early_conflict_no_put`)
-    // moved to `ingest_verified` in Item 10 — declared-hash semantics
-    // belong on the verification path.
+    // moved to `ingest_verified` — declared-hash semantics belong on the
+    // verification path.
 
     /// Branch (d) regression: existing row + NO declared hash → fall
     /// through to post-put behaviour. This path is already covered by
@@ -6807,9 +6803,8 @@ mod tests {
 
     // The declared-hash dedup test
     // (`ingest_hash_reference_duplicate_via_declared_sha256_does_not_put_blob`)
-    // moved to `ingest_verified` in Item 10 — its semantics belong on
-    // the verification path, not the direct-upload path. See backlog
-    // 028-initiative-17-0 §"Item 9".
+    // moved to `ingest_verified` — its semantics belong on the
+    // verification path, not the direct-upload path.
 
     /// Post-put dedup: no declared hash supplied, so the tarball IS
     /// put (that's how this dedup branch discovers the match), but
@@ -6881,7 +6876,7 @@ mod tests {
     //   as causation;
     //   atomicity-boundary rule: a failing group commit must NOT take
     //   the ingest down — the artifact IS persisted and `ingest` returns
-    //   Ok (the unlinked artifact is healed by Item 8's sweep).
+    //   Ok (the unlinked artifact is healed by the group-reconcile sweep).
     //
     // These tests deliberately use `make_use_case_with_group_lifecycle`
     // so they can inspect / inject on the mock group port alongside the
@@ -6980,13 +6975,13 @@ mod tests {
         // Stream id targets the ArtifactGroup aggregate.
         assert_eq!(c.batch.stream_id.category, StreamCategory::ArtifactGroup);
 
-        // Causation chain (review B6): the group commit's
-        // `causation_id` MUST equal the caller-supplied `event_id` of
-        // the persisted `ArtifactIngested` event. Since the adapter
-        // binds `EventToAppend::event_id` verbatim, that id is what
-        // lands in `events.event_id` — so the chain now resolves.
-        // Pre-B6 the use case minted a separate placeholder UUID and
-        // the chain dangled; this assertion is the regression guard.
+        // Causation chain: the group commit's `causation_id` MUST equal
+        // the caller-supplied `event_id` of the persisted
+        // `ArtifactIngested` event. Since the adapter binds
+        // `EventToAppend::event_id` verbatim, that id is what lands in
+        // `events.event_id` — so the chain now resolves. Previously the
+        // use case minted a separate placeholder UUID and the chain
+        // dangled; this assertion is the regression guard.
         let ingest_transitions = lifecycle.committed_transitions();
         assert_eq!(ingest_transitions.len(), 1);
         let ingest_batch = &ingest_transitions[0].1;
@@ -7013,16 +7008,16 @@ mod tests {
         ));
         assert_eq!(
             causation, ingest_batch.events[0].event_id,
-            "causation_id must equal the ArtifactIngested EventToAppend::event_id (B6)"
+            "causation_id must equal the ArtifactIngested EventToAppend::event_id"
         );
     }
 
     #[tokio::test]
     async fn ingest_continues_when_group_commit_fails() {
-        // Atomicity-boundary rule (§2.9): if the group commit fails
-        // AFTER `ArtifactIngested` has landed, `ingest` still returns
-        // `Ok` — the artifact is valid, just unlinked. Item 8's
-        // reconciliation sweep heals orphans at rest.
+        // Atomicity-boundary rule: if the group commit fails AFTER
+        // `ArtifactIngested` has landed, `ingest` still returns `Ok` —
+        // the artifact is valid, just unlinked. The group-reconcile sweep
+        // heals orphans at rest.
         let repo = pypi_repository();
         let repo_id = repo.id;
 
@@ -7302,9 +7297,9 @@ mod tests {
     // follower-registration primitive.
     // -----------------------------------------------------------------
 
-    /// F-14 cross-repo two-caller concurrency test (audit-mandated).
+    /// Cross-repo two-caller concurrency test.
     ///
-    /// Models the exact F-14 scenario: a single upstream artifact is
+    /// Models the scenario where a single upstream artifact is
     /// pulled concurrently into TWO different repositories sharing one
     /// `DedupKey::blob_by_hash` window.
     ///
@@ -7316,9 +7311,9 @@ mod tests {
     ///   `find_in_repo_by_hash(repoB, hash)` returns `None` — there is
     ///   no repo-B row (the leader only minted repo A's).
     ///
-    /// Pre-F-14-fix the follower's site mapped that `None` to a hard
+    /// Previously the follower's site mapped that `None` to a hard
     /// `Internal` ("post-coalesce artifact lookup found no row") and
-    /// the follower's pull failed closed. Post-fix the follower calls
+    /// the follower's pull failed closed. After the fix the follower calls
     /// [`IngestUseCase::register_existing_cas_blob`] and idempotently
     /// registers its OWN repo-B row pointing at the same CAS hash.
     ///
@@ -7345,7 +7340,7 @@ mod tests {
             //     repo-A artifact row exists. We model the leader's
             //     completed cross-repo dedup state directly (its own
             //     correctness is covered by the ingest_verified
-            //     suite); F-14 is solely about the FOLLOWER path.
+            //     suite); this test is solely about the FOLLOWER path.
             storage.insert_content(hash.clone(), b"shared upstream bytes".to_vec());
             let mut leader_row = sample_artifact(QuarantineStatus::None);
             leader_row.repository_id = repo_a_id;
@@ -7386,7 +7381,7 @@ mod tests {
             );
 
             // The follower path NEVER re-`storage.put`s — the content
-            // is already CAS-present (load-bearing F-14 property).
+            // is already CAS-present (the key cross-repo dedup property).
             assert_eq!(
                 storage.put_call_count(),
                 put_before_follower,
@@ -7452,7 +7447,7 @@ mod tests {
     /// (delegated `register_by_hash` `None`-branch `storage.exists`
     /// guard). The follower must never create a row pointing at a
     /// hash the CAS has never seen — this is the fail-closed half of
-    /// F-14 that the fix must preserve, not erase.
+    /// the cross-repo dedup fix that must be preserved.
     #[test]
     fn register_existing_cas_blob_missing_cas_content_is_not_found() {
         let repo_b = pypi_repository();
@@ -7571,12 +7566,11 @@ mod tests {
 
     // -- register_by_hash hardening regressions --------------------------------
     //
-    // C1 + C2 + I1 + I2 + I3 + I4 + I5 acceptance tests for the
-    // repo-scoped-lookup / metadata-cap / metric / dedup / size-resolution
-    // hardening of `register_by_hash`. The motivation behind each
-    // review finding — this block drives them out from the outside.
+    // Acceptance tests for the repo-scoped-lookup / metadata-cap / metric /
+    // dedup / size-resolution hardening of `register_by_hash`. This block
+    // drives them from the outside.
 
-    /// C1 — `find_by_repo_and_checksum` is repo-scoped, so
+    /// `find_by_repo_and_checksum` is repo-scoped, so
     /// `register_by_hash(Some(src))` is not fooled when the same SHA-256
     /// lives on multiple rows across repositories. Seed TWO artifact
     /// rows with an identical hash (one owned by `src`, one owned by an
@@ -7585,7 +7579,7 @@ mod tests {
     /// artifact's `size_bytes` matching the `src` row's size (the
     /// unrelated row was seeded with a distinct size so this assertion
     /// cannot pass by accident). Prior `find_by_checksum` returned an
-    /// arbitrary row; this test would fail against the pre-C1 code
+    /// arbitrary row; this test would fail against the earlier code
     /// whenever the "wrong" row sorted first in the adapter's response.
     #[test]
     fn register_by_hash_some_src_finds_correct_artifact_across_multi_repo_shared_hash() {
@@ -7642,7 +7636,7 @@ mod tests {
         });
     }
 
-    /// C2 — `register_by_hash` must enforce the per-format metadata cap
+    /// `register_by_hash` must enforce the per-format metadata cap
     /// the same way `ingest` does. Any OCI manifest PUT composing
     /// `register_by_hash` with an oversized `payload_metadata` would
     /// otherwise silently defeat the operator metadata caps.
@@ -7692,7 +7686,7 @@ mod tests {
             });
         });
 
-        // I1 + C2 tie-in: metric emission must carry the
+        // Metric tie-in: metric emission must carry the
         // `metadata_too_large` label, not `validation_error`.
         let entries = snap.into_vec();
         assert_counter(
@@ -7707,7 +7701,7 @@ mod tests {
         );
     }
 
-    /// I1 — foreign-repo `Some(src)` rejections must emit
+    /// Foreign-repo `Some(src)` rejections must emit
     /// `hort_ingest_total` with a classified error label. Under the
     /// pre-fix code the counter was never incremented on this path, so
     /// dashboards would miss every cross-mount authz failure.
@@ -7755,7 +7749,7 @@ mod tests {
             ],
             1,
         );
-        // I2 — duration histogram fires on failure paths too.
+        // duration histogram fires on failure paths too.
         assert_histogram_has_sample(
             &entries,
             "hort_ingest_duration_seconds",
@@ -7763,10 +7757,9 @@ mod tests {
         );
     }
 
-    /// I1 — `register_by_hash` must emit the `metadata_too_large`
-    /// label on the cap-miss path. Structurally independent of the
-    /// C2 test (which asserts the rejection itself); this one is the
-    /// metric-emission regression witness.
+    /// Pin that `register_by_hash` emits `metadata_too_large` on the
+    /// cap-miss path. Structurally independent of the cap-rejection test;
+    /// this one is the metric-emission regression witness.
     #[test]
     fn register_by_hash_emits_metadata_too_large_on_cap_violation() {
         let target = pypi_repository();
@@ -7811,11 +7804,10 @@ mod tests {
         );
     }
 
-    /// I1 — infrastructure failure on `lifecycle.commit_transition`
-    /// must still tick `hort_ingest_total`. Seeded via the
-    /// `MockArtifactLifecycle::fail_next_commit` injection shim so the
-    /// test exercises the actual error-path metric emission — not a
-    /// classifier unit test in disguise.
+    /// Infrastructure failure on `lifecycle.commit_transition` must still
+    /// tick `hort_ingest_total`. Seeded via the
+    /// `MockArtifactLifecycle::fail_next_commit` injection shim so the test
+    /// exercises the actual error-path metric emission.
     #[test]
     fn register_by_hash_emits_internal_on_lifecycle_failure() {
         let target = pypi_repository();
@@ -7870,10 +7862,8 @@ mod tests {
         );
     }
 
-    /// I2 — duration histogram fires on the happy path.
-    /// Happy-path emission was not directly asserted by the existing
-    /// test suite; pin it so a future refactor removing the histogram
-    /// call fails loudly.
+    /// Pin the duration histogram emission on the happy path so a future
+    /// refactor removing the histogram call fails loudly.
     #[test]
     fn register_by_hash_records_duration_histogram_on_success() {
         let target = pypi_repository();
@@ -7897,18 +7887,15 @@ mod tests {
             "hort_ingest_duration_seconds",
             &[("format", "pypi")],
         );
-        // And the size histogram — new emission wired up in the I1 +
-        // I2 refactor so the metric coverage of register_by_hash
-        // matches `ingest`'s.
+        // And the size histogram — to match `ingest`'s metric coverage.
         assert_histogram_has_sample(&entries, "hort_ingest_size_bytes", &[("format", "pypi")]);
     }
 
-    /// I3 — pin the "no re-streaming" property of
-    /// `register_by_hash` with a direct `put_call_count() == 0`
-    /// assertion on both success branches. A future refactor that
-    /// accidentally adds a `storage.put` call would fail this test;
-    /// the existing behavioural assertions (event shape, outcome
-    /// fields) would silently accept the regression.
+    /// Pin the "no re-streaming" property of `register_by_hash` with a
+    /// direct `put_call_count() == 0` assertion on both success branches.
+    /// A future refactor that accidentally adds a `storage.put` call would
+    /// fail this test; the existing behavioural assertions would silently
+    /// accept the regression.
     #[test]
     fn register_by_hash_some_src_happy_path_never_calls_storage_put() {
         let target = pypi_repository();
@@ -7934,9 +7921,9 @@ mod tests {
         });
     }
 
-    /// I3 — same assertion for the `None` branch. The
-    /// `storage.exists(&hash)` check must NOT promote itself to a
-    /// `put` call regardless of what the stored bytes are.
+    /// Same assertion for the `None` branch. The `storage.exists(&hash)`
+    /// check must NOT promote itself to a `put` call regardless of what
+    /// the stored bytes are.
     #[test]
     fn register_by_hash_none_with_exists_never_calls_storage_put() {
         let target = pypi_repository();
@@ -7965,7 +7952,7 @@ mod tests {
         });
     }
 
-    /// I4 — two sequential `register_by_hash` calls with the same
+    /// Two sequential `register_by_hash` calls with the same
     /// `(repository_id, coords.path, hash)` produce exactly ONE
     /// `commit_transition`; the second call returns the existing
     /// artifact's id. Prior code would emit a second `ArtifactIngested`
@@ -8034,7 +8021,7 @@ mod tests {
         );
     }
 
-    /// I4 — same path, DIFFERENT hash → `DomainError::Conflict`.
+    /// Same path, DIFFERENT hash → `DomainError::Conflict`.
     /// The `(repository_id, path)` UNIQUE constraint is honoured by
     /// the idempotence guard; a client mounting a fresh digest onto
     /// the same logical path must be told about the collision up front
@@ -8073,9 +8060,9 @@ mod tests {
         });
     }
 
-    /// I5 — `None` branch uses the authoritative
+    /// The `None` branch uses the authoritative
     /// `storage.size_of(&hash)` result when no `Artifact` row
-    /// references the hash yet (Phase 4 proxy/replication path). Prior
+    /// references the hash yet (proxy/replication path). Prior
     /// code silently stored `0` via `.unwrap_or(0)` on a missing
     /// artifact row; this test seeds storage with a known byte count
     /// and asserts the committed artifact's `size_bytes` reflects it.
@@ -8232,8 +8219,8 @@ mod tests {
             );
 
             // No refcount row landed — the failed insert was warned
-            // and skipped, not retried. Phase B's reconcile sweep
-            // (Item B3.5) is the documented catch-up.
+            // and skipped, not retried. The reconcile sweep
+            // is the documented catch-up.
             assert_eq!(
                 content_refs.entry_count(),
                 0,
@@ -8249,7 +8236,7 @@ mod tests {
     /// fails, and the outer ingest still returns `Ok`. After the
     /// dust settles the projection holds the `primary_content` row
     /// but NOT the `metadata_blob` row — exactly the drift the
-    /// reconcile sweep in Item B3.5 is designed to repair.
+    /// reconcile sweep is designed to repair.
     ///
     /// Uses the kind-targeted toggle (`fail_next_insert_for_kind`)
     /// so the failure fires precisely on the metadata_blob call,
@@ -8338,7 +8325,7 @@ mod tests {
             );
 
             // Load-bearing: the metadata_blob row is absent. Drift
-            // is left for B3.5 to repair.
+            // is left for the reconcile sweep to repair.
             let blob_rows = content_refs
                 .find_by_target(repo_id, &expected_blob_hash, Some("metadata_blob"))
                 .await
@@ -8346,7 +8333,7 @@ mod tests {
             assert_eq!(
                 blob_rows.len(),
                 0,
-                "metadata_blob row absent — drift left for B3.5 to repair"
+                "metadata_blob row absent — drift left for reconcile to repair"
             );
         });
     }
@@ -8742,8 +8729,7 @@ mod tests {
     /// METADATA bytes landed in CAS but the linkage row was not
     /// written; the caller sees `Err`. (The
     /// CAS-orphan blob is reaped by the GC reconcile
-    /// sweep — the design doc does NOT require a use-case-side
-    /// rollback here.)
+    /// sweep — a use-case-side rollback is not required here.)
     #[test]
     fn ingest_wheel_metadata_content_reference_insert_failure_propagates_err() {
         let repo = pypi_repository();
@@ -8821,7 +8807,7 @@ mod tests {
     /// only refcount write site on this path. Same invariant as the
     /// ingest path: refcount write failure does NOT abort the outer
     /// `register_by_hash`; the artifact is committed, drift is left
-    /// for the Phase B reconcile sweep (Item B3.5).
+    /// for the reconcile sweep.
     #[test]
     fn register_by_hash_refcount_failure_is_warn_only() {
         let target = pypi_repository();
@@ -9276,7 +9262,7 @@ mod tests {
 
     /// Construction with a Sha512 algorithm requires the matching
     /// 128-char hex; mismatched hex length fails at the
-    /// UpstreamPublishedChecksum constructor (Item 2).
+    /// UpstreamPublishedChecksum constructor.
     #[test]
     fn upstream_published_with_wrong_length_hex_for_algorithm_is_rejected() {
         // 64-char (sha256-length) hex with sha512 algorithm.
@@ -9490,7 +9476,7 @@ mod tests {
         });
     }
 
-    /// F46.4.3 — `ArtifactIngested` event payload carries
+    /// Pin that `ArtifactIngested` event payload carries
     /// `upstream_published_at` alongside the projection. The event is
     /// the source of truth for projection rebuild; without this, an
     /// `artifacts`-table rebuild from the event stream would silently
@@ -9534,7 +9520,7 @@ mod tests {
             // the `AppendEvents` batch (containing the `ArtifactIngested`
             // event) alongside the Artifact projection. Walk the recorded
             // transitions for the event payload — this is the bit
-            // F46.4.3 fixes (the projection bit was already pinned by
+            // (the projection bit was already pinned by
             // the pre-existing sibling test on `Artifact.upstream_published_at`).
             let transitions = lifecycle.committed_transitions();
             assert_eq!(transitions.len(), 1);
@@ -9555,7 +9541,7 @@ mod tests {
             assert_eq!(
                 ingested_payloads[0],
                 Some(published_at),
-                "F46.4.3: ArtifactIngested.upstream_published_at must mirror \
+                "ArtifactIngested.upstream_published_at must mirror \
                  Artifact.upstream_published_at so projection-rebuild stays \
                  bit-identical to the live row (required because publish-anchoring \
                  makes the value load-bearing for release authority)"
@@ -9563,11 +9549,11 @@ mod tests {
         });
     }
 
-    /// F46.4.3 — same as above but for the `None` case. Pre-Item-3/4
-    /// events deserialise via `#[serde(default)]` → `None`; this test
-    /// pins that post-fix events also carry `None` cleanly when no
-    /// upstream hint is available (direct uploads, format handlers
-    /// that don't surface one).
+    /// Same as above but for the `None` case. Pre-existing events
+    /// deserialise via `#[serde(default)]` → `None`; this test pins
+    /// that newer events also carry `None` cleanly when no upstream
+    /// hint is available (direct uploads, format handlers that don't
+    /// surface one).
     #[test]
     fn ingest_verified_records_upstream_published_at_none_on_event_payload() {
         let repo = pypi_repository();
@@ -9609,12 +9595,12 @@ mod tests {
             assert_eq!(ingested_payloads.len(), 1);
             assert_eq!(
                 ingested_payloads[0], None,
-                "F46.4.3: absent hint must round-trip as None on the event payload"
+                "absent hint must round-trip as None on the event payload"
             );
         });
     }
 
-    /// F46.4.3 — backward-compat: a pre-fix `ArtifactIngested` event
+    /// Backward-compat: a pre-existing `ArtifactIngested` event
     /// JSON (without the `upstream_published_at` key) must deserialise
     /// as `None` via `#[serde(default)]`. This pins the forward-compat
     /// contract: an existing event store doesn't need a rewrite when
@@ -9642,7 +9628,7 @@ mod tests {
             serde_json::from_str(pre_fix_json).expect("pre-fix JSON must still deserialise");
         assert_eq!(
             event.upstream_published_at, None,
-            "F46.4.3: #[serde(default)] on a new event field must produce None \
+            "#[serde(default)] on a new event field must produce None \
              for pre-fix persisted events — otherwise an existing event store \
              would need a rewrite, which is not on the table"
         );
@@ -9659,12 +9645,11 @@ mod tests {
     // produces an `ArtifactQuarantined` event for the assertions to walk.
     // ---------------------------------------------------------------------
 
-    /// Item 6 / Test 1 — opt-in `true` + recent `Some(upstream_published_at)`
+    /// Opt-in `true` + recent `Some(upstream_published_at)`
     /// (1h before ingest). The resolved anchor is the upstream publish time
     /// (the `min` clamp picks the smaller value; the upstream value is the
     /// smaller, so it wins). The persisted `ArtifactQuarantined` event must
-    /// carry the publish-time anchor — that's what the §2.5 sweep + Item-7
-    /// fast-path read.
+    /// carry the publish-time anchor — that's what the sweep fast-path reads.
     #[test]
     fn ingest_opted_in_recent_upstream_publish_uses_publish_anchor() {
         let repo = pypi_repository();
@@ -9709,8 +9694,8 @@ mod tests {
             );
 
             // Walk the persisted ArtifactQuarantined event — this is the
-            // bit the §2.5 sweep + Item-7 fast-path read; projection
-            // identity follows from the event payload (F46.4.3).
+            // value the sweep fast-path reads; projection
+            // identity follows from the event payload.
             let transitions = lifecycle.committed_transitions();
             let quarantine_batch = transitions
                 .iter()
@@ -9739,11 +9724,11 @@ mod tests {
         });
     }
 
-    /// Item 6 / Test 2 — opt-in `true` + `Some(upstream_published_at)` set
+    /// Opt-in `true` + `Some(upstream_published_at)` set
     /// 90 days in the past. The anchor is the upstream publish time (90
     /// days ago). The computed deadline (anchor + 24h default duration)
-    /// would already be elapsed — but Item 6 only stores the anchor; the
-    /// deadline-elapsed effect (early release / fast-path) is Item 7's
+    /// would already be elapsed — but this path only stores the anchor; the
+    /// deadline-elapsed effect (early release / fast-path) is the sweep's
     /// territory. This test pins the anchor exclusively.
     #[test]
     fn ingest_opted_in_long_ago_publish_collapses_window() {
@@ -9785,7 +9770,7 @@ mod tests {
             assert_eq!(
                 anchor, upstream_ts,
                 "long-ago upstream publish (90 days) is the anchor verbatim — \
-                 Item 6 stores the anchor; the deadline-elapsed effect is Item 7's job"
+                 the anchor is stored here; the deadline-elapsed effect is the sweep's job"
             );
 
             let transitions = lifecycle.committed_transitions();
@@ -9801,7 +9786,7 @@ mod tests {
         });
     }
 
-    /// Item 6 / Test 3 — the **future-skew clamp**. Opt-in `true` +
+    /// The **future-skew clamp**. Opt-in `true` +
     /// `Some(upstream_published_at)` 1h *after* ingest (physically
     /// impossible but a buggy or malicious upstream might send it). The
     /// `min(upstream, ingested)` clamp picks the smaller value (ingest)
@@ -9876,7 +9861,7 @@ mod tests {
         });
     }
 
-    /// Item 6 / Test 4 — opt-in `true` + `None` upstream. Best-effort:
+    /// Opt-in `true` + `None` upstream. Best-effort:
     /// the opt-in is on but the format adapter couldn't extract a hint
     /// for this artifact (an old release with no upload_time, a
     /// response without `Last-Modified`, etc.). Degrades to the ingest
@@ -9937,9 +9922,9 @@ mod tests {
         });
     }
 
-    /// Item 6 / Test 5 — opt-in `false` + `Some(upstream_published_at)`.
+    /// Opt-in `false` + `Some(upstream_published_at)`.
     /// The recording of `upstream_published_at` onto
-    /// `Artifact.upstream_published_at` is **unconditional** (Item 3);
+    /// `Artifact.upstream_published_at` is **unconditional**;
     /// **use** of the value behind `quarantine_window_start` is gated
     /// on the per-upstream opt-in. With the flag off, the anchor MUST
     /// stay at `ingested_at` regardless of the upstream hint.
@@ -9989,13 +9974,13 @@ mod tests {
             );
 
             // Recording vs use — the upstream value still rounds onto
-            // `Artifact.upstream_published_at` for audit (Item 3); only
+            // `Artifact.upstream_published_at` for audit; only
             // the *anchor consumer* is gated.
             assert_eq!(
                 artifact.upstream_published_at,
                 Some(upstream_ts),
-                "Item 3 invariant: upstream_published_at is recorded unconditionally; \
-                 only its consumption as the quarantine anchor is gated (Item 6)"
+                "upstream_published_at is recorded unconditionally; \
+                 only its consumption as the quarantine anchor is gated by the trust opt-in"
             );
 
             let transitions = lifecycle.committed_transitions();
@@ -10014,7 +9999,7 @@ mod tests {
         });
     }
 
-    /// Item 6 / Test 6 — direct upload. The `ingest_direct` path passes
+    /// Direct upload. The `ingest_direct` path passes
     /// `trust_upstream_publish_time = false` unconditionally
     /// (constructed at the `ingest_inner` call site — direct uploads
     /// have no serving `RepositoryUpstreamMapping`). Anchor is the
@@ -10239,8 +10224,8 @@ mod tests {
             assert_eq!(storage.put_call_count(), 1);
             assert_eq!(storage.delete_call_count(), 0);
 
-            // CAS hash on the row is the SHA-256 (decision §3.1 — the
-            // CAS key remains SHA-256, SHA-512 is verification-only).
+            // CAS hash on the row is the SHA-256 — the
+            // CAS key remains SHA-256, SHA-512 is verification-only.
             assert_eq!(outcome.artifact.sha256_checksum.to_string(), sha256_hex);
 
             // Artifact row was minted — the repo can find it by id.
@@ -10250,7 +10235,7 @@ mod tests {
             // Atomic emission: ArtifactIngested + ChecksumVerified land
             // in the same `commit_transition` batch on the artifact
             // stream. The SHA-512 path must mirror the SHA-256 path
-            // exactly here — that is the §13 audit invariant.
+            // exactly here — that is the audit invariant.
             let transitions = lifecycle.committed_transitions();
             assert_eq!(transitions.len(), 1);
             let (_artifact, batch, _meta) = &transitions[0];
@@ -10281,7 +10266,7 @@ mod tests {
 
     /// UpstreamPublished(Sha512) mismatch: the finalised SHA-512
     /// disagrees with the upstream-published hex — `Conflict` must
-    /// surface, no artifact row may be minted (mint-after-verify §3.4),
+    /// surface, no artifact row may be minted (mint-after-verify),
     /// `ChecksumMismatch` must land on the **repository** stream
     /// (`StreamId::repository(repo_id)`), the CAS blob must be rolled
     /// back via `storage.delete`, and `ChecksumVerified` must NOT fire.
@@ -10413,7 +10398,7 @@ mod tests {
     /// asserting:
     ///
     /// 1. Exactly one `ChecksumMismatch` lands on the repository stream
-    ///    (no artifact stream — mint-after-verify, §3.4).
+    ///    (no artifact stream — mint-after-verify).
     /// 2. `algorithm = Sha256` — the typed field, not parsed from any
     ///    string.
     /// 3. `computed_value` equals the actual computed SHA-256 of the
@@ -10695,7 +10680,7 @@ mod tests {
     /// `Conflict("stream … exceeds 200-event cap")` because the cap
     /// gate triggers when stream length is strictly greater than the
     /// cap. With `enforce_cap=false` (the fix), all 49 succeed and the
-    /// audit history grows unbounded as the §13 invariant requires.
+    /// audit history grows unbounded as the invariant requires.
     #[tokio::test]
     async fn repository_audit_stream_accepts_more_than_stream_event_cap_events() {
         use crate::use_cases::STREAM_EVENT_CAP;
@@ -10760,7 +10745,7 @@ mod tests {
         // The repository audit history — seeded prior + new appends —
         // totals STREAM_EVENT_CAP + 50 = 250 events, which is strictly
         // past the workspace cap. That an append at this depth was
-        // accepted at all is exactly the §13 unbounded-audit invariant.
+        // accepted at all is exactly the unbounded-audit invariant.
         let seeded_count = events
             .read_stream(&stream_id, ReadFrom::Start, 1000)
             .await
@@ -11259,7 +11244,7 @@ mod tests {
 
     #[test]
     fn cascade_seed_hook_suppressed_for_cascade_internal_verified_ingest() {
-        // H8 sibling — a `prefetch` leaf-ingest that is CASCADE-INTERNAL
+        // A `prefetch` leaf-ingest that is CASCADE-INTERNAL
         // (trigger_source "prefetch") marks `cascade_internal: true` in its
         // payload_metadata. The artifact it ingests is already covered by
         // its parent walk's depth-carrying child `prefetch-dependencies`
@@ -11536,9 +11521,8 @@ mod tests {
     }
 
     /// (d2) `VerifyIfPresent` on a non-OCI format (no applicable verifier in
-    /// the Tier-1 cosign-only set) → no `provenance-verify` job. This is the
-    /// §3.2 review fix: gating on `mode != Off` alone would enqueue a no-op
-    /// job for every non-OCI ingest.
+    /// the Tier-1 cosign-only set) → no `provenance-verify` job. Gating on
+    /// `mode != Off` alone would enqueue a no-op job for every non-OCI ingest.
     #[test]
     fn verify_if_present_non_oci_enqueues_no_provenance_verify_job() {
         let content: &[u8] = b"pypi sdist bytes";
@@ -11641,7 +11625,7 @@ mod tests {
 
     /// Default empty capability set (the un-wired composition default) →
     /// no `provenance-verify` job even on OCI with a non-Off mode. Proves
-    /// the gate is fail-safe before Item 6 wires the real set.
+    /// the gate is fail-safe when the real set is not yet configured.
     #[test]
     fn empty_capability_set_enqueues_no_provenance_verify_job() {
         let content: &[u8] = b"oci manifest bytes";

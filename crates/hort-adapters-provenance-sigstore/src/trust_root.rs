@@ -1,6 +1,6 @@
 //! Cached Sigstore trust root + its refresh-window bookkeeping.
 //!
-//! The verify path is **offline** (design §4): a stored Sigstore bundle
+//! The verify path is **offline**: a stored Sigstore bundle
 //! carries its own Fulcio cert chain (with SCT) + Rekor inclusion proof /
 //! SignedEntryTimestamp, and the adapter validates that material against a
 //! **cached trust root** (Fulcio CA certs + Rekor/CT-log public keys). The
@@ -41,7 +41,7 @@ pub(crate) fn parse_trusted_root(data: &[u8]) -> DomainResult<SigstoreTrustRoot>
 /// considers it stale. Sigstore's public-good TUF metadata has a short
 /// expiry; a day is a conservative refresh window that still keeps a
 /// worker bootable across a transient TUF outage. The composition root
-/// (Item 6) can override this.
+/// can override this.
 pub const DEFAULT_REFRESH_WINDOW_HOURS: i64 = 24;
 
 /// A minimal but structurally-valid `trusted_root.json` for tests across
@@ -63,7 +63,7 @@ pub(crate) fn minimal_trusted_root_json() -> Vec<u8> {
 
 /// The cached, offline-usable Sigstore trust root plus the bookkeeping
 /// `health_check` needs to assert it is "loaded and within its refresh
-/// window" (design §6) **without** probing live Rekor/Fulcio.
+/// window" **without** probing live Rekor/Fulcio.
 #[derive(Clone, Debug)]
 pub struct CachedTrustRoot {
     /// The raw `trusted_root.json` bytes. `Arc` so the adapter clones the
@@ -129,7 +129,7 @@ impl CachedTrustRoot {
 
     /// Whether the trust root is still within its refresh window relative
     /// to `now`. `health_check` consults this — a stale trust root means
-    /// the worker must not boot a verifier (design §6).
+    /// the worker must not boot a verifier.
     pub fn is_fresh_at(&self, now: DateTime<Utc>) -> bool {
         now.signed_duration_since(self.loaded_at) <= self.refresh_window
     }
@@ -166,8 +166,7 @@ impl CachedTrustRoot {
 /// # Errors
 /// `DomainError::Invariant` if the client cannot be built, the fetch
 /// fails, or the response is a non-2xx / unreadable body. The error is
-/// surfaced to the *refresh* caller (Item 6 schedules it); it never
-/// reaches a verify.
+/// surfaced to the *refresh* caller; it never reaches a verify.
 pub async fn refresh_trusted_root_json(
     trusted_root_url: &str,
     extra_ca_anchors: Option<&ExtraTrustAnchors>,

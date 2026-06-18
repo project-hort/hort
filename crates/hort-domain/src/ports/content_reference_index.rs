@@ -45,7 +45,7 @@
 //!
 //! # Write path
 //!
-//! On manifest `PUT`, Item 11's use case parses the manifest JSON, and
+//! On manifest `PUT`, the use case parses the manifest JSON, and
 //! if `.subject.digest` is set, calls
 //! [`ContentReferenceIndex::insert`] with
 //! `(source = manifest_artifact_id, target = subject_hash,
@@ -62,14 +62,14 @@
 //!
 //! # Read path
 //!
-//! Item 13's `GET /v2/<name>/referrers/<digest>` calls
+//! `GET /v2/<name>/referrers/<digest>` calls
 //! [`ContentReferenceIndex::find_by_target`] with the path digest and
 //! `Some("oci_subject")` as the `kind_filter` (so cross-`kind` rows,
 //! which the OCI API must not surface, are excluded at the SQL level).
 //!
 //! # Delete path
 //!
-//! Item 11's manifest `DELETE` calls
+//! The manifest `DELETE` handler calls
 //! [`ContentReferenceIndex::delete_by_source`] so subsequent
 //! target-side lookups don't surface tombstoned source artifacts. The
 //! migration's FK cascade on `source_artifact_id → artifacts(id) ON

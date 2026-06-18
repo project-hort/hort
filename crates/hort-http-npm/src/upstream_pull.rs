@@ -13,9 +13,8 @@
 //!    the raw body; the raw lives in the mirror. The projection's
 //!    `NpmVersionEntry` for the requested version carries the GENUINE
 //!    upstream `dist.tarball` (`entry.tarball`, captured verbatim by
-//!    the projector before any serve-time rewrite — F11 / §9.1
-//!    invariant I-1) and the verbatim `dist.integrity` SRI
-//!    (`entry.integrity` — ADR 0006 / I-3).
+//!    the projector before any serve-time rewrite) and the verbatim
+//!    `dist.integrity` SRI (`entry.integrity` — ADR 0006).
 //! 3. Recover the upstream `dist.integrity` SHA-512 from `entry.integrity`
 //!    via the same audited
 //!    [`NpmFormatHandler::parse_upstream_checksum`] decode, and the
@@ -32,14 +31,9 @@
 //!    algorithm on `UpstreamPublishedChecksum` is `Sha512` (ADR 0006).
 //!
 //! `try_upstream_tarball_pull` lives in this inbound-HTTP crate (NOT a
-//! use case) — keeps the orchestration close to the route. Item 5
-//! wires the dispatch from `serve_tarball`; this item only lands the
-//! orchestrator + its branch tests.
-//!
-//! Wire-mapping ([`UpstreamPullError`] → HTTP status / body) is deferred
-//! to Item 5; the discrimination here only needs to surface the failure
-//! modes cleanly. The variant list mirrors the PyPI (17.2) and Cargo
-//! (17.1) precedents so the Item 5 wire-map can use the same shape.
+//! use case) — keeps the orchestration close to the route. Wire-mapping
+//! ([`UpstreamPullError`] → HTTP status / body) is handled at the call
+//! site in `serve_tarball`.
 
 use std::sync::Arc;
 
@@ -67,25 +61,21 @@ use hort_http_core::context::AppContext;
 use crate::packument::{fetch_raw_with_cache, PackumentFetchError};
 
 /// Discriminated failure modes for [`try_upstream_tarball_pull`]. Wire
-/// mapping (HTTP status + envelope body) is performed by Item 5 in the
-/// route handler; the orchestrator itself only surfaces *what* went
-/// wrong, not *how to render it*.
+/// mapping (HTTP status + envelope body) is performed at the call site;
+/// the orchestrator itself only surfaces *what* went wrong, not *how to
+/// render it*.
 ///
-/// The variant list mirrors PyPI (`crates/hort-http-pypi/src/upstream_pull.rs::
-/// UpstreamPullError`) so the Item 5 wire-mapping can reuse the same
-/// shape. `FilenameMismatch` is the npm-specific defence-in-depth check —
+/// `FilenameMismatch` is the npm-specific defence-in-depth check —
 /// the upstream `dist.tarball` basename must agree with the URL filename
 /// the client asked for, otherwise an upstream could substitute a
 /// different tarball under the legitimate metadata.
 ///
-/// `MetadataMalformed` mirrors PyPI's `ParseError` — both surface the
-/// "upstream returned bytes the format handler couldn't parse" branch
-/// (npm: dist.integrity missing, malformed SRI, no sha512 entry).
-/// `TarballUrlInvalid` is a separate variant because the helper that
-/// extracts the URL is independent of the checksum parser (Item 2 design
-/// note); a body that parses cleanly for the integrity field but yields
-/// no valid `dist.tarball` URL is a distinct failure shape that the
-/// wire-map may want to render differently.
+/// `MetadataMalformed` covers cases where the upstream returned bytes
+/// the format handler couldn't parse (missing `dist.integrity`, malformed
+/// SRI, no sha512 entry). `TarballUrlInvalid` is a separate variant
+/// because the helper that extracts the URL is independent of the checksum
+/// parser; a body that parses cleanly for the integrity field but yields
+/// no valid `dist.tarball` URL is a distinct failure shape.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UpstreamPullError {
     /// No upstream mapping configured for this repo. Wire to "no
@@ -111,8 +101,7 @@ pub(crate) enum UpstreamPullError {
 
     /// `dist.integrity` parsed but the `dist.tarball` URL is missing,
     /// non-https, or the version isn't in the packument. Distinct from
-    /// `MetadataMalformed` because the URL helper is invoked separately
-    /// (Item 2 keeps the two parsers independent).
+    /// `MetadataMalformed` because the URL helper is invoked separately.
     #[error("upstream tarball URL invalid: {cause}")]
     TarballUrlInvalid { cause: String },
 
@@ -127,8 +116,8 @@ pub(crate) enum UpstreamPullError {
     /// `IngestUseCase::ingest_verified` returned `Conflict` — upstream
     /// bytes hashed differently from the SHA-512 advertised in
     /// `dist.integrity`. The use case already emitted `ChecksumMismatch`
-    /// on the repository stream and rolled back the CAS blob. The §15
-    /// security primitive against upstream tampering.
+    /// on the repository stream and rolled back the CAS blob. Security
+    /// primitive against upstream tampering.
     #[error("upstream checksum mismatch")]
     ChecksumMismatch,
 
@@ -150,8 +139,7 @@ pub(crate) enum UpstreamPullError {
 /// `version` is the resolved version; `filename` is the wire filename
 /// the client requested (e.g. `express-4.18.2.tgz`).
 ///
-/// Item 5 wires this from `serve_tarball` — Proxy-repo cache misses
-/// route here.
+/// Called from `serve_tarball` on Proxy-repo cache misses.
 #[tracing::instrument(
     skip(ctx),
     fields(
@@ -189,7 +177,7 @@ pub(crate) async fn try_upstream_tarball_pull(
     //    a packument-via-pull miss and a direct packument miss still
     //    share one coalescing window.
     //
-    //    F11 invariant preserved: the projection's `NpmVersionEntry`
+    //    Invariant preserved: the projection's `NpmVersionEntry`
     //    carries the GENUINE upstream `dist.tarball` (`entry.tarball`,
     //    captured verbatim by the projector before any serve-time
     //    rewrite) and the verbatim `dist.integrity` SRI
@@ -284,9 +272,9 @@ pub(crate) async fn try_upstream_tarball_pull(
     };
 
     // Build coords for the checksum recovery + the verified-ingest
-    // request. Spec 074 §2 — the path is the canonical npm logical path
-    // from the single SSOT constructor (`{name}/-/{basename}-{ver}.tgz`),
-    // matching the publish-handler's `do_publish` shape and the read-side
+    // request. The path is the canonical npm logical path from the single
+    // SSOT constructor (`{name}/-/{basename}-{ver}.tgz`), matching the
+    // publish-handler's `do_publish` shape and the read-side
     // `parse_download_path`. npm derives the filename from name+version, so
     // `filename = None`. The downstream basename check (below) still
     // asserts the upstream `dist.tarball` basename equals the request
@@ -429,7 +417,7 @@ pub(crate) async fn try_upstream_tarball_pull(
     let blob_tarball_url = tarball_url;
     let blob_ingest = ctx.ingest_use_case.clone();
     let blob_repo_id = repo.id;
-    // F-14: keep a clone for the cross-repo follower-registration
+    // Keep a clone for the cross-repo follower-registration
     // fallback below (the closure consumes `blob_coords`).
     let follower_coords = coords.clone();
     let blob_coords = coords;
@@ -483,13 +471,13 @@ pub(crate) async fn try_upstream_tarball_pull(
         // discriminators — preserve the existing wire-mapping. Follower-
         // side errors arrive as `AppError::External("pull-dedup
         // follower: ...")` and route to `IngestFailed` per the design's
-        // leader-only-discrimination contract (§4).
+        // leader-only-discrimination contract.
         Err(AppError::Domain(DomainError::Conflict(msg))) => {
-            // Audit invariant (design doc §13): the mismatch warn carries
-            // `algorithm`, `format`, `repository_id` so an operator can
-            // correlate it with the corresponding `ChecksumMismatch` event
-            // on the repository stream. NEVER `artifact_id` — no Artifact
-            // row was minted on the mismatch path (mint-after-verify).
+            // The mismatch warn carries `algorithm`, `format`, `repository_id`
+            // so an operator can correlate it with the corresponding
+            // `ChecksumMismatch` event on the repository stream. NEVER
+            // `artifact_id` — no Artifact row was minted on the mismatch
+            // path (mint-after-verify).
             tracing::warn!(
                 conflict = %msg,
                 format = "npm",
@@ -533,10 +521,10 @@ pub(crate) async fn try_upstream_tarball_pull(
     // artifact row by content hash. The leader's `ingest_verified`
     // (inside the closure) wrote the row; the follower reads it.
     //
-    // F-14 (ADR 0007): `blob_by_hash` is cross-repo, so a follower
-    // that joined a window whose leader ingested into a DIFFERENT repo
-    // has no row in `repo.id`. On `None` the follower idempotently
-    // registers its OWN per-repo row via `register_existing_cas_blob`
+    // (ADR 0007): `blob_by_hash` is cross-repo, so a follower that
+    // joined a window whose leader ingested into a DIFFERENT repo has no
+    // row in `repo.id`. On `None` the follower idempotently registers its
+    // OWN per-repo row via `register_existing_cas_blob`
     // (content already CAS-present + verified; no re-fetch, no
     // re-`storage.put`; same `ArtifactIngested` event the leader's
     // cross-repo dedup emits).
@@ -630,7 +618,7 @@ fn checksum_from_entry(
 ///
 /// `entry.tarball` is the genuine upstream URL captured by the
 /// projector before any serve-time rewrite (ADR 0026 §9.1 invariant
-/// I-1 / F11). A missing URL → the same "missing dist.tarball"
+/// I-1). A missing URL → the same "missing dist.tarball"
 /// `Validation` the raw parser produced.
 fn tarball_url_from_entry(entry: &NpmVersionEntry, version: &str) -> DomainResult<String> {
     let tarball = entry.tarball.as_deref().ok_or_else(|| {
@@ -695,9 +683,9 @@ fn tarball_basename(url: &str) -> std::borrow::Cow<'_, str> {
 ///   with `MetadataMalformed`: from an observability standpoint both are
 ///   "the upstream returned bytes the format handler couldn't fully
 ///   resolve into a tarball pointer". The orchestrator keeps the
-///   variants distinct because the underlying parsers are independent
-///   (Item 2 design note); the wire-map collapses them because
-///   downstream alerting groups them together.
+///   variants distinct because the underlying parsers are independent;
+///   the wire-map collapses them because downstream alerting groups
+///   them together.
 /// - The body shape (`{"error": "..."}`, `application/json`) mirrors
 ///   the existing PyPI / Cargo wire-maps so client-side logging stays
 ///   uniform across the success / quarantine / pull-through branches.
@@ -977,8 +965,8 @@ mod tests {
         seed_mapping(&mocks, repo.id);
 
         // Packument with only dist.shasum (SHA-1) — the format
-        // handler rejects (design doc §16: SHA-1 fallback NOT
-        // accepted).
+        // handler rejects (SHA-1 fallback is not accepted —
+        // collision-broken since 2017).
         let body = packument_legacy_shasum_only(
             "1.0.0",
             "https://registry.npmjs.org/legacy/-/legacy-1.0.0.tgz",
@@ -1219,11 +1207,11 @@ mod tests {
 
     // ---- Branch 8: cached packument bypasses upstream metadata fetch -------
 
-    /// Item 3 owns the cache write semantics; this orchestrator is a
-    /// read-only consumer. Pre-seed an envelope, then assert the
-    /// happy path completes without seeding any upstream metadata.
-    /// The mock's `fetch_metadata` returns a not_found Invariant when
-    /// no fixture is present — the only way this test passes is if
+    /// The cache write is owned by the packument-fetch helper; this
+    /// orchestrator is a read-only consumer. Pre-seed an envelope, then
+    /// assert the happy path completes without seeding any upstream
+    /// metadata. The mock's `fetch_metadata` returns a not_found Invariant
+    /// when no fixture is present — the only way this test passes is if
     /// `fetch_metadata` is never called.
     #[tokio::test]
     async fn try_upstream_tarball_pull_uses_cached_packument_when_present() {
@@ -1255,7 +1243,7 @@ mod tests {
                 .await
                 .expect("cached-path happy path must succeed");
         assert_eq!(artifact.name, "cached");
-        // F11 regression-companion: the orchestrator fetched the
+        // Regression companion: the orchestrator fetched the
         // *upstream* host, proven structurally — the `fetch_artifact`
         // mock keys on the literal `url`
         // (`https://registry.npmjs.org/...`), so the ingest succeeding
@@ -1264,27 +1252,25 @@ mod tests {
         // rewritten local URL would miss the mock and fail the fetch.
     }
 
-    // ---- Branch 8b: F11 regression — writer→reader contract seam -----------
+    // ---- Branch 8b: writer→reader contract seam -----------
 
-    /// **F11 regression test** — the headline.
+    /// **Regression test** — the headline.
     ///
     /// Drives the *real packument writer* (`packument::fetch_raw_with_cache`)
     /// then the *real tarball reader* (`try_upstream_tarball_pull`) — NOT
     /// a hand-seeded cache. A hand-seeded raw cache is green pre-fix and
-    /// does not exercise the Item-3 ↔ Item-4 contract seam (the
+    /// does not exercise the writer→reader contract seam (the
     /// `:1156` test proves that). This test populates the cache the way
     /// production does: an `npm install` GETs the packument first
     /// (`fetch_raw_with_cache` writes the cache), then GETs the tarball
     /// within the cache window (`try_upstream_tarball_pull` reads it).
     ///
-    /// Pre-fix (rewrite-before-cache): the writer cached the *rewritten*
+    /// Before the fix the writer cached the *rewritten*
     /// `http://localhost/npm/...` body; the reader fed that local URL to
     /// `extract_upstream_tarball_url`, whose `https://` guard rejected it
-    /// → `TarballUrlInvalid` → 502. **RED.**
-    ///
-    /// Post-fix (Option B — cache raw, rewrite on serve): the writer
-    /// caches the raw upstream body; the reader gets the genuine
-    /// `https://registry.npmjs.org/...` URL → ingest succeeds. **GREEN.**
+    /// → `TarballUrlInvalid` → 502. With the fix the writer caches the
+    /// raw upstream body; the reader gets the genuine
+    /// `https://registry.npmjs.org/...` URL → ingest succeeds.
     #[tokio::test]
     async fn f11_regression_packument_writer_then_tarball_reader_pulls_through() {
         use crate::packument::fetch_raw_with_cache;
@@ -1296,7 +1282,7 @@ mod tests {
 
         // The tarball bytes the upstream serves; the packument's
         // `dist.integrity` must agree (the verified-ingest rehash
-        // protects the tarball — that defence is unchanged by F11).
+        // protects the tarball — that defence is unchanged).
         let tarball_bytes = b"the real lodash 4.17.21 tarball bytes".to_vec();
         let sri = sri_sha512(&tarball_bytes);
         let upstream_url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
@@ -1328,7 +1314,7 @@ mod tests {
         .await
         .expect("packument fetch_raw_with_cache must succeed");
 
-        // F11 acceptance — the writer cached the projection AND mirrored
+        // Acceptance — the writer cached the projection AND mirrored
         // the raw body under the shared mirror key, so the reader below
         // can resolve the genuine upstream URL from EITHER. Assert the
         // mirror holds exactly the package's raw body under the
@@ -1340,7 +1326,7 @@ mod tests {
         );
         assert!(
             mocks.metadata_mirror.keys().contains(&expected_mirror_key),
-            "F11: the raw body must be mirrored under {expected_mirror_key}; got {:?}",
+            "The raw body must be mirrored under {expected_mirror_key}; got {:?}",
             mocks.metadata_mirror.keys()
         );
 
@@ -1349,18 +1335,13 @@ mod tests {
         // genuine upstream `dist.tarball` from `entry.tarball`. A
         // rewritten local URL would miss the `fetch_artifact` mock (keyed
         // on the literal upstream URL) and fail the fetch.
-        let artifact = try_upstream_tarball_pull(
-            &ctx,
-            &repo,
-            "lodash",
-            "4.17.21",
-            "lodash-4.17.21.tgz",
-        )
-        .await
-        .expect(
-            "F11: tarball pull-through must succeed — the cached projection must carry the \
+        let artifact =
+            try_upstream_tarball_pull(&ctx, &repo, "lodash", "4.17.21", "lodash-4.17.21.tgz")
+                .await
+                .expect(
+                    "Tarball pull-through must succeed — the cached projection must carry the \
              genuine upstream `dist.tarball` URL + verbatim `dist.integrity` SRI",
-        );
+                );
 
         assert_eq!(artifact.name, "lodash");
         assert_eq!(artifact.version.as_deref(), Some("4.17.21"));
@@ -1514,7 +1495,7 @@ mod tests {
         assert_eq!(artifact.name, "fallback");
     }
 
-    // ---- Item 6: audit invariant — exactly one ChecksumVerified -----------
+    // ---- Audit invariant — exactly one ChecksumVerified -----------
 
     /// Every artifact ingested via `ingest_verified` has exactly one
     /// `ChecksumVerified` event in its stream — same append batch as
@@ -1586,17 +1567,14 @@ mod tests {
         );
     }
 
-    // ---- Item 6: warn-capture for the security-sensitive branch ----------
+    // ---- Warn-capture for the security-sensitive branch ----------
 
-    /// Design doc §13 + architect skill (Observability rule "tracing
-    /// records what was attempted, including failures that never reach
-    /// the event store"): the `ChecksumMismatch` branch is the
-    /// security-sensitive site for the npm pull-through path. The warn
-    /// must carry `algorithm`, `format`, and `repository_id`, and must
-    /// NOT carry `artifact_id` (mint-after-verify — none was minted).
-    /// This test installs a per-thread `CapturingLayer` and asserts the
-    /// emitted `WARN` event mentions both the `algorithm = sha512` and
-    /// `format = npm` fields.
+    /// The `ChecksumMismatch` branch is the security-sensitive site for
+    /// the npm pull-through path. The warn must carry `algorithm`,
+    /// `format`, and `repository_id`, and must NOT carry `artifact_id`
+    /// (mint-after-verify — none was minted). This test installs a
+    /// per-thread `CapturingLayer` and asserts the emitted `WARN` event
+    /// mentions both the `algorithm = sha512` and `format = npm` fields.
     ///
     /// Uses the same `CapturingLayer` + `TRACING_TEST_MUTEX` +
     /// `install_global_passthrough_subscriber` idiom as

@@ -25,8 +25,7 @@ use crate::output::{format_json, format_table_rows};
 /// JSON envelope for `GET /api/v1/repositories/:name/security-score`.
 ///
 /// **Sync-required with hort-http-admin-security::dto**. Field names and
-/// serialisation format are part of the public API contract. See the
-/// design doc §7 for the envelope specification.
+/// serialisation format are part of the public API contract.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecurityScoreDto {
     /// Repository name (key), NOT the UUID. Resolved by the handler

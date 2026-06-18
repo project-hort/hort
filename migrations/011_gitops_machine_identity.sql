@@ -116,23 +116,23 @@
 -- appending 012_*_alter.sql on top.
 
 -- ---------------------------------------------------------------------------
--- oidc_issuers (§2 OidcIssuer aggregate)
+-- oidc_issuers (OidcIssuer aggregate)
 -- ---------------------------------------------------------------------------
 -- Columns:
 --   * `name` — UNIQUE, matches CRD `metadata.name`. Diff identity is
 --     `name` (ADR 0018); the unique constraint enforces this on the DB
 --     side.
 --   * `issuer_url` — canonical `iss` claim value. Apply-time validator
---     rejects HTTP (§3); the column accepts both shapes because the
+--     rejects HTTP URLs; the column accepts both shapes because the
 --     validation lives one layer up.
 --   * `audiences` — TEXT[] of acceptable `aud` claim values. Apply
---     validator gates non-empty (§3).
+--     validator gates non-empty.
 --   * `jwks_refresh_interval` — INTERVAL, default 1h (ADR 0018). Adapter
 --     layer maps this to `std::time::Duration` via PgInterval
 --     (`scanner_registry_repository.rs` precedent).
 --   * `allowed_algorithms` — TEXT[] of accepted JWT `alg` values
---     (RFC 7518). Default `{RS256}` per §2; apply validator gates
---     against `JwtAlg::from_str` (Item 1).
+--     (RFC 7518). Default `{RS256}`; apply validator gates
+--     against `JwtAlg::from_str`.
 
 --   * `require_jti` — BOOLEAN, default TRUE. When TRUE a federated JWT
 --     from this issuer that lacks a `jti` claim is rejected
@@ -159,17 +159,16 @@ CREATE TABLE public.oidc_issuers (
 );
 
 -- Federation-branch lookup: the handler matches the JWT `iss` claim
--- against `issuer_url` to find the validator config. §4 expects this
--- to be O(1) — the index gives a btree lookup against the column.
+-- against `issuer_url` to find the validator config. The handler expects
+-- this to be O(1) — the index gives a btree lookup against the column.
 CREATE INDEX idx_oidc_issuers_issuer_url ON public.oidc_issuers (issuer_url);
 
 -- ---------------------------------------------------------------------------
--- service_accounts (§2 ServiceAccount aggregate)
+-- service_accounts (ServiceAccount aggregate)
 -- ---------------------------------------------------------------------------
 -- Columns:
 --   * `name` — UNIQUE, matches CRD `metadata.name`. The backing
---     `users.username` is `'sa:' || name` (collision-prevention prefix
---     per §2).
+--     `users.username` is `'sa:' || name` (collision-prevention prefix).
 --   * `backing_user_id` — REFERENCES users(id) ON DELETE RESTRICT.
 --     See design decision (1) above for the RESTRICT rationale.
 --   * `role` — TEXT (not enum). Apply validator gates to
@@ -178,7 +177,7 @@ CREATE INDEX idx_oidc_issuers_issuer_url ON public.oidc_issuers (issuer_url);
 --     keeps the schema flat — the role enum lives in
 --     `crates/hort-domain/src/security`.
 --   * `repositories` — TEXT[] of repository keys. Apply validator
---     gates non-empty per §3 (no global SA grants).
+--     gates non-empty (no global SA grants).
 
 CREATE TABLE public.service_accounts (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -191,7 +190,7 @@ CREATE TABLE public.service_accounts (
 );
 
 -- ---------------------------------------------------------------------------
--- service_account_federated_identities (§2 FederatedIdentity sub-aggregate)
+-- service_account_federated_identities (FederatedIdentity sub-aggregate)
 -- ---------------------------------------------------------------------------
 -- Columns:
 --   * `service_account_id` — REFERENCES service_accounts(id) ON DELETE
@@ -224,15 +223,15 @@ CREATE TABLE public.service_account_federated_identities (
         CHECK (jsonb_typeof(claims) = 'object' AND claims <> '{}'::jsonb)
 );
 
--- Federation match scan: §4 walks rows whose `issuer_name` matches the
--- validated issuer. Per-issuer cardinality is small (a handful of SAs
+-- Federation match scan: the handler walks rows whose `issuer_name` matches
+-- the validated issuer. Per-issuer cardinality is small (a handful of SAs
 -- per CI system in practice), but the index keeps the scan cheap on
--- larger deployments and matches the backlog Item 2 acceptance.
+-- larger deployments.
 CREATE INDEX idx_service_account_federated_identities_issuer_name
     ON public.service_account_federated_identities (issuer_name);
 
 -- ---------------------------------------------------------------------------
--- service_account_fallback_rotations (§2 FallbackRotation sub-aggregate)
+-- service_account_fallback_rotations (FallbackRotation sub-aggregate)
 -- ---------------------------------------------------------------------------
 -- Columns:
 --   * `service_account_id` — PRIMARY KEY (1:1 with the SA — the
@@ -241,7 +240,7 @@ CREATE INDEX idx_service_account_federated_identities_issuer_name
 --     drops the rotation target alongside.
 --   * `target_namespace` / `target_name` — k8s Secret reference.
 --     Apply-time does NOT validate against
---     `worker.rotation.targetNamespaces` (§3) — that's a runtime
+--     `worker.rotation.targetNamespaces` — that's a runtime
 --     concern handled by the reconciler.
 --   * `format` — TEXT + inline CHECK pinning to the two supported
 --     wire-form values (see decision (3) above).
@@ -299,7 +298,7 @@ CREATE TABLE public.service_account_fallback_rotations (
 --     (`ValidatedClaims.issuer_name`), NOT the raw `iss` URL. Scopes
 --     the seen-set per trusted issuer; renaming an issuer (a deliberate
 --     operator act) starts a fresh namespace (a re-declared issuer is a
---     new trust root — acceptable, spec §3).
+--     new trust root — acceptable by design).
 --   * `key_kind` — discriminator `'jti' | 'composite'`. Keeps both key
 --     shapes in one table with one PK; the unused columns are NULL,
 --     gated by the CHECK below.
@@ -311,9 +310,8 @@ CREATE TABLE public.service_account_fallback_rotations (
 --     it is `lower(hex(sha256(iss US sub US iat US exp)))` (US = 0x1F
 --     unit separator, injective) computed in
 --     `crates/hort-domain` (`ReplayKey::key_id`) — never in SQL.
---   * `expires_at` — TTL horizon = `min(jwt_remaining, federation_max)`
---     (spec §4). Cleanup is the `replay-seen-prune` worker task
---     (default-ENABLED, spec §12 R4) issuing
+--   * `expires_at` — TTL horizon = `min(jwt_remaining, federation_max)`.
+--     Cleanup is the `replay-seen-prune` worker task (default-ENABLED) issuing
 --     `DELETE … WHERE expires_at < now()`. The claim INSERT does NOT
 --     gate on `expires_at` — `ON CONFLICT` is the whole check; a
 --     not-yet-pruned expired row is harmless (the validator already
@@ -349,7 +347,7 @@ CREATE TABLE public.jwt_replay_seen (
     )
 );
 
--- Cleanup-by-expiry support (spec §4): a btree on expires_at lets the
+-- Cleanup-by-expiry support: a btree on expires_at lets the
 -- `replay-seen-prune` delete-expired sweep range-scan instead of
 -- seqscan.
 CREATE INDEX idx_jwt_replay_seen_expires_at

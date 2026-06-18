@@ -35,9 +35,8 @@
 //! "elapsed" — the `<=` comparison favours
 //! [`ReEvaluationOutcome::ResetToReleased`]. The wall-clock at apply time
 //! is monotonic only at one-second resolution; either choice is
-//! defensible, but the design doc framing ("if the deadline is still in
-//! the future") makes "future" the discriminator and "now" the
-//! complement.
+//! defensible; the chosen framing ("if the deadline is still in the
+//! future") makes "future" the discriminator and "now" the complement.
 
 use chrono::{DateTime, Utc};
 

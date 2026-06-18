@@ -67,7 +67,7 @@ pub fn oci_blob_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
 /// without colliding on the `(repository_id, path)` UNIQUE constraint —
 /// legitimate for re-usable config blobs whose bytes happen to match a
 /// manifest in some pathological test corpus, and load-bearing for
-/// Item 12's manifest ingest path.
+/// the manifest ingest path.
 pub fn oci_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
     ArtifactCoords {
         name: name.to_string(),
@@ -82,7 +82,7 @@ pub fn oci_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
 /// Build `ArtifactCoords` for the OCI manifest-group root addressed by
 /// `(name, manifest_digest)`.
 ///
-/// §2.14.1 contract: `path` is EMPTY (`String::new()`) and `metadata` is
+/// The `path` field MUST be EMPTY (`String::new()`) and `metadata` MUST be
 /// `Value::Null`. These zero values are load-bearing — the cross-format
 /// `(repository_id, coords_json)` UNIQUE index canonicalises the coords
 /// row at INSERT time, so a non-zero `path` or non-Null `metadata` here
@@ -100,10 +100,10 @@ pub fn oci_group_coords(name: &str, _manifest_digest: &ContentHash) -> ArtifactC
         name: name.to_string(),
         name_as_published: name.to_string(),
         version: None,
-        // MUST be empty — §2.14.1 zero-path contract.
+        // MUST be empty — zero-path contract (see function doc).
         path: String::new(),
         format: RepositoryFormat::Oci,
-        // MUST be Value::Null — §2.14.1 zero-metadata contract.
+        // MUST be Value::Null — zero-metadata contract (see function doc).
         metadata: serde_json::Value::Null,
     }
 }
@@ -126,9 +126,9 @@ mod tests {
 
     #[test]
     fn blob_coords_name_fields_match_input_verbatim() {
-        // Identity normalisation (§2.14.1) — the same string goes in
-        // both `name` and `name_as_published` so drift-resilience
-        // lookups stay consistent with OCI's grammar being canonical.
+        // Identity normalisation — the same string goes in both `name`
+        // and `name_as_published` so drift-resilience lookups stay
+        // consistent with OCI's grammar being canonical.
         let c = oci_blob_coords("Library/NGINX", &sample_hash());
         assert_eq!(c.name, "Library/NGINX");
         assert_eq!(c.name_as_published, "Library/NGINX");
@@ -158,10 +158,10 @@ mod tests {
 
     #[test]
     fn group_coords_path_is_empty() {
-        // §2.14.1: the cross-format `(repository_id, coords_json)`
-        // UNIQUE index depends on this being the exact empty string.
-        // A non-empty path here would register a distinct group per
-        // manifest PUT and break the idempotence-on-re-push contract.
+        // The cross-format `(repository_id, coords_json)` UNIQUE index
+        // depends on this being the exact empty string. A non-empty path
+        // here would register a distinct group per manifest PUT and break
+        // the idempotence-on-re-push contract.
         let c = oci_group_coords("library/nginx", &sample_hash());
         assert_eq!(c.path, "");
     }
@@ -171,7 +171,7 @@ mod tests {
         let c = oci_group_coords("library/nginx", &sample_hash());
         assert!(
             c.metadata.is_null(),
-            "group metadata must be Null (§2.14.1)"
+            "group metadata must be Null (zero-metadata contract)"
         );
     }
 

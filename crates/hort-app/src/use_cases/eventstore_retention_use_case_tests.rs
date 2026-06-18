@@ -4,15 +4,15 @@
 //! `hort-app` is the 100%-coverage tier (mock every port). Every branch
 //! is pinned here:
 //! - empty candidate set → no-op.
-//! - TerminalGated terminal + floor-elapsed + `Delete` → `delete_stream`
-//!   (B9 chokepoint), `deleted` tallied.
+//! - TerminalGated terminal + floor-elapsed + `Delete` → `delete_stream`,
+//!   `deleted` tallied.
 //! - TerminalGated terminal + elapsed + `Archive` → `archive_stream`
 //!   with the exact `format!("{prefix}/{stream_id}")` target.
-//! - non-terminal tail → `skipped_non_terminal` + warn + no chokepoint.
-//! - floor not elapsed → `skipped_floor_not_elapsed` + no chokepoint.
+//! - non-terminal tail → `skipped_non_terminal` + warn.
+//! - floor not elapsed → `skipped_floor_not_elapsed`.
 //! - floor boundary: exactly-at (sealed) vs one-second-short (skipped),
 //!   pinned `now`.
-//! - B9-chokepoint failure → `errors`, sweep continues (second
+//! - seal chokepoint failure → `errors`, sweep continues (second
 //!   candidate still processed) — the fail-safe path.
 //! - meta-stream candidate → `skipped_meta_stream` + no chokepoint.
 //! - idempotent re-run: empty `read_stream` → `skipped_already_sealed`.
@@ -184,9 +184,9 @@ impl TerminalStreamReader for MockReader {
 // ---------------------------------------------------------------------------
 // MockEventStore — dedicated (the shared test_support::MockEventStore's
 // delete_stream/archive_stream are silent no-ops with no recording and
-// no failure injection; B5 needs to assert which chokepoint fired with
-// which target AND inject a chokepoint failure for the fail-safe path).
-// Self-contained so test_support stays untouched (B4 precedent).
+// no failure injection; these tests need to assert which chokepoint fired
+// with which target AND inject a chokepoint failure for the fail-safe path).
+// Self-contained so test_support stays untouched.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -230,9 +230,9 @@ impl MockEventStore {
 
 impl EventStore for MockEventStore {
     fn append(&self, _b: AppendEvents) -> BoxFuture<'_, DomainResult<AppendResult>> {
-        // B5 never appends through the use case (the B9 adapter does
-        // the StreamSealed append internally); a call here is a bug.
-        Box::pin(async { unreachable!("B5 use case must not append directly") })
+        // The retention use case never appends directly (the adapter
+        // handles the StreamSealed append internally); a call here is a bug.
+        Box::pin(async { unreachable!("retention use case must not append directly") })
     }
     fn read_stream(
         &self,
@@ -546,7 +546,7 @@ async fn floor_boundary_exactly_at_seals_one_second_short_skips() {
 }
 
 // ---------------------------------------------------------------------------
-// B9-chokepoint failure → errors, sweep continues (fail-safe path)
+// Seal chokepoint failure → errors, sweep continues (fail-safe path)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -573,8 +573,8 @@ async fn chokepoint_failure_records_error_and_sweep_continues() {
         MockEventStore::new()
             .seed_stream(&bad_sid, vec![purged_persisted(bad, 0)])
             .seed_stream(&good_sid, vec![purged_persisted(good, 0)])
-            // The unprivileged-role DELETE block until B6 wires
-            // hort_retention_role manifests exactly as this per-stream
+            // The unprivileged-role DELETE block when hort_retention_role
+            // is not wired manifests exactly as this per-stream
             // chokepoint Err.
             .fail_seal_for(&bad_sid),
         vec![artifact_rule(floor_secs(100))],
@@ -971,16 +971,14 @@ mod metrics_emission_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Item B14 — canonical_retention_rules builder
+// canonical_retention_rules builder
 //
-// The B14 deliverable: make B5's "registration seam" concrete. The pure
-// `hort-app` builder takes the resolved C-1 floor `Duration`s as explicit
-// params (NOT the `hort-server` `AuditRetentionFloors` struct — `hort-app`
-// must not depend on `hort-server`) and returns the canonical
-// `Vec<CategoryRetentionRule>`. B14 seeds it with the two categories B5
-// already supports: `AuthAttempts` (AgeGated, ≥6mo Authentication floor —
-// the B14 registration) and the artifact-lifecycle terminal-gated rule
-// (`ArtifactPurged`). B12/B13 append their entries in later PRs.
+// The pure `hort-app` builder takes the resolved C-1 floor `Duration`s as
+// explicit params (NOT the `hort-server` `AuditRetentionFloors` struct —
+// `hort-app` must not depend on `hort-server`) and returns the canonical
+// `Vec<CategoryRetentionRule>`: `AuthAttempts` (AgeGated, ≥6mo
+// Authentication floor) and the artifact-lifecycle terminal-gated rule
+// (`ArtifactPurged`), plus the DownloadAudit and TokenUse categories.
 // ---------------------------------------------------------------------------
 
 mod canonical_rules_tests {
@@ -1058,7 +1056,7 @@ mod canonical_rules_tests {
         let artifact = rules
             .iter()
             .find(|r| r.category == StreamCategory::Artifact)
-            .expect("canonical set must register the artifact-lifecycle rule (B5 §5)");
+            .expect("canonical set must register the artifact-lifecycle rule");
         assert_eq!(
             artifact.mode,
             SealMode::TerminalGated {
@@ -1099,11 +1097,11 @@ mod canonical_rules_tests {
         // `User` is NEVER a canonical_retention_rules entry — it is
         // only a `floor_for` mapping for the user CRUD lifecycle
         // stream (issuance/revocation); the per-use stream is its own
-        // `TokenUse` category (per §10.5).
+        // `TokenUse` category.
         assert!(!categories.contains(&StreamCategory::User));
     }
 
-    /// B12 — the DownloadAudit rule is AgeGated (rotated audit stream,
+    /// The DownloadAudit rule is AgeGated (rotated audit stream,
     /// no terminal event — same shape as the AuthAttempts rule) and
     /// carries the supplied download-audit floor verbatim.
     #[test]
@@ -1283,16 +1281,16 @@ mod canonical_rules_tests {
 
     #[tokio::test]
     async fn canonical_auth_rule_drives_b5_age_gated_seal_at_the_supplied_floor() {
-        // End-to-end through the B5 mock harness: an auth-{date} stream
+        // End-to-end through the mock harness: an auth-{date} stream
         // whose oldest event is JUST PAST the ≥6mo floor is sealed; one
         // JUST INSIDE the floor is NOT. `now` is pinned; the boundary
-        // mirrors B5's existing AgeGated boundary tests exactly.
+        // matches the existing AgeGated boundary tests exactly.
         let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
         let sid = auth_stream(date);
         // Floor in seconds-comparable units so the C-1 comparison is
-        // exact against pinned `now`/`first_event_at` (B5 `floor_secs`
-        // convention; the production builder threads a real `Duration`,
-        // here we feed a pinned-comparable one to keep the boundary tight).
+        // exact against pinned `now`/`first_event_at` (the production
+        // builder threads a real `Duration`; here we feed a
+        // pinned-comparable one to keep the boundary tight).
         let floor = floor_secs(100);
         let rules = canonical_retention_rules(
             floor,

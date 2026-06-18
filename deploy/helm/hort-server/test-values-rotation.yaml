@@ -1,12 +1,11 @@
 # Test fixture: enable service-account PAT rotation for
 # helm-template verification.
 #
-# Backlog 078 Item 9 (chart S4) — rotation is enabled by the SINGLE
-# source-of-truth toggle `scheduledTasks.serviceAccountRotation.enabled`.
-# That one flag drives BOTH the CronJob AND the worker-side wiring
-# (env block + per-namespace RBAC). There is no separate
-# `worker.rotation.enabled`; `worker.rotation.*` only carries the
-# worker-side PARAMETERS.
+# Rotation is enabled by the SINGLE source-of-truth toggle
+# `scheduledTasks.serviceAccountRotation.enabled`. That one flag drives
+# BOTH the CronJob AND the worker-side wiring (env block + per-namespace
+# RBAC). There is no separate `worker.rotation.enabled`;
+# `worker.rotation.*` only carries the worker-side PARAMETERS.
 #
 # Usage:
 #   helm template deploy/helm/hort-server/ \

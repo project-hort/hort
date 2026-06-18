@@ -179,10 +179,10 @@ DSN-free and reads its own env directly (see
 | `PG_STATEMENT_TIMEOUT_MS` | u64 | _unset → none (Postgres default)_ | No | Per-session `statement_timeout` in ms. `0` rejected. No `HORT_` prefix. |
 | `PG_ACQUIRE_TIMEOUT_SECS` | u64 | `30` | No | Pool `acquire_timeout`. `0` rejected. No `HORT_` prefix. |
 
-¹ Backlog 078 Item 5 — exactly one of `HORT_DATABASE_URL` / `DATABASE_URL` is
-required; `HORT_DATABASE_URL` is the canonical operator var and is tried first,
-with bare `DATABASE_URL` as the documented compat fallback. With neither set the
-error surfaces the name `"DATABASE_URL"`. This is identical to the worker.
+¹ Exactly one of `HORT_DATABASE_URL` / `DATABASE_URL` is required;
+`HORT_DATABASE_URL` is the canonical operator var and is tried first, with bare
+`DATABASE_URL` as the documented compat fallback. With neither set the error
+surfaces the name `"DATABASE_URL"`. This is identical to the worker.
 
 ### Logging & tracing
 
@@ -588,7 +588,7 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
-| `HORT_SCANNER_TRIVY_ENABLED` | bool | `true` | No | **Load-bearing** (Backlog 078 Item 6). When `false`, the worker does NOT register the Trivy backend even if its `--version` probe would pass — the flag is the enabling gate; the probe is a secondary health check that only runs on flag-enabled backends. Set from `worker.scanner.trivy.enabled`. |
+| `HORT_SCANNER_TRIVY_ENABLED` | bool | `true` | No | **Load-bearing.** When `false`, the worker does NOT register the Trivy backend even if its `--version` probe would pass — the flag is the enabling gate; the probe is a secondary health check that only runs on flag-enabled backends. Set from `worker.scanner.trivy.enabled`. |
 | `HORT_SCANNER_OSV_ENABLED` | bool | `true` | No | **Load-bearing**, same contract as `HORT_SCANNER_TRIVY_ENABLED`. Set from `worker.scanner.osv.enabled`. Disabling **both** backends is a hard boot error (a scanner worker with no backends has nothing to scan). |
 | `HORT_SCANNER_TRIVY_BIN` | path | `trivy` | No | Trivy binary path/name. |
 | `HORT_SCANNER_TRIVY_DB_DIR` | path | _unset → Trivy default cache_ | No | Trivy `--cache-dir`; omitted when unset. |
@@ -640,9 +640,8 @@ the server.
   (`hort-worker fatal: …`) — a configured-but-broken bundle fails fast
   rather than degrading to public-root-only TLS. The unreadable-file
   fatal **names the missing path and points at the absent CA-bundle
-  mount** (Backlog 078 Item 7 c), so a half-wired manual recipe (env set
-  but the worker volume forgotten) is an actionable error, not an opaque
-  crashloop. The chart only sets `HORT_EXTRA_CA_BUNDLE` on the worker
+  mount**, so a half-wired manual recipe (env set but the worker volume
+  forgotten) is an actionable error, not an opaque crashloop. The chart only sets `HORT_EXTRA_CA_BUNDLE` on the worker
   when it also auto-mounts the bundle there (`extraCaBundle.configMapName`
   / `secretName`); see [extra-ca-bundle.md](../how-to/deploy/extra-ca-bundle.md).
   The chart must provide a writable `/tmp` (an `emptyDir`).

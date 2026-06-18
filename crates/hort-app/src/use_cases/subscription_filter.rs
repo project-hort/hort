@@ -34,11 +34,11 @@
 //!    (`match *predicate {}`). The hook stays so future v1.x variants
 //!    AND-compose without changing the dispatcher loop.
 //!
-//! **Authorization is live, not snapshotted** (§4 prose, §11 invariant 3).
+//! **Authorization is live, not snapshotted.**
 //! Filter scope is the upper bound; the owner's current grants are the
 //! floor. The dispatcher loads one `RbacEvaluator` snapshot per delivery
-//! batch (Item 6b) and passes it down via [`FilterContext`] so every
-//! per-event check sees a consistent evaluator without re-loading.
+//! batch and passes it down via [`FilterContext`] so every per-event
+//! check sees a consistent evaluator without re-loading.
 //!
 //! No `tracing` — filter evaluation runs once per `(subscription, event)`
 //! pair on the dispatcher hot path; per-event log records would tank
@@ -59,7 +59,7 @@ use crate::rbac::RbacEvaluator;
 
 /// Resolved-once context the dispatcher carries through a delivery batch.
 ///
-/// The dispatcher (Item 6b) loads `rbac.load()` once per batch — the same
+/// The dispatcher loads `rbac.load()` once per batch — the same
 /// pattern [`crate::use_cases::subscription_use_case::SubscriptionUseCase::create`]
 /// uses — and reborrows the `RbacEvaluator` into every per-event
 /// [`matches`] call. The [`RepositoryRepository`] port is held but not
@@ -83,8 +83,8 @@ pub struct FilterContext<'a> {
 /// Evaluate a subscription filter against a persisted event.
 ///
 /// Returns `true` if the event should be delivered to the subscription;
-/// `false` otherwise. Short-circuits on the first failing step per the
-/// §4 contract. See the module-level docs for the evaluation order.
+/// `false` otherwise. Short-circuits on the first failing step.
+/// See the module-level docs for the evaluation order.
 pub async fn matches(
     filter: &SubscriptionFilter,
     event: &PersistedEvent,
@@ -186,7 +186,7 @@ pub async fn matches(
             .authorize(ctx.owner_principal, Permission::Read, Some(repo)),
     };
 
-    // Type-based admin requirement (F-39 + F-37) is strictly additive to the
+    // Type-based admin requirement is strictly additive to the
     // category/scope decision: an authorization-model-mutation or
     // privileged-audit type must additionally clear a live `Permission::Admin`
     // check regardless of the carrying stream's category (both the `(_, None)`
@@ -384,7 +384,7 @@ mod tests {
 
     /// Filter selecting the privileged `Authorization` category with
     /// `OwnedByActor` scope — the shape a poisoned-snapshot subscription
-    /// would carry to attempt RBAC-mutation exfiltration (F-3 / F-37).
+    /// would carry to attempt RBAC-mutation exfiltration.
     fn authorization_owned_filter() -> SubscriptionFilter {
         SubscriptionFilter {
             categories: vec![StreamCategory::Authorization],
@@ -808,9 +808,9 @@ mod tests {
     async fn live_authz_uses_current_grants_not_stored_snapshot() {
         // The same `filter` + same `event` + same `principal` evaluated
         // against two different evaluator snapshots produces different
-        // decisions. The dispatcher (Item 6b) reloads `rbac.load()`
-        // between batches, so revoking a grant takes effect within the
-        // auth cache TTL — this test documents that property.
+        // decisions. The dispatcher reloads `rbac.load()` between
+        // batches, so revoking a grant takes effect within the auth
+        // cache TTL — this test documents that property.
         let repo_a = Uuid::new_v4();
         let principal = principal_with_roles(Uuid::new_v4(), &["dev"]);
         let repos_arc = repos();
@@ -935,8 +935,8 @@ mod tests {
 
     // -- Dispatch-time privileged-category gate ----------------------------
 
-    /// F-37 gate mechanic (filter leg). A subscription whose snapshot was
-    /// elevated to `["admin"]` via the §5.5 PATCH-via-PAT path but whose
+    /// Privileged-category gate (filter leg). A subscription whose snapshot
+    /// was elevated to `["admin"]` via the PATCH-via-PAT path but whose
     /// owner is **not currently admin** synthesises (in
     /// `dispatcher::synthesise_principal`) an owner principal with the
     /// stale `"admin"` neutralised — i.e. `claims = []`. A privileged
@@ -965,7 +965,7 @@ mod tests {
         assert!(
             !matches(&filter, &event, &ctx).await,
             "privileged-category None-repo event must NOT reach a \
-             non-admin owner (F-3 dispatch-leg / F-37)"
+             non-admin owner"
         );
     }
 
@@ -1150,10 +1150,10 @@ mod tests {
         }
     }
 
-    /// F-39: a `Read`-only owner on `repo` must NOT receive a repo-scoped
+    /// A `Read`-only owner on `repo` must NOT receive a repo-scoped
     /// `PermissionGrantApplied` even though the carrying `Repository`
-    /// category is non-admin and the owner holds `Read` on the repo. Pre-fix
-    /// the `(_, Some(repo))` arm's `Read` check passed → leak.
+    /// category is non-admin and the owner holds `Read` on the repo.
+    /// Pre-fix the `(_, Some(repo))` arm's `Read` check passed → leak.
     #[tokio::test]
     async fn read_only_owner_denied_repo_scoped_permission_grant() {
         let repo_id = Uuid::new_v4();
@@ -1171,11 +1171,11 @@ mod tests {
 
         assert!(
             !matches(&filter, &event, &ctx).await,
-            "Read-only owner must NOT receive repo-scoped grant topology (F-39)"
+            "Read-only owner must NOT receive repo-scoped grant topology"
         );
     }
 
-    /// F-39: same for `RepositoryUpstreamMappingChanged`.
+    /// Same for `RepositoryUpstreamMappingChanged`.
     #[tokio::test]
     async fn read_only_owner_denied_repo_scoped_upstream_mapping_change() {
         let repo_id = Uuid::new_v4();
@@ -1193,11 +1193,11 @@ mod tests {
 
         assert!(
             !matches(&filter, &event, &ctx).await,
-            "Read-only owner must NOT receive upstream-mapping topology (F-39)"
+            "Read-only owner must NOT receive upstream-mapping topology"
         );
     }
 
-    /// F-37: a `Read`-only owner on `repo` must NOT receive an
+    /// A `Read`-only owner on `repo` must NOT receive an
     /// `ArtifactDownloaded` download-audit fact for `repo` (it is
     /// repo-associated, escaping the None-repo re-check).
     #[tokio::test]
@@ -1217,11 +1217,11 @@ mod tests {
 
         assert!(
             !matches(&filter, &event, &ctx).await,
-            "Read-only owner must NOT receive download-audit telemetry (F-37)"
+            "Read-only owner must NOT receive download-audit telemetry"
         );
     }
 
-    /// F-39 no-regression: an admin owner IS delivered the repo-scoped
+    /// No-regression: an admin owner IS delivered the repo-scoped
     /// `PermissionGrantApplied` (legitimate admin subscription).
     #[tokio::test]
     async fn admin_owner_receives_repo_scoped_permission_grant() {
@@ -1244,7 +1244,7 @@ mod tests {
         );
     }
 
-    /// F-37 no-regression: an admin owner IS delivered the
+    /// No-regression: an admin owner IS delivered the
     /// `ArtifactDownloaded` download-audit fact.
     #[tokio::test]
     async fn admin_owner_receives_download_audit_event() {

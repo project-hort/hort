@@ -63,15 +63,13 @@ fn worker_config_parses_with_minimum_required_env() {
     assert!(cfg.max_attempts >= 1);
 }
 
-/// M7: `WorkerConfig.lock_duration` round-trips through the env-var
-/// parser to the value the worker consumes when calling
-/// `ScanOrchestrationUseCase::claim_pending` in the poll loop. The
-/// review finding asked to thread `lock_duration` onto
-/// `ScanOrchestrationConfig` (in `hort-app`); this agent's touchable
-/// paths do not include `hort-app`, so the assertion lands on the
-/// worker side: parsing and propagation through the config struct
-/// must not lose the value. The actual claim-call wiring lives in
-/// `poll_loop::process_one_batch` at line `claim_pending(.., ctx.config.lock_duration)`.
+/// `WorkerConfig.lock_duration` round-trips through the env-var parser
+/// to the value the worker consumes when calling
+/// `ScanOrchestrationUseCase::claim_pending` in the poll loop.
+/// Parsing and propagation through the config struct must not lose the
+/// value. The actual claim-call wiring lives in
+/// `poll_loop::process_one_batch` at line
+/// `claim_pending(.., ctx.config.lock_duration)`.
 #[test]
 fn worker_config_lock_duration_roundtrips_through_env() {
     let _g = env_lock().lock().unwrap();
@@ -99,7 +97,7 @@ fn worker_config_lock_duration_roundtrips_through_env() {
     assert_eq!(
         default_cfg.lock_duration,
         std::time::Duration::from_secs(900),
-        "default lock duration must be 900s per design doc §6 table",
+        "default lock duration must be 900s",
     );
 }
 
@@ -274,7 +272,7 @@ fn build_app_context_signature_compiles() {
                 root: PathBuf::from("/tmp"),
             },
             redis_url_evictable: None,
-            // Backlog 078 Item 6 — load-bearing scanner enable flags.
+            // Load-bearing scanner enable flags.
             trivy_enabled: true,
             trivy_bin: PathBuf::from("trivy"),
             trivy_db_dir: None,

@@ -89,7 +89,7 @@ CREATE TABLE public.policy_projections (
     ),
     -- An empty provenance_backends array is permitted
     -- ONLY when provenance is off (a non-off mode with no verifier is
-    -- inert; rejected at apply by Item 5 and as defence-in-depth here).
+    -- inert; rejected at apply time and as defence-in-depth here).
     CONSTRAINT policy_projections_provenance_backends_nonempty_unless_off CHECK (
         (provenance_mode = 'off'::text) OR (cardinality(provenance_backends) > 0)
     ),

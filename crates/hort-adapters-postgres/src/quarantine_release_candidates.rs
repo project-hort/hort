@@ -16,8 +16,8 @@
 //!    never quarantines today, so no candidate ever escapes the
 //!    per-policy resolution.
 //!
-//! Cost is bounded by **number of policies**, not number of artifacts
-//! (design §2.5): there are typically a handful of distinct durations,
+//! Cost is bounded by **number of policies**, not number of artifacts:
+//! there are typically a handful of distinct durations,
 //! so the adapter groups repos by their effective duration and issues
 //! one indexed range scan per distinct duration `D`:
 //!
@@ -41,8 +41,8 @@
 //!
 //! See `crates/hort-app/src/task_handlers/quarantine_release_sweep.rs`
 //! for the handler that consumes this port and feeds the result into
-//! `QuarantineUseCase::release_expired`, which enforces the F-6
-//! fail-closed authority predicate per artifact (unchanged by Item 1b).
+//! `QuarantineUseCase::release_expired`, which enforces the
+//! fail-closed authority predicate per artifact.
 
 use std::collections::HashMap;
 
@@ -57,7 +57,7 @@ use hort_domain::ports::quarantine_release_candidates::{
 
 use crate::{map_sqlx_error, BoxFuture};
 
-/// PostgreSQL adapter for the §2.4 candidacy query.
+/// PostgreSQL adapter for the quarantine-release candidacy query.
 pub struct PgQuarantineReleaseCandidatesRepository {
     pool: PgPool,
 }
@@ -84,8 +84,8 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             // `quarantine_duration_secs`, then walk the quarantined-
             // artifact rows to build the `repo → duration` map. Cost is
             // O(policies + quarantined_repos), bounded by the policy set
-            // size — design §2.5: "Cost is bounded by *number of
-            // policies*, never number of artifacts."
+            // size: "Cost is bounded by *number of policies*, never
+            // number of artifacts."
             //
             // Per-repo precedence (mirrors
             // `QuarantineUseCase::record_scan_result`):
@@ -180,8 +180,7 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             .collect::<Result<Vec<_>, _>>()?;
 
             // Group repos by their resolved effective duration. A repo
-            // resolving to `None` (no operator policy, no global default,
-            // and pre-Item-2 no `DefaultPolicy::quarantine_duration_secs`)
+            // resolving to `None` (no operator policy, no global default)
             // contributes no candidates — the per-duration loop skips it.
             // A repo whose resolved duration is `<= 0` (permissive opt-
             // in) also contributes no candidates: permissive mode is
@@ -205,9 +204,9 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             //
             // The partial index `idx_artifacts_quarantine_window_start
             // ON (quarantine_window_start) WHERE quarantine_status =
-            // 'quarantined'` supports this. Per design
-            // §2.5: `quarantine_window_start <= <constant>` is a clean
-            // indexed range scan; combined with `repository_id = ANY(...)`
+            // 'quarantined'` supports this.
+            // `quarantine_window_start <= <constant>` is a clean indexed
+            // range scan; combined with `repository_id = ANY(...)`,
             // PostgreSQL applies the array filter as a bitmap-AND step
             // before the heap fetch.
             // -----------------------------------------------------------------
@@ -296,10 +295,10 @@ mod tests {
     }
 
     /// `select_expired` returns an empty `Vec` on an empty database —
-    /// no policies, no artifacts, no candidates. Pins the no-policy /
-    /// pre-Item-2 floor: with no operator-configured `ScanPolicy` AND
-    /// no `DefaultPolicy::quarantine_duration_secs` yet, the adapter
-    /// is a pure no-op rather than panicking on the absent default.
+    /// no policies, no artifacts, no candidates. With no
+    /// operator-configured `ScanPolicy` AND no
+    /// `DefaultPolicy::quarantine_duration_secs`, the adapter is a pure
+    /// no-op rather than panicking on the absent default.
     ///
     /// `#[serial(hort_pg_db)]` per CLAUDE.md "DB-backed test isolation
     /// (parallel-safety contract)": any new hort-adapters-postgres test

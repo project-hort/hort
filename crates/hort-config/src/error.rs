@@ -2,7 +2,7 @@
 //!
 //! Both phases collect every error before returning. A single malformed
 //! YAML file shouldn't hide five others — operators want to fix
-//! everything they can see in one boot pass. See design doc §4.1.
+//! everything they can see in one boot pass.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -107,7 +107,7 @@ pub enum ParseError {
 /// Bag of per-file parse errors, returned from `DesiredState::parse_files`.
 ///
 /// `Display` renders one error per line — the boot caller logs the
-/// rendered string at `tracing::error!` and exits non-zero (Item 9).
+/// rendered string at `tracing::error!` and exits non-zero.
 #[derive(Debug, thiserror::Error)]
 pub struct ParseErrors(pub Vec<(PathBuf, ParseError)>);
 
@@ -141,8 +141,7 @@ pub enum ValidationError {
     /// A `virtualMembers: [...]` entry references a key that is not
     /// declared in the desired state.
     ///
-    /// v1 design choice (§7): only desired-state-internal references
-    /// are accepted. Mixing a managed virtual repo with a `Local` row
+    /// Only desired-state-internal references are accepted. Mixing a managed virtual repo with a `Local` row
     /// from the current snapshot is rejected — the virtual repo itself
     /// must stay `Local` if the operator wants mixed membership. This
     /// keeps the gitops surface self-contained and avoids the `Local`

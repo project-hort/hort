@@ -1136,9 +1136,9 @@ pub async fn build_app_context(
     // `Arc<PgEventStore>` directly because they need the
     // `begin_unit_of_work` Postgres-specific surface that does NOT
     // live on the `EventStore` port. Lifecycle appends therefore do
-    // NOT broadcast (intentional — see design-doc §6 paragraph 4: the
-    // dispatcher subscribes once per process and the broadcast hook
-    // exists at the per-use-case `EventStore::append` boundary;
+    // NOT broadcast (intentional — the dispatcher subscribes once per
+    // process and the broadcast hook exists at the per-use-case
+    // `EventStore::append` boundary;
     // lifecycle ports own their own transactional append paths and
     // surface persisted events back to callers via `AppendResult` which
     // the use cases re-emit through the publisher when they need
@@ -1147,7 +1147,7 @@ pub async fn build_app_context(
     let event_publisher: Arc<EventStorePublisher> = if notify_config.enabled {
         let (sender, _initial_receiver) =
             tokio::sync::broadcast::channel(notify_config.channel_capacity as usize);
-        // The initial receiver is dropped immediately — Item 6b's
+        // The initial receiver is dropped immediately — the
         // dispatcher creates its own subscription via
         // `publisher.subscribe()` at task spawn time. Without dropping
         // the initial receiver here, the broadcast channel would never
@@ -1537,9 +1537,9 @@ pub async fn build_app_context(
         include_repository_label,
     ));
 
-    // Post-Item-3: the resolver holds no state. All public-URL
-    // derivation lives in F2's `request_trust_layer`, which consumes
-    // `public_base_url` (threaded in via `trust_config`) at request time.
+    // The resolver holds no state. All public-URL derivation lives in
+    // `request_trust_layer`, which consumes `public_base_url` (threaded
+    // in via `trust_config`) at request time.
     // `public_base_url` here is used only for the startup-log line below.
     let url_resolver = hort_http_core::url_resolver::UrlResolver;
 
@@ -2309,7 +2309,7 @@ pub async fn build_app_context(
     // `Arc<dyn EventNotifier>` (for the dispatcher's notifier registry,
     // below) AND `Arc<dyn WebhookTargetGuard>` (for the use-case
     // constructor). One instance services both trait views — see
-    // design-doc §10 "wire once" paragraph.
+    // the "wire once" rationale in the event-notifications doc.
     //
     // RBAC: same `ArcSwap<RbacEvaluator>` snapshot the API-token use
     // case and the task use case already hold — admin enforcement is
@@ -2601,7 +2601,7 @@ pub async fn build_app_context(
 
     // Trust-config mode string. Operators need the MODE for dashboards
     // — NOT the CIDR values (those are operator secrets / internal-net
-    // topology). See design doc §2.11.
+    // topology).
     let trust_mode = match (
         trust_config.public_base_url.is_some(),
         !trust_config.trusted_proxy_cidrs.is_empty(),

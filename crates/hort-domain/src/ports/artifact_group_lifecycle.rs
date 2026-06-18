@@ -7,7 +7,7 @@
 //! single transaction. The read-side lookup port lives at
 //! [`super::artifact_group_repository::ArtifactGroupRepository`]; the
 //! read/write split keeps consumers that only lookup independent of the
-//! transactional-write path. See design doc §2.6a, §2.9.
+//! transactional-write path.
 //!
 //! # Three load-bearing rules — do not deviate
 //!
@@ -67,7 +67,7 @@ use super::BoxFuture;
 ///   proceeds straight to the member INSERT.
 ///
 /// - `primary_role_assigned = Some(role)` — the use case decided this
-///   add should also fix the group's `primary_role` (§2.10 case 2:
+///   add should also fix the group's `primary_role` (the primary-role-assignment case:
 ///   group was created without a primary and this member arrives with
 ///   `is_primary = true`). The adapter runs a race-safe
 ///   `UPDATE ... WHERE primary_role = ''`. A concurrent caller that
@@ -81,7 +81,7 @@ pub struct GroupMemberCommit {
     /// The member to add. Always present.
     pub member: ArtifactGroupMember,
     /// `Some(role)` when this add also fixes a previously-empty
-    /// `primary_role`. See §2.10 case 2.
+    /// `primary_role`. See the primary-role-assignment case.
     pub primary_role_assigned: Option<String>,
 }
 
@@ -122,7 +122,7 @@ pub enum GroupCommitOutcome {
 pub trait ArtifactGroupLifecyclePort: Send + Sync {
     /// Atomically attach a member to a group (creating the group if
     /// `change.new_group.is_some()`), optionally assigning the primary
-    /// role (§2.10 case 2), and append the caller-supplied events.
+    /// role (the primary-role-assignment case), and append the caller-supplied events.
     ///
     /// # Adapter contract
     ///

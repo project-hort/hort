@@ -1,4 +1,4 @@
-//! `CheckpointAnchorPort` **read** adapter (ADR 0002, spec §6.1/§6.2).
+//! `CheckpointAnchorPort` **read** adapter (ADR 0002).
 //!
 //! Reads externally-anchored, Ed25519-signed event-chain checkpoints
 //! from a WORM-locked object-store prefix and feeds the
@@ -8,14 +8,13 @@
 //! [`CheckpointAnchorPort`](hort_domain::ports::checkpoint_anchor::CheckpointAnchorPort)
 //! boundary.
 //!
-//! **Scope (read only).** This crate is the *read* half of F-2's
+//! **Scope (read only).** This crate is the *read* half of the
 //! external anchor. Checkpoint **emission** — the S3 Object-Lock
-//! *write* adapter and the `eventstore-checkpoint` `TaskHandler` (spec
-//! §6/§12) — is a separate, not-yet-scheduled item and is deliberately
+//! *write* adapter and the `eventstore-checkpoint` `TaskHandler` —
+//! is a separate, not-yet-scheduled item and is deliberately
 //! NOT built here. Until an emitter ships the anchor store is
 //! legitimately empty and the verifier resolves the anchor verdict to
-//! `missing_checkpoint` (spec §6.4(a)) — a correct, spec-defined
-//! verdict, not a failure.
+//! `missing_checkpoint` — a correct, defined verdict, not a failure.
 //!
 //! **Store-agnostic / no own client.** This crate does *not* build an
 //! object store and depends only on `hort-domain` + crypto +
@@ -30,9 +29,9 @@
 //!
 //! **Signature.** Each checkpoint object is a JSON document with a
 //! detached, hex-encoded Ed25519 signature over the canonical
-//! serialization of the signed body (spec §6.2). The verifying key is
-//! an **operator-provisioned** SPKI PEM public key (§14 R2 — distinct
-//! from any runtime credential; KMS/HSM is a documented future). A
+//! serialization of the signed body. The verifying key is an
+//! **operator-provisioned** SPKI PEM public key (distinct from any
+//! runtime credential; KMS/HSM is a documented future). A
 //! checkpoint whose signature does not verify is dropped (a forged
 //! checkpoint must be indistinguishable from no checkpoint, or an
 //! attacker who can write the bucket but not forge the key could
@@ -53,10 +52,10 @@
 //! object is fed back through [`ObjectStoreCheckpointAnchor::read_all`]
 //! and the pure verify core, asserting `AnchorVerdict::Ok`).
 //!
-//! **Signed-body field set vs. spec §6.2 (precise — a real nuance).**
-//! `SignedBody` is the **shipped Item-3 contract pin**: it covers
+//! **Signed-body field set (precise — a real nuance).**
+//! `SignedBody` is the **shipped contract pin**: it covers
 //! `chain_format_version`, `checkpoint_seq`, `created_at`,
-//! `stream_heads`, `sealed_streams`. The spec §6.2 prose lists
+//! `stream_heads`, `sealed_streams`. The original specification lists
 //! `max_global_position` and `backfill_baseline` among the checkpoint
 //! fields the signature covers, but the **shipped reader does not
 //! verify them** (they are accepted-and-ignored extras —
@@ -68,7 +67,7 @@
 //! **unsigned advisory fields** alongside the signed body — precisely
 //! the forward-compatible extension the reader's [`CheckpointWire`]
 //! doc anticipates. This is recorded here so the residual is explicit:
-//! the §5 `backfill_baseline` honesty caveat is *carried* (auditors can
+//! the `backfill_baseline` honesty caveat is *carried* (auditors can
 //! read it) but is **not** itself cryptographically signed by the v1
 //! shipped contract; tightening the signature to cover it would be a
 //! coordinated reader+emitter `SignedBody` change (a future
@@ -93,7 +92,7 @@ use hort_domain::ports::checkpoint_emitter::CheckpointEmitterPort;
 use hort_domain::ports::BoxFuture;
 
 /// The object-store prefix the checkpoint emitter writes under
-/// (spec §6.2: `<bucket>/hort-event-chain-checkpoints/<RFC3339>-<seq>.json`).
+/// (`<bucket>/hort-event-chain-checkpoints/<RFC3339>-<seq>.json`).
 /// The read adapter lists exactly this prefix.
 pub const CHECKPOINT_PREFIX: &str = "hort-event-chain-checkpoints";
 
@@ -106,16 +105,16 @@ pub const CHECKPOINT_PREFIX: &str = "hort-event-chain-checkpoints";
 #[derive(Debug, thiserror::Error)]
 pub enum AnchorAdapterError {
     /// The operator-provisioned anchor public-key PEM did not parse as
-    /// an Ed25519 SPKI public key (spec §14 R2).
+    /// an Ed25519 SPKI public key.
     #[error("anchor public key PEM is not a valid Ed25519 SPKI key: {0}")]
     BadPublicKey(String),
 }
 
 // ---------------------------------------------------------------------------
-// Wire DTO (spec §6.2)
+// Wire DTO
 // ---------------------------------------------------------------------------
 
-/// On-the-wire checkpoint JSON (spec §6.2). Deserialized from the
+/// On-the-wire checkpoint JSON. Deserialized from the
 /// anchor object, then mapped to the pure [`Checkpoint`] the verify
 /// core consumes. Fields the verify core does not need
 /// (`max_global_position`, `backfill_baseline`) are accepted and
@@ -173,11 +172,11 @@ impl From<&SealedStreamRecord> for SealedWire {
     }
 }
 
-/// The §5 backfill-baseline honesty caveat, on the wire. Written into
+/// The backfill-baseline honesty caveat, on the wire. Written into
 /// the checkpoint JSON object as an **unsigned advisory field**
 /// (alongside, not inside, the [`SignedBody`] the shipped reader
-/// verifies — see the crate doc's "Signed-body field set vs. spec
-/// §6.2" note). `migration_timestamp` is RFC3339 UTC.
+/// verifies — see the crate doc's "Signed-body field set" note).
+/// `migration_timestamp` is RFC3339 UTC.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 struct BackfillBaselineWire {
     backfill_baseline: bool,
@@ -198,8 +197,7 @@ impl From<&BackfillBaseline> for BackfillBaselineWire {
 /// The signed body — every field except `signature`, serialized
 /// canonically (serde struct-field declaration order, no insignificant
 /// whitespace) so the verifier reconstructs exactly the bytes the
-/// emitter signed. Mirrors the spec §3.2 "canonical serialization"
-/// discipline applied to the checkpoint object.
+/// emitter signed.
 #[derive(serde::Serialize)]
 struct SignedBody<'a> {
     chain_format_version: &'a str,
@@ -234,12 +232,10 @@ impl CheckpointWire {
     /// Canonical bytes the detached signature covers (everything but
     /// `signature`). `serde_json::to_vec` is deterministic for a typed
     /// struct: fields emit in declaration order, no insignificant
-    /// whitespace, numbers shortest-round-trip — the same determinism
-    /// guarantee §3.2 relies on for the per-event payload.
+    /// whitespace, numbers shortest-round-trip.
     fn signed_body_bytes(&self) -> Vec<u8> {
-        // Behaviour byte-identical to the shipped Item-3 path; the only
-        // change is delegating the `serde_json::to_vec` call to the
-        // shared `signed_body_bytes` free fn so the emitter signs the
+        // The `serde_json::to_vec` call is delegated to the shared
+        // `signed_body_bytes` free fn so the emitter signs the
         // *same* bytes from the *same* `SignedBody` struct (single
         // source of truth — the contract cannot drift).
         signed_body_bytes(&SignedBody {
@@ -306,8 +302,8 @@ pub struct ObjectStoreCheckpointAnchor {
 
 impl ObjectStoreCheckpointAnchor {
     /// Build the adapter. `public_key_pem` is the operator-provisioned
-    /// SPKI PEM for the anchor signing key's public half (spec §14 R2).
-    /// Rejects a malformed key at construction so a misconfiguration is
+    /// SPKI PEM for the anchor signing key's public half. Rejects a
+    /// malformed key at construction so a misconfiguration is
     /// an operational error (subcommand exit 1), not a silent
     /// drop-everything that would masquerade as `missing_checkpoint`.
     pub fn new(
@@ -394,8 +390,8 @@ impl CheckpointAnchorPort for ObjectStoreCheckpointAnchor {
 // `SignedBody`) is byte-unchanged in behaviour.
 // ===========================================================================
 
-/// The object-store object key for a checkpoint (spec §6.2:
-/// `<bucket>/hort-event-chain-checkpoints/<RFC3339-utc>-<seq>.json`). The
+/// The object-store object key for a checkpoint
+/// (`<bucket>/hort-event-chain-checkpoints/<RFC3339-utc>-<seq>.json`). The
 /// timestamp is the checkpoint's `created_at` rendered RFC3339 with `Z`,
 /// `:` replaced by `-` so the key is filesystem/S3-key clean; the `seq`
 /// disambiguates and the read adapter ignores the key shape entirely
@@ -411,7 +407,7 @@ fn checkpoint_object_key(created_at: &DateTime<Utc>, seq: u64) -> String {
 /// The full on-wire checkpoint object the emitter writes: the
 /// [`SignedBody`] fields, the detached hex `signature`, **plus** the
 /// unsigned advisory extras (`max_global_position` and, on the first
-/// post-migration checkpoint only, the §5 `backfill_baseline` block).
+/// post-migration checkpoint only, the `backfill_baseline` block).
 /// The shipped reader parses exactly the signed subset + `signature`
 /// and ignores the extras (`CheckpointWire` is not
 /// `deny_unknown_fields`) — see the crate doc's signed-body nuance.
@@ -424,9 +420,9 @@ struct CheckpointObject<'a> {
     sealed_streams: &'a [SealedWire],
     /// Detached hex Ed25519 signature over `signed_body_bytes(SignedBody)`.
     signature: String,
-    /// Unsigned advisory cut-marker (spec §6.2 / §13 divergence 6).
+    /// Unsigned advisory cut-marker.
     max_global_position: u64,
-    /// Unsigned advisory §5 honesty caveat — present only on the first
+    /// Unsigned advisory honesty caveat — present only on the first
     /// post-migration checkpoint. Flattened so the keys
     /// (`backfill_baseline`, `baseline_max_global_position`,
     /// `migration_timestamp`) sit at the object root, matching the
@@ -440,15 +436,14 @@ struct CheckpointObject<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum EmitterAdapterError {
     /// The operator-provisioned anchor **signing** key PEM did not parse
-    /// as an Ed25519 PKCS#8 private key (spec §14 R2). A missing /
-    /// malformed key fails construction — never a silent unsigned or
-    /// weakly-signed checkpoint.
+    /// as an Ed25519 PKCS#8 private key. A missing / malformed key fails
+    /// construction — never a silent unsigned or weakly-signed checkpoint.
     #[error("anchor signing key PEM is not a valid Ed25519 PKCS#8 private key: {0}")]
     BadSigningKey(String),
 }
 
 /// S3-Object-Lock-anchored, Ed25519-signed checkpoint **write** adapter
-/// (ADR 0002, spec §6 / §9 / §14 R2). The additive counterpart of
+/// (ADR 0002). The additive counterpart of
 /// [`ObjectStoreCheckpointAnchor`].
 ///
 /// Construct via [`ObjectStoreCheckpointEmitter::new`] with a
@@ -482,7 +477,7 @@ pub enum EmitterAdapterError {
 /// bucket default retention onto **every newly `put` object
 /// automatically** — so each checkpoint this adapter writes is WORM
 /// (not even the account root can delete/overwrite it before expiry),
-/// satisfying spec §6.1 against the in-DB threat model. The residual
+/// satisfying the in-DB threat model. The residual
 /// (documented honestly, not fudged): WORM depends on correct bucket
 /// provisioning the *application cannot enforce or verify through
 /// `object_store`*; if the operator forgets to enable Object Lock the
@@ -498,10 +493,10 @@ pub struct ObjectStoreCheckpointEmitter {
 
 impl ObjectStoreCheckpointEmitter {
     /// Build the write adapter. `signing_key_pem` is the
-    /// operator-provisioned Ed25519 **PKCS#8 PEM private key** (spec
-    /// §14 R2 — a file under the existing `HORT_*` posture, distinct from
-    /// any runtime credential, never embedded/derived/generated at
-    /// runtime). A malformed/missing key is rejected **here**, at
+    /// operator-provisioned Ed25519 **PKCS#8 PEM private key** (a file
+    /// under the existing `HORT_*` posture, distinct from any runtime
+    /// credential, never embedded/derived/generated at runtime). A
+    /// malformed/missing key is rejected **here**, at
     /// construction, so a misconfiguration fails the task loudly rather
     /// than emitting a silently-unsigned checkpoint.
     pub fn new(
@@ -654,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn empty_store_yields_empty_vec() {
         // No emitter deployed yet -> empty -> the core maps this to
-        // MissingReason::NoCheckpoint (spec §6.4(a)), NOT an error.
+        // MissingReason::NoCheckpoint, NOT an error.
         let (_sk, pem) = keypair();
         let store = Arc::new(InMemory::new());
         let anchor = ObjectStoreCheckpointAnchor::new(store, &pem).unwrap();
@@ -896,7 +891,7 @@ mod tests {
     // by the read adapter (`read_all`) + the pure verify core
     // (`verify_against_checkpoint`) → `AnchorVerdict::Ok` against a matching
     // live-head set; a tampered body or a wrong signing key is rejected
-    // (dropped → not `Ok`). This proves §6.2 + the signature contract
+    // (dropped → not `Ok`). This proves the signature contract
     // end-to-end against the real verifier (the reader is the pin).
     // =======================================================================
 
@@ -930,7 +925,7 @@ mod tests {
         }
     }
 
-    // ---- construction key handling (§14 R2 fail-on-malformed) ----------
+    // ---- construction key handling (fail-on-malformed) -----------------
 
     #[test]
     fn emitter_rejects_malformed_signing_key_at_construction() {
@@ -952,7 +947,7 @@ mod tests {
         assert!(ObjectStoreCheckpointEmitter::new(store, &priv_pem).is_ok());
     }
 
-    // ---- object key shape (spec §6.2) ----------------------------------
+    // ---- object key shape ----------------------------------------------
 
     #[test]
     fn object_key_is_prefix_rfc3339_seq() {
@@ -972,7 +967,7 @@ mod tests {
         let (priv_pem, pub_pem) = signing_keypair_pems();
         let store = Arc::new(InMemory::new());
 
-        // A live-head set. Build the §6.2 checkpoint via the pure domain
+        // A live-head set. Build the checkpoint via the pure domain
         // builder (sorted witness + first-checkpoint backfill_baseline),
         // emit it through the WRITE adapter.
         let heads = vec![dh("admin-b", 3, 0xbb), dh("admin-a", 1, 0xaa)];
@@ -991,9 +986,9 @@ mod tests {
         let emitter = ObjectStoreCheckpointEmitter::new(store.clone(), &priv_pem).unwrap();
         emitter.emit(&cp).await.expect("emit succeeds");
 
-        // Now read it back through the EXISTING Item-3 reader (the
-        // contract pin) — signature must verify against the matching
-        // public key, and the domain Checkpoint must reconstruct.
+        // Now read it back through the reader — signature must verify
+        // against the matching public key, and the domain Checkpoint
+        // must reconstruct.
         let reader = ObjectStoreCheckpointAnchor::new(store, &pub_pem).unwrap();
         let cps = reader.read_all().await.expect("read_all");
         assert_eq!(cps.len(), 1, "the emitted object must verify + parse");
@@ -1010,7 +1005,7 @@ mod tests {
         );
 
         // Feed it through the pure verify core against a MATCHING live
-        // head set → AnchorVerdict::Ok. This is the end-to-end §6.2 +
+        // head set → AnchorVerdict::Ok. This is the end-to-end
         // signature-contract proof against the real verifier.
         let live = vec![
             ("admin-a".to_string(), 1u64, EventHash([0xaa; 32])),
@@ -1066,7 +1061,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_checkpoint_has_no_backfill_baseline_in_object() {
-        // §5: the honesty caveat is first-checkpoint-only. Build a
+        // The honesty caveat is first-checkpoint-only. Build a
         // non-first checkpoint and assert the object omits the baseline
         // keys entirely (skip_serializing_if).
         let (priv_pem, _pub) = signing_keypair_pems();

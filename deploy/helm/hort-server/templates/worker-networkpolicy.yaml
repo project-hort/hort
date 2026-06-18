@@ -9,7 +9,7 @@ WHY THIS EXISTS
   server's metrics-auth middleware would drag the whole auth/`AppContext`
   machinery into the worker. The access control for the scrape port is
   therefore a NetworkPolicy, not per-request auth (the standard pod-metrics
-  pattern; design `080-...` §3.6). Enabling the listener and its network
+  pattern). Enabling the listener and its network
   control are ONE structural action: this policy renders whenever
   `worker.metrics.enabled` AND `networkPolicy.enabled`, so an operator can
   never turn on a world-reachable, unauthenticated metrics port by flipping
@@ -37,8 +37,7 @@ ADDITIVE — never relaxes any pod's posture
 SCRAPE SOURCE — operator-supplied, no guessing, fail-closed when empty
   `scrapeFrom` is a verbatim list of k8s NetworkPolicyPeer objects (e.g. your
   Prometheus namespaceSelector / podSelector). The chart does not guess your
-  cluster's monitoring topology — mirrors the F-33 "chart does not guess your
-  CIDRs" rationale. **An EMPTY `scrapeFrom` renders `ingress: []` — genuine
+  cluster's monitoring topology — the chart does not guess your CIDRs. **An EMPTY `scrapeFrom` renders `ingress: []` — genuine
   deny-all-ingress — NOT a rule with `from: []`.** This is load-bearing: per
   the k8s NetworkPolicy spec a rule whose `from` is empty/missing matches ALL
   sources, so `from: []` would FAIL OPEN (port reachable cluster-wide). We
@@ -48,7 +47,7 @@ SCRAPE SOURCE — operator-supplied, no guessing, fail-closed when empty
   declaring exactly who may scrape it.
 
 ESCAPE HATCH PARITY
-  Gated on `.Values.networkPolicy.enabled` (the same F-33 toggle as the
+  Gated on `.Values.networkPolicy.enabled` (the same toggle as the
   app-pod + Job-scoped policies). `networkPolicy.enabled: false` drops THIS
   policy too — but then the server policy's deny-all is also gone, so the
   operator owns the worker port's reachability via their own L3/L4 / mesh

@@ -66,8 +66,8 @@ const ACCEPTED_STATUSES: &[&str] = &["quarantined", "rejected", "scan_indetermin
 
 /// Accepted values for `--reason`. Mirrors the server's closed set
 /// (`scanner | curator | curation_retroactive`) — `corruption` is
-/// deliberately omitted to match Item 10's M-1 boundary rejection.
-/// If Item 15 widens this, the server and CLI lists update together.
+/// deliberately omitted at the server boundary.
+/// If this is widened, the server and CLI lists update together.
 const ACCEPTED_REASONS: &[&str] = &["scanner", "curator", "curation_retroactive"];
 
 fn validate_status(s: &str) -> Result<()> {
@@ -151,8 +151,8 @@ pub struct QueueArgs {
 
     /// Filter by rejection-reason kind (`rejected` rows only). Valid:
     /// `scanner`, `curator`, `curation_retroactive`. Validated
-    /// client-side; `corruption` is rejected by the server (Item 10
-    /// M-1) so the CLI matches the closed set.
+    /// client-side; `corruption` is rejected by the server so the CLI
+    /// matches the closed set.
     #[arg(long)]
     pub reason: Option<String>,
 

@@ -38,9 +38,9 @@
 //! # Event payload integrity
 //!
 //! The use case is the SOLE constructor of `DomainEvent` payloads on
-//! this path. The adapter is forbidden from mutating payloads
-//! (§2.6a). On retry the use case builds new events against the
-//! observed `existing_id`; it never patches the prior batch.
+//! this path. The adapter is forbidden from mutating payloads.
+//! On retry the use case builds new events against the observed
+//! `existing_id`; it never patches the prior batch.
 
 use std::sync::Arc;
 
@@ -430,7 +430,7 @@ impl ArtifactGroupUseCase {
             return Ok(None);
         }
         if existing_primary.is_empty() {
-            // §2.10 case 2 — claim the empty slot.
+            // Claim the empty primary slot.
             return Ok(Some(role.to_string()));
         }
         if existing_primary == role {
@@ -783,7 +783,7 @@ mod tests {
     #[tokio::test]
     async fn add_member_first_placement_non_primary_leaves_primary_role_empty() {
         // When the first member is NOT primary, the group is created
-        // with `primary_role = ""` (§2.10 case 2 seed). A later
+        // with `primary_role = ""` (no primary claimed yet). A later
         // member with `is_primary = true` claims the slot via
         // `ArtifactGroupPrimaryRoleAssigned`.
         let (_groups, lifecycle, uc) = build();
@@ -864,8 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_member_primary_role_assigned_on_empty_slot() {
-        // §2.10 case 2: group created non-primary, later member
-        // claims the primary slot.
+        // Group created non-primary, later member claims the primary slot.
         let (groups, lifecycle, uc) = build();
         let repo = Uuid::new_v4();
         let coords = maven_coords("com.example:widget", "1.2.3");

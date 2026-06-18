@@ -5,18 +5,16 @@
 //! enums reach this crate via `hort_domain` (a zero-I/O dep), so importing
 //! them here doesn't break the runtime-free invariant on `hort-config`.
 //!
-//! Items 5–7 are layered:
-//! - Item 5 (this module) — parse + per-spec validate (one envelope at
-//!   a time).
-//! - Item 7 (`crate::desired`) — cross-spec validate (duplicate names,
-//!   dangling virtual members, HORT_AUTH_PROVIDER consistency) and diff.
-//! - Item 8 (`hort-app::ApplyConfigUseCase`) — execute the diff.
+//! Parsing and validation are layered:
+//! - This module — parse + per-spec validate (one envelope at a time).
+//! - `crate::desired` — cross-spec validate (duplicate names, dangling
+//!   virtual members, HORT_AUTH_PROVIDER consistency) and diff.
+//! - `hort-app::ApplyConfigUseCase` — execute the diff.
 //!
-//! The `to_create_repository` converter mentioned in the design doc
-//! lives in Item 8's use case (cycle: `hort-app` already depends on
-//! `hort-config`, so `hort-config` cannot depend on `hort-app`). Putting it
-//! there also keeps the validator-inlining note from Item 8 in one
-//! place.
+//! The `to_create_repository` converter lives in the apply use case
+//! (cycle: `hort-app` already depends on `hort-config`, so `hort-config`
+//! cannot depend on `hort-app`). Putting it there also keeps the
+//! validator-inlining note in one place.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -36,8 +34,8 @@ use crate::interpolate::interpolate;
 ///
 /// Field names use camelCase to match the Kubernetes-style operator
 /// surface. `deny_unknown_fields` makes typos surface immediately —
-/// silent default coercion is a footgun the design doc rules out
-/// explicitly (§9).
+/// silent default coercion is a footgun ruled out explicitly via
+/// `deny_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RepositorySpec {
@@ -49,7 +47,7 @@ pub struct RepositorySpec {
     /// the admin handler uses), which surfaces in cross-spec validation
     /// because it's never a useful production state for a managed repo.
     pub format: String,
-    /// `hosted | proxy | virtual | staging` — post-Item-0 names. The
+    /// `hosted | proxy | virtual | staging`. The
     /// `type` Rust keyword forces a serde rename.
     #[serde(rename = "type")]
     pub repo_type: String,
@@ -69,7 +67,7 @@ pub struct RepositorySpec {
     pub proxy: Option<ProxySpec>,
     /// Required iff `type == virtual`; forbidden otherwise. Each entry
     /// is the `metadata.name` of another `ArtifactRepository`. The
-    /// cross-spec validator (Item 7) resolves these to UUIDs.
+    /// The cross-spec validator resolves these to UUIDs.
     pub virtual_members: Option<Vec<String>>,
     pub is_public: bool,
     /// Opt-in per-repository download auditing (`downloadAuditEnabled`
@@ -261,8 +259,8 @@ pub fn parse_repository(path: &Path, bytes: &[u8]) -> Result<Envelope<Repository
     // Step 2: strict deserialize into the typed envelope.
     let mut env: Envelope<RepositorySpec> = serde_yaml_ng::from_slice(bytes)?;
     if env.kind != Kind::ArtifactRepository {
-        // The dispatch in `DesiredState::parse_files` (Item 7) routes
-        // by `kind` first, so this branch only fires when a single-
+        // The dispatch in `DesiredState::parse_files` routes by `kind`
+        // first, so this branch only fires when a single-
         // file caller hands us the wrong envelope. Fail loudly rather
         // than silently coercing.
         return Err(ParseError::UnknownKind {
@@ -425,7 +423,7 @@ pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationErro
         });
     }
 
-    // Prefetch-policy upper-bound caps (architect review F6.1).
+    // Prefetch-policy upper-bound caps (architect review).
     //
     // Migration `002_repositories.sql` stores `prefetch_depth` /
     // `prefetch_transitive_depth` / `prefetch_max_age_days` as `int`
@@ -453,7 +451,7 @@ pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationErro
                 "spec.prefetchPolicy.depth = {} exceeds the configured cap of {}. \
                  Practical operator values are 1-100; the cap exists to catch \
                  i32 wrap-on-write that would silently fall back to the in-code \
-                 default on read (architect review F6.1).",
+                 default on read (architect review).",
                 env.spec.prefetch_policy.depth, MAX_REASONABLE_PREFETCH_BOUND,
             ),
         });
@@ -464,7 +462,7 @@ pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationErro
             name: name.clone(),
             detail: format!(
                 "spec.prefetchPolicy.transitiveDepth = {} exceeds the configured cap of {}. \
-                 Cap mirrors `spec.prefetchPolicy.depth` — architect review F6.1.",
+                 Cap mirrors `spec.prefetchPolicy.depth` — architect review.",
                 env.spec.prefetch_policy.transitive_depth, MAX_REASONABLE_PREFETCH_BOUND,
             ),
         });
@@ -478,7 +476,7 @@ pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationErro
                     "spec.prefetchPolicy.maxAgeDays = {days} exceeds the configured cap of \
                      {MAX_REASONABLE_PREFETCH_BOUND}. A decade is ~3650 days; values above \
                      the cap exist only as the u32-near-MAX wrap footgun architect review \
-                     F6.1 caught."
+                     the cap caught."
                 ),
             });
         }
@@ -1584,7 +1582,7 @@ spec:
         }
     }
 
-    /// F3 part 1: `backend: filesystem` is accepted (the value the
+    /// `backend: filesystem` is accepted (the value the
     /// shipped docs/fixtures use — must stay green unchanged).
     #[test]
     fn storage_backend_filesystem_is_accepted_at_parse() {
@@ -1616,7 +1614,7 @@ spec:
   replicationPriority: immediate
 ";
         let env = parse_repository(&p(), yaml(body).as_bytes())
-            .expect("a storage-omitted RepositorySpec must parse (alpha-F8)");
+            .expect("a storage-omitted RepositorySpec must parse");
         assert!(
             env.spec.storage.is_none(),
             "omitted storage must deserialise to None, not a default"
@@ -1642,7 +1640,7 @@ spec:
         assert_eq!(env.spec.storage.as_ref().unwrap().backend, "s3");
     }
 
-    /// F3 part 1: the enum check is case-sensitive — it must match the
+    /// The enum check is case-sensitive — it must match the
     /// global `HORT_STORAGE_BACKEND` value-domain exactly. `Filesystem`
     /// / `S3` (wrong case) are rejected, never silently coerced.
     #[test]
@@ -1843,8 +1841,8 @@ spec:
     /// `prefetchPolicy:` block absent entirely — the struct-level
     /// `#[serde(default)]` on `RepositorySpec.prefetch_policy` lands a
     /// `PrefetchPolicy::default()` (disabled, depth=3, max_age_days=
-    /// None), so the F6.1 gate sees only in-cap defaults and must NOT
-    /// push any error. Pins the no-false-positive property for the
+    /// None), so the prefetch-cap gate sees only in-cap defaults and must
+    /// NOT push any error. Pins the no-false-positive property for the
     /// default-disabled prefetch posture every existing repo carries.
     #[test]
     fn prefetch_policy_absent_block_passes_the_f6_1_gate() {
@@ -1862,7 +1860,7 @@ spec:
             !errors
                 .iter()
                 .any(|e| e.to_string().contains("prefetchPolicy")),
-            "absent prefetchPolicy must not trigger the F6.1 gate; got: {errors:?}",
+            "absent prefetchPolicy must not trigger the prefetch-cap gate; got: {errors:?}",
         );
     }
 

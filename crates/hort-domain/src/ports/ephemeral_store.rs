@@ -22,7 +22,7 @@
 //! # Key space
 //!
 //! The port accepts any `&str`. Callers are responsible for namespacing
-//! (Item 0b pins `stateful_upload:{format}:{session_id}` as the
+//! (the convention is `stateful_upload:{format}:{session_id}` for the
 //! stateful-upload namespace). Adapters MUST NOT interpret the key —
 //! no prefix stripping, no parsing — so two different callers with
 //! disjoint prefixes cannot collide.

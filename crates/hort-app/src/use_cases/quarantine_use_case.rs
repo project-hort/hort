@@ -324,9 +324,9 @@ impl QuarantineUseCase {
     ///    adapter wraps all four writes in a single transaction
     ///    (orphan projections forbidden).
     ///
-    /// No actor parameter — uses [`system_actor`] internally (C3).
+    /// No actor parameter — uses [`system_actor`] internally.
     ///
-    /// **The previous Path B (split append) sequence —
+    /// **The previous split-append sequence —
     /// `record_scan_result` appends `ScanCompleted` and the
     /// orchestrator separately appends `ArtifactBecameVulnerable` —
     /// is gone.** Both events now ride the same atomic batch.
@@ -352,7 +352,7 @@ impl QuarantineUseCase {
         let actor = system_actor();
         let now = Utc::now();
 
-        // Step 1 — validate every finding (caps from design §3.4).
+        // Step 1 — validate every finding.
         for f in &findings {
             f.validate()?;
         }
@@ -832,7 +832,7 @@ impl QuarantineUseCase {
 
     /// Serialise `findings` to JSON, enforce the 8 MiB cap, and write
     /// to CAS. Returns `None` when `findings.is_empty()` (clean scans
-    /// never allocate a blob — design §3.4 invariant).
+    /// never allocate a blob — clean scans have no findings to store).
     async fn persist_findings_blob(&self, findings: &[Finding]) -> AppResult<Option<ContentHash>> {
         if findings.is_empty() {
             return Ok(None);
@@ -974,8 +974,8 @@ impl QuarantineUseCase {
     /// list once per call. If projection counts grow past low-thousands
     /// a dedicated `find_for_repo` port method becomes the next step;
     /// today it is overhead the contention path doesn't notice. The
-    /// helper is private because Item 5 will need similar logic and
-    /// may move it to a shared module then.
+    /// helper is private and may be extracted to a shared module if a
+    /// second caller appears.
     async fn resolve_active_policy_for_repo(
         &self,
         repo_id: Uuid,
@@ -1965,7 +1965,7 @@ mod tests {
             assert!(!p.violations.is_empty());
         }
 
-        // Actor is system (C3); artifact ends in Rejected.
+        // Actor is system; artifact ends in Rejected.
         assert_eq!(batch.actor, system_actor());
         assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Rejected);
     }
@@ -2416,10 +2416,10 @@ mod tests {
 
     /// License policy alone with empty SBOM input (v1 has no SBOM port)
     /// produces zero license-content violations; the accumulator stays at
-    /// Allow → ScanOutcome::Clean. This documents the inherited Item-3
-    /// concern (`evaluate_scan_result` is called with `&[]` for licenses
-    /// in v1) — license-content violations become reachable when a
-    /// follow-on item wires the SBOM port. The `license-policy-shape`
+    /// Allow → ScanOutcome::Clean. This documents the current behavior
+    /// (`evaluate_scan_result` is called with `&[]` for licenses in v1)
+    /// — license-content violations become reachable when a follow-on
+    /// change wires the SBOM port. The `license-policy-shape`
     /// `Warn` case (operator typo in YAML) is covered by `scan.rs` tests
     /// at the domain layer; in the scan path it does NOT block.
     #[tokio::test]
@@ -2694,10 +2694,10 @@ mod tests {
             DomainEvent::ArtifactReleased(r) => r,
             other => panic!("expected ArtifactReleased as second event; got {other:?}"),
         };
-        // F-6 accepted pair: Timer + ScanSucceeded (the same pair the
-        // Item-1b sweep uses for elapsed-deadline-with-clean-scan
-        // releases). released_by_user_id / justification stay None —
-        // this is a system-driven timer release, not an admin override.
+        // Accepted pair: Timer + ScanSucceeded (the same pair the timer
+        // sweep uses for elapsed-deadline-with-clean-scan releases).
+        // released_by_user_id / justification stay None — this is a
+        // system-driven timer release, not an admin override.
         assert_eq!(released.released_by, ReleaseReason::Timer);
         assert!(released.released_by_user_id.is_none());
         assert!(released.justification.is_none());
@@ -2719,8 +2719,8 @@ mod tests {
         assert!(delta.last_scan_at.is_some());
 
         // `hort_quarantine_released_total{reason=timer}` is incremented
-        // inline by `emit_release(REASON_TIMER)` — design §7 reuses
-        // this counter for both the sweep and the fast-path. The
+        // inline by `emit_release(REASON_TIMER)` — reused for both the
+        // sweep and the fast-path. The
         // event-batch assertion above is the structural witness;
         // counter-emission is exercised end-to-end by the sweep's
         // existing metric tests (`release_expired_*`).
@@ -3381,11 +3381,11 @@ mod tests {
 
                 let released = uc.release_expired(ids).await.unwrap();
 
-                // F-6: nothing is released — no authority is
-                // constructible for any candidate.
+                // Nothing is released — no authority is constructible
+                // for any candidate.
                 assert!(
                     released.is_empty(),
-                    "F-6 fail-closed: a never-successfully-scanned, non-waived \
+                    "fail-closed: a never-successfully-scanned, non-waived \
                      artifact must NOT timer-release on window expiry"
                 );
 
@@ -3405,7 +3405,7 @@ mod tests {
                 "timer"
             )
             .is_none(),
-            "F-6 fail-closed: hort_quarantine_released_total{{reason=timer}} must not fire"
+            "fail-closed: hort_quarantine_released_total{{reason=timer}} must not fire"
         );
     }
 
@@ -3655,8 +3655,8 @@ mod tests {
     async fn release_expired_quarantine_window_is_candidacy_only_not_authority() {
         let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
         // Artifact whose stored window anchor is set; the candidacy
-        // computation lives in the adapter's query (Item 1b territory),
-        // never in `release_expired` itself.
+        // computation lives in the adapter's query, never in
+        // `release_expired` itself.
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
         let pre = artifacts.get(artifact_id).unwrap().quarantine_window_start;
@@ -3718,7 +3718,7 @@ mod tests {
         assert!(released.contains(&b_waived));
         assert!(
             !released.contains(&c_failclosed),
-            "F-6 fail-closed: the unscanned, non-waived artifact must NOT release"
+            "fail-closed: the unscanned, non-waived artifact must NOT release"
         );
         assert_eq!(
             lifecycle.committed_transitions().len(),
@@ -3853,7 +3853,7 @@ mod tests {
     }
 
     /// Permissive mode (quarantineDuration:0): a `None` artifact (still
-    /// downloadable today — the fail-open-today half of F-6) transitions
+    /// downloadable today — fail-open until first scan) transitions
     /// to `ScanIndeterminate`, retroactively blocking downloads.
     #[tokio::test]
     async fn record_scan_indeterminate_from_none_permissive_hard_blocks() {
@@ -4544,13 +4544,13 @@ mod tests {
             records
                 .iter()
                 .any(|(_, msg)| msg.contains("skipping: no release authority")),
-            "F-6 fail-closed: timer sweep must log the no-authority skip arm, not a release"
+            "fail-closed: timer sweep must log the no-authority skip arm, not a release"
         );
         assert!(
             !records
                 .iter()
                 .any(|(_, msg)| msg.contains("released expired artifact")),
-            "F-6 fail-closed: timer sweep must NOT log a release"
+            "fail-closed: timer sweep must NOT log a release"
         );
     }
 

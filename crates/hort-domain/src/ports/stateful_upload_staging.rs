@@ -101,8 +101,8 @@ pub trait StatefulUploadStagingPort: Send + Sync {
     ///
     /// Bounded iteration — adapters MUST cap at `max` even if more entries
     /// exist. Ordering is unspecified; the sweep does not require deterministic
-    /// ordering. Used by the staging-orphan sweep (Init 11 Item 15) to
-    /// enumerate sessions whose ephemeral key may have TTL'd out.
+    /// ordering. Used by the staging-orphan sweep to enumerate sessions whose
+    /// ephemeral key may have TTL'd out.
     fn list(&self, max: usize) -> BoxFuture<'_, DomainResult<Vec<Uuid>>>;
 }
 

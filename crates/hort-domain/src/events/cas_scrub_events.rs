@@ -12,7 +12,7 @@
 //! events table accepts new `event_type` values by design (stream_category
 //! and event_type are `TEXT`, not Postgres enum types).
 //!
-//! **Flag-only.** Per design doc §2.7 the scrubber does NOT quarantine
+//! **Flag-only.** The scrubber does NOT quarantine
 //! on mismatch; it records the finding as an event + metric and lets
 //! the operator decide the response. An overreactive automation could
 //! quarantine a whole CAS shard on a single transient read error.

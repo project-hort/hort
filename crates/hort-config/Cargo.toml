@@ -9,7 +9,7 @@ description = "hort gitops configuration — zero-I/O YAML parsing, validation, 
 workspace = true
 
 [dependencies]
-# Item 5 — re-uses RepositoryFormat / RepositoryType / ReplicationPriority /
+# re-uses RepositoryFormat / RepositoryType / ReplicationPriority /
 # PromotionConfig / CurationConfig directly so the YAML schema mirrors the
 # persisted shape with no parallel enum surface to maintain. Domain layer
 # is pure Rust + zero I/O, so importing it here doesn't break the
@@ -19,21 +19,20 @@ hort-domain = { path = "../hort-domain" }
 # The envelope structs and per-kind specs derive `Serialize`/`Deserialize`;
 # error variants derive `thiserror::Error`.
 serde = { workspace = true }
-# Canonicalised JSON for `spec_digest` (Item 7) — sorted-key serialisation
+# Canonicalised JSON for `spec_digest` — sorted-key serialisation
 # of the parsed spec yields a stable hash insensitive to YAML whitespace.
 serde_json = { workspace = true }
-# YAML parsing for the `kind`/`spec` envelope. Workspace-promoted by
-# this initiative (see root `Cargo.toml`).
+# YAML parsing for the `kind`/`spec` envelope.
 serde_yaml_ng = { workspace = true }
-# SHA-256 for `spec_digest` (Item 7) — content-addressed digest of
-# the canonicalised spec lets the diff layer detect "spec changed
+# SHA-256 for `spec_digest` — content-addressed digest of the
+# canonicalised spec lets the diff layer detect "spec changed
 # since last apply" without re-comparing every field.
 sha2 = { workspace = true }
 # Per-crate error enums.
 thiserror = { workspace = true }
-# UUIDs in `CurrentSnapshot` (Item 7) — referenced from the diff layer
-# when it produces `delete` plans against `Repository.id`. Workspace-
-# already declares it for the rest of the codebase.
+# UUIDs in `CurrentSnapshot` — referenced from the diff layer when it
+# produces `delete` plans against `Repository.id`. Workspace-already
+# declares it for the rest of the codebase.
 uuid = { workspace = true }
 # `Exclusion.expiresAt` carries an RFC3339 timestamp parsed into
 # `DateTime<Utc>` at YAML deserialize time.
@@ -51,9 +50,9 @@ humantime = { workspace = true }
 rustls-pki-types = { version = "1", features = ["std"] }
 
 # NOTE: deliberately NO tokio, tracing, sqlx, axum, reqwest. This is a
-# zero-I/O library — file walking lives in `hort-server::gitops_boot`
-# (Item 9), tracing in the boot caller, persistence in the apply use
-# case (`hort-app`, Item 8). Adding any of those here would couple
-# parsing/validation to a runtime and make the unit tests slower.
+# zero-I/O library — file walking lives in `hort-server::gitops_boot`,
+# tracing in the boot caller, persistence in the apply use case
+# (`hort-app`). Adding any of those here would couple parsing/validation
+# to a runtime and make the unit tests slower.
 
 [dev-dependencies]

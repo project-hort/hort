@@ -166,7 +166,7 @@ Referenced by `postgres.app.existingSecret: hort-postgres-app`. The Secret
 **data key** is `DATABASE_URL` (matching the default `postgres.app.secretKey`)
 — this is the key *inside* the Secret, independent of the env-var name. The
 chart maps it to the container env var **`HORT_DATABASE_URL`** (the canonical
-DSN var; the binary falls back to bare `DATABASE_URL` — Backlog 078 Item 5). To
+DSN var; the binary falls back to bare `DATABASE_URL`). To
 use a different data-key name, set `postgres.app.secretKey` to match.
 
 ### 3.2 `postgres-admin-dsn` — migrations DSN (always required)
@@ -651,9 +651,9 @@ Operator's namespace selector covers the release namespace.
 
 ## See also
 
-- [`values-reference.md`](values-reference.md) — every chart key documented (Sprint 3 — Item 7).
-- [`examples-overlays.md`](examples-overlays.md) — edge-wiring overlays (Sprint 3 — Item 8).
-- [`security-hardening-checklist.md`](security-hardening-checklist.md) — chart hardening posture (Sprint 3 — Item 9).
+- [`values-reference.md`](values-reference.md) — every chart key documented.
+- [`examples-overlays.md`](examples-overlays.md) — edge-wiring overlays.
+- [`security-hardening-checklist.md`](security-hardening-checklist.md) — chart hardening posture.
 - [`../wire-secrets.md`](../wire-secrets.md) — operator-side secret-sync pattern catalog.
 - [`../declare-gitops-config.md`](../declare-gitops-config.md) — `$HORT_CONFIG_DIR` shape and gitops apply contract.
 - [`../http-transport-timeouts.md`](../http-transport-timeouts.md) — operator-tunable HTTP timeout knobs.

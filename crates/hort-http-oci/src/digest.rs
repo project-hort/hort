@@ -1,7 +1,7 @@
 //! Client-supplied digest parsing — shared between blob and manifest
 //! pull.
 //!
-//! Spec §3.1 only admits `sha256:<64-hex>` for Phase 1. Other
+//! The OCI Distribution Spec only admits `sha256:<64-hex>`. Other
 //! well-formed algorithms (`sha512:…`) return `UNSUPPORTED`;
 //! everything else (missing `:`, wrong length, non-hex) returns
 //! `DIGEST_INVALID`. Keeping the classifier in one module means a

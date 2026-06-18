@@ -19,8 +19,6 @@
 //! 6. Honours a [`tokio_util::sync::CancellationToken`] for graceful
 //!    shutdown.
 //!
-//! All of the above is per design doc §6 paragraphs 1-4 and §11
-//! invariants 1, 2, 10.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,13 +46,12 @@ use crate::rbac::RbacEvaluator;
 use crate::use_cases::subscription_filter::{matches as filter_matches, FilterContext};
 use crate::use_cases::subscription_use_case::SubscriptionUseCase;
 
-/// Debounce floor for `update_last_delivered`. Per design doc §6
-/// paragraph 3 — the dispatcher amortises writes over a 5-minute
-/// window. Failure persists immediately and is not debounced.
+/// Debounce floor for `update_last_delivered`. The dispatcher amortises
+/// writes over a 5-minute window. Failure persists immediately and is
+/// not debounced.
 pub(crate) const PROGRESS_DEBOUNCE: Duration = Duration::from_secs(5 * 60);
 
-/// Catch-up page size — per design doc §6 paragraph 4 and Item 6b
-/// backlog acceptance. We loop until `read_category` returns less than
+/// Catch-up page size. We loop until `read_category` returns less than
 /// `CATCHUP_PAGE`, signalling head reached.
 pub(crate) const CATCHUP_PAGE: u64 = 1000;
 
@@ -84,7 +81,7 @@ pub struct SubscriptionTaskDeps {
     /// but never consulted by the v1 filter.
     pub repositories: Arc<dyn RepositoryRepository>,
     /// Owner principal — synthesised **once at task spawn** from the
-    /// owner's `User` row + `snapshot_claims` (the F-37 stale-`"admin"`
+    /// owner's `User` row + `snapshot_claims` (the stale-`"admin"`
     /// strip + live-`is_admin` re-derivation happens at that synthesis
     /// time; see [`crate::dispatcher::dispatcher`]
     /// `synthesise_principal`). This value is then **frozen for the
@@ -120,8 +117,7 @@ pub struct SubscriptionTaskDeps {
 }
 
 /// Tracks the timestamp of the last persisted
-/// `update_last_delivered` call so the task can debounce writes per
-/// design doc §6 paragraph 3.
+/// `update_last_delivered` call so the task can debounce writes.
 ///
 /// Failures are NOT debounced (audit signal) — the debouncer is
 /// consulted only on the success branch.
@@ -326,8 +322,8 @@ async fn process_event_for_subscription(
 
     // 4. Send.
     let started = Instant::now();
-    // One-event batch — design doc allows multi-event batching as a
-    // future optimisation, but v1 keeps the per-event semantics simple.
+    // One-event batch — multi-event batching is a future optimisation;
+    // v1 keeps the per-event semantics simple.
     let _ = NOTIFY_BATCH_SIZE;
     let batch = std::slice::from_ref(event);
     let outcome = notifier

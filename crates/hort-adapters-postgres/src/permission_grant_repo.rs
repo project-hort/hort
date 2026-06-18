@@ -310,7 +310,7 @@ mod tests {
     // The DB-backed tests in this crate run against one shared
     // `DATABASE_URL` database with no per-test isolation. Production
     // serialises the only writer of these partitions — gitops apply is
-    // single-process per boot lock (design §3.2) — so the tests must
+    // single-process per boot lock — so the tests must
     // honour that same single-flight contract. `#[serial(hort_pg_db)]`
     // is one shared key across *every* DB-backed test in this crate;
     // it keeps them from running concurrently with each other (other

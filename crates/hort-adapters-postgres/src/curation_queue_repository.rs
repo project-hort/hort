@@ -1,10 +1,10 @@
 //! PostgreSQL adapter for [`CurationQueueRepository`].
 //!
-//! Executes the §2.5 + §3 queue listing query against the live
+//! Executes the queue listing query against the live
 //! `artifacts`, `repositories`, `scan_findings`, `policy_projections`,
 //! and `events` tables.
 //!
-//! ## Per-row deadline resolution (§2.5, load-bearing)
+//! ## Per-row deadline resolution (load-bearing)
 //!
 //! The queue can span repositories whose
 //! `ScanPolicy.quarantine_duration_secs` differ; the deadline must
@@ -17,7 +17,7 @@
 //! The use case does NOT pre-resolve a duration parameter (single query
 //! preserves both the `limit` cap and the cross-repo result set).
 //!
-//! ## Rejection-reason via LATERAL JOIN (§2.5)
+//! ## Rejection-reason via LATERAL JOIN
 //!
 //! For `quarantine_status = 'rejected'` rows the adapter resolves the
 //! latest `ArtifactRejected` event's `rejected_by` discriminator via:
@@ -47,7 +47,7 @@
 //!
 //! Adapter normalises both forms to lowercase string discriminators
 //! (`scanner`, `admin`, `curation_retroactive`, `curator`, plus
-//! `corruption` for `ArtifactCorrupted` — design §2.5 lists it though
+//! `corruption` for `ArtifactCorrupted` — though
 //! the variant tag is `ArtifactCorrupted` not `ArtifactRejected`; we
 //! include only the `RejectionReason` discriminators here and design's
 //! `corruption` is sourced separately if a future schema change adds
@@ -55,15 +55,14 @@
 //! variants) and the single-key object form (tuple variants).
 //!
 //! The lowercasing of the PascalCase JSONB key happens **inside SQL**
-//! (Approach A revised — case-symmetry fix on commit ce043c05): both
-//! the output column and the WHERE-clause filter share the same
-//! lowercased discriminator, so a caller passing the spec-mandated wire
-//! format (`filter.rejection_reason_kind = Some("curator")`) matches a
+//! (case-symmetry fix on commit ce043c05): both the output column and
+//! the WHERE-clause filter share the same lowercased discriminator, so
+//! a caller passing the wire format
+//! (`filter.rejection_reason_kind = Some("curator")`) matches a
 //! `{"Curator": …}` JSONB key. Before this fix the filter binding was
 //! compared against the raw PascalCase key (`"Curator"`), which
-//! contradicted design §2.5 + §3 and the lowercase output produced by
-//! the same query — a caller using the documented wire format hit zero
-//! rows.
+//! contradicted the lowercase output produced by the same query — a
+//! caller using the documented wire format hit zero rows.
 //!
 //! The `events` table has a unique index on `(stream_id,
 //! stream_position)`; LATERAL is one indexed lookup per artifact row
@@ -113,11 +112,11 @@ impl CurationQueueRepository for PgCurationQueueRepository {
             let limit = filter.limit.min(MAX_LIMIT);
 
             // Status filter as Option<&str> — bound to a NULL when the
-            // caller did not supply one. The §2.5 outer set is
+            // caller did not supply one. The outer set is
             // `IN ('quarantined','rejected','scan_indeterminate')`.
             let status_text: Option<String> = filter.status.map(|s| s.to_string());
 
-            // The §2.5 query.
+            // The queue listing query.
             //
             // - The `effective_policy_duration` CTE resolves
             //   `quarantine_duration_secs` per repo using the same
@@ -186,7 +185,7 @@ impl CurationQueueRepository for PgCurationQueueRepository {
                     -- `curator`, `curation_retroactive`, …) so this
                     -- output column and the WHERE-clause filter share
                     -- the same lowercased value — case-symmetric with
-                    -- the design §2.5 + §3 wire format.
+                    -- the documented wire format.
                     e.rejection_reason_kind     AS rejection_reason_kind_raw
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
@@ -212,8 +211,8 @@ impl CurationQueueRepository for PgCurationQueueRepository {
                     -- (`"Scanner"`/`"Admin"` bare-string for unit
                     -- variants; `"Curator"`/`"CurationRetroactive"`
                     -- single-key object for tuple variants) to the
-                    -- design §2.5 wire format (lowercase /
-                    -- snake_case) via an enumerated CASE that mirrors
+                    -- wire format (lowercase / snake_case) via an
+                    -- enumerated CASE that mirrors
                     -- `normalise_rejection_reason_kind` below.
                     -- Unknown variants lowercase through (defensive —
                     -- a future RejectionReason arm must still surface,
@@ -268,7 +267,7 @@ impl CurationQueueRepository for PgCurationQueueRepository {
     }
 }
 
-/// sqlx FromRow shape mirroring the §2.5 projection.
+/// sqlx FromRow shape for the queue listing projection.
 #[derive(sqlx::FromRow)]
 struct CurationQueueRow {
     artifact_id: Uuid,
@@ -287,7 +286,7 @@ struct CurationQueueRow {
 
 impl CurationQueueRow {
     fn into_domain(self) -> DomainResult<CurationQueueEntry> {
-        // The §2.5 outer filter pins this to a non-NULL set, but the
+        // The outer status filter pins this to a non-NULL set, but the
         // schema permits NULL — so the `None` arm exists as
         // defence-in-depth (mirrors `patch_candidate_repo` strict
         // mapping). Drift in the SQL WHERE clause surfaces as
@@ -311,8 +310,8 @@ impl CurationQueueRow {
         // `patch_candidate_repo`.
         let format: RepositoryFormat = self.format.parse().unwrap_or(RepositoryFormat::Generic);
 
-        // SQL already projects the design-doc-spelled lowercase /
-        // snake_case wire format (`"scanner" | "admin" | "curator" |
+        // SQL already projects the lowercase / snake_case wire format
+        // (`"scanner" | "admin" | "curator" |
         // "curation_retroactive"`) from the LATERAL subquery — both
         // halves of the case-symmetric filter (output projection +
         // WHERE clause) read it from the same expression. The
@@ -368,7 +367,7 @@ fn i64_finding_count_to_u32(v: i64) -> u32 {
 }
 
 /// Normalise the raw `rejected_by` discriminator to the
-/// design-doc-spelled enum (`"scanner"`, `"admin"`, `"curator"`,
+/// wire-format enum (`"scanner"`, `"admin"`, `"curator"`,
 /// `"curation_retroactive"`).
 ///
 /// **Note (case-symmetry fix on ce043c05):** the SQL LATERAL subquery
@@ -381,8 +380,8 @@ fn i64_finding_count_to_u32(v: i64) -> u32 {
 /// PascalCase to HTTP callers. The inline unit tests double as the
 /// canonical variant→wire-format mapping documentation.
 ///
-/// Adapter-private — the wire format the HTTP DTO renders (Item 10) is
-/// the normalised form. Pinning the case-conversion here makes the
+/// Adapter-private — the wire format the HTTP DTO renders is the
+/// normalised form. Pinning the case-conversion here makes the
 /// filter parameter (`filter.rejection_reason_kind = Some("curator")`)
 /// the same string the operator sees in the response.
 ///

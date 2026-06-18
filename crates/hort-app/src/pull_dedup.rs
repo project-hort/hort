@@ -75,12 +75,11 @@ use crate::error::AppError;
 use crate::metrics::{DedupLayer, DedupOutcomeLabel, UpstreamErrorKind};
 
 // ---------------------------------------------------------------------------
-// Constants — see design doc §6 ("Two derived constants, NOT env-tunable").
+// Constants — NOT env-tunable.
 // ---------------------------------------------------------------------------
 
 /// Layer-B lock TTL. Heartbeat every `HEARTBEAT_INTERVAL`; one missed
-/// heartbeat is tolerated. Operators do not foot-gun themselves with
-/// this knob — design doc §6.
+/// heartbeat is tolerated. Not operator-tunable.
 const LEADER_LOCK_TTL: Duration = Duration::from_secs(90);
 
 /// Heartbeat refresh cadence. `LEADER_LOCK_TTL / 3` so two missed
@@ -138,9 +137,9 @@ pub struct PullDedupConfig {
 }
 
 impl PullDedupConfig {
-    /// Default values matching the design doc §6 table. Used by tests
-    /// and as a fallback by the composition root if env-var parsing
-    /// is omitted (production wires explicitly via `Config`).
+    /// Default values used by tests and as a fallback by the composition
+    /// root if env-var parsing is omitted (production wires explicitly
+    /// via `Config`).
     pub fn defaults() -> Self {
         Self {
             ttl_not_found: Duration::from_secs(30),
@@ -154,8 +153,7 @@ impl PullDedupConfig {
 
 /// Resolve the negative-cache TTL for a terminal-failure
 /// [`UpstreamErrorKind`]. Total over every variant **except**
-/// `Success` (which is unreachable on the failure path). Mapping per
-/// design doc §6:
+/// `Success` (which is unreachable on the failure path). Mapping:
 ///
 /// | Variant cluster | TTL knob |
 /// |---|---|
@@ -194,7 +192,7 @@ fn ttl_for(kind: UpstreamErrorKind, cfg: &PullDedupConfig) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// Keys — see design doc §4.
+// Keys
 // ---------------------------------------------------------------------------
 
 /// Discriminator carried in [`DedupKey`] to keep the three keyspaces
@@ -310,7 +308,7 @@ impl DedupKey {
 }
 
 // ---------------------------------------------------------------------------
-// Outcome record — see design doc §4.
+// Outcome record
 // ---------------------------------------------------------------------------
 
 /// Terminal state recorded by the leader and observed by followers.
@@ -524,7 +522,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// Service — see design doc §3, §4.
+// Service
 // ---------------------------------------------------------------------------
 
 /// Shared Layer-A coalescing map. `Weak` so a leader's drop (panic,
@@ -533,8 +531,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 type LayerAMap = DashMap<DedupKey, Weak<broadcast::Sender<DedupOutcome>>>;
 
 /// `hort-app::pull_dedup::PullDedup` — the coordination service. Held
-/// on `AppContext` as `Arc<PullDedup>` (Item 2). Cheap to clone via
-/// `Arc`.
+/// on `AppContext` as `Arc<PullDedup>`. Cheap to clone via `Arc`.
 pub struct PullDedup {
     ephemeral: Arc<dyn EphemeralStore>,
     layer_a: Arc<LayerAMap>,
@@ -608,7 +605,7 @@ impl PullDedup {
     /// write to CAS via `IngestUseCase::ingest_verified` and return
     /// the resulting `ContentHash`. Followers receive only the hash
     /// and re-resolve the artifact row from CAS / the artifact
-    /// repository independently (design doc §5.2).
+    /// repository independently.
     ///
     /// Format crates extract `outcome.content_hash` inside the
     /// closure; the full `IngestOutcome` is not threaded through
@@ -731,8 +728,7 @@ impl PullDedup {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Channel capacity exceeded — implausible but
-                        // defended (design doc §9 case 7). Fall
-                        // through to Layer B.
+                        // defended. Fall through to Layer B.
                         warn!(
                             lagged_by = n,
                             "layer-A receiver lagged; falling through to layer B"
@@ -765,10 +761,9 @@ impl PullDedup {
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<BlobOrMetadataOk, AppError>> + Send,
     {
-        // Negative-cache short-circuit BEFORE put_if_absent (design
-        // doc §3 decision 3, §9 case 4). A `Failed` record with
-        // `expires_at` in the future means recent callers already
-        // discovered the upstream failure; we return the cached
+        // Negative-cache short-circuit BEFORE put_if_absent. A `Failed`
+        // record with `expires_at` in the future means recent callers
+        // already discovered the upstream failure; we return the cached
         // failure without round-tripping.
         let mut stale_record_to_overwrite = false;
         match self.ephemeral.get(&key.serialised).await {
@@ -789,10 +784,9 @@ impl PullDedup {
                         );
                         return self.handle_follower_outcome(&key, DedupLayer::Cluster, outcome);
                     }
-                    // Stale Failed record (design doc §9 case 4):
-                    // treat as absent. Overwrite via `put` after
-                    // election so put_if_absent does not block on
-                    // this stale record.
+                    // Stale Failed record: treat as absent. Overwrite
+                    // via `put` after election so put_if_absent does
+                    // not block on this stale record.
                     stale_record_to_overwrite = true;
                 }
                 Some(outcome @ DedupOutcome::SucceededMetadata { .. })
@@ -888,8 +882,7 @@ impl PullDedup {
 
     /// Leader path with a healthy Layer B. Set up the Layer-A
     /// broadcast, spawn the heartbeat task BEFORE the fetch closure
-    /// runs (design doc §9 case 1), then run the fetch and broadcast
-    /// the terminal outcome.
+    /// runs, then run the fetch and broadcast the terminal outcome.
     async fn run_as_leader<F, Fut>(
         &self,
         key: &DedupKey,
@@ -918,7 +911,7 @@ impl PullDedup {
         let weak = Arc::downgrade(&tx_strong);
         self.layer_a.insert(key.clone(), weak);
 
-        // Heartbeat — spawn BEFORE the fetch (design doc §9 case 1).
+        // Heartbeat — spawn BEFORE the fetch.
         let heartbeat_handle = self.spawn_heartbeat(key.serialised.clone());
 
         let started = std::time::Instant::now();
@@ -951,8 +944,7 @@ impl PullDedup {
         // Persist the terminal record (best-effort — fail-open: the
         // local result still flows back to our own caller). Use
         // `put` (replaces any in-flight record we wrote earlier);
-        // CAS-vs-late-leader collisions are tolerated per design doc
-        // §9 cases 2+3.
+        // CAS-vs-late-leader collisions are tolerated (best-effort persist).
         let terminal_bytes = encode_outcome(&outcome);
         let terminal_ttl = match &outcome {
             DedupOutcome::Failed {
@@ -1261,8 +1253,8 @@ fn emit_total(layer: DedupLayer, format: &str, outcome: DedupOutcomeLabel) {
     .increment(1);
 }
 
-/// Emit `hort_pull_dedup_wait_seconds{layer, format}` histogram. Bucket
-/// set per design doc §7 (configured at the recorder).
+/// Emit `hort_pull_dedup_wait_seconds{layer, format}` histogram
+/// (buckets configured at the recorder).
 fn emit_wait(layer: DedupLayer, format: &str, elapsed: Duration) {
     metrics::histogram!(
         "hort_pull_dedup_wait_seconds",
@@ -1417,10 +1409,10 @@ mod tests {
 
     type SnapshotRow = (CompositeKey, Option<Unit>, Option<SharedString>, DebugValue);
 
-    /// Test double for the Layer-B-unavailable case (§9 case 8).
-    /// Defined inline per the acceptance bullet at line 144 — do NOT
-    /// add `fail_next_*` injection to `InMemoryEphemeralStore` (that
-    /// contaminates the production adapter with test concerns).
+    /// Test double for the Layer-B-unavailable case.
+    /// Defined inline — do NOT add `fail_next_*` injection to
+    /// `InMemoryEphemeralStore` (that contaminates the production
+    /// adapter with test concerns).
     struct FailingEphemeralStore;
 
     impl EphemeralStore for FailingEphemeralStore {
@@ -1750,8 +1742,7 @@ mod tests {
 
     /// Defensive — `Success` is unreachable on the production
     /// failure path but the resolver is total. If a future commit
-    /// removes the defensive arm without updating the design doc,
-    /// this test fails.
+    /// removes the defensive arm, this test fails.
     #[test]
     fn ttl_for_success_uses_not_found_knob_defensive() {
         let cfg = PullDedupConfig::defaults();
@@ -2003,9 +1994,9 @@ mod tests {
 
     #[test]
     fn stale_failed_record_is_treated_as_absent_and_re_elects() {
-        // §9 case 4 — a `Failed` record with `expires_at` in the
-        // past must NOT short-circuit; the follower retries election
-        // and becomes the new leader.
+        // A `Failed` record with `expires_at` in the past must NOT
+        // short-circuit; the follower retries election and becomes
+        // the new leader.
         let snap = capture(|| async {
             let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
             let dd = PullDedup::new(store.clone(), PullDedupConfig::defaults());
@@ -2124,8 +2115,8 @@ mod tests {
 
     #[test]
     fn redis_unavailable_fails_open_and_emits_layer_b_unavailable() {
-        // §9 case 8 — `EphemeralStore::put_if_absent` errors. Caller
-        // proceeds as leader; metric ticks `layer_b_unavailable`.
+        // `EphemeralStore::put_if_absent` errors. Caller proceeds as
+        // leader; metric ticks `layer_b_unavailable`.
         let snap = capture(|| async {
             let store: Arc<dyn EphemeralStore> = Arc::new(FailingEphemeralStore);
             let dd = PullDedup::new(store, PullDedupConfig::defaults());
@@ -2472,10 +2463,10 @@ mod tests {
         assert!(handle.is_finished() || handle.await.is_err());
     }
 
-    /// §9 case 1 — heartbeat is spawned BEFORE the fetch closure
-    /// runs. We assert the property by confirming the lock record
-    /// is observable inside the fetch closure (i.e. election + lock
-    /// write happened before dispatch).
+    /// Heartbeat is spawned BEFORE the fetch closure runs. We assert
+    /// the property by confirming the lock record is observable inside
+    /// the fetch closure (i.e. election + lock write happened before
+    /// dispatch).
     #[test]
     fn heartbeat_spawned_before_fetch_lock_visible_in_closure() {
         capture(|| async {
@@ -2504,14 +2495,13 @@ mod tests {
         });
     }
 
-    /// §9 case 2/3 — defensive: a leader whose `compare_and_swap`
-    /// to terminal returns CAS-miss (because a new leader took the
-    /// lock during a slow fetch) still completes its own success
-    /// path. We model this by writing a SECOND record under the key
-    /// before the leader's terminal `put` runs — the leader's
-    /// `put` is unconditional `put`, so it overwrites; this test
-    /// asserts the leader does not panic and the fetch return
-    /// flows back correctly.
+    /// Defensive: a leader whose `compare_and_swap` to terminal
+    /// returns CAS-miss (because a new leader took the lock during a
+    /// slow fetch) still completes its own success path. We model this
+    /// by writing a SECOND record under the key before the leader's
+    /// terminal `put` runs — the leader's `put` is unconditional, so
+    /// it overwrites; this test asserts the leader does not panic and
+    /// the fetch return flows back correctly.
     #[test]
     fn leader_terminal_write_is_resilient_to_pre_existing_record() {
         capture(|| async {
@@ -2526,10 +2516,10 @@ mod tests {
         });
     }
 
-    /// §9 case 6 — `broadcast::Sender::send` returning SendError
-    /// (no live receivers) is harmless for the leader. The leader
-    /// still completes and writes to `EphemeralStore`. We assert
-    /// the return value is intact.
+    /// `broadcast::Sender::send` returning SendError (no live
+    /// receivers) is harmless for the leader. The leader still
+    /// completes and writes to `EphemeralStore`. We assert the return
+    /// value is intact.
     #[test]
     fn leader_send_with_no_receivers_returns_success() {
         capture(|| async {

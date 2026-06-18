@@ -85,7 +85,7 @@ use hort_domain::types::PageRequest;
 /// `trigger_source` literal on every cascade-enqueued row. Mirrors
 /// the migration-009 CHECK addition. The dedicated literal
 /// distinguishes cascade-spawned rows from cron / advisory / ingest
-/// / manual / seed-import in audit + metric labels — see §7
+/// / manual / seed-import in audit + metric labels
 /// (`hort_prefetch_enqueued_total{trigger}`).
 const PREFETCH_TRIGGER_SOURCE: &str = "prefetch";
 
@@ -434,7 +434,7 @@ struct WalkSummary {
     /// truncated because the cumulative descendant count would have
     /// exceeded `PrefetchPolicy::max_descendants`. Distinct from
     /// `child_walk_at_cap` (which fires on the per-package
-    /// `transitive_depth` cap). Item 6 (`hort_prefetch_amplification_total`)
+    /// `transitive_depth` cap). `hort_prefetch_amplification_total`
     /// reads this field to emit `result=cap_hit`.
     cap_hit: bool,
 }
@@ -538,16 +538,16 @@ impl TaskHandler for PrefetchDependenciesHandler {
             };
 
             // ----- Step 5: extract dependency specs -------------------
-            // spec 076 Item 3 — `extract_dependency_specs` is fed the
-            // STORED ARTIFACT (the format's own archive: npm `.tgz` / cargo
-            // `.crate` gzip-tar, pypi wheel zip), NOT a pre-selected
-            // manifest. `content` is the raw artifact bytes read from
-            // storage above; the handler locates its declared manifest
-            // inside the archive (`package/package.json`, `<dir>/Cargo.toml`,
+            // `extract_dependency_specs` is fed the STORED ARTIFACT (the
+            // format's own archive: npm `.tgz` / cargo `.crate` gzip-tar,
+            // pypi wheel zip), NOT a pre-selected manifest. `content` is
+            // the raw artifact bytes read from storage above; the handler
+            // locates its declared manifest inside the archive
+            // (`package/package.json`, `<dir>/Cargo.toml`,
             // `*.dist-info/METADATA`) via the audited `archive_bounds`
-            // extractor and parses it. The port stays a
-            // streaming `&mut dyn Read`, so a cursor over the in-memory
-            // artifact satisfies it without a second fetch.
+            // extractor and parses it. The port stays a streaming
+            // `&mut dyn Read`, so a cursor over the in-memory artifact
+            // satisfies it without a second fetch.
             let specs = match handler.extract_dependency_specs(&mut std::io::Cursor::new(&content))
             {
                 Ok(specs) => specs,
@@ -638,7 +638,7 @@ impl PrefetchDependenciesHandler {
     ///   read `ArtifactRepository::package_version_status` for the
     ///   held set + `FormatHandler::resolve_range_max(range, held)`.
     ///   `Some(_)` → Hort already holds a satisfying version; skip
-    ///   (the dedup-win path Item 12 already had).
+    ///   (the dedup-win path already had this).
     /// - **Pass 2 (upstream, bounded I/O):** for the cold cohort
     ///   (specs that Pass 1 did not absorb), coalesce by `(repo,
     ///   normalised_package)` so two specs referencing the same
@@ -772,9 +772,8 @@ impl PrefetchDependenciesHandler {
 
         // Pass 2 needs the catch-all upstream mapping. If absent,
         // the cold cohort is silently skipped (the held-set pass
-        // already ran). Mirrors Item 8b's `PrefetchTickHandler`
-        // mapping resolution — same port, same `path_prefix == ""`
-        // predicate.
+        // already ran). Mirrors `PrefetchTickHandler` mapping
+        // resolution — same port, same `path_prefix == ""` predicate.
         let upstream_mapping = if cold_by_package.is_empty() {
             None
         } else {
@@ -953,7 +952,7 @@ impl PrefetchDependenciesHandler {
         // The parent task params carry `current_descendants_so_far`;
         // this branch of the cascade has `remaining` headroom under
         // `max_descendants`. If the cohort exceeds it, drop the tail
-        // and flag `cap_hit` for Item 6's amplification metric. The
+        // and flag `cap_hit` for the amplification metric. The
         // child cascade rows are truncated in lockstep with their
         // paired prefetch leaves (they are produced one-to-one above).
         let attempted_prefetch = prefetch_rows.len() as u64;
@@ -1258,7 +1257,7 @@ mod tests {
             body: &mut dyn std::io::Read,
         ) -> DomainResult<Vec<String>> {
             // Test packument: `{"versions":{"1.0.0":{},"2.5.0":{}}}`.
-            // Item 12b cold-cohort tests seed this shape.
+            // Cold-cohort tests seed this shape.
             let mut buf = Vec::new();
             std::io::Read::read_to_end(body, &mut buf)
                 .map_err(|e| DomainError::Validation(e.to_string()))?;
@@ -1270,7 +1269,7 @@ mod tests {
             };
             Ok(versions.keys().cloned().collect())
         }
-        // spec 076 §3.8 NOTE: this stand-in JSON-parses `content` DIRECTLY,
+        // NOTE: this stand-in JSON-parses `content` DIRECTLY,
         // which deliberately diverges from the production npm handler's
         // archive-aware contract (the real handler is fed the stored `.tgz`
         // and reads `package/package.json` out of it via `archive_bounds`).
@@ -1692,8 +1691,8 @@ mod tests {
     // Dev-deps NOT followed: 1 runtime + 5 dev → only 1 prefetch
     //
     // The runtime/dev boundary is enforced by the FormatHandler
-    // (Item 11) — `extract_dependency_specs` returns RUNTIME deps
-    // only. This test confirms the cascade respects it.
+    // — `extract_dependency_specs` returns RUNTIME deps only.
+    // This test confirms the cascade respects it.
     // =====================================================================
 
     #[tokio::test]
@@ -2250,11 +2249,10 @@ mod tests {
     // Pass 2 cold-cohort hybrid resolution tests
     // =====================================================================
 
-    /// End-to-end Item 12b acceptance: a manifest with 3 deps where
-    /// 2 are already held and 1 is cold → exactly 1 upstream
-    /// `fetch_metadata` call, 1 `prefetch` row with the concrete
-    /// version `target_key`, 1 child `prefetch-dependencies` row.
-    /// Mirrors the backlog spec's acceptance scenario.
+    /// End-to-end acceptance: a manifest with 3 deps where 2 are
+    /// already held and 1 is cold → exactly 1 upstream `fetch_metadata`
+    /// call, 1 `prefetch` row with the concrete version `target_key`,
+    /// 1 child `prefetch-dependencies` row.
     #[tokio::test]
     async fn item_12b_acceptance_three_deps_two_held_one_cold_one_upstream_fetch() {
         let repo = make_repo(RepositoryFormat::Npm, 5);
@@ -2324,11 +2322,11 @@ mod tests {
         assert!(prefetch_batch[0].params.get("range").is_none());
     }
 
-    /// Overlapping-ranges dedup (Item 12b acceptance): two specs
-    /// `pkg@^1.0` and `pkg@~1.2` both resolve to upstream `1.2.5` →
-    /// ONE concrete prefetch row in the cohort (the second spec's
-    /// target_key matches the first and the in-batch enqueue gets
-    /// deduped by the mock's L3 seen-keys set).
+    /// Overlapping-ranges dedup: two specs `pkg@^1.0` and `pkg@~1.2`
+    /// both resolve to upstream `1.2.5` → ONE concrete prefetch row in
+    /// the cohort (the second spec's target_key matches the first and
+    /// the in-batch enqueue gets deduped by the mock's L3 seen-keys
+    /// set).
     #[tokio::test]
     async fn item_12b_overlapping_ranges_collapse_on_concrete_version() {
         let repo = make_repo(RepositoryFormat::Npm, 5);
@@ -2805,8 +2803,7 @@ mod tests {
     // changes the predicate (e.g. to a longest-prefix match like the
     // OCI-style mapping resolution), the resolver could pick the
     // narrower `@private/` mapping for a dep named `@private/foo` and
-    // open the cross-upstream cascade the audit's F-46.2.2 framing
-    // implied was already possible. The test asserts the chosen
+    // open a cross-upstream cascade. The test asserts the chosen
     // mapping was the catch-all by inspecting the enqueued row's
     // concrete version — distinct upstream version sets per mapping
     // surface the choice unambiguously.
@@ -2992,7 +2989,7 @@ mod tests {
     // `hort_prefetch_amplification_total`
     // amplification metric. Three result values:
     //   - `normal`           — walk completed under the cap.
-    //   - `cap_hit`          — walk truncated by the §2.4.1 cap.
+    //   - `cap_hit`          — walk truncated by the descendants cap.
     //   - `resolver_failed`  — cold-cohort upstream resolution failed
     //                          (`summary.no_upstream_mapping > 0`).
     //

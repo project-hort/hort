@@ -70,15 +70,14 @@ pub struct ExtraCaBoot {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtraCaBootError {
-    // Backlog 078 Item 7 (c) — the message NAMES the missing path AND
-    // points the operator at the likely cause (a CA-bundle volume that
-    // was never mounted onto the worker pod). The chart only sets this
-    // env when it also auto-mounts the bundle (`extraCaBundle.
-    // {configMapName,secretName}`, Item 7 a/b); the common way to reach
-    // this error is the manual Recipe-B path where the operator wired
-    // `worker.extraVolumes`/`worker.extraVolumeMounts` on only one of the
-    // two Deployments. A bare `No such file or directory` crashloop would
-    // be opaque; this turns it into an actionable fatal.
+    // The message NAMES the missing path AND points the operator at the
+    // likely cause (a CA-bundle volume that was never mounted onto the
+    // worker pod). The chart only sets this env when it also auto-mounts
+    // the bundle (`extraCaBundle.{configMapName,secretName}`); the common
+    // way to reach this error is the manual Recipe-B path where the
+    // operator wired `worker.extraVolumes`/`worker.extraVolumeMounts` on
+    // only one of the two Deployments. A bare `No such file or directory`
+    // crashloop would be opaque; this turns it into an actionable fatal.
     #[error(
         "HORT_EXTRA_CA_BUNDLE points at {path:?} but no file is readable there: {source}. \
          The worker pod is missing the CA-bundle mount at that path — set \
@@ -301,10 +300,10 @@ mod tests {
         assert_eq!(read_back, bytes);
     }
 
-    // -- Backlog 078 Item 7 (c) — missing-file boot path -----------------
+    // -- Missing-file boot path -------------------------------------------
     //
-    // The chart (Item 7 b) only sets `HORT_EXTRA_CA_BUNDLE` on the worker
-    // when the bundle is actually auto-mounted on the worker pod
+    // The chart only sets `HORT_EXTRA_CA_BUNDLE` on the worker when the
+    // bundle is actually auto-mounted on the worker pod
     // (`extraCaBundle.{configMapName,secretName}`). But an operator can
     // still misconfigure the env directly (Recipe B manual wiring with a
     // missing `worker.extraVolumeMounts` half, or a typo'd path). When the
@@ -336,7 +335,7 @@ mod tests {
             // …and it must point the operator at the likely cause — a
             // missing CA-bundle MOUNT on the worker pod — rather than a
             // bare OS errno. This is the difference between a clear fatal
-            // and an opaque crashloop (Item 7 c).
+            // and an opaque crashloop.
             assert!(
                 msg.to_lowercase().contains("mount"),
                 "error must hint at the missing mount; got: {msg}",

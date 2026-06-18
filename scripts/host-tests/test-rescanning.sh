@@ -25,8 +25,7 @@
 #     6. hort-cli admin task invoke cron-rescan-tick → assert 202 +
 #        task_job_id.
 #     7. Poll for ≥ 2 ScanCompleted events within 30s.
-#     8. hort-cli admin rescan $AID → assert 202 (Item 14 ships the
-#        CLI subcommand; Item 7 ships the server endpoint).
+#     8. hort-cli admin rescan $AID → assert 202.
 #     9. Poll for the 3rd ScanCompleted within 30s.
 #    10. Curl /metrics; assert:
 #          - hort_scan_jobs_enqueued_total{trigger_source="cron"} ≥ 1
@@ -190,7 +189,7 @@ phase_1_helm_template_smoke() {
     else
         assert_fail \
             "cron-rescan-tick CronJob rendered" \
-            "expected label 'hort-server.io/job: cron-rescan-tick' missing — Item 12 template not gated on scheduledTasks.cronRescanTick.enabled?"
+            "expected label 'hort-server.io/job: cron-rescan-tick' missing — template not gated on scheduledTasks.cronRescanTick.enabled?"
     fi
 
     # Assertion 1.3 — advisory-watch-tick CronJob present.
@@ -199,7 +198,7 @@ phase_1_helm_template_smoke() {
     else
         assert_fail \
             "advisory-watch-tick CronJob rendered" \
-            "expected label 'hort-server.io/job: advisory-watch-tick' missing — Item 12 advisory template not gated correctly?"
+            "expected label 'hort-server.io/job: advisory-watch-tick' missing — advisory template not gated correctly?"
     fi
 
     # Assertion 1.4 — the hort-cli command line carries the

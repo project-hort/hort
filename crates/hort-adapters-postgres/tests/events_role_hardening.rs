@@ -14,7 +14,7 @@
 //! (matches the convention in `event_store.rs` and `policy_projection_repo.rs`)
 //! so the suite stays green in dev environments without a database.
 //!
-//! What each test covers (see Item 7 spec — Acceptance §5):
+//! What each test covers:
 //!
 //! 1. `migration_strips_forbidden_privileges_from_hort_app_role` —
 //!    after the migration runs, a fresh non-superuser user that's a
@@ -49,11 +49,11 @@
 //!    paths (UPDATE/DELETE) — none exercised the *allowed* INSERT path
 //!    through the production adapter, so the FOR UPDATE collision
 //!    shipped. This test closes that gap.
-//! 6. `startup_probe_skips_for_events_table_owner` — finding F12: a
-//!    NOSUPERUSER role that is a member of `hort_admin` (the `events`
-//!    table owner) constructs `PgEventStore` successfully. A table
-//!    owner's UPDATE/DELETE/TRUNCATE is unrevokable, so the probe skips
-//!    rather than refusing — this is the admin-DSN path used by
+//! 6. `startup_probe_skips_for_events_table_owner` — a NOSUPERUSER
+//!    role that is a member of `hort_admin` (the `events` table owner)
+//!    constructs `PgEventStore` successfully. A table owner's
+//!    UPDATE/DELETE/TRUNCATE is unrevokable, so the probe skips rather
+//!    than refusing — this is the admin-DSN path used by
 //!    `issue-svc-token` / `reconcile-groups` / `scrub`.
 //!
 //! Each test creates a uniquely-named throwaway user inside the test
@@ -115,8 +115,8 @@ async fn create_app_user(admin: &PgPool) -> (String, String) {
 
 /// Mint a uniquely-named NOSUPERUSER LOGIN role that is a member of
 /// `hort_admin` — the role that owns the `events` table. `NOSUPERUSER` is
-/// essential: it exercises the finding-F12 table-owner skip distinctly
-/// from the superuser skip that precedes it in the probe. This is the
+/// essential: it exercises the table-owner skip distinctly from the
+/// superuser skip that precedes it in the probe. This is the
 /// admin-DSN identity `issue-svc-token` / `reconcile-groups` / `scrub`
 /// connect as. The caller `drop_user`s the role (its `hort_admin`
 /// membership is removed automatically by `DROP USER`).
@@ -247,7 +247,7 @@ fn counter_value(snap: Snapshot, name: &str, want: &[(&str, &str)]) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance §5 case 1 — migration strips forbidden privileges
+// Case 1 — migration strips forbidden privileges
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -314,7 +314,7 @@ async fn migration_strips_forbidden_privileges_from_hort_app_role() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance §5 case 1 (continued) — attempted UPDATE is permission-denied
+// Case 1 (continued) — attempted UPDATE is permission-denied
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -355,7 +355,7 @@ async fn migration_attempted_update_raises_permission_denied() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance §5 case 2 — startup probe refuses when relaxed grants exist
+// Case 2 — startup probe refuses when relaxed grants exist
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -366,9 +366,9 @@ async fn startup_probe_refuses_when_app_role_holds_update() {
     let (user, password) = create_app_user(&admin).await;
 
     // Fault inject: explicitly GRANT UPDATE on events to the test user.
-    // This simulates the H-7 vulnerability the audit identified:
-    // a misconfigured deployment where the runtime role retains a
-    // mutation privilege the migration intended to revoke.
+    // This simulates the vulnerability: a misconfigured deployment where
+    // the runtime role retains a mutation privilege the migration intended
+    // to revoke.
     let grant = format!("GRANT UPDATE ON events TO {user}");
     admin
         .execute(grant.as_str())
@@ -423,7 +423,7 @@ async fn startup_probe_refuses_when_app_role_holds_update() {
 }
 
 // ---------------------------------------------------------------------------
-// Finding F12 — privilege probe skips for the events-table owner
+// Privilege probe skips for the events-table owner
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -433,11 +433,12 @@ async fn startup_probe_skips_for_events_table_owner() {
     };
 
     // A NOSUPERUSER role that is a member of `hort_admin` — the owner of
-    // `events`. Without the F12 fix, `PgEventStore::new` refuses here:
-    // a table owner implicitly holds UPDATE, and `has_table_privilege`
-    // reports it regardless of any REVOKE, so the probe would fail with
-    // a forbidden-'UPDATE' error. This reproduces the alpha-test chain
-    // (the `svc-token-bootstrap` Job's `issue-svc-token` step).
+    // `events`. Without the table-owner skip, `PgEventStore::new` would
+    // refuse here: a table owner implicitly holds UPDATE, and
+    // `has_table_privilege` reports it regardless of any REVOKE, so the
+    // probe would fail with a forbidden-'UPDATE' error. This reproduces
+    // the admin-DSN path (the `svc-token-bootstrap` Job's
+    // `issue-svc-token` step).
     let (user, password) = create_admin_user(&admin).await;
 
     let user_url = user_url(&admin, &user, &password)
@@ -451,7 +452,7 @@ async fn startup_probe_skips_for_events_table_owner() {
         // Constructor MUST succeed — the table-owner skip applies.
         PgEventStore::new(pool.clone())
             .await
-            .expect("PgEventStore::new must succeed for the events-table owner (F12)");
+            .expect("PgEventStore::new must succeed for the events-table owner");
         pool.close().await;
     });
 
@@ -474,7 +475,7 @@ async fn startup_probe_skips_for_events_table_owner() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance §5 case 3 — trigger-caught path emits metric
+// Case 3 — trigger-caught path emits metric
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

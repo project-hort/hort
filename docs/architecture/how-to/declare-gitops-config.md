@@ -592,7 +592,7 @@ spec:
 - Field edit (scope, reason, expiry): one `ExclusionRemoved` +
   one `ExclusionAdded` on the same stream — the events crate has
   no `ExclusionUpdated`, and remove-and-add is the canonical update
-  form (design doc §3.3).
+  form.
 - YAML removed: one `ExclusionRemoved` event with
   `reason = "removed by gitops apply"`; the projection row is
   deleted.
@@ -999,7 +999,7 @@ credentialed pull-through path is live in production; the OCI
 multi-upstream pull-through smoke test exercises it end-to-end.
 
 The `RepositoryUseCase::update` and `delete` methods still live in
-`hort-app` and Item 4's `ManagedByConfiguration` rejection lives on
+`hort-app` and the `ManagedByConfiguration` rejection lives on
 them; they're load-bearing for any future inbound (gRPC, CLI, a
 later REST surface) that mounts them. They're just not addressable
 from HTTP today.

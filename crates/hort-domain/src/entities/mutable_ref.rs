@@ -128,7 +128,7 @@ mod tests {
         // Compile-time proof that matching is exhaustive against the two
         // variants. If someone adds a third variant without a cross-format
         // review, this match fails compilation (desired behaviour per
-        // §2.2 — "RefTarget is a closed enum").
+        // "RefTarget is a closed enum".
         fn describe(t: &RefTarget) -> &'static str {
             match t {
                 RefTarget::ContentHash(_) => "hash",

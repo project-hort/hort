@@ -191,7 +191,7 @@ mod metrics {
     pub(super) const RESULT_NO_SA_MATCH: &str = "no_sa_match";
     /// SA resolution: more than one `ServiceAccount` matched. Operator
     /// must narrow the trust policies — silently picking one would be
-    /// a configuration footgun (design doc §4 "Multi-match policy").
+    /// a configuration footgun ("Multi-match policy").
     pub(super) const RESULT_MULTIPLE_SA_MATCH: &str = "multiple_sa_match";
     /// Step-8 mint: the system-mint pipeline rejected the request
     /// (typed `ApiTokenError`). Distinct from
@@ -227,10 +227,10 @@ mod metrics {
     // the exchange counter classifies the protocol-level outcome of the
     // whole `/exchange` request, whereas `hort_fed_sa_match_total`
     // classifies the federation SA-selection decision specifically so a
-    // security reviewer can see F-7 audience-confusion denies and F-8
+    // security reviewer can see audience-confusion denies and
     // empty-claims fail-closed skips without disentangling them from the
     // broader `no_sa_match` bucket. `{result}`-only label (closed
-    // taxonomy, design §4); no high-cardinality labels.
+    // taxonomy); no high-cardinality labels.
     pub(super) const FED_SA_MATCH_COUNTER: &str = "hort_fed_sa_match_total";
     /// Exactly one `ServiceAccount` matched the validated claims (the
     /// only outcome that proceeds to mint). Counted once per successful
@@ -259,9 +259,8 @@ mod metrics {
 // ---------------------------------------------------------------------------
 
 /// Form body shape per RFC 8693 §2.1. `resource` / `audience` are
-/// intentionally absent — v1 ignores them per design doc §3 / §10
-/// carry-forward; including unused fields would advertise a surface
-/// that does not exist.
+/// intentionally absent — v1 ignores them; including unused fields
+/// would advertise a surface that does not exist.
 ///
 /// `scope` (space-separated permissions) and
 /// `requested_token_lifetime` (seconds) follow the RFC 8693 §2.1 wire
@@ -312,8 +311,8 @@ struct ExchangeErrorBody {
 
 /// Build the `/auth/exchange` route tree. The caller (`hort-server::http`)
 /// nests under `/api/v1` and decides whether to mount this at all
-/// based on `HORT_TOKEN_EXCHANGE_ENABLED` (design doc §9). When the flag
-/// is off, the route is not mounted at all and axum's default 404
+/// based on `HORT_TOKEN_EXCHANGE_ENABLED`. When the flag is off, the
+/// route is not mounted at all and axum's default 404
 /// applies — matching the "no surface advertised" requirement.
 pub fn token_exchange_routes() -> Router<Arc<AppContext>> {
     Router::new().route("/auth/exchange", post(post_exchange))
@@ -477,8 +476,8 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
     };
     let requested_lifetime_secs = form.requested_token_lifetime;
 
-    // 6. PAT-shape gate (design doc §8 invariant 3) — fires BEFORE
-    //    any IdP call so chained-PAT attempts cost zero IdP traffic.
+    // 6. PAT-shape gate — fires BEFORE any IdP call so chained-PAT
+    //    attempts cost zero IdP traffic.
     if parse_pat_token_format(subject_token).is_ok() {
         tracing::info!(
             reason = "pat_shape_rejected",
@@ -595,8 +594,7 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
     };
 
     // 8. Mint via the existing ApiTokenUseCase::issue_cli_session.
-    //    Truncate client_id to 255 chars at a char boundary BEFORE
-    //    handoff (design doc §3 wire-cap).
+    //    Truncate client_id to 255 chars at a char boundary BEFORE handoff.
     let client_name = form.client_id.as_deref().map(|s| {
         if s.len() <= CLIENT_ID_MAX_LEN {
             s.to_string()
@@ -609,11 +607,10 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
         }
     });
 
-    // Item B6 — distinct mapping per ApiTokenError variant. Caller-side
-    // denials (CapExceedsAuthority) MUST NOT collapse into the operator-
-    // actionable infrastructure_error bucket; doing so generates false
-    // positives on outage dashboards and obscures real outages behind
-    // RBAC-denial noise.
+    // Distinct mapping per ApiTokenError variant. Caller-side denials
+    // (CapExceedsAuthority) MUST NOT collapse into the operator-actionable
+    // infrastructure_error bucket; doing so generates false positives on
+    // outage dashboards and obscures real outages behind RBAC-denial noise.
     let issued = match ctx
         .api_token_use_case
         .issue_cli_session(
@@ -802,8 +799,7 @@ fn error_outcome_with_kind(
 }
 
 /// Apply `Cache-Control: no-store` to every response (success AND
-/// error). Design doc §8 invariant 6 — plaintext leaves the server
-/// exactly once.
+/// error) — plaintext leaves the server exactly once.
 fn with_no_store(mut response: Response) -> Response {
     response
         .headers_mut()
@@ -870,9 +866,9 @@ fn record_duration(kind: &'static str, label: &'static str, seconds: f64) {
 // Federation branch on /auth/exchange
 // ===========================================================================
 
-/// Maximum minted-bearer lifetime for the federation branch. Per design
-/// doc §4 step 8 ("validity = min(1h, jwt.exp - now)"). The federation
-/// flow mints a non-refreshable bearer; ≤1 h keeps the laptop-theft /
+/// Maximum minted-bearer lifetime for the federation branch
+/// ("validity = min(1h, jwt.exp - now)"). The federation flow mints a
+/// non-refreshable bearer; ≤1 h keeps the laptop-theft /
 /// CI-runner-leak blast radius bounded.
 const FEDERATION_MAX_LIFETIME_SECS: u64 = 3600;
 
@@ -891,15 +887,14 @@ const FEDERATION_MAX_LIFETIME_SECS: u64 = 3600;
 /// and never crosses an HTTP boundary as a deserialised value.
 #[derive(Debug)]
 enum FederationHandlerError {
-    /// Validator port rejected the JWT (step 1–6 of the §4 flow).
+    /// Validator port rejected the JWT (claim-validation steps).
     Validator(FederationDenyReason),
-    /// Step 7 of the §4 flow: zero `ServiceAccount`s matched the
-    /// validated claims. Operator must declare a `ServiceAccount` with
+    /// Zero `ServiceAccount`s matched the validated claims. Operator
+    /// must declare a `ServiceAccount` with
     /// `federatedIdentities[].claims` matching this JWT shape.
     NoSaMatch,
-    /// Step 7 of the §4 flow: multiple `ServiceAccount`s matched the
-    /// validated claims. Per §4 "Multi-match policy" this is a
-    /// configuration error, not an authorization choice — the handler
+    /// Multiple `ServiceAccount`s matched the validated claims. This is
+    /// a configuration error, not an authorization choice — the handler
     /// denies and surfaces the SA names at INFO so the operator can
     /// narrow the trust policies.
     MultipleSaMatch { sa_names: Vec<String> },
@@ -1126,16 +1121,16 @@ async fn handle_federated_jwt(
             // `hort_token_exchange_total` (the HTTP contract is
             // unchanged: still 401 `invalid_grant`, "no ServiceAccount
             // matches"), so dashboards keyed on the exchange counter do
-            // not regress; the F-7/F-8 split rides only the new metric.
-            // `info!` (audit, not `err`) on the empty-claims skip — a
-            // `{}` row reaching runtime means an out-of-band write and
-            // is security-relevant per design §4.
+            // not regress; the audience/empty-claims split rides only the
+            // new metric. `info!` (audit, not `err`) on the empty-claims
+            // skip — a `{}` row reaching runtime means an out-of-band
+            // write and is security-relevant.
             if any_empty_claims {
                 tracing::info!(
                     event = "federation_empty_claims_skipped",
                     iss = %claims.issuer,
                     sub = %claims.subject,
-                    "F-8: a federated_identities row carried an empty claims map — \
+                    "a federated_identities row carried an empty claims map — \
                      fail-closed skip (apply-time validation should have rejected it; \
                      this row was likely written out-of-band)"
                 );
@@ -1182,19 +1177,16 @@ async fn handle_federated_jwt(
     //    `description` carries the source IP for revocation UX,
     //    mirroring the CliSession path.
     //
-    //    alpha-F9b: `declared_permissions` is derived from the SA's
-    //    role via `service_account_permission_for_role` — the SAME
-    //    mapping the apply pipeline uses to expand the SA's role into
-    //    a `GrantSubject::User(backing_user_id)` grant. An empty
-    //    `declared_permissions` was the bug: the cap leg of
+    //    `declared_permissions` is derived from the SA's role via
+    //    `service_account_permission_for_role` — the SAME mapping the
+    //    apply pipeline uses to expand the SA's role into a
+    //    `GrantSubject::User(backing_user_id)` grant. An empty
+    //    `declared_permissions` would be a bug: the cap leg of
     //    `RbacEvaluator::authorize` (`cap_allows_optional_repo`)
     //    requires `cap.permissions.contains(&requested)` — empty
     //    permissions never contain anything, so an empty cap denies
-    //    every authz check regardless of the User-subject grant. The
-    //    pre-fix comment claimed "the backing SA user already carries
-    //    the role + repo grants" which is true for the user-grants
-    //    leg but irrelevant once the cap leg has already returned
-    //    false. Per-repo scoping stays on the User-subject grant —
+    //    every authz check regardless of the User-subject grant.
+    //    Per-repo scoping stays on the User-subject grant —
     //    we leave `repository_ids = None` so a future apply that
     //    extends the SA's `repositories` list doesn't strand
     //    already-minted tokens with a stale cap.
@@ -1241,8 +1233,8 @@ async fn handle_federated_jwt(
     };
 
     let client_label = client_id.unwrap_or("federated").to_string();
-    // alpha-F9b — role-derived cap permission. A corrupt `sa.role` is
-    // an Invariant from the apply pipeline (apply-time validator gates
+    // Role-derived cap permission. A corrupt `sa.role` is an invariant
+    // violation from the apply pipeline (apply-time validator gates
     // role ∈ {developer, reader}), so unreachable here in practice;
     // surface it as a 500 rather than mint an empty-cap token that
     // would deterministically deny.
@@ -1395,10 +1387,10 @@ async fn handle_federated_jwt(
 /// `OidcIssuer.audiences`), NOT the raw `all_claims["aud"]`. The raw
 /// value may be an RFC 7519 §4.1.3 array, which the generic
 /// `.as_str()` path silently fails to match; binding to the resolved
-/// scalar is both correct for the array case AND the F-7 fix —
-/// without it, a JWT minted for a *different* relying party whose
-/// other claims happen to satisfy the fragment could assume the SA
-/// (confused-deputy / token-redirection).
+/// scalar is correct for the array case and closes the confused-deputy
+/// / token-redirection vector (without it, a JWT minted for a
+/// *different* relying party whose other claims happen to satisfy the
+/// fragment could assume the SA).
 const AUD_CLAIM_KEY: &str = "aud";
 
 /// Per-FI evaluation outcome. `Match` / `NoMatch` are the only two
@@ -1413,8 +1405,8 @@ enum FiEval {
     /// At least one non-`aud` claim mismatched. Generic no-match.
     NoMatch,
     /// Every non-`aud` claim matched, but the FI pinned an `aud`
-    /// selector that did not equal the validator-resolved audience.
-    /// The F-7 confused-deputy signal.
+    /// selector that did not equal the validator-resolved audience
+    /// (confused-deputy / token-redirection signal).
     AudienceDenied,
     /// The FI's `claims` map is empty.
     /// Apply-time validation rejects this (ADR 0018), so a
@@ -1451,7 +1443,7 @@ fn evaluate_fi(
     let mut aud_ok = true;
     for (k, expected) in &fi.claims {
         if k == AUD_CLAIM_KEY {
-            // F-7: bind to the resolved single audience, not the raw
+            // Bind to the resolved single audience, not the raw
             // (possibly-array) `all_claims["aud"]`.
             aud_ok = claims.audience == *expected;
         } else {
@@ -1468,10 +1460,10 @@ fn evaluate_fi(
     }
     match (non_aud_all_match, aud_ok) {
         (true, true) => FiEval::Match,
-        // Sole reason for the non-match is the audience binding — the
-        // F-7 confused-deputy case the audit names. Surfaced as a
-        // distinct metric label so a reviewer sees token-redirection
-        // attempts without disentangling them from generic no-match.
+        // Sole reason for the non-match is the audience binding —
+        // confused-deputy / token-redirection case. Surfaced as a
+        // distinct metric label so a reviewer sees such attempts
+        // without disentangling them from generic no-match.
         (true, false) => FiEval::AudienceDenied,
         _ => FiEval::NoMatch,
     }
@@ -1480,9 +1472,9 @@ fn evaluate_fi(
 /// SA-resolution outcome. `matches` is the set of `ServiceAccount`s a
 /// matching `FederatedIdentity` selected. `any_audience_denied` /
 /// `any_empty_claims` are set when at least one FI was rejected
-/// *solely* by the F-7 audience binding / the F-8 empty-claims
-/// fail-closed skip and no SA matched — the call site uses them to
-/// emit `hort_fed_sa_match_total{result=denied_audience|denied_empty_claims}`
+/// *solely* by the audience binding / the empty-claims fail-closed
+/// skip and no SA matched — the call site uses them to emit
+/// `hort_fed_sa_match_total{result=denied_audience|denied_empty_claims}`
 /// so the confused-deputy and empty-claims signals are observable
 /// without disentangling them from the generic `no_sa_match` bucket.
 struct SaMatchOutcome<'a> {
@@ -1549,9 +1541,8 @@ fn emit_fed_sa_match(result: &'static str) {
 
 /// Emit the structured deny log AND build the 401 response. Single
 /// emission site so every deny variant produces an identical log shape
-/// (design doc §4 "Deny logging" / §7 — no claim values beyond `iss`,
-/// `sub`, `aud` at INFO; `MultipleSaMatch` additionally surfaces the
-/// matched SA names per the multi-match policy).
+/// (no claim values beyond `iss`, `sub`, `aud` at INFO;
+/// `MultipleSaMatch` additionally surfaces the matched SA names).
 fn deny_outcome(err: &FederationHandlerError, iss: &str, sub: &str, aud: &str) -> Outcome {
     let reason = err.as_str();
     // Empty audience renders as the explicit "<absent>" sentinel so the
@@ -2129,8 +2120,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
     ///   principals carry a `developer` role.
     /// - An `RbacEvaluator` seeded with a `developer` role granting
     ///   global Read / Write / Delete — enough for the cli_session
-    ///   issuance pipeline's cap-vs-authority check (which forces
-    ///   `[Read, Write, Delete]` per design doc 039 §6) to succeed.
+    ///   issuance pipeline's cap-vs-authority check to succeed.
     fn build_router_with_idp(
         base: &Arc<AppContext>,
         mocks: &MockPorts,
@@ -2574,13 +2564,13 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
     }
 
     // -----------------------------------------------------------------------
-    // B3 metric-emission tests
+    // Metric-emission tests
     // -----------------------------------------------------------------------
     //
     // These tests register a `metrics_util::debugging::DebuggingRecorder`
     // for the duration of a synthetic `/exchange` request and assert
     // that the (counter, histogram, label-set) shape matches the catalog
-    // entry registered by Item B3. Each test runs its own
+    // entry registered in the metrics catalog. Each test runs its own
     // `tokio::runtime` because `metrics::with_local_recorder` is a
     // sync entry point and we cannot nest a `block_on` from inside a
     // surrounding `#[tokio::test]` runtime.
@@ -2707,7 +2697,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             .unwrap()
     }
 
-    // -- B3.a: every result label fires at least once -----------------------
+    // -- Every result label fires at least once -------------------------------
     //
     // `success`, `source_token_pat_rejected`, `source_token_expired`,
     // and `idp_unavailable` already have dedicated DebuggingRecorder
@@ -2846,13 +2836,13 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
     /// user is provisioned with no role, and the cap-vs-grants check
     /// in `issue_cli_session` rejects the forced
     /// `[Read, Write, Delete]` declaration as `CapExceedsAuthority`.
-    /// Per Item B6 the handler maps this to a caller-side denial —
+    /// The handler maps this to a caller-side denial —
     /// HTTP 403 access_denied with the
     /// `hort_token_exchange_total{result="cap_exceeds_authority"}`
     /// counter — NOT to the operator-actionable infrastructure_error
-    /// bucket. (Pre-B6 the handler collapsed every ApiTokenError to
+    /// bucket. (Previously the handler collapsed every ApiTokenError to
     /// infrastructure_error, generating false-positive outage alerts
-    /// on RBAC denials; B6 fixes that.)
+    /// on RBAC denials.)
     #[test]
     fn exchange_metric_fires_cap_exceeds_authority_on_issuance_denial() {
         let snap = capture_full_snapshot(|| {
@@ -2907,7 +2897,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
     }
 
-    // -- B3.b: double-emission canonical test -------------------------------
+    // -- Double-emission canonical test ---------------------------------------
 
     /// Locks in the contract that the success path of `/exchange`
     /// fires BOTH the handler-level counter and the use-case-level
@@ -2944,7 +2934,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
     }
 
-    // -- B3.c + B3.d: histogram firing on success and error paths -----------
+    // -- Histogram firing on success and error paths -------------------------
 
     #[test]
     fn exchange_histogram_records_duration_on_success() {
@@ -2992,7 +2982,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
     }
 
-    // -- B7.F4: AuthContext::Disabled fallback ------------------------------
+    // -- AuthContext::Disabled fallback --
 
     /// Pins the
     /// composition-bug-guard arm. The handler exposes a 503
@@ -3031,39 +3021,19 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
     }
 
-    // -- B7.F2 + B7.F3: REPORTED COVERAGE GAP -------------------------------
+    // -- Coverage gaps (failure-injection not yet implemented) ---------------
     //
-    // The two remaining B7 coverage gaps require failure-injection
-    // hooks on `MockUserRepository` that do not exist today. Per the
-    // B7 starter prompt, B7 does NOT extend
-    // `crates/hort-app/src/use_cases/test_support.rs`; this is reported
-    // for a follow-on (parallel to B6a's `MockApiTokenRepository::fail_next_insert`):
-    //
-    // - **F2** (`exchange_metric_fires_subject_not_authorised_on_post_validation_403`)
-    //   would need either (a) `MockUserRepository::fail_next_find_by_external_id`
-    //   / `fail_next_upsert_on_login` to inject a `DomainError`, or
-    //   (b) the `AuthenticateUseCase`'s OIDC path to actually reject
-    //   `is_active=false` users (today it merely persists the flag —
-    //   the §3 design row "user deactivated → 403" is not enforced
-    //   in code yet, only documented).
-    //
-    // - **F3** (`exchange_metric_fires_infrastructure_error_on_authenticate_bearer_catchall`)
-    //   would need a `fail_next_*` hook on `MockUserRepository` to
-    //   surface `AppError::Domain` from a downstream port; the
-    //   handler's `Err(_)` arm is otherwise unreachable in tests.
-    //
-    // The catch-all `Err(_)` arm IS exercised at compile time by
-    // exhaustive matching, so a regression that mis-routed an
+    // `exchange_metric_fires_subject_not_authorised_on_post_validation_403`
+    // and `exchange_metric_fires_infrastructure_error_on_authenticate_bearer_catchall`
+    // require failure-injection hooks on `MockUserRepository` that do
+    // not yet exist. The catch-all `Err(_)` arm IS exercised at compile
+    // time by exhaustive matching, so a regression that mis-routed an
     // `AppError::Repository(_)` through the wrong arm would fail to
-    // compile. Runtime coverage of the arm is the gap.
-    //
-    // Closing these requires a B7a-style follow-on adding
-    // `MockUserRepository::fail_next_find_by_external_id` and
-    // `MockUserRepository::fail_next_upsert_on_login` (mirroring the
-    // existing ten `fail_next_*` precedents — `MockRefRegistryPort::fail_next_insert`
-    // is the closest shape match).
+    // compile. Runtime coverage of the arm is the gap, deferred to a
+    // follow-on that adds `MockUserRepository::fail_next_find_by_external_id`
+    // and `MockUserRepository::fail_next_upsert_on_login`.
 
-    // -- B3.e: cardinality discipline ---------------------------------------
+    // -- Cardinality discipline -----------------------------------------------
 
     /// Locks in the closed-`{kind, result}` label set against future
     /// regression. If someone adds `format=`, `client_id=`,
@@ -3111,7 +3081,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
     }
 
-    // -- B7.B.5: closed-enum lock against the catalog ----------------------
+    // -- Closed-enum lock against the catalog --------------------------------
 
     /// Locks in the closed
     /// `result` enum against the catalog for the **cli_session**
@@ -3157,13 +3127,9 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         assert_eq!(
             actual, expected,
             "metric `result` enum diverges from the docs/metrics-catalog.md \
-             post-B7 closed taxonomy: actual={actual:?}, expected={expected:?}"
+             closed taxonomy: actual={actual:?}, expected={expected:?}"
         );
-        assert_eq!(
-            actual.len(),
-            10,
-            "post-B7 closed enum has exactly 10 values"
-        );
+        assert_eq!(actual.len(), 10, "closed enum has exactly 10 values");
     }
 
     // =====================================================================
@@ -3586,7 +3552,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         }
     }
 
-    /// F-7 confused-deputy: a JWT minted (legitimately) for a DIFFERENT
+    /// Confused-deputy: a JWT minted (legitimately) for a DIFFERENT
     /// relying party — `audience = "other-rp"` — whose other claims
     /// (`repository`) satisfy the SA fragment must NOT assume the SA.
     /// The `aud` selector binds to the validator-resolved audience, so
@@ -3620,7 +3586,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         assert_eq!(
             counter_value(&snap, metrics::FED_SA_MATCH_COUNTER, "denied_audience"),
             1,
-            "F-7: the audience-confusion deny must be observable; saw {snap:?}"
+            "the audience-confusion deny must be observable; saw {snap:?}"
         );
         assert_eq!(
             counter_value(&snap, metrics::FED_SA_MATCH_COUNTER, "matched"),
@@ -3659,7 +3625,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
     }
 
     /// `hort_fed_sa_match_total` carries the `{result}` label ONLY — no
-    /// high-cardinality leakage (design §4 / metrics-catalog rule).
+    /// high-cardinality leakage (metrics-catalog rule).
     #[test]
     fn fed_sa_match_metric_carries_only_result_label() {
         let snap = capture_full_snapshot(|| {
@@ -3756,8 +3722,8 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         }
     }
 
-    /// F-8 runtime fail-closed: an SA whose FI has `claims = {}` must
-    /// NOT be matched by any JWT from the issuer (the vacuously-true
+    /// Runtime fail-closed: an SA whose FI has `claims = {}` must NOT
+    /// be matched by any JWT from the issuer (the vacuously-true
     /// `[].iter().all() ⇒ true` footgun). Pins: 401 `invalid_grant`,
     /// no token, and `hort_fed_sa_match_total{result="denied_empty_claims"}`.
     #[test]
@@ -3775,14 +3741,14 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                 assert_eq!(v["error"], "invalid_grant");
                 assert!(
                     v.get("access_token").is_none(),
-                    "an empty-claims FI must never mint a token (F-8 fail-closed)"
+                    "an empty-claims FI must never mint a token (fail-closed)"
                 );
             });
         });
         assert_eq!(
             counter_value(&snap, metrics::FED_SA_MATCH_COUNTER, "denied_empty_claims"),
             1,
-            "F-8: the empty-claims fail-closed skip must be observable; saw {snap:?}"
+            "the empty-claims fail-closed skip must be observable; saw {snap:?}"
         );
         assert_eq!(
             counter_value(&snap, metrics::FED_SA_MATCH_COUNTER, "matched"),
@@ -3791,7 +3757,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
     }
 
-    /// Pure-unit coverage of the F-8 fail-closed skip inside
+    /// Pure-unit coverage of the empty-claims fail-closed skip inside
     /// `collect_sa_matches`: `claims = {}` ⇒ zero matches AND the
     /// empty-claims flag set so the call site emits
     /// `denied_empty_claims` rather than the generic `no_sa_match`.
@@ -3826,7 +3792,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
     }
 
     /// A non-empty fragment that fully matches still returns `Match` —
-    /// the F-8 guard does not regress the happy path.
+    /// the empty-claims guard does not regress the happy path.
     #[test]
     fn evaluate_fi_non_empty_match_unaffected_by_f8_guard() {
         let mut claims_map = std::collections::BTreeMap::new();
@@ -4080,7 +4046,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
     }
 
     /// JWT.exp 10 minutes from now ⇒ minted token expires_at ≤ now + 10
-    /// min. Pins design doc §4 step 8: validity = min(1h, jwt.exp - now).
+    /// min. Pins: validity = min(1h, jwt.exp - now).
     #[test]
     fn federation_validity_cap_respects_jwt_exp_when_below_1h() {
         rt().block_on(async {
@@ -4133,10 +4099,10 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         });
     }
 
-    /// Pins design doc §4 step 8 — ApiTokenIssued event carries the
-    /// three federation-attribution fields. The payload propagation
-    /// is the federation-audit contract; an empty / wrong value would
-    /// silently break correlation against the foreign issuer's JWT log.
+    /// Pins that ApiTokenIssued carries the three federation-attribution
+    /// fields. The payload propagation is the federation-audit contract;
+    /// an empty / wrong value would silently break correlation against
+    /// the foreign issuer's JWT log.
     #[test]
     fn federation_emits_api_token_issued_with_source_fields() {
         rt().block_on(async {
@@ -4174,8 +4140,8 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         });
     }
 
-    /// alpha-F9b — a federation-minted SA token MUST carry the SA's
-    /// role-derived permission in `declared_permissions`; an empty cap
+    /// A federation-minted SA token MUST carry the SA's role-derived
+    /// permission in `declared_permissions`; an empty cap
     /// deterministically denies every authz check because
     /// `cap_allows_optional_repo` requires
     /// `cap.permissions.contains(requested)`. Pin developer → Write.
@@ -4203,8 +4169,8 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             assert_eq!(
                 issued.declared_permissions,
                 vec![Permission::Write],
-                "developer SA federation mint must carry [Write]; empty was the alpha-F9b bug \
-                 (the cap leg of RbacEvaluator::authorize denies every check on empty cap)"
+                "developer SA federation mint must carry [Write]; an empty cap \
+                 would deny every authz check (cap leg requires permissions.contains(requested))"
             );
             assert!(
                 issued.repository_ids.is_none(),
@@ -4214,7 +4180,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         });
     }
 
-    /// alpha-F9b — symmetric pin for the `reader` role → Read.
+    /// Symmetric pin for the `reader` role → Read.
     #[test]
     fn federation_minted_token_carries_role_derived_read_for_reader_sa() {
         rt().block_on(async {

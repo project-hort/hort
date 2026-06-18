@@ -4,7 +4,7 @@
 # declarations (phase 6).
 #
 # Stages a transient $HORT_CONFIG_DIR containing one of EACH new kind
-# landed in 14b (Role, PermissionGrant, CurationRule, ScanPolicy,
+# (Role, PermissionGrant, CurationRule, ScanPolicy,
 # Exclusion) plus one ArtifactRepository that references the
 # CurationRule by name (so the junction-edge wiring is exercised) and
 # one GroupMapping for parity with the gitops baseline.
@@ -552,7 +552,7 @@ fi
 # verifies the *enforcement* pipeline that consumes those managed
 # declarations. Each subphase pins
 # a single decision-point's metric label set against the catalog and
-# the lifecycle event the design doc §5 mandates.
+# the expected lifecycle event.
 #
 # Reachable from a black-box smoke against the v2 stack:
 #   - **6a) Curation gate at ingest** (decision_point=curation):
@@ -610,9 +610,9 @@ fi
 #     surface mounted; the use case is wired but no inbound adapter
 #     exists yet.
 #
-# These three remain dormant per the §1 dormancy admonition; this
-# script's intent is to fail loudly the day they DO surface (so the
-# implementer remembers to extend the smoke).
+# These three remain dormant; this script's intent is to fail loudly
+# the day they DO surface (so the implementer remembers to extend the
+# smoke).
 #
 # All HTTP calls to hort-server use the Keycloak `dev-user` access
 # token fetched from the v2 stack's Keycloak host port (25082) —

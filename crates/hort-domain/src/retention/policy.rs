@@ -23,12 +23,10 @@
 //! - the embedded `predicate` / `scope` re-validate on `Created` /
 //!   `Updated` so a malformed payload cannot enter replayed state.
 //!
-//! `project` is the in-domain test surface the B1 acceptance bullet
-//! ("replay test over a fixture stream that includes a `Composite(And,
-//! [HasFindingAboveSeverity(High), HasFixAvailable,
-//! HasFindingDetectedFor(7d)])` policy") exercises. Persisting these
-//! events through the real Postgres event-store adapter and the
-//! round-trip there is the **carved-out** B1-adapter follow-on.
+//! `project` is exercised by replay tests over fixture streams that
+//! include composite security-driven predicates. Persisting these events
+//! through the real Postgres event-store adapter and round-tripping
+//! there is the adapter layer's job.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -562,8 +560,8 @@ mod tests {
         assert_eq!(p.stream_version, 1);
     }
 
-    /// The canonical operator pattern fixture (B1 acceptance bullet /
-    /// §4 / §1): a `Composite(And, [HasFindingAboveSeverity(High),
+    /// The canonical operator pattern fixture: a
+    /// `Composite(And, [HasFindingAboveSeverity(High),
     /// HasFixAvailable, HasFindingDetectedFor(7d)])` policy replayed
     /// over a Created → Evaluated → Updated stream.
     #[test]
@@ -583,7 +581,7 @@ mod tests {
                 id,
                 name: "high-with-fix-7d".into(),
                 predicate: canonical.clone(),
-                // §6 invariant 8 default for security-driven retention.
+                // Default scope for security-driven retention.
                 scope: RetentionScope::IngestSource(IngestSource::Proxied),
                 created_at: ts(100),
             },

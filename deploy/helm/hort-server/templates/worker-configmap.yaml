@@ -19,10 +19,10 @@ metadata:
     {{- include "hort-server.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
 data:
-  {{- /* Backlog 078 Item 6 (chart S3) — load-bearing scanner enable   */}}
-  {{- /* flags. When false, the worker does NOT register that backend   */}}
-  {{- /* regardless of the binary `--version` probe (the flag is the    */}}
-  {{- /* gate; the probe is a secondary health check).                  */}}
+  {{- /* Load-bearing scanner enable flags. When false, the worker does */}}
+  {{- /* NOT register that backend regardless of the binary `--version` */}}
+  {{- /* probe (the flag is the gate; the probe is a secondary health   */}}
+  {{- /* check).                                                        */}}
   HORT_SCANNER_TRIVY_ENABLED: {{ .Values.worker.scanner.trivy.enabled | quote }}
   HORT_SCANNER_OSV_ENABLED: {{ .Values.worker.scanner.osv.enabled | quote }}
   HORT_SCANNER_TRIVY_BIN: {{ .Values.worker.scanner.trivy.binary | quote }}

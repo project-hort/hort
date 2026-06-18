@@ -92,7 +92,7 @@ pub mod verify_event_chain;
 ///    the scrub passes a mapper from `ScrubReport` to either SUCCESS or
 ///    `ExitCode::from(1)`),
 /// 4. maps `Err(anyhow::Error)` to [`ExitCode::FAILURE`], printing the
-///    full context chain via the `Debug` impl (matches pre-F3 behaviour
+///    full context chain via the `Debug` impl (matches the earlier behaviour
 ///    of a `main() -> anyhow::Result<()>`).
 ///
 /// Runtime-build failure prints `error: building tokio runtime: {err}`
@@ -306,7 +306,7 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Migrate)));
     }
 
-    // `scrub` subcommand parses with empty args (Item 12 will add fields).
+    // `scrub` subcommand parses with empty args.
 
     #[test]
     fn scrub_parses() {
@@ -347,7 +347,7 @@ mod tests {
     }
 
     // `admin` without a subcommand must fail — the nested enum is
-    // required. Pins the shape so Item 15's starter prompt doesn't
+    // required. Pins the shape so a future subcommand addition doesn't
     // drift. Clap reports this as `DisplayHelpOnMissingArgumentOrSubcommand`
     // by default (prints the subcommand's help + exits non-zero),
     // which is fine — the important property is that it doesn't

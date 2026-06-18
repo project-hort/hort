@@ -3,9 +3,7 @@
 //! Applies a process-wide [`ExtraTrustAnchors`] bundle to a
 //! `reqwest::ClientBuilder`. Failures fold into the existing
 //! `tls_classified_error(UpstreamErrorKind::CaUnknown, …)` discipline —
-//! no parallel error enum is introduced. See design §3 for the three-shape
-//! decision (upstream-http → `DomainResult`, oidc → crate-local error,
-//! storage → `object_store::Error`).
+//! no parallel error enum is introduced.
 
 use reqwest::ClientBuilder;
 

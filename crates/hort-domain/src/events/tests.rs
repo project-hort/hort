@@ -208,7 +208,7 @@ fn stream_id_from_str_user_round_trip() {
 
 #[test]
 fn stream_category_user_distinct_from_admin() {
-    // The B7 deviation note: `User` is structurally distinct from
+    // `User` is structurally distinct from
     // `Admin`. Keep these on separate streams so an audit consumer
     // reading "all admin events" never collides with the per-user
     // PAT lifecycle.
@@ -273,7 +273,7 @@ fn stream_id_from_str_artifact_group_round_trip() {
     assert_eq!(parsed.to_string(), display);
 }
 
-/// **B1 regression guard** — `artifact-<uuid>` and `artifact_group-<uuid>`
+/// **Regression guard** — `artifact-<uuid>` and `artifact_group-<uuid>`
 /// MUST resolve to different categories. The parser splits on the first
 /// `'-'`; the category prefix for groups is `"artifact_group"` (underscore,
 /// then hyphen before the UUID), so the two stream forms cannot collide.
@@ -572,7 +572,7 @@ fn stream_category_token_use_requires_admin() {
     assert!(StreamCategory::TokenUse.requires_admin());
 }
 
-/// F-2 canonical-bytes distinctness: a token-use stream id is never
+/// Canonical-bytes distinctness: a token-use stream id is never
 /// equal to the token-owner's `User` lifecycle stream id, the
 /// artifact aggregate stream, or a download-audit stream for the same
 /// uuid (the symmetric stream-identity property at the StreamId level —
@@ -725,9 +725,8 @@ fn stream_id_eventstore_retention_constructor() {
 #[test]
 fn stream_id_eventstore_retention_is_a_stable_singleton() {
     // Two calls must yield the same `entity_id` — there is exactly
-    // one global never-deleted audit-meta stream (the F-2
-    // `StreamSealed` tombstones + F-9 Part-3 destructive-task audit
-    // both land here).
+    // one global never-deleted audit-meta stream (the `StreamSealed`
+    // tombstones + destructive-task audit both land here).
     let a = StreamId::eventstore_retention();
     let b = StreamId::eventstore_retention();
     assert_eq!(a, b);
@@ -814,7 +813,7 @@ fn ref_moved_validate_ok_content_hash_move() {
 
 #[test]
 fn ref_moved_validate_rejects_same_target() {
-    // §2.4 — "Idempotent re-pointing is NOT an event." Emitting `RefMoved`
+    // "Idempotent re-pointing is NOT an event." Emitting `RefMoved`
     // with `from == Some(to)` is a caller mistake; the domain rejects it
     // as an Invariant violation.
     let target = RefTarget::Version("1.2.3".into());
@@ -1079,7 +1078,7 @@ fn artifact_group_initiated_validate_ok_with_primary() {
 
 #[test]
 fn artifact_group_initiated_validate_ok_empty_primary_role_sentinel() {
-    // §2.10 case 2: first member is not primary → group created with
+    // First member is not primary → group created with
     // `primary_role = ""` sentinel. The empty string is explicitly valid
     // here — it is the signal that no primary has been assigned yet.
     let e = ArtifactGroupInitiated {
@@ -2693,7 +2692,7 @@ fn validate_artifact_released_policy_re_evaluation_with_released_by_user_id_reje
 
 #[test]
 fn validate_artifact_released_admin_oversize_justification_rejected() {
-    // 513-byte justification — one over the 512-byte cap from §2.3.
+    // 513-byte justification — one over the 512-byte cap.
     let oversized = "x".repeat(513);
     let e = ArtifactReleased {
         artifact_id: id(),
@@ -2794,7 +2793,7 @@ fn validate_artifact_released_curator_missing_justification_rejected() {
 
 #[test]
 fn validate_artifact_released_curator_oversize_justification_rejected() {
-    // 513-byte justification — one over the 512-byte cap from §2.3.
+    // 513-byte justification — one over the 512-byte cap.
     let oversized = "x".repeat(513);
     let e = ArtifactReleased {
         artifact_id: id(),

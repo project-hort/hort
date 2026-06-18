@@ -202,12 +202,12 @@ pub(crate) fn stream_category_from_text(s: &str) -> DomainResult<StreamCategory>
 
 // ---------------------------------------------------------------------------
 // EventTypeKind wire form (PascalCase variant name — matches the
-// `event_type` string used in the §8 notification payload).
+// `event_type` string used in the notification payload).
 // ---------------------------------------------------------------------------
 
 /// Wire form for an [`EventTypeKind`] inside the
 /// `filter.event_types.kinds` JSON array. The form is the variant name
-/// verbatim — matches the `event_type` field shipped in the §8
+/// verbatim — matches the `event_type` field shipped in the
 /// notification payload so receivers parse one canonical string.
 pub(crate) fn event_type_kind_to_text(k: EventTypeKind) -> &'static str {
     match k {
@@ -598,7 +598,7 @@ impl FilterDto {
         };
         // `NamedPredicate` is an empty enum in v1 — `named_predicates`
         // is always serialised as an empty array. The shape is reserved
-        // for the audited extension path (design §3 / §11 invariant 4).
+        // for the audited extension path.
         json!({
             "categories": categories,
             "event_types": event_types,
@@ -1477,7 +1477,7 @@ mod tests {
     fn event_type_kind_dto_round_trips_every_variant() {
         // ALL `EventTypeKind` variants — including the high-volume slots
         // that are not yet emittable from `DomainEvent` (the wire form
-        // is forward-compatible — design §3 / §11 invariant 5).
+        // is forward-compatible).
         let all = [
             EventTypeKind::ArtifactIngested,
             EventTypeKind::ChecksumVerified,
@@ -1830,7 +1830,7 @@ mod tests {
         assert_eq!(sub.filter, filter);
         assert_eq!(
             sub.snapshot_claims, snapshot,
-            "snapshot_claims must round-trip verbatim (authority floor — §5.5)"
+            "snapshot_claims must round-trip verbatim (authority floor)"
         );
         assert_eq!(sub.state, SubscriptionState::Active);
         assert_eq!(sub.last_delivered_position, Some(12_891));
@@ -1840,8 +1840,7 @@ mod tests {
     #[test]
     fn subscription_row_empty_snapshot_claims_round_trips_as_empty() {
         // The DB default for the new column is `'{}'` — an empty
-        // snapshot (subscription created via PAT by a non-admin, §5.5
-        // PATCH-via-PAT wrinkle / `snapshot_empty_no_admin` diagnostic)
+        // snapshot (subscription created via PAT by a non-admin)
         // must survive the mapper as an empty `Vec`, NOT as `None`/panic.
         let row = SubscriptionRow {
             id: Uuid::new_v4(),

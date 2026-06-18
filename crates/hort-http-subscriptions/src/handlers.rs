@@ -144,8 +144,8 @@ pub async fn get_subscription(
 /// - Otherwise → call `update()`. Note that the use case's `update()`
 ///   accepts a `state` field but emits a single `SubscriptionUpdated`
 ///   event with `changed_fields = ["state"]` instead of the dedicated
-///   pause/resume event; the dispatch above preserves the §5 audit
-///   shape for the common operator surface.
+///   pause/resume event; the dispatch above preserves the dedicated
+///   audit event shape for the common operator surface.
 pub async fn update_subscription(
     State(ctx): State<Arc<AppContext>>,
     AuthenticatedCaller(principal): AuthenticatedCaller,

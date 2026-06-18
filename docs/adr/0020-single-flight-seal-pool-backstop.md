@@ -1,7 +1,7 @@
 # 0020 — Single-flight backstop for the unbounded seal/retention append
 
 - **Status:** Accepted
-- **Enforced by:** layered single-flight (CronJob `concurrencyPolicy: Forbid` + worker per-kind semaphore `concurrency=1` + per-UTC-day idempotency key + sequential `seal_one` await) plus a connection-level `lock_timeout` backstop on both worker pools. Relaxing any layer protecting `seal_and_remove`'s unbounded `StreamSealed` append is a hard block pending F-2 co-review.
+- **Enforced by:** layered single-flight (CronJob `concurrencyPolicy: Forbid` + worker per-kind semaphore `concurrency=1` + per-UTC-day idempotency key + sequential `seal_one` await) plus a connection-level `lock_timeout` backstop on both worker pools. Relaxing any layer protecting `seal_and_remove`'s unbounded `StreamSealed` append is a hard block pending co-review.
 - **Supersedes:** —
 
 ## Context
@@ -12,7 +12,7 @@
 
 The unbounded append is protected by **defence in depth**: (1) the `eventstore-archive` CronJob's `concurrencyPolicy: Forbid`; (2) the worker per-kind semaphore (`concurrency=1`); (3) the per-UTC-day idempotency key; (4) the sequential `seal_one` await. As a connection-level backstop, both worker Postgres pools carry a **`lock_timeout`** (`HORT_WORKER_LOCK_TIMEOUT_MS`, default 120000 ms) — bounding only lock-acquisition wait, never aborting a legitimately slow large-stream `DELETE`.
 
-Relaxing **any** single-flight layer is a hard block pending **F-2 co-review**. Setting the timeout to `0` (disables the backstop on both pools), substituting `statement_timeout` for `lock_timeout`, or applying the bound to only one of the two pools are all forbidden without the recorded rationale.
+Relaxing **any** single-flight layer is a hard block pending co-review. Setting the timeout to `0` (disables the backstop on both pools), substituting `statement_timeout` for `lock_timeout`, or applying the bound to only one of the two pools are all forbidden without the recorded rationale.
 
 ## Consequences
 

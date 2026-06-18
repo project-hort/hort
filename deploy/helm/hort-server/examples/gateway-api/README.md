@@ -103,9 +103,8 @@ For end-to-end TLS — where the Gateway re-encrypts traffic to the
 chart's pods rather than forwarding plain HTTP — Gateway API exposes
 the [`BackendTLSPolicy`](https://gateway-api.sigs.k8s.io/api-types/backendtlspolicy/)
 resource (also under `gateway.networking.k8s.io/v1`). hort-server does **not** terminate TLS in the binary itself, so the
-Gateway terminates TLS and talks plain HTTP to the chart's pods. `BackendTLSPolicy` becomes relevant
-once the in-binary-TLS initiative ships and the chart's Service grows
-an HTTPS port.
+Gateway terminates TLS and talks plain HTTP to the chart's pods. `BackendTLSPolicy` becomes relevant once in-binary TLS is supported
+and the chart's Service grows an HTTPS port.
 
 ## Pitfalls
 

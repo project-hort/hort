@@ -19,7 +19,7 @@
 //! stream the rest of the apply-time authz mutations use; the rotation
 //! event lands on the SA's backing-user stream
 //! ([`StreamId::user`](super::StreamId::user)) alongside the
-//! `ApiTokenIssued` it correlates with. Item 1's scope ends at the
+//! `ApiTokenIssued` it correlates with. This module's scope ends at the
 //! payload struct; the apply use case and the rotation handler pick the
 //! stream id.
 //!
@@ -146,7 +146,7 @@ impl ServiceAccountCreated {
 /// row — role, repositories, federated identities, or fallback rotation
 /// changed for the matching `metadata.name`.
 ///
-/// Identity is `service_account_name` (§3). Before/after values stay
+/// Identity is `service_account_name`. Before/after values stay
 /// out of the payload (see module docstring).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceAccountUpdated {

@@ -1003,9 +1003,8 @@ impl TryFrom<FederatedIdentityRow> for FederatedIdentity {
             tracing::warn!(
                 entity = "FederatedIdentity",
                 federated_identity_id = %row.id,
-                "claims column is an empty JSON object — rejecting (F-8 \
-                 defense-in-depth; empty claims = any JWT from the issuer \
-                 can assume the SA)"
+                "claims column is an empty JSON object — rejecting (defense-in-depth; \
+                 empty claims = any JWT from the issuer can assume the SA)"
             );
             return Err(DomainError::Invariant(format!(
                 "claims must be a non-empty JSON object in \
@@ -1050,7 +1049,7 @@ impl TryFrom<FederatedIdentityRow> for FederatedIdentity {
 /// [`SecretFormat::from_str`] and surfaces unknown literals as
 /// `DomainError::Invariant`. Both intervals translate through the
 /// `pg_interval_to_duration` helper; the DB CHECK
-/// `validity >= 2 * rotation_interval` enforces the §2 safety margin.
+/// `validity >= 2 * rotation_interval` enforces the safety margin.
 #[derive(Debug, FromRow)]
 pub struct FallbackRotationRow {
     pub service_account_id: Uuid,
@@ -1698,11 +1697,10 @@ mod tests {
         assert_eq!(user.external_id.as_deref(), Some("okta|abc123"));
     }
 
-    /// Item 10 (§2.10, L3): a users row with an unexpected `auth_provider`
-    /// value must surface as `DomainError::Invariant`, not silently coerce
-    /// to `Local`. The schema CHECK prevents this in practice; the strict
-    /// mapper is defense-in-depth against out-of-band writes and schema
-    /// drift.
+    /// A users row with an unexpected `auth_provider` value must surface
+    /// as `DomainError::Invariant`, not silently coerce to `Local`. The
+    /// schema CHECK prevents this in practice; the strict mapper is
+    /// defense-in-depth against out-of-band writes and schema drift.
     #[test]
     fn user_corrupted_auth_provider_returns_invariant() {
         let row = UserRow {
@@ -2128,7 +2126,7 @@ mod tests {
     /// Round-trip `DomainEvent::ArtifactGroupMemberAdded` (the simplest of
     /// the four group events — no nested `ArtifactCoords`) through the
     /// adapter's existing tagged-enum serialisation helpers. Same
-    /// invariant the `RefMoved` round-trip test locked in for Item 2:
+    /// Same invariant the `RefMoved` round-trip test locked in:
     /// `serialize_event_data` / `deserialize_event_data` MUST NOT need
     /// modification to support new `DomainEvent` variants — serde's
     /// derived impls handle that.
@@ -2224,10 +2222,9 @@ mod tests {
     /// Companion round-trip for `DomainEvent::ArtifactGroupInitiated` —
     /// this one carries a nested `ArtifactCoords`, which is the variant
     /// that motivated adding `Serialize + Deserialize` to
-    /// `ArtifactCoords` (Item 5 scope-fence exception). If the coords
-    /// serde derives ever regressed, this test is the first line that
-    /// would fail — the tagged-enum envelope round-trip would throw on
-    /// deserialise.
+    /// `ArtifactCoords`. If the coords serde derives ever regressed,
+    /// this test is the first line that would fail — the tagged-enum
+    /// envelope round-trip would throw on deserialise.
     #[test]
     fn event_row_artifact_group_initiated_round_trip_unchanged_mapper() {
         use hort_domain::events::ArtifactGroupInitiated;
@@ -2375,7 +2372,7 @@ mod tests {
 
     #[test]
     fn pg_interval_six_hours_round_trip() {
-        // §2 default for `FallbackRotation.rotation_interval`.
+        // Default for `FallbackRotation.rotation_interval`.
         let iv = PgInterval {
             months: 0,
             days: 0,
@@ -2604,8 +2601,8 @@ mod tests {
         assert_eq!(sa.backing_user_id, Uuid::from_u128(1));
         assert_eq!(sa.role, "developer");
         assert_eq!(sa.repositories, vec!["pypi-internal"]);
-        // Sub-aggregates are empty; the repository impl (Item 3)
-        // populates them via separate queries.
+        // Sub-aggregates are empty; the repository impl populates them
+        // via separate queries.
         assert!(sa.federated_identities.is_empty());
         assert!(sa.fallback_rotation.is_none());
     }
@@ -2689,7 +2686,7 @@ mod tests {
         assert!(
             err.to_string().contains("non-empty")
                 && err.to_string().contains("privilege-escalation"),
-            "empty-claims reject must explain the F-8 footgun, got: {err}"
+            "empty-claims reject must explain the privilege-escalation footgun, got: {err}"
         );
     }
 

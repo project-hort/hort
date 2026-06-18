@@ -75,20 +75,19 @@ use crate::use_cases::ingest_use_case::{IngestUseCase, VerifiedIngestRequest};
 
 /// Parsed shape of the `params` JSONB column for a `prefetch` row.
 ///
-/// **Item 12b changes the shape from Item 12.** The cascade now
-/// resolves a CONCRETE version in
+/// The cascade resolves a CONCRETE version in
 /// `PrefetchDependenciesHandler::plan_and_enqueue` (Pass 2 hybrid
-/// resolution), so the leaf row carries `version` — not the opaque
-/// `range` Item 12 wrote. Old `range`-shaped rows in flight at
-/// upgrade time will fail to parse and be marked failed (non-retry);
-/// the next ingest cascade re-derives them with the new shape.
+/// resolution), so the leaf row carries `version` — not an opaque
+/// range field. Old range-shaped rows in flight at upgrade time will
+/// fail to parse and be marked failed (non-retry); the next ingest
+/// cascade re-derives them with the new shape.
 ///
 /// `pub(crate)` so the producers that enqueue `"prefetch"` rows
 /// (`PrefetchDependenciesHandler`'s leaf cohort and
 /// `SelfServicePrefetchUseCase`'s root enqueue) can pin the
-/// producer→consumer params contract in their own unit tests — the
-/// H8 regression guard: a producer emitting a shape this consumer
-/// cannot deserialize is exactly the self-service-prefetch defect.
+/// producer→consumer params contract in their own unit tests — a
+/// producer emitting a shape this consumer cannot deserialize is
+/// exactly the self-service-prefetch defect.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PrefetchParams {
     /// Repository the leaf-ingest targets. Format + upstream mapping
@@ -108,7 +107,7 @@ pub(crate) struct PrefetchParams {
 ///
 /// Constructed at worker composition time with the ports the leaf
 /// pull-through needs. Mirrors `PrefetchDependenciesHandler`'s
-/// wiring shape (Item 12b §2) verbatim — same `UpstreamProxy` +
+/// wiring shape verbatim — same `UpstreamProxy` +
 /// `RepositoryUpstreamMappingRepository` + format-handler map; adds
 /// the `IngestUseCase` for the actual verified-ingest call.
 pub struct PrefetchIngestHandler {
@@ -188,10 +187,10 @@ impl TaskHandler for PrefetchIngestHandler {
             };
             let mut summary = LeafSummary::default();
 
-            // H8 sibling — a cascade-spawned leaf (trigger_source
-            // "prefetch") is already walked by its parent's depth-carrying
-            // child row, so its ingest must NOT fire the depth-0 seed hook.
-            // A self-service ROOT leaf ("self_service") is a seed and must.
+            // A cascade-spawned leaf (trigger_source "prefetch") is already
+            // walked by its parent's depth-carrying child row, so its ingest
+            // must NOT fire the depth-0 seed hook. A self-service ROOT leaf
+            // ("self_service") is a seed and must.
             // The flag rides the ingest request's payload_metadata.
             let cascade_internal = is_cascade_internal_leaf(&ctx.job_row.trigger_source);
 
@@ -331,13 +330,13 @@ async fn generic_per_url_pull(
     cascade_internal: bool,
     summary: &mut LeafSummary,
 ) {
-    // Spec 074 §2 (H9 fix) — build the canonical projection path via the
-    // single SSOT constructor BEFORE the coords. Previously `path` was left
-    // empty (`String::new()`), so every npm/cargo leaf collided on the empty
-    // `(repository_id, "")` projection key — all but the first ingest lost.
-    // npm/cargo derive the filename from name+version, so `filename = None`.
-    // On build failure, short-circuit this leaf (mirrors the other per-leaf
-    // failure handling — `warn!` + `short_circuited`).
+    // Build the canonical projection path via the single SSOT constructor
+    // BEFORE the coords. Previously `path` was left empty (`String::new()`),
+    // so every npm/cargo leaf collided on the empty `(repository_id, "")`
+    // projection key — all but the first ingest lost. npm/cargo derive the
+    // filename from name+version, so `filename = None`. On build failure,
+    // short-circuit this leaf (mirrors the other per-leaf failure handling —
+    // `warn!` + `short_circuited`).
     let path = match leaf_logical_path(handler.as_ref(), &parsed.package, &parsed.version, None) {
         Ok(p) => p,
         Err(err) => {
@@ -495,8 +494,8 @@ async fn generic_per_url_pull(
             payload_metadata: serde_json::json!({
                 "source": "prefetch_leaf_pull",
                 "upstream_url": url,
-                // H8 sibling — suppress the per-ingest seed hook for a
-                // cascade-internal leaf (its parent's child row walks it).
+                // Suppress the per-ingest seed hook for a cascade-internal
+                // leaf (its parent's child row walks it).
                 "cascade_internal": cascade_internal,
             }),
             upstream_checksum: upstream_checksum.clone(),
@@ -664,12 +663,11 @@ async fn pypi_per_distribution_fanout(
             continue;
         };
 
-        // Build per-distribution coords. Spec 074 §2 (H10 fix) — the path
-        // comes from the single SSOT constructor
-        // (`simple/{normalized}/{filename}`), which both keys the projection
-        // reachably AND lets PyPI's `parse_upstream_checksum` match the
-        // basename of `coords.path` against the per-URL `urls[]` entry.
-        // Previously this wrote a bare `{filename}` — a PEP-503-wrong,
+        // Build per-distribution coords. The path comes from the single SSOT
+        // constructor (`simple/{normalized}/{filename}`), which both keys the
+        // projection reachably AND lets PyPI's `parse_upstream_checksum`
+        // match the basename of `coords.path` against the per-URL `urls[]`
+        // entry. Previously this wrote a bare `{filename}` — a PEP-503-wrong,
         // unreachable projection path. pypi carries no version in the path,
         // so `version = ""`; the filename is required (multi-distribution).
         let path = match leaf_logical_path(handler.as_ref(), &parsed.package, "", Some(filename)) {
@@ -755,8 +753,8 @@ async fn pypi_per_distribution_fanout(
                 "source": "prefetch_leaf_pull_pypi",
                 "upstream_url": url,
                 "filename": filename,
-                // H8 sibling — suppress the per-ingest seed hook for a
-                // cascade-internal leaf (its parent's child row walks it).
+                // Suppress the per-ingest seed hook for a cascade-internal
+                // leaf (its parent's child row walks it).
                 "cascade_internal": cascade_internal,
             }),
             upstream_checksum,
@@ -793,10 +791,10 @@ async fn pypi_per_distribution_fanout(
     }
 }
 
-/// H8 sibling — classify a `prefetch` leaf-ingest's trigger source as
-/// cascade-internal. A cascade-spawned leaf (trigger_source `"prefetch"` —
-/// the literal `PrefetchDependenciesHandler::plan_and_enqueue` writes) is
-/// already covered by its parent walk's depth-carrying child
+/// Classify a `prefetch` leaf-ingest's trigger source as cascade-internal.
+/// A cascade-spawned leaf (trigger_source `"prefetch"` — the literal
+/// `PrefetchDependenciesHandler::plan_and_enqueue` writes) is already
+/// covered by its parent walk's depth-carrying child
 /// `prefetch-dependencies` row, so its ingest must NOT fire the per-ingest
 /// depth-0 seed hook (that double-walk resets the cascade depth to 0 and
 /// defeats the transitive_depth / max_descendants caps). Every other
@@ -808,15 +806,14 @@ fn is_cascade_internal_leaf(trigger_source: &str) -> bool {
     trigger_source == "prefetch"
 }
 
-/// Canonical projection path for a prefetch leaf artifact (spec 074
-/// §0/§3). The ONE place the leaf builds `coords.path` — delegates to the
-/// format's single SSOT constructor
-/// [`FormatHandler::build_artifact_logical_path`] so the leaf's stored path
-/// can never diverge from the read-side `parse_download_path` lookup
-/// (`(repository_id, coords.path)` is the projection key). Extracted as a
-/// pure helper so the H9/H10 class (empty / wrong path) is unit-testable
-/// below E2E. npm/cargo pass `filename = None` (they derive it from
-/// name+version); pypi passes `Some(filename)` (multi-distribution).
+/// Canonical projection path for a prefetch leaf artifact. The ONE place
+/// the leaf builds `coords.path` — delegates to the format's single SSOT
+/// constructor [`FormatHandler::build_artifact_logical_path`] so the leaf's
+/// stored path can never diverge from the read-side `parse_download_path`
+/// lookup (`(repository_id, coords.path)` is the projection key). Extracted
+/// as a pure helper so the empty/wrong-path class of failure is
+/// unit-testable below E2E. npm/cargo pass `filename = None` (they derive
+/// it from name+version); pypi passes `Some(filename)` (multi-distribution).
 fn leaf_logical_path(
     handler: &dyn FormatHandler,
     package: &str,
@@ -923,9 +920,8 @@ mod tests {
         assert!(parsed.is_err(), "missing repository_id must fail");
     }
 
-    /// Concrete-version params (Item 12b post-cascade shape) parse
-    /// correctly. Regression guard: a future field rename would
-    /// break the cascade's enqueue → leaf chain.
+    /// Concrete-version params parse correctly. Regression guard: a future
+    /// field rename would break the cascade's enqueue → leaf chain.
     #[test]
     fn concrete_version_params_parse() {
         let p = json!({
@@ -938,11 +934,11 @@ mod tests {
         assert_eq!(parsed.version, "4.18.2");
     }
 
-    /// Old-shape (Item 12's opaque `range` field) is **NOT**
-    /// accepted: the `version` field is required. Pre-12b rows in
-    /// flight at upgrade time fail to parse, which the dispatcher
-    /// treats as non-retry — the cascade re-derives them with the
-    /// new shape on the next ingest.
+    /// The old opaque `range` field is **NOT** accepted: the `version`
+    /// field is required. Rows using the old shape that are in flight at
+    /// upgrade time fail to parse, which the dispatcher treats as
+    /// non-retry — the cascade re-derives them with the new shape on the
+    /// next ingest.
     #[test]
     fn old_range_shape_does_not_parse_without_version() {
         let p = json!({
@@ -960,12 +956,11 @@ mod tests {
         let _ctx = make_context();
     }
 
-    /// H8 sibling — the cascade-internal classification. Only
-    /// cascade-spawned leaves (trigger_source "prefetch") are
-    /// cascade-internal (their artifact is already walked by the parent's
-    /// child row → suppress the seed hook). A self-service ROOT leaf
-    /// ("self_service") and every other source is a SEED → must fire the
-    /// hook.
+    /// Cascade-internal classification. Only cascade-spawned leaves
+    /// (trigger_source "prefetch") are cascade-internal (their artifact is
+    /// already walked by the parent's child row → suppress the seed hook).
+    /// A self-service ROOT leaf ("self_service") and every other source is
+    /// a SEED → must fire the hook.
     #[test]
     fn cascade_internal_only_for_prefetch_trigger_source() {
         assert!(is_cascade_internal_leaf("prefetch"));
@@ -975,7 +970,7 @@ mod tests {
         assert!(!is_cascade_internal_leaf("cron"));
     }
 
-    // -- leaf_logical_path (spec 074 §0/§3 leaf-path guard) -------------------
+    // -- leaf_logical_path (leaf-path guard) ----------------------------------
     //
     // `hort-app` cannot dev-depend on `hort-formats` (it would form a
     // dependency cycle — `hort-formats → hort-app`). The exact canonical
@@ -984,10 +979,9 @@ mod tests {
     // `hort-formats`'s own per-format `build_logical_path_*` tests. Here we
     // pin (a) that `leaf_logical_path` faithfully DELEGATES to the handler
     // (npm/cargo `filename = None`, pypi `Some(filename)`), producing the
-    // spec's canonical leaf strings against a stub that mirrors each
-    // format's SSOT shape, and (b) that a build `Err` propagates (so the
-    // leaf short-circuits rather than writing a wrong path — the H9/H10
-    // class guard).
+    // canonical leaf strings against a stub that mirrors each format's SSOT
+    // shape, and (b) that a build `Err` propagates (so the leaf
+    // short-circuits rather than writing a wrong path).
 
     /// A stub handler whose `build_artifact_logical_path` mirrors the three
     /// real format shapes, selected by `format_key`. Lets the leaf-path
@@ -1071,7 +1065,7 @@ mod tests {
     fn leaf_logical_path_propagates_build_error() {
         // pypi with `filename = None` -> the handler errs; `leaf_logical_path`
         // must surface the `Err` (the leaf short-circuits rather than writing
-        // a wrong/empty path — the H9/H10 short-circuit guard).
+        // a wrong/empty path).
         let h = StubLeafHandler { key: "pypi" };
         let err = leaf_logical_path(&h, "foo", "1.0.0", None).unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));

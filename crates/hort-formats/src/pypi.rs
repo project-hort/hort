@@ -28,18 +28,17 @@ const PYPI_VERSION_JSON_MAX_BYTES: u64 = 128 * 1024;
 
 /// Compressed-input cap for the whole stored PyPI distribution artifact
 /// (a wheel zip or an sdist gzip) fed to
-/// [`PyPiFormatHandler::extract_dependency_specs`] (spec 076 Item 5). The
-/// cascade caller reads the artifact from CAS under a 32 MiB **compressed**
-/// bound (`prefetch_dependencies::read_artifact_bytes`) before handing it
-/// here, so this cap is set to that same 32 MiB to admit every artifact the
-/// cascade can present while still bounding the buffer if a future caller
-/// streams an unbounded reader in. It is a *compressed* container cap (a
-/// plausibility / storage bound, large — mirrors npm's
-/// `NPM_TARBALL_MAX_BYTES`; see
-/// `feedback_cap_taxonomy_streaming_vs_buffered`). The decompressed-output /
+/// [`PyPiFormatHandler::extract_dependency_specs`]. The cascade caller reads
+/// the artifact from CAS under a 32 MiB **compressed** bound
+/// (`prefetch_dependencies::read_artifact_bytes`) before handing it here, so
+/// this cap is set to that same 32 MiB to admit every artifact the cascade
+/// can present while still bounding the buffer if a future caller streams an
+/// unbounded reader in. It is a *compressed* container cap (a plausibility /
+/// storage bound, large — mirrors npm's `NPM_TARBALL_MAX_BYTES`; see
+/// The decompressed-output /
 /// compression-ratio / entry-count bomb guards for the wheel-zip path live in
-/// `archive_bounds::iter_zip_entries` (spec 076 §3.2), NOT here; the extracted
-/// METADATA entry is separately bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
+/// `archive_bounds::iter_zip_entries`, NOT here; the extracted METADATA entry
+/// is separately bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
 const PYPI_DIST_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 // Per-format unified index builders (see explanation/index-construction.md).
@@ -50,9 +49,8 @@ const PYPI_DIST_MAX_BYTES: usize = 32 * 1024 * 1024;
 // `hort-app::use_cases::index_serve` for dep-graph reasons).
 pub mod index;
 // PyPI simple-index JSON streaming projector (see ADR 0026).
-// Projects the PEP 691 simple-index `files[]` array; design doc §4.2
-// described a `releases{}` map but the production consumer uses
-// `files[]`.
+// Projects the PEP 691 simple-index `files[]` array; the production
+// consumer uses `files[]`, not the `releases{}` map shape.
 pub mod projection;
 
 /// PyPI format handler (PEP 503 compliant).
@@ -409,7 +407,7 @@ fn extract_wheel_metadata_bytes_from_zip(buf: &[u8]) -> DomainResult<Option<Byte
 
     let Some(idx) = first_match_index else {
         // Zero `*.dist-info/METADATA` entries — malformed wheel that
-        // verified primary content. Non-fatal per §2.4.
+        // verified primary content. Non-fatal.
         return Ok(None);
     };
     if match_count > 1 {
@@ -448,7 +446,7 @@ fn extract_wheel_metadata_bytes_from_zip(buf: &[u8]) -> DomainResult<Option<Byte
     let mut bytes_out: Vec<u8> = Vec::new();
     let mut limited = (&mut entry).take(PYPI_WHEEL_METADATA_MAX_BYTES + 1);
     if limited.read_to_end(&mut bytes_out).is_err() {
-        // Read error mid-entry — corrupted wheel. Non-fatal per §2.4.
+        // Read error mid-entry — corrupted wheel. Non-fatal.
         return Ok(None);
     }
     if bytes_out.len() as u64 > PYPI_WHEEL_METADATA_MAX_BYTES {
@@ -507,11 +505,11 @@ impl FormatHandler for PyPiFormatHandler {
         validate_pep_503_name(project)?;
         validate_pypi_filename(filename)?;
 
-        // Spec 074 §1.2 (H10 fix) — the read path uses the SSOT constructor
-        // so it embeds the PEP 503 NORMALIZED project segment (was the raw
-        // project — a PEP 503 violation that split `Foo.Bar`/`foo_bar` into
-        // separate projection rows). pypi carries no version in the path, so
-        // `version = ""`; the filename is required and embedded verbatim.
+        // The read path uses the SSOT constructor so it embeds the PEP 503
+        // NORMALIZED project segment (was the raw project — a PEP 503
+        // violation that split `Foo.Bar`/`foo_bar` into separate projection
+        // rows). pypi carries no version in the path, so `version = ""`;
+        // the filename is required and embedded verbatim.
         let path = self.build_artifact_logical_path(project, "", Some(filename))?;
         Ok(ArtifactCoords {
             name: self.normalize_name(project),
@@ -523,8 +521,8 @@ impl FormatHandler for PyPiFormatHandler {
         })
     }
 
-    /// Spec 074 §1.1 — the single logical-projection-path constructor for
-    /// pypi. `simple/{n}/{filename}` with `n = normalize_name(name)` (PEP
+    /// The single logical-projection-path constructor for pypi.
+    /// `simple/{n}/{filename}` with `n = normalize_name(name)` (PEP
     /// 503: lowercase + collapse `[-_.]+` → `-`) and the filename embedded
     /// VERBATIM. `filename` is REQUIRED (pypi is multi-distribution — one
     /// `(name, version)` maps to many files); `None` is rejected.
@@ -543,8 +541,8 @@ impl FormatHandler for PyPiFormatHandler {
         Ok(format!("simple/{n}/{filename}"))
     }
 
-    /// PyPI METADATA (including long description) — design doc §6.1
-    /// placeholder of 128 KB pending empirical measurement (Item 6).
+    /// PyPI METADATA (including long description) — 128 KB cap
+    /// (calibrated against real-world METADATA sizes).
     fn metadata_expected_max_bytes(&self) -> usize {
         131_072
     }
@@ -586,7 +584,7 @@ impl FormatHandler for PyPiFormatHandler {
     ///
     /// Bounded by the existing 128 KB
     /// [`metadata_expected_max_bytes`](Self::metadata_expected_max_bytes)
-    /// cap, raised here to a Phase-1-pragmatic 10 MiB ceiling to admit
+    /// cap, raised here to a 10 MiB ceiling to admit
     /// realistic simple-index pages (the per-version JSON cap was
     /// sized for METADATA only — a project with thousands of versions
     /// publishes a much larger HTML index). Bodies above 10 MiB are
@@ -607,8 +605,8 @@ impl FormatHandler for PyPiFormatHandler {
     /// serve path.)
     fn extract_upstream_versions(&self, body: &mut dyn Read) -> DomainResult<Vec<String>> {
         // Simple-index pages are bounded separately from per-version
-        // JSON metadata; 10 MiB is a Phase-1 hard cap (a project with
-        // O(10^4) versions, average filename ~80 bytes per anchor,
+        // JSON metadata; 10 MiB hard cap (a project with O(10^4) versions,
+        // average filename ~80 bytes per anchor,
         // tops out under 4 MiB — leaving 2.5x headroom).
         const SIMPLE_INDEX_MAX_BYTES: usize = 10 * 1024 * 1024;
         let body =
@@ -677,9 +675,8 @@ impl FormatHandler for PyPiFormatHandler {
     /// whose `filename` matches the basename of `coords.path`, and
     /// extract `digests.sha256`.
     ///
-    /// SHA-1 / MD5 fallback is REJECTED (design doc §16): an entry with
-    /// only `md5` in `digests` produces `Validation`, not a softer
-    /// fallback.
+    /// SHA-1 / MD5 fallback is REJECTED: an entry with only `md5` in
+    /// `digests` produces `Validation`, not a softer fallback.
     ///
     /// Streaming (see ADR 0026): `body` is a streaming reader over the
     /// per-version JSON API body. Unlike the npm packument / cargo
@@ -910,9 +907,9 @@ impl FormatHandler for PyPiFormatHandler {
     /// - Wheel ZIP has zero `*.dist-info/METADATA` entries (malformed
     ///   wheel that nonetheless verified).
     ///
-    /// The non-fatal posture matches the design (§2.4): a corrupt
-    /// wheel that primary-content-hash-verified must not block ingest;
-    /// PEP 658 simply does not advertise for it and pip falls back to
+    /// The non-fatal posture is intentional: a corrupt wheel that
+    /// primary-content-hash-verified must not block ingest; PEP 658
+    /// simply does not advertise for it and pip falls back to
     /// whole-wheel download.
     ///
     /// Fatal failure mode (`Err(DomainError::Validation)`):
@@ -985,8 +982,8 @@ impl FormatHandler for PyPiFormatHandler {
     ///   sidecar is a cleaner future dependency source for the wheel case;
     ///   out of scope here.)
     /// - **anything else:** a clear `Err` ("unrecognised pypi distribution
-    ///   container") — this is the H11 failure mode (raw METADATA / arbitrary
-    ///   bytes where a container is now expected), reported honestly.
+    ///   container") — raw METADATA or arbitrary bytes where a container is
+    ///   expected, reported honestly.
     ///
     /// **Runtime classes only.** The extracted METADATA is parsed by
     /// [`parse_wheel_metadata_into_specs`], which walks `Requires-Dist:` lines
@@ -1003,7 +1000,7 @@ impl FormatHandler for PyPiFormatHandler {
     /// entry is separately bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`] (1 MiB)
     /// as a parser-input sanity cap on this identical content.
     ///
-    /// **Errors (spec 076 §3.5).**
+    /// **Errors.**
     /// - Input is neither a wheel zip nor an sdist gzip → `Validation`
     ///   ("unrecognised pypi distribution container").
     /// - Wheel zip is malformed / unreadable → `Validation`.
@@ -1049,7 +1046,7 @@ impl FormatHandler for PyPiFormatHandler {
                 );
                 Ok(Vec::new())
             }
-            // Neither container — the H11 failure mode, reported honestly.
+            // Neither container — unrecognised bytes, reported honestly.
             _ => Err(DomainError::Validation(
                 "unrecognised pypi distribution container: expected a wheel zip \
                  (PK\\x03\\x04) or an sdist gzip (\\x1f\\x8b)"
@@ -1169,13 +1166,12 @@ fn locate_wheel_metadata_in_zip(buf: &[u8]) -> DomainResult<Option<Vec<u8>>> {
     Ok(found)
 }
 
-/// Spec 076 Item 5 — parse the *declared runtime* dependency specs from a
-/// wheel `METADATA` (PEP 566) file body.
+/// Parse the *declared runtime* dependency specs from a wheel `METADATA`
+/// (PEP 566) file body.
 ///
 /// Factored out of [`PyPiFormatHandler::extract_dependency_specs`] so the
-/// bytes-in/specs-out kernel is unit-testable directly without manufacturing a
-/// wheel ZIP. The METADATA-text logic is byte-identical to the pre-076
-/// in-place loop.
+/// bytes-in/specs-out kernel is unit-testable directly without manufacturing
+/// a wheel ZIP.
 ///
 /// **Runtime classes only.** Walks `Requires-Dist:` lines but FILTERS OUT any
 /// line carrying an `extra == '<name>'` environment marker (via
@@ -1284,8 +1280,8 @@ fn is_extras_gated_requirement(req: &str) -> bool {
 ///
 /// Reuses the conventions of [`parse_pep_508_requirement`] but keeps
 /// the *original* specifier string instead of distilling it down to an
-/// exact-pin (which is what the SBOM path wants). For Item 11 the
-/// range grammar is what the cascade feeds back into
+/// exact-pin (which is what the SBOM path wants). The range grammar is
+/// what the cascade feeds back into
 /// [`PyPiFormatHandler::resolve_range_max`], so it must round-trip.
 fn parse_requires_dist_into_spec(line: &str) -> Option<(String, String)> {
     // Drop the marker — only the requirement proper carries the range.
@@ -1353,7 +1349,7 @@ fn parse_requires_dist_into_spec(line: &str) -> Option<(String, String)> {
 /// Only the `==` exact-pin operator promotes to a concrete version; any
 /// other operator (including the parenthesised forms) leaves the version
 /// as `None`. We deliberately do NOT ship a full PEP 508 grammar parser —
-/// per the design doc "lift, don't re-derive."
+/// the intent is to parse what's needed, not re-derive the full grammar.
 fn parse_pep_508_requirement(line: &str) -> Option<(String, Option<String>)> {
     // 1. Drop the environment marker (everything after the first `;`).
     let head = line.split(';').next()?;
@@ -1614,16 +1610,16 @@ mod tests {
             .parse_download_path("simple/My_Package/My_Package-1.0.tar.gz")
             .unwrap();
         assert_eq!(coords.name, "my-package");
-        // Spec 074 §1.2 (H10 fix): the stored path now embeds the PEP 503
-        // NORMALIZED project segment, not the raw one — `simple/{normalized}/
-        // {filename verbatim}`. Previously this wrote `simple/My_Package/...`,
+        // The stored path embeds the PEP 503 NORMALIZED project segment,
+        // not the raw one — `simple/{normalized}/{filename verbatim}`.
+        // Previously this wrote `simple/My_Package/...`,
         // a PEP-503-violating, variant-row-splitting path.
         assert_eq!(coords.path, "simple/my-package/My_Package-1.0.tar.gz");
         // `name_as_published` keeps the as-typed spelling for display/audit.
         assert_eq!(coords.name_as_published, "My_Package");
     }
 
-    // -- build_artifact_logical_path (spec 074 SSOT constructor) ---------------
+    // -- build_artifact_logical_path ------------------------------------------
 
     /// `simple/{n}/{filename}` with `n` PEP-503-normalized and the
     /// filename embedded VERBATIM. `version` is ignored.
@@ -1664,7 +1660,7 @@ mod tests {
     }
 
     /// `filename = None` is rejected — pypi is multi-distribution and the
-    /// filename is required to make the path reachable (spec 074 §1.1).
+    /// filename is required to make the path reachable.
     #[test]
     fn build_logical_path_requires_filename() {
         let err = handler()
@@ -1675,7 +1671,7 @@ mod tests {
 
     /// pypi `normalize_name` already collapses `[-_.]` at the identity
     /// layer (PEP 503), so variants merge into one project at publish — no
-    /// separate registration-collision check is needed (spec 075 §1).
+    /// separate registration-collision check is needed.
     #[test]
     fn collision_key_is_none() {
         assert_eq!(handler().collision_key("Foo.Bar"), None);
@@ -1684,7 +1680,7 @@ mod tests {
 
     /// Round-trip / inverse: the canonical request path parses to the
     /// canonical (normalized) path, and rebuilding from the parsed
-    /// (name, filename) yields the same path (spec 074 §3).
+    /// (name, filename) yields the same path.
     #[test]
     fn build_logical_path_round_trip() {
         // `foo-bar` is already PEP 503 canonical, so parse(p).path == p.
@@ -1700,9 +1696,8 @@ mod tests {
         );
     }
 
-    /// Variant collapse (the PEP 503 identity guard — would have caught the
-    /// pypi row-split): `Foo.Bar` and `foo_bar` build the SAME path
-    /// (`simple/foo-bar/...`) — spec 074 §1.0 / §3.
+    /// Variant collapse (the PEP 503 identity guard): `Foo.Bar` and
+    /// `foo_bar` build the SAME path (`simple/foo-bar/...`).
     #[test]
     fn build_logical_path_variant_collapse() {
         let a = handler()
@@ -2303,8 +2298,7 @@ mod tests {
         assert_eq!(cs.hex(), REQUESTS_SDIST_SHA256);
     }
 
-    /// Spec 074 §1.3 (MEDIUM, Origin-pillar regression guard) — the H10 fix
-    /// changed `coords.path`'s name segment from the raw project to the
+    /// Regression guard: the stored `coords.path` name segment uses the
     /// PEP-503-normalized form (`simple/{normalized}/{filename}`).
     /// `coords.path` is **dual-use**: besides keying the projection, its
     /// BASENAME (`rsplit('/').next()`) is what `parse_upstream_checksum`
@@ -2321,7 +2315,7 @@ mod tests {
         const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
         // The SSOT constructor normalizes the name segment but keeps the
-        // filename verbatim — the exact shape the H10 leaf/parse fix writes.
+        // filename verbatim.
         let path = handler()
             .build_artifact_logical_path("My_Package", "", Some("My_Package-1.0.tar.gz"))
             .unwrap();
@@ -3272,9 +3266,9 @@ mod tests {
     #[test]
     fn extract_wheel_metadata_bytes_pypi_wheel_without_metadata_member_returns_none() {
         // Malformed wheel: a valid ZIP that does not carry a
-        // `*.dist-info/METADATA` entry. Non-fatal per §2.4 — the wheel
-        // ingest already succeeded; PEP 658 simply does not advertise
-        // for this artifact.
+        // `*.dist-info/METADATA` entry. Non-fatal — the wheel ingest
+        // already succeeded; PEP 658 simply does not advertise for
+        // this artifact.
         let zip_bytes = build_wheel_zip(&[("example/__init__.py", b""), ("README.txt", b"hi")]);
         let coords = coords_for("example", Some("1.0.0"), "example-1.0.0-py3-none-any.whl");
         let payload = PayloadAccess::Bytes(&zip_bytes);
@@ -3420,7 +3414,7 @@ mod tests {
     // against the factored-out private fn (METADATA bytes in, specs out). They
     // do NOT exercise the archive/magic-sniff layer — that is covered by the
     // `_from_wheel_zip` / `_sdist_gzip` / `_unknown_magic` archive-shape tests
-    // below (spec 076 Item 5). The split mirrors the npm
+    // below. The split mirrors the npm
     // `parse_npm_runtime_dependencies`-vs-`_from_tgz` test split.
 
     /// Real-shape wheel `METADATA` fragment with a mix of runtime
@@ -3713,14 +3707,14 @@ Requires-Dist: also-extras ; extra not in ['prod']\n";
         assert_eq!(names, vec!["real-dep"]);
     }
 
-    // -- extract_dependency_specs ARCHIVE-AWARE (spec 076 Item 5) -----------
+    // -- extract_dependency_specs ARCHIVE-AWARE ------------------------------------
     //
     // The cascade hands `extract_dependency_specs` the *stored distribution
     // artifact* — a wheel (zip, `PK\x03\x04`) or an sdist (gzip, `\x1f\x8b`),
-    // NOT a pre-selected METADATA body (the H11 bug for pypi). A wheel's
-    // runtime deps live in `*.dist-info/METADATA` INSIDE the zip; an sdist
-    // is best-effort skipped. The pure `Requires-Dist` parse logic is unit
-    // tested directly against the private `parse_wheel_metadata_into_specs`
+    // NOT a pre-selected METADATA body. A wheel's runtime deps live in
+    // `*.dist-info/METADATA` INSIDE the zip; an sdist is best-effort skipped.
+    // The pure `Requires-Dist` parse logic is unit tested directly against the
+    // private `parse_wheel_metadata_into_specs`
     // fn (the `_metadata` tests above); these tests build a real
     // distribution container and assert the trait method routes correctly.
 
@@ -3745,11 +3739,11 @@ Requires-Dist: also-extras ; extra not in ['prod']\n";
         gz.finish().expect("make_sdist_tar_gz: finish gzip")
     }
 
-    /// RED→GREEN (spec 076 Item 5): feeding the trait method a real `.whl`
-    /// (a zip carrying `<dist>-<ver>.dist-info/METADATA`, as the cascade
-    /// does) must locate the METADATA entry INSIDE the zip and return ONLY
-    /// the runtime deps — extras-gated lines dropped. Pre-fix this fails
-    /// because the impl parses the zip bytes as METADATA text and finds no
+    /// Feeding the trait method a real `.whl` (a zip carrying
+    /// `<dist>-<ver>.dist-info/METADATA`, as the cascade does) must locate
+    /// the METADATA entry INSIDE the zip and return ONLY the runtime deps —
+    /// extras-gated lines dropped. Before the archive-aware fix this failed
+    /// because the impl parsed the zip bytes as METADATA text and found no
     /// `Requires-Dist:` headers (zip magic is not RFC-5322).
     #[test]
     fn extract_dependency_specs_pypi_from_wheel_zip_returns_only_runtime_deps() {
@@ -3826,9 +3820,8 @@ Long description body.\n" as &[u8];
     }
 
     /// Bytes whose leading magic is neither `PK\x03\x04` (wheel/zip) nor
-    /// `\x1f\x8b` (sdist/gzip) → a clear `Err` (the H11 failure mode for
-    /// pypi: raw METADATA / arbitrary bytes handed where a distribution
-    /// container is now expected).
+    /// `\x1f\x8b` (sdist/gzip) → a clear `Err` (raw METADATA or arbitrary
+    /// bytes handed where a distribution container is expected).
     #[test]
     fn extract_dependency_specs_pypi_unknown_magic_is_err() {
         let body = b"Metadata-Version: 2.1\nRequires-Dist: foo>=1.0\n";

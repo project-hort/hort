@@ -32,7 +32,7 @@
 //! atomic delete-absent + upsert-present. Because `save_managed`
 //! reconciles the *entire* gitops partition, the ServiceAccount
 //! `User`-subject grants and the envelope-declared grants are unioned
-//! into one `save_managed(permission_grants)` call (§5.8).
+//! into one `save_managed(permission_grants)` call.
 //!
 //! # Topological apply
 //!
@@ -183,7 +183,7 @@ pub enum UpstreamHostAllowlist {
     /// k8s ConfigMap defaults, docker-compose `${VAR:-}`, and shell
     /// `export VAR=` all silently produce the empty value — those
     /// would otherwise turn every upstream mapping into a hard reject
-    /// with no operator intent. See design doc §3.10.
+    /// with no operator intent.
     Disabled,
     /// `HORT_UPSTREAM_ALLOWLIST_HOSTS=__deny_all__` (literal sentinel,
     /// exact match). Every upstream mapping is rejected — bootstrap-
@@ -782,11 +782,11 @@ impl ApplyConfigUseCase {
     /// a single-claim grant using that claim land cleanly **in the same
     /// bundle**.
     ///
-    /// Resolution order (design doc §2.2 + §6 invariants 1 & 4):
+    /// Resolution order:
     ///
     /// - **Bundle declares `PermissionGrantLintConfig`** → the bundle's
     ///   spec is the effective config (`LintConfig::from(&spec)`). The
-    ///   kind carries the *full* `LintConfig` shape (Item 2 §2.1), so
+    ///   kind carries the *full* `LintConfig` shape, so
     ///   the bundle's declaration overlays the composed default
     ///   wholesale — this is the "same-bundle" path: the spec is
     ///   resolved here, **before** [`Self::apply_permission_grants`], so
@@ -795,8 +795,8 @@ impl ApplyConfigUseCase {
     /// - **Bundle omits the kind** → the composition-root-installed
     ///   `self.lint_config` (the [`Self::with_lint_config`] boot seam;
     ///   [`LintConfig::default`] when the root never opted out). A
-    ///   missing kind is **not** a downgrade (§6 invariant 1) — the
-    ///   secure default is preserved verbatim.
+    ///   a missing kind is **not** a downgrade — the secure default
+    ///   is preserved verbatim.
     ///
     /// Observability (**counts
     /// only, never claim names**): a resolved *non-default* config logs
@@ -870,7 +870,7 @@ impl ApplyConfigUseCase {
         resolved
     }
 
-    /// Pre-write validation + lint pass (H14 / Spec 076 §5.2-§5.3).
+    /// Pre-write validation + lint pass.
     ///
     /// Runs every check that is **provably performed before the first DB
     /// write** (`apply`'s Stage-1 `save_managed`): snapshot/env validation,
@@ -884,8 +884,7 @@ impl ApplyConfigUseCase {
     /// to PARK not-ready on a pre-write config error instead of
     /// crashlooping: a failure here cannot have left a half-applied state,
     /// so parking is safe -- unlike the in-stage validation inside the apply
-    /// stages, which is mid-write-capable and must still crash (Spec 076
-    /// §5.3 / architect T1).
+    /// stages, which is mid-write-capable and must still crash.
     ///
     /// `emit_advisories` gates the two always-on advisory `warn!`s
     /// (under-constrained federated identities; provenance
@@ -948,8 +947,8 @@ impl ApplyConfigUseCase {
             )));
         }
 
-        // Row 3 (audit F-7) — apply-time advisory WARNING (never a hard
-        // reject) for under-constrained `federatedIdentities[]`. The
+        // Apply-time advisory WARNING (never a hard reject) for
+        // under-constrained `federatedIdentities[]`. The
         // validator carries the typed fields in `warn_context`; this caller
         // re-emits them as the original STRUCTURED `warn!` fields
         // (service_account / federated_identity_index / issuer) — byte-identical
@@ -1039,8 +1038,8 @@ impl ApplyConfigUseCase {
         // `AppError::Domain(DomainError::Validation(_))`. Later rules are
         // NOT emitted/reported.
         //
-        // - Rows 5 (F-46.3 trust_upstream_publish_time × scan_backends:[])
-        //   and 6 (F-46.7 PrefetchPolicy.max_age_days) historically
+        // - Rows 5 (trust_upstream_publish_time × scan_backends:[])
+        //   and 6 (PrefetchPolicy.max_age_days) historically
         //   `"; "`-join every finding of the row AND tick
         //   `hort_apply_config_linter_total{rule, result=reject}` once per
         //   finding (cardinality bounded by mappings / repositories).
@@ -1141,7 +1140,7 @@ impl ApplyConfigUseCase {
         Ok(())
     }
 
-    /// Pre-write validation/lint gate for the boot path (H14 / Spec 076 §5).
+    /// Pre-write validation/lint gate for the boot path.
     ///
     /// `gitops_boot` calls this **before** [`Self::apply`] so a
     /// provably-pre-write config error parks the pod not-ready instead of
@@ -1172,7 +1171,7 @@ impl ApplyConfigUseCase {
         // ----- snapshot -----
         let snapshot = self.build_snapshot().await?;
 
-        // ----- pre-write validation/lint (H14 / Spec 076 §5) -----
+        // ----- pre-write validation/lint -----
         // Every check below is provably before the first DB write. The boot
         // path runs this same pass via `preflight_validate` BEFORE calling
         // `apply`, so a pre-write config error parks not-ready instead of
@@ -1259,10 +1258,10 @@ impl ApplyConfigUseCase {
         // partition *before* the grant linter runs inside
         // `apply_permission_grants`. This is what makes an allowlist
         // entry + a single-claim grant using that claim in the SAME
-        // bundle apply cleanly (§6 invariant 4). Absent kind ⇒ the
-        // composition-root default (`LintConfig::default()` unless the
-        // root opted out via `with_lint_config`) — a missing kind is
-        // not a downgrade (§6 invariant 1).
+        // bundle apply cleanly (same-bundle allowlist + grant pattern).
+        // Absent kind ⇒ the composition-root default
+        // (`LintConfig::default()` unless the root opted out via
+        // `with_lint_config`) — a missing kind is not a downgrade.
         let effective_lint_config = self.resolve_effective_lint_config(&desired);
         self.apply_permission_grants(
             &plan.permission_grants,
@@ -2473,7 +2472,7 @@ impl ApplyConfigUseCase {
         for env in &desired.retention_policies {
             let name = &env.metadata.name;
             // Resolve the JSON-shaped machine-envelope predicate +
-            // scope into B1's domain enums (the `hort-config` layer
+            // scope into domain enums (the `hort-config` layer
             // holds them as `serde_json::Value`; per-spec validation
             // already ran in `DesiredState::validate`, so a parse
             // failure here is a contract violation surfaced as a
@@ -2541,7 +2540,7 @@ impl ApplyConfigUseCase {
                     }
                 }
                 None => {
-                    // No active row of this name. Per B1's
+                    // No active row of this name. Per the
                     // terminal-archive model a re-declared archived
                     // name mints a FRESH policy_id (no reactivation),
                     // so create unconditionally — the
@@ -3121,8 +3120,7 @@ impl ApplyConfigUseCase {
         let mut authz_events_by_stream: HashMap<StreamId, Vec<EventToAppend>> = HashMap::new();
 
         // Capture prior-state for every update row before any
-        // save_managed runs. This is the model from `apply_roles` —
-        // the design doc §3.2 cites this pattern explicitly. We need
+        // save_managed runs. This mirrors the model from `apply_roles`. We need
         // the prior `(secret_ref, upstream_url, id, repository_id)`
         // to compute the `previous_*` fields on the
         // `RepositoryUpstreamMappingChanged` event before the upsert
@@ -3783,8 +3781,8 @@ fn emit_unchanged(kind: &'static str, count: usize, report: &mut ApplyReport) {
     report.unchanged += count;
 }
 
-/// Build an `OidcIssuer` from a validated spec envelope (Initiative
-/// 39 Item 3). The `validate_oidc_issuer` pass has already gated the
+/// Build an `OidcIssuer` from a validated spec envelope.
+/// The `validate_oidc_issuer` pass has already gated the
 /// algorithm strings, so every `JwtAlg::from_str` is expected to
 /// succeed — a failure here is an `Invariant` because it means the
 /// validator was bypassed.
@@ -3908,7 +3906,7 @@ fn build_service_account_from_spec(
 ///
 /// `pub` so cross-crate callers (notably the `hort-http-core` federation
 /// `/api/v1/token/exchange` handler, which mints SA tokens from
-/// validated JWTs — alpha-F9b) can stamp the federation token's
+/// validated JWTs) can stamp the federation token's
 /// `declared_permissions` from the same role-mapping table the apply
 /// pipeline uses; otherwise the federation cap leg of
 /// `RbacEvaluator::authorize` denies every check (empty cap permissions
@@ -3939,10 +3937,9 @@ fn sha256_of(s: &str) -> [u8; 32] {
 /// Build a `Repository` from a `RepositorySpec` envelope. Inlines the
 /// validator from `RepositoryUseCase::create` (the upstream-url
 /// requirement on `Proxy` repos): the public use case rejects every
-/// gitops-managed write via Item 4, so the apply pipeline must NOT
-/// route through it. Five lines of duplication beats a shared
-/// validator module that exists for one extra caller — see Item 8
-/// design notes.
+/// gitops-managed write, so the apply pipeline must NOT route through
+/// it. Five lines of duplication beats a shared validator module that
+/// exists for one extra caller.
 fn build_repository_from_spec(
     env: &Envelope<RepositorySpec>,
     id: Uuid,
@@ -3983,7 +3980,7 @@ fn build_repository_from_spec(
     // `storage_*` columns are NOT NULL with no usable default, so the
     // omitted case is resolved to concrete, internally-consistent
     // values here (never NULL, never a magic free-string sentinel —
-    // that was the F3 footgun): the effective global backend if the
+    // that was the original footgun): the effective global backend if the
     // composition wired one, else `"filesystem"` (the DB column default
     // and the domain default — the least-surprising fallback when the
     // cross-check is unwired); the placement-inert `storage_path`
@@ -4332,7 +4329,7 @@ fn humantime_secs(s: &str) -> i64 {
 /// the operator-disclosed reference, never the resolved bytes the
 /// `SecretPort` would return on `resolve()`. The literal string is
 /// recorded as-is for forensic correlation against the secret-store
-/// audit log; design §3.2 documents the trade-off vs hashing.
+/// audit log (the identifier, not the value, is recorded).
 ///
 /// See `crates/hort-domain/src/events/authorization_events.rs` →
 /// `upstream_mapping_changed_payload_records_identifier_not_value`
@@ -5409,10 +5406,10 @@ mod tests {
     /// grant (Claims subject, `repository: None`, non-Admin
     /// permission) MUST fail the whole apply with
     /// `AppError::Domain(DomainError::Validation(_))` under **zero**
-    /// operator config — proving the F-34 secure-by-default posture
-    /// (the mitigation §1.1 declares load-bearing is blocking out of
-    /// the box, not opt-in). No grant row and no `PermissionGrantApplied`
-    /// event lands (strict-atomic abort before `save_managed`).
+    /// operator config — proving the secure-by-default posture
+    /// (blocking out of the box, not opt-in). No grant row and no
+    /// `PermissionGrantApplied` event lands (strict-atomic abort before
+    /// `save_managed`).
     #[tokio::test]
     async fn secure_by_default_wildcard_grant_fails_apply_with_zero_config() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -5450,8 +5447,8 @@ mod tests {
     }
 
     /// A non-allowlisted single-claim grant fails apply by default
-    /// (F-34: `single-claim-grant` rejects, the allowlist is the
-    /// per-claim opt-out).
+    /// (`single-claim-grant` rejects, the allowlist is the per-claim
+    /// opt-out).
     #[tokio::test]
     async fn secure_by_default_single_claim_grant_fails_apply() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -5476,7 +5473,7 @@ mod tests {
     }
 
     /// An unjustified direct-`User` **Admin** grant fails apply by
-    /// default (F-36: the highest-privilege claim-bypass shape).
+    /// default (the highest-privilege claim-bypass shape).
     #[tokio::test]
     async fn secure_by_default_unjustified_user_admin_grant_fails_apply() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -5513,11 +5510,10 @@ mod tests {
     /// the Item-10 seam inside `apply_permission_grants`, which the
     /// pipeline runs *after* `apply_claim_mappings`' whole-partition
     /// `save_managed`. So for the collision rule the apply still
-    /// **fails** (the load-bearing §8.1 / F-34 CI gate property: the
-    /// gitops apply returns `Err`, the operator's CI is red, the bad
-    /// mapping never goes live in an *accepted* state), but the
-    /// claim-mapping partition reconcile already ran before the abort.
-    /// The F-34/F-36 *core* (the three grant rules) IS strict-atomic —
+    /// **fails** (the gitops apply returns `Err`, the operator's CI is
+    /// red, the bad mapping never goes live in an *accepted* state), but
+    /// the claim-mapping partition reconcile already ran before the abort.
+    /// The three grant rules ARE strict-atomic —
     /// they reject before the grant `save_managed`. Making the
     /// collision rule strict-atomic too would require running a
     /// claim-mapping pre-check before `apply_claim_mappings`, which is
@@ -5609,8 +5605,8 @@ mod tests {
     // source, exactly as a real gitops apply.
     // ===================================================================
 
-    /// Build a `kind: PermissionGrantLintConfig` envelope (the Item 2
-    /// singleton gitops surface) with the given allowlist + optional
+    /// Build a `kind: PermissionGrantLintConfig` envelope (the singleton
+    /// gitops surface) with the given allowlist + optional
     /// per-rule downgrades, and place it on `desired` the way
     /// `DesiredState::absorb` would (the `Option` slot + the
     /// per-source-path bookkeeping the singleton check reads).
@@ -5635,14 +5631,13 @@ mod tests {
             .push(std::path::PathBuf::from(format!("{name}.yaml")));
     }
 
-    /// **Red-first (the canonical F2 regression).** An allowlist entry
-    /// AND a single-claim grant using exactly that claim, declared in
-    /// the SAME bundle, applies cleanly — the lint-config partition is
-    /// resolved *before* the grant linter, so the grant is the
-    /// per-claim opt-out and `single-claim-grant` passes. Before Item 3
-    /// the production path was hardwired to `LintConfig::default()`
-    /// (empty allowlist) so this bundle rejected unconditionally — the
-    /// exact alpha F2 defect.
+    /// **Red-first (regression).** An allowlist entry AND a single-claim
+    /// grant using exactly that claim, declared in the SAME bundle,
+    /// applies cleanly — the lint-config partition is resolved *before*
+    /// the grant linter, so the grant is the per-claim opt-out and
+    /// `single-claim-grant` passes. Previously the production path was
+    /// hardwired to `LintConfig::default()` (empty allowlist) so this
+    /// bundle rejected unconditionally.
     #[tokio::test]
     async fn same_bundle_allowlist_then_single_claim_grant_applies() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -5661,10 +5656,9 @@ mod tests {
             "read",
             Some("npm-public"),
         ));
-        let report =
-            h.uc.apply(desired, env_oidc())
-                .await
-                .expect("allowlist+grant in one bundle must apply (F2 §2.2 ordering)");
+        let report = h.uc.apply(desired, env_oidc()).await.expect(
+            "allowlist+grant in one bundle must apply (ordering: allowlist resolves before linter)",
+        );
         // repo + grant created; the linter did NOT reject.
         assert_eq!(report.created, 2);
         assert_eq!(h.grant_repo.save_managed_call_count(), 1);
@@ -5674,7 +5668,7 @@ mod tests {
     /// Absent `PermissionGrantLintConfig` ⇒ `LintConfig::default()`
     /// (secure default unchanged). A non-allowlisted single-claim grant
     /// with NO lint-config kind still rejects — a missing kind is NOT a
-    /// downgrade (§6 invariant 1).
+    /// downgrade (the secure default is preserved).
     #[tokio::test]
     async fn absent_lint_config_kind_keeps_secure_default_reject() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -5734,8 +5728,8 @@ mod tests {
 
     /// `resolve_effective_lint_config`: absent kind → the
     /// composition-root default (here `LintConfig::default()` because
-    /// the harness never opts out) — the §6-invariant-1 property in
-    /// isolation, and exercises the `None` arm of the resolver.
+    /// the harness never opts out) — verifying the composition-root
+    /// default is used, and exercises the `None` arm of the resolver.
     #[test]
     fn resolver_absent_kind_returns_composition_root_default() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -5861,7 +5855,7 @@ mod tests {
         );
         assert!(
             !info.1.contains("team-alpha") && !info.1.contains("platform-readers"),
-            "info must NOT log claim names (counts only — §5): {}",
+            "info must NOT log claim names (counts only): {}",
             info.1
         );
     }
@@ -6381,10 +6375,9 @@ mod tests {
     /// The rc.19 regression, at the apply layer. A repo whose
     /// `storage:` block is omitted applies cleanly **and** the
     /// persisted row inherits the deployment's effective global
-    /// backend — the documented honest path the F3 validator's own
-    /// remedy points at. Before Item 11 this config could not even
-    /// parse (`missing field 'storage'`), so the remedy was
-    /// unimplementable.
+    /// backend — the documented honest path the storage validator's
+    /// own remedy points at. This config previously could not even parse
+    /// (`missing field 'storage'`), so the remedy was unimplementable.
     #[tokio::test]
     async fn storage_omitted_inherits_effective_global_s3() {
         use hort_domain::ports::repository_repository::RepositoryRepository;
@@ -6401,7 +6394,7 @@ mod tests {
             .with_effective_storage_backend(crate::storage_backend::EffectiveStorageBackend::S3);
         uc.apply(desired, env_oidc())
             .await
-            .expect("a storage-omitted repo must apply (alpha-F8) — not reject, not crash");
+            .expect("a storage-omitted repo must apply — not reject, not crash");
 
         let stored = h.repos.find_by_key("omitted-on-s3").await.unwrap();
         assert_eq!(
@@ -6457,7 +6450,7 @@ mod tests {
             .with_effective_storage_backend(crate::storage_backend::EffectiveStorageBackend::S3);
         uc.apply(desired, env_oidc()).await.expect(
             "omitted storage is the validator's own remedy — it must inherit, \
-             never trip reject_repo_storage_backend_mismatch (alpha-F8)",
+             never trip reject_repo_storage_backend_mismatch",
         );
     }
 
@@ -6617,7 +6610,7 @@ mod tests {
         h.uc.apply(desired.clone(), env_oidc()).await.unwrap();
         let applied_before = count_cm_applied(&authz_events(&h).await);
         // Replay the identical desired set → unchanged digest → no new
-        // ClaimMappingApplied (silent no-op per §5.7).
+        // ClaimMappingApplied (silent no-op — unchanged digest).
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
         assert_eq!(report.unchanged, 1);
         assert_eq!(report.created, 0);
@@ -6663,7 +6656,7 @@ mod tests {
         h.uc.apply(desired, env_oidc()).await.unwrap();
         assert_eq!(h.claim_mappings.managed_count(), 2);
         // Empty `claim_mappings` slice in desired → save_managed(&[])
-        // revokes the entire gitops-managed partition (Item 7 A2′).
+        // revokes the entire gitops-managed partition.
         let report =
             h.uc.apply(DesiredState::default(), env_oidc())
                 .await
@@ -6908,7 +6901,7 @@ mod tests {
             Some("npm-public"),
         ));
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
-        // Repo + Grant = 2 created (no `roles` table — §2).
+        // Repo + Grant = 2 created (no `roles` table).
         assert_eq!(report.created, 2);
         assert_eq!(h.grant_repo.save_managed_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
@@ -7290,7 +7283,7 @@ mod tests {
             .push(exclusion_env("ex1", "prod-default", "CVE-2024-0001"));
 
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
-        // 6 objects created (one per kind — `roles` is dropped, §2):
+        // 6 objects created (one per kind — `roles` is dropped):
         // repository, claim_mapping, curation_rule, permission_grant,
         // scan_policy, exclusion.
         assert_eq!(report.created, 6);
@@ -7835,8 +7828,8 @@ mod tests {
         h.rule_repo.link_rule_to_repo(rule.id, repo_id);
     }
 
-    /// Item 7 — declaring a `Block` rule for the first time triggers the
-    /// retroactive pass on previously-active matching artifacts. The
+    /// Declaring a `Block` rule for the first time triggers the retroactive
+    /// pass on previously-active matching artifacts. The
     /// artifact transitions to `Rejected` AND the apply emits both a
     /// `CurationApplied { trigger: Retroactive, action: Block }` on the
     /// per-repo curation stream and an `ArtifactRejected` on the
@@ -8191,10 +8184,9 @@ mod tests {
         );
     }
 
-    /// Item 7 asymmetry — declaring `Block` then weakening to `Allow`
-    /// must NOT auto-unblock the previously-rejected artifact. Verifies
-    /// the load-bearing asymmetric semantics from §3.6: rejection is
-    /// sticky, admin explicit release is the override.
+    /// Declaring `Block` then weakening to `Allow` must NOT auto-unblock
+    /// the previously-rejected artifact. Rejection is sticky; admin
+    /// explicit release is the override.
     #[tokio::test]
     async fn retro_weaken_does_not_unblock_or_emit_events() {
         let h = build_harness();
@@ -8247,8 +8239,8 @@ mod tests {
         );
     }
 
-    /// Item 7 — declaring a Warn rule emits CurationApplied on the
-    /// curation stream but does NOT mutate artifact state.
+    /// Declaring a Warn rule emits CurationApplied on the curation stream
+    /// but does NOT mutate artifact state.
     #[tokio::test]
     async fn retro_warn_emits_event_without_state_change() {
         let h = build_harness();
@@ -8304,10 +8296,10 @@ mod tests {
         assert!(found, "expected CurationApplied(Warn) on curation stream");
     }
 
-    /// Item 7 — `list_active_for_repo` excludes `Rejected` artifacts;
-    /// the retroactive pass on a rule that would block them is a
-    /// no-op (no events, no state change). Defends the
-    /// "rejection is sticky" property at the repo-listing layer.
+    /// `list_active_for_repo` excludes `Rejected` artifacts; the
+    /// retroactive pass on a rule that would block them is a no-op
+    /// (no events, no state change). Defends the "rejection is sticky"
+    /// property at the repo-listing layer.
     #[tokio::test]
     async fn retro_skips_already_rejected_artifacts() {
         let h = build_harness();
@@ -8344,7 +8336,7 @@ mod tests {
         assert!(h.lifecycle.committed_transitions().is_empty());
     }
 
-    /// Item 7 strict-atomic discipline — a concurrent ingest causing
+    /// Strict-atomic discipline — a concurrent ingest causing
     /// `commit_transition` to fail with `Conflict` aborts the entire
     /// apply pipeline as `AppError::ConcurrentModification`. The
     /// operator restarts; the second pass re-resolves and continues
@@ -8386,8 +8378,8 @@ mod tests {
         assert!(matches!(err, AppError::ConcurrentModification(_)));
     }
 
-    /// Item 7 — declaring a NEW rule with action=Allow does NOT trigger
-    /// any retroactive events even when matching artifacts exist
+    /// Declaring a NEW rule with action=Allow does NOT trigger any
+    /// retroactive events even when matching artifacts exist
     /// (Allow → NoChange is silent).
     #[tokio::test]
     async fn retro_create_allow_rule_emits_no_events() {
@@ -9033,7 +9025,7 @@ mod tests {
         }
     }
 
-    /// §4.3 audit-completeness gate, repo-scoped slice. Drives
+    /// Audit-completeness gate, repo-scoped slice. Drives
     /// `ApplyConfigUseCase::apply` with a planned mutation for each
     /// repo-scoped authz kind (PermissionGrant repo-scoped, PermissionGrant
     /// global, RepositoryUpstreamMapping create/update/delete) and
@@ -9356,7 +9348,7 @@ mod tests {
 
     /// Empty PermissionGrant plan must produce no append on either
     /// the Authorization or any Repository stream — bookend to the
-    /// Item 4 `empty_role_plan_appends_no_authorization_event` test.
+    /// `empty_role_plan_appends_no_authorization_event` test.
     #[tokio::test]
     async fn empty_permission_grant_plan_appends_no_audit_event() {
         let h = build_harness();
@@ -9529,7 +9521,7 @@ mod tests {
         assert!(a.permits("registry.npmjs.org"));
         assert!(a.permits("pypi.org"));
         // No suffix matching by design — `*.example.com` is NOT
-        // implemented in this PR (out of scope per the design doc).
+        // implemented (out of scope here).
         assert!(!a.permits("subdomain.registry.npmjs.org"));
         assert!(!a.permits("registry-1.docker.io"));
         // Case-sensitive — same as URL host comparison; if the
@@ -9785,7 +9777,7 @@ mod tests {
     /// permitted under a looser allowlist must succeed regardless of
     /// the now-tighter allowlist — otherwise tightening the
     /// allowlist would also block GC of mappings the operator wants
-    /// gone. (Apply-time-only enforcement; see design §3.10.)
+    /// gone. (Apply-time-only enforcement.)
     #[tokio::test]
     async fn allowlist_delete_path_exempt_from_host_check() {
         // First apply: write the mapping under `Disabled` (legacy
@@ -10172,11 +10164,11 @@ mod tests {
         );
     }
 
-    /// F-46.3 — the resolved scan policy runs a scanner, so the
-    /// publish-time opt-in is permitted. The apply pipeline proceeds
-    /// normally (Gate 2 is still operative; the cross-opt-in collapse
-    /// does not occur). The new linter metric does NOT tick a `reject`
-    /// result for this rule.
+    /// The resolved scan policy runs a scanner, so the publish-time
+    /// opt-in is permitted. The apply pipeline proceeds normally
+    /// (Gate 2 is still operative; the cross-opt-in collapse does not
+    /// occur). The linter metric does NOT tick a `reject` result for
+    /// this rule.
     #[test]
     fn apply_accepts_trust_upstream_publish_time_when_resolved_policy_runs_scanner() {
         use crate::metrics::capture_metrics;
@@ -10306,9 +10298,9 @@ mod tests {
         );
     }
 
-    /// F-46.7 — happy path: a `PrefetchPolicy` with `max_age_days =
-    /// None` (the default) passes the linter cleanly. The new linter
-    /// metric does NOT tick a `reject` result for this rule.
+    /// Happy path: a `PrefetchPolicy` with `max_age_days = None` (the
+    /// default) passes the linter cleanly. The linter metric does NOT
+    /// tick a `reject` result for this rule.
     #[test]
     fn apply_accepts_prefetch_policy_with_max_age_days_none() {
         use hort_domain::entities::repository::{PrefetchPolicy, PrefetchTrigger};
@@ -10361,8 +10353,8 @@ mod tests {
     //     error — unchanged by the refactor.
     // ===================================================================
 
-    /// §7.1 parity — for a corpus of bad configs, the rule the apply
-    /// pre-write pass aborts on equals the FIRST-error-in-row-order rule
+    /// For a corpus of bad configs, the rule the apply pre-write pass
+    /// aborts on equals the FIRST-error-in-row-order rule
     /// `StaticConfigValidator::validate` reports. Rows 1/4 (env/DB) do not
     /// trip for these corpus configs (clean snapshot, default `trivy`
     /// registry), so the apply abort is exactly the static subset's first
@@ -10716,8 +10708,8 @@ mod tests {
     }
 
     /// Row-5 multi-offender metric — two trust_pt mappings whose resolved
-    /// policy waives scanning ⇒ the F-46.3 counter ticks twice, and the
-    /// abort is that rule's error. (Row 5 precedes row 6.)
+    /// policy waives scanning ⇒ the counter ticks twice, and the abort
+    /// is that rule's error. (Row 5 precedes row 6.)
     #[test]
     fn apply_row5_metric_ticks_once_per_offending_mapping_unchanged() {
         use crate::metrics::capture_metrics;
@@ -10789,7 +10781,7 @@ mod tests {
     //     (consumes domain `ProvenanceConfigError::RequiredWithoutIdentities`).
     //   - WARN `VerifyIfPresent` with empty `provenance_identities`
     //     (consumes domain `ProvenanceConfigWarning::...`; apply succeeds).
-    // `require_approval` is deliberately NOT linted (design §0).
+    // `require_approval` is deliberately NOT linted.
     // ===================================================================
 
     /// Provenance-linter helper — a `ScanPolicy` envelope with a
@@ -11094,11 +11086,11 @@ mod tests {
         });
     }
 
-    /// H14 — `preflight_validate` surfaces a pre-write config error the
-    /// same way `apply` would (`DomainError::Validation`) but WITHOUT
-    /// running any write stage. `gitops_boot` maps this to the
-    /// park-eligible `GitopsBootError::PreflightValidate`, so the pod parks
-    /// not-ready instead of crashlooping. Mirrors
+    /// `preflight_validate` surfaces a pre-write config error the same way
+    /// `apply` would (`DomainError::Validation`) but WITHOUT running any
+    /// write stage. `gitops_boot` maps this to the park-eligible
+    /// `GitopsBootError::PreflightValidate`, so the pod parks not-ready
+    /// instead of crashlooping. Mirrors
     /// `apply_rejects_unknown_scan_backend_with_validation_error`.
     #[tokio::test]
     async fn preflight_validate_rejects_unknown_scan_backend() {
@@ -11122,7 +11114,7 @@ mod tests {
         }
     }
 
-    /// H14 — `preflight_validate` returns `Ok(())` for a valid config AND
+    /// `preflight_validate` returns `Ok(())` for a valid config AND
     /// suppresses the always-on advisory `warn!`s (`emit_advisories =
     /// false`), so the boot's preflight-then-`apply` sequence does not
     /// double-log them — `apply` re-runs the same pass with advisories
@@ -11186,10 +11178,9 @@ mod tests {
         });
     }
 
-    /// ACCEPT: an empty `provenance_capable_formats` set (the Item-5
-    /// default, before Item 6 wires `{"oci"}`) fail-closes a `Required`
-    /// policy on *every* format, including OCI. Proves the default-empty
-    /// posture.
+    /// ACCEPT: an empty `provenance_capable_formats` set fail-closes a
+    /// `Required` policy on *every* format, including OCI. Proves the
+    /// default-empty posture.
     #[test]
     fn apply_rejects_required_provenance_when_capable_set_empty() {
         let mut captured_err: Option<AppError> = None;
@@ -11650,7 +11641,7 @@ mod tests {
         assert_eq!(managed[0].subject, GrantSubject::User(sa_users[0].id));
     }
 
-    /// alpha-F9a closure proof — replay the operator's rc.20 bundle
+    /// Closure proof — replay the operator's rc.20 bundle
     /// (`glci-supply-chain-security` SA + `developer` claim grants
     /// covered by a `singleClaimAllowlist: [developer]` lint config +
     /// `gitlab-kdp` OidcIssuer) and assert the SA-derived User-subject
@@ -11704,7 +11695,7 @@ mod tests {
 
         h.uc.apply(desired, env_oidc())
             .await
-            .expect("operator F9 bundle must apply cleanly");
+            .expect("operator bundle must apply cleanly");
 
         let sa_user = h
             .users
@@ -11909,17 +11900,15 @@ mod tests {
                 .oidc_issuers
                 .push(oidc_issuer_env_for_apply("github-actions"));
             // `service_account_env_for_apply(..., Some(_))` builds an FI
-            // with ONLY a `repository` claim — exactly the F-7
-            // under-constrained shape (no
-            // ref/environment/workflow/aud discriminator).
+            // with ONLY a `repository` claim — the under-constrained shape
+            // (no ref/environment/workflow/aud discriminator).
             desired.service_accounts.push(service_account_env_for_apply(
                 "ci-loose",
                 &["pypi-internal"],
                 Some("github-actions"),
             ));
 
-            // Apply MUST still succeed — warning, not ValidationError
-            // (backlog Item 4).
+            // Apply MUST still succeed — warning, not ValidationError.
             let report = h.uc.apply(desired, env_oidc()).await.unwrap();
             assert_eq!(
                 report.created, 2,
@@ -11936,7 +11925,7 @@ mod tests {
             })
             .expect(
                 "ApplyConfigUseCase::apply must emit a WARN for an under-constrained FI \
-                 (B2: detector was dead code before this wiring)",
+                 (detector was previously dead code before this wiring)",
             );
         let msg = &warn.1;
         assert!(
@@ -11948,8 +11937,8 @@ mod tests {
             "warn must carry the issuer reference: {msg}"
         );
         assert!(
-            msg.contains("F-7") && msg.contains("discriminating"),
-            "warn must forward the detector's F-7 remediation message: {msg}"
+            msg.contains("discriminating"),
+            "warn must forward the detector's remediation message: {msg}"
         );
     }
 
@@ -11998,7 +11987,7 @@ mod tests {
             !records
                 .iter()
                 .any(|(_, msg)| msg.contains("under-constrained federatedIdentities")),
-            "a repository+environment FI is well-constrained — no F-7 warning expected"
+            "a repository+environment FI is well-constrained — no under-constrained warning expected"
         );
     }
 
@@ -12169,7 +12158,7 @@ mod tests {
         // the scenario the prior agent reported as buggy. The PG sweep
         // would previously schedule the SA-owned grants for delete (their
         // digests carry `managed_by = GitOps`, no mirror envelope in
-        // desired). Item 3.5 must short-circuit this by excluding
+        // desired). The PG planner must short-circuit this by excluding
         // SA-owned digests from the PG delete plan.
         let mut desired_b = DesiredState::default();
         desired_b
@@ -12508,10 +12497,10 @@ mod tests {
             assert_eq!(proj.active_count(), 0);
         }
 
-        /// §6 invariant 8: a security-driven predicate whose scope does
-        /// NOT exclude IngestSource(Direct) fires an apply-time `info!`
-        /// (NOT an error — the policy still applies; B1 acceptance
-        /// bullet 4). A proxied-scoped security predicate does NOT warn.
+        /// A security-driven predicate whose scope does NOT exclude
+        /// IngestSource(Direct) fires an apply-time `info!` (NOT an error —
+        /// the policy still applies). A proxied-scoped security predicate
+        /// does NOT warn.
         #[test]
         fn inv8_security_predicate_non_direct_excluding_scope_warns_but_applies() {
             install_global();
@@ -12549,7 +12538,7 @@ mod tests {
                 recs.iter().any(|(lvl, msg)| *lvl == tracing::Level::INFO
                     && msg.contains("does not exclude IngestSource(Direct)")
                     && msg.contains("vuln-allrepos")),
-                "§6-inv-8 info! must fire for a security predicate with a \
+                "info! must fire for a security predicate with a \
                  non-direct-excluding scope; captured: {recs:?}"
             );
             drop(recs);
@@ -12572,7 +12561,7 @@ mod tests {
                     .iter()
                     .any(|(_, msg)| msg.contains("does not exclude IngestSource(Direct)")),
                 "a proxied-scoped (direct-excluding) security predicate must \
-                 NOT fire the §6-inv-8 warning; captured: {recs2:?}"
+                 NOT fire the warning; captured: {recs2:?}"
             );
         }
 

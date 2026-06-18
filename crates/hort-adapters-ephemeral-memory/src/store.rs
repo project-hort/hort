@@ -16,7 +16,7 @@ use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_domain::ports::BoxFuture;
 
 /// Cadence of the background evictor sweep. One second is the
-/// documented contract in Item 0a; coarser would let expired entries
+/// documented contract; coarser would let expired entries
 /// linger long enough to confuse TTL-sensitive tests, finer would
 /// waste CPU without a corresponding correctness gain.
 const EVICTOR_TICK: Duration = Duration::from_millis(1000);

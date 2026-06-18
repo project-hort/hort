@@ -12,8 +12,7 @@
 //!   the cumulative finding-tier counts across every `ScanCompleted`
 //!   event.
 //! - `last_scan_at` — the most recent `ScanCompleted` event in the
-//!   repository (per-repo aggregate, NOT per-artifact — see §3.6a for
-//!   the per-artifact denorm column).
+//!   repository (per-repo aggregate, NOT per-artifact).
 //!
 //! Atomicity contract: the row is updated **inside the same Postgres
 //! transaction** as the originating event append. This is enforced by
@@ -28,7 +27,6 @@
 //! Underflow guard: counts never go negative. The Postgres adapter
 //! clamps with `GREATEST(0, current + delta)`. Subtracting more than
 //! the current value stays at zero rather than wrapping or erroring.
-//! See §3.6 invariant in the design doc.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;

@@ -299,9 +299,8 @@ async fn dispatch(
 /// the outer level rather than under a nest.
 ///
 /// Subsequent OCI routes (blobs, manifests, tags, catalog, referrers)
-/// will be added via `route("/v2/<...>")` inside this builder as they
-/// land in Items 5+. The builder's signature stays stable; only the
-/// body changes.
+/// are added via `route("/v2/<...>")` inside this builder as they
+/// land. The builder's signature stays stable; only the body changes.
 pub fn oci_routes(ctx: Arc<AppContext>) -> Router<Arc<AppContext>> {
     oci_routes_with_config(&OciHttpConfig::default(), ctx)
 }
@@ -381,17 +380,17 @@ pub fn oci_routes_with_config(
         // it has its own credential validation surface. Mounted on the
         // read-and-admin half because it is GET-only with no body.
         .route("/v2/auth", axum::routing::get(v2_auth::handle_v2_auth))
-        // Item 8 — per-repo catalog (modern default, always mounted).
-        // More specific than `/v2/:repo_key/*tail`, so axum routes
+        // Per-repo catalog (modern default, always mounted). More
+        // specific than `/v2/:repo_key/*tail`, so axum routes
         // `/v2/:repo_key/_catalog` here rather than into the pull
         // dispatcher.
         .route(
             "/v2/:repo_key/_catalog",
             axum::routing::get(catalog::get_repo_catalog),
         )
-        // Items 6-7-8 — pull dispatcher (blob + manifest + tags
-        // list). Wildcard catch-all on `:repo_key`.
-        // DELETE on the same template handles manifest delete (Item 4).
+        // Pull dispatcher (blob + manifest + tags list). Wildcard
+        // catch-all on `:repo_key`. DELETE on the same template
+        // handles manifest delete.
         .route(
             "/v2/:repo_key/*tail",
             axum::routing::get(get_pull)
@@ -400,7 +399,7 @@ pub fn oci_routes_with_config(
         );
 
     if config.legacy_catalog_enabled {
-        // Item 8 — Docker-legacy global catalog. Opt-in via
+        // Docker-legacy global catalog. Opt-in via
         // `HORT_OCI_LEGACY_CATALOG_ENABLED=true`. Lists qualified
         // `<repo_key>/<name>` tuples across visible repos.
         read_and_admin_router = read_and_admin_router.route(
@@ -444,7 +443,7 @@ pub fn oci_routes_with_config(
 }
 
 /// Method-level PUT dispatcher that routes `/v2/:repo_key/*tail` PUT
-/// between Item 1's blob-upload finalize and Item 4's manifest PUT.
+/// between blob-upload finalize and manifest PUT.
 ///
 /// Inspects the tail: `/manifests/<ref>` → manifest PUT,
 /// `/blobs/uploads/<uuid>` → blob-upload PUT. A tail that matches
@@ -1000,7 +999,7 @@ mod tests {
         // trying to protect; with the flag on, visibility filtering
         // takes over.
         //
-        // `RbacAccess::Disabled` admits every actor (ADR 0008 §5):
+        // `RbacAccess::Disabled` admits every actor (ADR 0008):
         // a `RbacAccess::Disabled` access use case would visibility-filter
         // as if the caller carried every grant, so the private repo would
         // surface even on an anonymous catalog. To exercise the
@@ -1053,7 +1052,7 @@ mod tests {
 
             // Flip the access use case to Enabled with the same RBAC
             // snapshot so `list_visible(None, _)` collapses private
-            // repos to invisible per §5.
+            // repos to invisible for unauthenticated actors.
             // `ctx.repositories` is `pub(crate)` (ADR 0008); pull the
             // same `Arc<MockRepositoryRepository>` off the harness's
             // MockPorts handle (`h.repositories`).
@@ -1095,8 +1094,8 @@ mod tests {
     // ---------------- put_dispatch: wildcard-PUT routing --------------
 
     /// Regression guard for the method-level PUT dispatcher wired in
-    /// `oci_routes_with_config`. Item 1's blob-upload finalize (PUT
-    /// `/blobs/uploads/<uuid>`) and Item 4's manifest write (PUT
+    /// `oci_routes_with_config`. Blob-upload finalize (PUT
+    /// `/blobs/uploads/<uuid>`) and manifest write (PUT
     /// `/manifests/<ref>`) share the `/v2/:repo_key/*tail` template;
     /// this test exercises the manifest branch and asserts the right
     /// handler answers (MANIFEST_INVALID on unsupported content-type —
@@ -1122,7 +1121,7 @@ mod tests {
                 .body(Body::from(b"{}".to_vec()))
                 .unwrap();
             // Wrap into the `AuthenticatedPrincipal` newtype via the
-            // test-support helper; the F1 extractors no longer read the
+            // test-support helper; the extractors no longer read the
             // bare `CallerPrincipal` slot.
             hort_http_core::middleware::auth::test_support::inject_principal(
                 &mut req,
@@ -1175,7 +1174,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
             // Wrap into the `AuthenticatedPrincipal` newtype via the
-            // test-support helper; the F1 extractors no longer read the
+            // test-support helper; the extractors no longer read the
             // bare `CallerPrincipal` slot.
             hort_http_core::middleware::auth::test_support::inject_principal(
                 &mut req,
@@ -1216,7 +1215,7 @@ mod tests {
     // boundary is caught.
 
     /// Acceptance #5 — `BoundedPath` cap. A 600-byte `*tail` capture
-    /// must reject with 400 at the extractor (closes L-A8). The
+    /// must reject with 400 at the extractor. The
     /// `MAX_ROUTE_PARAM_BYTES` cap is 512; 600 is comfortably over.
     /// The response body shape comes from `BoundedPath`'s extractor
     /// rejection (the JSON `{"error":"route parameter too long",
@@ -1247,7 +1246,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "600-byte tail must be rejected at the BoundedPath extractor (L-A8)"
+            "600-byte tail must be rejected at the BoundedPath extractor"
         );
     }
 

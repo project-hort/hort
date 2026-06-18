@@ -29,7 +29,7 @@
 //! replayable within that window. Defence in depth: every storage
 //! operation re-resolves the user's grants via `RbacEvaluator::authorize`,
 //! so a leaked JWT can never escalate beyond what the *target user*
-//! could currently do. See design doc §6 "Replay semantics".
+//! could currently do.
 //!
 //! # Public surface
 //!
@@ -141,7 +141,7 @@ mod exp_serde {
 /// `active_signing` mints; verify accepts either the active or the
 /// previous public key. This is the rotation primitive: deploy new
 /// active + roll old active to prev → wait `exp` window → deploy
-/// without prev. See design doc §6 "Rotation procedure".
+/// without prev.
 pub struct OciTokenSigningKey {
     active_signing: SigningKey,
     active_verifying: VerifyingKey,
@@ -178,9 +178,9 @@ impl OciTokenSigningKey {
     /// PEM-encoded SubjectPublicKeyInfo for the previous public-half.
     ///
     /// The JSON-shaped `_PREV` slot accepts a public-only PEM (verify-
-    /// only) per design §6 — operators rotate by holding two private
-    /// keys briefly only on the deploying side; the previous key's
-    /// public half is enough for verification.
+    /// only — operators rotate by holding two private keys briefly
+    /// only on the deploying side; the previous key's public half is
+    /// enough for verification.
     pub fn from_pem(
         active_pem: &str,
         prev_public_pem: Option<&str>,
@@ -392,7 +392,7 @@ pub enum VerificationError {
     Malformed { message: String },
 }
 
-/// Default mint TTL — design doc §6 specifies 5 minutes.
+/// Default mint TTL (5 minutes).
 pub const DEFAULT_MINT_TTL: StdDuration = StdDuration::from_secs(300);
 
 // ---------------------------------------------------------------------------
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn mint_claims_then_verify_claims_round_trips_arbitrary_payload() {
-        // §13.4 — the CliSession JWT reuses this Ed25519 primitive with a
+        // The CliSession JWT reuses this Ed25519 primitive with a
         // DIFFERENT claims shape. The generic methods must round-trip any
         // `Serialize`/`Deserialize` payload, not just `OciAccessClaims`.
         let sk = fresh_signing_key();
@@ -647,9 +647,9 @@ mod tests {
 
     #[test]
     fn verify_claims_rejects_wrong_audience() {
-        // §13.4 discriminator: a payload minted for one `aud` must NOT
-        // verify against a different `aud` — this is the OCI-vs-CliSession
-        // separator (issuer/signature alone are shared).
+        // Audience discriminator: a payload minted for one `aud` must
+        // NOT verify against a different `aud` — this is the
+        // OCI-vs-CliSession separator (issuer/signature alone are shared).
         let sk = fresh_signing_key();
         let key = OciTokenSigningKey::new(sk, None);
         let jwt = key.mint_claims(&sample_generic_claims()).expect("mint");

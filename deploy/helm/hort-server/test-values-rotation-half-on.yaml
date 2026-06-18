@@ -1,14 +1,12 @@
-# Test fixture: half-set rotation misconfig (Backlog 078 Item 9, chart S4).
+# Test fixture: half-set rotation misconfig.
 #
-# Item 9 collapsed the pre-078 two-place rotation switch into a SINGLE
-# source-of-truth toggle `scheduledTasks.serviceAccountRotation.enabled`.
-# The pieces that must still physically agree when that toggle is on are
-# enforced by the top-level `values.schema.json` `allOf` couplings
-# (rules 9a/9b, mirroring the `replicaCount ⇒ ephemeralStore/storage`
-# couplings):
-#   9a: serviceAccountRotation.enabled ⇒ scheduledTasks.adminTasksEnabled
-#   9b: serviceAccountRotation.enabled ⇒ worker.enabled
-#                                      ∧ worker.rotation.publicRegistryHost
+# `scheduledTasks.serviceAccountRotation.enabled` is the SINGLE
+# source-of-truth toggle. The pieces that must still physically agree when
+# that toggle is on are enforced by the top-level `values.schema.json`
+# `allOf` couplings:
+#   - serviceAccountRotation.enabled ⇒ scheduledTasks.adminTasksEnabled
+#   - serviceAccountRotation.enabled ⇒ worker.enabled
+#                                    ∧ worker.rotation.publicRegistryHost
 #
 # This fixture is the canonical half-set state: the single rotation toggle
 # is flipped ON, but the `adminTasksEnabled` umbrella is left at its
@@ -23,9 +21,9 @@
 #
 # Other half-set shapes the same schema rejects (reproduce by editing):
 #   - adminTasksEnabled: true but worker.rotation.publicRegistryHost: ""
-#     (rule 9b — worker env has nowhere to point).
+#     (worker env has nowhere to point).
 #   - adminTasksEnabled: true but worker.enabled: false
-#     (rule 9b — the worker that performs rotation is not deployed).
+#     (the worker that performs rotation is not deployed).
 
 worker:
   enabled: true
@@ -37,7 +35,7 @@ worker:
 scheduledTasks:
   # adminTasksEnabled left at its default (false) — the umbrella the
   # rotation CronJob renders under. With it absent, the single rotation
-  # toggle below is a silent half-on; rule 9a rejects this combination.
+  # toggle below is a silent half-on; the schema rejects this combination.
   serviceAccountRotation:
     enabled: true
 

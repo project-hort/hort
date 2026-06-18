@@ -29,7 +29,7 @@ available for manual operator invocation. So this CronJob:
   - Does NOT depend on `scheduledTasks.adminTasksEnabled` — that toggle
     gates the svc-token chain this template deliberately avoids.
 
-Default schedule: every 5 minutes (design §2.4 finding 3).
+Default schedule: every 5 minutes.
 Operator-tunable via `quarantineReleaseSweep.schedule`.
 The 5-minute cadence bounds both window-gate latency and how fast a
 `quarantineDuration` change takes effect, on an hours-scale window.
@@ -123,11 +123,11 @@ spec:
                 - name: tmp
                   mountPath: /tmp
                 {{- if include "hort-server.extraCaBundle.autoMounted" . }}
-                {{- /* Backlog 078 Item 7 — gate the mount on the
-                       auto-mount source (configMapName/secretName), NOT
-                       on `.path` alone: with `.path` set but no source the
-                       volume below never rendered, leaving a dangling
-                       volumeMount that fails pod admission. */}}
+                {{- /* Gate the mount on the auto-mount source
+                       (configMapName/secretName), NOT on `.path` alone:
+                       with `.path` set but no source the volume below
+                       never rendered, leaving a dangling volumeMount
+                       that fails pod admission. */}}
                 {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
                 {{- end }}
                 {{- with .Values.extraVolumeMounts }}

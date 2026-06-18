@@ -84,10 +84,9 @@ const CRON_PRIORITY: i16 = 10;
 
 /// Arguments to `hort-server enqueue-wheel-metadata-backfill`.
 ///
-/// `--batch-size` is the only knob. Mirrors the design doc's per-tick
-/// budget; operators tightening below the default 100 are explicitly
-/// making the wall-clock vs memory tradeoff. The handler caps at 1000
-/// regardless of input.
+/// `--batch-size` is the only knob. Operators tightening below the
+/// default 100 are explicitly making the wall-clock vs memory tradeoff.
+/// The handler caps at 1000 regardless of input.
 #[derive(Debug, Args)]
 pub struct EnqueueWheelMetadataBackfillArgs {
     /// How many wheel artifacts to walk per invocation. Defaults to

@@ -47,12 +47,12 @@ pub struct RescanCandidate {
     /// `Repository.format` `Display` impl the worker dispatches on.
     pub format: String,
     /// The resolved policy's `rescan_interval_hours`. Carried for
-    /// per-candidate tracing only; the §3.2 query already filtered
+    /// per-candidate tracing only; the eligibility query already filtered
     /// `> 0` and the past-interval predicate.
     pub rescan_interval_hours: i32,
 }
 
-/// Outbound port for the §3.2 eligibility query.
+/// Outbound port for the rescan eligibility query.
 ///
 /// The Postgres adapter implements this against the canonical SQL
 /// (joining `artifacts` to `policy_projections` via the repo→policy

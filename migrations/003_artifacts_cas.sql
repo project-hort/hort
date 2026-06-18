@@ -39,7 +39,7 @@
 -- Notable absences carried from the prototype dump (deliberate drops):
 --   - idx_artifacts_name_gin — depended on pg_trgm. Zero v2 queries used
 --     trigram operators; the index plus the extension are dropped.
---     See design §2.3 and tools/migration-baseline/README.md.
+--     See tools/migration-baseline/README.md.
 
 -- ---------------------------------------------------------------------------
 -- artifacts
@@ -80,7 +80,7 @@ CREATE TABLE public.artifacts (
     -- upstream that did not supply a parseable value). **Audit field —
     -- untrusted upstream-asserted input.** Recording it is not
     -- trusting it; the window-anchor computation that consumes it
-    -- (Phase 2 / Item 6) is gated separately on the per-upstream
+    -- is gated separately on the per-upstream
     -- `RepositoryUpstreamMapping.trust_upstream_publish_time` opt-in.
     upstream_published_at timestamp with time zone,
     name_as_published text NOT NULL,

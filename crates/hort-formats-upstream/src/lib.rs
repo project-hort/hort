@@ -20,15 +20,13 @@
 //!
 //! [`UpstreamMetadataAdapter`] holds `Arc<dyn UpstreamResolver>` +
 //! `Arc<dyn EphemeralStore>` + `Arc<dyn UpstreamProxy>` +
-//! `Arc<PullDedup>` — **never** `Arc<AppContext>`. Item 8 wires
-//! `AppContext` to hold `Arc<dyn UpstreamMetadataPort>`, so holding
+//! `Arc<PullDedup>` — **never** `Arc<AppContext>`. The composition root
+//! wires `AppContext` to hold `Arc<dyn UpstreamMetadataPort>`, so holding
 //! `AppContext` here would close a construction cycle. The composition
 //! root passes the same `Arc`s to both this adapter's constructor and
-//! into `AppContext::builder()` — "shared dependency, two consumers"
-//! per the design doc §3.2 commentary block (line 470-480 of the
-//! design doc).
+//! into `AppContext::builder()` — "shared dependency, two consumers".
 //!
-//! # Dispatch table (§3 + §8 of the design doc)
+//! # Dispatch table
 //!
 //! | `format` | fetch                                                | parser                                                      |
 //! |----------|------------------------------------------------------|-------------------------------------------------------------|
@@ -38,7 +36,7 @@
 //! | `"oci"`  | rejected → [`UpstreamFetchError::UnsupportedFormat`] | n/a                                                         |
 //! | other    | rejected → [`UpstreamFetchError::UnsupportedFormat`] | n/a                                                         |
 //!
-//! # Error mapping (§3.2 taxonomy)
+//! # Error mapping
 //!
 //! The per-format helpers currently classify upstream failures into
 //! three coarse variants (`NoUpstream`, `UpstreamUnavailable`,
@@ -121,7 +119,7 @@ const FORMAT_NPM: &str = "npm";
 const FORMAT_PYPI: &str = "pypi";
 /// Wire format key for Cargo.
 const FORMAT_CARGO: &str = "cargo";
-/// Wire format key for OCI (upstream metadata not supported; see dispatch §8).
+/// Wire format key for OCI (upstream metadata not supported).
 const FORMAT_OCI: &str = "oci";
 
 /// Default per-version-object projector cap
@@ -149,11 +147,10 @@ impl UpstreamMetadataAdapter {
     /// Construct a new adapter holding the shared resolver + cache +
     /// proxy + dedup `Arc`s.
     ///
-    /// The composition root (Item 8) passes the same `Arc`s — by
-    /// `Arc::clone` — to BOTH this constructor AND `AppContext::builder()`,
-    /// so the adapter does not reach into a constructed `AppContext`
-    /// (no construction cycle). See the crate-level docs for the
-    /// rationale.
+    /// The composition root passes the same `Arc`s — by `Arc::clone` —
+    /// to BOTH this constructor AND `AppContext::builder()`, so the adapter
+    /// does not reach into a constructed `AppContext` (no construction
+    /// cycle). See the crate-level docs for the rationale.
     pub fn new(
         resolver: Arc<dyn UpstreamResolver>,
         cache: Arc<dyn EphemeralStore>,
@@ -211,7 +208,7 @@ impl UpstreamMetadataAdapter {
     /// fetch + parse pair. Extracted from [`Self::list_versions`] so the
     /// dispatch can be unit-tested in isolation. Returns the typed
     /// [`UpstreamFetchError`] for any branch — the consuming use case
-    /// (Items 5 + 6) classifies once at the metric site.
+    /// classifies once at the metric site.
     async fn dispatch(
         &self,
         format: &str,
@@ -223,9 +220,7 @@ impl UpstreamMetadataAdapter {
             FORMAT_PYPI => self.dispatch_pypi(mapping, package).await,
             FORMAT_CARGO => self.dispatch_cargo(mapping, package).await,
             FORMAT_OCI => {
-                // §8 — discovery + prefetch are not supported for OCI;
-                // the use case converts this variant to the §8 reason
-                // string at the inbound boundary.
+                // Discovery + prefetch are not supported for OCI.
                 tracing::debug!(
                     format = %format,
                     "upstream metadata: OCI is rejected upstream of URL composition",
@@ -386,8 +381,8 @@ impl UpstreamMetadataPort for UpstreamMetadataAdapter {
                     );
                 }
                 Err(UpstreamFetchError::UnsupportedFormat) => {
-                    // Not warn — this is the §8 expected reject path,
-                    // logged at debug in the dispatch helper.
+                    // Not warn — this is the expected unsupported-format
+                    // reject path, logged at debug in the dispatch helper.
                 }
                 Err(other) => {
                     tracing::warn!(
@@ -590,9 +585,9 @@ mod tests {
 
         // `AppContext` already holds the resolver / cache / upstream
         // proxy / pull-dedup we need; we take the same `Arc`s ("shared
-        // dependency, two consumers" per the design doc). At runtime
-        // (Item 8) the composition root passes these `Arc`s into both
-        // sides; here we mimic that by reading from the test ctx.
+        // dependency, two consumers" pattern. At runtime the composition
+        // root passes these `Arc`s into both sides; here we mimic that by
+        // reading from the test ctx.
         let resolver: Arc<dyn UpstreamResolver> = ctx.upstream_resolver.clone();
         let cache: Arc<dyn EphemeralStore> = ctx.ephemeral_evictable.clone();
         let upstream_proxy: Arc<dyn UpstreamProxy> = ctx.upstream_proxy.clone();
@@ -716,7 +711,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Dispatch table — rejection paths (§8 OCI + unknown format)
+    // Dispatch table — rejection paths (OCI + unknown format)
     // -----------------------------------------------------------------
 
     #[tokio::test]
@@ -1054,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_new_accepts_four_arcs_in_expected_order() {
         // We don't need the adapter to do anything — we just need it to
-        // construct, holding the four Arcs the design doc names.
+        // construct, holding the four Arcs the adapter expects.
         let metrics = PrometheusBuilder::new().build_recorder().handle();
         let (ctx, _mocks) = build_mock_ctx(metrics);
         let resolver: Arc<dyn UpstreamResolver> = ctx.upstream_resolver.clone();
@@ -1065,16 +1060,15 @@ mod tests {
         let adapter = UpstreamMetadataAdapter::new(resolver, cache, upstream_proxy, pull_dedup);
 
         // `Clone` is part of the public surface — the composition root
-        // hands out `Arc<dyn UpstreamMetadataPort>` clones at Item 8.
+        // hands out `Arc<dyn UpstreamMetadataPort>` clones.
         let _cloned = adapter.clone();
     }
 
     // -----------------------------------------------------------------
     // Compile-time pin — the adapter MUST implement `UpstreamMetadataPort`
-    // and be holdable as `Arc<dyn UpstreamMetadataPort>`. This is what
-    // Item 8 will compose against; a future change that breaks dyn-
-    // compatibility surfaces here at test build time, not at the
-    // composition root.
+    // and be holdable as `Arc<dyn UpstreamMetadataPort>`. A future change
+    // that breaks dyn-compatibility surfaces here at test build time, not
+    // at the composition root.
     // -----------------------------------------------------------------
 
     #[test]

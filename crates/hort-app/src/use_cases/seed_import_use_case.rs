@@ -13,7 +13,7 @@
 //!
 //! **Critical invariant — the scan still gates.** Seed-import stamps
 //! the time anchor only. A dirty scan still transitions the artifact
-//! to `Rejected` via `Artifact::reject_from_scan` (F-6 fail-closed
+//! to `Rejected` via `Artifact::reject_from_scan` (fail-closed
 //! release authority is unchanged). This is **NOT** `ScanWaived` and
 //! **NOT** permissive mode (`quarantineDuration: 0`); both of those
 //! retire the scan as a gate. Seed-import only retires the *observation
@@ -646,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_one_item_artifact_lands_quarantined_with_backdated_anchor_status() {
-        // Item 5 acceptance: backdated-anchor.
+        // Acceptance: backdated-anchor.
         let (uc, artifacts, _l, storage, repos, _p) = make_use_case();
         let repo = pypi_repository();
         let repo_id = repo.id;
@@ -683,7 +683,7 @@ mod tests {
     // Acceptance: a dirty scan still rejects (use case does NOT bypass scan)
     // -----------------------------------------------------------------------
 
-    /// Item 5 acceptance: dirty-scan-still-rejects.
+    /// Acceptance: dirty-scan-still-rejects.
     ///
     /// Seed-import produces an artifact in `Quarantined` status (NOT
     /// `Released`, NOT `ScanWaived`). The scan gate still applies —

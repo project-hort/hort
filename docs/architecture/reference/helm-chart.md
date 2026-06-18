@@ -182,7 +182,7 @@ fixed `45`.
 `values.schema.json` (JSON Schema draft-07) rejects a bad
 `helm install`/`upgrade` **before** anything reaches the cluster.
 
-### Strict schema — unknown keys fail (Backlog 078 Item 11, chart S1)
+### Strict schema — unknown keys fail
 
 `additionalProperties: false` is set on the **top-level object and every
 nested object block the chart owns the shape of**. An unknown, mistyped,
@@ -243,12 +243,12 @@ server boot-crash loop.
 | `scheduledTasks.serviceAccountRotation.enabled`, `worker.rotation.publicRegistryHost` empty | `worker.rotation.publicRegistryHost is required when scheduledTasks.serviceAccountRotation.enabled=true` (the `required` template function; schema rule 9b rejects the same shape earlier). |
 | `metrics.serviceMonitor.enabled`, `metrics.bindAddr` empty | `metrics.serviceMonitor.enabled=true requires metrics.bindAddr …` |
 
-> Backlog 078 Item 9 (chart S4) collapsed the pre-078 two-place rotation
-> switch into the single `scheduledTasks.serviceAccountRotation.enabled`
-> toggle and moved the cross-field half-set checks from a bespoke
-> `fail`-based template helper into the schema rules 9a/9b above — so a
-> half-set rotation config is now rejected by `values.schema.json` (the
-> uniform validation style) rather than a template `fail`.
+> The pre-existing two-place rotation switch was collapsed into the single
+> `scheduledTasks.serviceAccountRotation.enabled` toggle and the cross-field
+> half-set checks were moved from a bespoke `fail`-based template helper into
+> the schema rules 9a/9b above — so a half-set rotation config is now rejected
+> by `values.schema.json` (the uniform validation style) rather than a template
+> `fail`.
 
 ---
 
@@ -276,7 +276,7 @@ for what each rendered env var does and its boot-time interlocks.
 
 ## 7. Scheduled tasks & worker — operator notes
 
-All periodic tasks live under `scheduledTasks.*` (Backlog 078 Item 8); each
+All periodic tasks live under `scheduledTasks.*`; each
 carries an `executionPath` attribute. `worker.enabled` and
 `scheduledTasks.adminTasksEnabled` are **both off by default**; neither is
 required for a functioning registry. Enable them only when you need
@@ -304,7 +304,7 @@ service-account rotation.
   also needs `postgres.admin.existingSecret` (the bootstrap Job mints the
   SA token under the admin DSN) and an in-cluster network path from
   CronJob pods to the hort-server Service.
-- **Rotation single toggle (Backlog 078 Item 9):**
+- **Rotation single toggle:**
   `scheduledTasks.serviceAccountRotation.enabled` is the **single**
   source-of-truth switch — it drives both the CronJob and the worker-side
   wiring (env + per-namespace RBAC). There is no separate

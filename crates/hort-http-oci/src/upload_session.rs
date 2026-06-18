@@ -37,8 +37,8 @@
 //! field set is under the crate's control and no foreign tool reads it.
 //! `session_id` is the key, not a field on the value.
 //!
-//! The record now carries a `version: u64` field (Item 2 — PATCH
-//! append). The `EphemeralStore` port's own CAS version counter is
+//! The record carries a `version: u64` field for optimistic-concurrency
+//! CAS on PATCH appends. The `EphemeralStore` port's own CAS version counter is
 //! opaque from this module's perspective; mirroring it inside the
 //! encoded record gives callers a self-describing "what
 //! expected_version do I pass to `compare_and_swap`?" primitive
@@ -81,9 +81,9 @@ use super::coords::oci_blob_coords;
 // TTL
 // ---------------------------------------------------------------------------
 
-/// Default upload-session TTL.  Per backlog, `HORT_OCI_SESSION_MAX_AGE_SECS`
-/// will thread this through `hort-server::Config` (tracked in the OCI
-/// pull-through backlog); until then the hardcoded one-hour ceiling is
+/// Default upload-session TTL. `HORT_OCI_SESSION_MAX_AGE_SECS` will
+/// thread this through `hort-server::Config` in a future change; until
+/// then the hardcoded one-hour ceiling is
 /// adequate — it matches the Docker Registry v2 reference implementation
 /// and gives humans enough time to retry a multi-gigabyte push over a
 /// flaky link without GC'ing the session out from under them.
@@ -284,7 +284,7 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Result<UploadSessionRecord, DomainE
 /// Return envelope of [`initiate`].
 ///
 /// `initial_version = 1` is returned explicitly for parity with the
-/// `EphemeralStore::compare_and_swap` contract — Items 2/3 feed this
+/// `EphemeralStore::compare_and_swap` contract — the compare_and_swap callers feed this
 /// back in as `expected_version` on the first PATCH / PUT.  Encoding
 /// the "first version is 1" invariant at the type level would be
 /// over-specified — the port trait documents the same guarantee.
@@ -306,7 +306,7 @@ pub struct InitiateOutcome {
 /// stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InitiateResult {
-    /// Session created. Caller emits the §2.10 202 + `Location` /
+    /// Session created. Caller emits the 202 + `Location` /
     /// `Docker-Upload-UUID` / `Range: 0-0` envelope.
     Created(InitiateOutcome),
     /// Per-`(repo, principal)` cap exceeded. Caller emits 429 with
@@ -322,11 +322,11 @@ pub enum InitiateResult {
 /// `hort_stateful_upload_sessions_total`, and returns the session id for
 /// the handler to serve in the `Location` header.
 ///
-/// `_actor` is accepted for API parity with Items 2/3 (which will use
-/// it on causation/audit events); Item 1 does not persist an event
-/// until finalize, so the actor stays unused here.  Intentional — the
-/// signature is part of the public contract and Items 2/3 will carry
-/// the actor through to `add_member` / `register_by_hash`.
+/// `_actor` is accepted for API parity with the PATCH/PUT handlers
+/// (which use it on causation/audit events); initiate does not persist
+/// an event until finalize, so the actor stays unused here. The
+/// signature is part of the public contract and the PUT/PATCH handlers
+/// carry the actor through to `add_member` / `register_by_hash`.
 ///
 /// On `put_if_absent` returning `Ok(false)` (key already present —
 /// cosmically unlikely under random v4 UUIDs) we surface a
@@ -565,7 +565,7 @@ async fn resolve_repo_label(ctx: &AppContext, repo_id: Uuid) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// append_chunk (Item 2 — PATCH)
+// append_chunk (PATCH)
 // ---------------------------------------------------------------------------
 
 /// Inclusive `(start, end)` byte range parsed from a `Content-Range`
@@ -580,7 +580,7 @@ pub struct ContentRange {
 
 impl ContentRange {
     /// Span width — `end - start + 1` because the range is inclusive
-    /// on both ends per OCI spec §2.3.
+    /// on both ends per the OCI spec.
     pub fn span(&self) -> u64 {
         // `end < start` is rejected by the parser before this type is
         // constructed.  A saturating_sub here would mask an arithmetic
@@ -601,7 +601,7 @@ impl ContentRange {
 /// 2. Validates the `Content-Range` against the session's progress and
 ///    the caller-supplied `max_bytes` cap.  Each kind of mismatch
 ///    surfaces as a distinct [`AppError`] variant so the adapter can
-///    emit the right §2.8 status code (416 / 400 / 413).
+///    emit the right status code (416 / 400 / 413).
 /// 3. `ctx.stateful_upload_staging.append(session_id, stream)` — appends
 ///    the body bytes to staging.  Non-retryable; a failure on this step
 ///    leaves the session's `bytes_received` unchanged (we haven't CASed
@@ -609,20 +609,20 @@ impl ContentRange {
 /// 4. `ctx.ephemeral_durable.compare_and_swap(key, record.version, new_record,
 ///    TTL)` — atomic bump + TTL slide.  A CAS miss means a concurrent
 ///    PATCH won; we surface [`DomainError::Conflict`] so the adapter
-///    emits `400 BLOB_UPLOAD_INVALID` per §2.8.
+///    emits `400 BLOB_UPLOAD_INVALID`.
 ///
 /// # Tenant isolation
 ///
 /// The `repo_id` argument is the write-authorised repository resolved
 /// from the request's `:repo_key` path param.  The session's stored
 /// `repository_id` MUST match.  Mismatch maps to
-/// [`DomainError::NotFound`] (not `Forbidden`) — the design doc's
-/// anti-enumeration stance in §2.9 item 9.
+/// [`DomainError::NotFound`] (not `Forbidden`) — anti-enumeration:
+/// the session UUID must not reveal whether it belongs to another repo.
 ///
 /// # Hash deferral
 ///
 /// This function DOES NOT compute the SHA-256 of the chunk.  Hashing
-/// happens once on finalize (Item 3) via `StoragePort::put`, which is
+/// happens once on finalize via `StoragePort::put`, which is
 /// the workspace-wide CAS invariant.  Attempting to hash chunks here
 /// would re-implement the incremental-hash pattern in a worse spot
 /// (the adapter can't participate in a multi-chunk digest without a
@@ -811,10 +811,9 @@ async fn append_chunk_core(
     match cas_outcome {
         Some(_new_store_version) => Ok(new_record),
         None => {
-            // Concurrent PATCH bumped the version underneath us.  Per
-            // §2.8 the spec-compliant response is 400
-            // `BLOB_UPLOAD_INVALID`.  Surface as Conflict; the HTTP
-            // adapter translates.
+            // Concurrent PATCH bumped the version underneath us. The
+            // spec-compliant response is 400 `BLOB_UPLOAD_INVALID`.
+            // Surface as Conflict; the HTTP adapter translates.
             tracing::info!(
                 session_id = %session_id,
                 expected_version = record.version,
@@ -828,7 +827,7 @@ async fn append_chunk_core(
 }
 
 // ---------------------------------------------------------------------------
-// finalize (Item 3 — PUT)
+// finalize (PUT)
 // ---------------------------------------------------------------------------
 
 /// Finalize an in-flight OCI blob upload session.
@@ -860,15 +859,14 @@ async fn append_chunk_core(
 ///   atomic at the use-case boundary (either both land or neither),
 ///   and the client sees an error. The session + staging are still
 ///   live; the next PATCH/PUT from the client either succeeds (new
-///   content, same session) or the GC sweep (Item 15) reaps on TTL
-///   expiry.
+///   content, same session) or the GC sweep reaps on TTL expiry.
 /// - **Between steps 1 and 2:** the ingest event + CAS blob are
 ///   committed but the session key lingers. The session TTL expires
-///   on its own; the GC sweep (Item 15) is belt-and-braces. A client
-///   retry on the same session UUID finds stale state but the artifact
-///   is already durable so the retry is a no-op at the registry level.
+///   on its own; the GC sweep is belt-and-braces. A client retry on
+///   the same session UUID finds stale state but the artifact is
+///   already durable so the retry is a no-op at the registry level.
 /// - **Between steps 2 and 3:** the session is gone but the staging
-///   file orphans. Item 15 sweeps staging by mtime age and reaps.
+///   file orphans. The GC sweep reaps staging by mtime age.
 /// - **Digest-mismatch path:** the CAS blob rollback is performed
 ///   *inside* `IngestUseCase::ingest`. This function's only
 ///   responsibility is to additionally drop the session + staging so
@@ -1038,8 +1036,8 @@ async fn finalize_core(
 
     // --- Open staging. If the session exists but staging does not,
     // that's an invariant breach: `append_chunk` + `initiate` always
-    // leave these two halves consistent. Item 15's GC sweep is the
-    // only legitimate mechanism that could race a finalize and
+    // leave these two halves consistent. The GC sweep is the only
+    // legitimate mechanism that could race a finalize and
     // remove staging underneath it — we surface `Invariant` so the
     // handler returns 500 and the operator sees the loud log. The
     // error mapping intentionally turns a `NotFound { entity:
@@ -1133,7 +1131,7 @@ async fn finalize_core(
 ///
 /// Each leg logs `warn!` on failure and continues so the caller can
 /// still surface the ingest result (success or Conflict) to the
-/// client. The GC sweep (Item 15) picks up anything left behind.
+/// client. The GC sweep picks up anything left behind.
 async fn cleanup_session_and_staging(
     ctx: &AppContext,
     key: &str,
@@ -1354,7 +1352,7 @@ mod tests {
                  a future change that clones the Arc before return breaks this helper"
             )
         });
-        // `AppContext`'s data ports are `pub(crate)` (ADR 0008 §4) so
+        // `AppContext`'s data ports are `pub(crate)` (ADR 0008) so
         // the `..base` struct-update syntax is unreachable across
         // crates. Mutating the `pub ephemeral_*` fields in place is
         // equivalent and keeps the helper's intent intact.

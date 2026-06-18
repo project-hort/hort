@@ -4,19 +4,17 @@
 //! a paginated event-log scan over `events` filtered to curator
 //! decisions (`ArtifactReleased{authority: CuratorWaiver}`,
 //! `ArtifactRejected{rejected_by: Curator}`, `ExclusionAdded`,
-//! `ExclusionRemoved`). Adapter lands in Item 7.
+//! `ExclusionRemoved`).
 //!
-//! **Item 5 stub scope.** Item 5 wires `Arc<dyn _>` into
-//! `CurationUseCase`'s port-only constructor so Item 7's body slots in
-//! one-shot. The trait, [`CurationDecisionEntry`],
-//! [`CurationDecisionFilter`], and [`CurationDecisionKind`] are defined
-//! here so the use-case struct compiles; Item 7 supplies the SQL
-//! adapter and the use-case `list_decisions` method body.
+//! The trait, [`CurationDecisionEntry`], [`CurationDecisionFilter`], and
+//! [`CurationDecisionKind`] are defined here so the use-case struct
+//! compiles; the SQL adapter and the use-case `list_decisions` method body
+//! are supplied by the Postgres adapter.
 //!
 //! # Domain DTO discipline
 //!
-//! No serde on these types — HTTP DTO lives in the inbound-HTTP crate
-//! (Item 9). Mirrors the `PatchCandidateRepository` discipline.
+//! No serde on these types — HTTP DTO lives in the inbound-HTTP crate.
+//! Mirrors the `PatchCandidateRepository` discipline.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -26,7 +24,7 @@ use crate::error::DomainResult;
 use super::BoxFuture;
 
 /// Discriminator for the four curator decision shapes the listing
-/// surfaces (design doc §2.9).
+/// surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurationDecisionKind {
     /// Curator-driven release (`ArtifactReleased { authority:
@@ -90,8 +88,8 @@ impl Default for CurationDecisionFilter {
 
 /// Outbound port: paginated decisions log.
 ///
-/// **Item 5 stub.** Full body + Postgres adapter in Item 7. The trait
-/// exists here so `CurationUseCase` can hold `Arc<dyn _>` one-shot.
+/// The trait exists here so `CurationUseCase` can hold `Arc<dyn _>`;
+/// the Postgres adapter supplies the full implementation.
 pub trait CurationDecisionsRepository: Send + Sync {
     fn list_decisions<'a>(
         &'a self,

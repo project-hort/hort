@@ -15,7 +15,7 @@
 //!   [`WheelMetadataUseCase::serve`]. Returns 200 + bytes +
 //!   `Content-Digest` on success; 404 on Rejected /
 //!   ScanIndeterminate / un-backfilled / invisible / missing
-//!   (F-25 anti-enumeration); 503 + `Retry-After` on Quarantined.
+//!   (anti-enumeration); 503 + `Retry-After` on Quarantined.
 //! - **wheel path with proxy repo** → strategy-2 dispatch:
 //!   1. Call [`WheelMetadataUseCase::serve`] (the hosted path). On
 //!      success — wheel was already in CAS AND the `wheel_metadata`
@@ -119,7 +119,7 @@ use hort_http_core::error::ApiError;
 /// this helper.
 ///
 /// This dispatcher resolves the repo's `RepositoryType` first so a
-/// proxy repo's `.metadata` routes through the Item 5 strategy-2
+/// proxy repo's `.metadata` routes through the strategy-2
 /// cache-miss-via-pull-through dispatch (see module doc). Hosted /
 /// Staging / Virtual repos call through to
 /// [`WheelMetadataUseCase::serve`] directly.
@@ -130,7 +130,7 @@ pub(crate) async fn serve_pep658_metadata(
     wheel_filename: String,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    // (a) Visibility-gated repo resolution FIRST. This is the F-25
+    // (a) Visibility-gated repo resolution FIRST. This is the
     // anti-enumeration gate — an invisible private repo must yield the
     // canonical `Repository NotFound` envelope, byte-identical to a
     // missing-repo response. Performing the sdist suffix-check
@@ -150,7 +150,7 @@ pub(crate) async fn serve_pep658_metadata(
         .map_err(ApiError::from)?;
 
     // (b) Sdist path → 404. PEP 658 applies only to wheels (PEP 658
-    // §"Specification"). After the F-25 hop above, an invisible repo
+    // §"Specification"). After the visibility check above, an invisible repo
     // has already produced a `Repository NotFound` — so by the time we
     // reach this check, the caller is known to have Read on the repo
     // (or auth is disabled). A sdist `.metadata` returns
@@ -208,10 +208,10 @@ pub(crate) async fn serve_pep658_metadata(
 ///    ContentReference row" (legacy wheel or the ingest hook
 ///    saw `extract_wheel_metadata_bytes` return `None`):
 ///    - `find_visible_by_path` returns `Ok(artifact)` → 404, do NOT
-///      pull. Operator runs Item 7's backfill task.
+///      pull. Operator runs the backfill task.
 ///    - `find_visible_by_path` returns `NotFound { entity:
 ///      "Artifact" }` → trigger
-///      [`crate::upstream_pull::try_upstream_file_pull`]. Item 3's
+///      [`crate::upstream_pull::try_upstream_file_pull`]. The
 ///      ingest hook fires automatically; on success, re-serve via the
 ///      hosted path.
 ///
@@ -263,7 +263,7 @@ async fn serve_proxy_with_pull_fallback(
             // have been `Quarantined` — so by elimination this arm
             // is the legacy-no-metadata-row case (or Rejected /
             // ScanIndeterminate which we collapse to 404 anyway per
-            // §3 invariant c).
+            // all collapse to 404).
             tracing::debug!(
                 "proxy .metadata 404 — wheel in CAS but no wheel_metadata row \
                  (legacy ingest or extract returned None); \
@@ -280,7 +280,7 @@ async fn serve_proxy_with_pull_fallback(
             // (2b) Real cache miss — trigger pull-through.
             tracing::info!(
                 "proxy .metadata cache miss — triggering wheel pull-through; \
-                 Item 3's ingest hook will extract + persist METADATA into CAS"
+                 the ingest hook will extract + persist METADATA into CAS"
             );
             match crate::upstream_pull::try_upstream_file_pull(
                 &ctx,
@@ -292,7 +292,7 @@ async fn serve_proxy_with_pull_fallback(
             {
                 Ok(_artifact) => {
                     // Re-serve via the hosted path now that the wheel
-                    // (and, by Item 3's hook, the wheel_metadata
+                    // (and, by the ingest hook, the wheel_metadata
                     // ContentReference) is in CAS.
                     let outcome = ctx
                         .wheel_metadata_use_case
@@ -311,7 +311,7 @@ async fn serve_proxy_with_pull_fallback(
             }
         }
         // Repository visibility / other errors propagate. The first
-        // `serve` call already passed the F-25 hop, so a `Repository`
+        // `serve` call already passed the visibility check, so a `Repository`
         // NotFound here would indicate a race (repo deleted between
         // the two calls) — surface it indistinguishably from the
         // initial visibility check.

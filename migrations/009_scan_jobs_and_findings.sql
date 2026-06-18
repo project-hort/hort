@@ -167,7 +167,7 @@ CREATE TABLE public.jobs (
     -- The two partial unique indexes below (`jobs_prefetch_unique` +
     -- `jobs_prefetch_dependencies_unique`) absorb concurrent cascade
     -- re-walks of the same (repo, package, version) cohort —
-    -- design §2.3's three-level dedup, L3:
+    -- Three-level dedup, L3:
     --
     --   L1 — PullDedup (single-flight upstream pull)
     --   L2 — artifacts path-UNIQUE (terminal ingest absorb)

@@ -49,7 +49,7 @@ if any ClaimMapping is declared while `HORT_AUTH_PROVIDER=disabled` (no
 
 | File | Kind | Purpose |
 |---|---|---|
-| `auth/29-admins-claim-mapping.yaml` | ClaimMapping  | OIDC group `hort-admins` → `admin` claim (the realm's `admin` user; required for the admin-only surfaces — §8.4, §11) |
+| `auth/29-admins-claim-mapping.yaml` | ClaimMapping  | OIDC group `hort-admins` → `admin` claim (the realm's `admin` user; required for the admin-only surfaces) |
 | `auth/30-developers-claim-mapping.yaml` | ClaimMapping  | OIDC group `test-developers` → `developer` claim |
 | `auth/30b-ci-pushers-claim-mapping.yaml` | ClaimMapping | OIDC group `test-developers` → `ci-pusher` claim (fan-out — a member's resolved set is `[developer, ci-pusher]`, the two-claim subject the grants require) |
 | `auth/31-read-npm-proxy.yaml` | PermissionGrant | `[developer, ci-pusher]` → Read on `npm-proxy` |

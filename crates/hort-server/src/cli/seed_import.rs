@@ -44,7 +44,7 @@
 //!
 //! Rationale: an explicit list is the smaller, most-honest start. A
 //! lockfile parser (one per ecosystem) is significant scope and lands
-//! as a follow-on initiative if operators ask for it. JSON was
+//! as a follow-on if operators ask for it. JSON was
 //! considered but TSV is the smaller surface — `awk` / `cut` /
 //! `grep` etc. round-trip cleanly.
 //!

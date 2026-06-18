@@ -37,9 +37,8 @@ pub struct SecretRef {
 /// Where a secret's bytes are read from.
 ///
 /// Closed enum — adapters that need a new source kind extend this set
-/// in coordination with the port contract; the design doc §2 is the
-/// canonical list. Serialised lower-snake-case so YAML config files
-/// can spell `source: env_var` / `source: file`.
+/// in coordination with the port contract. Serialised lower-snake-case
+/// so YAML config files can spell `source: env_var` / `source: file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretSource {

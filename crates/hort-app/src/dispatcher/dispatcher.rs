@@ -635,8 +635,8 @@ mod tests {
         u
     }
 
-    /// Active, non-admin user — the F-3 / F-37 subject (an ordinary
-    /// authenticated user who can create subscriptions).
+    /// Active, non-admin user — an ordinary authenticated user who can
+    /// create subscriptions.
     fn non_admin_user(id: Uuid) -> User {
         let mut u = admin_user(id);
         u.is_admin = false;
@@ -958,10 +958,9 @@ mod tests {
         );
     }
 
-    /// Base test 2 (backlog Item 9 acceptance). `snapshot_claims = []`
-    /// + `user.is_admin = true` → `principal.claims = ["admin"]`
-    /// (synthetic admin claim derived from the live bit; §6 invariant
-    /// 3). Admin-owned subscriptions still authorise.
+    /// `snapshot_claims = []` + `user.is_admin = true` →
+    /// `principal.claims = ["admin"]` (synthetic admin claim derived
+    /// from the live bit). Admin-owned subscriptions still authorise.
     #[tokio::test]
     async fn synthesise_principal_empty_snapshot_admin_owner_gets_admin_claim() {
         let owner = Uuid::new_v4();
@@ -984,8 +983,7 @@ mod tests {
         assert!(principal.token_kind.is_none());
     }
 
-    /// **F-37 canonical closure (audit 2026-05-15 §4A).** Owner
-    /// `is_admin = false`, but `snapshot_claims = ["admin"]` — the §5.5
+    /// Owner `is_admin = false`, but `snapshot_claims = ["admin"]` — the
     /// PATCH-via-PAT elevation persisted by a then-admin actor whose
     /// admin was later revoked. The synthesised principal MUST NOT
     /// carry `"admin"`: the stale snapshot string is neutralised and
@@ -994,7 +992,7 @@ mod tests {
     /// dispatch-time privileged-category gate (subscription_filter
     /// step 4) blocks every `ADMIN_CATEGORIES` event — snapshot
     /// elevation cannot retroactively unlock a privileged category
-    /// against a non-admin owner. F-37 closed by construction.
+    /// against a non-admin owner.
     #[tokio::test]
     async fn f37_stale_snapshot_admin_does_not_elevate_non_admin_owner() {
         let owner = Uuid::new_v4();
@@ -1013,7 +1011,7 @@ mod tests {
         assert!(
             !principal.claims.iter().any(|c| c == "admin"),
             "stale snapshot \"admin\" MUST be stripped for a \
-             non-admin owner — F-37: snapshot elevation cannot unlock \
+             non-admin owner — snapshot elevation cannot unlock \
              privileged categories against a non-admin owner"
         );
         assert!(

@@ -1,12 +1,10 @@
 //! `kind: Exclusion` schema, parser, and per-spec validation.
 //!
 //! Event-sourced sub-state of a parent `ScanPolicy`: identity is
-//! `(policy_name, cve_id, package_pattern_or_null)` (design doc §3.3).
-//! The diff lives in Item 14b-8's `ApplyEventSourcedKind`
-//! implementation; this module only covers schema + per-envelope
-//! validation. Cross-doc rules (parent policy must exist;
-//! `(cve_id, package_pattern)` unique per parent) live in
-//! `crate::desired::validate`.
+//! `(policy_name, cve_id, package_pattern_or_null)`.
+//! This module covers schema + per-envelope validation only. Cross-doc
+//! rules (parent policy must exist; `(cve_id, package_pattern)` unique
+//! per parent) live in `crate::desired::validate`.
 
 use std::path::Path;
 
@@ -40,8 +38,8 @@ pub struct ExclusionSpec {
     pub package_pattern: Option<String>,
     /// `global` or `{ repository: <metadata.name> }`. The cross-spec
     /// validator does NOT resolve the repository reference here —
-    /// the apply pipeline (Item 14b-8) inherits the resolution from
-    /// the parent policy's scope when present.
+    /// the apply pipeline inherits the resolution from the parent
+    /// policy's scope when present.
     pub scope: ScopeSpec,
     /// Operator-facing rationale stored on the `ExclusionAdded`
     /// event. Mandatory by intent — empty rationale is an audit

@@ -10,8 +10,8 @@
 //! These tests are deliberately handler-shaped — they exercise the
 //! status-code mapping, the DTO → domain boundary, and the response
 //! envelope serialisation. The use-case-level coverage (token-kind
-//! gate per-tick, RBAC denial per-tick, the §6.8 status overlay, the
-//! §§6.3-6.5 per-item dispatch) lives in
+//! gate per-tick, RBAC denial per-tick, the status overlay, and the
+//! per-item dispatch) lives in
 //! `crates/hort-app/src/use_cases/{discovery,self_service_prefetch}_use_case.rs::tests`.
 
 use std::sync::Arc;
@@ -331,7 +331,7 @@ async fn list_versions_missing_permission_read_returns_403() {
 
 #[tokio::test]
 async fn list_versions_anonymous_returns_401() {
-    // F-25 read-endpoint regression guard. The GET routes through
+    // Anti-enumeration regression guard. The GET routes through
     // `extract_optional_principal` in production, which inserts
     // `Option<AuthenticatedPrincipal> = None` for an anonymous request.
     // The handler must thread that `None` into the use case, whose Gate 0
@@ -472,8 +472,7 @@ async fn prefetch_malformed_body_returns_400() {
     let resp = router.oneshot(req).await.unwrap();
     // axum's `Json` extractor returns 422 (Unprocessable Entity) for
     // shape mismatches, NOT 400 — both are within the 4xx "client did
-    // something wrong" envelope. The status-code matrix in §2.3 says
-    // "400" for malformed; we assert the broader 4xx class here.
+    // something wrong" envelope. We assert the broader 4xx class here.
     assert!(
         resp.status().is_client_error(),
         "expected 4xx, got {}",

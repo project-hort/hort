@@ -49,10 +49,10 @@ sha2 = { workspace = true }
 hex  = { workspace = true }
 
 # Structured logging — the adapter does not emit a metric directly (the
-# dispatcher owns `hort_notify_delivery_*` per design doc §12; cardinality
+# dispatcher owns `hort_notify_delivery_*`; cardinality
 # discipline). Tracing spans are optional but kept available so a
-# future warn! on delivery failure (without the URL — design §11 audit
-# row) can be wired without a Cargo.toml change.
+# future warn! on delivery failure (without the URL) can be wired
+# without a Cargo.toml change.
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -11,7 +11,7 @@
 //! `?by_correlation=true` and renders whichever populated field
 //! (`events` xor `groups`) the response carries.
 //!
-//! # Query parameters (design §2.7, §2.9)
+//! # Query parameters
 //!
 //! - `--type <waive|block|exclude_finding|unexclude_finding>` → `?type=`.
 //!   Closed-set validation client-side.
@@ -349,7 +349,7 @@ fn render_groups_table(
     Ok(())
 }
 
-/// Justifications can be up to 512 bytes (Item 12 cap). Long
+/// Justifications can be up to 512 bytes. Long
 /// justifications wreck table column alignment. Truncate to 60 chars
 /// with an ellipsis for the table view; JSON output carries the full
 /// text.

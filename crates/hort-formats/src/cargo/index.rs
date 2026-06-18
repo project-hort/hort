@@ -1,6 +1,6 @@
 //! Cargo `IndexBuilder` — third concrete `IndexBuilder` impl in the
 //! unified Source → Filter → Builder pipeline
-//! (see explanation/index-construction.md, design doc §2.1 / §2.2 / §2.6).
+//! (see explanation/index-construction.md).
 //!
 //! - [`CargoVersionPayload`] (re-exported from
 //!   [`hort_app::use_cases::index_serve`] — defined there for the same
@@ -116,8 +116,8 @@ pub use hort_app::use_cases::index_serve::CargoVersionPayload;
 /// post-filter `Vec<VersionEntry>`.
 ///
 /// Stateless; the per-format serve handler constructs an instance per
-/// request (cheap — it's a unit struct). The Item-1 [`IndexBuilder`]
-/// trait contract is "stateless wire-shape emitter"; this matches.
+/// request (cheap — it's a unit struct). The [`IndexBuilder`] trait
+/// contract is "stateless wire-shape emitter"; this matches.
 ///
 /// # Panics
 ///

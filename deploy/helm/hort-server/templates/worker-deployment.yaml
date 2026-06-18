@@ -76,12 +76,10 @@ spec:
           # No args — the binary's main is the poll loop.
           env:
             # ----- Postgres (app-role DSN, NOT admin) -----
-            # Backlog 078 Item 5 — inject only the canonical HORT_DATABASE_URL,
-            # uniform with the server/migrate/cronjob pods. The worker (like
-            # hort-server) prefers HORT_DATABASE_URL and falls back to bare
-            # DATABASE_URL (sqlx-cli / Tier-2 / 12-factor), so the previously
-            # belt-and-suspenders duplicate DATABASE_URL injection is redundant
-            # and has been dropped.
+            # Inject only the canonical HORT_DATABASE_URL, uniform with the
+            # server/migrate/cronjob pods. The worker (like hort-server)
+            # prefers HORT_DATABASE_URL and falls back to bare DATABASE_URL
+            # (sqlx-cli / Tier-2 / 12-factor).
             - name: HORT_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -164,11 +162,10 @@ spec:
             - name: HORT_WORKER_ID
               value: {{ .Values.worker.workerIdOverride | default "" | quote }}
             # ----- Scanner-specific env from the ConfigMap -----
-            {{- /* Backlog 078 Item 6 (chart S3) — load-bearing scanner */}}
-            {{- /* enable flags. The worker gates backend registration  */}}
-            {{- /* on these BEFORE the `--version` probe runs, so        */}}
-            {{- /* `enabled: false` reliably disables a backend even     */}}
-            {{- /* when its binary is present.                           */}}
+            {{- /* Load-bearing scanner enable flags. The worker gates  */}}
+            {{- /* backend registration on these BEFORE the `--version` */}}
+            {{- /* probe runs, so `enabled: false` reliably disables a  */}}
+            {{- /* backend even when its binary is present.             */}}
             - name: HORT_SCANNER_TRIVY_ENABLED
               valueFrom:
                 configMapKeyRef:
@@ -253,39 +250,33 @@ spec:
               value: "0.0.0.0:{{ .Values.worker.metrics.port }}"
             {{- end }}
             {{- if include "hort-server.extraCaBundle.autoMounted" . }}
-            {{- /* Backlog 078 Item 7 (b / convention 9): set
-                   HORT_EXTRA_CA_BUNDLE on the worker ONLY when the chart
-                   also auto-mounts the bundle on the worker pod
+            {{- /* Set HORT_EXTRA_CA_BUNDLE on the worker ONLY when the
+                   chart also auto-mounts the bundle on the worker pod
                    (extraCaBundle.configMapName or .secretName, mounted
-                   symmetrically with the server below). Previously this
-                   was gated on `.path` alone, so a path-only config set
-                   the env without mounting the file → the worker boot's
-                   fail-closed read of HORT_EXTRA_CA_BUNDLE crashlooped.
-                   For the manual extraVolumes recipe the operator sets
-                   this var themselves via `worker.extraEnv`. */}}
+                   symmetrically with the server below). For the manual
+                   extraVolumes recipe the operator sets this var
+                   themselves via `worker.extraEnv`. */}}
             - name: HORT_EXTRA_CA_BUNDLE
               value: {{ .Values.extraCaBundle.path | quote }}
             {{- end }}
             {{- /* Service-account PAT rotation env vars. Gated by the     */}}
             {{- /* single source-of-truth toggle                           */}}
-            {{- /* `scheduledTasks.serviceAccountRotation.enabled` (NOT a  */}}
-            {{- /* separate worker switch — the single toggle also renders  */}}
-            {{- /* the CronJob trigger + the per-namespace RBAC, so        */}}
-            {{- /* flipping it on/off moves all three in lockstep). The    */}}
-            {{- /* schema requires `adminTasksEnabled` +                   */}}
-            {{- /* `worker.rotation.publicRegistryHost` when this is on,  */}}
-            {{- /* so a half-set config fails at `helm install`.          */}}
-            {{- /*  - HORT_K8S_SECRET_WRITER_ENABLED gates the writer       */}}
-            {{- /*    adapter (Item 6).                                   */}}
-            {{- /*  - HORT_ROTATION_TARGET_NAMESPACES gates which           */}}
-            {{- /*    namespaces the rotation handler is willing to       */}}
-            {{- /*    write into (Item 7). Comma-separated; empty         */}}
-            {{- /*    string means "register but warn on every SA".       */}}
-            {{- /*  - HORT_PUBLIC_REGISTRY_HOST is REQUIRED — the           */}}
-            {{- /*    `dockerconfigjson.auths` map has nowhere to point   */}}
-            {{- /*    without it. `required` short-circuits chart render  */}}
-            {{- /*    so a misconfigured operator gets a clear error at   */}}
-            {{- /*    install time, not at runtime.                       */}}
+            {{- /* `scheduledTasks.serviceAccountRotation.enabled` — the   */}}
+            {{- /* same toggle also renders the CronJob trigger + the      */}}
+            {{- /* per-namespace RBAC, so flipping it on/off moves all     */}}
+            {{- /* three in lockstep. The schema requires                  */}}
+            {{- /* `adminTasksEnabled` + `worker.rotation.publicRegistry-  */}}
+            {{- /* Host` when this is on, so a half-set config fails at    */}}
+            {{- /* `helm install`.                                          */}}
+            {{- /*  - HORT_K8S_SECRET_WRITER_ENABLED gates the writer      */}}
+            {{- /*    adapter.                                             */}}
+            {{- /*  - HORT_ROTATION_TARGET_NAMESPACES — comma-separated;   */}}
+            {{- /*    empty string means "register but warn on every SA".  */}}
+            {{- /*  - HORT_PUBLIC_REGISTRY_HOST is REQUIRED — the          */}}
+            {{- /*    `dockerconfigjson.auths` map has nowhere to point    */}}
+            {{- /*    without it. `required` short-circuits chart render   */}}
+            {{- /*    so a misconfigured operator gets a clear error at    */}}
+            {{- /*    install time, not at runtime.                        */}}
             {{- if .Values.scheduledTasks.serviceAccountRotation.enabled }}
             - name: HORT_K8S_SECRET_WRITER_ENABLED
               value: "true"
@@ -345,9 +336,8 @@ spec:
               readOnly: true
             {{- end }}
             {{- if include "hort-server.extraCaBundle.autoMounted" . }}
-            {{- /* Backlog 078 Item 7 (a) — symmetric with the server
-                   Deployment: configMapName OR secretName auto-mounts on
-                   the worker too. */}}
+            {{- /* Symmetric with the server Deployment: configMapName OR
+                   secretName auto-mounts on the worker too. */}}
             {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 12 }}
             {{- end }}
             {{- with .Values.worker.extraVolumeMounts }}

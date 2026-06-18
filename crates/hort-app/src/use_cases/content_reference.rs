@@ -143,7 +143,7 @@ impl ContentReferenceUseCase {
     ///
     /// **Trust contract — no authz here.** Caller (the per-format
     /// `IndexSource::fetch` impl) has already passed
-    /// `list_by_raw_name_visible` (F-25) for the same `repo_id`; the
+    /// `list_by_raw_name_visible` for the same `repo_id`; the
     /// `source_artifact_id` slice is the set of trusted ids returned
     /// from that hop (trusted-ids contract, ADR 0008). Re-checking
     /// visibility here would pay an extra DB roundtrip per

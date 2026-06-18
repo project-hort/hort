@@ -1,4 +1,4 @@
-//! `GET /api/v1/events` handler (design doc §9).
+//! `GET /api/v1/events` handler.
 //!
 //! Single route, single handler. Per-category authz table:
 //!
@@ -14,12 +14,10 @@
 //!   empty AND the publisher exposes a broadcast receiver, subscribe and
 //!   wait up to `wait_ms`. On the first matching event we re-read to
 //!   backfill the page (the broadcast is a wake-up signal, not the
-//!   payload — the event-store is the source of truth per §11
-//!   invariant 2).
+//!   payload — the event-store is the source of truth).
 //!
 //! `next_after` is the unfiltered last-seen position so a non-admin
-//! caller re-querying does NOT replay events that filtered out — that
-//! is the explicit §9 trade-off.
+//! caller re-querying does NOT replay events that filtered out.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,15 +44,14 @@ use crate::dto::{
 /// True for categories that require `Permission::Admin`. False for
 /// per-repo categories where per-event filtering applies.
 ///
-/// This is the table from design doc §9. The table itself now lives in
-/// `hort-domain` as [`StreamCategory::requires_admin`] — the single
-/// source of truth shared with the subscription create/update + dispatch
-/// gate in `hort-app` (which cannot import this private fn:
-/// `hort-http-events` depends on `hort-app`, so the reverse would be a
-/// circular crate dependency). This fn is a thin delegator so the
-/// events-read gate and the subscription gate can never drift. A new
-/// `StreamCategory` variant fails to compile in the domain predicate's
-/// exhaustive match, not here.
+/// The table itself lives in `hort-domain` as
+/// [`StreamCategory::requires_admin`] — the single source of truth shared
+/// with the subscription create/update + dispatch gate in `hort-app`
+/// (which cannot import this private fn: `hort-http-events` depends on
+/// `hort-app`, so the reverse would be a circular crate dependency). This
+/// fn is a thin delegator so the events-read gate and the subscription gate
+/// can never drift. A new `StreamCategory` variant fails to compile in the
+/// domain predicate's exhaustive match, not here.
 fn category_requires_admin(category: StreamCategory) -> bool {
     category.requires_admin()
 }
@@ -68,9 +65,9 @@ pub async fn get_events(
     // Wall-clock start for the `hort_events_pull_duration_seconds`
     // histogram. Captured before any work — every exit path that is
     // metered records against this. The bad-request exit (unknown
-    // `category`) intentionally does NOT emit the metric: design doc
-    // §12 enumerates only `result ∈ {success, no_match, forbidden}`
-    // and the request never reaches the read path.
+    // `category`) intentionally does NOT emit the metric: only
+    // `result ∈ {success, no_match, forbidden}` is metered, and the
+    // request never reaches the read path.
     let started = Instant::now();
 
     // 1. Parse category — closed match, 400 on unknown.
@@ -108,8 +105,8 @@ pub async fn get_events(
     //    call remains the source of truth.
     //
     //    Infrastructure failure surfaces as a 500; the metric stays
-    //    silent because design doc §12 does not enumerate an `error`
-    //    result variant. Operators detect 5xx via the HTTP histogram.
+    //    silent because `error` is not an enumerated result variant.
+    //    Operators detect 5xx via the HTTP histogram.
     let events = if wait_ms > 0 {
         long_poll_events(&ctx, category, after, max, wait_ms).await?
     } else {
@@ -119,11 +116,10 @@ pub async fn get_events(
             .map_err(EventsHandlerError::Infrastructure)?
     };
 
-    // 4. Pre-filter accounting — design doc §9 ("next_after is the
-    //    last-seen position regardless of filtering"). A non-admin
-    //    caller whose Read scope shrinks between calls MUST NOT replay
-    //    events that filtered out: same trade-off the dispatcher
-    //    makes per §4.
+    // 4. Pre-filter accounting — `next_after` is the last-seen position
+    //    regardless of filtering. A non-admin caller whose Read scope
+    //    shrinks between calls MUST NOT replay events that filtered out:
+    //    same trade-off the dispatcher makes.
     let next_after = events
         .iter()
         .map(|e| e.global_position)
@@ -148,11 +144,11 @@ pub async fn get_events(
     //    subscription dispatch gate. (Admin-only categories never reach this
     //    branch; they already passed the upfront gate.)
     //
-    //    `type_gated_drops` counts events dropped specifically by the new
+    //    `type_gated_drops` counts events dropped specifically by the
     //    type gate so we can emit ONE aggregate `info!` audit record per
-    //    request (§4) — never per-event (that would tank the read hot
-    //    path), and never `err`/error-level (this is an authz audit fact,
-    //    not a server error). The event id is never logged.
+    //    request — never per-event (that would tank the read hot path),
+    //    and never `err`/error-level (this is an authz audit fact, not a
+    //    server error). The event id is never logged.
     let mut type_gated_drops: u32 = 0;
     let dto_events: Vec<PersistedEventDto> = if !admin_required {
         match &ctx.auth {
@@ -196,16 +192,16 @@ pub async fn get_events(
         events.iter().map(map_event).collect()
     };
 
-    // §4 — one aggregate audit record per request for the new type-based
-    // Admin-required denials (F-39 + F-37). `info!`, not `err`: this is an
-    // expected authz outcome, not a server error. Carries the category and
-    // a drop count only — never an event id or payload.
+    // One aggregate audit record per request for type-based Admin-required
+    // denials. `info!`, not `err`: this is an expected authz outcome, not a
+    // server error. Carries the category and a drop count only — never an
+    // event id or payload.
     if type_gated_drops > 0 {
         tracing::info!(
             category = category_label,
             denied_count = type_gated_drops,
             "events read: filtered authorization-model / privileged-audit \
-             event types for a non-admin caller (audit F-39/F-37)"
+             event types for a non-admin caller"
         );
     }
 
@@ -215,8 +211,8 @@ pub async fn get_events(
     //    `success` (the matter is whether the read had a hit). For
     //    per-repo categories that read rows but filtered everything
     //    out per principal grants, the page-level read DID match —
-    //    that stays `success` too, mirroring the design doc §9 rule
-    //    that `next_after` is unfiltered.
+    //    that stays `success` too (mirroring the rule that `next_after`
+    //    is unfiltered).
     let result = if events.is_empty() {
         EventsPullResult::NoMatch
     } else {
@@ -235,7 +231,7 @@ pub async fn get_events(
 /// publisher's broadcast channel and waits up to `wait_ms` for a
 /// matching event to land. On a wake-up we re-read the category page
 /// rather than returning the broadcast payload directly — the
-/// event-store is the source of truth (§11 invariant 2).
+/// event-store is the authoritative source.
 ///
 /// When the publisher exposes no broadcast sender (notifications
 /// disabled / mock publisher), the slow path collapses to the empty

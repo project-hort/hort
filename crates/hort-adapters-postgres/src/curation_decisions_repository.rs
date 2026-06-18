@@ -1,13 +1,12 @@
 //! PostgreSQL adapter for [`CurationDecisionsRepository`].
 //!
-//! Executes the §2.9 + §3 event-log scan against the live `events`
+//! Executes the event-log scan against the live `events`
 //! table (and joins to `artifacts` for the `--repository` / `--package`
 //! filters that apply to waive/block rows only).
 //!
 //! ## Per-event-type curator-actor discrimination (load-bearing)
 //!
-//! The four event types use different discriminator surfaces (design
-//! §2.9 + §3):
+//! The four event types use different discriminator surfaces:
 //!
 //! | Event type        | Discriminator surface | JSONB path / column                                  |
 //! |-------------------|-----------------------|------------------------------------------------------|
@@ -35,7 +34,7 @@
 //!
 //! ## ArtifactReleased payload-side discriminator
 //!
-//! The design doc §2.9 references `payload->>'authority' =
+//! An earlier implementation referenced `payload->>'authority' =
 //! 'CuratorWaiver'` but the actual `ArtifactReleased` payload has no
 //! `authority` field (see `artifact_events.rs:404-418`). The variant
 //! tag rides on `released_by: ReleaseReason`, where
@@ -47,10 +46,10 @@
 //!
 //! ## ArtifactRejected payload-side discriminator (case-symmetric SQL)
 //!
-//! Mirrors Item 6's `curation_queue_repository`: the `rejected_by`
+//! The `rejected_by`
 //! JSONB key is PascalCase (`{"Curator": {"curator_id": ...}}` for
-//! the tuple variant) but the design doc spells the discriminator in
-//! lowercase. The adapter applies the same lowercase mapping inline
+//! the tuple variant) but the wire format uses lowercase. The adapter
+//! applies the same lowercase mapping inline
 //! and filters on the mapped value (`= 'curator'`), making the
 //! WHERE-clause filter symmetric with the wire format the operator
 //! supplies.
@@ -63,7 +62,7 @@
 //!
 //! ## --repository / --package filters (waive/block only)
 //!
-//! Per design §2.9 + the task spec, these filters join through to
+//! These filters join through to
 //! `artifacts` for `ArtifactReleased` / `ArtifactRejected` rows and
 //! are no-ops for `ExclusionAdded` / `ExclusionRemoved` rows (those
 //! are policy-keyed, not artifact-keyed). The SQL gates the join via
@@ -73,7 +72,7 @@
 //! ## --by-correlation
 //!
 //! NOT a SQL flag. The port always returns one row per event; the
-//! HTTP/CLI rendering layer (Items 10 / 13) may collapse by
+//! HTTP/CLI rendering layer may collapse by
 //! `correlation_id` if asked.
 //!
 //! See `docs/architecture/how-to/curator-workflow.md` for operator guidance.
@@ -113,16 +112,15 @@ impl CurationDecisionsRepository for PgCurationDecisionsRepository {
     ) -> BoxFuture<'a, DomainResult<Vec<CurationDecisionEntry>>> {
         Box::pin(async move {
             // Clamp limit defensively (use case validates; adapter
-            // enforces — same pattern as Item 6).
+            // enforces as belt-and-braces).
             let limit = filter.limit.min(MAX_LIMIT);
 
             // Translate the kind filter to its on-disk discriminator
-            // (lowercase wire format, mirroring Item 6's
-            // case-symmetric approach). When `None`, the kind filter is
+            // (lowercase wire format, case-symmetric). When `None`, the kind filter is
             // bypassed — all four curator event types surface.
             let kind_text: Option<&'static str> = filter.kind.map(kind_to_wire);
 
-            // The §2.9 event-log query.
+            // The event-log query.
             //
             // The `decisions` CTE filters the events table to the four
             // curator decision event types AND applies the per-event-
@@ -133,7 +131,7 @@ impl CurationDecisionsRepository for PgCurationDecisionsRepository {
             //
             // The artifact join is a `LEFT JOIN` against `artifacts`,
             // resolved via the `stream_id = 'artifact-' || a.id::text`
-            // shape (matches Item 6's LATERAL extraction shape). The
+            // shape (matches the LATERAL extraction shape). The
             // join is meaningful for ArtifactReleased / ArtifactRejected
             // rows and produces NULL for ExclusionAdded /
             // ExclusionRemoved (those streams are policy-keyed).
@@ -196,8 +194,7 @@ impl CurationDecisionsRepository for PgCurationDecisionsRepository {
                             -- field (RejectionReason::Curator is a
                             -- tuple variant → `{"Curator": {...}}`).
                             -- Case-symmetric: lowercase the JSONB key
-                            -- inside SQL to match the wire format
-                            -- (mirrors Item 6).
+                            -- inside SQL to match the wire format.
                             (e.event_type = 'ArtifactRejected'
                              AND CASE
                                     WHEN jsonb_typeof(e.event_data->'data'->'rejected_by') = 'string'
@@ -276,7 +273,7 @@ impl CurationDecisionsRepository for PgCurationDecisionsRepository {
                   -- Repository filter: applies ONLY to artifact-keyed
                   -- rows (Waive/Block). Exclude/Unexclude rows surface
                   -- regardless when the filter is set (policy-keyed,
-                  -- not artifact-keyed — design §2.9).
+                  -- not artifact-keyed).
                   AND ($3::uuid IS NULL
                        OR d.event_type IN ('ExclusionAdded', 'ExclusionRemoved')
                        OR a.repository_id = $3)
@@ -308,8 +305,7 @@ impl CurationDecisionsRepository for PgCurationDecisionsRepository {
 }
 
 /// Mapping from [`CurationDecisionKind`] to the lowercase wire-format
-/// discriminator the SQL `kind` column emits. Mirrors Item 6's
-/// case-symmetric approach.
+/// discriminator the SQL `kind` column emits.
 fn kind_to_wire(kind: CurationDecisionKind) -> &'static str {
     match kind {
         CurationDecisionKind::Waive => "waive",
@@ -320,8 +316,7 @@ fn kind_to_wire(kind: CurationDecisionKind) -> &'static str {
 }
 
 /// Inverse of [`kind_to_wire`]. Returns `Err(DomainError::Invariant)`
-/// on an unknown discriminator — defensive, mirrors Item 6 strict
-/// row-mapping.
+/// on an unknown discriminator — defensive strict row-mapping.
 fn kind_from_wire(raw: &str) -> DomainResult<CurationDecisionKind> {
     match raw {
         "waive" => Ok(CurationDecisionKind::Waive),
@@ -334,7 +329,7 @@ fn kind_from_wire(raw: &str) -> DomainResult<CurationDecisionKind> {
     }
 }
 
-/// sqlx FromRow shape mirroring the §2.9 projection.
+/// sqlx FromRow shape for the event-log projection.
 #[derive(sqlx::FromRow)]
 struct CurationDecisionRow {
     event_id: Uuid,
@@ -362,7 +357,7 @@ impl CurationDecisionRow {
         // gitops/system-driven exclusion (filtered out by the CTE) or
         // a future code path that bypasses the standard envelope —
         // either way, an invariant violation on the curator-decisions
-        // surface. Strict mapping mirrors Item 6.
+        // surface.
         let actor_id = self.actor_id.ok_or_else(|| {
             DomainError::Invariant(format!(
                 "curation_decisions_repo row {} has NULL actor_id (CTE invariant violated)",
@@ -414,8 +409,7 @@ mod tests {
     #[test]
     fn kind_to_wire_spelling_is_lowercase_snake_case() {
         // Pin the wire format (the same strings the HTTP query param
-        // `?type=...` and the `hort-cli --type ...` flag accept per
-        // design §2.7).
+        // `?type=...` and the `hort-cli --type ...` flag accept).
         assert_eq!(kind_to_wire(CurationDecisionKind::Waive), "waive");
         assert_eq!(kind_to_wire(CurationDecisionKind::Block), "block");
         assert_eq!(

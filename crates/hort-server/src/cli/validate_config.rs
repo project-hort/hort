@@ -3,8 +3,8 @@
 //!
 //! Runs the pure
 //! [`StaticConfigValidator`](hort_app::lint::StaticConfigValidator) — the
-//! snapshot-free subset of the apply-time validation/lint pass (design §2
-//! rows 2,3,5,6,7,7b,8) — over a gitops config tree, **DSN-free** and
+//! snapshot-free subset of the apply-time validation/lint pass (rows
+//! 2,3,5,6,7,7b,8) — over a gitops config tree, **DSN-free** and
 //! **synchronous** (no Tokio runtime; the whole flow is file reads +
 //! parse + validate, none of which is async). It is the offline operator
 //! surface for a CI pre-merge gate: it reproduces the server's *static*
@@ -12,7 +12,7 @@
 //!
 //! # Config is env, not flags
 //!
-//! Per design §3.2 the command takes **no config-input arguments** — its
+//! The command takes **no config-input arguments** — its
 //! deployment facts come from the **same env as server boot**:
 //!
 //! - `HORT_CONFIG_DIR` — the gitops tree (the exact var `serve` reads at
@@ -34,25 +34,25 @@
 //!
 //! The version-static facts (`provenance_capable_formats = {"oci"}`, the
 //! grant `LintConfig::default()`) are baked into the binary
-//! (version-correct by construction, §7.4) — a different hort-server
-//! version ships a different validator.
+//! (version-correct by construction) — a different hort-server version
+//! ships a different validator.
 //!
 //! The only flag is `--strict` (a CI **behaviour** toggle, not deployment
-//! config): it promotes any warning — including the M1 zero-files warning
+//! config): it promotes any warning — including the zero-files warning
 //! — to a non-zero exit.
 //!
-//! # Exit codes (design §3.2)
+//! # Exit codes
 //!
 //! - **0** — clean (no errors; warnings only when not `--strict`).
 //! - **1** — validation error(s): a parse / cross-validate error, any
-//!   reject rule (incl. row 7b), **or** (`--strict` and any warning
-//!   present, incl. the 0-files warning).
+//!   reject rule (incl. row 7b), **or** (`--strict` and any warning present,
+//!   incl. the 0-files warning).
 //! - **2** — missing/invalid required env (`HORT_CONFIG_DIR` /
 //!   `HORT_STORAGE_BACKEND`).
 //! - **3** — operational (the config dir is unreadable / the walk
 //!   errored).
 //!
-//! # Honesty (design §3.3)
+//! # Honesty
 //!
 //! A clean `validate-config` is **necessary but NOT sufficient** for a
 //! successful apply: it runs the static subset only and does **not** run
@@ -76,7 +76,7 @@ use crate::config::LogFormat;
 use crate::gitops_boot::collect_yaml_files;
 use crate::telemetry;
 
-/// The §3.3 honesty footer (one line). A clean run is necessary but not
+/// The honesty footer (one line). A clean run is necessary but not
 /// sufficient: the static validator does not run the current-state or
 /// live-worker checks that only the running deployment can.
 const HONESTY_FOOTER: &str = "Note: a clean validate-config is necessary but NOT sufficient for \
@@ -84,7 +84,7 @@ const HONESTY_FOOTER: &str = "Note: a clean validate-config is necessary but NOT
      or the live-worker scanBackends registry check; those run at apply/boot against the running \
      deployment.";
 
-/// The M1 zero-files warning (design §7.2). A `HORT_CONFIG_DIR` that
+/// The zero-files warning. A `HORT_CONFIG_DIR` that
 /// exists but holds 0 YAML files is a genuinely-valid empty config, but
 /// because the CI path overrides `HORT_CONFIG_DIR` (cluster mount path ≠
 /// CI checkout path) a typo'd-but-existing path would otherwise read as a
@@ -99,7 +99,7 @@ const ZERO_FILES_WARNING: &str = "validated 0 config files — is HORT_CONFIG_DI
 /// only flag is `--strict`, a CI behaviour toggle (warnings → failure).
 #[derive(Debug, Args)]
 pub struct ValidateConfigArgs {
-    /// Treat any warning (including the M1 "validated 0 config files"
+    /// Treat any warning (including the "validated 0 config files"
     /// warning) as a failure — promotes a clean-but-warned run from
     /// exit 0 to exit 1. For CI gates that must catch advisory findings
     /// and a mis-pointed `HORT_CONFIG_DIR`. A behaviour knob, not
@@ -108,7 +108,7 @@ pub struct ValidateConfigArgs {
     pub strict: bool,
 }
 
-/// The resolved deployment inputs (design §3.2). Built by
+/// The resolved deployment inputs. Built by
 /// [`resolve_inputs`] from the env; consumed by [`validate_tree`].
 #[derive(Debug)]
 struct Inputs {
@@ -132,11 +132,11 @@ struct Inputs {
 /// the log format comes from `HORT_LOG_FORMAT` (defaulting to `Pretty`),
 /// and tracing is used for **operational** errors only (a dir-walk
 /// failure → `error!`); the validation result goes to stdout/stderr +
-/// the exit code, not metrics (§5).
+/// the exit code, not metrics.
 pub fn run(args: &ValidateConfigArgs) -> ExitCode {
     // Light, DSN-free tracing init. We deliberately do NOT build a full
-    // `Config` (that would require the DSN + the F2 trust-policy check —
-    // the very things this offline command must not need). `HORT_LOG_FORMAT`
+    // `Config` (that would require the DSN — the very thing this offline
+    // command must not need). `HORT_LOG_FORMAT`
     // is read independently; an unset/invalid value falls back to `Pretty`
     // (a cosmetic log knob must never fail the gate). A double-init is
     // harmless — `init_tracing` uses `try_init` and we ignore the result.
@@ -221,7 +221,7 @@ fn resolve_inputs(get_var: impl Fn(&str) -> Option<String>) -> Result<Inputs, Ex
     })
 }
 
-/// The core validate flow (design §3.2 steps), factored out of [`run`] so
+/// The core validate flow, factored out of [`run`] so
 /// it is testable with tempdirs and **no** global env. Returns the
 /// process exit code (0/1/2/3 — `validate_tree` itself never returns 2,
 /// which is the missing-env code [`resolve_inputs`] owns).
@@ -229,7 +229,7 @@ fn resolve_inputs(get_var: impl Fn(&str) -> Option<String>) -> Result<Inputs, Ex
 /// Steps:
 /// 1. `collect_yaml_files(config_dir)` — on `Err` (unreadable / walk
 ///    error): `error!` + `eprintln!` → exit 3.
-/// 2. M1 zero-files warning: if `files.is_empty()`, record a warning
+/// 2. Zero-files warning: if `files.is_empty()`, record a warning
 ///    (still proceed — an empty config is genuinely valid).
 /// 3. `DesiredState::parse_files(files)` — on `Err`: print the
 ///    parse/cross-validate error(s) to stderr → exit 1.
@@ -256,15 +256,14 @@ fn validate_tree(
         Ok(files) => files,
         Err(e) => {
             // Operational failure — the dir is unreadable / the walk
-            // errored. `error!` (the only tracing the command emits, §5)
-            // plus a human-facing stderr line.
+            // errored. `error!` plus a human-facing stderr line.
             error!(error = %e, config_dir = %config_dir.display(), "validate-config: directory walk failed");
             eprintln!("error: {e}");
             return ExitCode::from(3);
         }
     };
 
-    // ---- 2. M1 zero-files warning ----
+    // ---- 2. zero-files warning ----
     //
     // `parse_files(empty) = Ok(empty DesiredState)` — a genuinely empty
     // config is valid — so we still proceed; we only *record* the warning
@@ -283,7 +282,7 @@ fn validate_tree(
 
     // ---- 4. run the snapshot-free validator (rows 2,3,5,6,7,7b,8) ----
     //
-    // Version-static facts baked into the binary (§7.4): the
+    // Version-static facts baked into the binary: the
     // provenance-capable format set is THE shared
     // `hort_app::provenance::TIER1_PROVENANCE_CAPABLE_FORMATS` const the server
     // composition (`gitops_boot.rs` / `composition.rs`) also derives from — so
@@ -345,7 +344,7 @@ fn validate_tree(
     // ---- 6. exit code ----
     //
     // Fail (exit 1) on ANY error finding, OR — under `--strict` only — on
-    // any warning (the rule warnings, the M1 zero-files warning, or the
+    // any warning (the rule warnings, the zero-files warning, or the
     // HORT_UPSTREAM_USER_AGENT warning). Warnings without `--strict`, and
     // the fully-clean case, succeed.
     let any_warning =
@@ -510,8 +509,8 @@ spec:
 
     // ---- validate_tree (tempdirs — NO global env) ------------------------
 
-    /// Offline proof (§7.4): a valid small fixture tree validates to
-    /// exit 0. This test never reads `DATABASE_URL` — `validate_tree`
+    /// A valid small fixture tree validates to exit 0. This test never
+    /// reads `DATABASE_URL` — `validate_tree`
     /// (and the whole command) is DSN-free by construction (it calls no
     /// `Config::from_env`, opens no pool, and reads no DSN), so the
     /// offline guarantee holds without any env juggling here.
@@ -526,7 +525,7 @@ spec:
     #[test]
     fn validate_tree_zero_files_is_exit_0_default() {
         // An existing dir with 0 YAML files: a genuinely empty config is
-        // valid → exit 0 (but the M1 warning is recorded — see strict).
+        // valid → exit 0 (but the zero-files warning is recorded — see strict).
         let dir = TempDir::new().unwrap();
         let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
         assert_eq!(code_str(code), success());
@@ -534,7 +533,7 @@ spec:
 
     #[test]
     fn validate_tree_zero_files_under_strict_is_exit_1() {
-        // Same empty dir under `--strict` → the M1 zero-files warning is
+        // Same empty dir under `--strict` → the zero-files warning is
         // promoted to a failure (catches a mis-pointed HORT_CONFIG_DIR).
         let dir = TempDir::new().unwrap();
         let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, true);
@@ -798,7 +797,7 @@ spec:
     backend: filesystem
     path: npm-proxy
 ";
-        // A single-claim ([developer]) grant — the §8.1 linter rejects it
+        // A single-claim ([developer]) grant — the linter rejects it
         // (single-claim-grant rule, `reject` by secure default).
         let grant = "\
 apiVersion: project-hort.de/v1beta1
@@ -838,8 +837,8 @@ spec:
   allowedAlgorithms: [RS256]
   requireJti: true
 ";
-        // An SA with a single FI constrained by ONLY `repository` — the
-        // F-7 Class-1 under-constrained advisory (a warning, not an error).
+        // An SA with a single FI constrained by ONLY `repository` — an
+        // under-constrained advisory (a warning, not an error).
         let sa = "\
 apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount

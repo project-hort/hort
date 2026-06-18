@@ -6,8 +6,8 @@
 //! Both handlers are thin wrappers per the architect-doc pattern: extract
 //! [`hort_http_core::middleware::auth::AuthenticatedPrincipal`], invoke the
 //! corresponding use case, map `AppError` → `ApiError`. The token-kind
-//! gate (§2.6), RBAC gate (§2.5 Finding E), OCI rejection (§8), and
-//! per-item orchestration (§§6.3-6.5) all live INSIDE the use cases.
+//! gate, RBAC gate, OCI rejection, and per-package orchestration all
+//! live INSIDE the use cases.
 
 pub mod list_versions;
 pub mod prefetch;

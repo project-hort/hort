@@ -70,6 +70,5 @@ sha2                        = { workspace = true }
 tower                       = { workspace = true }
 arc-swap                    = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-# Item 6: tracing-warn capture test for the non-success branches;
-# mirrors the Cargo crate's adoption in 17.1 Item 7.
+# Tracing-warn capture test for the non-success branches.
 tracing-subscriber          = { workspace = true }

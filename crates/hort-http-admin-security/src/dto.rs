@@ -2,7 +2,7 @@
 //!
 //! Distinct from the domain [`hort_domain::ports::repo_security_score_repository::RepoSecurityScore`]:
 //! the wire shape carries the repository's **name** (string key) rather
-//! than its UUID, matching the §7 design-doc envelope. The domain row
+//! than its UUID. The domain row
 //! is keyed by `repository_id`, so the handler resolves the id → name
 //! through [`hort_app::use_cases::security_score_use_case::SecurityScoreUseCase::resolve_repo_name`]
 //! before serialisation.
@@ -14,10 +14,10 @@ use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 
 /// JSON envelope for `GET /api/v1/repositories/:name/security-score`.
 ///
-/// Mirrors the §7 example payload — the `severity_histogram` field
-/// carries the four cumulative severity-tier counts (`critical`, `high`,
-/// `medium`, `low`). The `negligible` count from the §7 example is not
-/// tracked by the v1 projection (aligned with Trivy/OSV's four canonical
+/// The `severity_histogram` field carries the four cumulative
+/// severity-tier counts (`critical`, `high`, `medium`, `low`). The
+/// `negligible` count is not tracked by the v1 projection (aligned with
+/// Trivy/OSV's four canonical
 /// tiers); future scanners that emit a fifth tier will extend both the
 /// projection and this DTO together.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -46,7 +46,7 @@ pub struct SeverityHistogramDto {
 
 impl SecurityScoreDto {
     /// Build a wire-shape DTO from a domain row + the resolved
-    /// repository name. Mirrors the §7 example envelope.
+    /// repository name.
     pub fn from_domain(repository: String, score: &RepoSecurityScore) -> Self {
         Self {
             repository,
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn serialised_envelope_matches_design_doc_shape() {
-        // Sanity-check the §7 wire shape. Field names matter — these
+        // Sanity-check the wire shape. Field names matter — these
         // are part of the public API contract.
         let dto = SecurityScoreDto::from_domain("internal-pypi".into(), &sample_score());
         let v = serde_json::to_value(&dto).unwrap();

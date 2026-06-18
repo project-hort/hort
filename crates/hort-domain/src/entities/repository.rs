@@ -714,8 +714,8 @@ pub struct Repository {
     /// `ReleasedOnly` (build-safe — a range never `503`s); operators who
     /// want maximal upstream discoverability at the cost of an
     /// intermittent first-build `503` set `IncludePending`. The
-    /// serve consumer lands in Item 3; this field is the operator-
-    /// selectable knob. Threaded through gitops `RepositorySpec`
+    /// The serve consumer reads this field; it is the operator-selectable
+    /// knob. Threaded through gitops `RepositorySpec`
     /// (`indexMode` in YAML, absent → `ReleasedOnly`).
     pub index_mode: IndexMode,
     /// Prefetch policy — proactive background ingestion so
@@ -739,7 +739,7 @@ pub struct Repository {
     /// `DomainError::ManagedByConfiguration`.
     pub managed_by: super::managed_by::ManagedBy,
     /// SHA-256 of the canonicalised gitops `spec` JSON at apply time.
-    /// Item 7's diff uses this to detect "spec changed since last apply"
+    /// The gitops diff uses this to detect "spec changed since last apply"
     /// without re-comparing every field. `None` for `Local` rows.
     pub managed_by_digest: Option<[u8; 32]>,
 }

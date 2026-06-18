@@ -6,8 +6,8 @@
 //! - [`build_http_client`] — the canonical `reqwest::Client` builder used
 //!   by every OIDC outbound HTTP request. Centralises:
 //!   - extra-CA-bundle layering (ADR 0010),
-//!   - redirect cap of 3 hops (security.md §JWKS fetch hardening),
-//!   - per-client timeout (security.md §JWKS fetch hardening),
+//!   - redirect cap of 3 hops,
+//!   - per-client timeout,
 //!   - TLS version pin: TLS 1.3 preferred, TLS 1.2 accepted
 //!     (BSI TR-02102-2, ADR 0010).
 //! - [`get_capped_body`] — streaming GET with a hard byte cap on the
@@ -165,8 +165,8 @@ pub(crate) async fn get_capped_body(
 /// single-issuer `OidcProvider` path → `OidcValidationError::IdpUnavailable`;
 /// the multi-issuer `MultiIssuerJwksValidator` path →
 /// `FederationDenyReason::UnknownKid`). No NEW wire error / metric
-/// variant is introduced — the design (§3.6) says "reject with the
-/// existing JWKS-fetch error classification".
+/// variant is introduced — each path rejects with its existing
+/// JWKS-fetch error classification.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum JwksUriCheckError {
     /// `issuer_url` or `jwks_uri` failed to parse as an absolute URL, or
@@ -178,7 +178,7 @@ pub(crate) enum JwksUriCheckError {
     /// (case-insensitive). Same-host binding is the strongest,
     /// lowest-false-positive control for OIDC: a compromised /
     /// MITM'd discovery endpoint pointing `jwks_uri` off-origin is the
-    /// SSRF vector F-48 closes.
+    /// SSRF vector this check closes.
     OffHost {
         issuer_host: String,
         jwks_host: String,
@@ -196,7 +196,7 @@ pub(crate) enum JwksUriCheckError {
 /// implementation; the two call sites map [`JwksUriCheckError`] onto
 /// their own existing JWKS-fetch error classification.
 ///
-/// The check is **additive** (§5): it runs in addition to — and does not
+/// The check is **additive**: it runs in addition to — and does not
 /// weaken — the TLS-version pin and redirect cap layered by
 /// [`build_http_client`]. One control, before the fetch:
 ///
@@ -222,8 +222,7 @@ pub(crate) enum JwksUriCheckError {
 /// discovery document cannot redirect it to an arbitrary internal service
 /// — `is_routable` only ever rejects the operator's own trusted issuer
 /// host for negligible security benefit. Same-host binding is the
-/// load-bearing SSRF control; routability is not. (User-approved post-E2E
-/// correction; design §3.6 amended.)
+/// load-bearing SSRF control; routability is not.
 ///
 /// The function does no I/O, so it is synchronous.
 pub(crate) fn check_jwks_uri_bound(

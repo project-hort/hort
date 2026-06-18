@@ -551,8 +551,8 @@ mod tests {
 
     #[test]
     fn field_manager_constant_pinned() {
-        // Pinned by the design doc — the SSA field-manager identifies
-        // this adapter. Changing it would silently re-take ownership
+        // Pinned — the SSA field-manager identifies this adapter.
+        // Changing it would silently re-take ownership
         // of every existing Secret on the next tick, surfacing as a
         // mass-conflict event the operator did not expect.
         assert_eq!(FIELD_MANAGER_RE_EXPORT, "hort-worker");

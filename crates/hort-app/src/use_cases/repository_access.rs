@@ -206,7 +206,7 @@ impl RepositoryAccessUseCase {
     /// check that is the actual access gate; surfacing "missing" as
     /// `Ok(None)` lets the use case map a missing-repo scope to
     /// "no actions granted" rather than aborting the whole exchange
-    /// with a 404 (per design doc §6 partial-grant semantics).
+    /// with a 404 (partial-grant semantics).
     /// Keeping the helper narrowly scoped to id-only avoids handing
     /// callers the full `Repository` row through a no-authz door.
     #[tracing::instrument(skip(self))]
@@ -1108,8 +1108,7 @@ mod tests {
     }
 
     /// Pagination passes through verbatim — `total` reflects the raw
-    /// port total, not the post-filter visible count. Phase 1 contract
-    /// per §3.1.
+    /// port total, not the post-filter visible count.
     #[tokio::test]
     async fn list_visible_total_reflects_raw_page_total() {
         let repos = Arc::new(MockRepositoryRepository::new());

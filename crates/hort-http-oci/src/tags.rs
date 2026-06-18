@@ -1,5 +1,4 @@
-//! OCI tags list — `GET /v2/<repo_key>/<name>/tags/list` (Item 8, spec
-//! end-8).
+//! OCI tags list — `GET /v2/<repo_key>/<name>/tags/list`.
 //!
 //! Drives [`hort_app::use_cases::ref_use_case::RefUseCase::list`] over
 //! the `(repo_id, namespace=name)` pair. The cursor walk is byte-stable;

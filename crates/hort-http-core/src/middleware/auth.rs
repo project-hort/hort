@@ -217,7 +217,7 @@ pub async fn require_principal(
 
     // Audit attribution: fail2ban / SIEM consumers of the auth-attempt
     // info log need `client_ip` to correlate with rate-limit rejections
-    // (which include it). F2's request_trust_layer populates this;
+    // (which include it). The request trust layer populates this;
     // absence is a composition bug. Fall back to an explicit sentinel
     // so the structured field always exists.
     let client_ip_raw: Option<std::net::IpAddr> = req
@@ -235,7 +235,7 @@ pub async fn require_principal(
         Some(t) => t.to_string(),
         None => {
             emit_attempt_metric(RESULT_MISSING_HEADER);
-            // L7: auth failures are audit events — fail2ban / SIEM
+            // Auth failures are audit events — fail2ban / SIEM
             // consumers need them at info level, not debug.
             tracing::info!(
                 result = RESULT_MISSING_HEADER,
@@ -289,15 +289,15 @@ pub async fn require_principal(
             // sentinel). The password field is still handed to the
             // bearer validator below; if it is not a valid token
             // this 401s. The DB password-check identity path no
-            // longer exists. We log the R1 reject here (audit, not
-            // an error) so SIEM/fail2ban see the deprecated-shape
-            // attempt before the generic bearer-validation 401.
+            // longer exists. Log the reject here (audit, not an error)
+            // so SIEM/fail2ban see the deprecated-shape attempt before
+            // the generic bearer-validation 401.
             let _ = password;
             tracing::info!(
                 result = "basic_identity_forbidden",
                 client_ip = %client_ip,
                 "auth attempt: HTTP Basic username+password rejected as identity source \
-                 (R1 — Basic is a token carrier only; supply a native token in the \
+                 (Basic is a token carrier only; supply a native token in the \
                  password field)"
             );
         }
@@ -330,7 +330,7 @@ pub async fn require_principal(
         Err(err) => {
             let label = classify_auth_error(&err);
             emit_attempt_metric(label);
-            // L7: per-failure audit log at info level.
+            // Per-failure audit log at info level.
             tracing::info!(result = label, client_ip = %client_ip, "auth attempt");
             // Best-effort audit event.
             // The audit-event `result` payload uses the SAME label
@@ -827,10 +827,9 @@ pub(crate) fn www_authenticate_for(ctx: &AuthContext, is_oci: bool) -> String {
 /// [`is_oci_path`] classifier still feeds the `is_oci` argument.
 fn unauthorized_missing_header(auth: &AuthContext, is_oci: bool) -> Response {
     let www = www_authenticate_for(auth, is_oci);
-    // tracing::debug! per design §6 — challenge selection is not
-    // security-sensitive state change; debug-level keeps the log
-    // volume bounded while still letting an operator confirm the
-    // selector wired up correctly.
+    // tracing::debug! — challenge selection is not a security-sensitive
+    // state change; debug-level keeps the log volume bounded while
+    // still letting an operator confirm the selector wired up correctly.
     tracing::debug!(
         scheme = www.split_once(' ').map(|(s, _)| s).unwrap_or(www.as_str()),
         is_oci,
@@ -923,7 +922,7 @@ fn classify_auth_error(err: &AppError) -> &'static str {
 }
 
 /// Pure mapping from [`OidcValidationError`] variant to the corresponding
-/// catalog value. Extracted so the L1 change is independently testable
+/// catalog value. Extracted so the mapping is independently testable
 /// without constructing an [`AppError`] wrapper.
 fn classify_oidc_error(err: &OidcValidationError) -> &'static str {
     match err {
@@ -1034,8 +1033,8 @@ const PAT_OVER_HTTP_REFUSAL_REASON: &str = "pat over http refused";
 /// - the request has no positive evidence of TLS — i.e.
 ///   `RequestTrust.public_url.scheme() != "https"` (the trust layer
 ///   already folds `X-Forwarded-Proto: https` from a trusted peer
-///   into `public_url` per the F2 policy table; we deliberately do
-///   NOT introduce a new trust path here).
+///   into `public_url`; we deliberately do NOT introduce a new trust
+///   path here).
 ///
 /// Returns `None` when ANY of the above is false — the auth pipeline
 /// proceeds normally.
@@ -1090,7 +1089,7 @@ fn upgrade_required_response(reason: &'static str) -> Response {
 /// supplied [`CallerPrincipal`] in the [`AuthenticatedPrincipal`]
 /// newtype before insertion. Tests that previously bypassed
 /// `require_principal` by writing the bare slot must use this helper
-/// instead; the F1 extractor no longer reads the bare slot.
+/// instead; the principal extractor no longer reads the bare slot.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use axum::http::Request;
@@ -1495,8 +1494,8 @@ mod tests {
         assert!(body.contains("invalid or expired token"), "got: {body}");
         let entries = snap.into_vec();
         // MockIdentityProvider returns `OidcValidationError::SignatureInvalid`
-        // on unknown inputs (Item 14 L1) → classifier pattern-matches
-        // the variant and resolves to `invalid_token`.
+        // on unknown inputs — classifier pattern-matches the variant
+        // and resolves to `invalid_token`.
         let v = find(
             &entries,
             MetricKind::Counter,
@@ -1696,13 +1695,12 @@ mod tests {
         }
     }
 
-    // -- L1 end-to-end: port-contract enum → metric label -------------
+    // -- End-to-end: port-contract enum → metric label -----------------
     //
-    // These prove the L1 refactor isn't just a pure-fn win — the typed
-    // variant travels all the way from the MockIdentityProvider through
-    // the `?` in AuthenticateUseCase and lands as the right label on
-    // hort_auth_attempts_total. A regression that re-introduces string
-    // classification would fail these.
+    // These prove the typed variant travels all the way from the
+    // MockIdentityProvider through the `?` in AuthenticateUseCase and
+    // lands as the right label on hort_auth_attempts_total. A regression
+    // that re-introduces string classification would fail these.
 
     #[test]
     fn require_principal_expired_variant_emits_expired_label() {
@@ -1943,7 +1941,7 @@ mod tests {
         // Read-path IdP-outage canary: when the upstream IdP is
         // unreachable (mock returns OidcValidationError::IdpUnavailable),
         // the metric must increment idp_unavailable, NOT invalid_token.
-        // This is the M-3 distinction operators rely on.
+        // This distinction between idp_unavailable and invalid_token is what operators rely on.
         let (snap, status) = capture(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2056,7 +2054,7 @@ mod tests {
                 (status, body)
             });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        // Item 10: 5xx responses must never surface internal paths / crate
+        // 5xx responses must never surface internal paths / crate
         // identifiers. Helper is a no-op for non-5xx statuses.
         crate::error::assert_no_internal_leakage(status, &body);
     }
@@ -2107,7 +2105,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async { to_bytes(resp.into_body(), 1024).await.unwrap().to_vec() });
-        // Item 10: sanitisation invariant applies to every 5xx leaving the
+        // Sanitisation invariant applies to every 5xx leaving the
         // ApiError -> Response mapper.
         crate::error::assert_no_internal_leakage(status, &body);
     }
@@ -2580,13 +2578,12 @@ mod tests {
 
     #[test]
     fn resolve_token_collapses_malformed_basic_to_absent() {
-        // Structural check for the L2 change: a malformed Basic header
-        // must not be treated as "token present" — it must fall into
-        // Absent so the caller returns 401, and the warn! branch in
-        // resolve_token fires. We inspect the outcome directly here; a
-        // subscriber-based assertion for the warn! emission would buy
-        // nothing beyond this structural check. See the module-level
-        // report for the rationale.
+        // Structural check: a malformed Basic header must not be treated
+        // as "token present" — it must fall into Absent so the caller
+        // returns 401, and the warn! branch in resolve_token fires. We
+        // inspect the outcome directly here; a subscriber-based assertion
+        // for the warn! emission would buy nothing beyond this structural
+        // check.
         let req: Request<Body> = HttpRequest::get("/")
             .header(header::AUTHORIZATION, "Basic !@#$")
             .body(Body::empty())
@@ -2668,8 +2665,7 @@ mod tests {
     fn r1_basic_token_carrier_still_authenticates_under_bearer_only() {
         // CONTRACT: Basic carrying a native token in the password field
         // (`__token__:<token>`, the twine/pip/cargo/npm shape) keeps
-        // working untouched under BearerOnly. This is the path R1 must
-        // NOT break.
+        // working untouched under BearerOnly. This path must NOT break.
         let (snap, status) = capture(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2696,7 +2692,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Basic-as-token-carrier must keep authenticating after R1"
+            "Basic-as-token-carrier must keep authenticating under BearerOnly"
         );
         let entries = snap.into_vec();
         assert!(
@@ -2745,7 +2741,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "a raw username+password must NOT authenticate (R1)"
+            "a raw username+password must NOT authenticate under BearerOnly"
         );
     }
 
@@ -2757,7 +2753,7 @@ mod tests {
         // password authenticates and NO DB password-check identity path
         // is taken (it no longer exists). This pins that the username
         // half is ignored for the carrier path regardless of its value,
-        // i.e. R1 removed the identity branch entirely rather than
+        // i.e. the identity branch was removed entirely rather than
         // gating it on the `__token__` sentinel.
         let (_snap, status) = capture(|| {
             tokio::runtime::Builder::new_current_thread()
@@ -3092,7 +3088,7 @@ mod tests {
     const PAT_TOKEN: &str = "hort_pat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     /// Build a `RequestTrust` with the given scheme on `public_url`,
-    /// pinned to a localhost peer. Mirrors the F2 layer's output
+    /// pinned to a localhost peer. Mirrors the trust layer's output
     /// without standing it up; lets the test pin the gate's input.
     fn trust_with_scheme(scheme: &str) -> crate::middleware::trust::RequestTrust {
         let url = format!("{scheme}://test.example.invalid:8080");
@@ -3232,7 +3228,7 @@ mod tests {
 
     /// `RequestTrust.public_url` carries `https://…` (operator-pinned
     /// `HORT_PUBLIC_BASE_URL` OR `X-Forwarded-Proto: https` from a
-    /// trusted proxy, both folded into `public_url` by the F2 layer)
+    /// trusted proxy, both folded into `public_url` by the trust layer)
     /// → the gate is satisfied and the request flows through to auth.
     #[test]
     fn pat_token_over_https_proceeds_normally() {
@@ -3259,14 +3255,14 @@ mod tests {
     }
 
     /// `X-Forwarded-Proto: https` from a trusted proxy is folded into
-    /// `RequestTrust.public_url.scheme()` by the F2 layer — by the
+    /// `RequestTrust.public_url.scheme()` by the trust layer — by the
     /// time auth sees it, the trust is encoded as the scheme. This
     /// test pins that contract: a request with the trust-rendered
     /// `https://` public_url proceeds normally on the PAT path even
     /// when the literal request URL is HTTP.
     #[test]
     fn pat_token_over_http_with_x_forwarded_proto_https_proceeds_normally() {
-        // The F2 trust layer is the single source of truth for "is
+        // The trust layer is the single source of truth for "is
         // this https?". We don't re-evaluate forwarding here. The
         // contract under test: a `RequestTrust` whose `public_url`
         // scheme is `https://` satisfies the gate, regardless of the
@@ -3333,8 +3329,8 @@ mod tests {
     /// A genuine CliSession JWT (correct `aud` + `token_kind`) over
     /// plaintext HTTP with the secure-default `pat_over_http_allowed =
     /// false` → 426 Upgrade Required, validator NEVER invoked. This is
-    /// the F-42 close: the credential is refused on cleartext just like a
-    /// `hort_pat_*` token.
+    /// The credential is refused on cleartext just like a `hort_pat_*`
+    /// token.
     #[test]
     fn cli_session_jwt_over_http_returns_426_when_flag_unset() {
         let token = cli_session_shaped_jwt(
@@ -3412,7 +3408,7 @@ mod tests {
         assert!(!looks_like_pat_token("eyJhbGc.foo.bar")); // OIDC JWT shape
         assert!(!looks_like_pat_token("hort_xyz_body")); // wrong kind
         assert!(!looks_like_pat_token("hort-pat-body")); // wrong separator
-                                                         // F-42: the `hort_cli_` prefix is dead (CliSession is a JWT now);
+                                                         // The `hort_cli_` prefix is dead (CliSession is a JWT now);
                                                          // the gate no longer keys on it. A `hort_cli_*` shape is treated
                                                          // like any other unknown opaque token — it is NOT a PAT prefix.
         assert!(!looks_like_pat_token("hort_cli_anything"));

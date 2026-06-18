@@ -203,8 +203,8 @@ pub trait ArtifactRepository: Send + Sync {
     ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>>;
 
     /// Per-`(package, version)` servability query — the hot serve-path
-    /// read used by the quarantine-aware index-serve filter (Initiative
-    /// 47 §2.1 + §3, design §9 calls this the highest-QPS new query).
+    /// read used by the quarantine-aware index-serve filter (the
+    /// highest-QPS new query).
     ///
     /// Returns `(version, quarantine_status)` for every artifact whose
     /// `(repository_id, name)` matches and that is not soft-deleted.
@@ -237,10 +237,9 @@ pub trait ArtifactRepository: Send + Sync {
     /// `(version, status)`. Discovery, which needs the quarantine
     /// deadline, uses [`Self::package_version_anchors`] instead.
     ///
-    /// F27: this query previously selected a non-existent
-    /// `quarantine_deadline` column and 500'd on every call; the schema
-    /// stores only the anchor (`quarantine_window_start`), never a
-    /// precomputed deadline.
+    /// Note: this query must not select any `quarantine_deadline` column
+    /// (none exists); the schema stores only the anchor
+    /// (`quarantine_window_start`), never a precomputed deadline.
     fn package_version_status(
         &self,
         repository_id: Uuid,

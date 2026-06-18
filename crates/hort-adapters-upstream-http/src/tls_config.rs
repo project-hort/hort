@@ -11,9 +11,8 @@
 //!   chain + private key. Both must be set together (the value-object
 //!   constructor enforces this in lockstep with the schema CHECK). A
 //!   server demanding a client cert from a mapping without these
-//!   surfaces as `UpstreamErrorKind::Unauthorized` (the design doc §3.9
-//!   classifies mTLS-required-but-missing as a 401-shape, not a TLS-
-//!   shape).
+//!   surfaces as `UpstreamErrorKind::Unauthorized` (mTLS-required-but-
+//!   missing is classified as a 401-shape, not a TLS-shape).
 //! - `pinned_cert_sha256` — operator-pinned SHA-256 thumbprint of the
 //!   leaf certificate's DER bytes. Adds a [`PinningVerifier`] that
 //!   delegates to a [`rustls::client::WebPkiServerVerifier`] for chain
@@ -25,11 +24,8 @@
 //! The `PinningVerifier` does not skip name validation or chain-trust
 //! checking. The leaf cert must still be a valid X.509 (so an arbitrary
 //! self-signed cert without proper subject alt names fails name
-//! validation as today; pinning is *additive* defence). Per the design
-//! doc §3.9: "the upstream presented a syntactically valid certificate
-//! that chained to a trusted CA but did not match the operator-pinned
-//! thumbprint". A pin without chain trust would be a TOFU model, which
-//! the audit explicitly does not require.
+//! validation as today; pinning is *additive* defence). A pin without
+//! chain trust would be a TOFU model, which is explicitly not required.
 //!
 //! ## Cache lifetime
 //!

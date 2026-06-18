@@ -552,7 +552,7 @@
     },
     "publicBaseUrlComment": {"type": "string"},
     "api": {
-      "description": "Backlog 078 Item 10 — main API listener. `bindAddr` (HORT_API_BIND) follows the `<subsystem>.bindAddr` shape shared by `metrics.bindAddr` and `control.bindAddr`; the pre-078 top-level `apiBindAddr` is retired (HARD rename, no alias).",
+      "description": "Main API listener. `bindAddr` (HORT_API_BIND) follows the `<subsystem>.bindAddr` shape shared by `metrics.bindAddr` and `control.bindAddr`; the top-level `apiBindAddr` key is retired (HARD rename, no alias).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -574,7 +574,7 @@
         "maxInflight": {"type": "integer", "minimum": 0},
         "maxInflightPerIp": {"type": "integer", "minimum": 0},
         "publishBodyMaxSize": {
-          "description": "HORT_PUBLISH_BODY_MAX_SIZE (Backlog 078 Item 4) — per-publish body-size ceiling as a human-readable size string (e.g. \"300Mi\", \"1Gi\", or a bare byte integer). Empty leaves the env var unset (binary default, 300 MiB); an explicit \"0\" is the refuse-all-publishes kill-switch.",
+          "description": "HORT_PUBLISH_BODY_MAX_SIZE — per-publish body-size ceiling as a human-readable size string (e.g. \"300Mi\", \"1Gi\", or a bare byte integer). Empty leaves the env var unset (binary default, 300 MiB); an explicit \"0\" is the refuse-all-publishes kill-switch.",
           "type": "string",
           "pattern": "^([0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?)?$"
         }
@@ -620,7 +620,7 @@
       }
     },
     "oci": {
-      "description": "OCI Distribution surfaces. Backlog 078 Item 10 grouped the OCI upload timeout here (HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS) as `uploadTimeoutSeconds`; the pre-078 `http.ociUploadTimeoutSeconds` key is retired (HARD rename, no alias).",
+      "description": "OCI Distribution surfaces. The OCI upload timeout (HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS) is exposed here as `uploadTimeoutSeconds`; the prior `http.ociUploadTimeoutSeconds` key is retired (HARD rename, no alias).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -666,7 +666,7 @@
       },
       "allOf": [
         {
-          "description": "Backlog 078 Item 7 / convention 9: configMapName and secretName are mutually exclusive — a pod can mount only one ca.crt at `path`. When at least one is non-empty, exactly one must be.",
+          "description": "configMapName and secretName are mutually exclusive — a pod can mount only one ca.crt at `path`. When at least one is non-empty, exactly one must be.",
           "if": {
             "anyOf": [
               {"properties": {"configMapName": {"type": "string", "minLength": 1}}, "required": ["configMapName"]},
@@ -689,7 +689,7 @@
           }
         },
         {
-          "description": "Backlog 078 Item 7: an auto-mount source requires a non-empty `path` (the mount path + the env value).",
+          "description": "An auto-mount source requires a non-empty `path` (the mount path + the env value).",
           "if": {
             "anyOf": [
               {"properties": {"configMapName": {"type": "string", "minLength": 1}}, "required": ["configMapName"]},
@@ -766,7 +766,7 @@
     },
     "gitopsConfig": {"type": "object"},
     "scheduledTasks": {
-      "description": "Backlog 078 Item 8 (chart N1) — unified scheduled-task tree. ALL periodic tasks live here regardless of execution path; each carries an `executionPath` attribute (dsn-direct | admin-task). `executionPath: dsn-direct` tasks run a `hort-server` subcommand with the runtime DSN only (no svc-token), gated solely by their own `enabled`. `executionPath: admin-task` tasks invoke `hort-cli admin task invoke <kind>` against the admin-task HTTP endpoint with the `<release>-svc-token` PAT, gated by BOTH `adminTasksEnabled` (the master toggle, which also gates the svc-token-bootstrap Job + RBAC) AND their own `enabled`. Replaces the pre-078 `cronJobs.*` block + the five top-level task keys.",
+      "description": "Unified scheduled-task tree. ALL periodic tasks live here regardless of execution path; each carries an `executionPath` attribute (dsn-direct | admin-task). `executionPath: dsn-direct` tasks run a `hort-server` subcommand with the runtime DSN only (no svc-token), gated solely by their own `enabled`. `executionPath: admin-task` tasks invoke `hort-cli admin task invoke <kind>` against the admin-task HTTP endpoint with the `<release>-svc-token` PAT, gated by BOTH `adminTasksEnabled` (the master toggle, which also gates the svc-token-bootstrap Job + RBAC) AND their own `enabled`. Replaces the prior `cronJobs.*` block + the five top-level task keys.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -1065,7 +1065,7 @@
           "additionalProperties": false,
           "properties": {
             "lockTimeoutMs": {
-              "description": "HORT_WORKER_LOCK_TIMEOUT_MS — Postgres lock_timeout (milliseconds) for both worker pools. Default 120000 (2 min), generous on purpose: under §10.2-INV single-flight it must never fire in correct operation; a small value risks a false abort if single-flight is ever deliberately relaxed. 0 disables the backstop — only set 0 if you have an alternative single-flight enforcement; doing so re-opens the unbounded-block failure mode this backstop covers. Relaxing any single-flight layer requires F-2 co-review per §10.2-INV.",
+              "description": "HORT_WORKER_LOCK_TIMEOUT_MS — Postgres lock_timeout (milliseconds) for both worker pools. Default 120000 (2 min), generous on purpose: under the single-flight invariant it must never fire in correct operation; a small value risks a false abort if single-flight is ever deliberately relaxed. 0 disables the backstop — only set 0 if you have an alternative single-flight enforcement; doing so re-opens the unbounded-block failure mode this backstop covers.",
               "type": "integer",
               "minimum": 0
             }
@@ -1147,7 +1147,7 @@
       }
     },
     {
-      "description": "Backlog 078 Item 9 (chart S4), Rule 9a: fallback PAT rotation is enabled by the SINGLE toggle `scheduledTasks.serviceAccountRotation.enabled`. When it is true, the `scheduledTasks.adminTasksEnabled` master umbrella MUST also be true — the rotation CronJob is an `executionPath: admin-task` template that renders only under the umbrella, so without it the single toggle would silently render no CronJob (a half-on no-op). Mirrors the `replicaCount ⇒ ephemeralStore/storage` top-level couplings: fail fast at `helm install` rather than half-enabling at runtime.",
+      "description": "Rule 9a: fallback PAT rotation is enabled by the SINGLE toggle `scheduledTasks.serviceAccountRotation.enabled`. When it is true, the `scheduledTasks.adminTasksEnabled` master umbrella MUST also be true — the rotation CronJob is an `executionPath: admin-task` template that renders only under the umbrella, so without it the single toggle would silently render no CronJob (a half-on no-op). Mirrors the `replicaCount ⇒ ephemeralStore/storage` top-level couplings: fail fast at `helm install` rather than half-enabling at runtime.",
       "if": {
         "properties": {
           "scheduledTasks": {
@@ -1176,7 +1176,7 @@
       }
     },
     {
-      "description": "Backlog 078 Item 9 (chart S4), Rule 9b: when `scheduledTasks.serviceAccountRotation.enabled` is true, `worker.enabled` MUST be true AND `worker.rotation.publicRegistryHost` MUST be non-empty. The single rotation toggle drives the worker-side wiring (the rotation env block in worker-deployment.yaml + the per-namespace RBAC), which is meaningless without the worker Deployment and has nowhere to point the `dockerconfigjson.auths` map without the registry host. Fail fast at install rather than producing a worker that cannot rotate. Mirrors the `replicaCount ⇒ …` couplings' shape.",
+      "description": "Rule 9b: when `scheduledTasks.serviceAccountRotation.enabled` is true, `worker.enabled` MUST be true AND `worker.rotation.publicRegistryHost` MUST be non-empty. The single rotation toggle drives the worker-side wiring (the rotation env block in worker-deployment.yaml + the per-namespace RBAC), which is meaningless without the worker Deployment and has nowhere to point the `dockerconfigjson.auths` map without the registry host. Fail fast at install rather than producing a worker that cannot rotate. Mirrors the `replicaCount ⇒ …` couplings' shape.",
       "if": {
         "properties": {
           "scheduledTasks": {

@@ -37,8 +37,7 @@ use hort_config::DesiredState;
 /// **pure core** of the resolution the apply pipeline runs in
 /// [`crate::use_cases::apply_config_use_case::ApplyConfigUseCase::resolve_effective_lint_config`];
 /// it is shared between apply and the offline
-/// [`StaticConfigValidator`]'s row-8 so the two cannot
-/// drift.
+/// [`StaticConfigValidator`] so the two cannot drift.
 ///
 /// Resolution (identical to apply):
 /// - `> 1` declared `PermissionGrantLintConfig` envelope (a singleton
@@ -46,7 +45,7 @@ use hort_config::DesiredState;
 ///   the secure [`LintConfig::default`] — never a last-wins of an
 ///   operator opt-out.
 /// - no `PermissionGrantLintConfig` envelope ⇒ `base.clone()` (a missing
-///   kind is **not** a downgrade — §6 invariant 1).
+///   kind is **not** a downgrade).
 /// - exactly one envelope ⇒ the config its spec maps to
 ///   (`LintConfig::from(&env.spec)`).
 ///
@@ -91,7 +90,7 @@ mod tests {
 
     /// No declared `PermissionGrantLintConfig` envelope ⇒ the resolver
     /// returns the composition-root `base` verbatim (a missing kind is not
-    /// a downgrade — §6 invariant 1).
+    /// a downgrade).
     #[test]
     fn shared_resolver_absent_kind_returns_base() {
         let base = LintConfig {

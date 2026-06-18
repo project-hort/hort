@@ -76,7 +76,7 @@ fn argon2_context() -> Argon2<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Internal verifier trait — pub(crate) so B5 can reuse the spy harness
+// Internal verifier trait — pub(crate) so callers can reuse the spy harness
 // ---------------------------------------------------------------------------
 
 /// Verifier strategy. The default ([`DefaultArgon2Verifier`]) calls into
@@ -263,10 +263,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Counter-spy verifier. Wraps the real verifier and counts how
-    /// many times `verify` is called — this is the architectural
-    /// invariant from design doc §8 invariant 1: every input shape
-    /// (valid hash, wrong hash, malformed hash, empty hash) hits the
-    /// verify path EXACTLY ONCE.
+    /// many times `verify` is called — the architectural invariant is
+    /// that every input shape (valid hash, wrong hash, malformed hash,
+    /// empty hash) hits the verify path EXACTLY ONCE.
     struct CountingVerifier {
         calls: AtomicUsize,
     }
@@ -460,8 +459,8 @@ mod tests {
     #[test]
     fn argon2_context_uses_owasp_2024_params() {
         // Pin the parameter constants — a perf-panic PR that drops
-        // them silently would be caught here. The catalog +
-        // design doc §7 and §8 invariant 1 depend on these values.
+        // them silently would be caught here. The OWASP 2024 catalog
+        // and constant-time invariant depend on these values.
         assert_eq!(M_COST_KIB, 19_456);
         assert_eq!(T_COST, 2);
         assert_eq!(P_COST, 1);

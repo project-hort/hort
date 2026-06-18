@@ -370,7 +370,7 @@ fn no_oci_manifest_consumer_calls_the_deleted_manifest_body_bytes_helper() {
 
     assert!(
         hits.is_empty(),
-        "the spec §7 sibling deleted `manifest_body_bytes`; an OCI manifest \
+        "`manifest_body_bytes` was deleted; an OCI manifest \
          consumer reintroduced a call to it (re-buffering the whole upstream \
          manifest body). The streaming path opens the fetch tempfile as a \
          `tokio::fs::File` and hands it to `ingest_verified`. Found {} hit(s):\n{}",

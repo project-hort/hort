@@ -11,7 +11,7 @@
 //! Mirrors [`ScanOrchestrationUseCase`](super::scan_orchestration::ScanOrchestrationUseCase):
 //! port-only `Arc<dyn _Port>` dependencies, no concrete use-case handles.
 //!
-//! # Fail-closed semantics (design §3.1)
+//! # Fail-closed semantics
 //!
 //! - Under [`ProvenanceMode::Required`], a bundle-fetch / CAS-read failure
 //!   that retries cannot resolve → fold to
@@ -26,12 +26,12 @@
 //!   (the gate is at ingest-enqueue time); the orchestrator returns a
 //!   no-op skip if it is ever invoked for an `Off` policy.
 //!
-//! # Tracing (design §6)
+//! # Tracing
 //!
 //! `info!` on `ProvenanceVerified` and on `ProvenanceRejected` (these are
 //! supply-chain audit decisions, NOT `err`); no `#[instrument(err)]`. The
-//! domain stays tracing-free. **Metrics land in Item 6**, not here (the
-//! catalog-same-PR rule binds metric emission to its `docs/metrics-catalog.md`
+//! domain stays tracing-free. Metrics are emitted by the callers per the
+//! catalog-same-PR rule (binds metric emission to its `docs/metrics-catalog.md`
 //! entry + a `with_local_recorder` test).
 
 use std::sync::Arc;
@@ -228,12 +228,12 @@ impl ProvenanceOrchestrationUseCase {
         // retries. A fetch failure that retries cannot resolve folds to a
         // mode-dependent verdict (Required → fail-closed; VerifyIfPresent
         // → allow).
-        // The backend label for the metrics (design §6). Tier-1 is a
-        // single verifier (cosign); for a future multi-verifier set the
-        // first applicable port names the metric series — the
-        // representative backend that ran for this format. Captured before
-        // any fetch-failure early-return so the fail-closed / degrade
-        // verdicts carry the same label.
+        // The backend label for the metrics. Tier-1 is a single verifier
+        // (cosign); for a future multi-verifier set the first applicable
+        // port names the metric series — the representative backend that
+        // ran for this format. Captured before any fetch-failure
+        // early-return so the fail-closed / degrade verdicts carry the
+        // same label.
         let backend = applicable[0].name().to_string();
 
         let mut bundles = match self
@@ -252,7 +252,7 @@ impl ProvenanceOrchestrationUseCase {
         // bundle was found AND the repo is a proxy/pull-through scope
         // (`upstream_resolver.resolve(..).is_some()`), fetch the image's
         // Sigstore referrer(s) from upstream, land them into local CAS via the
-        // narrow create (§3.4), then re-read the local bundle set once. A
+        // narrow create, then re-read the local bundle set once. A
         // hosted repo (`resolve → None`) with no local bundle is left
         // unchanged (nothing to fetch → stays `NoAttestation`). An upstream
         // fetch error follows the SAME `apply_fetch_failure` arm as a local
@@ -317,9 +317,9 @@ impl ProvenanceOrchestrationUseCase {
         };
 
         // Build the verifier inputs. `provenance_identities` is the slice
-        // of allowed signer patterns; an empty slice under `Required` is an
-        // apply-time reject (Item 5) — the verifier treats it as
-        // verify-time input only.
+        // of allowed signer patterns; an empty slice under `Required` is
+        // rejected at apply time — the verifier treats it as verify-time
+        // input only.
         let empty_identities = Vec::new();
         let allowed_identities = policy
             .as_ref()
@@ -419,7 +419,7 @@ impl ProvenanceOrchestrationUseCase {
 
     /// Fetch the image's Sigstore referrer(s) from upstream and land each one
     /// (referrer manifest + its bundle blob) into local CAS via the **narrow
-    /// create** (§3.4) — NOT `ingest_verified`. Per landed referrer this
+    /// create** — NOT `ingest_verified`. Per landed referrer this
     /// writes a status-`None` referrer-manifest artifact (via
     /// `commit_transition` + `ArtifactIngested`, with **no** scan/provenance
     /// enqueue) and the `oci_subject` content-reference row pointing AT the
@@ -458,7 +458,7 @@ impl ProvenanceOrchestrationUseCase {
 
         // 2. Keep only Sigstore-bundle referrers (by `artifact_type` or
         //    `media_type`); land each. A referrer that yields no bundle layer
-        //    (or fails the §8.7 declared-digest integrity check) is skipped.
+        //    (or fails the declared-digest integrity check) is skipped.
         let mut landed_bundles = 0usize;
         for descriptor in descriptors {
             let is_sigstore = descriptor.artifact_type.as_deref()
@@ -487,11 +487,11 @@ impl ProvenanceOrchestrationUseCase {
     }
 
     /// Land a single upstream referrer: fetch its manifest, store the
-    /// manifest + each Sigstore-bundle blob into CAS with the §8.7
+    /// manifest + each Sigstore-bundle blob into CAS with a
     /// declared-digest integrity check, commit the status-`None`
     /// referrer-manifest artifact, and write the `oci_subject` row. Returns
     /// `Ok(true)` when ≥1 bundle blob was landed, `Ok(false)` when the
-    /// referrer was skipped (non-bundle manifest, or §8.7 integrity
+    /// referrer was skipped (non-bundle manifest, or digest integrity
     /// mismatch). An upstream / CAS error propagates (mode-dependent).
     async fn land_one_referrer(
         &self,
@@ -500,7 +500,7 @@ impl ProvenanceOrchestrationUseCase {
         upstream_name: &str,
         referrer_digest: &str,
     ) -> AppResult<bool> {
-        // The referrer manifest's own declared digest (§8.7 — the manifest is
+        // The referrer manifest's own declared digest (the manifest is
         // content-addressed; a `sha256:` reference is required, else skip).
         let Some(declared_manifest_hash) = parse_sha256_digest(referrer_digest) else {
             return Ok(false);
@@ -530,7 +530,7 @@ impl ProvenanceOrchestrationUseCase {
             return Ok(false);
         }
 
-        // c. Fetch + store each bundle blob. §8.7: the put-returned hash MUST
+        // c. Fetch + store each bundle blob. The put-returned hash MUST
         //    equal the manifest-DECLARED layer digest; on mismatch the whole
         //    referrer is skipped (fail-closed — never land a tampered blob).
         //    Note: blobs are put BEFORE the digest check, so a mismatch here
@@ -556,14 +556,14 @@ impl ProvenanceOrchestrationUseCase {
                     artifact_id = %artifact.id,
                     declared = %blob_hash,
                     stored = %put.hash,
-                    "provenance: upstream bundle blob digest mismatch — skipping referrer (§8.7)",
+                    "provenance: upstream bundle blob digest mismatch — skipping referrer",
                 );
                 return Ok(false);
             }
         }
 
-        // d. Store the referrer manifest in CAS with the SAME §8.7 check —
-        //    its put-returned hash must equal the descriptor's declared digest.
+        // d. Store the referrer manifest in CAS — its put-returned hash must
+        //    equal the descriptor's declared digest.
         let manifest_put = self
             .storage
             .put(Box::new(std::io::Cursor::new(manifest_bytes)))
@@ -573,7 +573,7 @@ impl ProvenanceOrchestrationUseCase {
                 artifact_id = %artifact.id,
                 declared = %declared_manifest_hash,
                 stored = %manifest_put.hash,
-                "provenance: upstream referrer manifest digest mismatch — skipping (§8.7)",
+                "provenance: upstream referrer manifest digest mismatch — skipping",
             );
             return Ok(false);
         }
@@ -787,9 +787,9 @@ impl ProvenanceOrchestrationUseCase {
 
         let Some(event) = event else {
             // NoAttestation under VerifyIfPresent / Off — no event, status
-            // unchanged. Metric (design §6): the allowed-unsigned case
-            // ticks `no_attestation` (no reject sibling). Single emission
-            // layer — the orchestration use case.
+            // unchanged. The allowed-unsigned case ticks `no_attestation`
+            // (no reject sibling). Single emission layer — the
+            // orchestration use case.
             crate::metrics::emit_provenance_verify(
                 backend,
                 mode,
@@ -801,9 +801,9 @@ impl ProvenanceOrchestrationUseCase {
             });
         };
 
-        // Tracing (design §6): info! on the supply-chain decision — audit
-        // signal, not `err`. Domain stays tracing-free. Metrics (§6) fire
-        // alongside, once per applied verdict, at this single layer:
+        // Tracing: info! on the supply-chain decision — audit signal, not
+        // `err`. Domain stays tracing-free. Metrics fire alongside, once
+        // per applied verdict, at this single layer:
         // `hort_provenance_verify_total{backend, mode, result}` always, +
         // `hort_provenance_reject_total{backend, reason}` on a rejection.
         // The coarse verdict bucket surfaced to the task handler's
@@ -868,8 +868,7 @@ impl ProvenanceOrchestrationUseCase {
         })
     }
 
-    /// Handle a bundle-fetch / CAS-read failure mode-dependently
-    /// (design §3.1):
+    /// Handle a bundle-fetch / CAS-read failure mode-dependently:
     ///
     /// - `Required` → fail-closed `Rejected{RekorNotFound}` (a never-
     ///   verified `Required` artifact must never timer-release);

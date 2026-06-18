@@ -138,7 +138,7 @@ impl SessionRequest {
     /// supplies the lifetime in seconds.
     pub fn from_login_args(args: &LoginArgs) -> Self {
         let scope = if args.admin {
-            // Wire shape per design doc §2.1: space-separated.
+            // Wire shape: space-separated.
             // Order doesn't matter to the server's parser; `admin`
             // first reads naturally for operators eyeballing logs.
             Some("admin read write delete".to_string())
@@ -892,7 +892,7 @@ pub fn persist_token(server_url: &str, token: &str) -> Result<()> {
 /// Behaviour-preserving core of [`persist_token`] parameterised on the target
 /// path so it is testable without driving `$HOME`.
 ///
-/// F-18 (write-then-chmod TOCTOU). The previous implementation did
+/// Write-then-chmod TOCTOU fix. The previous implementation did
 /// `fs::write` (creating the file at the process umask, commonly 0644,
 /// containing the plaintext bearer token) and *then* `set_permissions(0600)`,
 /// leaving a world-readable window on a multi-user host; on an existing file
@@ -1338,7 +1338,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // persist_token_to tests — F-18 (write-then-chmod TOCTOU)
+    // persist_token_to tests — write-then-chmod TOCTOU
     //
     // The atomic temp-file-in-same-dir + rename approach must close:
     //   (a) world-readable window between create and chmod,

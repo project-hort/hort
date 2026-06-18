@@ -3,7 +3,7 @@
 //!
 //! Two tower layer builders, both backed by [`tower_governor`] with a
 //! custom [`KeyExtractor`] that reads [`RequestTrust::client_ip`] out of
-//! request extensions (populated by F2's [`request_trust_layer`]):
+//! request extensions (populated by [`request_trust_layer`]):
 //!
 //! - [`auth_rate_limit_layer`] — wraps [`require_principal`]. Per-IP
 //!   token-bucket limiting auth attempts; bucket cap via
@@ -41,15 +41,15 @@
 //! `require_principal` would decouple the two, but the current router
 //! applies `require_principal` to the same write-method set via
 //! `method_based_auth_dispatch` — so there's no sub-tree to narrow to
-//! without a router re-architecture. If a future initiative splits
-//! admin endpoints from format endpoints (different auth caps per
-//! surface), revisit the attach points then.
+//! without a router re-architecture. If a future change splits admin
+//! endpoints from format endpoints (different auth caps per surface),
+//! revisit the attach points then.
 //!
 //! # Why not `SmartIpKeyExtractor`?
 //!
 //! `tower_governor` ships a `SmartIpKeyExtractor` that sniffs
 //! `X-Forwarded-For` / `X-Real-IP` / `Forwarded` without consulting a
-//! trusted-proxy allowlist. Using it here would silently bypass the F2
+//! trusted-proxy allowlist. Using it here would silently bypass the
 //! trust policy: an unauthenticated client could set
 //! `X-Forwarded-For: 1.2.3.4` and escape their bucket. All peer-IP
 //! evaluation lives in [`crate::middleware::trust`]; this module consumes
@@ -148,12 +148,12 @@ impl Default for RateLimitConfig {
 // ---------------------------------------------------------------------------
 
 /// Custom [`KeyExtractor`] that pulls [`RequestTrust::client_ip`] out of
-/// request extensions. Populated by F2's `request_trust_layer`; if the
+/// request extensions (populated by `request_trust_layer`); if the
 /// extension is missing the extractor surfaces
 /// [`GovernorError::UnableToExtractKey`] → `500 Internal Server Error`.
 ///
 /// Why 500 instead of falling back to `ConnectInfo<SocketAddr>`: a
-/// ConnectInfo fallback would silently bypass F2's trust policy whenever
+/// ConnectInfo fallback would silently bypass the trust policy whenever
 /// the router is composed incorrectly (rate-limit layer attached before
 /// the trust layer). 500 is the conservative failure — it surfaces the
 /// composition bug immediately rather than hiding it behind a subtly-
@@ -665,7 +665,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Distinct client IPs get distinct buckets (proves F2 feeds the key).
+    // Distinct client IPs get distinct buckets (proves the trust layer feeds the key).
     // ------------------------------------------------------------------
 
     #[test]
@@ -807,10 +807,10 @@ mod tests {
     #[test]
     fn missing_request_trust_yields_500_not_bucket_bypass() {
         // If the router is composed incorrectly (rate-limit attached
-        // without F2's trust layer upstream), the extractor has no
+        // without the trust layer upstream), the extractor has no
         // client_ip to key on. Surfacing 500 makes the composition bug
         // immediately visible; a ConnectInfo fallback would silently
-        // bypass F2's trust policy.
+        // bypass the trust policy.
         //
         // POST to reach the rate-limiter's method filter; a GET would
         // bypass the limiter entirely and succeed with 200.

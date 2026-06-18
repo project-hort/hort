@@ -225,10 +225,9 @@ fi
 # Step 4: assert hort-server logs contain "ChecksumMismatch". This is
 # the audit-trail witness — even if the metric ticked, an operator
 # investigating a supply-chain alert should be able to grep the logs
-# and find the structured event. Item 8 in the backlog explicitly
-# requires "algorithm=Sha512" in the structured event; we grep for
-# the event-type string here and rely on the structured logger
-# (tracing JSON) to carry the algorithm field.
+# and find the structured event. The structured event carries
+# "algorithm=Sha512"; we grep for the event-type string here and rely
+# on the structured logger (tracing JSON) to carry the algorithm field.
 #
 # Reaching the host docker daemon from inside the sidecar requires
 # /var/run/docker.sock mounted in. If it isn't, soft-skip this leg —

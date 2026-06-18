@@ -27,7 +27,7 @@
 //! This validator is **adapter-local** (`pub(crate)`). The OCI grammar
 //! is HTTP-adapter-specific; the `hort-formats::oci::normalize_name`
 //! identity function in `hort-formats` stays as-is. Per the inbound-HTTP
-//! crate topology (ADR 0008 §8), validation that's protocol-shaped lives
+//! crate topology (ADR 0008), validation that's protocol-shaped lives
 //! next to the HTTP handlers, not in `hort-domain` or `hort-formats`.
 //!
 //! ## Where it runs
@@ -216,9 +216,9 @@ mod tests {
 
     // ---------------- Acceptance criteria coverage ------------------------
     //
-    // Backlog Item 10 lists seven mandatory test shapes. Each one has a
-    // dedicated test below; additional smaller tests pin specific
-    // grammar branches (e.g. trailing separator, single-component cap).
+    // Seven mandatory test shapes are covered below; additional smaller
+    // tests pin specific grammar branches (e.g. trailing separator,
+    // single-component cap).
 
     /// Acceptance #1 — Grammar happy path.
     #[test]

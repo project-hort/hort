@@ -3,7 +3,7 @@
 //! Bulk curator block by `(repository, package, versions[])`. Wraps the
 //! [`BlockTarget::VersionList`] arm of [`CurationUseCase::block`].
 //!
-//! **Continue-on-error (design §2.3).** Per-version failures land in
+//! **Continue-on-error.** Per-version failures land in
 //! `outcome.failed`; successful appends are NOT rolled back (event
 //! sourcing — events are immutable). The wire response is therefore
 //! `200 OK` with the FULL [`BlockOutcomeDto`] body (correlation_id +
@@ -11,7 +11,7 @@
 //! a non-empty `failed` list is STILL 200, NOT 5xx. Operators read the
 //! envelope to discover which versions transitioned and which did not.
 //!
-//! Status-code mapping (design §3 acceptance):
+//! Status-code mapping:
 //! - `200 OK` with full [`BlockOutcomeDto`] body on any non-validation
 //!   outcome (including partial success — empty `failed` is the all-OK
 //!   case, non-empty `failed` is the partial-success case)
@@ -186,7 +186,7 @@ impl BlockOutcomeDto {
 /// Resolves `repository` (stable key) → `repository_id` (Uuid) via the
 /// repository use case; dispatches the [`BlockTarget::VersionList`] arm;
 /// returns the FULL `BlockOutcomeDto` body on any non-validation outcome
-/// (continue-on-error per §2.3 — partial success is 200, NOT 5xx).
+/// (continue-on-error — partial success is 200, NOT 5xx).
 #[tracing::instrument(skip(ctx, principal, body))]
 pub async fn post_block_versions(
     principal: CurateOrAdminPrincipal,
@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "partial success must return 200 — continue-on-error per §2.3"
+            "partial success must return 200 — continue-on-error"
         );
 
         let bytes = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();

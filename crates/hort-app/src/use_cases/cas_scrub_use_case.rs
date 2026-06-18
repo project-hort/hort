@@ -18,7 +18,7 @@
 //! lists tens of thousands of blobs, issues one `get()` per blob, and
 //! runs for minutes. That shape does not fit a web request.
 //!
-//! **Hex-onion discipline (§2.0.4).** Business logic lives here; the CLI
+//! **Hex-onion discipline.** Business logic lives here; the CLI
 //! parses arguments and maps the report to an exit code. No DB or file
 //! I/O leaks into the CLI module.
 

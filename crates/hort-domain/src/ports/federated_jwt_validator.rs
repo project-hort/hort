@@ -57,8 +57,8 @@ use super::BoxFuture;
 ///
 /// - `issuer` — canonical `iss` claim value (matches the
 ///   `OidcIssuer.issuer_url` that was looked up).
-/// - `issuer_name` — the resolved `OidcIssuer.name`. Item 5 uses this
-///   to match `ServiceAccount.federated_identities[].issuer_name`
+/// - `issuer_name` — the resolved `OidcIssuer.name`. The federation handler
+///   uses this to match `ServiceAccount.federated_identities[].issuer_name`
 ///   AND to surface in the audit log without exposing the URL form.
 /// - `subject` — the validated `sub` claim.
 /// - `audience` — the matched audience (one of
@@ -68,26 +68,25 @@ use super::BoxFuture;
 /// - `jti` — optional JWT ID for audit logging
 ///   (`TokenIssued.source_jti`). Foreign IdPs are inconsistent about
 ///   whether they emit `jti`; absence is not a deny condition.
-/// - `expires_at` — `exp` claim as a `DateTime<Utc>`. Item 5 uses this
-///   to cap the minted bearer's validity at `min(1h, jwt.exp - now)`.
+/// - `expires_at` — `exp` claim as a `DateTime<Utc>`. The federation handler
+///   uses this to cap the minted bearer's validity at `min(1h, jwt.exp - now)`.
 /// - `iat` — raw `iat` claim (RFC 7519 §4.1.6) as NumericDate seconds,
 ///   when present. The
 ///   `ReplayKey::Composite` fallback needs the *raw* `iat`/`exp` wire
 ///   values (byte-stable across replays of the same token), so the
 ///   validator surfaces them additively rather than the use case
 ///   re-parsing the JWT. `None` when the JWT carried no `iat` (the
-///   composite key is then not constructible — see §5 behaviour
-///   matrix).
+///   composite key is then not constructible).
 /// - `exp_raw` — raw `exp` claim as NumericDate seconds. Always present
 ///   (the validator already enforced `exp`); kept alongside the typed
 ///   `expires_at` so the composite key is byte-stable without
 ///   round-tripping through `DateTime`.
 /// - `all_claims` — the raw decoded payload as a `BTreeMap` (ordered
-///   key iteration is needed for deterministic audit hashing). Item 5
-///   walks `ServiceAccount.federated_identities[].claims` against
-///   this map for exact-match SA resolution. The map carries
-///   `serde_json::Value` so nested objects and arrays survive the
-///   round trip from the JWT payload.
+///   key iteration is needed for deterministic audit hashing). The
+///   federation handler walks
+///   `ServiceAccount.federated_identities[].claims` against this map for
+///   exact-match SA resolution. The map carries `serde_json::Value` so
+///   nested objects and arrays survive the round trip from the JWT payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedClaims {
     pub issuer: String,
@@ -112,8 +111,7 @@ pub struct ValidatedClaims {
 // FederationDenyReason
 // ---------------------------------------------------------------------------
 
-/// Deny taxonomy for federation-branch JWT validation, mapping 1:1 to
-/// the design-doc §4 deny-log catalogue.
+/// Deny taxonomy for federation-branch JWT validation.
 ///
 /// The federation handler maps each variant to:
 /// - one `hort_token_exchange_total{kind=federated_jwt, result=...}`
@@ -129,7 +127,7 @@ pub struct ValidatedClaims {
 /// not be conflated. This enum is the validator's contract; SA-match
 /// failures belong on the handler's wider deny enum.
 ///
-/// Variants are ordered to match the §4 flow chart (top to bottom).
+/// Variants are ordered to match the validation flow (top to bottom).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FederationDenyReason {
     /// Step 1: the JWT cannot be parsed (bad base64, missing header
@@ -165,7 +163,7 @@ pub enum FederationDenyReason {
 impl FederationDenyReason {
     /// Wire-form string for the `result` label of
     /// `hort_token_exchange_total{kind=federated_jwt}` and the
-    /// `reason = ...` deny-log field. Normative — see design doc §7.
+    /// `reason = ...` deny-log field. Normative.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InvalidFormat => "invalid_format",
@@ -243,8 +241,7 @@ mod tests {
     #[test]
     fn deny_reason_as_str_covers_every_variant() {
         // The wire-form string is part of the public metrics +
-        // deny-log contract (design doc §7). Each variant must map
-        // to a fixed string.
+        // deny-log contract. Each variant must map to a fixed string.
         assert_eq!(
             FederationDenyReason::InvalidFormat.as_str(),
             "invalid_format"

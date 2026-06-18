@@ -17,7 +17,7 @@
 //!    with a 300 s TTL.
 //! 7. Return 202 on the fresh path, 200 on the cache-hit path.
 //!
-//! # Metrics (design §6.2)
+//! # Metrics
 //!
 //! `hort_admin_tasks_enqueued_total{kind, result}` is incremented at every
 //! terminal path:
@@ -77,7 +77,7 @@ const IDEM_TTL: Duration = Duration::from_secs(300);
 /// Prevents pathological cache-key attacks.
 const MAX_IDEM_KEY_BYTES: usize = 128;
 
-/// Metric name emitted on every terminal path (design §6.2).
+/// Metric name emitted on every terminal path.
 const METRIC_ENQUEUED: &str = "hort_admin_tasks_enqueued_total";
 
 /// `result` label values for `hort_admin_tasks_enqueued_total`.

@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // -- Item 10 (§2.10) — External / Scanner sanitisation -------------
+    // -- External / Scanner sanitisation -------------
 
     #[test]
     fn external_error_body_is_opaque_upstream_unavailable() {
@@ -544,7 +544,7 @@ mod tests {
         assert_no_internal_leakage(status, &body);
     }
 
-    // -- Item 4: ManagedByConfiguration → 409 problem+json -----------------
+    // -- ManagedByConfiguration → 409 problem+json -----------------
 
     fn managed_by_response() -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let rt = tokio::runtime::Builder::new_current_thread()

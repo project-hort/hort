@@ -3,11 +3,11 @@
 //! Single-artifact curator block. The use case's [`BlockTarget::Artifact`]
 //! arm pre-flights `find_by_id(artifact_id)` so an unknown id surfaces as
 //! a top-level `Err(NotFound)` rather than landing in the
-//! `outcome.failed` list — matching `waive`'s shape (per Item 5 amend).
+//! `outcome.failed` list — matching `waive`'s shape.
 //! The HTTP layer therefore maps a miss to **404**, not to 200 with
 //! a failed-entry envelope.
 //!
-//! Status-code mapping (design §3 acceptance):
+//! Status-code mapping:
 //! - `200 OK` with a trivial [`BlockOutcomeDto`] body — at most one of
 //!   `blocked_artifact_ids` / `already_rejected_ids` / `failed` has
 //!   a single entry; the others are empty
@@ -58,7 +58,7 @@ pub struct BlockRequestDto {
 /// See module docs for the full status-code map. Wraps the
 /// [`BlockTarget::Artifact`] arm of [`CurationUseCase::block`] —
 /// single-artifact target. The use case pre-flights `find_by_id`
-/// (per Item 5 amend) so a stale id is a 404, NOT an envelope entry.
+/// so a stale id is a 404, NOT an envelope entry.
 #[tracing::instrument(skip(ctx, principal, body))]
 pub async fn post_block(
     principal: CurateOrAdminPrincipal,
@@ -350,8 +350,8 @@ mod tests {
         assert!(mocks.lifecycle.committed_transitions().is_empty());
     }
 
-    /// Unknown artifact_id → 404 (single-artifact target preflight per
-    /// Item 5 amend; the use case's `find_by_id` miss surfaces top-level
+    /// Unknown artifact_id → 404 (single-artifact target preflight;
+    /// the use case's `find_by_id` miss surfaces top-level
     /// `NotFound`, not an envelope entry).
     #[tokio::test]
     async fn block_unknown_artifact_returns_404() {

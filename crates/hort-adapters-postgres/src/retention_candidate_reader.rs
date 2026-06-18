@@ -1,24 +1,24 @@
 //! PostgreSQL adapter for [`RetentionCandidateReader`] (ADR 0020).
 //!
 //! Enumerates non-protected artifacts and resolves each one's
-//! repo-scoped rescan interval (the §6-inv-7 freshness-window input)
+//! repo-scoped rescan interval (freshness-window input)
 //! via the repo→policy chain — the **identical**
 //! `JOIN LATERAL policy_projections` the
 //! [`rescan_candidates`](crate::rescan_candidates) adapter uses, with
-//! two deliberate deviations (RESOLVED #4 / #5):
+//! two deliberate deviations from the rescan adapter:
 //!
 //! 1. **LEFT** join, not INNER: an artifact with no resolved scan
-//!    policy yields `resolved_rescan_interval_hours = None` (→ B3's
-//!    default 24 h) rather than being dropped — age-based retention
-//!    applies even without a scan policy.
+//!    policy yields `resolved_rescan_interval_hours = None` (→ default
+//!    24 h) rather than being dropped — age-based retention applies
+//!    even without a scan policy.
 //! 2. The protected-status filter is `quarantine_status NOT IN
-//!    ('quarantined','rejected','scan_indeterminate')` (B3's §6-inv-1
+//!    ('quarantined','rejected','scan_indeterminate')` (the GC-protected
 //!    set: `none` / `released` are retention-eligible) — broader than
 //!    the rescan adapter's `= 'released'`.
 //!
 //! The query additionally `JOIN`s `repositories r ON r.id =
 //! a.repository_id` to select `r.format` (aliased `repo_format`) — the
-//! per-artifact [`RepositoryFormat`] B3's §4 `RetentionScope::Format`
+//! per-artifact [`RepositoryFormat`] the `RetentionScope::Format`
 //! gate needs (`Artifact` itself has no `format` field). This is an
 //! INNER join: every artifact's `repository_id` is a FK into
 //! `repositories`, so it never drops a row. Still a **single query**:
@@ -107,16 +107,16 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
             // repo-scoped non-archived policy if one exists, else a
             // non-archived Global. LEFT JOIN so a no-policy artifact
             // is kept with `resolved_rescan_interval_hours = NULL`
-            // (→ B3 default 24h) — NOT dropped (the rescan adapter's
+            // (→ default 24h) — NOT dropped (the rescan adapter's
             // INNER-join behaviour is wrong for age-based retention).
             //
             // `$3::uuid` keyset cursor: when NULL, no lower bound
             // (first page); otherwise `a.id > $3`. The `now`
             // parameter is bound for caller-pinned time coherence
-            // (the B3 / rescan convention) even though the
-            // protected-status filter does not consult it — kept in
-            // the signature/SQL so a future age pre-filter has a
-            // pinned `now` available without a signature change.
+            // even though the protected-status filter does not
+            // consult it — kept in the signature/SQL so a future age
+            // pre-filter has a pinned `now` available without a
+            // signature change.
             let sql = r#"
                 SELECT a.id, a.repository_id, a.name, a.name_as_published,
                        a.version, a.path, a.size_bytes,

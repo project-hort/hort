@@ -59,7 +59,7 @@
 --     and direct-purl-lookup paths work without re-derivation.
 --   * `ecosystem` / `name` / `version` — typed columns matching the
 --     OSV diff entry shape. The `(ecosystem, name)` index drives the
---     advisory-watch DISTINCT-artifact_id query (design §3.3 / §3.4):
+--     advisory-watch DISTINCT-artifact_id query:
 --
 --       SELECT DISTINCT artifact_id
 --       FROM sbom_components
@@ -84,7 +84,7 @@ CREATE TABLE public.sbom_components (
 CREATE INDEX sbom_components_purl_idx
     ON public.sbom_components (purl);
 
--- Drives the advisory-watch DISTINCT-artifact_id query (§3.3 / §3.4).
+-- Drives the advisory-watch DISTINCT-artifact_id query.
 CREATE INDEX sbom_components_ecosystem_name_idx
     ON public.sbom_components (ecosystem, name);
 
@@ -123,7 +123,7 @@ CREATE TABLE public.advisory_sync_state (
 -- whatever OSV published between the install moment and the first
 -- scheduled tick — typically several hours later under the default
 -- `0 */6 * * *` schedule. The 24-hour offset gives the first tick a
--- meaningful backfill window. See design doc §3.7.
+-- meaningful backfill window.
 --
 -- `ON CONFLICT DO NOTHING` keeps the migration idempotent: re-running
 -- on a database that already has the seed row is a no-op (existing

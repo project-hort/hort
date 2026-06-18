@@ -10,7 +10,7 @@
 //! [`serve`] function is driven by [`super::tail::parse_tail`] +
 //! [`super::tail::TailKind::Blob`] — this module owns only the
 //! blob-serving logic; tail parsing lives in `tail.rs` so manifests
-//! (Item 7) and future handlers share the same parser.
+//! future handlers share the same parser.
 //!
 //! ## Quarantine handling
 //!
@@ -588,10 +588,10 @@ pub(crate) async fn try_upstream_blob_pull(
 
     // 4. Discriminate leader-side typed errors and map to the existing
     //    outcome variants. Follower-side errors arrive as
-    //    `AppError::External("pull-dedup follower: ...")` (§4 doc:
-    //    "Followers do not see the leader's full error chain") and
-    //    route to `Internal` per the design's leader-only-discrimination
-    //    contract — followers never re-attempt.
+    //    `AppError::External("pull-dedup follower: ...")` — followers
+    //    do not see the leader's full error chain and route to `Internal`
+    //    per the leader-only-discrimination contract; they never
+    //    re-attempt.
     let content_hash = match coalesce_result {
         Ok(h) => h,
         Err(AppError::Domain(DomainError::Conflict(msg))) => {
@@ -1246,7 +1246,7 @@ mod tests {
     fn get_blob_served_with_spec_headers() {
         // Pre-compute the hash outside the async block so it can be
         // used both for seeding and URL construction. Digest of the
-        // test payload — Item 6 does not re-verify, it just streams.
+        // test payload — the handler does not re-verify, it just streams.
         let content = b"hello world".to_vec();
         let hex = {
             use sha2::Digest;
@@ -1416,7 +1416,7 @@ mod tests {
             (1..=120).contains(&secs),
             "Retry-After out of expected range: {secs}"
         );
-        // F8: assert body shape so a regression to TOOMANYREQUESTS /
+        // Assert body shape so a regression to TOOMANYREQUESTS /
         // mis-aligned status+code pair would be caught.
         assert_eq!(
             content_type.as_deref(),
@@ -1514,7 +1514,7 @@ mod tests {
         assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
     }
 
-    // -- F3: DB-error collapse guard --------------------------------------
+    // -- DB-error collapse guard ------------------------------------------
 
     /// A non-`NotFound` DomainError (simulating pool exhaustion or a
     /// transient SQL failure) must NOT collapse to 404 NAME_UNKNOWN.
@@ -1543,7 +1543,7 @@ mod tests {
         assert_eq!(parsed["errors"][0]["code"], "INTERNAL");
     }
 
-    // -- F7: zero-byte blob Content-Length --------------------------------
+    // -- Zero-byte blob Content-Length ------------------------------------
 
     /// OCI's empty-config blob (sha256:44136f...) is a legal 0-byte
     /// object. Without `Content-Length: 0` axum chunk-encodes the
@@ -1593,7 +1593,7 @@ mod tests {
         assert!(body.is_empty(), "body must be zero bytes");
     }
 
-    // -- F9: HEAD against a missing blob ----------------------------------
+    // -- HEAD against a missing blob --------------------------------------
 
     /// HEAD for a non-existent digest must return 404 — the status
     /// must match GET so HEAD-before-GET probing works. The wire body
@@ -1917,7 +1917,7 @@ mod tests {
     /// ("config + layer blobs"). The aggregate is not assembled into
     /// a single record by the pull path; this test pins that each
     /// blob's value is recorded individually so a downstream consumer
-    /// (Item 6) can compute max across them.
+    /// can compute max across them.
     #[test]
     fn blob_max_selection_recorded_per_artifact_across_image() {
         use hort_app::use_cases::test_support::MockUpstreamProxy;
@@ -2715,20 +2715,19 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
-            "anonymous read on private OCI repo MUST be 404 (Init 11 C1)"
+            "anonymous read on private OCI repo MUST be 404"
         );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         // Anti-enumeration: NAME_UNKNOWN (same envelope as
-        // missing-repo). Per OCI Distribution §2.8 + Init 15 §5.
+        // missing-repo).
         assert_eq!(
             parsed["errors"][0]["code"], "NAME_UNKNOWN",
             "envelope must match the missing-repo case to defeat probing"
         );
     }
 
-    /// Local miss + NO upstream mapping → BLOB_UNKNOWN (the
-    /// pre-Item-11 baseline). Regression-guard so a future change
-    /// can't silently make the resolver mandatory.
+    /// Local miss + NO upstream mapping → BLOB_UNKNOWN. Regression-guard
+    /// so a future change can't silently make the resolver mandatory.
     #[test]
     fn cache_miss_without_upstream_mapping_still_returns_blob_unknown() {
         let (status, body) = run(async {
@@ -2778,8 +2777,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// Tampered upstream: the upstream serves bytes whose hash does NOT
-    /// match the digest in the request URL. Asserts the four outcomes
-    /// from design §15:
+    /// match the digest in the request URL. Asserts the four outcomes:
     /// 1. HTTP response is 502 (pull-through mismatch wire mapping).
     /// 2. ChecksumMismatch event is appended to the REPOSITORY stream
     ///    (`StreamId::repository(repo_id)`) — never the artifact stream.

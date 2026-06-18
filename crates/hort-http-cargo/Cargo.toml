@@ -53,5 +53,5 @@ tower                       = { workspace = true }
 arc-swap                    = { workspace = true }
 # Tests scope a Prometheus recorder to verify metric emission paths fire.
 metrics-exporter-prometheus = { workspace = true }
-# Item 7: tracing-warn capture test for the checksum-mismatch branch.
+# Tracing-warn capture test for the checksum-mismatch branch.
 tracing-subscriber           = { workspace = true }

@@ -209,7 +209,7 @@ where
             //    empty allow-list never matches (the any-signer footgun is
             //    apply-rejected upstream under `Required`; under
             //    `VerifyIfPresent` an empty list rejects forged/untrusted
-            //    signers — design §2.4).
+            //    signers).
             let identity_ok = allowed
                 .iter()
                 .any(|p| p.matches(&observed.issuer, &observed.san));
@@ -262,8 +262,8 @@ fn predicate_type_of(bundle: &Bundle) -> Option<String> {
     }
 }
 
-/// Map a `sigstore` [`VerificationError`] to the domain reject reason
-/// (design §4). A missing/invalid SET is `RekorNotFound` and is **never**
+/// Map a `sigstore` [`VerificationError`] to the domain reject reason.
+/// A missing/invalid SET is `RekorNotFound` and is **never**
 /// retried online; a chain/SCT failure is `CertChainInvalid`; anything
 /// structurally broken in the bundle is `BundleMalformed`.
 ///
@@ -295,9 +295,9 @@ fn map_verification_error(
         // The offline tlog/SET-consistency failure surfaces as
         // `SignatureErrorKind::Transparency` ("signature transparency
         // materials are inconsistent") — the SET is missing or does not
-        // match the signing materials. Per design §4 this is
-        // `RekorNotFound`, NEVER a live Rekor fetch. A genuine bad
-        // signature / unsupported algorithm is a cert/key-level failure.
+        // match the signing materials. This maps to `RekorNotFound`,
+        // NEVER a live Rekor fetch. A genuine bad signature /
+        // unsupported algorithm is a cert/key-level failure.
         VE::Signature(_) => {
             if err.to_string().contains("transparency") {
                 ProvenanceRejectReason::RekorNotFound

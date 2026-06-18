@@ -1,14 +1,13 @@
 //! `DesiredState` — the parsed-and-validated set of objects from
-//! `$HORT_CONFIG_DIR`. Item 8 consumes this into `ApplyConfigUseCase`.
+//! `$HORT_CONFIG_DIR`. `ApplyConfigUseCase` consumes this.
 //!
 //! Two validation entry points:
-//! - `validate()` — environment-agnostic rules (per-spec validation
-//!   from Items 5/6, plus duplicate-name and cross-spec
-//!   virtual-member resolution). Pure-static — unit tests don't need
-//!   a snapshot.
+//! - `validate()` — environment-agnostic rules (per-spec validation,
+//!   plus duplicate-name and cross-spec virtual-member resolution).
+//!   Pure-static — unit tests don't need a snapshot.
 //! - `validate_against(snapshot, env)` — adds the snapshot- and
 //!   env-aware rules: managed conflicts (a desired entry collides
-//!   with a current `Local` row) and the §8.1 rule
+//!   with a current `Local` row) and the rule
 //!   "HORT_AUTH_PROVIDER=disabled but ClaimMapping declared = fatal".
 //!
 //! Both collect every error before returning — operators want one
@@ -208,8 +207,7 @@ impl DesiredState {
                 // Singleton: keep the FIRST envelope so `validate`
                 // still per-spec-validates a config, and record EVERY
                 // contributing path so a >1 declaration surfaces as a
-                // named `SingletonConflict` (never a silent last-wins
-                // — design doc §6 invariant 2).
+                // named `SingletonConflict` (never a silent last-wins).
                 self.lint_config_sources.push(source.to_path_buf());
                 if self.lint_config.is_none() {
                     self.lint_config = Some(env);
@@ -633,8 +631,8 @@ fn push_init14_reference_errors(
 
 /// Per-policy duplicate exclusion check.
 ///
-/// Per design doc §3.3, exclusion identity is
-/// `(cve_id, package_pattern_or_null)` SCOPED to the parent policy.
+/// Exclusion identity is `(cve_id, package_pattern_or_null)` SCOPED to
+/// the parent policy.
 /// Two exclusions in the same policy with the same `(cve_id, pattern)`
 /// is a duplicate; the same pair under two different policies is
 /// independent. The standard `metadata.name` duplicate check (above)
@@ -896,7 +894,7 @@ pub fn validate_trust_upstream_publish_time_against_scan_backends(
 ///
 /// **Fail-closed.** No escape hatch. The operator-actionable error
 /// message names the offending `repo_key` and points at the future
-/// enforcement initiative; the operator's recourse is to drop the
+/// enforcement; the operator's recourse is to drop the
 /// field. Once removed the apply re-runs cleanly.
 ///
 /// Pure function of `DesiredState`; runs alongside

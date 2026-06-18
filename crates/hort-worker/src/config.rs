@@ -95,21 +95,21 @@ pub struct WorkerConfig {
     /// is wired; the binary still parses it unconditionally so a missing
     /// value is loud.
     pub redis_url_evictable: Option<String>,
-    /// Backlog 078 Item 6 (chart S3) — the load-bearing Trivy enable
-    /// flag, parsed from `HORT_SCANNER_TRIVY_ENABLED` (default `true`).
-    /// When `false`, the composition root NEVER constructs or registers
-    /// the Trivy backend, **regardless of whether the binary `--version`
-    /// probe would pass** — the flag is the enabling gate; the probe is
-    /// a secondary health check that only runs on flag-enabled backends.
-    /// This closes the pre-078 "cosmetic only" footgun where
+    /// The load-bearing Trivy enable flag, parsed from
+    /// `HORT_SCANNER_TRIVY_ENABLED` (default `true`). When `false`, the
+    /// composition root NEVER constructs or registers the Trivy backend,
+    /// **regardless of whether the binary `--version` probe would pass**
+    /// — the flag is the enabling gate; the probe is a secondary health
+    /// check that only runs on flag-enabled backends. This closes the
+    /// pre-release "cosmetic only" footgun where
     /// `scanner.trivy.enabled: false` did not reliably disable the
     /// backend (the probe was the real gate).
     pub trivy_enabled: bool,
     pub trivy_bin: PathBuf,
     pub trivy_db_dir: Option<PathBuf>,
-    /// Backlog 078 Item 6 (chart S3) — the load-bearing OSV-scanner
-    /// enable flag, parsed from `HORT_SCANNER_OSV_ENABLED` (default
-    /// `true`). Same load-bearing contract as [`Self::trivy_enabled`].
+    /// The load-bearing OSV-scanner enable flag, parsed from
+    /// `HORT_SCANNER_OSV_ENABLED` (default `true`). Same load-bearing
+    /// contract as [`Self::trivy_enabled`].
     pub osv_enabled: bool,
     pub osv_scanner_bin: PathBuf,
     /// The load-bearing cosign/Sigstore provenance verifier enable flag,
@@ -193,7 +193,7 @@ pub struct WorkerConfig {
     /// rolls back, zero rows removed — one fewer branch, no
     /// special-case).
     pub retention_database_url: Option<String>,
-    /// The C-1 audit-retention floors, resolved here from the same
+    /// The audit-retention floors, resolved here from the same
     /// `HORT_RETENTION_FLOOR_*_DAYS` env vars and the same MIN clamps
     /// `hort-server` uses. `AuditRetentionFloors` lives in `hort-server`
     /// config but the retention composition root is `hort-worker`;
@@ -214,14 +214,13 @@ pub struct WorkerConfig {
     /// legitimately slow large-stream `DELETE`.
     ///
     /// Sourced from `HORT_WORKER_LOCK_TIMEOUT_MS`; default `120000`
-    /// (2 min) — generous on purpose, because the §10.2-INV
-    /// single-flight precondition means it must never fire in correct
-    /// operation; a small value risks a false abort if single-flight
-    /// is ever deliberately relaxed. `0` disables the backstop
-    /// (Postgres default; the composition root skips the
-    /// `after_connect` `SET` entirely) — an operator escape hatch.
-    /// Setting `0` re-opens the unbounded-block failure mode this
-    /// backstop covers (see ADR 0020 / §10.2-INV).
+    /// (2 min) — generous on purpose, because the single-flight
+    /// precondition means it must never fire in correct operation; a
+    /// small value risks a false abort if single-flight is ever
+    /// deliberately relaxed. `0` disables the backstop (Postgres
+    /// default; the composition root skips the `after_connect` `SET`
+    /// entirely) — an operator escape hatch. Setting `0` re-opens the
+    /// unbounded-block failure mode this backstop covers (see ADR 0020).
     pub lock_timeout_ms: u64,
     /// Bind address for the worker's internal-only `GET /metrics`
     /// Prometheus scrape listener. The worker installs a Prometheus
@@ -233,22 +232,20 @@ pub struct WorkerConfig {
     /// (case-insensitive) is the explicit disable; a malformed address is a
     /// loud boot-path config error, never a silent fallback.
     ///
-    /// **Auth posture — declared deviation from design §3.6 / M1.** M1 asked
-    /// the worker `/metrics` to *reuse the server's per-request metrics auth*
-    /// (`HORT_METRICS_REQUIRE_AUTH`). The worker has **no inbound-HTTP auth
-    /// stack** (it is a background processor, not an API surface), so mounting
-    /// that middleware would drag the entire auth/`AppContext` machinery into
-    /// the worker — disproportionate for one scrape route. Instead this
-    /// listener has **no per-request auth**; exposure is controlled by the
-    /// operator-chosen bind + a **mandatory NetworkPolicy** (the `repository`
-    /// labels carry repo names, so it must never be world-reachable). This is
-    /// the standard pod-metrics pattern and the objectively-cheaper control;
-    /// the how-to (Item 6) documents the required NetworkPolicy.
+    /// **Auth posture.** The worker has **no inbound-HTTP auth stack** (it
+    /// is a background processor, not an API surface), so mounting the
+    /// server's metrics auth middleware would drag the entire
+    /// auth/`AppContext` machinery into the worker — disproportionate for
+    /// one scrape route. Instead this listener has **no per-request auth**;
+    /// exposure is controlled by the operator-chosen bind + a **mandatory
+    /// NetworkPolicy** (the `repository` labels carry repo names, so it
+    /// must never be world-reachable). This is the standard pod-metrics
+    /// pattern and the objectively-cheaper control.
     pub metrics_bind_addr: Option<std::net::SocketAddr>,
 }
 
-/// The C-1 audit-retention floors, resolved in `hort-worker` from the
-/// same env vars + MIN clamps as `hort-server::config::AuditRetentionFloors`.
+/// Audit-retention floors, resolved in `hort-worker` from the same env
+/// vars + MIN clamps as `hort-server::config::AuditRetentionFloors`.
 /// Duplicated (not shared) because `hort-app`/`hort-worker` must not
 /// depend on `hort-server`; the floor *values* are identical by
 /// construction (same env vars, same `MIN_*` constants, same resolution).
@@ -263,8 +260,8 @@ pub struct AuditRetentionFloors {
 }
 
 impl AuditRetentionFloors {
-    /// C-1 documented minimums (day counts; months as 30-day units).
-    /// Byte-identical to `hort-server::config::AuditRetentionFloors`.
+    /// Documented minimum floor values (day counts; months as 30-day
+    /// units). Byte-identical to `hort-server::config::AuditRetentionFloors`.
     pub const MIN_AUTHENTICATION_DAYS: i64 = 180;
     pub const MIN_ARTIFACT_DOWNLOADED_DAYS: i64 = 90;
     pub const MIN_API_TOKEN_USED_DAYS: i64 = 1080;
@@ -311,8 +308,7 @@ impl WorkerConfig {
     /// Parse the full worker config from process environment.
     ///
     /// Mirrors the [`Config::from_env`](`hort-server`) shape: pure
-    /// `std::env::var` reads with no logging side effects. Defaults
-    /// match the design doc §6 table.
+    /// `std::env::var` reads with no logging side effects.
     pub fn from_env() -> Result<Self, ConfigError> {
         let minimal = MinimalConfig {
             database_url: require("HORT_DATABASE_URL").or_else(|_| require("DATABASE_URL"))?,
@@ -320,10 +316,10 @@ impl WorkerConfig {
         };
         let storage = parse_storage()?;
         let redis_url_evictable = optional("HORT_REDIS_URL_EVICTABLE");
-        // Backlog 078 Item 6 (chart S3) — load-bearing scanner enable
-        // flags. Default `true` preserves the pre-078 default-enabled
-        // posture (both backends register when their probes pass); an
-        // explicit `false` drops that backend before the probe runs.
+        // Load-bearing scanner enable flags. Default `true` preserves the
+        // default-enabled posture (both backends register when their
+        // probes pass); an explicit `false` drops that backend before the
+        // probe runs.
         let trivy_enabled = parse_bool_default("HORT_SCANNER_TRIVY_ENABLED", true)?;
         let trivy_bin = path_or_default("HORT_SCANNER_TRIVY_BIN", "trivy");
         let trivy_db_dir = optional("HORT_SCANNER_TRIVY_DB_DIR").map(PathBuf::from);
@@ -381,8 +377,8 @@ impl WorkerConfig {
             parse_bool_default("HORT_REFCOUNT_RECONCILE_ON_STARTUP", true)?;
         // Optional dedicated hort_retention_role DSN (ADR 0009 §10.2).
         let retention_database_url = optional("HORT_RETENTION_DATABASE_URL");
-        // The C-1 audit-retention floors, resolved from the same env
-        // vars + MIN clamps hort-server uses (duplicated, not shared).
+        // The audit-retention floors, resolved from the same env vars +
+        // MIN clamps hort-server uses (duplicated, not shared).
         let audit_retention_floors = {
             let d = AuditRetentionFloors::c1_defaults();
             AuditRetentionFloors {
@@ -507,9 +503,9 @@ fn parse_metrics_bind_addr() -> Result<Option<std::net::SocketAddr>, ConfigError
 }
 
 /// Mirror of `hort-server::config::resolve_retention_floor_days`.
-/// An override below the documented C-1 minimum is a hard startup
-/// failure; unset → the C-1 default. Duplicated (not shared) because
-/// `hort-worker` must not depend on `hort-server`.
+/// An override below the documented minimum is a hard startup failure;
+/// unset → the default. Duplicated (not shared) because `hort-worker`
+/// must not depend on `hort-server`.
 fn resolve_retention_floor_days(
     var: &'static str,
     min_days: i64,
@@ -524,7 +520,7 @@ fn resolve_retention_floor_days(
             if parsed < min_days {
                 return Err(ConfigError::InvalidValue {
                     var,
-                    reason: format!("must be >= {min_days} (C-1 minimum; got {parsed})"),
+                    reason: format!("must be >= {min_days} (minimum; got {parsed})"),
                 });
             }
             Ok(Duration::from_secs(parsed as u64 * 86_400))
@@ -595,9 +591,9 @@ fn parse_u32_default(var: &'static str, default: u32) -> Result<u32, ConfigError
 
 /// Parse a human-readable byte-size string to a byte count.
 ///
-/// Backlog 078 Item 4 — mirror of `hort-server::config::parse_byte_size`.
-/// Duplicated (not shared) because `hort-worker` must not depend on
-/// `hort-server` (same rationale as [`resolve_retention_floor_days`]).
+/// Mirror of `hort-server::config::parse_byte_size`. Duplicated (not
+/// shared) because `hort-worker` must not depend on `hort-server`
+/// (same rationale as [`resolve_retention_floor_days`]).
 ///
 /// Accepts a bare byte integer (`67108864`), a binary-suffixed value
 /// (`64Ki`, `64Mi`, `1Gi`, `2Ti` — multiples of 1024), or a decimal-
@@ -658,11 +654,11 @@ pub(crate) fn parse_byte_size(raw: &str) -> Result<u64, String> {
 /// Resolve an operator byte-cap env var that accepts a size string,
 /// falling back to `default` when the var is unset, empty, or malformed.
 ///
-/// Backlog 078 Item 4 — the scanner caps preserve their pre-078
-/// "unset/invalid → adapter default" semantics (the registration path is
-/// best-effort tunable, not a hard-fail boot knob), but the operator
-/// surface is now a size string rather than a bare integer so a multi-GiB
-/// value can never round-trip through Helm's float64 coercion.
+/// The scanner caps preserve "unset/invalid → adapter default" semantics
+/// (the registration path is best-effort tunable, not a hard-fail boot
+/// knob), but the operator surface is now a size string rather than a
+/// bare integer so a multi-GiB value can never round-trip through Helm's
+/// float64 coercion.
 pub(crate) fn parse_byte_size_or(var: &str, default: u64) -> u64 {
     std::env::var(var)
         .ok()
@@ -827,7 +823,7 @@ mod tests {
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "HORT_REDIS_URL_EVICTABLE",
-        // Backlog 078 Item 6 — load-bearing scanner enable flags.
+        // Load-bearing scanner enable flags.
         "HORT_SCANNER_TRIVY_ENABLED",
         "HORT_SCANNER_OSV_ENABLED",
         "HORT_SCANNER_TRIVY_BIN",
@@ -879,8 +875,8 @@ mod tests {
             other => panic!("expected Filesystem storage, got {other:?}"),
         }
         assert_eq!(cfg.redis_url_evictable, None);
-        // Backlog 078 Item 6 — scanner enable flags default `true`
-        // (preserves the pre-078 default-enabled posture).
+        // Scanner enable flags default `true` (preserves the
+        // default-enabled posture).
         assert!(
             cfg.trivy_enabled,
             "HORT_SCANNER_TRIVY_ENABLED must default to true"
@@ -1189,7 +1185,7 @@ mod tests {
         // 0 = disabled (Postgres default); the composition root skips
         // the `after_connect` SET entirely. Parsing must accept it,
         // unlike statement_timeout where 0 is rejected — here 0 is the
-        // documented operator escape hatch (spec §4).
+        // documented operator escape hatch.
         std::env::set_var("HORT_WORKER_LOCK_TIMEOUT_MS", "0");
 
         let cfg = WorkerConfig::from_env().expect("parses with lock timeout disabled");
@@ -1229,7 +1225,7 @@ mod tests {
         assert_eq!(cfg.minimal.database_url, "postgres://fallback/y");
     }
 
-    // -- Backlog 078 Item 4 — scanner byte caps are size strings ----------
+    // -- Scanner byte caps are size strings --------------------------------
 
     #[test]
     fn parse_byte_size_size_strings_and_bare_integer() {
@@ -1284,7 +1280,7 @@ mod tests {
         std::env::remove_var(VAR);
     }
 
-    // -- Backlog 078 Item 6 — load-bearing scanner enable flags -----------
+    // -- Load-bearing scanner enable flags ---------------------------------
 
     #[test]
     fn scanner_enable_flags_parse_false_when_set() {

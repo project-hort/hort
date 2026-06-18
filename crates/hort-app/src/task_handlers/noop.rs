@@ -2,8 +2,7 @@
 //!
 //! The handler computes a BLAKE3 hash of the `params` JSON and returns
 //! `Completed` with a result summary containing the digest and timestamp.
-//! This is used by the worker dispatcher's smoke test (Item 12) and the
-//! E2E canary tick (Item 13).
+//! This is used by the worker dispatcher's smoke test and the E2E canary tick.
 
 use chrono::Utc;
 use hort_domain::error::DomainResult;

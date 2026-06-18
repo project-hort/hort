@@ -108,8 +108,7 @@ impl ArtifactUseCase {
     /// [`AppError::Repository`] when called against a use case whose
     /// access port was not wired — that signals a composition-root bug
     /// (`new` was called instead of `with_repository_access`). Phase 1
-    /// composition keeps both call sites alive; Item 2 migrates OCI to
-    /// the wired form.
+    /// composition keeps both call sites alive.
     #[must_use]
     pub fn with_repository_access(mut self, access: Arc<RepositoryAccessUseCase>) -> Self {
         self.repository_access = Some(access);
@@ -174,8 +173,8 @@ impl ArtifactUseCase {
     ///    normalised form, then `find_by_name_in_repo(repo, normalised)`.
     /// 2. If step 1 returns a non-empty `Vec`, return it unchanged.
     /// 3. Otherwise fall back to `find_by_name_as_published(repo, raw_name)`
-    ///    — the exact client-supplied form is stored on every artifact row
-    ///    (Item 6). If the fallback finds rows, the current normalisation
+    ///    — the exact client-supplied form is stored on every artifact row.
+    ///    If the fallback finds rows, the current normalisation
     ///    function has drifted from whatever was active at ingest. Emit an
     ///    `info!` log naming the repo, raw name, current normalised form,
     ///    and count of recovered rows so operators can detect drift in the
@@ -625,7 +624,7 @@ impl ArtifactUseCase {
 
     /// Repo-scoped hash lookup. Caller supplies a pre-authz'd
     /// `repo_id` (typically from `WriteRepoAccess` on a manifest PUT).
-    /// Closes the §2 inventory bug at OCI `manifests_write.rs:922`
+    /// Closes the inventory bug at OCI `manifests_write.rs:922`
     /// where today's `find_by_checksum` returns any repo's row matching
     /// the hash, breaking the OCI §2.14 same-repo manifest invariant.
     #[tracing::instrument(skip(self))]
@@ -1058,7 +1057,7 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
-    // -- list_by_raw_name: normalisation drift fallback (Item 6) --------------
+    // -- list_by_raw_name: normalisation drift fallback --------------
     //
     // These tests use the shared [`StubFormatHandler`] re-exported from
     // `test_support`; it is also the stub the `IngestUseCase` cap-boundary
@@ -1734,8 +1733,8 @@ mod tests {
     /// via `Option::unwrap_or_default()` on the Ok path. (The Err path
     /// properly substitutes UNKNOWN sentinels; the Ok path has a
     /// pre-existing quirk where a successful download with a missing
-    /// repo emits empty-string labels. That's unrelated to Item 6 — the
-    /// point of this test is to cover line 220.)
+    /// repo emits empty-string labels. That's unrelated to the normalisation
+    /// drift fallback — the point of this test is to cover line 220.)
     #[test]
     fn download_with_missing_repository_still_serves_and_covers_none_branch() {
         let artifacts = Arc::new(MockArtifactRepository::new());
@@ -2781,11 +2780,10 @@ mod visibility_extension_tests {
 
     // -- find_in_repo_by_hash ---------------------------------------------
 
-    /// **Acceptance bullet — multi-repo isolation (closes the §2 bug).**
+    /// **Acceptance bullet — multi-repo isolation.**
     /// Two artifact rows with identical SHA in different repos. Querying
     /// by repo A's id returns A's row; querying by repo B's id returns
-    /// B's row. Closes the OCI §2.14 same-repo invariant violation
-    /// flagged in the design doc.
+    /// B's row. Closes the OCI §2.14 same-repo invariant violation.
     #[tokio::test]
     async fn find_in_repo_by_hash_isolates_across_repos() {
         let artifacts = Arc::new(MockArtifactRepository::new());

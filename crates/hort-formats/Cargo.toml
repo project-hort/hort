@@ -54,9 +54,8 @@ toml          = { workspace = true }
 # parsing happens only against bytes the upstream-verification
 # path already validated. The prior `hort-app` `index_serve_filter`
 # wiring deliberately avoided these crates because it needed
-# ORDERING only — Item 11 brings the range-grammar surface in
-# with it, per the workspace comment in `index_serve_filter.rs`
-# at the `NpmSemverOrdering` docstring.
+# ORDERING only; the range-grammar surface is documented
+# in `index_serve_filter.rs` at the `NpmSemverOrdering` docstring.
 semver        = "1"
 pep440_rs     = "0.7"
 

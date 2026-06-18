@@ -38,7 +38,7 @@
 //! versions the key for the amendment (a rolling deploy never has new
 //! code read a pre-amendment `cargo_index:` entry whose payload is a
 //! base64-JSON raw-body envelope, not a serialized projection). The
-//! **mapping id** is the invalidation axis (Item 3 reasoning): an
+//! **mapping id** is the invalidation axis: an
 //! upstream URL change rotates the mapping, which is exactly when stale
 //! upstream-derived bytes should die. A repo rename keeps the mapping
 //! intact and shouldn't churn the cache. `prefix/name` is the exact path
@@ -223,7 +223,7 @@ pub async fn fetch_raw_with_cache(
     };
 
     // The path the upstream sees AND the suffix of the cache key.
-    // `index_path_for` already lowercases — same shape Item 3 uses for
+    // `index_path_for` already lowercases — same shape used for
     // `upstream_checksum_metadata_path`, so a Proxy serving `Foo` and
     // `foo` collapses to a single cache row.
     let path = hort_formats::cargo::index_path_for(crate_name);
@@ -356,7 +356,7 @@ pub async fn fetch_raw_with_cache(
             // NDJSON line, which `fetch_and_project` propagates; followers
             // see the leader's wrapped error (not `Validation`) and fall
             // through to `UpstreamUnavailable` — leader-only
-            // discrimination (see `PullDedup` §coalesce contract).
+            // discrimination (see `PullDedup` coalesce contract).
             if let AppError::Domain(DomainError::Validation(msg)) = &e {
                 tracing::warn!(cause = %msg, "cargo upstream sparse-index malformed (parse_error)");
                 return Err(IndexFetchError::MetadataMalformed { cause: msg.clone() });
@@ -400,7 +400,7 @@ pub async fn fetch_raw_with_cache(
 
 /// Re-project a raw sparse-index body from the metadata mirror through
 /// the streaming projector. Used **only** on the stale-while-error /
-/// air-gapped fallback path (§4) — off the hot serve path, which never
+/// air-gapped fallback path — off the hot serve path, which never
 /// reads the mirror (it renders the cached projection). The mirror
 /// reader is read into a buffer here and projected via `Cursor`: the
 /// sync `MetadataProjector` (`R: std::io::Read`) cannot take an

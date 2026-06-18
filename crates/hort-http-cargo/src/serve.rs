@@ -11,15 +11,15 @@
 //!      invariants byte-for-byte);
 //!    - anything else → [`HostedCargoSource`] (reads
 //!      [`ArtifactUseCase::list_by_raw_name_visible`] — the
-//!      F-25-anti-enumeration-enforcing entry point).
+//!      anti-enumeration-enforcing entry point).
 //! 2. **Filter pipeline.** `NonServableStatusFilter` then
 //!    `IndexModeFilter::new(repo.index_mode)`. Identical to the
-//!    npm Item-2 / pypi Item-3 pipeline; future operator-defined
-//!    exclusion filters append to this list per design §2.4.
+//!    npm/pypi pipeline; future operator-defined exclusion filters
+//!    append to this list.
 //! 3. **Builder.** [`CargoIndexBuilder`] emits the sparse-index
 //!    NDJSON body.
 //!
-//! # F-25 anti-enumeration shape
+//! # Anti-enumeration shape
 //!
 //! Anonymous / denied callers on a private repo receive `404`, not
 //! `403`. The hosted source's `list_by_raw_name_visible` already
@@ -59,10 +59,8 @@
 //! - **One `info!` line** carrying `format`, `repository`, `package`,
 //!   `index_source = "hosted" | "proxy"`, and the
 //!   `upstream_versions` / `served_versions` / `filtered_versions`
-//!   triple. `index_source` is the tracing field design §4 added;
-//!   no metric exists for it (operators dashboard from the tracing
-//!   field instead per the design's explicit "tracing field, NOT a
-//!   new metric" rule).
+//!   triple. `index_source` is a tracing field (no metric — operators
+//!   dashboard from the tracing field, not a new metric).
 
 use std::sync::Arc;
 
@@ -472,7 +470,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 3. F-25 anti-enumeration — anonymous caller on a private repo
+    // 3. Anti-enumeration — anonymous caller on a private repo
     //    receives NotFound (not 403).
     // -----------------------------------------------------------------
 
@@ -514,7 +512,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "F-25 anti-enumeration: denied caller MUST receive 404, NEVER 403",
+            "anti-enumeration: denied caller MUST receive 404, NEVER 403",
         );
     }
 

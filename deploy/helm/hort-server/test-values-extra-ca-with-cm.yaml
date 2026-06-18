@@ -1,5 +1,5 @@
 # extraCaBundle smoke fixture: path + configMapName both set (Recipe A).
-# Expected rendering (Backlog 078 Item 7 — symmetric auto-mount):
+# Expected rendering (symmetric auto-mount):
 #   - HORT_EXTRA_CA_BUNDLE env var present on BOTH server + worker
 #   - volumeMounts + volumes entry for `extra-ca-bundle` on server,
 #     worker, and the two always-on CronJobs (scrub, quarantineRelease-

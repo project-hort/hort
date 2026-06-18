@@ -20,16 +20,16 @@
 //!   shipped wire form or force every existing policy consumer to handle
 //!   variants that make no sense for them. Divergence is intentional.
 //! - [`ExpirationReason`] — the discriminated reason carried by the
-//!   `ArtifactExpired` event (§4). The event type itself lands on the
-//!   *artifact* stream and is wired in Item B2; B1 only owns the
+//!   `ArtifactExpired` event. The event type itself lands on the
+//!   *artifact* stream; this module only owns the
 //!   `RetentionPolicy` aggregate and the reason value object it
 //!   produces.
 //! - [`RetentionPolicy`] — the replayed aggregate state, reconstructed
 //!   by the pure fold [`RetentionPolicy::project`] /
 //!   [`RetentionPolicy::apply`]. Pure replay is a pure function over
-//!   events (§4 / §1) and is exhaustively tested in-domain.
+//!   events and is exhaustively tested in-domain.
 //!
-//! ## Item B3 additions
+//! ## Evaluation additions
 //!
 //! - [`evaluate`] / [`matches_bool`] / [`EvaluationInputs`] /
 //!   [`EvaluationOutcome`] — the **pure** retention-predicate evaluator.
@@ -40,17 +40,12 @@
 //!   the quarantine/rejected filter, the `HasFindingDetectedFor`
 //!   stream anchor, and event append + metrics.
 //!
-//! ## Carved to a follow-on (NOT in B1)
+//! ## Domain-only scope
 //!
-//! The B1 backlog acceptance bullets about *adapter persistence + replay
-//! round-trips through the event-store adapter* and the *apply-pipeline
-//! `info!`-level §6-invariant-8 warning* are explicitly **out of scope
-//! for B1** (domain-only). They are carried to the B1-adapter / B3
-//! apply-path follow-on. The domain layer is zero-I/O, zero-`tracing`,
-//! zero-metrics — an `info!` warning cannot live here by construction.
+//! The domain layer is zero-I/O, zero-`tracing`, zero-metrics.
 //! The `serde` round-trip tests in this module prove the payloads are
 //! *wire-stable*; persisting them through the real Postgres event store
-//! is the adapter item's job.
+//! is the adapter layer's job.
 
 mod evaluate;
 mod policy;

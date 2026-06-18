@@ -1,17 +1,12 @@
 //! `CurationQueueRepository` port.
 //!
 //! Outbound port behind the curation-queue read surface: a paginated
-//! read of curator-actionable
-//! artifacts with per-row policy-deadline resolution + rejection-reason
-//! discriminator via LATERAL JOIN.
+//! read of curator-actionable artifacts with per-row policy-deadline
+//! resolution + rejection-reason discriminator via LATERAL JOIN.
 //!
-//! **Item 5 stub scope.** Item 5 (`CurationUseCase::waive` + `::block`)
-//! wires `Arc<dyn CurationQueueRepository>` into `CurationUseCase`'s
-//! port-only constructor so the full port can be threaded one-shot
-//! when Item 6 lands. The trait, [`CurationQueueEntry`], and
-//! [`CurationQueueFilter`] are defined here so the use-case
-//! struct compiles; Item 6 supplies the SQL adapter + the use-case
-//! `list_queue` method body.
+//! The trait, [`CurationQueueEntry`], and [`CurationQueueFilter`] are
+//! defined here so the use-case struct compiles; the Postgres adapter
+//! supplies the SQL body.
 //!
 //! # Domain DTO discipline
 //!
@@ -30,7 +25,7 @@ use crate::error::DomainResult;
 use super::BoxFuture;
 
 /// One row of the curation queue listing — an artifact currently in a
-/// curator-actionable state. Design doc §2.5 + §3.
+/// curator-actionable state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurationQueueEntry {
     pub artifact_id: Uuid,
@@ -48,8 +43,8 @@ pub struct CurationQueueEntry {
     pub quarantine_deadline: Option<DateTime<Utc>>,
     pub finding_count: u32,
     pub max_severity: Option<SeverityThreshold>,
-    /// Design doc §2.5 — discriminator from the latest `ArtifactRejected`
-    /// event's `rejected_by` payload (`"scanner" | "curator" |
+    /// Discriminator from the latest `ArtifactRejected` event's
+    /// `rejected_by` payload (`"scanner" | "curator" |
     /// "curation_retroactive" | "corruption"`). `None` for non-rejected
     /// rows or when the event is missing (defensive).
     pub rejection_reason_kind: Option<String>,

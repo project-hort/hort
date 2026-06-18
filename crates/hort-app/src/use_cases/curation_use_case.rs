@@ -26,7 +26,7 @@
 //! does not permit "all-or-nothing"). The justification cap is enforced
 //! ONCE at the call boundary; the same justification text rides every
 //! event the call emits, so oversize justification fails fast before
-//! any append. See design doc §2.3 amendment for the rationale.
+//! any append.
 
 use std::sync::Arc;
 
@@ -66,7 +66,7 @@ use crate::use_cases::{read_expected_version, CallerPrivileges};
 const MAX_JUSTIFICATION_BYTES: usize = 512;
 
 /// Maximum number of versions per `BlockTarget::VersionList` call.
-/// Mirrors the queue `limit` shape — bounded per-call work (design §2.7).
+/// Mirrors the queue `limit` shape — bounded per-call work.
 const MAX_VERSIONS_PER_CALL: usize = 100;
 
 /// Maximum `limit` accepted by [`CurationUseCase::list_queue`] — caps
@@ -86,7 +86,7 @@ const MAX_QUEUE_LIMIT: u32 = 500;
 /// surface misses").
 const VERSION_RESOLUTION_PAGE_LIMIT: u64 = 256;
 
-/// Target of a [`CurationUseCase::block`] call (design doc §2.3 / §3).
+/// Target of a [`CurationUseCase::block`] call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BlockTarget {
     /// Single-artifact block — the canonical primitive.
@@ -94,7 +94,7 @@ pub enum BlockTarget {
     /// Bulk block by explicit `(repository, package, versions)` list.
     /// Versions that don't resolve to an artifact_id surface in
     /// [`BlockOutcome::not_found_versions`] (NOT auto-blocked on future
-    /// ingest — design §1 OOS).
+    /// ingest).
     VersionList {
         repository_id: Uuid,
         package: String,
@@ -102,7 +102,7 @@ pub enum BlockTarget {
     },
 }
 
-/// Result envelope for [`CurationUseCase::block`] (design doc §3).
+/// Result envelope for [`CurationUseCase::block`].
 ///
 /// Returned for BOTH target shapes. For `BlockTarget::Artifact` at most
 /// one of `blocked_artifact_ids` / `already_rejected_ids` / `failed`
@@ -129,7 +129,7 @@ pub struct BlockOutcome {
     /// artifact_id (not ingested yet). Blocking does NOT auto-block
     /// future ingests of these.
     pub not_found_versions: Vec<String>,
-    /// Per-append failures (continue-on-error per design §2.3): the
+    /// Per-append failures (continue-on-error): the
     /// artifact_id + the `AppError` returned by the event-store
     /// commit. Successful appends in the same call are NOT rolled
     /// back.
@@ -142,16 +142,15 @@ pub struct CurationUseCase {
     events: Arc<EventStorePublisher>,
     artifacts: Arc<dyn ArtifactRepository>,
     lifecycle: Arc<dyn ArtifactLifecyclePort>,
-    /// Per-row deadline resolution for `list_queue` (Item 6). Held
-    /// from Item 5 so the constructor is one-shot; method body lands
-    /// with Item 6's adapter.
+    /// Per-row deadline resolution for `list_queue`. Held
+    /// at construction time so the constructor is one-shot.
     #[allow(dead_code)]
     policies: Arc<dyn PolicyProjectionRepository>,
-    /// Queue listing port (Item 6).
+    /// Queue listing port.
     queue_repo: Arc<dyn CurationQueueRepository>,
-    /// Decisions listing port (Item 7).
+    /// Decisions listing port.
     decisions_repo: Arc<dyn CurationDecisionsRepository>,
-    /// Active-exclusions listing port (Item 8).
+    /// Active-exclusions listing port.
     exclusions_repo: Arc<dyn CurationExclusionsRepository>,
     /// Repository-key resolution
     /// for the `hort_curation_decisions_total{repository}` label. Uses
@@ -180,9 +179,7 @@ impl CurationUseCase {
     /// `QuarantineUseCase::new`'s port-only construction (no concrete
     /// adapters, no `sqlx::PgPool`, no `reqwest::Client`).
     ///
-    /// All 7 fields are wired from Item 5; the three `_repo` fields'
-    /// `list_*` methods land with Items 6/7/8 alongside their Postgres
-    /// adapters.
+    /// All 7 fields are wired at construction time.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         events: Arc<EventStorePublisher>,
@@ -243,33 +240,32 @@ impl CurationUseCase {
         Ok(())
     }
 
-    /// Paginated read-only listing of curator-actionable artifacts
-    /// (design §2.5). One row per artifact currently in
+    /// Paginated read-only listing of curator-actionable artifacts.
+    /// One row per artifact currently in
     /// `Quarantined` / `Rejected` / `ScanIndeterminate` (the
     /// curator-actionable set), with per-row quarantine deadline
     /// resolved at query time and a rejection-reason discriminator
     /// for rejected rows.
     ///
     /// Authority: `Permission::Curate` OR `Permission::Admin`
-    /// (design §2.7 — same authority as `waive` / `block`). Denial is
+    /// (same authority as `waive` / `block`). Denial is
     /// `info!` (architect rule — not `err`).
     ///
     /// **Per-row deadline.** The adapter resolves
     /// `effective_quarantine_deadline(window_start, duration)` per
-    /// row in SQL via a join to `policy_projections` (design §2.5);
+    /// row in SQL via a join to `policy_projections`;
     /// the use case does NOT pre-resolve a duration parameter. This
     /// preserves both the `limit` cap (single query) and the
     /// cross-repo result set (variable durations).
     ///
     /// **Rejection reason** is extracted by the adapter via a
     /// LATERAL JOIN against the artifact's latest `ArtifactRejected`
-    /// event (design §2.5 — bounded by `limit` × one indexed event-
-    /// store lookup; queue browsing is operator-driven, low QPS).
+    /// event (bounded by `limit` × one indexed event-store lookup;
+    /// queue browsing is operator-driven, low QPS).
     ///
-    /// **No metric emission in Item 6** — queue listings are
-    /// operator-paced reads; the design's `hort_curation_decisions_total`
-    /// covers decisions, not reads. A queue-listing-specific metric is
-    /// not implemented.
+    /// **No metric emission** — queue listings are operator-paced reads;
+    /// `hort_curation_decisions_total` covers decisions, not reads.
+    /// A queue-listing-specific metric is not implemented.
     #[tracing::instrument(skip(self, privileges))]
     pub async fn list_queue(
         &self,
@@ -329,12 +325,12 @@ impl CurationUseCase {
         Ok(entries)
     }
 
-    /// Paginated event-log scan of curator decisions (design §2.9). One
+    /// Paginated event-log scan of curator decisions. One
     /// row per event — `--by-correlation` collapse is an HTTP/CLI
-    /// rendering concern (Items 10 / 13), NOT a port-level flag.
+    /// rendering concern, NOT a port-level flag.
     ///
-    /// Authority: `Permission::Curate` OR `Permission::Admin` (design
-    /// §2.9 — same gate as `list_queue`). Denial is `info!` (architect
+    /// Authority: `Permission::Curate` OR `Permission::Admin`
+    /// (same gate as `list_queue`). Denial is `info!` (architect
     /// rule — not `err`).
     ///
     /// **Filter pass-through.** The use case validates the privilege
@@ -352,7 +348,7 @@ impl CurationUseCase {
     /// **`#[instrument]` WITHOUT `err`** — privilege denial is the
     /// security-relevant signal and rides the explicit `info!` denied
     /// path; `err` would surface every Forbidden/Validation as ERROR.
-    /// Mirrors `list_queue` shape (Item 6).
+    /// Mirrors `list_queue` shape.
     #[tracing::instrument(skip(self, privileges))]
     pub async fn list_decisions(
         &self,
@@ -375,8 +371,8 @@ impl CurationUseCase {
         }
 
         // 2) Validate the limit BEFORE calling the repo. `limit >
-        //    MAX_QUEUE_LIMIT` is a caller-input issue (design §3 — limit
-        //    capped at 500), not a system error — Validation.
+        //    MAX_QUEUE_LIMIT` is a caller-input issue (limit capped at
+        //    500), not a system error — Validation.
         //
         //    Reuses MAX_QUEUE_LIMIT — the same cap applies to
         //    queue / decisions / exclusions listings (bounded
@@ -423,14 +419,14 @@ impl CurationUseCase {
         Ok(entries)
     }
 
-    /// Paginated current-state listing of active CVE exclusions
-    /// (design §2.9). Distinct from `list_decisions` because
-    /// exclusions have **ongoing state** (active until removed or
-    /// expired); decisions are point-in-time. Reuses the existing
-    /// `exclusion_projections` table — no new projection.
+    /// Paginated current-state listing of active CVE exclusions.
+    /// Distinct from `list_decisions` because exclusions have
+    /// **ongoing state** (active until removed or expired); decisions
+    /// are point-in-time. Reuses the existing `exclusion_projections`
+    /// table — no new projection.
     ///
-    /// Authority: `Permission::Curate` OR `Permission::Admin` (design
-    /// §2.9 — same gate as `list_queue` / `list_decisions`). Denial
+    /// Authority: `Permission::Curate` OR `Permission::Admin`
+    /// (same gate as `list_queue` / `list_decisions`). Denial
     /// is `info!` (architect rule — not `err`).
     ///
     /// **Filter pass-through.** The use case validates the privilege
@@ -515,9 +511,8 @@ impl CurationUseCase {
     /// Curator-driven release of a `Quarantined` artifact.
     ///
     /// Mirrors `QuarantineUseCase::admin_release`. Source-state guard
-    /// is `Quarantined` ONLY (design doc §2.2) — curator does NOT
-    /// clear stuck-scanner artifacts (`ScanIndeterminate`), which
-    /// stays admin-only.
+    /// is `Quarantined` ONLY — curator does NOT clear stuck-scanner
+    /// artifacts (`ScanIndeterminate`), which stays admin-only.
     ///
     /// Audit: emits `ArtifactReleased { authority: CuratorWaiver,
     /// released_by_user_id: Some(actor.user_id), justification:
@@ -548,9 +543,9 @@ impl CurationUseCase {
         }
 
         // 2) Justification cap — fail fast BEFORE any event-store
-        //    interaction (design §2.3: "the same justification text
-        //    rides every event the call emits, so an oversize
-        //    justification fails the call fast").
+        //    interaction ("the same justification text rides every
+        //    event the call emits, so an oversize justification fails
+        //    the call fast").
         if let Err(e) = Self::validate_justification(&justification) {
             tracing::info!(
                 artifact_id = %artifact_id,
@@ -691,9 +686,8 @@ impl CurationUseCase {
     /// transitioned artifact.
     ///
     /// **Continue-on-error.** Per-append failures land in
-    /// `BlockOutcome.failed`; successful appends are not rolled back
-    /// (design §2.3 amendment). The justification cap is enforced ONCE
-    /// at the call boundary.
+    /// `BlockOutcome.failed`; successful appends are not rolled back.
+    /// The justification cap is enforced ONCE at the call boundary.
     #[tracing::instrument(skip(self, privileges, justification))]
     pub async fn block(
         &self,
@@ -719,9 +713,8 @@ impl CurationUseCase {
             return Err(e);
         }
 
-        // 2) Justification cap — single boundary check (design §2.3 —
-        //    "same justification text rides every event the call
-        //    emits").
+        // 2) Justification cap — single boundary check ("same
+        //    justification text rides every event the call emits").
         if let Err(e) = Self::validate_justification(&justification) {
             tracing::info!(
                 actor_id = %actor.user_id,
@@ -751,13 +744,12 @@ impl CurationUseCase {
             BlockTarget::Artifact(artifact_id) => {
                 // Single-artifact target: `find_by_id` IS the resolution
                 // step. A miss here is a top-level `Err(NotFound)` —
-                // matching `waive`'s shape, so the HTTP handler (Item 9)
-                // can map it to 404 without inspecting the envelope.
-                // The continue-on-error envelope semantics (per design
-                // §2.3) apply specifically to `BlockTarget::VersionList`
-                // where N artifacts share a call; the single-artifact
-                // case is N=1 and the operator already knows what they
-                // targeted. See module docs and Item 5's review notes.
+                // matching `waive`'s shape, so the HTTP handler can map
+                // it to 404 without inspecting the envelope.
+                // The continue-on-error envelope semantics apply
+                // specifically to `BlockTarget::VersionList` where N
+                // artifacts share a call; the single-artifact case is
+                // N=1 and the operator already knows what they targeted.
                 //
                 // We pre-flight `find_by_id` here so a miss bubbles as
                 // `Err` (instead of being captured into
@@ -774,10 +766,9 @@ impl CurationUseCase {
                     let app_err = AppError::Domain(e);
                     let result = classify_append_error(&app_err);
                     // Pre-flight NotFound — no repository_id available;
-                    // emit `_all` (Item 14: `None` collapses to the
-                    // sentinel at the helper). `block_one`'s own emit
-                    // sites resolve the key once the second `find_by_id`
-                    // succeeds.
+                    // emit `_all` (`None` collapses to the sentinel at
+                    // the helper). `block_one`'s own emit sites resolve
+                    // the key once the second `find_by_id` succeeds.
                     emit_curation_decision(CurationDecisionLabel::Block, None, result);
                     tracing::info!(
                         artifact_id = %artifact_id,
@@ -803,7 +794,7 @@ impl CurationUseCase {
                 package,
                 versions,
             } => {
-                // Per-call cap (design §2.7): bounded work per call.
+                // Per-call cap: bounded work per call.
                 if versions.is_empty() {
                     let e = AppError::Domain(DomainError::Validation(
                         "versions must be non-empty".into(),
@@ -893,9 +884,8 @@ impl CurationUseCase {
                             // can race the curator). A stage-2 NotFound
                             // (race: artifact deleted between resolve
                             // and append) goes to `outcome.failed` per
-                            // continue-on-error (design §2.3) — the
-                            // call does not abort the remaining
-                            // versions.
+                            // continue-on-error — the call does not
+                            // abort the remaining versions.
                             self.block_one(
                                 a.id,
                                 &actor,
@@ -947,9 +937,9 @@ impl CurationUseCase {
     /// `Err(NotFound)` instead of an envelope entry — matching
     /// `waive`'s shape.
     ///
-    /// Per-call metric emission (design §7): ONE tick per attempted
-    /// append (not per call). `ok` for transitioned, `conflict` for
-    /// failed-append (event-store conflict / domain Invariant), etc.
+    /// Per-call metric emission: ONE tick per attempted append (not per
+    /// call). `ok` for transitioned, `conflict` for failed-append
+    /// (event-store conflict / domain Invariant), etc.
     /// `Already-rejected` short-circuit ticks `ok` (the operator
     /// intent succeeded — the artifact is in the requested terminal
     /// state).
@@ -987,10 +977,10 @@ impl CurationUseCase {
         // Resolve `repository_id → key` once
         // per attempted append (single bounded query). For
         // `BlockTarget::VersionList` this is one lookup per resolved
-        // version (N <= 100 per call cap, design §2.7). The cardinality
-        // knob `METRICS_INCLUDE_REPOSITORY_LABEL=false` short-circuits
-        // every call to the `_all` sentinel without touching the DB,
-        // so operators at scale pay no cost.
+        // version (N <= 100 per-call cap). The cardinality knob
+        // `METRICS_INCLUDE_REPOSITORY_LABEL=false` short-circuits every
+        // call to the `_all` sentinel without touching the DB, so
+        // operators at scale pay no cost.
         let repository_id = artifact.repository_id;
         let repo_label = self.repository_access.metric_label(repository_id).await;
 
@@ -1071,7 +1061,7 @@ impl CurationUseCase {
     }
 }
 
-/// Classify an `AppError` into the `result` metric label (design §7).
+/// Classify an `AppError` into the `result` metric label.
 ///
 /// `conflict` for event-store version conflict (Domain::Conflict) and
 /// domain-rule invariants (the source-state guard's `Invariant` flavour
@@ -1117,18 +1107,9 @@ mod tests {
     use super::*;
     use crate::use_cases::test_support::*;
 
-    // -- Stub ports for the Item-5 use case --------------------------------
-    //
-    // These stubs match the trait but panic on call: Item 5 wires the
-    // ports into `CurationUseCase` from construction (the
-    // port-only-construction discipline) but does NOT exercise their
-    // method bodies — `waive` / `block` only touch `events` / `artifacts`
-    // / `lifecycle`. Items 6-8 add proper mocks alongside their
-    // `list_*` use-case-method bodies.
+    // -- Mock ports --------------------------------------------------------
 
-    /// Item 6 — proper mock that records `list_queue` calls and
-    /// returns a configurable Vec. Replaces the Item-5 panic-on-call
-    /// stub now that the use case calls the port.
+    /// Mock that records `list_queue` calls and returns a configurable Vec.
     pub struct MockCurationQueueRepository {
         recorded: std::sync::Mutex<Vec<CurationQueueFilter>>,
         result: std::sync::Mutex<DomainResult<Vec<CurationQueueEntry>>>,
@@ -1165,9 +1146,7 @@ mod tests {
         }
     }
 
-    /// Item 7 — proper mock that records `list_decisions` calls and
-    /// returns a configurable Vec. Replaces the Item-5 panic-on-call
-    /// stub now that the use case calls the port.
+    /// Mock that records `list_decisions` calls and returns a configurable Vec.
     pub struct MockCurationDecisionsRepository {
         recorded: std::sync::Mutex<Vec<CurationDecisionFilter>>,
         result: std::sync::Mutex<DomainResult<Vec<CurationDecisionEntry>>>,
@@ -1204,9 +1183,7 @@ mod tests {
         }
     }
 
-    /// Item 8 — proper mock that records `list_exclusions` calls and
-    /// returns a configurable Vec. Replaces the Item-5 panic-on-call
-    /// stub now that the use case calls the port.
+    /// Mock that records `list_exclusions` calls and returns a configurable Vec.
     pub struct MockCurationExclusionsRepository {
         recorded: std::sync::Mutex<Vec<CurationExclusionFilter>>,
         result: std::sync::Mutex<DomainResult<Vec<CurationExclusionEntry>>>,
@@ -1263,8 +1240,8 @@ mod tests {
 
     /// Construct a `RepositoryAccessUseCase` seeded with a single
     /// repository at the given id whose key is `repo_key`. Used by
-    /// Item 14 metric-label tests that assert the resolved key is
-    /// threaded through to `hort_curation_decisions_total{repository}`.
+    /// metric-label tests that assert the resolved key is threaded
+    /// through to `hort_curation_decisions_total{repository}`.
     fn repository_access_with_key(
         repo_id: Uuid,
         repo_key: &str,
@@ -1293,8 +1270,8 @@ mod tests {
     }
 
     /// Variant of [`make_use_case`] that lets the caller supply a
-    /// pre-built `RepositoryAccessUseCase` — used by Item 14 metric-
-    /// label tests that need the lookup to return a specific key.
+    /// pre-built `RepositoryAccessUseCase` — used by metric-label
+    /// tests that need the lookup to return a specific key.
     #[allow(clippy::type_complexity)]
     fn make_use_case_with_repo_access(
         repository_access: Arc<RepositoryAccessUseCase>,
@@ -1325,8 +1302,7 @@ mod tests {
     }
 
     /// Variant of [`make_use_case`] that exposes the
-    /// `MockCurationQueueRepository` for inspection by Item-6
-    /// `list_queue` tests.
+    /// `MockCurationQueueRepository` for `list_queue` tests.
     #[allow(clippy::type_complexity)]
     fn make_use_case_with_queue() -> (CurationUseCase, Arc<MockCurationQueueRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
@@ -1350,8 +1326,7 @@ mod tests {
     }
 
     /// Variant of [`make_use_case`] that exposes the
-    /// `MockCurationDecisionsRepository` for inspection by Item-7
-    /// `list_decisions` tests.
+    /// `MockCurationDecisionsRepository` for `list_decisions` tests.
     #[allow(clippy::type_complexity)]
     fn make_use_case_with_decisions() -> (CurationUseCase, Arc<MockCurationDecisionsRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
@@ -1375,8 +1350,7 @@ mod tests {
     }
 
     /// Variant of [`make_use_case`] that exposes the
-    /// `MockCurationExclusionsRepository` for inspection by Item-8
-    /// `list_exclusions` tests.
+    /// `MockCurationExclusionsRepository` for `list_exclusions` tests.
     #[allow(clippy::type_complexity)]
     fn make_use_case_with_exclusions() -> (CurationUseCase, Arc<MockCurationExclusionsRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
@@ -1545,8 +1519,7 @@ mod tests {
     }
 
     /// Source-state guard: `waive` rejects non-`Quarantined` states.
-    /// `ScanIndeterminate` stays admin-only via `admin_release` per
-    /// design §2.2.
+    /// `ScanIndeterminate` stays admin-only via `admin_release`.
     #[tokio::test]
     async fn waive_non_quarantined_source_state_rejected() {
         let (uc, artifacts, events, lifecycle) = make_use_case();
@@ -1835,7 +1808,7 @@ mod tests {
     }
 
     /// >100 versions is rejected with `Invalid` before any event-store
-    /// access — per-call cap (design §2.7).
+    /// access — per-call cap.
     #[tokio::test]
     async fn block_version_list_oversize_is_invalid() {
         let (uc, _artifacts, _events, lifecycle) = make_use_case();
@@ -1857,8 +1830,8 @@ mod tests {
         assert!(lifecycle.committed_transitions().is_empty());
     }
 
-    /// Oversize justification fails fast — once at the call boundary
-    /// (design §2.3). No append, no resolution.
+    /// Oversize justification fails fast — once at the call boundary.
+    /// No append, no resolution.
     #[tokio::test]
     async fn block_version_list_oversize_justification_fails_fast() {
         let (uc, _artifacts, _events, lifecycle) = make_use_case();
@@ -1881,7 +1854,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Continue-on-error (design §2.3 amendment)
+    // Continue-on-error
     // ------------------------------------------------------------------
 
     /// **Load-bearing test.** A per-append failure (event-store
@@ -2112,7 +2085,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // list_queue (Item 6)
+    // list_queue
     // ------------------------------------------------------------------
 
     use chrono::{DateTime, Utc};
@@ -2197,8 +2170,8 @@ mod tests {
     }
 
     /// `limit > 500` is rejected as `Validation` BEFORE the port is
-    /// called. Adapter clamps defensively (Item 6 §2.5), but the
-    /// use-case-side gate is the authoritative check.
+    /// called. Adapter clamps defensively, but the use-case-side gate
+    /// is the authoritative check.
     #[tokio::test]
     async fn list_queue_oversize_limit_is_invalid() {
         let (uc, queue_repo) = make_use_case_with_queue();
@@ -2257,7 +2230,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // list_decisions (Item 7)
+    // list_decisions
     // ------------------------------------------------------------------
 
     use hort_domain::ports::curation_decisions_repository::CurationDecisionKind;
@@ -2409,7 +2382,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // list_exclusions (Item 8)
+    // list_exclusions
     // ------------------------------------------------------------------
 
     fn sample_exclusion_entry() -> CurationExclusionEntry {
@@ -2555,14 +2528,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Item 14 — `hort_curation_decisions_total` metric emission tests.
+    // `hort_curation_decisions_total` metric emission tests.
     //
-    // Pin the `decision`, `repository`, and `result` labels per design
-    // §7. The `repository` label is the M-2 resolution: when a repo
-    // exists for the artifact's `repository_id`, the label is the key;
-    // when `METRICS_INCLUDE_REPOSITORY_LABEL=false`, the helper
-    // collapses to `_all`; when the lookup misses, the helper falls to
-    // `unknown`.
+    // Pins the `decision`, `repository`, and `result` labels.
+    // The `repository` label: when a repo exists for the artifact's
+    // `repository_id`, the label is the key; when
+    // `METRICS_INCLUDE_REPOSITORY_LABEL=false`, the helper collapses to
+    // `_all`; when the lookup misses, the helper falls to `unknown`.
     // ------------------------------------------------------------------
 
     /// Helper — read every `hort_curation_decisions_total` increment from
@@ -2598,9 +2570,8 @@ mod tests {
 
     /// `waive` happy path emits exactly one
     /// `hort_curation_decisions_total{decision=waive, repository=<key>,
-    /// result=ok}` tick — the resolved repo key flows through the
-    /// new `RepositoryAccessUseCase::metric_label` lookup, NOT the
-    /// `_all` fallback that Item 5 emitted before M-2.
+    /// result=ok}` tick — the resolved repo key flows through
+    /// `RepositoryAccessUseCase::metric_label`.
     #[test]
     fn waive_happy_path_emits_metric_with_resolved_repository_key() {
         use metrics_util::debugging::DebuggingRecorder;
@@ -2849,10 +2820,10 @@ mod tests {
     }
 
     /// `block(BlockTarget::VersionList)` emits ONE tick per attempted
-    /// append (design §7 — "per-append per call"). Three transitioned
-    /// versions → three `ok` ticks, all carrying the same resolved
-    /// repo key (the VersionList target's `repository_id` is the same
-    /// for every version).
+    /// append ("per-append per call"). Three transitioned versions →
+    /// three `ok` ticks, all carrying the same resolved repo key (the
+    /// VersionList target's `repository_id` is the same for every
+    /// version).
     #[test]
     fn block_version_list_emits_one_metric_tick_per_attempted_append() {
         use metrics_util::debugging::DebuggingRecorder;
@@ -2912,8 +2883,8 @@ mod tests {
     ///   - `{result=ok, count=4}` — 4 transitioned artifacts
     ///   - `{result=conflict, count=1}` — the `Invariant`-rejected one
     ///
-    /// Pins the design §7 "per-attempted-append" semantics on the
-    /// loop's failure branch.
+    /// Pins the "per-attempted-append" semantics on the loop's failure
+    /// branch.
     #[test]
     fn block_version_list_continue_on_error_emits_per_outcome_metric() {
         use metrics_util::debugging::DebuggingRecorder;

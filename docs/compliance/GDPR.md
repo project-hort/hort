@@ -226,9 +226,9 @@ the authentication surface is "did this IP probe other services in the
 same time window", and that question is unanswerable without a stable
 IP attribution.
 
-The 2026-04-30 security audit recorded a Low-severity observation
-(**L-9**) that the IP also lands in `tracing::info!` on every auth
-failure. The disposition is documented-as-accepted. The rationale:
+A prior security audit recorded a low-severity observation that the IP
+also lands in `tracing::info!` on every auth failure. The disposition
+is documented-as-accepted. The rationale:
 
 1. The throttle that exists on `hort_auth_events_appended_total`
    (per-(client_ip_bucket, result), 60s window) operates at the event

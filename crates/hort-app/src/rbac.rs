@@ -69,7 +69,7 @@ pub struct EffectiveGrantSet {
 /// [`GrantSubject`] — either a *required claim set* the caller must wholly
 /// possess, or a *direct user id*. There is no role id left to key on, so
 /// the index itself collapses to a flat `Vec<PermissionGrant>` scanned
-/// with the §5.1 subject match. The grant count is small in practice
+/// with a subject match. The grant count is small in practice
 /// (single- to low-double-digit per deployment); a linear scan is faster
 /// than maintaining a `repository_id`-keyed map and keeps the type
 /// trivially correct. A repo-keyed index is a pure optimisation that can
@@ -380,10 +380,10 @@ impl RbacEvaluator {
         requested_permissions: &[Permission],
     ) -> Option<TokenCap> {
         // Admin short-circuit — a full admin holds every requested
-        // permission globally (§5.1). Mirror the existing global-cap
-        // request shape (`repository_ids: None`) so the clamp's global
-        // branch + the ≤1h admin gate run UNCHANGED (§13.8). Dedup keeps
-        // the cap shape stable if a caller repeats a permission.
+        // permission globally. Mirror the existing global-cap request shape
+        // (`repository_ids: None`) so the clamp's global branch + the ≤1h
+        // admin gate run UNCHANGED. Dedup keeps the cap shape stable if a
+        // caller repeats a permission.
         if principal.claims.iter().any(|c| c == "admin") {
             let permissions = dedup_preserving_order(requested_permissions);
             if permissions.is_empty() {
@@ -398,7 +398,7 @@ impl RbacEvaluator {
         // Admin-scope-by-a-non-admin is NOT a derivation concern — it is
         // the existing issuance admin gate's job (`run_issuance_gates`
         // step 3 → `AdminAuthorityRequired` / `AdminTokenDisallowed`),
-        // which §13.8 requires run UNCHANGED. So when a non-admin caller
+        // which the issuance admin gate requires run UNCHANGED. So when a non-admin caller
         // requests `Permission::Admin`, keep it verbatim in the derived
         // cap (forcing a global shape — `Admin` only makes sense globally)
         // and let the downstream admin gate deny it. Clamping it away here
@@ -607,10 +607,10 @@ pub fn resolve_claims(mappings: &[ClaimMapping], idp_groups: &[String]) -> Vec<S
 /// sync by construction — auditors querying "who has admin?" can grep the
 /// bit or the claim and get the same answer.
 ///
-/// `pub(crate)` because every principal-build path (OIDC happy path —
-/// Item 5; PAT path — Item 6; dispatcher synthesis — Item 9) calls it.
-/// It is intentionally NOT public API: external crates build principals
-/// through the use-case layer, not by hand.
+/// `pub(crate)` because every principal-build path (OIDC happy path,
+/// PAT path, dispatcher synthesis) calls it. It is intentionally NOT
+/// public API: external crates build principals through the use-case
+/// layer, not by hand.
 pub(crate) fn add_admin_claim_if_admin(claims: &mut Vec<String>, is_admin: bool) {
     if is_admin && !claims.iter().any(|c| c == "admin") {
         claims.push("admin".to_string());
@@ -1131,9 +1131,8 @@ mod tests {
 
     #[test]
     fn admin_user_with_non_admin_cap_denies_admin_action() {
-        // The load-bearing structural change in §B6: admin short-circuit
-        // no longer bypasses the cap leg. Admin claim + cap = [Read,Write]
-        // requesting Admin → DENY (cap doesn't list Admin).
+        // Admin short-circuit no longer bypasses the cap leg.
+        // Admin claim + cap = [Read,Write] requesting Admin → DENY (cap doesn't list Admin).
         let eval = RbacEvaluator::new(Vec::new());
         let p = principal_with_cap(
             &["admin"],
@@ -1157,7 +1156,7 @@ mod tests {
 
     #[test]
     fn token_cap_none_preserves_legacy_behaviour() {
-        // The contract for non-token callers: identical results pre-§B6.
+        // The contract for non-token callers: results are unchanged.
         let repo_a = Uuid::new_v4();
         let eval = dev_writes_repo_a(repo_a);
 
@@ -1212,7 +1211,7 @@ mod tests {
         assert!(!eval.authorize(&p_ro, Permission::Write, Some(repo_a)));
     }
 
-    /// **§B6 acceptance bullet 5 — live-intersection regression test.**
+    /// **Live-intersection regression test.**
     ///
     /// Build evaluator A where the developer claim grants Write on
     /// `repo_a`; principal carries cap `[Read, Write]`. Authorize succeeds.
@@ -1301,8 +1300,7 @@ mod tests {
     fn claims_satisfy_empty_required_is_vacuously_true() {
         let eval = RbacEvaluator::new(Vec::new());
         let p = principal(&[]);
-        // No requirements ⇒ trivially satisfied. (The F-9 caller never
-        // passes an empty slice; this pins the `.all()` boundary.)
+        // No requirements ⇒ trivially satisfied (this pins the `.all()` boundary).
         assert!(eval.claims_satisfy(&p, &[]));
     }
 
@@ -1319,9 +1317,9 @@ mod tests {
 
     #[test]
     fn derive_cap_admin_yields_global_cap_with_requested_permissions() {
-        // §13.8 — an admin (or any globally-authorized caller) derives a
-        // GLOBAL cap (`repository_ids: None`) via the admin short-circuit,
-        // so the existing global-branch + ≤1h admin gate run unchanged.
+        // An admin (or any globally-authorized caller) derives a GLOBAL cap
+        // (`repository_ids: None`) via the admin short-circuit, so the
+        // existing global-branch + ≤1h admin gate run unchanged.
         let eval = RbacEvaluator::new(Vec::new());
         let p = principal(&["admin"]);
         let cap = eval
@@ -1356,10 +1354,10 @@ mod tests {
 
     #[test]
     fn derive_cap_per_repo_uniform_grants_yield_per_repo_cap() {
-        // THE canonical dev-user shape (§13.8 / acceptance #2): per-repo
-        // grants for `{Read, Prefetch}` on three repos, NO global grant.
-        // Derivation yields `{npm,pypi,cargo} × {read,prefetch}` →
-        // `Some(repos)` → the clamp's per-repo branch passes.
+        // The canonical dev-user shape: per-repo grants for `{Read, Prefetch}`
+        // on three repos, NO global grant. Derivation yields
+        // `{npm,pypi,cargo} × {read,prefetch}` → `Some(repos)` → the
+        // clamp's per-repo branch passes.
         let npm = Uuid::new_v4();
         let pypi = Uuid::new_v4();
         let cargo = Uuid::new_v4();
@@ -1430,9 +1428,9 @@ mod tests {
 
     #[test]
     fn derive_cap_zero_authority_yields_none() {
-        // §13.8 / acceptance #4 — a caller holding NONE of the requested
-        // permissions derives an EMPTY footprint → None. The use case must
-        // NOT mint an empty-cap token that silently authorizes nothing.
+        // A caller holding NONE of the requested permissions derives an
+        // EMPTY footprint → None. The use case must NOT mint an empty-cap
+        // token that silently authorizes nothing.
         let eval = RbacEvaluator::new(vec![claims_grant(
             &["reader"],
             Some(Uuid::new_v4()),
@@ -1526,8 +1524,7 @@ mod tests {
         // repo B, with neither permission held on the OTHER repo — has no
         // single repository on which the caller holds BOTH derived
         // permissions. The derivation fails CLOSED (None) rather than mint
-        // a cap whose every cell the clamp would reject anyway. (v1
-        // least-privilege posture; §13.8 valid-by-construction note.)
+        // a cap whose every cell the clamp would reject anyway.
         let repo_a = Uuid::new_v4();
         let repo_b = Uuid::new_v4();
         let eval = RbacEvaluator::new(vec![
@@ -1544,11 +1541,11 @@ mod tests {
 
     #[test]
     fn derive_cap_non_admin_requesting_admin_keeps_admin_for_the_gate() {
-        // §13.8 — the admin gate (`run_issuance_gates` step 3) runs
-        // UNCHANGED. A non-admin requesting `Admin` must NOT have it
-        // silently clamped away (which would downgrade to a non-admin
-        // session); the derivation keeps `Admin` so the downstream gate
-        // surfaces `AdminAuthorityRequired`. The cap is global-shaped.
+        // The admin gate (`run_issuance_gates` step 3) runs UNCHANGED.
+        // A non-admin requesting `Admin` must NOT have it silently clamped
+        // away (which would downgrade to a non-admin session); the
+        // derivation keeps `Admin` so the downstream gate surfaces
+        // `AdminAuthorityRequired`. The cap is global-shaped.
         let repo = Uuid::new_v4();
         let eval = RbacEvaluator::new(vec![claims_grant(
             &["developer"],
@@ -1591,7 +1588,7 @@ mod tests {
     // optional user id + the `is_admin` flag), returns every
     // `(repository, permission)` cell the set holds — the SAME subject
     // match + admin short-circuit + repo-scope semantics as `authorize`.
-    // Cap-agnostic by design (§2.1): it reports the grant-leg authority,
+    // Cap-agnostic by design: it reports the grant-leg authority,
     // not what a token can exercise.
 
     /// Convenience: turn `&[&str]` into the owned `Vec<String>`
@@ -1604,7 +1601,7 @@ mod tests {
     #[test]
     fn effective_grants_admin_via_admin_claim_short_circuits_to_marker() {
         // `claims` carries the synthetic `admin` claim → marker, empty
-        // cells, NEVER an enumeration of every repo (§5 edge case 5).
+        // cells, NEVER an enumeration of every repo.
         let eval = RbacEvaluator::new(vec![
             claims_grant(&["developer"], Some(Uuid::new_v4()), Permission::Read),
             claims_grant(&["admin"], None, Permission::Write),

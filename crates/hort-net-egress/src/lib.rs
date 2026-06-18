@@ -7,7 +7,7 @@
 //!
 //! - [`is_routable`] — the canonical routability predicate. IPv4 +
 //!   IPv6 with IPv4-mapped / IPv4-compatible addresses both inheriting
-//!   the IPv4 filter (audit H-3 close).
+//!   the IPv4 filter.
 //!
 //! # History
 //!
@@ -49,8 +49,8 @@
 //! such a dep is a structural review block — the dep graph is the
 //! enforcement mechanism for the "infrastructure-only" charter.
 //!
-//! Audit findings addressed: M-A2 (drift), H-3 (the IPv4-mapped IPv6
-//! routability bug this crate's predicate fixes).
+//! The predicate fixes the IPv4-mapped IPv6 routability bug and eliminates
+//! drift-prone copies across adapters.
 
 mod ssrf;
 

@@ -11,10 +11,10 @@
 #     OwnedByActor subscription. Its persisted snapshot_claims MUST be
 #     exactly [developer, team-alpha]; a matching artifact event MUST be
 #     delivered to the webhook receiver within 5s.
-#   NEGATIVE (pins §6 invariant 1): the SAME user creates a subscription
-#     via a PAT (not OIDC). snapshot_claims MUST be []; a matching event
-#     MUST NOT be delivered within 5s — the PAT path never consults
-#     claim_mappings, so the OwnedByActor scope resolves to nothing.
+#   NEGATIVE: the SAME user creates a subscription via a PAT (not OIDC).
+#     snapshot_claims MUST be []; a matching event MUST NOT be delivered
+#     within 5s — the PAT path never consults claim_mappings, so the
+#     OwnedByActor scope resolves to nothing.
 #
 # Opt-in: gated behind HORT_E2E_NOTIFICATIONS=1 (mirrors the template's
 # opt-in posture). Default e2e profile does NOT run this smoke.
@@ -662,11 +662,10 @@ fi
 # Phase 6 — NEGATIVE: same user, PAT-created subscription → NO delivery
 # -----------------------------------------------------------------------------
 #
-# Pins §6 invariant 1: a PAT carries zero non-admin claims (the PAT
-# path never consults claim_mappings). The SAME non-admin user creating
-# a subscription via a PAT gets snapshot_claims == [] — so the
-# OwnedByActor scope resolves to nothing and the matching event MUST
-# NOT be delivered.
+# A PAT carries zero non-admin claims (the PAT path never consults
+# claim_mappings). The SAME non-admin user creating a subscription via
+# a PAT gets snapshot_claims == [] — so the OwnedByActor scope resolves
+# to nothing and the matching event MUST NOT be delivered.
 
 log ""
 log "--> [8/9] NEGATIVE: mint a PAT for '$RBAC_USER', create subscription via PAT"
@@ -702,7 +701,7 @@ fi
 if [ -n "$NEG_SUB_ID" ]; then
     NEG_SNAP="$(snapshot_claims_of "$NEG_SUB_ID")"
     if [ "$NEG_SNAP" = "[]" ]; then
-        assert_pass "persisted snapshot_claims == [] (§6 invariant 1: PAT carries no claims)"
+        assert_pass "persisted snapshot_claims == [] (PAT carries no claims)"
     else
         assert_fail \
             "negative-snapshot-claims" \

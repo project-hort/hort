@@ -276,7 +276,7 @@ impl TaskHandler for ServiceAccountRotationHandler {
 
                 // -- Mint --------------------------------------------
                 // `validity` is in seconds; clamp into u64 for the
-                // request. The §3 apply-time invariant pins
+                // request. The apply-time invariant pins
                 // `validity ≥ 2 × rotation_interval ≥ 2 h` so the
                 // value is well-bounded.
                 let validity_secs = rotation.validity.as_secs();
@@ -586,7 +586,7 @@ mod tests {
     }
 
     fn validity() -> StdDuration {
-        // 2 × rotation_interval per §3 invariant.
+        // 2 × rotation_interval (the apply-time invariant).
         StdDuration::from_secs(12 * 3600)
     }
 

@@ -181,7 +181,7 @@ fn seed_subscription(mocks: &MockPorts, owner: Uuid, name: &str) -> Subscription
 
 // ---------------------------------------------------------------------------
 // Test 1 — POST returns 201; the request carries a secret_ref locator
-// (mirrors upstream-mapping) and NO plaintext is echoed back (F-19).
+// (mirrors upstream-mapping) and NO plaintext is echoed back.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -200,11 +200,11 @@ async fn post_subscriptions_returns_201_with_secret_ref_and_no_plaintext_in_resp
 
     let body = body_json(resp).await;
     assert!(body["id"].is_string());
-    // F-19: no plaintext secret is handled anywhere in the create path —
+    // No plaintext secret is handled anywhere in the create path —
     // the response carries NO `secret_plaintext` field at all.
     assert!(
         body.get("secret_plaintext").is_none(),
-        "create response must not carry a plaintext secret (F-19): {body}"
+        "create response must not carry a plaintext secret: {body}"
     );
     // The webhook secret_ref / hash / plaintext never appear on the read
     // shape either.
@@ -218,7 +218,7 @@ async fn post_subscriptions_returns_201_with_secret_ref_and_no_plaintext_in_resp
 // ---------------------------------------------------------------------------
 // Test 1b — a malformed secret_ref (env_var location not POSIX-portable)
 // is rejected at the wire boundary with 400 invalid_webhook_secret_ref
-// (F-19; mirrors the upstream-mapping validate_secret_ref boundary rule).
+// (mirrors the upstream-mapping validate_secret_ref boundary rule).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -699,7 +699,7 @@ async fn webhook_secret_ref_never_returned_on_get() {
     let owner = Uuid::new_v4();
     let id = seed_subscription(&mocks, owner, "no-echo");
     // Inject a webhook target carrying a SecretRef locator directly
-    // (F-19: the row stores the locator, never the secret material).
+    // (the row stores the locator, never the secret material).
     {
         let url = url::Url::parse("https://example.com/hook").unwrap();
         let secret_ref = SecretRef {

@@ -16,9 +16,8 @@
 //!
 //! This module imports nothing from `tokio`, `tracing`, `sqlx`,
 //! `redis`, or any adapter crate. It is pure data and pure functions,
-//! so it can be embedded in tests, the metric wrapper (Item 2), and
-//! the composition root (Item 4) without dragging async runtimes or
-//! I/O along.
+//! so it can be embedded in tests, the metric wrapper, and the
+//! composition root without dragging async runtimes or I/O along.
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub enum EphemeralKeyspaceClass {
@@ -49,8 +48,7 @@ impl EphemeralKeyspaceClass {
 
 /// Single source of truth for prefix → class mapping.
 ///
-/// Verbatim copy of the registry in design doc §3.1, including the
-/// source-citation comments. Every entry is reachable from at least
+/// Every entry is reachable from at least
 /// one `EphemeralStore::put*` / `compare_and_swap` / `extend_ttl` /
 /// `try_increment_counter` call site in the workspace; the
 /// keyspace-exhaustiveness integration test
@@ -292,7 +290,7 @@ mod tests {
 
     #[test]
     fn token_use_audit_throttle_resolves_to_durable() {
-        // B13 per-token audit-emit throttle.
+        // Per-token audit-emit throttle.
         assert_eq!(
             keyspace_class("token_use:audit:throttle:00000000-0000-0000-0000-000000000000"),
             Some(EphemeralKeyspaceClass::Durable),

@@ -11,7 +11,7 @@
 //!   cargo test -p hort-adapters-postgres --test rescan_candidates
 //! ```
 //!
-//! Coverage matrix (mirrors the §3.2 eligibility predicate):
+//! Coverage matrix (mirrors the eligibility predicate):
 //!
 //! - `select_eligible_returns_never_scanned_released_artifact`
 //! - `select_eligible_skips_recently_scanned_within_interval`

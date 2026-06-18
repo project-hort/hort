@@ -1,6 +1,6 @@
 //! `DispatchSecretPort` — selects the underlying adapter by
-//! `SecretRef::source`. Per design doc §5.3 — three lines of routing,
-//! no env vars, no config knobs.
+//! `SecretRef::source`. Three lines of routing, no env vars, no config
+//! knobs.
 
 use std::sync::Arc;
 
@@ -11,9 +11,9 @@ use hort_domain::ports::BoxFuture;
 /// Routes a `SecretPort::resolve` call to the env-var or file adapter
 /// based on `SecretRef::source`.
 ///
-/// Public field access is the documented composition shape (design
-/// doc §5.3); there is no constructor function — direct struct init
-/// keeps the wiring obvious in `hort-server::composition`.
+/// Public field access is the documented composition shape; there is
+/// no constructor function — direct struct init keeps the wiring
+/// obvious in `hort-server::composition`.
 pub struct DispatchSecretPort {
     pub env: Arc<dyn SecretPort>,
     pub file: Arc<dyn SecretPort>,

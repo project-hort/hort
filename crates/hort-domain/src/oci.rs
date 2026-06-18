@@ -96,7 +96,7 @@ pub fn sigstore_bundle_layers(manifest_json: &[u8]) -> DomainResult<Vec<ContentH
 /// read). Requiring *every* layer to be a bundle makes "exempted" ⟺
 /// "carries no runnable content": a mixed manifest (one bundle layer plus a
 /// `tar+gzip` malware layer) is **not** pure, so it stays scanned. This is
-/// the load-bearing anti-scan-evasion guard (design §3.4c leg 1, §8.9).
+/// the load-bearing anti-scan-evasion guard.
 ///
 /// Recognition is keyed solely on the per-layer `mediaType`; the
 /// manifest-level `artifactType` Mode-2 fallback that [`sigstore_bundle_layers`]
@@ -315,7 +315,7 @@ mod tests {
         // THE SECURITY GUARD: a bundle layer beside a runnable tar+gzip
         // layer must NOT be exempted — it stays on the scan/quarantine
         // path. The exemption may fire only when "carries no runnable
-        // content" holds (design §3.4c leg 1).
+        // content" holds.
         let m = manifest(&serde_json::json!({
             "layers": [
                 { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) },

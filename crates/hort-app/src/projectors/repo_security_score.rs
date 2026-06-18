@@ -174,8 +174,8 @@ impl RepoSecurityScoreProjector {
     ///
     /// `ScanIndeterminate` is a *distinct* terminal state that the
     /// three-bucket `repo_security_scores` projection does not model
-    /// (adding a fourth bucket is out of scope for Item 5 — it would
-    /// need a migration + a score-doc change). It is therefore treated
+    /// (adding a fourth bucket is out of scope here — it would need a
+    /// migration + a score-doc change). It is therefore treated
     /// as un-tracked, exactly like [`QuarantineStatus::None`]: a
     /// `Quarantined → ScanIndeterminate` transition decrements
     /// `quarantined_count` and increments nothing (the artifact is no
