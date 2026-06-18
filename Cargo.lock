@@ -805,8 +805,20 @@ checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
 dependencies = [
  "anstream",
  "anstyle",
- "clap_lex",
+ "clap_lex 1.1.0",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.5.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5abde44486daf70c5be8b8f8f1b66c49f86236edf6fa2abadb4d961c4c6229a"
+dependencies = [
+ "clap",
+ "clap_lex 0.7.7",
+ "is_executable",
+ "shlex",
 ]
 
 [[package]]
@@ -820,6 +832,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "clap_lex"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "clap_lex"
@@ -2435,6 +2453,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "clap_complete",
  "directories",
  "humantime",
  "mockito",
@@ -3331,6 +3350,15 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+
+[[package]]
+name = "is_executable"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baabb8b4867b26294d818bf3f651a454b6901431711abb96e296245888d6e8c4"
+dependencies = [
+ "windows-sys 0.60.2",
+]
 
 [[package]]
 name = "is_terminal_polyfill"

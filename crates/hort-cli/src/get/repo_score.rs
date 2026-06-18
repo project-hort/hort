@@ -69,7 +69,7 @@ pub struct SecurityScoreListDto {
 #[derive(Args, Debug)]
 pub struct RepoScoreArgs {
     /// Show a single repository (omit for paginated list)
-    #[arg(long)]
+    #[arg(long, add = crate::completions::repo_arg_candidates())]
     pub name: Option<String>,
     /// Page size (list mode only)
     #[arg(long)]

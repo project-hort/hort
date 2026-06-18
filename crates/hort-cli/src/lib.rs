@@ -10,11 +10,23 @@
 //! any of those crates in `Cargo.toml`) and verified post-build via
 //! `cargo tree -p hort-cli`.
 
+use clap::{Parser, Subcommand};
+
+use crate::admin::AdminArgs;
+use crate::auth::AuthArgs;
+use crate::completions::CompletionsArgs;
+use crate::config::OutputFormat;
+use crate::curation::CurationArgs;
+use crate::get::GetArgs;
+use crate::list_versions::ListVersionsArgs;
+use crate::prefetch::PrefetchArgs;
+
 /// Admin task subcommands (invoke, list, get).
 pub mod admin;
 /// Auth subcommands (login, status, logout).
 pub mod auth;
 pub mod client;
+pub mod completions;
 pub mod config;
 /// Curation decision subcommands (waive, block, exclude-finding,
 /// unexclude-finding). Mounted at the top level of the `Commands` enum,
@@ -32,6 +44,69 @@ pub mod output;
 /// array to `/api/v1/repositories/{repo}/prefetch` and renders the
 /// `PrefetchOutcome` continue-on-error envelope.
 pub mod prefetch;
+
+// -----------------------------------------------------------------
+// CLI shape (pub so `main.rs` and `completions.rs` can both see them)
+// -----------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "hort-cli",
+    version,
+    about = "Hort CLI",
+    long_about = None,
+    // Print help when no subcommand is given.
+    subcommand_required = false,
+    arg_required_else_help = false,
+)]
+pub struct Cli {
+    /// Server base URL (overrides HORT_SERVER and config file).
+    #[arg(long, env = "HORT_SERVER", global = true)]
+    pub server: Option<String>,
+
+    /// Bearer token (overrides HORT_TOKEN and config file).
+    #[arg(long, env = "HORT_TOKEN", global = true)]
+    pub token: Option<String>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table, global = true)]
+    pub output: OutputFormat,
+
+    #[command(subcommand)]
+    pub cmd: Option<Commands>,
+}
+
+/// Subcommand variants.
+///
+/// `Curation` is mounted at the top level, NOT under `Admin` — the
+/// hort-server convention places operational verbs alongside `Admin`.
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    // Auth subcommands.
+    /// Authenticate with the server (login, status, logout).
+    Auth(AuthArgs),
+    // Admin task subcommands.
+    /// Manage server admin tasks (invoke, list, get).
+    Admin(AdminArgs),
+    // Get subcommands.
+    /// Get repository security scores.
+    Get(GetArgs),
+    // Curator decision subcommands (top-level, not under admin).
+    /// Curator decisions: waive, block, exclude-finding, unexclude-finding.
+    Curation(CurationArgs),
+    // Discovery + self-service prefetch subcommands (top-level,
+    // mirroring the `get` subcommand placement). Both require a CLI
+    // session JWT (TokenKind::CliSession) — enforced server-side, no
+    // client-side pre-flight (the server is the source of truth and a
+    // redundant check would drift).
+    /// List versions of a package in a repository with per-version
+    /// status (released / quarantined / rejected / unknown / ...).
+    ListVersions(ListVersionsArgs),
+    /// Enqueue a self-service prefetch for `(repo, package, version?)`.
+    Prefetch(PrefetchArgs),
+    /// Generate a shell completion script (bash/zsh/fish/powershell/elvish).
+    Completions(CompletionsArgs),
+}
 
 /// Render a top-level CLI error for stderr.
 ///

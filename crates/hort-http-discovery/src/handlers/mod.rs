@@ -9,6 +9,7 @@
 //! gate, RBAC gate, OCI rejection, and per-package orchestration all
 //! live INSIDE the use cases.
 
+pub mod list_repositories;
 pub mod list_versions;
 pub mod prefetch;
 

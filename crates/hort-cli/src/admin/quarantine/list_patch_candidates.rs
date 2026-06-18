@@ -78,7 +78,7 @@ pub struct PatchCandidateListResponseDto {
 pub struct ListPatchCandidatesArgs {
     /// Filter by repository key (e.g. `npm-proxy`). When absent:
     /// admin-wide scope. Unknown keys return 404.
-    #[arg(long = "repo")]
+    #[arg(long = "repo", add = crate::completions::repo_arg_candidates())]
     pub repository: Option<String>,
 
     /// Maximum rows to return (server caps at 500 — 400 on overflow).

@@ -157,7 +157,7 @@ pub struct BlockArtifactArgs {
 pub struct BlockVersionsArgs {
     /// Repository stable key (e.g. `npm-proxy`). Resolved server-side
     /// via `RepositoryUseCase::get_by_key`; unknown keys surface as 404.
-    #[arg(long = "repo", required = true)]
+    #[arg(long = "repo", required = true, add = crate::completions::repo_arg_candidates())]
     pub repository: String,
 
     /// Package name to match (`artifacts.name` column).
