@@ -1,0 +1,97 @@
+name: Installer
+
+# Lints + fixture-functional-tests the hort.rs installer scripts, and (gated) deploys them.
+#
+# The `deploy-pages` job is READY-BUT-GATED: it serves install/ at the hort.rs apex from this
+# repo's own GitHub Pages, but stays SKIPPED until the repo variable INSTALLER_PAGES_LIVE='true'
+# (also requires: Pages enabled with source = GitHub Actions, and hort.rs DNS pointed at GitHub
+# Pages). Do NOT enable it before a release publishes signed hort-cli-* assets, or the served
+# installer will 404 on download. (No separate repo: hort.rs is the main repo's Pages domain.)
+#
+# STILL DEFERRED (need real release assets): a "real release end-to-end" verify job + a
+# wrong-identity (HORT_TEST_BAD_IDENTITY=1) fail-closed check. project-hort/hort currently has
+# one prerelease with 0 assets, so those cannot run yet.
+on:
+  push:
+    branches: [main]
+    paths: ['install/**', '.github/workflows/install.yml']
+  pull_request:
+    paths: ['install/**', '.github/workflows/install.yml']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Shell lint + drift guard
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck dash
+          shellcheck install/install-cli.sh install/tests/*.sh
+          sh -n install/install-cli.sh
+          dash -n install/install-cli.sh
+          sh install/tests/test_pin_consistency.sh
+      - name: PSScriptAnalyzer (install-cli.ps1)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path install/install-cli.ps1 -Severity Warning,Error
+          if ($r) { $r | Format-Table -AutoSize; exit 1 }
+          Write-Host 'PSScriptAnalyzer clean'
+
+  functional-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Fixture functional test (stubbed cosign)
+        run: sh install/tests/test_install_sh.sh
+
+  functional-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Fixture functional test (stubbed cosign)
+        shell: pwsh
+        run: pwsh -File install/tests/test_install_ps1.ps1
+
+  # READY-BUT-GATED (see header): serves install/ at the hort.rs apex from this repo's own
+  # GitHub Pages. Skipped until repo variable INSTALLER_PAGES_LIVE='true'. To go live: publish
+  # a release with signed hort-cli-* assets, enable Pages (source = GitHub Actions) with custom
+  # domain hort.rs, point hort.rs DNS at GitHub Pages, then set INSTALLER_PAGES_LIVE=true.
+  deploy-pages:
+    needs: [lint, functional-unix, functional-windows]
+    if: ${{ github.ref == 'refs/heads/main' && vars.INSTALLER_PAGES_LIVE == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Stage install/ as the Pages site
+        run: |
+          mkdir -p _site
+          cp install/install-cli.sh install/install-cli.ps1 install/cosign.pin install/index.html _site/
+          echo 'hort.rs' > _site/CNAME
+      - name: Configure Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
