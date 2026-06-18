@@ -16,6 +16,7 @@ path = "src/main.rs"
 # HTTP client — pure HTTP, no DSN, no hort-domain / hort-app / hort-adapters-* deps.
 reqwest    = { workspace = true, features = ["rustls-tls", "json"] }
 clap       = { workspace = true, features = ["derive", "env"] }
+clap_complete = { version = "=4.5.55", features = ["unstable-dynamic"] }
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }

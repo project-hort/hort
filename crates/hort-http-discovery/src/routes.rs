@@ -13,15 +13,19 @@
 //!
 //! Resulting absolute paths:
 //!
+//! - `GET  /api/v1/repositories`
 //! - `GET  /api/v1/repositories/:repo_key/discovery/versions/:package_name`
 //! - `POST /api/v1/repositories/:repo_key/prefetch`
 //!
-//! **NOT** in `hort_http_core::router::is_anonymous_path` — both routes
-//! require an authenticated principal (the token-kind gate inside the
-//! use case rejects anonymous-equivalent tokens before any port I/O,
-//! but the structural defense-in-depth lives at the middleware edge:
-//! the `require_principal` layer returns 401 to unauthenticated callers
-//! before this handler runs).
+//! **Auth posture** — none of these routes appear in
+//! `hort_http_core::router::is_anonymous_path`. The global router's
+//! method-based dispatch sends every `GET` through
+//! `extract_optional_principal` (principal is `Option<…>`), which is
+//! exactly the read-endpoint pattern (ADR 0013): handlers receive `None`
+//! for unauthenticated callers and enforce visibility themselves via the
+//! use-case layer. The discovery-versions and prefetch routes additionally
+//! apply a token-kind gate inside their use cases (CliSession or PAT
+//! required); `GET /repositories` has no token-kind restriction.
 
 use std::sync::Arc;
 
@@ -30,6 +34,7 @@ use axum::Router;
 
 use hort_http_core::context::AppContext;
 
+use crate::handlers::list_repositories::list_repositories;
 use crate::handlers::list_versions::list_versions;
 use crate::handlers::prefetch::prefetch;
 
@@ -41,6 +46,7 @@ use crate::handlers::prefetch::prefetch;
 /// pattern is the ADR 0008 norm.
 pub fn routes() -> Router<Arc<AppContext>> {
     Router::new()
+        .route("/repositories", get(list_repositories))
         .route(
             "/repositories/:repo_key/discovery/versions/:package_name",
             get(list_versions),

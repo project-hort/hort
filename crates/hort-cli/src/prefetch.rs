@@ -173,6 +173,7 @@ pub enum PrefetchItemErrorDto {
 #[derive(Args, Debug)]
 pub struct PrefetchArgs {
     /// Repository stable key (e.g. `npm-proxy`).
+    #[arg(add = crate::completions::repo_arg_candidates())]
     pub repo: String,
     /// Package name in the format-native spelling (e.g. `left-pad`,
     /// `Django`, `serde`).

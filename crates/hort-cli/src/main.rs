@@ -2,14 +2,18 @@
 //!
 //! clap dispatch shell for the hort command-line client. Wires the
 //! subcommands (auth / admin task / get repo-score / curation /
-//! discovery / prefetch) and prints help when invoked with no
-//! subcommand so `hort-cli --help` works.
+//! discovery / prefetch / completions) and prints help when invoked with
+//! no subcommand so `hort-cli --help` works.
 //!
 //! # Design notes
 //!
 //! - `current_thread` tokio runtime is sufficient for a CLI tool that
 //!   makes sequential HTTP requests. No background tasks run here;
-//!   concurrency is at the process level (operator scripts).
+//!   concurrency is at the process level (operator scripts). The runtime
+//!   is built explicitly (rather than via `#[tokio::main]`) so the dynamic
+//!   shell-completion entrypoint can run *before* any runtime exists — the
+//!   completer's value provider does its own `block_on`, which would panic
+//!   if nested inside a running runtime. See `main`.
 //! - Config resolution (`load_effective_config`) is called before
 //!   any subcommand dispatch so all subcommands receive a validated
 //!   `EffectiveConfig`. Unknown-field tolerance is handled inside
@@ -20,83 +24,56 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser};
 
-use hort_cli::admin::AdminArgs;
-use hort_cli::auth::AuthArgs;
-use hort_cli::config::OutputFormat;
-use hort_cli::curation::CurationArgs;
-use hort_cli::get::GetArgs;
-use hort_cli::list_versions::ListVersionsArgs;
-use hort_cli::prefetch::PrefetchArgs;
-
-// -----------------------------------------------------------------
-// CLI shape
-// -----------------------------------------------------------------
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "hort-cli",
-    version,
-    about = "Hort CLI",
-    long_about = None,
-    // Print help when no subcommand is given.
-    subcommand_required = false,
-    arg_required_else_help = false,
-)]
-struct Cli {
-    /// Server base URL (overrides HORT_SERVER and config file).
-    #[arg(long, env = "HORT_SERVER", global = true)]
-    server: Option<String>,
-
-    /// Bearer token (overrides HORT_TOKEN and config file).
-    #[arg(long, env = "HORT_TOKEN", global = true)]
-    token: Option<String>,
-
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table, global = true)]
-    output: OutputFormat,
-
-    #[command(subcommand)]
-    cmd: Option<Commands>,
-}
-
-/// Subcommand variants.
-///
-/// `Curation` is mounted at the top level, NOT under `Admin` — the
-/// hort-server convention places operational verbs alongside `Admin`.
-#[derive(Subcommand, Debug)]
-enum Commands {
-    // Auth subcommands.
-    /// Authenticate with the server (login, status, logout).
-    Auth(AuthArgs),
-    // Admin task subcommands.
-    /// Manage server admin tasks (invoke, list, get).
-    Admin(AdminArgs),
-    // Get subcommands.
-    /// Get repository security scores.
-    Get(GetArgs),
-    // Curator decision subcommands (top-level, not under admin).
-    /// Curator decisions: waive, block, exclude-finding, unexclude-finding.
-    Curation(CurationArgs),
-    // Discovery + self-service prefetch subcommands (top-level,
-    // mirroring the `get` subcommand placement). Both require a CLI
-    // session JWT (TokenKind::CliSession) — enforced server-side, no
-    // client-side pre-flight (the server is the source of truth and a
-    // redundant check would drift).
-    /// List versions of a package in a repository with per-version
-    /// status (released / quarantined / rejected / unknown / ...).
-    ListVersions(ListVersionsArgs),
-    /// Enqueue a self-service prefetch for `(repo, package, version?)`.
-    Prefetch(PrefetchArgs),
-}
+use hort_cli::{Cli, Commands};
 
 // -----------------------------------------------------------------
 // Entrypoint
 // -----------------------------------------------------------------
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Dynamic shell-completion entrypoint (clap_complete unstable-dynamic
+    // engine). This MUST run before any stdout is written, before
+    // `Cli::parse()`, and — critically — BEFORE the tokio runtime is built.
+    //
+    // It is a no-op unless the `COMPLETE` env var is set (i.e. the shell
+    // re-invoked us mid-TAB via the registration stub from
+    // `source <(COMPLETE=bash hort-cli)`); in that case it prints the
+    // candidates and `process::exit(0)`s before returning. In the normal
+    // (no-`COMPLETE`) case it returns immediately and we fall through to the
+    // tokio runtime below.
+    //
+    // # Why outside the runtime
+    //
+    // The repo-key value provider ([`completions::repo_arg_candidates`])
+    // synchronously `block_on`s a throwaway current-thread tokio runtime to
+    // run the HTTP fetch. If `CompleteEnv::complete()` ran *inside* an
+    // already-running `#[tokio::main]` runtime, that nested `block_on` would
+    // panic ("Cannot start a runtime from within a runtime") — and a panic
+    // in the completer breaks the user's shell line. Running the completion
+    // entrypoint here, before any runtime exists, keeps the provider's
+    // `block_on` legal. The static `hort-cli completions <shell>` subcommand
+    // remains the always-available floor; see `completions::run`.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
+    // Normal (non-completion) path: build the current-thread runtime and
+    // drive the async entrypoint. `current_thread` is sufficient for a CLI
+    // that makes sequential HTTP requests.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("hort-cli: failed to start async runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    runtime.block_on(run())
+}
+
+async fn run() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialise tracing. RUST_LOG overrides the default.
@@ -173,6 +150,8 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        // completions subcommand — synchronous, no config needed.
+        Some(Commands::Completions(args)) => hort_cli::completions::run(&args),
     }
 }
 

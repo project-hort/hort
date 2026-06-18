@@ -141,7 +141,7 @@ pub struct CurationQueueResponseDto {
 pub struct QueueArgs {
     /// Filter by repository stable key (e.g. `npm-proxy`). Unknown key
     /// returns 404.
-    #[arg(long = "repo")]
+    #[arg(long = "repo", add = crate::completions::repo_arg_candidates())]
     pub repository: Option<String>,
 
     /// Filter by quarantine status. Valid: `quarantined`, `rejected`,

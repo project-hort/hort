@@ -164,7 +164,7 @@ pub struct DecisionsArgs {
 
     /// Filter by repository stable key (e.g. `npm-proxy`). Unknown key
     /// → 404 from the server.
-    #[arg(long = "repo")]
+    #[arg(long = "repo", add = crate::completions::repo_arg_candidates())]
     pub repository: Option<String>,
 
     /// Filter by package name substring (server-side semantics).
