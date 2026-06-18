@@ -1,9 +1,16 @@
-//! # hort-formats — WASM Format Module Host
+//! # hort-formats — Format Module Host
 //!
-//! Loads deploy-time WASM format modules from `$WASM_PLUGIN_DIR`, introspects
-//! their capability group declarations via the module manifest, and dispatches
-//! format-specific operations (parse coords, generate index, verify checksum,
-//! handle stateful protocol) to the appropriate module.
+//! **Status (v1): the WASM host below is a *planned* (post-v1) target, NOT
+//! wired today** — there is no `wasmtime` in the build and no
+//! `$WASM_PLUGIN_DIR` loading. Format handlers are currently compiled-in
+//! Rust structs behind the `FormatHandler` trait (see "Compiled-in handlers"
+//! below and ADR 0005). The sections that follow describe the intended WASM
+//! design and are written in the future tense.
+//!
+//! *(Planned)* Loads deploy-time WASM format modules from `$WASM_PLUGIN_DIR`,
+//! introspects their capability group declarations via the module manifest,
+//! and dispatches format-specific operations (parse coords, generate index,
+//! verify checksum, handle stateful protocol) to the appropriate module.
 //!
 //! Depends on: hort-domain (FormatPort trait, capability group types), hort-app
 //! Used by:    each hort-http-<format> crate (constructs its own
@@ -28,10 +35,11 @@
 //! `FormatHandler` trait boundary (see explanation/format-handlers.md + ADR 0005).
 //! Migration to deploy-time WASM modules is planned.
 //!
-//! ## Hot reload
+//! ## Hot reload *(planned)*
 //!
-//! Modules are reloaded from disk on SIGHUP without restarting the process.
-//! The host re-reads manifests and re-registers routes for any changed modules.
+//! Once the WASM host ships, modules will be reloaded from disk on SIGHUP
+//! without restarting the process: the host re-reads manifests and
+//! re-registers routes for any changed modules. (Not implemented in v1.)
 
 pub mod archive_bounds;
 pub mod cargo;

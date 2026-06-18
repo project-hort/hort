@@ -310,16 +310,20 @@ impl OsvAdvisoryAdapter {
 
     fn vuln_to_finding(component: &PreparedComponent<'_>, vuln: OsvVuln) -> Finding {
         // Severity precedence: numeric `database_specific.severity`
-        // (highest signal); else string label there; else fallback to
-        // `Medium`. The `severity[].score` (CVSS vector) requires a
-        // calculator we deliberately do not ship; v1 falls back to the
-        // `database_specific` shape.
+        // (highest signal); else string label there; else fail-closed
+        // fallback to the HIGHEST tier `Critical` (SUP-4). The
+        // `severity[].score` (CVSS vector) requires a calculator we
+        // deliberately do not ship; v1 falls back to the
+        // `database_specific` shape. A finding whose severity we cannot
+        // determine must still block under the default Critical threshold
+        // rather than slip under it — unified with the scanner-osv and
+        // trivy adapters.
         let severity = vuln
             .database_specific
             .as_ref()
             .and_then(|ds| ds.severity.as_deref())
             .and_then(severity::label_to_severity)
-            .unwrap_or(SeverityThreshold::Medium);
+            .unwrap_or(SeverityThreshold::Critical);
 
         // Title: prefer the one-line summary; else the long-form
         // details; else the vuln id (so the field is never empty).
@@ -732,7 +736,10 @@ mod tests {
     }
 
     #[test]
-    fn vuln_to_finding_falls_back_to_medium_when_severity_absent() {
+    fn vuln_to_finding_falls_back_to_critical_when_severity_absent_fail_closed() {
+        // SUP-4: a finding whose severity cannot be determined fails
+        // CLOSED to the highest tier (`Critical`) so it still trips the
+        // default Critical block threshold rather than slipping under it.
         let prepared = PreparedComponent {
             name: "x",
             version: Some("1"),
@@ -744,7 +751,7 @@ mod tests {
             ..Default::default()
         };
         let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
-        assert_eq!(finding.severity, SeverityThreshold::Medium);
+        assert_eq!(finding.severity, SeverityThreshold::Critical);
         // Title falls back to the vuln id when summary/details are absent.
         assert_eq!(finding.title, "OSV-1");
     }

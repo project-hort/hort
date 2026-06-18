@@ -279,10 +279,14 @@ and a `groups` claim.
 
 ## §4 — Start `hort-worker`, then `hort-server`  *(Track A+B)*
 
-> **Order matters on a fresh DB.** The default scan policy declares
-> `scan_backends: [trivy, osv]`, and gitops apply at server boot **fail-closes**
-> unless a live worker has registered those backends in `scanner_registry`.
-> Start the **worker first** so it registers `trivy`/`osv`, then the server.
+> **Start order is no longer load-bearing.** The default scan policy declares
+> `scan_backends: [trivy, osv]`. Gitops apply at server boot validates those
+> names against the binary's compiled-in scanner set (`KNOWN_SCAN_BACKENDS`),
+> **not** the live `scanner_registry`, so the server boots cleanly even if no
+> worker has registered yet (regression H20 — a correct policy used to
+> fail-close the boot until a worker appeared). Still start the worker so
+> quarantined artifacts actually get scanned and released; the order below is
+> a convenience, not a requirement.
 
 ```bash
 # Terminal B — worker (start first)
@@ -847,7 +851,7 @@ unset HORT_TOKEN ADMIN_PAT ADMIN_TOKEN DEV_TOKEN READER_TOKEN \
 
 | Symptom | Likely cause |
 |---------|---|
-| `hort-server serve` exits `gitops validation failed: … scanBackends … <no live worker registered>` | Start `hort-worker` **before** `hort-server` (§4) so it registers `trivy`/`osv`. |
+| `hort-server serve` exits `gitops validation failed: … scanBackends … is not a supported scanner backend (supported: osv, trivy)` | Typo'd / unsupported `scan_backends` entry. Use only `trivy`/`osv`, or remove the entry. (Boot no longer requires a live worker — H20.) |
 | `hort-server serve` exits `… GroupMapping object(s) are declared … HORT_AUTH_PROVIDER=disabled` | Track A is pointed at the full tree. Use `HORT_CONFIG_DIR=…/gitops-config/base` (alpha.env default), or switch to Track B (`alpha.env.oidc`). |
 | `migrate` fails "previously applied but has been modified" | Stale schema — recreate the DB (§2 drift note). |
 | `/metrics` returns `401` | `HORT_METRICS_REQUIRE_AUTH` not false — `source alpha.env`, or pass a bearer. |

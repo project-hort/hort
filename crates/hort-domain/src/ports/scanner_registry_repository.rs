@@ -4,10 +4,14 @@
 //! Each `hort-worker` calls
 //! [`ScannerRegistryRepository::upsert_self`] on boot and refreshes
 //! `last_heartbeat` every 60 seconds via
-//! [`ScannerRegistryRepository::refresh_heartbeat`]. The apply-pipeline
-//! consumes the read-side via [`ScannerRegistryRepository::list_live`]
-//! to validate `ScanPolicy.scan_backends` entries against the union of
-//! currently-registered backends.
+//! [`ScannerRegistryRepository::refresh_heartbeat`]. The `hort-server`
+//! admin worker-list endpoint consumes the read-side via
+//! [`ScannerRegistryRepository::list_all`] to surface every registered
+//! worker with its liveness. (The apply pipeline no longer reads this
+//! table — H20 moved `scanBackends` validation onto the compiled-in
+//! `hort_app::scanning::KNOWN_SCAN_BACKENDS` set; the "alive vs stale"
+//! liveness threshold is now a presentation policy applied by the
+//! consuming use case, not a storage filter.)
 //!
 //! The table is mutable, not event-sourced — worker liveness does not
 //! belong on the immutable event log.
@@ -51,7 +55,7 @@ pub struct ScannerRegistryEntry {
 ///
 /// Only `hort-worker` writes rows (`upsert_self` on startup +
 /// `refresh_heartbeat` on the 60s tick); `hort-server` reads via
-/// `list_live` for apply-time policy validation. Both writers connect
+/// `list_all` for the admin worker-list endpoint. Both writers connect
 /// via the `hort_app_role` Postgres role (DML-only, no DDL —
 /// ADR 0009).
 pub trait ScannerRegistryRepository: Send + Sync {
@@ -73,15 +77,33 @@ pub trait ScannerRegistryRepository: Send + Sync {
     /// silently — caller layer treats that as a logged warn).
     fn refresh_heartbeat<'a>(&'a self, worker_id: &'a str) -> BoxFuture<'a, DomainResult<()>>;
 
-    /// List every row whose `last_heartbeat` is within the supplied
-    /// liveness window — i.e. workers that have ticked recently
-    /// enough to be considered alive. Used by apply-time policy
-    /// validation and the operator-facing health
-    /// endpoint.
-    fn list_live<'a>(
-        &'a self,
-        liveness_window: Duration,
-    ) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>>;
+    /// List registered worker rows, most-recently-seen first.
+    /// Returns the raw rows; deciding which are "alive" vs "stale"
+    /// (the ~5-minute `last_heartbeat` threshold) is a presentation
+    /// policy applied by the consuming use case
+    /// (`ScannerWorkerQueryUseCase`), not a storage filter — so a dead
+    /// worker stays visible in the admin worker-list with its
+    /// last-heartbeat age rather than silently vanishing.
+    ///
+    /// Implementations MUST bound the result defensively (the read is
+    /// admin-facing and must not return an unbounded set if pruning ever
+    /// lags). The Postgres adapter caps at the N most-recently-seen rows
+    /// (`ORDER BY last_heartbeat DESC LIMIT N`); live workers always sort
+    /// to the top, so the cap only ever drops the oldest dead rows.
+    /// [`prune_stale`](Self::prune_stale) keeps the table well under the
+    /// cap, so it is a safety bound, not pagination.
+    fn list_all<'a>(&'a self) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>>;
+
+    /// Delete every worker row whose `last_heartbeat` is older than
+    /// `older_than` (i.e. `last_heartbeat < now() - older_than`), returning
+    /// the number of rows removed. Housekeeping for the worker-coordination
+    /// table: pod churn (rollouts, HPA scaling) leaves a row per retired
+    /// `worker_id` that never heartbeats again, so without this the table
+    /// grows without bound. Driven by the `scanner-registry-prune` worker
+    /// task on a cron cadence. Idempotent (re-running deletes the same
+    /// already-gone set → 0). A live worker is never deleted — it
+    /// heartbeats every 60 s, so its `last_heartbeat` is always recent.
+    fn prune_stale<'a>(&'a self, older_than: Duration) -> BoxFuture<'a, DomainResult<u64>>;
 }
 
 #[cfg(test)]

@@ -280,6 +280,17 @@ impl IndexSource for ProxyNpmSource {
                     },
                 ));
             }
+            Err(PackumentFetchError::InvalidName { cause }) => {
+                // A traversal-shaped / illegal package name fails closed
+                // BEFORE any cache-key / upstream-URL construction
+                // (INJ-3). Surface as `Validation` → 400 (a client
+                // fault), mirroring the `MetadataMalformed` parse-class
+                // arm below, NOT the network / `upstream_unavailable`
+                // bucket.
+                return Err(AppError::Domain(
+                    hort_domain::error::DomainError::Validation(cause),
+                ));
+            }
             Err(PackumentFetchError::UpstreamUnavailable) => {
                 // Preserve the wire mapping: surface as a typed error
                 // the unified handler converts to 502. The most fitting

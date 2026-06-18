@@ -41,6 +41,7 @@ use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUse
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
+use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerQueryUseCase;
 // `PolicyUseCase` wired into the mock
 // `AppContext` so the HTTP exclusion write endpoints
 // (`/api/v1/admin/policies/:policy_id/exclusions[/:cve_id]`) drive the
@@ -96,6 +97,9 @@ use hort_domain::ports::patch_candidate_repository::{
     PatchCandidate, PatchCandidateFilter, PatchCandidateRepository,
 };
 use hort_domain::ports::repository_repository::RepositoryRepository;
+use hort_domain::ports::scanner_registry_repository::{
+    ScannerRegistryEntry, ScannerRegistryRepository,
+};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::subscription_repository::SubscriptionRepository;
 use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
@@ -169,6 +173,61 @@ impl PatchCandidateRepository for MockPatchCandidateRepository {
             // `limit` is honoured end-to-end.
             Ok(rows.into_iter().take(limit).collect())
         })
+    }
+}
+
+/// Handler-layer mock for [`ScannerRegistryRepository`].
+///
+/// Lives here (not in `hort-app::use_cases::test_support`) because it is
+/// only consumed by handler tests in `hort-http-core::handlers::admin` and
+/// downstream inbound-HTTP crates pulling `hort-http-core/test-support`.
+/// The use-case layer has its own inline private mock in
+/// `crates/hort-app/src/use_cases/scanner_worker_query_use_case.rs`.
+///
+/// `list_all` returns the seeded rows in insertion order; the write methods
+/// are no-ops (the admin read path never calls them).
+pub struct MockScannerRegistryRepository {
+    rows: Mutex<Vec<ScannerRegistryEntry>>,
+}
+
+impl Default for MockScannerRegistryRepository {
+    fn default() -> Self {
+        Self {
+            rows: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl MockScannerRegistryRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the rows returned by the next `list_all` call.
+    pub fn seed(&self, rows: Vec<ScannerRegistryEntry>) {
+        *self.rows.lock().unwrap() = rows;
+    }
+}
+
+impl ScannerRegistryRepository for MockScannerRegistryRepository {
+    fn upsert_self<'a>(
+        &'a self,
+        _worker_id: &'a str,
+        _backends: Vec<String>,
+    ) -> BoxFuture<'a, DomainResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn refresh_heartbeat<'a>(&'a self, _worker_id: &'a str) -> BoxFuture<'a, DomainResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn list_all<'a>(&'a self) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
+        Box::pin(async move { Ok(self.rows.lock().unwrap().clone()) })
+    }
+    fn prune_stale<'a>(
+        &'a self,
+        _older_than: std::time::Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        Box::pin(async { Ok(0) })
     }
 }
 
@@ -713,6 +772,10 @@ pub struct MockPorts {
     /// `GET /admin/quarantine/patch-candidates` surface seed rows via
     /// `seed(...)` and read recorded filters via `calls()`.
     pub patch_candidates: Arc<MockPatchCandidateRepository>,
+    /// `scanner_registry` mock wired into
+    /// `ScannerWorkerQueryUseCase`. Tests asserting the
+    /// `GET /admin/workers` surface seed rows via `seed(...)`.
+    pub scanner_workers: Arc<MockScannerRegistryRepository>,
     /// `PermissionGrantRepository` mock wired
     /// into `EffectivePermissionsUseCase` AND
     /// `RbacResolveUseCase`. Tests asserting
@@ -1083,6 +1146,15 @@ pub fn build_mock_ctx_with_label_flag(
         patch_candidates.clone() as Arc<dyn PatchCandidateRepository>
     ));
 
+    // `ScannerWorkerQueryUseCase` for the admin worker-list surface
+    // (`GET /admin/workers`). Wired with the mock registry exposed on
+    // `MockPorts.scanner_workers` so handler tests seed rows via
+    // `mocks.scanner_workers.seed(...)`.
+    let scanner_workers = Arc::new(MockScannerRegistryRepository::new());
+    let scanner_worker_query_use_case = Arc::new(ScannerWorkerQueryUseCase::new(
+        scanner_workers.clone() as Arc<dyn ScannerRegistryRepository>,
+    ));
+
     // `PrefetchUseCase` planner. Zero-cost unit
     // struct; the `Arc` mirrors the rest of the use-case surface.
     let prefetch_use_case = Arc::new(PrefetchUseCase::new());
@@ -1237,6 +1309,8 @@ pub fn build_mock_ctx_with_label_flag(
         // See field doc.
         patch_candidate_use_case,
         // See field doc.
+        scanner_worker_query_use_case,
+        // See field doc.
         prefetch_use_case,
         // See field doc.
         effective_permissions_use_case,
@@ -1384,6 +1458,7 @@ pub fn build_mock_ctx_with_label_flag(
         security_scores,
         jobs,
         patch_candidates,
+        scanner_workers,
         permission_grants,
         claim_mappings,
         subscriptions,
@@ -1465,6 +1540,9 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         // `RepositoryAccessUseCase`, so no `with_*` helper rebuild is
         // needed when the access policy flips.
         patch_candidate_use_case: base.patch_candidate_use_case.clone(),
+        // Carry forward. The worker-list surface is admin-only and does
+        // not consume `RepositoryAccessUseCase`, so no rebuild is needed.
+        scanner_worker_query_use_case: base.scanner_worker_query_use_case.clone(),
         // Carry forward. The prefetch planner is
         // a stateless unit struct; rebuilding would yield the identical
         // instance, but threading the existing `Arc` keeps pointer

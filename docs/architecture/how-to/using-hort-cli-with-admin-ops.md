@@ -94,6 +94,39 @@ $ hort-cli admin task invoke staging-sweep
 …
 ```
 
+### Inspect scanner workers
+
+`hort-cli admin workers list` shows every worker that has registered in
+the `scanner_registry` — the scanner backends it advertises and whether it
+is currently heartbeating. A worker that has stopped heartbeating stays in
+the listing as `LIVE=NO` (it is **not** filtered out), so you can tell "my
+trivy worker died" apart from "I never had one".
+
+```sh
+$ hort-cli admin workers list
+WORKER_ID      BACKENDS   LIVE  LAST_SEEN  REGISTERED
+worker-abc123  trivy,osv  yes   12s ago    3d ago
+worker-def456  trivy      NO    47m ago    3d ago
+```
+
+- **LIVE** is `yes` when the last heartbeat is within ~5 minutes (the
+  worker heartbeats every 60 s, so this tolerates four missed ticks); `NO`
+  flags a stale/dead worker to investigate.
+- **LAST_SEEN** is the age of the last heartbeat; **REGISTERED** is how
+  long ago the worker first registered.
+- `--output json` emits the raw rows (`worker_id`, `backends`,
+  `registered_at`, `last_heartbeat`, `live`, `last_seen_secs_ago`) for
+  scripting.
+
+This is a read-only admin endpoint (`GET /api/v1/admin/workers`) and needs
+the `admin` claim like the other `admin` subcommands.
+
+Rows for workers that stopped heartbeating are garbage-collected
+automatically: the default-enabled `scanner-registry-prune` CronJob deletes
+any worker not seen for 7 days, so the listing shows roughly the last week
+of churn and the table never grows without bound. (The read is also capped
+at the 1000 most-recently-seen workers as a safety bound.)
+
 ### Re-login after expiry ("session expired")
 
 A 15 min admin session expires quickly. Once the token crosses `expires_at`,

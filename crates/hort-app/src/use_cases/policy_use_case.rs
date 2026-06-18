@@ -86,9 +86,9 @@ pub struct CreatePolicyCommand {
     /// Names of the scanner backends this policy
     /// invokes per scan. An empty `Vec` means "no scanning"; the
     /// gitops apply pipeline is expected to validate every entry
-    /// against the live `scanner_registry` (via
-    /// `hort_config::desired::validate_scan_policy_backends`) before
-    /// reaching this use case.
+    /// against the compiled-in `hort_app::scanning::KNOWN_SCAN_BACKENDS`
+    /// set (via `hort_config::desired::validate_scan_policy_backends`)
+    /// before reaching this use case.
     pub scan_backends: Vec<String>,
     /// Interval in hours between bulk re-scans of
     /// artifacts governed by this policy. The value `0` is the

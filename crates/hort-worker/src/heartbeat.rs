@@ -279,11 +279,11 @@ mod tests {
                 .push(worker_id.to_string());
             Box::pin(async { Ok(()) })
         }
-        fn list_live<'a>(
-            &'a self,
-            _liveness_window: Duration,
-        ) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
+        fn list_all<'a>(&'a self) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+        fn prune_stale<'a>(&'a self, _older_than: Duration) -> BoxFuture<'a, DomainResult<u64>> {
+            Box::pin(async { Ok(0) })
         }
     }
 
@@ -364,11 +364,14 @@ mod tests {
             ) -> BoxFuture<'a, DomainResult<()>> {
                 Box::pin(async { Ok(()) })
             }
-            fn list_live<'a>(
-                &'a self,
-                _liveness_window: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
+            fn list_all<'a>(&'a self) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
                 Box::pin(async { Ok(Vec::new()) })
+            }
+            fn prune_stale<'a>(
+                &'a self,
+                _older_than: Duration,
+            ) -> BoxFuture<'a, DomainResult<u64>> {
+                Box::pin(async { Ok(0) })
             }
         }
         // Returns `()` despite the error — no panic, no propagated

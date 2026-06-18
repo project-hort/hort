@@ -137,6 +137,10 @@ pub mod retention_use_case;
 pub mod provenance_orchestration;
 pub(crate) mod scan_history;
 pub mod scan_orchestration;
+// Admin-only read of the scanner_registry worker table, backing
+// `GET /api/v1/admin/workers` / `hort admin workers list` (ADR 0000
+// "Scanner-registry read side orphaned" — wires the orphaned reader).
+pub mod scanner_worker_query_use_case;
 // Read-side use case backing
 // `GET /api/v1/repositories/:name/security-score` and
 // `GET /api/v1/security-score`.

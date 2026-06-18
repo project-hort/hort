@@ -62,12 +62,15 @@ use hort_http_core::context::AppContext;
 ///
 /// The variant list mirrors Cargo's prior art
 /// (`crates/hort-http-cargo/src/upstream_pull.rs::UpstreamPullError`),
-/// adapted to the two-leg PyPI pipeline. `CurationBlocked` is omitted
-/// here: the existing PyPI handlers don't yet emit it; when curation is
-/// extended to the PyPI pull path, add the variant in the same PR that
-/// wires the route. Until then, a curation block bubbles as
-/// `IngestFailed` — the wire-map collapses that to a 500 which is
-/// preferable to inventing a route the use case can't actually reach.
+/// adapted to the two-leg PyPI pipeline. `CurationBlocked` is wired
+/// proactively (latent until a curation rule covers a PyPI proxy
+/// artifact): when the pre-storage curation gate blocks an upstream
+/// pull, `ingest_verified` returns `DomainError::CurationBlocked`, which
+/// the orchestrator surfaces as this variant and the wire-map collapses
+/// to a 404 byte-identical to a genuine miss — the anti-enumeration
+/// contract (`hort_http_core::error`). Without this arm the block would
+/// fall through the catch-all to `IngestFailed` → 500, an observable
+/// enumeration oracle (LOG-1/LOG-2).
 ///
 /// `ParseError(String)` / `IngestFailed(String)` / `Internal(String)`
 /// carry the inner detail for tracing — the wire-map renders
@@ -103,9 +106,18 @@ pub(crate) enum UpstreamPullError {
     #[error("upstream checksum mismatch")]
     ChecksumMismatch,
 
+    /// `IngestUseCase::ingest_verified` returned `CurationBlocked` — a
+    /// curation rule matched the upstream artifact. The ingest use case
+    /// already emitted the audit `tracing::info!`. Wire-map collapses
+    /// this to 404 (byte-identical to a genuine upstream miss) so an
+    /// unauthenticated prober cannot distinguish a curation-blocked
+    /// distribution from a non-existent one — the anti-enumeration
+    /// contract (`hort_http_core::error`) and the Cargo / OCI prior art.
+    #[error("upstream artifact blocked by curation rule")]
+    CurationBlocked,
+
     /// Any other ingest-time error — storage failure, event-store
-    /// failure, repo lookup failure after ingest, curation block.
-    /// Wire to 500.
+    /// failure, repo lookup failure after ingest. Wire to 500.
     #[error("ingest failed: {0}")]
     IngestFailed(String),
 
@@ -437,6 +449,18 @@ pub(crate) async fn try_upstream_file_pull(
             tracing::warn!(conflict = %msg, "PyPI upstream checksum mismatch");
             return Err(UpstreamPullError::ChecksumMismatch);
         }
+        // Leader-side curation block: a curation rule matched the
+        // upstream distribution during `ingest_verified`. Collapse to
+        // 404 (byte-identical to a genuine miss) at the wire-map so a
+        // probe cannot distinguish a blocked distribution from a
+        // non-existent one — mirrors the Cargo prior art and the
+        // anti-enumeration contract (`hort_http_core::error`). Must
+        // precede the catch-all `Err(e)` arm, which would otherwise
+        // route this to a 500.
+        Err(AppError::Domain(DomainError::CurationBlocked { .. })) => {
+            tracing::warn!("PyPI upstream artifact blocked by curation rule");
+            return Err(UpstreamPullError::CurationBlocked);
+        }
         Err(e) => {
             // `fetch_artifact` errors and any other ingest-time
             // infrastructure failure converge here. The original
@@ -652,7 +676,7 @@ fn url_from_entry(entry: &PypiVersionFileInfo, filename: &str) -> DomainResult<S
 ///
 /// | Variant | Status | `X-Hort-Reason` |
 /// |---|---|---|
-/// | `NoUpstreamMapping` | 404 | — |
+/// | `NoUpstreamMapping` / `CurationBlocked` | 404 | — |
 /// | `ChecksumMismatch` | 502 | `upstream-checksum-mismatch` |
 /// | `ParseError` | 502 | `upstream-metadata-malformed` |
 /// | `MetadataFetchFailed{stage}` | 502 | `upstream-metadata-fetch-failed-{stage}` |
@@ -677,13 +701,21 @@ fn url_from_entry(entry: &PypiVersionFileInfo, filename: &str) -> DomainResult<S
 ///   without forcing a wire-map update in the same PR.
 pub(crate) fn map_upstream_pull_error(e: &UpstreamPullError) -> Response {
     match e {
-        UpstreamPullError::NoUpstreamMapping => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header("Content-Type", "application/json")
-            .body(Body::from(
-                serde_json::json!({"error": "package not found"}).to_string(),
-            ))
-            .unwrap(),
+        // `CurationBlocked` collapses to the SAME 404 envelope as a
+        // genuine `NoUpstreamMapping` miss (byte-identical body +
+        // status, no distinguishing header) so an unauthenticated
+        // prober cannot tell a curation-blocked distribution from a
+        // non-existent one — the anti-enumeration contract and the
+        // Cargo / OCI prior art.
+        UpstreamPullError::NoUpstreamMapping | UpstreamPullError::CurationBlocked => {
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": "package not found"}).to_string(),
+                ))
+                .unwrap()
+        }
         UpstreamPullError::ChecksumMismatch => Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .header("Content-Type", "application/json")
@@ -1245,6 +1277,79 @@ mod tests {
         assert!(
             matches!(err, UpstreamPullError::IngestFailed(_)),
             "expected IngestFailed, got {err:?}"
+        );
+    }
+
+    // ---- Branch 8b: ingest_verified returns CurationBlocked → 404 -----------
+
+    /// A curation rule blocks the upstream distribution during
+    /// `ingest_verified`. The orchestrator must surface
+    /// `CurationBlocked` (NOT `IngestFailed`), and the wire-map must
+    /// render it as a 404 **byte-identical** (status + headers + body)
+    /// to a genuine `NoUpstreamMapping` miss — the anti-enumeration
+    /// contract (LOG-1/LOG-2). Mirrors the Cargo
+    /// `ingest_verified_returns_curation_blocked_returns_curation_blocked`
+    /// test. Latent in production until a curation rule covers a PyPI
+    /// proxy artifact; wired proactively for parity.
+    #[tokio::test]
+    async fn ingest_verified_curation_blocked_returns_404_identical_to_miss() {
+        use axum::body::to_bytes;
+        use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
+
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = pypi_repo("pypi-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id, "");
+
+        // Valid per-version JSON + matching sdist bytes — the pull
+        // reaches `ingest_verified`, where the curation gate fires.
+        let body_bytes = b"the actual sdist body".to_vec();
+        let sha = sha256_hex(&body_bytes);
+        let url = "https://files.pythonhosted.org/packages/abc/requests-2.31.0.tar.gz";
+        let json = pypi_json("requests-2.31.0.tar.gz", &sha, url);
+        mocks
+            .upstream_proxy
+            .insert_metadata("", "/pypi/requests/2.31.0/json", json);
+        mocks.upstream_proxy.insert_artifact("", url, body_bytes);
+
+        // Curation rule that matches everything in this repo.
+        let rule = CurationRule {
+            id: Uuid::new_v4(),
+            name: "block-all".into(),
+            format: None,
+            package_pattern: "*".into(),
+            action: CurationRuleAction::Block,
+            reason: "policy".into(),
+            managed_by: ManagedBy::GitOps,
+            managed_by_digest: Some([0xab; 32]),
+        };
+        mocks.curation_rules.set_rules_for_repo(repo.id, vec![rule]);
+
+        let err = try_upstream_file_pull(&ctx, &repo, "requests", "requests-2.31.0.tar.gz")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::CurationBlocked),
+            "expected CurationBlocked, got {err:?}"
+        );
+
+        // The rendered response must be a 404 byte-identical to a
+        // genuine `NoUpstreamMapping` miss — no enumeration oracle.
+        let blocked = map_upstream_pull_error(&UpstreamPullError::CurationBlocked);
+        let miss = map_upstream_pull_error(&UpstreamPullError::NoUpstreamMapping);
+        assert_eq!(blocked.status(), StatusCode::NOT_FOUND);
+        assert_eq!(blocked.status(), miss.status());
+        assert_eq!(
+            blocked.headers(),
+            miss.headers(),
+            "curation-blocked headers must match a genuine miss"
+        );
+        let blocked_body = to_bytes(blocked.into_body(), usize::MAX).await.unwrap();
+        let miss_body = to_bytes(miss.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            blocked_body, miss_body,
+            "curation-blocked body must be byte-identical to a genuine miss"
         );
     }
 

@@ -43,20 +43,48 @@ verify identically.**
    transparency-log fetch on the verify path.** The verifier
    (`crates/hort-adapters-provenance-sigstore/src/verifier.rs`) validates a
    stored Sigstore v0.3 bundle's own material — Fulcio certificate chain
-   (with SCT), Rekor inclusion proof / SignedEntryTimestamp — against a
-   cached trust root (`src/trust_root.rs`), and matches the observed signer
-   `{issuer, san}` extracted from the leaf certificate (`src/identity.rs`)
-   against the policy's allowed-identity patterns. The trust root is loaded
-   **once at boot** from an operator-provisioned `trusted_root.json`
+   (with SCT), artifact signature, digest binding, **and the Rekor Merkle
+   inclusion proof + checkpoint signature** — against a cached trust root
+   (`src/trust_root.rs`), and matches the observed signer `{issuer, san}`
+   extracted from the leaf certificate (`src/identity.rs`) against the
+   policy's allowed-identity patterns. The trust root is loaded **once at
+   boot** from an operator-provisioned `trusted_root.json`
    (`HORT_PROVENANCE_TRUSTED_ROOT_FILE`); a missing, malformed, or stale file
-   is a hard boot error (`crates/hort-worker/src/composition.rs:1452`). The
-   adapter's live-refresh helper exists but is deliberately unwired — the
-   root rotates through the release pipeline, never a runtime fetch. A bundle
-   lacking offline-verifiable material is `Rejected{BundleMalformed}`; an
-   absent bundle is `NoAttestation`; neither ever falls back to a live
-   lookup. Signature binding is to the artifact preimage: the verifier
-   recomputes the digest from the bytes, so a valid bundle for a *different*
-   digest can never yield `Verified`.
+   is a hard boot error (`crates/hort-worker/src/composition.rs`), as is a
+   trust root carrying no Rekor public key (it would reject every bundle
+   `RekorNotFound`). The adapter's live-refresh helper exists but is
+   deliberately unwired — the root rotates through the release pipeline,
+   never a runtime fetch. A bundle lacking offline-verifiable material is
+   `Rejected{BundleMalformed}`; an absent bundle is `NoAttestation`; neither
+   ever falls back to a live lookup. Signature binding is to the artifact
+   preimage: the verifier recomputes the digest from the bytes, so a valid
+   bundle for a *different* digest can never yield `Verified`.
+
+   **Rekor inclusion verification (closes sigstore-rs#285 for v0.3).** The
+   pinned `sigstore` 0.14 `verify_digest` leaves the Rekor Merkle inclusion
+   proof + checkpoint/SET steps as upstream `TODO`s. The adapter closes that
+   gap **offline** for the v0.3 bundle format
+   (`src/inclusion.rs`): after `verify_digest` succeeds it reconstructs the
+   public `rekor::models::InclusionProof` from the bundle's protobuf
+   transparency-log entry (fail-closed `Vec<u8> → [u8; 32]` width checks; the
+   checkpoint signed-note envelope parsed via `SignedCheckpoint`) and runs
+   the crate's cryptographically-complete `InclusionProof::verify` — full
+   RFC-6962 Merkle inclusion over the entry's `canonicalized_body` leaf, the
+   checkpoint signature, and root/tree-size consistency — against the Rekor
+   public key selected from the pinned trust root by the entry's `logID`. Any
+   failure is fail-closed `Rejected{RekorNotFound}` (never a panic, skip, or
+   live fetch). Verification now attests *"a valid Fulcio cert + SCT for a
+   policy-allowed signer signed these bytes **and** the entry is provably in
+   the public Rekor transparency log."* The older v0.1 SET-only
+   (`inclusion_promise`) path is out of scope and rejected. Route A (the
+   official `sigstore` 0.14 public `InclusionProof::verify` primitive, no
+   dependency swap) was chosen over migrating to the third-party
+   `sigstore-verify` 0.8 crate: a source review found the latter **never
+   computes the Merkle leaf→root proof** (its `inclusion_proof.hashes` audit
+   path is unused — it verifies only the checkpoint signature plus a
+   same-bundle root-hash equality), so it is *weaker* on the exact guarantee
+   this closes, and it would raise supply-chain surface (a conda-ecosystem
+   reimplementation, not official sigstore-rs).
 2. **Deploy-time opt-in, policy-time mode.** The cosign verifier registers in
    the worker only when `HORT_PROVENANCE_COSIGN_ENABLED=true` (default
    `false` — `crates/hort-worker/src/config.rs:350`). The per-policy field is

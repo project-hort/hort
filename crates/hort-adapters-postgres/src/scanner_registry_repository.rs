@@ -2,8 +2,9 @@
 //! worker-coordination table from migration 009 (ADR 0009).
 //!
 //! The adapter uses the runtime `hort_app_role` Postgres role
-//! (DML only — no DDL). Migration 009 grants `SELECT, INSERT,
-//! UPDATE` on `scanner_registry` to that role.
+//! (DML only — no DDL). Migration 009 grants `SELECT, INSERT, UPDATE,
+//! DELETE` on `scanner_registry` to that role (DELETE backs the
+//! `prune_stale` housekeeping sweep).
 
 use std::time::Duration;
 
@@ -17,6 +18,13 @@ use hort_domain::ports::scanner_registry_repository::{
 };
 
 use crate::{map_sqlx_error, BoxFuture};
+
+/// Defensive cap on `list_all` — the admin read returns at most this many
+/// of the most-recently-seen workers. `prune_stale` keeps the table well
+/// under it; the cap only bites if pruning lags badly, and even then the
+/// live workers (highest `last_heartbeat`) always sort to the top, so it
+/// only ever drops the oldest dead rows.
+const LIST_CAP: i64 = 1000;
 
 /// PostgreSQL adapter for [`ScannerRegistryRepository`].
 pub struct PgScannerRegistryRepository {
@@ -94,28 +102,28 @@ impl ScannerRegistryRepository for PgScannerRegistryRepository {
         })
     }
 
-    fn list_live<'a>(
-        &'a self,
-        liveness_window: Duration,
-    ) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
-        let interval = duration_to_pg_interval(liveness_window);
+    fn list_all<'a>(&'a self) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
         Box::pin(async move {
+            // Most-recently-seen first + a defensive `LIMIT`: the read is
+            // admin-facing and must stay bounded even if pruning lags. Live
+            // workers (highest `last_heartbeat`) always sort to the top, so
+            // the cap only ever drops the oldest dead rows.
             let rows = sqlx::query(
                 "SELECT worker_id, backends, registered_at, last_heartbeat\n\
                    FROM public.scanner_registry\n\
-                  WHERE last_heartbeat > now() - $1\n\
-                  ORDER BY worker_id",
+                  ORDER BY last_heartbeat DESC\n\
+                  LIMIT $1",
             )
-            .bind(interval)
+            .bind(LIST_CAP)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| map_sqlx_error(&e, "ScannerRegistryEntry", "list_live"))?;
+            .map_err(|e| map_sqlx_error(&e, "ScannerRegistryEntry", "list_all"))?;
 
             rows.iter()
                 .map(|row| {
                     let worker_id: String = row
                         .try_get("worker_id")
-                        .map_err(|e| map_sqlx_error(&e, "ScannerRegistryEntry", "list_live"))?;
+                        .map_err(|e| map_sqlx_error(&e, "ScannerRegistryEntry", "list_all"))?;
                     let backends: Vec<String> = row
                         .try_get("backends")
                         .map_err(|e| map_sqlx_error(&e, "ScannerRegistryEntry", &worker_id))?;
@@ -135,20 +143,34 @@ impl ScannerRegistryRepository for PgScannerRegistryRepository {
                 .collect()
         })
     }
+
+    fn prune_stale<'a>(&'a self, older_than: Duration) -> BoxFuture<'a, DomainResult<u64>> {
+        let interval = duration_to_pg_interval(older_than);
+        Box::pin(async move {
+            let result = sqlx::query(
+                "DELETE FROM public.scanner_registry\n\
+                  WHERE last_heartbeat < now() - $1",
+            )
+            .bind(interval)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "ScannerRegistryEntry", "prune_stale"))?;
+            Ok(result.rows_affected())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `duration_to_pg_interval` round-trips a typical 5-minute
-    /// liveness window.
+    /// `duration_to_pg_interval` round-trips a typical 7-day prune horizon.
     #[test]
-    fn duration_to_pg_interval_5_minutes() {
-        let i = duration_to_pg_interval(Duration::from_secs(300));
+    fn duration_to_pg_interval_7_days() {
+        let i = duration_to_pg_interval(Duration::from_secs(7 * 24 * 3600));
         assert_eq!(i.months, 0);
         assert_eq!(i.days, 0);
-        assert_eq!(i.microseconds, 300_000_000);
+        assert_eq!(i.microseconds, 7 * 24 * 3600 * 1_000_000);
     }
 
     /// Overflow clamps rather than panics. Mirrors the jobs_repository
@@ -157,13 +179,5 @@ mod tests {
     fn duration_to_pg_interval_clamps_overflow() {
         let i = duration_to_pg_interval(Duration::from_secs(u64::MAX / 2));
         assert_eq!(i.microseconds, i64::MAX);
-    }
-
-    /// Zero is zero microseconds — a degenerate liveness window
-    /// returns an empty list (no rows match `> now() - 0`).
-    #[test]
-    fn duration_to_pg_interval_zero() {
-        let i = duration_to_pg_interval(Duration::from_secs(0));
-        assert_eq!(i.microseconds, 0);
     }
 }

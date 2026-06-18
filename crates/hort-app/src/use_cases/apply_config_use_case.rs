@@ -145,7 +145,6 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, RepositoryUpstreamMappingArgs, RepositoryUpstreamMappingRepository,
     UpstreamAuth,
 };
-use hort_domain::ports::scanner_registry_repository::ScannerRegistryRepository;
 use hort_domain::ports::secret_port::SecretRef;
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
@@ -383,19 +382,6 @@ pub struct ApplyConfigUseCase {
     /// order reason as `IngestUseCase` and `QuarantineUseCase`: the
     /// wrapper sits at a higher tier.
     content_references: Arc<dyn ContentReferenceIndex>,
-    /// Read-side worker-coordination
-    /// port consulted at apply-time to validate
-    /// `ScanPolicy.scan_backends` entries against the union of
-    /// currently-registered backends. The validator
-    /// (`hort_config::desired::validate_scan_policy_backends`) runs after
-    /// the snapshot/env validation pass — it needs the registry
-    /// snapshot which is intentionally NOT threaded through
-    /// `CurrentSnapshot` (that struct is the read-side
-    /// `ManagedBy=Local` snapshot; `scanner_registry` is a write-side
-    /// worker-coordination table — see
-    /// `docs/architecture/explanation/scanning-pipeline.md`).
-    /// Liveness window pinned to 5 minutes.
-    scanner_registry: Arc<dyn ScannerRegistryRepository>,
     /// Read/write port for `oidc_issuers` (ADR 0018). The
     /// apply pipeline is the only writer; the federation handler
     /// is the only read-heavy consumer.
@@ -607,7 +593,6 @@ impl ApplyConfigUseCase {
         upstream_mappings: Arc<dyn RepositoryUpstreamMappingRepository>,
         upstream_allowlist: UpstreamHostAllowlist,
         content_references: Arc<dyn ContentReferenceIndex>,
-        scanner_registry: Arc<dyn ScannerRegistryRepository>,
         oidc_issuers: Arc<dyn OidcIssuerRepository>,
         service_accounts: Arc<dyn ServiceAccountRepository>,
         users: Arc<dyn UserRepository>,
@@ -625,7 +610,6 @@ impl ApplyConfigUseCase {
             upstream_mappings,
             upstream_allowlist,
             content_references,
-            scanner_registry,
             oidc_issuers,
             service_accounts,
             users,
@@ -761,7 +745,7 @@ impl ApplyConfigUseCase {
     /// and calls this after [`Self::new`]; without it, the cross-check
     /// is skipped (`None` slot — every pre-existing test harness keeps
     /// compiling/passing unchanged). Builder-shaped exactly like
-    /// `with_lint_config` / `with_retention` so the 16-arg constructor
+    /// `with_lint_config` / `with_retention` so the constructor
     /// signature is byte-unchanged (no port-contract change, no
     /// `ApplyConfigUseCase::new` change). The value is the *true*
     /// `{filesystem, s3}` deployment fact — never the coarse
@@ -877,8 +861,10 @@ impl ApplyConfigUseCase {
     /// the SA->issuer FK check, the `scanBackends` /
     /// `trust_upstream_publish_time` / `prefetchPolicy.maxAgeDays` /
     /// provenance linters, and the per-repo storage-backend check. Only the
-    /// `build_snapshot` reads + the `scanner_registry.list_live` read touch
-    /// the database -- zero writes.
+    /// `build_snapshot` reads touch the database -- zero writes. (The
+    /// `scanBackends` check validates against the compiled-in
+    /// `crate::scanning::KNOWN_SCAN_BACKENDS` set, so it does no I/O and is
+    /// immune to worker-registration timing -- see regression H20.)
     ///
     /// This is the seam `gitops_boot` uses (via [`Self::preflight_validate`])
     /// to PARK not-ready on a pre-write config error instead of
@@ -983,40 +969,36 @@ impl ApplyConfigUseCase {
             }
         }
 
-        // ----- Apply-time scanner-
-        // backend validation against the live worker registry. Surfaces
-        // unknown `scanBackends:` entries as YAML errors before the
-        // diff/apply stage starts, matching the error shape used by
-        // `validate_against` (snapshot+env). The validator
-        // (`hort_config::desired::validate_scan_policy_backends`) is
-        // intentionally not folded into `validate_against` because that
-        // signature is snapshot-only — `scanner_registry` is a
-        // write-side worker-coordination table, distinct from the
-        // read-side `ManagedBy=Local` snapshot. See the
-        // validator's rustdoc for the rationale.
+        // ----- Apply-time scanner-backend validation against the
+        // compiled-in capability set (`crate::scanning::KNOWN_SCAN_BACKENDS`),
+        // NOT the live `scanner_registry`. Surfaces an unknown
+        // `scanBackends:` entry (a typo, or a backend this build does not
+        // ship) as a pre-write `Validation` error before the diff/apply
+        // stage starts, matching the error shape used by `validate_against`
+        // (snapshot+env).
         //
-        // Liveness window pinned to 5 minutes
-        // (workers whose `last_heartbeat > now() - 5 minutes`).
-        let live_workers = self
-            .scanner_registry
-            .list_live(std::time::Duration::from_secs(300))
-            .await?;
-        let live_backends: Vec<String> = {
-            use std::collections::BTreeSet;
-            let mut set: BTreeSet<String> = BTreeSet::new();
-            for entry in &live_workers {
-                for b in &entry.backends {
-                    set.insert(b.clone());
-                }
-            }
-            set.into_iter().collect()
-        };
+        // Why the static set and not the live `scanner_registry`:
+        // validating a backend *name* against the live worker registry was a
+        // boot-ordering hazard (regression H20). On a fresh deployment the
+        // gitops boot runs this preflight before any `hort-worker` has
+        // registered its first heartbeat, so the live set is transiently
+        // empty and a correct `scanBackends: [trivy]` policy was rejected
+        // fail-closed — parking the server not-ready with no retry. A
+        // backend name is valid or not as a permanent property of the build,
+        // independent of worker-registration timing; whether a worker
+        // advertising it is *running* is a runtime-liveness concern for
+        // metrics/health, not a config-validity error. See
+        // `crate::scanning` and the validator's rustdoc.
+        let valid_backends: Vec<String> = crate::scanning::KNOWN_SCAN_BACKENDS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let scan_backend_errors =
-            hort_config::desired::validate_scan_policy_backends(desired, &live_backends);
+            hort_config::desired::validate_scan_policy_backends(desired, &valid_backends);
         if !scan_backend_errors.is_empty() {
             tracing::error!(
                 error_count = scan_backend_errors.len(),
-                "gitops apply: scanBackends validation failed against scanner_registry"
+                "gitops apply: scanBackends validation failed (unsupported backend)"
             );
             let joined = scan_backend_errors
                 .into_iter()
@@ -4237,12 +4219,11 @@ fn create_command_from_spec(
         max_artifact_age_secs: env.spec.max_artifact_age.as_deref().map(humantime_secs),
         license_policy: env.spec.license_policy.clone(),
         // `scan_backends` flows from YAML to the
-        // create command. Apply-time validation against the live
-        // `scanner_registry` happens upstream of this helper, in
-        // `ApplyConfigUseCase::apply` (see the
+        // create command. Apply-time validation against the compiled-in
+        // `crate::scanning::KNOWN_SCAN_BACKENDS` set happens upstream of this
+        // helper, in `ApplyConfigUseCase::apply` (see the
         // `validate_scan_policy_backends` call site there); reaching
-        // this code path implies every entry already resolves against
-        // a registered backend.
+        // this code path implies every entry is a supported backend.
         scan_backends: env.spec.scan_backends.clone(),
         // `rescan_interval_hours` flows from YAML to
         // the create command. `validate_scan_policy` (hort-config) has
@@ -5119,13 +5100,6 @@ mod tests {
         // tests don't seed rows).
         #[allow(dead_code)]
         content_refs: Arc<crate::use_cases::test_support::MockContentReferenceIndex>,
-        // Scanner-registry mock. Default
-        // harness seeds one live worker advertising `["trivy"]` so
-        // existing tests whose `ScanPolicy.scan_backends` defaults to
-        // `["trivy"]` continue to validate cleanly. Backend-validation
-        // tests build a fresh harness with `build_harness_with_registry`.
-        #[allow(dead_code)]
-        scanner_registry: Arc<crate::use_cases::test_support::MockScannerRegistryRepository>,
         // OidcIssuer / ServiceAccount gitops surface mocks. Default empty;
         // SA tests seed via the `repos` mock + the harness's `users`
         // mock and let the apply pipeline write through.
@@ -5171,13 +5145,6 @@ mod tests {
         );
         let content_refs =
             Arc::new(crate::use_cases::test_support::MockContentReferenceIndex::new());
-        // Default mock seeds one live
-        // worker advertising `["trivy"]`, matching the default
-        // `scan_backends` from `hort-config`. Existing tests whose
-        // policies declare `scan_backends: ["trivy"]` continue to
-        // pass apply-time validation without per-test setup.
-        let scanner_registry =
-            Arc::new(crate::use_cases::test_support::MockScannerRegistryRepository::new());
         let policies = Arc::new(PolicyUseCase::new(
             crate::event_store_publisher::wrap_for_test(events.clone()),
             proj.clone(),
@@ -5209,7 +5176,6 @@ mod tests {
             // harness with `build_harness_with_allowlist`.
             UpstreamHostAllowlist::Disabled,
             content_refs.clone(),
-            scanner_registry.clone(),
             oidc_issuers.clone(),
             service_accounts.clone(),
             users.clone(),
@@ -5233,83 +5199,6 @@ mod tests {
             lifecycle,
             upstream,
             content_refs,
-            scanner_registry,
-            oidc_issuers,
-            service_accounts,
-            users,
-        }
-    }
-
-    /// Build a harness whose
-    /// `scanner_registry` mock returns the supplied liveness snapshot.
-    /// `workers` is `[(worker_id, [backend, ...])]`. Use
-    /// `build_harness_with_registry(vec![])` for the empty-registry
-    /// arm.
-    fn build_harness_with_registry(workers: Vec<(&str, Vec<&str>)>) -> Harness {
-        let repos = Arc::new(MockRepositoryRepository::new());
-        let claim_mappings = Arc::new(MockClaimMappingRepo::new());
-        let grant_repo = Arc::new(MockPermissionGrantRepo::new());
-        let rule_repo = Arc::new(MockCurationRuleRepo::new());
-        let proj = Arc::new(MockPolicyProjections::new());
-        let events = Arc::new(MockPolicyEventStore::new());
-        let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
-        let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
-            artifacts.clone(),
-        ));
-        let upstream = Arc::new(
-            crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository::new(),
-        );
-        let content_refs =
-            Arc::new(crate::use_cases::test_support::MockContentReferenceIndex::new());
-        let scanner_registry = Arc::new(
-            crate::use_cases::test_support::MockScannerRegistryRepository::with_entries(workers),
-        );
-        let policies = Arc::new(PolicyUseCase::new(
-            crate::event_store_publisher::wrap_for_test(events.clone()),
-            proj.clone(),
-            artifacts.clone(),
-            lifecycle.clone(),
-            Arc::new(crate::use_cases::test_support::MockStoragePort::new()),
-            default_repository_access_for_policy(),
-        ));
-        let oidc_issuers =
-            Arc::new(crate::use_cases::test_support::MockOidcIssuerRepository::new());
-        let service_accounts =
-            Arc::new(crate::use_cases::test_support::MockServiceAccountRepository::new());
-        let users = Arc::new(crate::use_cases::test_support::MockUserRepository::new());
-        let uc = ApplyConfigUseCase::new(
-            repos.clone(),
-            claim_mappings.clone(),
-            grant_repo.clone(),
-            rule_repo.clone(),
-            proj.clone(),
-            policies,
-            artifacts.clone(),
-            lifecycle.clone(),
-            crate::event_store_publisher::wrap_for_test(events.clone()),
-            upstream.clone(),
-            UpstreamHostAllowlist::Disabled,
-            content_refs.clone(),
-            scanner_registry.clone(),
-            oidc_issuers.clone(),
-            service_accounts.clone(),
-            users.clone(),
-        )
-        // Permissive linter (see `build_harness`).
-        .with_lint_config(crate::lint::LintConfig::permissive_for_tests());
-        Harness {
-            uc,
-            repos,
-            claim_mappings,
-            grant_repo,
-            rule_repo,
-            proj,
-            events,
-            artifacts,
-            lifecycle,
-            upstream,
-            content_refs,
-            scanner_registry,
             oidc_issuers,
             service_accounts,
             users,
@@ -5336,8 +5225,6 @@ mod tests {
         );
         let content_refs =
             Arc::new(crate::use_cases::test_support::MockContentReferenceIndex::new());
-        let scanner_registry =
-            Arc::new(crate::use_cases::test_support::MockScannerRegistryRepository::new());
         let policies = Arc::new(PolicyUseCase::new(
             crate::event_store_publisher::wrap_for_test(events.clone()),
             proj.clone(),
@@ -5364,7 +5251,6 @@ mod tests {
             upstream.clone(),
             allowlist,
             content_refs.clone(),
-            scanner_registry.clone(),
             oidc_issuers.clone(),
             service_accounts.clone(),
             users.clone(),
@@ -5383,7 +5269,6 @@ mod tests {
             lifecycle,
             upstream,
             content_refs,
-            scanner_registry,
             oidc_issuers,
             service_accounts,
             users,
@@ -9829,7 +9714,6 @@ mod tests {
             h.upstream.clone(),
             UpstreamHostAllowlist::Hosts(vec!["registry.npmjs.org".to_string()]),
             h.content_refs.clone(),
-            h.scanner_registry.clone(),
             h.oidc_issuers.clone(),
             h.service_accounts.clone(),
             h.users.clone(),
@@ -9855,8 +9739,13 @@ mod tests {
     //
     // The validator (`hort_config::desired::validate_scan_policy_backends`)
     // is unit-tested in `hort-config`; these tests pin the *wiring* — that
-    // `ApplyConfigUseCase::apply` actually invokes it against the live
-    // `scanner_registry` snapshot before the diff/apply stage.
+    // `ApplyConfigUseCase::apply` invokes it against the compiled-in
+    // `crate::scanning::KNOWN_SCAN_BACKENDS` set (NOT the live
+    // `scanner_registry`) before the diff/apply stage. Validating against
+    // the static set is what makes a correct `scanBackends: [trivy]` policy
+    // apply on a fresh boot with zero workers registered (regression H20);
+    // `build_harness()` wires no scanner registry at all, so these tests
+    // exercise exactly that no-workers posture.
     // ------------------------------------------------------------------
 
     /// Helper for the backend-validation tests — build a `ScanPolicy` with the
@@ -9890,7 +9779,7 @@ mod tests {
     /// colliding on the UNIQUE-name constraint.
     #[tokio::test]
     async fn apply_reactivates_archived_policy_when_yaml_re_declares_same_name() {
-        let h = build_harness_with_registry(vec![("w1", vec!["trivy"])]);
+        let h = build_harness();
         let policy_id = Uuid::new_v4();
         let now = Utc::now();
         h.proj.insert_active(ScanPolicyProjection {
@@ -9966,11 +9855,11 @@ mod tests {
     }
 
     /// Apply succeeds when every entry in
-    /// `ScanPolicy.scan_backends` matches a backend advertised by some
-    /// live worker in the registry. Pins the happy path of the wiring.
+    /// `ScanPolicy.scan_backends` is a supported (compiled-in) backend.
+    /// Pins the happy path of the wiring.
     #[tokio::test]
-    async fn apply_succeeds_when_scan_backends_match_registered() {
-        let h = build_harness_with_registry(vec![("w1", vec!["trivy"])]);
+    async fn apply_succeeds_when_scan_backends_are_supported() {
+        let h = build_harness();
         let mut desired = DesiredState::default();
         desired
             .scan_policies
@@ -9978,17 +9867,37 @@ mod tests {
         let report =
             h.uc.apply(desired, env_oidc())
                 .await
-                .expect("apply must succeed when scan_backends ⊆ live registry");
+                .expect("apply must succeed when scan_backends ⊆ KNOWN_SCAN_BACKENDS");
         assert_eq!(report.created, 1);
     }
 
-    /// Apply rejects an unknown `scan_backends`
+    /// H20 regression. A correct `scan_backends: [trivy]` policy must apply
+    /// even though NO scanner worker has registered — the production
+    /// boot-race posture (`build_harness()` wires no scanner registry at
+    /// all). The previous build validated `scan_backends` against the live
+    /// `scanner_registry`, so on a fresh deploy this rejected fail-closed and
+    /// parked the server not-ready with no retry. Validating against the
+    /// compiled-in `KNOWN_SCAN_BACKENDS` set removes the race.
+    #[tokio::test]
+    async fn apply_succeeds_for_known_backend_without_live_workers() {
+        let h = build_harness();
+        let mut desired = DesiredState::default();
+        desired
+            .scan_policies
+            .push(scan_policy_with_backends("p1", vec!["trivy"]));
+        let report = h.uc.apply(desired, env_oidc()).await.expect(
+            "H20: a correct scan_backends:[trivy] policy must apply with zero workers registered",
+        );
+        assert_eq!(report.created, 1);
+    }
+
+    /// Apply rejects an unsupported `scan_backends`
     /// entry with a `Validation` error. Without the wiring, this test
     /// fails because `apply` returns `Ok` (the misconfiguration only
     /// surfaces at runtime as a `tracing::warn!` from the orchestrator).
     #[tokio::test]
     async fn apply_rejects_unknown_scan_backend_with_validation_error() {
-        let h = build_harness_with_registry(vec![("w1", vec!["trivy"])]);
+        let h = build_harness();
         let mut desired = DesiredState::default();
         desired
             .scan_policies
@@ -9996,7 +9905,7 @@ mod tests {
         let err =
             h.uc.apply(desired, env_oidc())
                 .await
-                .expect_err("apply must reject scan_backends entry not in registry");
+                .expect_err("apply must reject an unsupported scan_backends entry");
         match err {
             AppError::Domain(DomainError::Validation(msg)) => {
                 assert!(
@@ -10005,7 +9914,7 @@ mod tests {
                 );
                 assert!(
                     msg.contains("trivy"),
-                    "validation error must list the registered names so the operator \
+                    "validation error must list the supported names so the operator \
                      spots the typo, got: {msg}"
                 );
             }
@@ -10013,40 +9922,13 @@ mod tests {
         }
     }
 
-    /// Empty registry plus a non-empty
-    /// `scan_backends` is rejected loudly: `apply` fails with the
-    /// literal `<no live worker registered>` so operators see "no
-    /// workers ticking" rather than a confusing `got X, expected []`.
-    #[tokio::test]
-    async fn apply_rejects_scan_backends_when_registry_empty() {
-        let h = build_harness_with_registry(vec![]);
-        let mut desired = DesiredState::default();
-        desired
-            .scan_policies
-            .push(scan_policy_with_backends("p1", vec!["trivy"]));
-        let err =
-            h.uc.apply(desired, env_oidc())
-                .await
-                .expect_err("apply must fail loud when no workers are live");
-        match err {
-            AppError::Domain(DomainError::Validation(msg)) => {
-                assert!(
-                    msg.contains("<no live worker registered>"),
-                    "empty-registry error must surface the literal \
-                     `<no live worker registered>`, got: {msg}"
-                );
-            }
-            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
-        }
-    }
-
     /// Empty `scan_backends` is the operator opt-out
-    /// path: the policy is valid even when the registry is empty. The
-    /// validator's empty-input rule (see `validate_scan_policy_backends`
-    /// rustdoc) must keep working through the wiring.
+    /// path: the policy is valid (ADR 0007 `ScanWaived`). The validator's
+    /// empty-input rule (see `validate_scan_policy_backends` rustdoc) must
+    /// keep working through the wiring.
     #[tokio::test]
-    async fn apply_accepts_empty_scan_backends_regardless_of_registry() {
-        let h = build_harness_with_registry(vec![]);
+    async fn apply_accepts_empty_scan_backends() {
+        let h = build_harness();
         let mut desired = DesiredState::default();
         desired
             .scan_policies
@@ -10054,18 +9936,18 @@ mod tests {
         let report =
             h.uc.apply(desired, env_oidc())
                 .await
-                .expect("apply must accept opt-out (empty scan_backends) even with empty registry");
+                .expect("apply must accept opt-out (empty scan_backends)");
         assert_eq!(report.created, 1);
     }
 
     /// A `DesiredState` with no `ScanPolicy`
-    /// envelopes still triggers the validator (which iterates an empty
-    /// list and returns no errors) and apply proceeds. Pins that the
-    /// wiring does NOT short-circuit the registry call on an empty
-    /// `desired.scan_policies` — the call is harmless and uniform.
+    /// envelopes still runs the validator (which iterates an empty list and
+    /// returns no errors) and apply proceeds. Pins that the wiring does NOT
+    /// special-case an empty `desired.scan_policies` — the check is harmless
+    /// and uniform.
     #[tokio::test]
     async fn apply_with_no_scan_policy_skips_backend_validation() {
-        let h = build_harness_with_registry(vec![]);
+        let h = build_harness();
         let desired = DesiredState::default();
         let _report =
             h.uc.apply(desired, env_oidc())
@@ -10106,7 +9988,7 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let h = build_harness_with_registry(vec![("w1", vec!["trivy"])]);
+                let h = build_harness();
                 let mut mapping_env = upstream_mapping_env(
                     "oci-mirror-dockerhub",
                     "oci-mirror-e2e",
@@ -10178,7 +10060,7 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let h = build_harness_with_registry(vec![("w1", vec!["trivy"])]);
+                let h = build_harness();
                 let mut mapping_env = upstream_mapping_env(
                     "oci-mirror-dockerhub",
                     "oci-mirror-e2e",
@@ -10721,7 +10603,7 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let h = build_harness_with_registry(vec![("w1", vec!["trivy"])]);
+                let h = build_harness();
                 let mut m1 =
                     upstream_mapping_env("m1", "mirror-a", "a/", "https://registry-1.docker.io");
                 m1.spec.trust_upstream_publish_time = true;
@@ -11094,7 +10976,7 @@ mod tests {
     /// `apply_rejects_unknown_scan_backend_with_validation_error`.
     #[tokio::test]
     async fn preflight_validate_rejects_unknown_scan_backend() {
-        let h = build_harness_with_registry(vec![("w1", vec!["trivy"])]);
+        let h = build_harness();
         let mut desired = DesiredState::default();
         desired
             .scan_policies
@@ -11102,7 +10984,7 @@ mod tests {
         let err =
             h.uc.preflight_validate(&desired, &env_oidc())
                 .await
-                .expect_err("preflight must reject a scan_backends entry not in the registry");
+                .expect_err("preflight must reject an unsupported scan_backends entry");
         match err {
             AppError::Domain(DomainError::Validation(msg)) => {
                 assert!(
@@ -11112,6 +10994,26 @@ mod tests {
             }
             other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
         }
+    }
+
+    /// H20 regression, boot path. `preflight_validate` is the seam
+    /// `gitops_boot` runs before `apply`; on a fresh deploy it executes
+    /// before any worker has registered. A correct `scan_backends: [trivy]`
+    /// policy must pass preflight (return `Ok`) in that no-workers posture —
+    /// the previous build returned `DomainError::Validation` here, which
+    /// `gitops_boot` mapped to the park-eligible
+    /// `GitopsBootError::PreflightValidate`, parking the pod not-ready with
+    /// no retry.
+    #[tokio::test]
+    async fn preflight_validate_accepts_known_backend_without_live_workers() {
+        let h = build_harness();
+        let mut desired = DesiredState::default();
+        desired
+            .scan_policies
+            .push(scan_policy_with_backends("p1", vec!["trivy"]));
+        h.uc.preflight_validate(&desired, &env_oidc()).await.expect(
+            "H20: preflight must accept scan_backends:[trivy] with zero workers registered",
+        );
     }
 
     /// `preflight_validate` returns `Ok(())` for a valid config AND
@@ -11431,7 +11333,6 @@ mod tests {
             h.upstream.clone(),
             UpstreamHostAllowlist::Disabled,
             h.content_refs.clone(),
-            h.scanner_registry.clone(),
             h.oidc_issuers.clone(),
             h.service_accounts.clone(),
             h.users.clone(),

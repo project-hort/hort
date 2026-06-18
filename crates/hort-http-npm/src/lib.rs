@@ -813,11 +813,13 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
-    /// npm publish hits a curation `Block` rule. npm only has a
-    /// client-upload path (PUT /:repo_key/:name) — there is no
-    /// pull-through fetch handler today, so the per-format 404-override
-    /// does not apply here. The default `DomainError::CurationBlocked`
-    /// → 403 mapping in `hort_http_core::error::ApiError::into_response`
+    /// npm publish hits a curation `Block` rule. This is the
+    /// client-upload path (PUT /:repo_key/:name); the per-format
+    /// 404-override applies only to the pull-through *fetch* path
+    /// (`try_upstream_tarball_pull`'s `CurationBlocked` arm → 404,
+    /// byte-identical to a miss). On the publish path the default
+    /// `DomainError::CurationBlocked` → 403 mapping in
+    /// `hort_http_core::error::ApiError::into_response` applies, so this
     /// must surface as 403 with the rule's reason in the body.
     #[tokio::test]
     async fn publish_unscoped_curation_block_returns_403() {

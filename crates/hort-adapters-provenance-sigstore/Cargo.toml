@@ -27,6 +27,9 @@ serde_json = { workspace = true }
 hex        = { workspace = true }
 sha2       = { workspace = true }
 chrono     = { workspace = true }
+# Adapter-layer observability (ADR 0027 §9): a `debug!` records which
+# fail-closed branch a Rekor-inclusion rejection took (never key bytes).
+tracing    = { workspace = true }
 
 # Sigstore verification primitives (ADR 0027). Offline bundle verify
 # against an injectable trust root (`ManualTrustRoot` / `SigstoreTrustRoot::
@@ -68,3 +71,13 @@ rcgen = "0.13"
 # In-process HTTP server for the TUF trust-root refresh fetch test (the
 # only live-HTTP path in the crate). Same dev-dep the OSV adapter uses.
 wiremock = "0.6"
+# Test-only: synthesize a valid single-/two-leaf Rekor Merkle inclusion
+# proof + signed checkpoint to prove `inclusion::verify_inclusion` runs the
+# real RFC-6962 fold + ECDSA P-256 checkpoint-signature path (no network,
+# no committed key). `aws-lc-rs` is the workspace-standard crypto provider
+# (the same one `sigstore`/`jsonwebtoken` use, already in the locked graph
+# — adds no new transitive crate); `base64` (the `"0.22"` workspace line)
+# encodes the checkpoint root + signature into the signed-note envelope.
+# Both are dev-deps in sibling adapter crates (oidc / upstream-http / k8s).
+aws-lc-rs = "1.16"
+base64 = "0.22"

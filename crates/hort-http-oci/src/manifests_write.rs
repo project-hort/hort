@@ -417,12 +417,20 @@ pub(crate) async fn put_manifest_dispatch(
             }
         }
     } else {
-        // Tag-ref PUT: still declare the computed hash so the ingest
-        // path has a consistent post-storage check. `IngestUseCase::ingest`
-        // treats `declared_sha256 = Some(computed)` as a tautology in
-        // this case, but asserting it closes a latent window where a
-        // concurrent mutation between compute and commit would slip
-        // through.
+        // Tag-ref PUT: validate the tag against the OCI grammar (INJ-4 — the
+        // same `validate_oci_tag` the GET/serve path uses) BEFORE it becomes
+        // a stored ref, via the shared `tag_invalid_response` mapping (400
+        // `MANIFEST_INVALID`, non-echoing reason). Mirrors the digest
+        // branch's malformed-digest rejection above; rejects before any
+        // ingest/state change.
+        if let Err(e) = super::tag::validate_oci_tag(&reference) {
+            return super::tag_invalid_response(e);
+        }
+        // Declare the computed hash so the ingest path has a consistent
+        // post-storage check. `IngestUseCase::ingest` treats
+        // `declared_sha256 = Some(computed)` as a tautology here, but
+        // asserting it closes a latent window where a concurrent mutation
+        // between compute and commit would slip through.
         Some(computed_hash.clone())
     };
 
@@ -798,6 +806,13 @@ pub(crate) async fn delete_manifest_dispatch(
         )
         .await
     } else {
+        // Tag-ref DELETE: validate the tag against the OCI grammar (INJ-4 —
+        // same `validate_oci_tag` as the GET/serve and PUT paths) before the
+        // `RefUseCase::retire`, via the shared `tag_invalid_response` mapping
+        // (400 `MANIFEST_INVALID`, non-echoing reason).
+        if let Err(e) = super::tag::validate_oci_tag(&reference) {
+            return super::tag_invalid_response(e);
+        }
         delete_by_tag(&ctx, repo_id, &repo_key, &name, &reference, actor).await
     }
 }
@@ -1456,6 +1471,70 @@ mod tests {
         // Three add_member calls (manifest + config + 1 layer).
         assert_eq!(group_count, 3);
         assert_eq!(ref_count, 1, "ref count for library/nginx namespace");
+    }
+
+    /// INJ-4: a PUT to an out-of-grammar tag is rejected 400 `MANIFEST_INVALID`
+    /// BEFORE any ingest / ref write — the tag validator runs before the state
+    /// change, so a malformed tag can never become a stored ref. The body is a
+    /// well-formed manifest over unseeded blobs (never resolved, because the
+    /// tag check rejects first); the 400 with an `oci.tag:` reason proves the
+    /// validator fired pre-ingest, and `group_count`/`ref_count` staying 0
+    /// proves no state change. The response never echoes the offending bytes.
+    #[test]
+    fn put_manifest_out_of_grammar_tag_rejected_400_before_ingest() {
+        let over_cap = "a".repeat(129);
+        let cases: [(&str, &str); 4] = [
+            ("..", "double-dot path traversal"),
+            (".leadingdot", "leading dot"),
+            ("-leadinghyphen", "leading hyphen"),
+            (&over_cap, "129-byte over-cap tag"),
+        ];
+        for (uri_tag, label) in cases {
+            let (status, body, group_count, ref_count) = run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                // Well-formed manifest body over UNSEEDED blobs — never
+                // resolved, because the tag check rejects before blob
+                // resolution / ingest.
+                let config_hash: ContentHash =
+                    format!("{:x}", Sha256::digest(b"cfg")).parse().unwrap();
+                let layer_hash: ContentHash =
+                    format!("{:x}", Sha256::digest(b"layer")).parse().unwrap();
+                let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
+
+                let router = router().with_state(h.ctx.clone());
+                let uri = format!("/v2/myrepo/library/nginx/manifests/{uri_tag}");
+                let resp = router.oneshot(put_request(&uri, body)).await.unwrap();
+                let status = resp.status();
+                let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+                let group_count = h.group_lifecycle.commit_call_count();
+                let ref_count = h.refs.list(repo_id, "library/nginx").await.unwrap().len();
+                (status, rbody, group_count, ref_count)
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "case: {label}");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["errors"][0]["code"], "MANIFEST_INVALID",
+                "case: {label}"
+            );
+            let reason = parsed["errors"][0]["detail"]["reason"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                reason.starts_with("oci.tag: "),
+                "case {label}: reason must be tagged `oci.tag:` ({reason})"
+            );
+            assert_eq!(
+                group_count, 0,
+                "case {label}: no ingest before tag rejection"
+            );
+            assert_eq!(
+                ref_count, 0,
+                "case {label}: no ref written before tag rejection"
+            );
+        }
     }
 
     // -------------------- PUT — causation integrity --------------------
@@ -2470,6 +2549,48 @@ mod tests {
         });
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(post_count, 0, "ref must be retired after DELETE");
+    }
+
+    /// INJ-4: a DELETE to an out-of-grammar tag is rejected 400
+    /// `MANIFEST_INVALID` before the `RefUseCase::retire`. No ref is seeded,
+    /// so an unvalidated path would 404 (`ManifestUnknown`) on the retire
+    /// miss; the 400 with an `oci.tag:` reason proves the validator fired
+    /// first. The response never echoes the offending bytes.
+    #[test]
+    fn delete_manifest_out_of_grammar_tag_rejected_400() {
+        let over_cap = "a".repeat(129);
+        let cases: [(&str, &str); 4] = [
+            ("..", "double-dot path traversal"),
+            (".leadingdot", "leading dot"),
+            ("-leadinghyphen", "leading hyphen"),
+            (&over_cap, "129-byte over-cap tag"),
+        ];
+        for (uri_tag, label) in cases {
+            let (status, body) = run(async {
+                let h = harness();
+                h.repositories.insert(oci_repo("myrepo"));
+                let router = router().with_state(h.ctx.clone());
+                let uri = format!("/v2/myrepo/library/nginx/manifests/{uri_tag}");
+                let req = with_principal(HttpRequest::delete(&uri).body(Body::empty()).unwrap());
+                let resp = router.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+                (status, rbody)
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "case: {label}");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["errors"][0]["code"], "MANIFEST_INVALID",
+                "case: {label}"
+            );
+            let reason = parsed["errors"][0]["detail"]["reason"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                reason.starts_with("oci.tag: "),
+                "case {label}: reason must be tagged `oci.tag:` ({reason})"
+            );
+        }
     }
 
     #[test]

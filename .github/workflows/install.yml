@@ -9,7 +9,7 @@ name: Installer
 # installer will 404 on download. (No separate repo: hort.rs is the main repo's Pages domain.)
 #
 # STILL DEFERRED (need real release assets): a "real release end-to-end" verify job + a
-# wrong-identity (HORT_TEST_BAD_IDENTITY=1) fail-closed check. project-hort/hort currently has
+# wrong-identity (_HORT_INTERNAL_TEST_BAD_IDENTITY=1) fail-closed check. project-hort/hort currently has
 # one prerelease with 0 assets, so those cannot run yet.
 on:
   push:

@@ -67,3 +67,17 @@ The installer scripts verify hort-cli release artifacts using:
 These values **must stay in sync** with
 `docs/architecture/how-to/release-verification.md`. The consistency test
 `install/tests/test_pin_consistency.sh` enforces this on every CI run.
+
+## Internal CI-test knob
+
+`_HORT_INTERNAL_TEST_BAD_IDENTITY` (leading underscore = internal-only naming
+convention; INFRA-15) is a **CI-test-only** environment variable read by
+`install-cli.sh` / `install-cli.ps1`. When set to `1` it substitutes a
+deliberately *non-matching* cosign `--certificate-identity-regexp`
+(`https://github.com/definitely-not-project-hort/.*`) so a test can assert the
+installer's signature verification **fails closed** on an identity mismatch.
+
+It is **fail-closed and not operator-facing**: it can only make verification
+*stricter* (force a reject), never weaker — it cannot skip or relax the shipped
+`https://github.com/project-hort/.*` identity gate. Do not set it in a real
+install.

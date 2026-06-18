@@ -66,9 +66,6 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, RepositoryUpstreamMappingRepository,
 };
 use hort_domain::ports::scan_findings_repository::{ScanFindingsRepository, ScanFindingsRow};
-use hort_domain::ports::scanner_registry_repository::{
-    ScannerRegistryEntry, ScannerRegistryRepository,
-};
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use hort_domain::ports::stateful_upload_staging::StatefulUploadStagingPort;
 use hort_domain::ports::storage::{PutResult, StoragePort, StreamItem};
@@ -5069,124 +5066,6 @@ impl ScanFindingsRepository for MockScanFindingsRepository {
         }
         self.inserted.lock().unwrap().push(rows.to_vec());
         Box::pin(async { Ok(()) })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MockScannerRegistryRepository
-// ---------------------------------------------------------------------------
-
-/// Test mock for [`ScannerRegistryRepository`].
-///
-/// `list_live` returns a configurable snapshot. The default
-/// (`MockScannerRegistryRepository::new`) returns a single worker
-/// advertising `["trivy"]` so existing apply-pipeline tests whose
-/// `ScanPolicy.scan_backends` defaults to `["trivy"]` keep passing
-/// after the apply-time validation hook lands. Tests that need a
-/// different liveness snapshot construct via
-/// [`MockScannerRegistryRepository::with_entries`] or
-/// [`MockScannerRegistryRepository::empty`].
-///
-/// `upsert_self` and `refresh_heartbeat` are not exercised by
-/// `ApplyConfigUseCase` (apply only reads) — they are wired as
-/// no-ops so the mock satisfies the trait.
-#[allow(dead_code)]
-pub struct MockScannerRegistryRepository {
-    entries: Mutex<Vec<ScannerRegistryEntry>>,
-}
-
-#[allow(dead_code)]
-impl MockScannerRegistryRepository {
-    /// Default permissive mock: one live worker advertising `trivy`.
-    /// Matches the default `scan_backends` from `hort-config` so tests
-    /// that don't care about the registry don't have to set it up.
-    pub fn new() -> Self {
-        let now = Utc::now();
-        Self {
-            entries: Mutex::new(vec![ScannerRegistryEntry {
-                worker_id: "mock-worker-default".to_string(),
-                backends: vec!["trivy".to_string()],
-                registered_at: now,
-                last_heartbeat: now,
-            }]),
-        }
-    }
-
-    /// Empty registry — no workers live. Used by the
-    /// `apply_rejects_scan_backends_when_registry_empty` test.
-    pub fn empty() -> Self {
-        Self {
-            entries: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Construct with the supplied liveness snapshot. Each `(worker_id,
-    /// backends)` tuple becomes one row whose `registered_at` and
-    /// `last_heartbeat` are set to `now()`.
-    pub fn with_entries(workers: Vec<(&str, Vec<&str>)>) -> Self {
-        let now = Utc::now();
-        let entries = workers
-            .into_iter()
-            .map(|(id, backends)| ScannerRegistryEntry {
-                worker_id: id.to_string(),
-                backends: backends.into_iter().map(str::to_string).collect(),
-                registered_at: now,
-                last_heartbeat: now,
-            })
-            .collect();
-        Self {
-            entries: Mutex::new(entries),
-        }
-    }
-}
-
-impl Default for MockScannerRegistryRepository {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ScannerRegistryRepository for MockScannerRegistryRepository {
-    fn upsert_self<'a>(
-        &'a self,
-        worker_id: &'a str,
-        backends: Vec<String>,
-    ) -> BoxFuture<'a, DomainResult<()>> {
-        Box::pin(async move {
-            let now = Utc::now();
-            let mut guard = self.entries.lock().unwrap();
-            if let Some(existing) = guard.iter_mut().find(|e| e.worker_id == worker_id) {
-                existing.backends = backends;
-                existing.last_heartbeat = now;
-            } else {
-                guard.push(ScannerRegistryEntry {
-                    worker_id: worker_id.to_string(),
-                    backends,
-                    registered_at: now,
-                    last_heartbeat: now,
-                });
-            }
-            Ok(())
-        })
-    }
-
-    fn refresh_heartbeat<'a>(&'a self, worker_id: &'a str) -> BoxFuture<'a, DomainResult<()>> {
-        Box::pin(async move {
-            let now = Utc::now();
-            let mut guard = self.entries.lock().unwrap();
-            if let Some(existing) = guard.iter_mut().find(|e| e.worker_id == worker_id) {
-                existing.last_heartbeat = now;
-            }
-            Ok(())
-        })
-    }
-
-    fn list_live<'a>(
-        &'a self,
-        _liveness_window: std::time::Duration,
-    ) -> BoxFuture<'a, DomainResult<Vec<ScannerRegistryEntry>>> {
-        let snapshot = self.entries.lock().unwrap().clone();
-        Box::pin(async move { Ok(snapshot) })
     }
 }
 

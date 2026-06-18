@@ -49,6 +49,7 @@ use uuid::Uuid;
 use hort_app::error::AppError;
 use hort_app::use_cases::effective_permissions_use_case::{EffectiveGrant, EffectivePermissions};
 use hort_app::use_cases::patch_candidate_use_case::MAX_LIMIT as PATCH_CANDIDATE_MAX_LIMIT;
+use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerView;
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::rbac::GrantSubject;
 use hort_domain::error::DomainError;
@@ -131,6 +132,12 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         // `require_admin()` is a no-op defence-in-depth check. Read-only —
         // no domain event.
         .route("/rbac/resolve", post(post_rbac_resolve))
+        // Admin-only read of the `scanner_registry` worker-coordination
+        // table — "which workers are alive, and what backends do they
+        // advertise?". Gated by the `AdminPrincipal` extractor (same as
+        // the routes above); the use-case-side `require_admin()` is a
+        // no-op defence-in-depth check. Read-only — no domain event.
+        .route("/workers", get(get_scanner_workers))
     // There are no REST writes to repository_upstream_mappings;
     // gitops is the only writer. The standalone `UpstreamMappingSpec` gitops
     // kind is that writer — ApplyConfigUseCase emits RepositoryUpstreamMapping
@@ -354,6 +361,77 @@ async fn get_quarantine_patch_candidates(
         candidates: candidates
             .into_iter()
             .map(PatchCandidateDto::from_domain)
+            .collect(),
+    };
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Admin-only read of the scanner-worker registry
+// ---------------------------------------------------------------------------
+
+/// Response DTO for `GET /admin/workers`.
+#[derive(Debug, Serialize)]
+struct ScannerWorkersResponseDto {
+    workers: Vec<ScannerWorkerDto>,
+}
+
+/// Wire-format row for [`ScannerWorkersResponseDto`]. Mirrors
+/// [`ScannerWorkerView`] one-to-one; `DateTime<Utc>` serialises as
+/// ISO-8601 via the default chrono serde impl. Constructed only via
+/// [`ScannerWorkerDto::from_view`] — inbound HTTP cannot synthesise rows.
+#[derive(Debug, Serialize)]
+struct ScannerWorkerDto {
+    worker_id: String,
+    backends: Vec<String>,
+    registered_at: DateTime<Utc>,
+    last_heartbeat: DateTime<Utc>,
+    /// `true` when the last heartbeat is within the use case's liveness
+    /// threshold (~5 min); a stale worker stays in the listing with
+    /// `live = false` rather than vanishing.
+    live: bool,
+    last_seen_secs_ago: i64,
+}
+
+impl ScannerWorkerDto {
+    fn from_view(v: ScannerWorkerView) -> Self {
+        Self {
+            worker_id: v.worker_id,
+            backends: v.backends,
+            registered_at: v.registered_at,
+            last_heartbeat: v.last_heartbeat,
+            live: v.live,
+            last_seen_secs_ago: v.last_seen_secs_ago,
+        }
+    }
+}
+
+async fn get_scanner_workers(
+    admin: AdminPrincipal,
+    State(ctx): State<Arc<AppContext>>,
+) -> Result<Response, ApiError> {
+    // The AdminPrincipal extractor already enforced Permission::Admin at
+    // the request edge; pass `is_admin: true` so the use-case-side gate is
+    // a no-op rather than a duplicate authz call.
+    let actor = ApiActor {
+        user_id: admin.0.user_id,
+    };
+    let privileges = CallerPrivileges {
+        is_admin: true,
+        is_reviewer: false,
+        is_curator: false,
+        writable_repository_ids: Vec::new(),
+    };
+
+    let workers = ctx
+        .scanner_worker_query_use_case
+        .list(actor, privileges)
+        .await?;
+
+    let body = ScannerWorkersResponseDto {
+        workers: workers
+            .into_iter()
+            .map(ScannerWorkerDto::from_view)
             .collect(),
     };
     Ok((StatusCode::OK, Json(body)).into_response())
@@ -1813,6 +1891,82 @@ mod tests {
                 r#"{"groups":["devs"]}"#,
                 Some(principal_with_claims(&["reader"])),
             ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ----- GET /admin/workers ------
+
+    use hort_domain::ports::scanner_registry_repository::ScannerRegistryEntry;
+
+    /// Build `GET /admin/workers` with an optional admin principal.
+    fn workers_get(principal: Option<CallerPrincipal>) -> Request<Body> {
+        let mut req = Request::get("/admin/workers").body(Body::empty()).unwrap();
+        if let Some(p) = principal {
+            crate::middleware::auth::test_support::inject_principal(&mut req, p);
+        }
+        req
+    }
+
+    fn worker_entry(id: &str, last_heartbeat: DateTime<Utc>) -> ScannerRegistryEntry {
+        ScannerRegistryEntry {
+            worker_id: id.into(),
+            backends: vec!["trivy".into(), "osv".into()],
+            registered_at: last_heartbeat,
+            last_heartbeat,
+        }
+    }
+
+    /// Happy path: seed a fresh worker and a stale (backdated) one; admin
+    /// GET returns 200 with `{"workers":[…]}`, each row carrying the
+    /// derived `live` + `last_seen_secs_ago`. The stale worker stays in
+    /// the listing (`live=false`) rather than being filtered out.
+    #[tokio::test]
+    async fn workers_happy_path_returns_200_with_liveness() {
+        // `patch_candidates_harness` builds the full `/admin` router (all
+        // of `admin_routes()`), so it serves `/admin/workers` too.
+        let (router, mocks) = patch_candidates_harness();
+        let now = Utc::now();
+        mocks.scanner_workers.seed(vec![
+            worker_entry("w-fresh", now),
+            worker_entry("w-stale", now - chrono::Duration::seconds(3600)),
+        ]);
+
+        let response = router
+            .oneshot(workers_get(Some(principal_with_claims(&["admin"]))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v["workers"].as_array().expect("workers array");
+        assert_eq!(arr.len(), 2);
+
+        let fresh = arr.iter().find(|w| w["worker_id"] == "w-fresh").unwrap();
+        assert_eq!(fresh["live"], true, "fresh heartbeat → live");
+        assert_eq!(fresh["backends"], serde_json::json!(["trivy", "osv"]));
+
+        let stale = arr.iter().find(|w| w["worker_id"] == "w-stale").unwrap();
+        assert_eq!(
+            stale["live"], false,
+            "1h-old heartbeat → stale, still listed"
+        );
+        assert!(
+            stale["last_seen_secs_ago"].as_i64().unwrap() >= 3500,
+            "stale age ~3600s, got {}",
+            stale["last_seen_secs_ago"]
+        );
+    }
+
+    /// Non-admin caller → 403; the AdminPrincipal extractor short-circuits
+    /// before the handler body runs (no registry read).
+    #[tokio::test]
+    async fn workers_non_admin_returns_403() {
+        let (router, _mocks) = patch_candidates_harness();
+        let response = router
+            .oneshot(workers_get(Some(principal_with_claims(&["reader"]))))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);

@@ -27,6 +27,7 @@ use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase;
 use hort_app::use_cases::pat_cache::PatCache;
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
+use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerQueryUseCase;
 // The finding-exclusion HTTP write surface
 // (`POST/DELETE /api/v1/admin/policies/:policy_id/exclusions[/:cve_id]`)
 // calls `PolicyUseCase::{add_exclusion, remove_exclusion}`. The use
@@ -297,6 +298,12 @@ pub struct AppContext {
     /// request edge) and clamps `filter.limit` at 500 before reaching
     /// the adapter.
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
+    /// Admin-only read of the `scanner_registry` worker table
+    /// (`GET /api/v1/admin/workers`). The use case enforces
+    /// `Permission::Admin` (defence in depth — the `AdminPrincipal`
+    /// extractor enforces the same gate at the request edge) and stamps
+    /// each row with derived liveness.
+    pub scanner_worker_query_use_case: Arc<ScannerWorkerQueryUseCase>,
     /// Prefetch trigger planner. Format crates
     /// (`hort-http-npm`, `hort-http-cargo`, `hort-http-pypi`) call
     /// [`PrefetchUseCase::plan`] from their index/metadata serve site
@@ -830,6 +837,8 @@ pub struct AppContextParts {
     pub manual_rescan_use_case: Arc<ManualRescanUseCase>,
     /// See [`AppContext::patch_candidate_use_case`].
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
+    /// See [`AppContext::scanner_worker_query_use_case`].
+    pub scanner_worker_query_use_case: Arc<ScannerWorkerQueryUseCase>,
     /// See [`AppContext::prefetch_use_case`].
     pub prefetch_use_case: Arc<PrefetchUseCase>,
     /// See [`AppContext::effective_permissions_use_case`].
@@ -953,6 +962,7 @@ impl AppContext {
             task_use_case: parts.task_use_case,
             manual_rescan_use_case: parts.manual_rescan_use_case,
             patch_candidate_use_case: parts.patch_candidate_use_case,
+            scanner_worker_query_use_case: parts.scanner_worker_query_use_case,
             prefetch_use_case: parts.prefetch_use_case,
             effective_permissions_use_case: parts.effective_permissions_use_case,
             rbac_resolve_use_case: parts.rbac_resolve_use_case,

@@ -402,8 +402,14 @@ fn principal_is_admin(principal: &CallerPrincipal) -> bool {
 ///
 /// | Cap includes | Max lifetime | Min lifetime |
 /// |---|---|---|
-/// | Only `read/write/delete` | 86 400 s (24 h) | 300 s |
-/// | Includes `admin` | 3 600 s (1 h) | 300 s |
+/// | Only `read/write/delete` | 900 s (15 min) | 300 s |
+/// | Includes `admin` | 900 s (15 min) | 300 s |
+///
+/// The two max values are the `MAX_NON_ADMIN_CLI_SESSION_LIFETIME_SECS` /
+/// `MAX_ADMIN_CLI_SESSION_LIFETIME_SECS` constants, both **900 s** today;
+/// the per-cap-shape branch is retained for possible future divergence.
+/// (Do not "reconcile" this doc *upward* to 24 h/1 h — the enforced cap is
+/// 900 s and ADR 0013 fixes the admin ceiling at ≤ 1 h.)
 ///
 /// Below 300 s ⇒ `Err(ApiTokenError::LifetimeBelowMinimum)`.
 /// Above the per-cap max ⇒ clamped silently (RFC 8693 §2.1 explicit
@@ -753,6 +759,12 @@ impl ApiTokenUseCase {
             // No event for "wasn't actually admin" — that's the
             // extractor's territory. The use case still defends
             // depth-in-depth in case the handler skips the extractor.
+            tracing::info!(
+                actor_user_id = %admin.user_id,
+                target_user_id = %target_user_id,
+                denial_reason = "not_admin",
+                "service-account token issuance denied"
+            );
             return Err(ApiTokenError::NotAuthorized);
         }
         let target = self.users.find_by_id(target_user_id).await?;
@@ -1960,6 +1972,13 @@ impl ApiTokenUseCase {
             Err(other) => return Err(ApiTokenError::Infrastructure(other)),
         };
         if !admin_authority && actor.user_id != token.user_id {
+            tracing::info!(
+                actor_user_id = %actor.user_id,
+                target_user_id = %token.user_id,
+                token_id = %token_id,
+                denial_reason = "cross_user_revoke",
+                "token revoke denied"
+            );
             return Err(ApiTokenError::NotAuthorized);
         }
         self.tokens.revoke(token_id).await?;

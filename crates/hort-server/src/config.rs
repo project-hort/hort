@@ -1584,6 +1584,27 @@ pub enum ConfigError {
         Disable the gate via HORT_REQUIRE_HTTPS=false if plaintext is intentional."
     )]
     InsecureHttp,
+    /// `HORT_BEARER_ALLOW_OVER_HTTP=true` was set AND
+    /// `HORT_PUBLIC_BASE_URL` is an `https://...` URL. This combination is
+    /// self-contradictory: an HTTPS public base URL means the deployment is
+    /// TLS-terminated (directly or via a proxy), yet the flag relaxes the
+    /// bearer-token transport guard to permit PAT / CliSession JWTs over
+    /// plaintext HTTP. A TLS-terminated registry has no legitimate need for
+    /// the relaxation, so its presence is almost certainly a leftover /
+    /// copy-paste misconfiguration that silently widens the bearer-token
+    /// exposure surface. Fail closed rather than only warn. A genuinely
+    /// plaintext-internal deployment (`HORT_PUBLIC_BASE_URL` unset or
+    /// `http://...`) is unaffected and still only warns.
+    #[error(
+        "HORT_BEARER_ALLOW_OVER_HTTP=true contradicts HORT_PUBLIC_BASE_URL={public_base_url} \
+        (an https:// URL): the deployment is TLS-terminated, so allowing bearer tokens \
+        (PAT + CliSession JWT) over plaintext HTTP is almost certainly a misconfiguration \
+        that widens the bearer-token exposure surface. Either drop HORT_BEARER_ALLOW_OVER_HTTP \
+        (bearer tokens already flow over the TLS endpoint), or — if you really intend a \
+        plaintext-internal listener — front the service with a plaintext (http://) \
+        HORT_PUBLIC_BASE_URL instead."
+    )]
+    BearerOverHttpContradictsTls { public_base_url: String },
     /// `HORT_EXTRA_CA_BUNDLE` was set but the file
     /// at that path could not be read (missing, permission denied, etc.).
     /// Fail closed — a misconfigured trust knob must not silently degrade
@@ -2186,6 +2207,26 @@ impl Config {
             .ok()
             .filter(|v| !v.is_empty());
         let allow_pat_over_http = parse_bool("HORT_BEARER_ALLOW_OVER_HTTP", false)?;
+        // Hard-fail a self-contradictory "bearer over plaintext HTTP" + TLS
+        // posture (INFRA-13). When the operator both relaxes the
+        // bearer-token transport guard (`HORT_BEARER_ALLOW_OVER_HTTP=true`)
+        // AND advertises an `https://` public base URL — i.e. the deployment
+        // is clearly TLS-terminated (directly or behind a proxy) — the two
+        // settings cancel each other out: a TLS-terminated registry has no
+        // legitimate need for the plaintext relaxation. Treat it as a
+        // misconfiguration and refuse to boot rather than only warning. A
+        // genuinely plaintext-internal deploy (`public_base_url` is `None` or
+        // `http://...`) keeps the existing WARN-only behaviour
+        // (`emit_pat_over_http_signal`, emitted later in composition).
+        if allow_pat_over_http {
+            if let Some(url) = public_base_url.as_ref() {
+                if url.scheme() == "https" {
+                    return Err(ConfigError::BearerOverHttpContradictsTls {
+                        public_base_url: url.as_str().to_string(),
+                    });
+                }
+            }
+        }
         let pat_cache_size = parse_pat_cache_size()?;
         let pat_lockout_threshold = parse_pat_lockout_threshold()?;
         let pat_lockout_window_secs = parse_pat_lockout_window_secs()?;
@@ -5316,6 +5357,92 @@ mod tests {
         temp_env::with_vars(env, || {
             let cfg = Config::from_env().unwrap();
             assert!(!cfg.require_https);
+        });
+    }
+
+    // ---------- HORT_BEARER_ALLOW_OVER_HTTP × TLS contradiction (INFRA-13) ----------
+    //
+    // Hard-fail only the self-contradictory combination:
+    //   `HORT_BEARER_ALLOW_OVER_HTTP=true` AND `HORT_PUBLIC_BASE_URL=https://...`
+    // Every other combination either WARNs (plaintext-internal deploys) or
+    // is unaffected (flag off). The four tests below pin the truth table.
+
+    /// The failure case: `allow_pat_over_http=true` AND an https public
+    /// base URL → `ConfigError::BearerOverHttpContradictsTls` at parse time.
+    #[test]
+    fn bearer_over_http_with_https_base_url_fails_startup() {
+        let mut env = fs_env();
+        set_public_base_url(&mut env, Some("https://hort.example.com"));
+        env.push(("HORT_BEARER_ALLOW_OVER_HTTP", Some("true")));
+        temp_env::with_vars(env, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BearerOverHttpContradictsTls { .. }),
+                "expected BearerOverHttpContradictsTls, got {err:?}"
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("HORT_BEARER_ALLOW_OVER_HTTP"),
+                "error must name HORT_BEARER_ALLOW_OVER_HTTP, got {msg}"
+            );
+            assert!(
+                msg.contains("HORT_PUBLIC_BASE_URL"),
+                "error must name HORT_PUBLIC_BASE_URL, got {msg}"
+            );
+            // The offending https URL is echoed so the operator sees which
+            // value tripped the guard.
+            assert!(
+                msg.contains("https://hort.example.com"),
+                "error should echo the offending https URL, got {msg}"
+            );
+        });
+    }
+
+    /// `allow_pat_over_http=true` with an `http://` public base URL → OK.
+    /// A genuinely plaintext-internal deploy is still allowed; the boot
+    /// path only WARNs (via `emit_pat_over_http_signal` in composition).
+    #[test]
+    fn bearer_over_http_with_http_base_url_starts_normally() {
+        let mut env = fs_env();
+        // fs_env already defaults HORT_PUBLIC_BASE_URL to http://hort-server:8080.
+        env.push(("HORT_BEARER_ALLOW_OVER_HTTP", Some("true")));
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.allow_pat_over_http);
+            assert_eq!(cfg.public_base_url.unwrap().scheme(), "http");
+        });
+    }
+
+    /// `allow_pat_over_http=true` with NO public base URL (None) → OK.
+    /// The TLS posture is unknown, so the relaxation is not contradictory.
+    /// `public_base_url=None` requires a trusted-proxy CIDR to clear the
+    /// `TrustUnconfigured` guard — set one so this test isolates the
+    /// INFRA-13 check.
+    #[test]
+    fn bearer_over_http_with_no_base_url_starts_normally() {
+        let mut env = fs_env();
+        set_public_base_url(&mut env, None);
+        set_trusted_proxy_cidrs(&mut env, Some("10.0.0.0/8"));
+        env.push(("HORT_BEARER_ALLOW_OVER_HTTP", Some("true")));
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.allow_pat_over_http);
+            assert!(cfg.public_base_url.is_none());
+        });
+    }
+
+    /// `allow_pat_over_http=false` (the default) with an https public base
+    /// URL → OK. The guard is keyed on the flag being on; a TLS deployment
+    /// without the relaxation is the normal, intended posture.
+    #[test]
+    fn bearer_over_http_disabled_with_https_base_url_starts_normally() {
+        let mut env = fs_env();
+        set_public_base_url(&mut env, Some("https://hort.example.com"));
+        // HORT_BEARER_ALLOW_OVER_HTTP unset → defaults false.
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.allow_pat_over_http);
+            assert_eq!(cfg.public_base_url.unwrap().scheme(), "https");
         });
     }
 

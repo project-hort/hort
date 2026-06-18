@@ -1515,6 +1515,34 @@ scheduledTasks:
     # applies here too.
     schedule: "0 * * * *"
 
+  # -- Scanner-worker registry prune ----------------------------
+
+  # Scanner-worker registry housekeeping: deletes `scanner_registry`
+  # rows whose `last_heartbeat` is older than the handler's 7-day
+  # retention horizon. Pod churn (rollouts, HPA scaling) leaves a row per
+  # retired worker_id that never heartbeats again; without this the
+  # worker-coordination table — and the admin worker-list
+  # (`hort admin workers list`) — grows without bound.
+  #
+  # DEFAULT-ENABLED (like replaySeenPrune): steady-state housekeeping,
+  # not an opt-in retrofit. The `adminTasksEnabled` master toggle is
+  # still the single opt-in surface.
+  #
+  # Cleanup degrades SAFE: disabling this or a failed tick only grows the
+  # table — worker liveness is recomputed from `last_heartbeat` on every
+  # admin-list read, independent of pruning. The handler retries a failed
+  # tick on the next schedule (warn!, never error!).
+  #
+  # The worker side needs no extra provisioning — the prune reuses the
+  # `scanner_registry` handle the heartbeat task already holds, so the
+  # handler is registered unconditionally and this route is always live.
+  scannerRegistryPrune:
+    executionPath: admin-task
+    enabled: true
+    # Default cadence — hourly (a single cheap DELETE per tick keeps the
+    # table tight between runs).
+    schedule: "0 * * * *"
+
   # -- Event-chain verifier -------------------------------------
 
   # Event-chain verifier: run the offline tamper-evidence verifier

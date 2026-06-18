@@ -150,7 +150,7 @@ Checks run vs. not run:
 | | Checks |
 |---|---|
 | **Run (offline)** | YAML parse + per-envelope domain validation + cross-validate + singleton-conflict; desired-internal `ServiceAccount` → `OidcIssuer` reference consistency; the under-constrained `federatedIdentities` advisory (warning); the `trustUpstreamPublishTime` × empty-`scanBackends` cross-opt-in reject; the inert `prefetchPolicy.maxAgeDays` reject; provenance-policy validation against the binary's provenance-capable format set; the per-repo `storage.backend` vs `HORT_STORAGE_BACKEND` mismatch reject; the permission-grant linter (secure-default `LintConfig` base, desired-side overrides applied). |
-| **Not run (need the live deployment)** | Current-state checks (managed-by ownership, immutable-field changes) and the live-worker `scanBackends` registry check. A clean run is therefore necessary but not sufficient for a clean apply; the command prints a one-line footer saying so. |
+| **Not run (need the live deployment)** | Current-state checks (managed-by ownership, immutable-field changes). The `scanBackends` supported-backend check runs only at apply (validating against the binary's compiled-in scanner set, not the live worker registry — regression H20); the offline validator does not currently run it. A clean run is therefore necessary but not sufficient for a clean apply; the command prints a one-line footer saying so. |
 
 A directory that exists but contains zero YAML files validates clean —
 exit `0` — with the warning `validated 0 config files — is
@@ -244,7 +244,7 @@ for the timeout knobs in depth.
 | `HORT_OCI_TOKEN_SIGNING_KEY_PREV_FILE` | path | _unset → none_ | No | Previous signing key from a file (mutually exclusive with the inline `_PREV`). |
 | `HORT_TOKEN_ALLOW_ADMIN` | bool | `false` | No | Permit `Permission::Admin` in token issuance / exchange. |
 | `HORT_TOKEN_ALLOW_UNBOUNDED_SVC` | bool | `false` | No | Permit null-expiry service-account tokens via admin-mint. |
-| `HORT_BEARER_ALLOW_OVER_HTTP` | bool | `false` | No | Allow bearer auth (every bearer kind: PAT + CliSession JWT) over plaintext HTTP (transport-unsafe; logs one boot WARN + sets the unsafe-config gauge). |
+| `HORT_BEARER_ALLOW_OVER_HTTP` | bool | `false` | No | Allow bearer auth (every bearer kind: PAT + CliSession JWT) over plaintext HTTP (transport-unsafe; logs one boot WARN + sets the unsafe-config gauge). **Boot-fails** when combined with an `https://` `HORT_PUBLIC_BASE_URL` — a TLS-terminated deploy that also relaxes the bearer transport guard is self-contradictory (INFRA-13). Only WARNs when `HORT_PUBLIC_BASE_URL` is `http://...` or unset. |
 
 ### Rate limiting, lockout & load shedding
 

@@ -195,6 +195,12 @@ raw_kind!(EventstoreCheckpointRawParams, "eventstore-checkpoint");
 // CronJob driving this route is **default-ENABLED** — a deliberate
 // divergence from the admin-task default-disabled convention.
 raw_kind!(ReplaySeenPruneRawParams, "replay-seen-prune");
+// The worker's `ScannerRegistryPruneHandler` consumes the row this route
+// enqueues. Body is empty; the handler runs one
+// `DELETE FROM scanner_registry WHERE last_heartbeat < now() - 7d` tick.
+// The CronJob driving this route is **default-ENABLED** (like
+// replay-seen-prune) — steady-state housekeeping, not an opt-in retrofit.
+raw_kind!(ScannerRegistryPruneRawParams, "scanner-registry-prune");
 
 #[cfg(test)]
 mod tests {

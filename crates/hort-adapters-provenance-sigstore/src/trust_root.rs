@@ -1,12 +1,16 @@
 //! Cached Sigstore trust root + its refresh-window bookkeeping.
 //!
 //! The verify path is **offline**: a stored Sigstore bundle
-//! carries its own Fulcio cert chain (with SCT) + Rekor inclusion proof /
-//! SignedEntryTimestamp, and the adapter validates that material against a
-//! **cached trust root** (Fulcio CA certs + Rekor/CT-log public keys). The
-//! trust root is refreshed periodically via TUF — *not* per verify. This
-//! module owns that cached material and the "is it loaded and within its
-//! refresh window?" predicate `health_check` consults.
+//! carries its own Fulcio cert chain (with SCT) + Rekor Merkle inclusion
+//! proof with a signed checkpoint, and the adapter validates that material
+//! (chain/SCT/signature/digest binding **and** the inclusion proof +
+//! checkpoint signature) against a **cached trust root** (Fulcio CA certs +
+//! CT-log public keys + Rekor public keys). The trust root is refreshed
+//! periodically via TUF — *not* per verify. This module owns that cached
+//! material, exposes its Rekor keys ([`CachedTrustRoot::rekor_keys`]) for
+//! inclusion verification + the worker boot assertion, and provides the "is
+//! it loaded and within its refresh window?" predicate `health_check`
+//! consults.
 //!
 //! The trust root is **injectable**: [`CachedTrustRoot::from_trusted_root_json`]
 //! parses a Sigstore `trusted_root.json` (the standard TUF target) fully
@@ -125,6 +129,28 @@ impl CachedTrustRoot {
     /// parse error here is an internal invariant violation.
     pub(crate) fn build_sigstore_trust_root(&self) -> DomainResult<SigstoreTrustRoot> {
         parse_trusted_root(&self.trusted_root_json)
+    }
+
+    /// Snapshot the trust root's **Rekor public keys** into an owned
+    /// `BTreeMap<hex(logID.key_id), DER SPKI bytes>` — the same keying
+    /// `SigstoreTrustRoot::rekor_keys()` uses — for offline Rekor Merkle
+    /// inclusion-proof + checkpoint-signature verification (ADR 0027).
+    ///
+    /// Owned so the keys outlive the `SigstoreTrustRoot` that
+    /// `sigstore::Verifier::new` consumes by value. An empty map means the
+    /// loaded `trusted_root.json` carries no (time-valid) Rekor key — the
+    /// worker composition treats that as a hard boot error when a verifier
+    /// is registered (a root with no Rekor key would fail *every* verify
+    /// post-inclusion-fix), and a per-verify lookup against an empty map
+    /// fails closed (`RekorNotFound`).
+    ///
+    /// # Errors
+    /// `DomainError::Invariant` if the cached bytes no longer parse — an
+    /// internal invariant violation, since they were validated at
+    /// construction.
+    pub fn rekor_keys(&self) -> DomainResult<std::collections::BTreeMap<String, Vec<u8>>> {
+        let trust_root = self.build_sigstore_trust_root()?;
+        Ok(crate::inclusion::collect_rekor_keys(&trust_root))
     }
 
     /// Whether the trust root is still within its refresh window relative
@@ -257,6 +283,35 @@ mod tests {
         // A fresh owned root is parseable from the cached bytes (offline).
         root.build_sigstore_trust_root()
             .expect("re-parse from cached bytes succeeds");
+    }
+
+    #[test]
+    fn rekor_keys_is_empty_for_minimal_root() {
+        // The minimal fixture root has empty `tlogs` → no Rekor keys. The
+        // worker boot assertion (ADR 0027 §8) treats this as a hard error
+        // when a provenance verifier is registered.
+        let root =
+            CachedTrustRoot::from_trusted_root_json(&minimal_trusted_root_json()).expect("parse");
+        let keys = root.rekor_keys().expect("rekor_keys reads");
+        assert!(keys.is_empty(), "minimal root carries no Rekor key");
+    }
+
+    #[test]
+    fn rekor_keys_is_non_empty_for_production_root() {
+        // The committed production public-good trusted_root.json carries the
+        // public-good Rekor key(s) — the boot assertion passes for it.
+        let prod = include_bytes!("../tests/fixtures/sigstore_trusted_root_public_good.json");
+        let root = CachedTrustRoot::from_trusted_root_json(prod).expect("production root parses");
+        let keys = root.rekor_keys().expect("rekor_keys reads");
+        assert!(
+            !keys.is_empty(),
+            "production root must carry at least one Rekor key"
+        );
+        // Keys are the DER SPKI bytes, keyed by lowercase-hex logID.
+        for (id, der) in &keys {
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(!der.is_empty());
+        }
     }
 
     #[tokio::test]

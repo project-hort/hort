@@ -367,49 +367,86 @@ fn pypi_scan_href_values(html: &str) -> Vec<&str> {
 /// - `Ok(Some(bytes))` — METADATA bytes (first matching entry; the
 ///   wheel spec mandates exactly one, but a malformed wheel with
 ///   multiple entries logs `debug!` and uses the first).
-/// - `Err(DomainError::Validation)` — the entry's reported
-///   uncompressed size exceeds the cap (checked **before** the read,
-///   so a header-claimed multi-GB entry is rejected without I/O).
+/// - `Err(DomainError::Validation)` — the matched entry exceeds
+///   [`PYPI_WHEEL_METADATA_MAX_BYTES`], OR an `archive_bounds` guard
+///   tripped (entry-count cap / compression-ratio). The entry-count cap
+///   (SUP-5) is shared with [`locate_wheel_metadata_in_zip`]: both walk
+///   the central directory through [`archive_bounds::iter_zip_entries`]
+///   (`MAX_ENTRIES = 1024`), so a wheel whose central directory exceeds
+///   the cap is rejected uniformly on either metadata path.
+///
+/// Routed through the same audited [`archive_bounds::iter_zip_entries`]
+/// (`crate::archive_bounds::iter_zip_entries`) as the sibling
+/// [`locate_wheel_metadata_in_zip`] — the single sanctioned home for ZIP
+/// extraction. The only difference between the two is fatality: this PEP
+/// 658 path is best-effort (a non-ZIP / corrupt buffer is `Ok(None)`,
+/// because the primary wheel ingest already succeeded and PEP 658 is
+/// merely not advertised), whereas the dependency-extraction sibling has
+/// already magic-sniffed the buffer as a zip and treats a parse failure
+/// as a corrupt-wheel `Err`. A *bounds* trip (entry cap / ratio) is fatal
+/// on BOTH paths — never silently downgraded to `Ok(None)`.
 fn extract_wheel_metadata_bytes_from_zip(buf: &[u8]) -> DomainResult<Option<Bytes>> {
-    let cursor = Cursor::new(buf);
-    let Ok(mut archive) = zip::ZipArchive::new(cursor) else {
-        // Non-fatal: corrupt ZIP / non-ZIP bytes claiming to be a
-        // wheel. The wheel ingest already succeeded; PEP 658
-        // simply does not apply for this artifact.
-        return Ok(None);
-    };
-
-    // PEP 427 §A wheel format: exactly one `*.dist-info/` directory at
-    // the archive root, with `METADATA` inside it. Walk by index so we
-    // can short-circuit on the first match; bypasses the second-match
-    // borrow-checker issue with by_name.
-    let mut first_match_index: Option<usize> = None;
+    let mut first_match: Option<Bytes> = None;
     let mut match_count: usize = 0;
-    for i in 0..archive.len() {
-        // Iteration is bounded by `archive.len()`, which is read from
-        // the ZIP central directory — itself bounded by the byte
-        // buffer's length.
-        let Ok(entry) = archive.by_index(i) else {
-            // skip unreadable entries
-            continue;
-        };
-        if !entry.is_file() {
-            continue;
-        }
-        let name = entry.name();
-        if is_wheel_metadata_path(name) {
-            match_count += 1;
-            if first_match_index.is_none() {
-                first_match_index = Some(i);
+    let mut read_err: Option<String> = None;
+
+    let iter_result = crate::archive_bounds::iter_zip_entries(
+        Cursor::new(buf),
+        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
+        |name, reader| {
+            if read_err.is_some() || !is_wheel_metadata_path(name) {
+                return;
             }
+            match_count += 1;
+            // First match wins (the wheel spec mandates exactly one
+            // `*.dist-info/METADATA`); count the rest for the debug log but
+            // do not re-read them.
+            if first_match.is_some() {
+                return;
+            }
+            // Parser-input sanity cap on the EXTRACTED entry (the
+            // archive-level decompression-bomb / compression-ratio guard is
+            // `iter_zip_entries`' `BoundedReader` job). `take(cap + 1)` lets
+            // us detect an entry that overruns the metadata cap; a read error
+            // is an `archive_bounds` bounds trip (compression-ratio /
+            // output-cap) and is FATAL — never a silent skip. Mirrors the
+            // sibling `locate_wheel_metadata_in_zip` exactly.
+            let mut bytes_out: Vec<u8> = Vec::new();
+            let mut limited = reader.take(PYPI_WHEEL_METADATA_MAX_BYTES + 1);
+            match limited.read_to_end(&mut bytes_out) {
+                Ok(_) if bytes_out.len() as u64 > PYPI_WHEEL_METADATA_MAX_BYTES => {
+                    read_err = Some(format!(
+                        "wheel METADATA entry read overran cap of {PYPI_WHEEL_METADATA_MAX_BYTES} \
+                         bytes (entry header lied about uncompressed size)"
+                    ));
+                }
+                Ok(_) => first_match = Some(Bytes::from(bytes_out)),
+                Err(e) => {
+                    read_err = Some(format!("wheel METADATA entry read failed: {e}"));
+                }
+            }
+        },
+    );
+
+    match iter_result {
+        Ok(()) => {}
+        // A non-ZIP / corrupt buffer is non-fatal on the PEP 658 path: the
+        // wheel ingest already succeeded; PEP 658 just is not advertised.
+        Err(crate::archive_bounds::ZipIterError::Open(_)) => return Ok(None),
+        // An entry-count / bounds trip (SUP-5) is hostile — fail closed.
+        Err(e @ crate::archive_bounds::ZipIterError::Bounds(_))
+        | Err(e @ crate::archive_bounds::ZipIterError::Entry { .. }) => {
+            return Err(DomainError::Validation(format!(
+                "pypi wheel zip rejected during PEP 658 metadata extraction: {e}"
+            )));
         }
     }
 
-    let Some(idx) = first_match_index else {
-        // Zero `*.dist-info/METADATA` entries — malformed wheel that
-        // verified primary content. Non-fatal.
-        return Ok(None);
-    };
+    // An over-cap read or a bounds trip mid-read is fatal — fail closed.
+    if let Some(msg) = read_err {
+        return Err(DomainError::Validation(msg));
+    }
+
     if match_count > 1 {
         // Wheel spec mandates exactly one. pip picks the first; we do
         // the same and log for the operator. Does NOT error.
@@ -419,43 +456,9 @@ fn extract_wheel_metadata_bytes_from_zip(buf: &[u8]) -> DomainResult<Option<Byte
         );
     }
 
-    // Open the chosen entry. Check the header-reported uncompressed
-    // size BEFORE reading any bytes — defends against a maliciously-
-    // crafted entry whose header claims gigabytes uncompressed but
-    // compresses to a few KB.
-    let mut entry = archive.by_index(idx).map_err(|_| {
-        // Re-opening the same index that succeeded above is a logic
-        // error, not user-facing data corruption — but the only
-        // honest return shape is `Validation` since we don't have an
-        // `Invariant` arm reachable here without ergonomic noise.
-        DomainError::Validation(
-            "wheel METADATA entry became unreadable between scan and read".to_string(),
-        )
-    })?;
-    let declared_size = entry.size();
-    if declared_size > PYPI_WHEEL_METADATA_MAX_BYTES {
-        return Err(DomainError::Validation(format!(
-            "wheel METADATA entry declared {declared_size} bytes uncompressed; cap is {PYPI_WHEEL_METADATA_MAX_BYTES}"
-        )));
-    }
-    // Defense-in-depth: cap the actual read at the same limit, so an
-    // entry that lies on its uncompressed-size header (real read
-    // overflows) is still bounded. The bytes read may legitimately
-    // differ from `declared_size` for stored (no-compression) entries
-    // whose declared size matches; the cap rules either case.
-    let mut bytes_out: Vec<u8> = Vec::new();
-    let mut limited = (&mut entry).take(PYPI_WHEEL_METADATA_MAX_BYTES + 1);
-    if limited.read_to_end(&mut bytes_out).is_err() {
-        // Read error mid-entry — corrupted wheel. Non-fatal.
-        return Ok(None);
-    }
-    if bytes_out.len() as u64 > PYPI_WHEEL_METADATA_MAX_BYTES {
-        return Err(DomainError::Validation(format!(
-            "wheel METADATA entry read overran cap of {PYPI_WHEEL_METADATA_MAX_BYTES} bytes \
-             (entry header lied about uncompressed size)"
-        )));
-    }
-    Ok(Some(Bytes::from(bytes_out)))
+    // Zero `*.dist-info/METADATA` entries falls through here as `Ok(None)` —
+    // a malformed wheel that verified primary content. Non-fatal.
+    Ok(first_match)
 }
 
 /// PEP 427 §A — wheel METADATA lives at
@@ -3281,13 +3284,33 @@ mod tests {
         );
     }
 
+    /// Deterministic pseudo-random byte vector (xorshift64) — used to build
+    /// an *incompressible* METADATA entry whose post-decompression size is
+    /// honest (it does not collapse under DEFLATE), so the over-cap reject
+    /// exercises the metadata-byte cap rather than the compression-ratio
+    /// guard.
+    fn incompressible_bytes(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
     #[test]
     fn extract_wheel_metadata_bytes_pypi_oversized_metadata_returns_validation_error() {
-        // A wheel METADATA entry whose uncompressed size exceeds
-        // PYPI_WHEEL_METADATA_MAX_BYTES (1 MiB) is rejected on the
-        // header — checked BEFORE the read, so a header-claimed multi-
-        // GB entry is refused without OOM.
-        let oversized = vec![b'A'; 1024 * 1024 + 1];
+        // A wheel METADATA entry whose decompressed size exceeds
+        // PYPI_WHEEL_METADATA_MAX_BYTES (1 MiB) is rejected. Incompressible
+        // bytes ensure the entry stays > 1 MiB through DEFLATE (so it passes
+        // the compression-ratio guard and trips the metadata-cap reject, not
+        // the ratio guard), and `take(cap + 1)` bounds the read so a
+        // multi-GB entry is refused without OOM.
+        let oversized = incompressible_bytes(1024 * 1024 + 4096);
         let zip_bytes =
             build_wheel_zip(&[("example-1.0.0.dist-info/METADATA", oversized.as_slice())]);
         let coords = coords_for("example", Some("1.0.0"), "example-1.0.0-py3-none-any.whl");
@@ -3321,6 +3344,37 @@ mod tests {
         assert!(
             out.is_none(),
             "corrupt-ZIP wheel must be non-fatal Ok(None)"
+        );
+    }
+
+    #[test]
+    fn extract_wheel_metadata_bytes_pypi_entry_count_over_cap_is_rejected() {
+        // SUP-5: the PEP 658 metadata-extraction path must honour the same
+        // `archive_bounds::MAX_ENTRIES` (1024) central-directory cap that the
+        // sibling `locate_wheel_metadata_in_zip` enforces. A wheel whose
+        // central directory exceeds the cap is hostile (entry-count
+        // exhaustion vector) and must FAIL CLOSED — a `Validation` error,
+        // never a silent `Ok(None)` that would bypass the bound.
+        let mut entries: Vec<(String, &[u8])> = Vec::new();
+        for i in 0..(crate::archive_bounds::MAX_ENTRIES + 5) {
+            entries.push((format!("padding/file_{i}.txt"), b"x" as &[u8]));
+        }
+        // METADATA lives last, so reaching it requires walking past the cap.
+        entries.push((
+            "example-1.0.0.dist-info/METADATA".to_string(),
+            sample_metadata_body(),
+        ));
+        let entry_refs: Vec<(&str, &[u8])> =
+            entries.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+        let zip_bytes = build_wheel_zip(&entry_refs);
+        let coords = coords_for("example", Some("1.0.0"), "example-1.0.0-py3-none-any.whl");
+        let payload = PayloadAccess::Bytes(&zip_bytes);
+        let err = handler()
+            .extract_wheel_metadata_bytes(&coords, payload)
+            .expect_err("over-cap wheel central directory must fail closed");
+        assert!(
+            matches!(err, DomainError::Validation(_)),
+            "entry-count over-cap must surface as Validation, got: {err:?}",
         );
     }
 
@@ -3368,11 +3422,14 @@ mod tests {
 
     #[test]
     fn extract_wheel_metadata_bytes_pypi_metadata_at_cap_boundary_is_accepted() {
-        // Boundary regression: an entry exactly at the cap (1 MiB)
-        // must be accepted; the size gate uses `>` not `>=` so the
-        // boundary admits. Without this guard a future "fix" tightening
-        // to `>=` would silently reject a legitimate 1 MiB entry.
-        let exactly_at_cap = vec![b'M'; 1024 * 1024];
+        // Boundary regression: an entry exactly at the cap (1 MiB) must be
+        // accepted; the size gate uses `>` not `>=` so the boundary admits.
+        // Without this guard a future "fix" tightening to `>=` would
+        // silently reject a legitimate 1 MiB entry. Incompressible bytes
+        // keep the entry honestly at 1 MiB through DEFLATE so it clears the
+        // archive_bounds compression-ratio guard and the metadata-cap reject
+        // is the only gate under test.
+        let exactly_at_cap = incompressible_bytes(1024 * 1024);
         let zip_bytes = build_wheel_zip(&[(
             "example-1.0.0.dist-info/METADATA",
             exactly_at_cap.as_slice(),

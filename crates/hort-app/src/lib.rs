@@ -76,6 +76,11 @@ pub mod project;
 // ScanPolicy wire->domain mappers.
 pub mod provenance;
 pub mod rbac;
+// The vulnerability-scanner backends compiled into this build — the single
+// source of truth the apply-time `scanBackends` validator checks against
+// (sibling of `crate::provenance`). Static, not the live worker registry:
+// see the module docs (regression H20).
+pub mod scanning;
 // The deployment's effective global storage backend as a pure value
 // type (zero-I/O, sibling of `crate::lint::LintConfig`). Threaded into
 // `ApplyConfigUseCase` via the additive `with_effective_storage_backend`

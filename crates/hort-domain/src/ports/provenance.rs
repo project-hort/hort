@@ -138,9 +138,15 @@ pub enum ProvenanceRejectReason {
     Unsigned,
     /// A valid signature whose `{issuer, san}` is not in the allowed set.
     UntrustedIdentity,
-    /// The bundle's Rekor inclusion proof / SignedEntryTimestamp could
-    /// not be validated (missing or invalid SET). **Never** a fall-back
-    /// to a live Rekor fetch.
+    /// The bundle's Rekor transparency-log entry is not provably in the
+    /// log: the Merkle inclusion proof or the checkpoint signature failed to
+    /// verify against the trust root's Rekor public key, or the tlog
+    /// material is structurally absent / unparseable. The Sigstore adapter
+    /// verifies this cryptographically and fully offline (RFC-6962 Merkle
+    /// inclusion + checkpoint signature, v0.3 bundle format); it is
+    /// **never** a fall-back to a live Rekor fetch. This catches both a
+    /// structurally absent proof and a forged-but-well-formed one whose
+    /// entry is not in the log.
     RekorNotFound,
     /// The Fulcio certificate chain failed validation against the cached
     /// trust root.

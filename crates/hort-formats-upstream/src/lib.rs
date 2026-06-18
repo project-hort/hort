@@ -429,6 +429,12 @@ fn map_npm_helper_error(e: &npm_helpers::PackumentFetchError) -> UpstreamFetchEr
         PackumentFetchError::MetadataMalformed { .. } => {
             UpstreamFetchError::ParseError("npm upstream packument malformed".into())
         }
+        // A package name that fails `validate_npm_name` on the proxy-GET path
+        // (INJ-3 serve-path validation) is a parse/validation-class failure;
+        // map to `ParseError` with a sanitised constant (no name fragments).
+        PackumentFetchError::InvalidName { .. } => {
+            UpstreamFetchError::ParseError("npm package name invalid".into())
+        }
         PackumentFetchError::VersionObjectTooLarge { .. } => {
             UpstreamFetchError::ParseError("npm upstream version object too large".into())
         }

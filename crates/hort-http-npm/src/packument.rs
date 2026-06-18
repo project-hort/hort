@@ -162,6 +162,15 @@ pub(crate) type CachedNpmProjection = CachedProjection<NpmProjection>;
 pub enum PackumentFetchError {
     #[error("no upstream mapping configured")]
     NoUpstream,
+    /// The requested package name failed `validate_npm_name` (serve-path
+    /// parity, INJ-3): a `..` / `..%2f`-shaped name that the bare
+    /// `normalize_name` URL-decode would otherwise pass through into the
+    /// Redis cache key / mirror key / composed upstream URL. Fail-closed
+    /// BEFORE any key construction. Carries the validator's message;
+    /// consumers surface it as `Validation` → 400 (a client fault, NOT
+    /// the `UpstreamUnavailable` network bucket).
+    #[error("invalid package name: {cause}")]
+    InvalidName { cause: String },
     #[error("upstream unavailable")]
     UpstreamUnavailable,
     /// The upstream metadata body exceeded the configured storage backstop.
@@ -274,6 +283,24 @@ pub async fn fetch_raw_with_cache(
         tracing::warn!("npm proxy repository has no upstream mapping configured");
         return Err(PackumentFetchError::NoUpstream);
     };
+
+    // ---- Package-name validation (serve-path parity, INJ-3) ----------
+    // The publish path validates the npm name via `validate_npm_name`
+    // before any storage write; the proxy-GET serve path historically
+    // only ran the bare `normalize_name` URL-decode, so a `..` / `..%2f`
+    // -shaped name would flow unvalidated into the Redis cache key, the
+    // mirror key, AND the composed upstream URL below. There is no
+    // filesystem escape (CAS + `reject_traversal` backstop), but the
+    // cache key / mirror key / upstream path would be polluted. Reject
+    // here, BEFORE any key / upstream-URL construction, returning the
+    // SAME `npm.name` `DomainError::Validation` the publish path emits
+    // (consumers map it to 400 — a client fault, not an outage).
+    if let Err(e) = hort_formats::npm::validate_npm_name(pkg_name) {
+        tracing::warn!("npm proxy package name failed validation; refusing to construct keys");
+        return Err(PackumentFetchError::InvalidName {
+            cause: e.to_string(),
+        });
+    }
 
     // The cache key uses the URL-encoded form so scoped (`@types%2fnode`)
     // and unscoped names occupy distinct cache rows even when the un-
@@ -1083,6 +1110,87 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, PackumentFetchError::NoUpstream));
+    }
+
+    /// Serve-path package-name validation (INJ-3). A traversal-shaped
+    /// proxy-GET name (`..`, `..%2f`, `../etc`) must be rejected by
+    /// `validate_npm_name` BEFORE any cache-key / mirror-key /
+    /// upstream-URL construction — surfaced as `InvalidName`, NOT
+    /// lowercase-normalised onward. The mapping is seeded so the request
+    /// reaches the validation gate (which sits after the mapping
+    /// resolve) rather than short-circuiting on `NoUpstream`. A tripwire
+    /// one-shot upstream failure proves `fetch_metadata` is never called
+    /// (the reject fires before any upstream leg).
+    #[tokio::test]
+    async fn fetch_rejects_traversal_name_before_key_construction() {
+        for bad in ["..", "..%2f", "../etc", "..%2fetc"] {
+            let metrics = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(metrics);
+            let repo = proxy_npm_repo("npm-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(&mocks, repo.id);
+
+            // Tripwire: if validation were bypassed, the fetch would call
+            // upstream and consume this one-shot failure.
+            mocks
+                .upstream_proxy
+                .fail_next_metadata_with(DomainError::Invariant(
+                    "MARKER:fetch_metadata_must_not_be_called".into(),
+                ));
+
+            let err = fetch_raw_with_cache(
+                ctx.upstream_resolver.as_ref(),
+                ctx.ephemeral_evictable.as_ref(),
+                ctx.upstream_proxy.as_ref(),
+                ctx.pull_dedup.as_ref(),
+                Some(ctx.metadata_mirror.as_ref()),
+                cap(),
+                &repo,
+                bad,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(err, PackumentFetchError::InvalidName { .. }),
+                "traversal name {bad:?} must reject with InvalidName, got {err:?}"
+            );
+        }
+    }
+
+    /// The validation gate must not regress the happy path: a normal
+    /// package name flows past validation into the cache/upstream
+    /// pipeline. A fresh cache hit lets us assert the gate is permissive
+    /// without seeding an upstream.
+    #[tokio::test]
+    async fn fetch_accepts_valid_name_past_validation_gate() {
+        let metrics = PrometheusBuilder::new().build_recorder().handle();
+        let (ctx, mocks) = build_mock_ctx(metrics);
+        let repo = proxy_npm_repo("npm-mirror");
+        mocks.repositories.insert(repo.clone());
+        let mapping_id = seed_mapping(&mocks, repo.id);
+
+        let entry = CachedNpmProjection::from_projection(sample_projection());
+        let key = format!("npm_packument_proj:{mapping_id}:express");
+        mocks
+            .ephemeral_evictable
+            .put(&key, entry.encode(), NPM_PACKUMENT_STALE_TTL)
+            .await
+            .unwrap();
+
+        let projection = fetch_raw_with_cache(
+            ctx.upstream_resolver.as_ref(),
+            ctx.ephemeral_evictable.as_ref(),
+            ctx.upstream_proxy.as_ref(),
+            ctx.pull_dedup.as_ref(),
+            Some(ctx.metadata_mirror.as_ref()),
+            cap(),
+            &repo,
+            "express",
+        )
+        .await
+        .expect("valid name must pass the validation gate");
+        assert_eq!(projection.dist_tag_latest.as_deref(), Some("1.2.3"));
     }
 
     /// (d) Fresh projection-cache hit → returns the cached projection,

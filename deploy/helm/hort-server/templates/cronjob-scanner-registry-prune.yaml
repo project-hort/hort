@@ -1,0 +1,104 @@
+{{/*
+Scanner-registry-prune CronJob (scanner-worker registry housekeeping).
+
+Periodically invokes `hort-cli admin task invoke scanner-registry-prune`,
+which hits `POST /api/v1/admin/tasks/scanner-registry-prune`. The endpoint
+enqueues a `kind='scanner-registry-prune'` row that the worker's dispatcher
+hands to the `ScannerRegistryPruneHandler` (registered unconditionally in
+`hort-worker::composition` — it reuses the `scanner_registry` handle the
+heartbeat task already holds; the table lives in the same database,
+migration 009).
+
+The handler runs one
+`DELETE FROM scanner_registry WHERE last_heartbeat < now() - 7d` tick and
+reports the deleted-row count in the job's `result_summary`.
+
+Architectural note: this CronJob is a *trigger* only. The actual DELETE
+runs in the worker pod (the `PgScannerRegistryRepository::prune_stale`
+DML). The CronJob pod only calls the hort-server admin-task HTTP endpoint
+with a service-account PAT.
+
+Default schedule: **hourly** — a single cheap DELETE per tick keeps the
+worker-coordination table tight between runs.
+
+Cleanup degrades SAFE: if this CronJob is disabled or the prune fails, the
+table only grows — worker liveness is recomputed from `last_heartbeat` on
+every admin-list read, independent of pruning, so the
+`hort admin workers list` `live` flags NEVER degrade. The only cost is
+storage. A failed tick is retried on the next schedule (the handler returns
+`Failed { retry: true }`, logged at `warn!`, never `error!` and never a
+hard worker failure).
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents a second
+pod while the previous tick runs. Execution-overlap protection lives in the
+worker's per-kind semaphore (the handler is registered single-active).
+
+Idempotency-Key: `--idempotency-key-window=hour` computes
+`<UTC hour>:scanner-registry-prune`, so a controller-restart double-fire
+within the same hour short-circuits at the framework layer rather than
+enqueuing two prune jobs for the same window (harmless if it did — the
+second DELETE is a no-op — but consistent with the sibling templates).
+
+DEFAULT-ENABLED: like replay-seen-prune, this is steady-state housekeeping
+with no security effect either way (worker liveness is read-time-computed),
+so the template ships `scheduledTasks.scannerRegistryPrune.enabled: true`.
+The parent toggle `scheduledTasks.adminTasksEnabled` must still be true for
+ANY CronJob (and the svc-token bootstrap Job) to render; that master switch
+is the single opt-in surface.
+
+The service-account token (`{{ release }}-svc-token`) is mounted from the
+k8s Secret written by the bootstrap Job (svc-token-bootstrap-job.yaml).
+*/}}
+{{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.scannerRegistryPrune.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-scanner-registry-prune
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: scanner-registry-prune
+spec:
+  schedule: {{ .Values.scheduledTasks.scannerRegistryPrune.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: scanner-registry-prune
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: hort-cli
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Distroless runtime: invoke `hort-cli` directly; the
+              # idempotency key is computed inside the CLI via
+              # `--idempotency-key-window` (no shell `date`).
+              command:
+                - /usr/local/bin/hort-cli
+              args:
+                - admin
+                - task
+                - invoke
+                - scanner-registry-prune
+                - --idempotency-key-window
+                - hour
+              env:
+                - name: HORT_SERVER
+                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                - name: HORT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "hort-server.fullname" . }}-svc-token
+                      key: token
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

@@ -19,6 +19,7 @@ pub mod task_get;
 pub mod task_invoke;
 pub mod task_list;
 pub mod users;
+pub mod workers;
 
 use clap::Subcommand;
 
@@ -75,6 +76,14 @@ pub enum AdminCommand {
     /// `users effective-permissions`.
     /// See `docs/architecture/how-to/operate/claim-based-rbac.md`.
     Rbac(rbac::RbacArgs),
+
+    /// Scanner-worker registry reads.
+    ///
+    /// `workers list` shows every worker that has registered in the
+    /// `scanner_registry` — its advertised backends and liveness
+    /// (`GET /admin/workers`). Stale/dead workers stay in the listing
+    /// (`LIVE=NO`) rather than vanishing.
+    Workers(workers::WorkersArgs),
 }
 
 /// `admin task` arguments.
@@ -127,6 +136,9 @@ pub async fn run(
             run_users(users_args, output, cli_server, cli_token).await
         }
         AdminCommand::Rbac(rbac_args) => run_rbac(rbac_args, output, cli_server, cli_token).await,
+        AdminCommand::Workers(workers_args) => {
+            run_workers(workers_args, output, cli_server, cli_token).await
+        }
     }
 }
 
@@ -214,6 +226,33 @@ async fn run_quarantine(
 
     let client = AkClient::new(&cfg)?;
     quarantine::run(client, args, output).await?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Dispatch for `admin workers`.
+///
+/// Mirrors `run_quarantine` — loads config, builds the HTTP client, hands
+/// off to the `workers` module's per-subcommand dispatcher.
+async fn run_workers(
+    args: workers::WorkersArgs,
+    output: OutputFormat,
+    cli_server: Option<String>,
+    cli_token: Option<String>,
+) -> anyhow::Result<std::process::ExitCode> {
+    use crate::client::AkClient;
+    use crate::config::load_effective_config;
+
+    let cfg = match load_effective_config(cli_server, cli_token) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hort-cli: config error: {e}");
+            eprintln!("Hint: run `hort-cli auth login` to set up credentials.");
+            return Ok(std::process::ExitCode::from(2));
+        }
+    };
+
+    let client = AkClient::new(&cfg)?;
+    workers::run(client, args, output).await?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 

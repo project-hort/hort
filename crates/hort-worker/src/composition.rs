@@ -78,8 +78,9 @@ use hort_app::task_handlers::{
     EventstoreCheckpointHandler, NoopTaskHandler, PrefetchDependenciesHandler,
     PrefetchIngestHandler, PrefetchRowRetentionSweepHandler, PrefetchTickHandler,
     ProvenanceVerifyHandler, QuarantineReleaseSweepHandler, ReplaySeenPruneHandler,
-    RetentionEvaluateHandler, RetentionPurgeHandler, ScanTaskHandler, SeedImportHandler,
-    ServiceAccountRotationHandler, StagingSweepHandler, WheelMetadataBackfillHandler,
+    RetentionEvaluateHandler, RetentionPurgeHandler, ScanTaskHandler, ScannerRegistryPruneHandler,
+    SeedImportHandler, ServiceAccountRotationHandler, StagingSweepHandler,
+    WheelMetadataBackfillHandler,
 };
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
 // IngestUseCase + ArtifactGroupUseCase are the dep subtree the worker
@@ -1030,6 +1031,27 @@ pub async fn build_app_context(
     );
 
     // -----------------------------------------------------------------
+    // Register the ScannerRegistryPruneHandler (worker-registry
+    // housekeeping). Reuses the same `scanner_registry` handle the
+    // heartbeat task holds — the prune is a single
+    // `DELETE … WHERE last_heartbeat < now() - 7d` per tick. Always
+    // registered (only needs the Postgres pool); concurrency = 1 (two
+    // concurrent ticks would contend on the same stale rows for no
+    // benefit). Degrades SAFE: a missed prune only grows the table —
+    // liveness flags are recomputed from `last_heartbeat` on every read,
+    // independent of pruning — so `Failed { retry: true }`, never a hard
+    // worker failure.
+    // -----------------------------------------------------------------
+    dispatcher.register(
+        Arc::new(ScannerRegistryPruneHandler::new(scanner_registry.clone())),
+        1, // single-active — see the call-site rationale.
+    );
+    tracing::info!(
+        "ScannerRegistryPruneHandler registered (single-active per worker replica) \
+         — scanner_registry stale-row cleanup wired (default-ENABLED CronJob)"
+    );
+
+    // -----------------------------------------------------------------
     // Register the three retention TaskHandlers + boot sweep +
     // in-process RefcountReconcileGate + optional hort_retention_role
     // pool (ADR 0020). Registered unconditionally: a handler whose
@@ -1498,6 +1520,31 @@ async fn register_provenance_verify(
                 trusted_root_path.display()
             )
         })?;
+
+    // Fail-closed boot assertion (ADR 0027): the verify path now
+    // cryptographically verifies the Rekor Merkle inclusion proof +
+    // checkpoint signature against the trust root's Rekor public key
+    // (selected per-entry by `logID`). A trust root with no (time-valid)
+    // Rekor key would therefore reject EVERY bundle `RekorNotFound` — a
+    // fail-closed-but-useless state. Catch the misprovisioned root here, at
+    // boot, rather than per artifact at verify time.
+    let rekor_keys = cached_trust_root.rekor_keys().map_err(|e| {
+        anyhow!(
+            "the pinned Sigstore trust root at {} could not be read for its Rekor keys: {e}",
+            trusted_root_path.display()
+        )
+    })?;
+    if rekor_keys.is_empty() {
+        return Err(anyhow!(
+            "the pinned Sigstore trust root at {} carries no Rekor public key (empty/expired \
+             `tlogs`). Provenance verification now requires a Rekor key to verify the Merkle \
+             inclusion proof + checkpoint signature (ADR 0027); without one every bundle would \
+             be rejected `RekorNotFound`. Provision a current trusted_root.json with a valid \
+             Rekor key (rotated via the Hort image/release pipeline).",
+            trusted_root_path.display()
+        ));
+    }
+
     let provenance_port: Arc<dyn ProvenancePort> = Arc::new(
         hort_adapters_provenance_sigstore::SigstoreProvenanceAdapter::new(cached_trust_root),
     );
