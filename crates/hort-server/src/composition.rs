@@ -47,6 +47,7 @@ use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
 use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
+use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerQueryUseCase;
 // `PolicyUseCase` is exposed on `AppContext` for
 // the HTTP exclusion write surface
 // (`POST/DELETE /api/v1/admin/policies/:policy_id/exclusions[/:cve_id]`).
@@ -2211,6 +2212,19 @@ pub async fn build_app_context(
     let patch_candidate_repo = Arc::new(PgPatchCandidateRepository::new(db.clone()));
     let patch_candidate_use_case = Arc::new(PatchCandidateUseCase::new(patch_candidate_repo));
 
+    // `ScannerWorkerQueryUseCase` for the admin `GET /admin/workers`
+    // endpoint. Wires the READ side of the `scanner_registry`
+    // worker-coordination table — the consumer for the worker heartbeat
+    // (ADR 0000 "Scanner-registry read side orphaned"; H20 removed the
+    // apply-time reader, this restores one). The use case enforces
+    // `Permission::Admin` and stamps each row with derived liveness.
+    let scanner_registry = Arc::new(
+        hort_adapters_postgres::scanner_registry_repository::PgScannerRegistryRepository::new(
+            db.clone(),
+        ),
+    );
+    let scanner_worker_query_use_case = Arc::new(ScannerWorkerQueryUseCase::new(scanner_registry));
+
     // Prefetch planner. Zero-cost unit struct;
     // the `Arc` mirrors the rest of the use-case surface.
     let prefetch_use_case = Arc::new(PrefetchUseCase::new());
@@ -2716,6 +2730,7 @@ pub async fn build_app_context(
         task_use_case,
         manual_rescan_use_case,
         patch_candidate_use_case,
+        scanner_worker_query_use_case,
         prefetch_use_case,
         effective_permissions_use_case,
         rbac_resolve_use_case,

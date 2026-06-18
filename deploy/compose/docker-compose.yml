@@ -3,15 +3,35 @@
 # Intentionally minimal: unblocks E2E testing via the native-client scripts.
 # Production deployment (ingress, TLS, secrets, HA postgres) is out of
 # scope for Phase B.
+#
+# ============================ DANGER: DEV/CI ONLY ============================
+# This compose stack is for local development and the E2E smoke harness ONLY.
+# It ships intentionally-weak defaults that MUST NOT be used in production:
+#   - default DB / Keycloak-admin passwords (overridable — see below),
+#   - anonymous /metrics on 0.0.0.0 (HORT_METRICS_REQUIRE_AUTH=false),
+#   - plaintext HTTP, no TLS, ephemeral data.
+# Credentials are overridable via the environment (e.g. a gitignored
+# `.env.local`, see `.env.local.example`): `${POSTGRES_PASSWORD:-registry}` /
+# `${KC_ADMIN_PASSWORD:-admin}`. Do NOT copy this file into a production
+# deployment. Resource limits (`mem_limit`/`cpus`) cap each container so a
+# memory-amplifying scan (Trivy) cannot OOM a shared CI runner host.
+# ============================================================================
 
 name: hort
 
 services:
   postgres:
     image: postgres:15
+    # Resource cap (B7/INFRA-6): bound postgres memory so the dev/CI host is
+    # protected. Smoke data is tens-of-MB; 512m is comfortable.
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "1.0"
     environment:
       POSTGRES_USER: registry
-      POSTGRES_PASSWORD: registry
+      # DANGER (dev/CI only): default password. Override in any real use via
+      # POSTGRES_PASSWORD in the environment / `.env.local`.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-registry}
       POSTGRES_DB: artifact_registry
       # Ephemeral data root: see the `tmpfs` block below. `PGDATA` lives
       # under a subdirectory of the tmpfs mount because the official
@@ -58,6 +78,11 @@ services:
     # aligned with what Keycloak themselves CI against.
     image: quay.io/keycloak/keycloak:26.6
     container_name: hort-keycloak
+    # Resource cap (B7/INFRA-6): the JVM dev-mode server + one realm fits
+    # comfortably in 1.5g; bump if a richer realm import OOMs the start.
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cpus: "2.0"
     command:
       - start-dev
       - --import-realm
@@ -67,7 +92,9 @@ services:
     environment:
       # Keycloak 26 renamed the bootstrap admin env vars.
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # DANGER (dev/CI only): default admin password. Override via
+      # KC_ADMIN_PASSWORD in the environment / `.env.local`.
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:-admin}
       KC_HTTP_PORT: "8080"
       KC_HEALTH_ENABLED: "true"
       # Must match hort-server's HORT_OIDC_ISSUER_URL host:port exactly — the
@@ -150,17 +177,49 @@ services:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
     container_name: hort-migrate
+    mem_limit: 512m
+    cpus: "1.0"
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["migrate"]
+    # INFRA-4 fail-closed guard (B7 remainder): refuse to run migrations
+    # against a production deployment that still carries the dev default DB
+    # credentials. INERT in dev/CI (HORT_ENV unset → the `if` is false →
+    # straight to `exec migrate`), so it needs no compose-E2E validation.
+    # `$$VAR` escapes compose's own interpolation so the in-container
+    # `/bin/sh` (the debian-slim runtime image ships one) evaluates the
+    # *runtime* env, not compose at parse time. The entrypoint is overridden
+    # because the image ENTRYPOINT is the hort-server binary, not a shell.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$$HORT_ENV" = "production" ]; then
+          case "$$DATABASE_URL" in
+            *registry:registry@*)
+              echo "FATAL: HORT_ENV=production but DATABASE_URL still uses the dev default DB credentials (registry:registry). This compose stack is dev/CI ONLY (see the DANGER banner above); set a real POSTGRES_PASSWORD / DATABASE_URL, or do not use this file in production." >&2
+              exit 1
+              ;;
+          esac
+        fi
+        exec /usr/local/bin/hort-server migrate
     environment:
-      DATABASE_URL: "postgres://registry:registry@postgres:5432/artifact_registry"
+      DATABASE_URL: "postgres://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/artifact_registry"
+      # Forwarded from the host so the INFRA-4 guard above can detect a
+      # production misuse; empty in dev/CI, which keeps the guard inert.
+      HORT_ENV: ${HORT_ENV:-}
       HORT_LOG_FORMAT: "json"
       RUST_LOG: "hort_server=info,hort_adapters_postgres=info,sqlx=warn"
     restart: "no"
 
   hort-server:
+    # Resource caps + least-capability hardening (B7/INFRA-6/11). The
+    # server runs as non-root (uid 65532) and binds high ports
+    # (8080/9090), so it needs no Linux capabilities — drop them all.
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: "2.0"
+    cap_drop:
+      - ALL
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
@@ -174,11 +233,14 @@ services:
       cas-init:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: "postgres://registry:registry@postgres:5432/artifact_registry"
+      DATABASE_URL: "postgres://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/artifact_registry"
       HORT_STORAGE_BACKEND: "filesystem"
       HORT_STORAGE_FILESYSTEM_PATH: "/var/lib/hort-server/cas"
       HORT_API_BIND: "0.0.0.0:8080"
       HORT_METRICS_BIND: "0.0.0.0:9090"
+      # DANGER (dev/CI only): the next two flags expose /metrics on 0.0.0.0
+      # WITHOUT auth (repo names, error rates, traffic shape). Production MUST
+      # leave both UNSET (secure defaults: bind off / require auth).
       # Explicit opt-in to bind /metrics on 0.0.0.0; hort-server
       # refuses the unspecified-address bind without this flag. The
       # compose network namespace requires 0.0.0.0 so the host
@@ -250,6 +312,15 @@ services:
     # CI may override `image:` with a registry-published tag.
     profiles:
       - worker
+    # Resource caps + least-capability hardening (B7/INFRA-6/11). The
+    # worker runs Trivy (memory-hungry) — 4g bounds it so a pathological
+    # scan can't OOM a shared CI host while staying generous for normal
+    # artifacts. Non-root (uid 65532), no listening ports → drop all caps.
+    mem_limit: 4g
+    memswap_limit: 4g
+    cpus: "2.0"
+    cap_drop:
+      - ALL
     build:
       context: ../..
       dockerfile: docker/Dockerfile.worker
@@ -265,7 +336,7 @@ services:
     environment:
       # DSN matches hort-server's so the worker hits the same database
       # via the compose-network alias `postgres`.
-      HORT_DATABASE_URL: "postgres://registry:registry@postgres:5432/artifact_registry"
+      HORT_DATABASE_URL: "postgres://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/artifact_registry"
       HORT_LOG_FORMAT: "json"
       RUST_LOG: "hort_worker=info,hort_app=info,hort_adapters_postgres=info,hort_adapters_scanner_trivy=info,hort_adapters_scanner_osv=info,hort_adapters_advisory_osv=info,sqlx=warn"
       # Storage selector mirrors hort-server's CAS — the worker streams

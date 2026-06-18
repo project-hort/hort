@@ -1,13 +1,14 @@
 //! Trivy severity string → [`SeverityThreshold`] mapping.
 //!
 //! Trivy reports one of five severity bands as an uppercase string:
-//! `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `UNKNOWN`. The fifth band
-//! plus any unrecognised string maps to [`SeverityThreshold::Low`] —
-//! conservative because the orchestrator's policy evaluator gates on
-//! threshold; mapping unknowns to anything higher would risk false
-//! "block" decisions, mapping to anything lower would risk silently
-//! dropping the finding from the policy view (the variant set has no
-//! `Negligible`).
+//! `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `UNKNOWN`. The fifth band plus
+//! any unrecognised string maps to the HIGHEST tier
+//! [`SeverityThreshold::Critical`] — **fail-closed** (SUP-4). A finding
+//! whose severity we cannot determine must still trip the default
+//! Critical block threshold rather than slip under it; mapping unknowns
+//! to a low tier (the prior `Low` default) was a fail-OPEN gap that let
+//! an unparseable-severity finding pass the release gate. Unified with
+//! the scanner-osv and advisory-osv adapters.
 //!
 //! The mapping is case-insensitive: `"critical"` and `"CRITICAL"` both
 //! resolve to [`SeverityThreshold::Critical`]. Trivy spells the
@@ -23,18 +24,19 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 /// - `MEDIUM`   → [`SeverityThreshold::Medium`]
 /// - `LOW`      → [`SeverityThreshold::Low`]
 ///
-/// Anything else (including `UNKNOWN`, `NEGLIGIBLE`, empty) maps to
-/// [`SeverityThreshold::Low`].
+/// Anything else (including `UNKNOWN`, `NEGLIGIBLE`, empty) maps to the
+/// highest tier [`SeverityThreshold::Critical`] (fail-closed, SUP-4).
 pub(crate) fn trivy_severity_to_threshold(severity: &str) -> SeverityThreshold {
     match severity.trim().to_ascii_uppercase().as_str() {
         "CRITICAL" => SeverityThreshold::Critical,
         "HIGH" => SeverityThreshold::High,
         "MEDIUM" => SeverityThreshold::Medium,
         "LOW" => SeverityThreshold::Low,
-        // UNKNOWN / NEGLIGIBLE / empty / anything else: conservative
-        // fallback to Low so the orchestrator still sees the finding
-        // (the SeverityThreshold enum has no lower band).
-        _ => SeverityThreshold::Low,
+        // UNKNOWN / NEGLIGIBLE / empty / anything else: fail-closed
+        // fallback to the HIGHEST tier (`Critical`) so an
+        // unparseable-severity finding still trips the default Critical
+        // block threshold rather than slipping under it (SUP-4).
+        _ => SeverityThreshold::Critical,
     }
 }
 
@@ -69,24 +71,26 @@ mod tests {
     }
 
     #[test]
-    fn unknown_maps_to_low_conservative_fallback() {
+    fn unknown_maps_to_critical_fail_closed() {
+        // SUP-4: an unparseable severity must fail CLOSED to the highest
+        // tier so it still trips the default Critical block threshold.
         assert_eq!(
             trivy_severity_to_threshold("UNKNOWN"),
-            SeverityThreshold::Low
+            SeverityThreshold::Critical
         );
     }
 
     #[test]
-    fn negligible_maps_to_low_conservative_fallback() {
+    fn negligible_maps_to_critical_fail_closed() {
         assert_eq!(
             trivy_severity_to_threshold("NEGLIGIBLE"),
-            SeverityThreshold::Low
+            SeverityThreshold::Critical
         );
     }
 
     #[test]
-    fn empty_maps_to_low_conservative_fallback() {
-        assert_eq!(trivy_severity_to_threshold(""), SeverityThreshold::Low);
+    fn empty_maps_to_critical_fail_closed() {
+        assert_eq!(trivy_severity_to_threshold(""), SeverityThreshold::Critical);
     }
 
     #[test]
@@ -111,10 +115,11 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_label_maps_to_low_conservative_fallback() {
+    fn unrecognised_label_maps_to_critical_fail_closed() {
+        // SUP-4: any unrecognised label fails CLOSED to the highest tier.
         assert_eq!(
             trivy_severity_to_threshold("nuclear"),
-            SeverityThreshold::Low
+            SeverityThreshold::Critical
         );
     }
 }

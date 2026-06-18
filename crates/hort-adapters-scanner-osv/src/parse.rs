@@ -164,13 +164,28 @@ pub(crate) struct OsvGroup {
 // Public parse + lowering API
 // ---------------------------------------------------------------------------
 
-/// Parse an osv-scanner `--format json` document. Empty stdout is
-/// treated as a clean scan.
+/// Parse an osv-scanner `--format json` document.
+///
+/// **Fail-closed on empty stdout (SUP-3).** An `exit==0 && empty stdout`
+/// scan is *indeterminate*, NOT clean: osv-scanner with `--format json`
+/// always emits a (possibly empty-`results`) JSON document on a real run,
+/// so empty stdout means the scanner produced no parseable result at all
+/// (truncated pipe, wrapper that swallowed output, etc.). Treating that as
+/// "zero findings → clean" would let a vulnerable artifact pass the
+/// release gate on a silent scanner failure. We surface it as a parse
+/// error so the caller maps it to `ScanIndeterminate`, mirroring the
+/// already-error `exit==1 && empty stdout` path. The error shape matches
+/// the malformed-JSON path (a `serde_json::Error`), so the caller's
+/// existing `map_err` lowers both to the same `DomainError::Validation`.
 pub(crate) fn parse_osv_scanner_report(
     stdout: &[u8],
 ) -> Result<OsvScannerReport, serde_json::Error> {
     if stdout.is_empty() {
-        return Ok(OsvScannerReport::default());
+        // Produce a `serde_json::Error` of the same shape the
+        // malformed-JSON branch returns, so the indeterminate signal flows
+        // through the caller's identical error mapping. Parsing empty bytes
+        // as a struct is itself an EOF error — reuse it directly.
+        return serde_json::from_slice::<OsvScannerReport>(b"");
     }
     serde_json::from_slice(stdout)
 }
@@ -259,8 +274,12 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
                 .iter()
                 .find_map(|sv| label_to_severity(&sv.score))
         })
-        // Final fallback: missing severity maps to Medium.
-        .unwrap_or(SeverityThreshold::Medium);
+        // Final fallback (SUP-4): a finding whose severity we cannot
+        // determine maps to the HIGHEST tier (`Critical`), fail-closed —
+        // an unparseable-severity finding must still trip the default
+        // Critical block threshold rather than slip under it. Unified with
+        // the advisory-osv and trivy adapters.
+        .unwrap_or(SeverityThreshold::Critical);
 
     let title = vuln
         .summary
@@ -394,16 +413,27 @@ mod tests {
         }
     }
 
-    // ----- empty stdout fallback --------------------------------------------
+    // ----- empty stdout: fail-closed (SUP-3) --------------------------------
 
     #[test]
-    fn parse_empty_stdout_returns_empty_report() {
-        let r = parse_osv_scanner_report(b"").expect("parse");
-        assert!(r.results.is_empty());
+    fn parse_empty_stdout_is_indeterminate_err_not_clean() {
+        // SUP-3: `exit==0 && empty stdout` must NOT be treated as a clean
+        // (zero-findings) scan — that is fail-OPEN. Empty stdout means the
+        // scanner produced no parseable document, which is indeterminate.
+        // Surfacing an `Err` lets the orchestrator map it to
+        // `ScanIndeterminate` instead of releasing a possibly-vulnerable
+        // artifact.
+        let r = parse_osv_scanner_report(b"");
+        assert!(
+            r.is_err(),
+            "empty stdout must be indeterminate Err, not Ok(clean): {r:?}"
+        );
     }
 
     #[test]
     fn parse_empty_results_object_returns_empty_report() {
+        // An explicit empty-`results` JSON document IS a real, parseable
+        // clean scan — distinct from empty stdout. This stays Ok.
         let r = parse_osv_scanner_report(b"{}").expect("parse");
         assert!(r.results.is_empty());
     }
@@ -601,11 +631,14 @@ mod tests {
     }
 
     #[test]
-    fn severity_falls_back_to_medium_when_score_absent() {
+    fn severity_falls_back_to_critical_when_score_absent_fail_closed() {
+        // SUP-4: a finding whose severity cannot be determined fails
+        // CLOSED to the highest tier (`Critical`) so it still trips the
+        // default Critical block threshold rather than slipping under it.
         let pkg = pkg("lodash", "npm", "4.17.20");
         let v = vuln_skeleton();
         let f = vuln_to_finding(&pkg, &[], &v);
-        assert_eq!(f.severity, SeverityThreshold::Medium);
+        assert_eq!(f.severity, SeverityThreshold::Critical);
         assert_eq!(f.cvss_score, None);
     }
 

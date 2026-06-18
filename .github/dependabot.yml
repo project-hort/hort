@@ -12,6 +12,20 @@ updates:
     commit-message:
       prefix: "chore"
 
+  # B10/INFRA-8: the dev/E2E compose stack — its Dockerfile (digest-pinned
+  # base images) and the docker-compose.yml service image tags.
+  - package-ecosystem: "docker"
+    directory: "/deploy/compose"
+    schedule:
+      interval: "weekly"
+    reviewers:
+      - "hort/maintainers"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

@@ -1,0 +1,19 @@
+# .trivyignore — reviewed and accepted CVE allowlist
+#
+# This file is the escape hatch for the now-blocking Trivy publish-path gate in
+# .github/workflows/docker-publish.yml (Trivy scan - Backend), which fails the
+# release on any fixable CRITICAL CVE (`exit-code: 1`, `severity: CRITICAL`,
+# `ignore-unfixed: true`).
+#
+# List one CVE ID per line (e.g. `CVE-2024-12345`). A line here means the CVE
+# has been reviewed and consciously accepted — typically an unfixable
+# base-image CVE Trivy still flags as fixable, or a CVE in a code path the
+# image does not exercise.
+#
+# Discipline:
+#   - Every addition MUST be reviewed (a CVE silenced here is a CVE we ship).
+#   - Prefer upgrading the affected layer/dependency over adding an entry.
+#   - Keep a short justification comment above each ID and reassess on each
+#     release so stale acceptances do not accumulate.
+#
+# (Empty by default — no CVEs are currently accepted.)

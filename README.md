@@ -1,8 +1,8 @@
 # Hort
 
-**Hort** is a universal, multi-protocol artifact repository and supply-chain
+**Hort** is a universal, multi-format artifact repository and supply-chain
 platform — one server that proxies, stores, scans, and governs packages across
-every major package ecosystem, built on a hexagonal, event-sourced architecture.
+extensible package ecosystems, built on a hexagonal, event-sourced architecture.
 
 > Built mainly with **Claude Opus 4.7 (1M context)**.
 
@@ -16,7 +16,7 @@ The name is the platform's four load-bearing guarantees:
 - **Origin** — mandatory upstream verification. Every pull-through fetch
   verifies a checksum (the protocol-native digest for OCI; parsed upstream
   metadata for Cargo / PyPI / npm). A format that cannot verify cannot proxy.
-- **Repository** — the multi-protocol artifact surface: OCI, npm, PyPI, and
+- **Repository** — the multi-format artifact surface: OCI, npm, PyPI, and
   Cargo, each served through a dedicated inbound adapter behind one set of
   domain ports.
 - **Trail** — the event-sourced artifact lifecycle and a tamper-evident,
@@ -46,7 +46,7 @@ domain (pure Rust, zero I/O)
   → application (use cases, orchestration)
     → outbound port traits
       → adapters (PostgreSQL, object storage, scanners)
-inbound HTTP adapters (one crate per protocol) → composition root
+inbound HTTP adapters (one crate per format) → composition root
 ```
 
 - **Event-sourced lifecycle.** Artifact state transitions produce immutable
@@ -58,7 +58,7 @@ inbound HTTP adapters (one crate per protocol) → composition root
 - **Format modularization (roadmap).** The architecture is designed to load
   formats as sandboxed, deploy-time WASM modules from `$WASM_PLUGIN_DIR`, each
   declaring its capability groups in a manifest. Today's format handlers are
-  compiled-in per-protocol adapters.
+  compiled-in per-format adapters.
 - **Quarantine + scanning.** Pulled and pushed artifacts can be held in
   quarantine until a fail-closed release predicate (vulnerability scan,
   upstream verification, policy) is satisfied.

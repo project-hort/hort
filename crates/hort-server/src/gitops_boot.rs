@@ -39,7 +39,6 @@ use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
-use hort_domain::ports::scanner_registry_repository::ScannerRegistryRepository;
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::user_repository::UserRepository;
@@ -283,16 +282,6 @@ async fn apply_inner(
             pool.clone(),
         ),
     );
-    // Read-side worker-coordination
-    // port for apply-time `scanBackends` validation. The same adapter
-    // is constructed by the worker's composition root for write-side
-    // heartbeats; here we only need the `list_live` read path. Cheap
-    // pool clone — the `PgPool` itself owns connection lifecycle.
-    let scanner_registry: Arc<dyn ScannerRegistryRepository> = Arc::new(
-        hort_adapters_postgres::scanner_registry_repository::PgScannerRegistryRepository::new(
-            pool.clone(),
-        ),
-    );
     // Apply-pipeline ports for the machine-identity gitops
     // kinds (OidcIssuer + ServiceAccount — ADR 0018). The user repo is
     // reused
@@ -349,7 +338,6 @@ async fn apply_inner(
         upstream_mappings,
         upstream_allowlist,
         content_references,
-        scanner_registry,
         oidc_issuers,
         service_accounts,
         users,
@@ -408,7 +396,7 @@ async fn apply_inner(
                 Err(GitopsBootError::PreflightValidate(msg))
             }
             // A non-validation error from preflight is infrastructure (snapshot
-            // build / scanner_registry read) — NOT provably benign, so crash.
+            // build read) — NOT provably benign, so crash.
             other => {
                 let rendered = other.to_string();
                 tracing::error!(error = %rendered, "gitops boot: preflight failed (infrastructure)");
@@ -537,12 +525,14 @@ fn record_duration_metric(seconds: f64) {
 /// - `Read` / `Walk` — fail during `collect_yaml_files`'s directory walk,
 ///   before parse and therefore before any write.
 /// - `PreflightValidate` — fails in `apply_uc.preflight_validate()`, which
-///   `apply_inner` runs BEFORE `apply()`. That pass performs only reads
-///   (snapshot + `scanner_registry.list_live`) and the in-memory
-///   validation/lint checks — zero writes — so a failure here is provably
-///   pre-write and parks. This is the validation/lint that operators most
-///   commonly trip (a typo'd `scanBackends`, a bad lint/provenance config,
-///   a duplicate name, a dangling FK); it no longer crashloops.
+///   `apply_inner` runs BEFORE `apply()`. That pass performs only the
+///   snapshot read and the in-memory validation/lint checks — zero writes —
+///   so a failure here is provably pre-write and parks. This is the
+///   validation/lint that operators most commonly trip (a typo'd
+///   `scanBackends`, a bad lint/provenance config, a duplicate name, a
+///   dangling FK); it no longer crashloops. (A *correct* `scanBackends`
+///   entry no longer trips it on a fresh boot: backends are validated
+///   against the compiled-in set, not the live worker registry — H20.)
 ///
 /// `Validate` and `Apply` originate from `apply_uc.apply()` (or the
 /// adapter / event-store-probe construction that immediately precedes it),

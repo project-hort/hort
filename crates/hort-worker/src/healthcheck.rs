@@ -10,10 +10,15 @@
 //!    `SELECT 1` fails, the worker has no useful work it can do.
 //!
 //! What it deliberately does NOT do:
-//!   - **Start the dispatcher** — wedged-but-alive workers are caught
-//!     by the existing `scanner_registry.last_heartbeat` staleness
-//!     check, not by the k8s probe. The probe's responsibility is
-//!     "did the binary boot far enough that env + DB are reachable".
+//!   - **Start the dispatcher** — the k8s probe checks reachability, not
+//!     liveness of the work loop. (Wedged-but-alive-worker detection via
+//!     `scanner_registry.last_heartbeat` staleness is *operator-driven*, not
+//!     automated: `hort admin workers list` / `GET /api/v1/admin/workers`
+//!     surfaces each worker's `live` flag + last-heartbeat age, so an
+//!     operator can spot a stale worker — but no probe/alert reads the
+//!     staleness automatically yet. The probe here does not attempt it.)
+//!     The probe's responsibility is "did the binary boot far enough that
+//!     env + DB are reachable".
 //!   - **Probe Trivy or osv-scanner** — those are scan-time concerns.
 //!     A broken scanner binary makes scan jobs fail, but the worker
 //!     process itself is still healthy in the k8s sense.

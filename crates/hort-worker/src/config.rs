@@ -80,14 +80,34 @@ impl std::fmt::Debug for StorageConfig {
 /// Subset of `hort_server::config::MinimalConfig` the worker consumes —
 /// database URL + log format. Carried as a struct so callers can read
 /// `cfg.minimal.database_url` the same way `hort-server` does.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MinimalConfig {
     pub database_url: String,
     pub log_format: LogFormat,
 }
 
+impl std::fmt::Debug for MinimalConfig {
+    /// Hand-rolled to redact `database_url` — a DSN with an inline
+    /// password whose value would otherwise leak through any `{:?}`
+    /// expansion. Mirrors `hort_server::config::Config`'s redacting
+    /// `Debug` and the [`StorageConfig`] `<redacted>` placeholder
+    /// spelling. `log_format` is non-secret and passes through verbatim.
+    /// The exhaustive destructure forces this impl to stay in sync with
+    /// the struct — a new field is a compile error here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            database_url: _,
+            log_format,
+        } = self;
+        f.debug_struct("MinimalConfig")
+            .field("database_url", &"<redacted>")
+            .field("log_format", log_format)
+            .finish()
+    }
+}
+
 /// Full worker configuration. See module doc for the env-var surface.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerConfig {
     pub minimal: MinimalConfig,
     pub storage: StorageConfig,
@@ -242,6 +262,99 @@ pub struct WorkerConfig {
     /// must never be world-reachable). This is the standard pod-metrics
     /// pattern and the objectively-cheaper control.
     pub metrics_bind_addr: Option<std::net::SocketAddr>,
+}
+
+impl std::fmt::Debug for WorkerConfig {
+    /// Hand-rolled to redact the DSN-bearing fields whose inline
+    /// passwords would otherwise leak through any `{:?}` expansion:
+    /// `redis_url_evictable` and `retention_database_url` (both
+    /// `Option`), plus the nested `minimal.database_url` and the S3
+    /// credentials inside `storage` (each redacted by its own `Debug`).
+    /// Mirrors `hort_server::config::Config`'s redacting `Debug`: the
+    /// optional DSN fields surface only their structural shape
+    /// (`Some("<redacted>")` / `None`) so a reader of `?cfg` can tell the
+    /// override is configured without seeing the value, and every other
+    /// field passes through verbatim. The exhaustive destructure forces
+    /// this impl to stay in sync with the struct — a new field is a
+    /// compile error here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            minimal,
+            storage,
+            redis_url_evictable: _,
+            trivy_enabled,
+            trivy_bin,
+            trivy_db_dir,
+            osv_enabled,
+            osv_scanner_bin,
+            provenance_cosign_enabled,
+            provenance_trusted_root_file,
+            advisory_osv_url,
+            advisory_osv_bulk_url,
+            advisory_watch_ecosystems,
+            stateful_upload_staging_dir,
+            poll_interval,
+            batch_size,
+            max_attempts,
+            lock_duration,
+            worker_id,
+            rotation_namespaces,
+            public_registry_host,
+            include_service_account_label,
+            refcount_reconcile_on_startup,
+            retention_database_url: _,
+            audit_retention_floors,
+            retention_stream_mode,
+            lock_timeout_ms,
+            metrics_bind_addr,
+        } = self;
+        f.debug_struct("WorkerConfig")
+            .field("minimal", minimal)
+            .field("storage", storage)
+            // DSN with inline password — surface only the structural
+            // shape (`Some("<redacted>")` / `None`).
+            .field(
+                "redis_url_evictable",
+                &self.redis_url_evictable.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trivy_enabled", trivy_enabled)
+            .field("trivy_bin", trivy_bin)
+            .field("trivy_db_dir", trivy_db_dir)
+            .field("osv_enabled", osv_enabled)
+            .field("osv_scanner_bin", osv_scanner_bin)
+            .field("provenance_cosign_enabled", provenance_cosign_enabled)
+            .field("provenance_trusted_root_file", provenance_trusted_root_file)
+            .field("advisory_osv_url", advisory_osv_url)
+            .field("advisory_osv_bulk_url", advisory_osv_bulk_url)
+            .field("advisory_watch_ecosystems", advisory_watch_ecosystems)
+            .field("stateful_upload_staging_dir", stateful_upload_staging_dir)
+            .field("poll_interval", poll_interval)
+            .field("batch_size", batch_size)
+            .field("max_attempts", max_attempts)
+            .field("lock_duration", lock_duration)
+            .field("worker_id", worker_id)
+            .field("rotation_namespaces", rotation_namespaces)
+            .field("public_registry_host", public_registry_host)
+            .field(
+                "include_service_account_label",
+                include_service_account_label,
+            )
+            .field(
+                "refcount_reconcile_on_startup",
+                refcount_reconcile_on_startup,
+            )
+            // DSN with inline password — surface only the structural
+            // shape (`Some("<redacted>")` / `None`).
+            .field(
+                "retention_database_url",
+                &self.retention_database_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("audit_retention_floors", audit_retention_floors)
+            .field("retention_stream_mode", retention_stream_mode)
+            .field("lock_timeout_ms", lock_timeout_ms)
+            .field("metrics_bind_addr", metrics_bind_addr)
+            .finish()
+    }
 }
 
 /// Audit-retention floors, resolved in `hort-worker` from the same env
@@ -1382,5 +1495,90 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    // -- DSN redaction in `Debug` (LOG-5) ----------------------------------
+    //
+    // `MinimalConfig` and `WorkerConfig` carry Postgres/Redis DSNs with
+    // inline passwords (`database_url`, `redis_url_evictable`,
+    // `retention_database_url`). Both have hand-rolled `Debug` impls that
+    // redact those fields with the `<redacted>` placeholder; a stray
+    // `{:?}` must never print the passwords. Mirrors the server's
+    // `config_debug_does_not_leak_database_url` regression test.
+
+    const SENSITIVE_DATABASE_PASSWORD: &str = "supersecretdbpw";
+    const SENSITIVE_REDIS_EVICTABLE_PASSWORD: &str = "supersecretevictablepw";
+    const SENSITIVE_RETENTION_DATABASE_PASSWORD: &str = "supersecretretentionpw";
+
+    #[test]
+    fn worker_config_debug_does_not_leak_dsn_passwords() {
+        let _g = lock_env();
+        clear_all();
+        // `HORT_RETENTION_DATABASE_URL` is not in `SLOTS`; set it
+        // explicitly so the optional secret field is populated and the
+        // redaction path is exercised deterministically (and clear any
+        // inherited value implicitly by overwriting it).
+        std::env::set_var(
+            "HORT_DATABASE_URL",
+            format!("postgres://user:{SENSITIVE_DATABASE_PASSWORD}@db.example:5432/hort"),
+        );
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var(
+            "HORT_REDIS_URL_EVICTABLE",
+            format!("redis://user:{SENSITIVE_REDIS_EVICTABLE_PASSWORD}@evictable.example:6379/0"),
+        );
+        std::env::set_var(
+            "HORT_RETENTION_DATABASE_URL",
+            format!(
+                "postgres://user:{SENSITIVE_RETENTION_DATABASE_PASSWORD}@retention.example:5432/hort"
+            ),
+        );
+
+        let cfg = WorkerConfig::from_env().expect("parses with sensitive DSNs");
+
+        // Sanity: the secret fields actually hold the passwords (so a
+        // green assertion below means redaction, not an empty value).
+        assert!(cfg
+            .minimal
+            .database_url
+            .contains(SENSITIVE_DATABASE_PASSWORD));
+        assert!(cfg
+            .redis_url_evictable
+            .as_deref()
+            .is_some_and(|u| u.contains(SENSITIVE_REDIS_EVICTABLE_PASSWORD)));
+        assert!(cfg
+            .retention_database_url
+            .as_deref()
+            .is_some_and(|u| u.contains(SENSITIVE_RETENTION_DATABASE_PASSWORD)));
+
+        let debug_repr = format!("{cfg:?}");
+        for pw in [
+            SENSITIVE_DATABASE_PASSWORD,
+            SENSITIVE_REDIS_EVICTABLE_PASSWORD,
+            SENSITIVE_RETENTION_DATABASE_PASSWORD,
+        ] {
+            assert!(
+                !debug_repr.contains(pw),
+                "WorkerConfig Debug leaked DSN password {pw:?}: {debug_repr}"
+            );
+        }
+        assert!(
+            debug_repr.contains("<redacted>"),
+            "WorkerConfig Debug missing `<redacted>` placeholder: {debug_repr}"
+        );
+
+        // The nested `MinimalConfig` Debug must redact on its own too.
+        let minimal_repr = format!("{:?}", cfg.minimal);
+        assert!(
+            !minimal_repr.contains(SENSITIVE_DATABASE_PASSWORD),
+            "MinimalConfig Debug leaked database_url password: {minimal_repr}"
+        );
+        assert!(
+            minimal_repr.contains("<redacted>"),
+            "MinimalConfig Debug missing `<redacted>` placeholder: {minimal_repr}"
+        );
+
+        // Cleanup the slot we set outside `SLOTS`.
+        std::env::remove_var("HORT_RETENTION_DATABASE_URL");
     }
 }

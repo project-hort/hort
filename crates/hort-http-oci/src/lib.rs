@@ -43,6 +43,7 @@ pub(crate) mod name;
 pub(crate) mod prefetch;
 pub(crate) mod quarantine;
 pub mod referrers;
+pub(crate) mod tag;
 pub mod tags;
 pub(crate) mod tail;
 pub mod upload_session;
@@ -122,6 +123,27 @@ pub(crate) fn name_invalid_response(err: hort_domain::error::DomainError) -> Res
         // misrepresent the failure on the wire).
         other => {
             tracing::error!(error = %other, "OCI name validator returned non-Validation error");
+            OciError::Internal.into_response()
+        }
+    }
+}
+
+/// Map a [`crate::tag::validate_oci_tag`] rejection to the OCI handler
+/// response — the tag-grammar sibling of [`name_invalid_response`] (INJ-4).
+/// A `Validation` error becomes 400 `MANIFEST_INVALID` carrying the
+/// deterministic `oci.tag:` reason (which never echoes the offending bytes —
+/// see `tag.rs`); any other shape (the validator never returns one today)
+/// surfaces as `Internal` rather than being silently treated as a valid tag.
+/// Shared by the manifest GET / PUT / DELETE tag branches so the reject
+/// shape is identical across all three.
+pub(crate) fn tag_invalid_response(err: hort_domain::error::DomainError) -> Response {
+    match err {
+        hort_domain::error::DomainError::Validation(reason) => OciError::ManifestInvalid {
+            detail: Some(serde_json::json!({ "reason": reason })),
+        }
+        .into_response(),
+        other => {
+            tracing::error!(error = %other, "OCI tag validator returned non-Validation error");
             OciError::Internal.into_response()
         }
     }

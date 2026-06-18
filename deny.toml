@@ -66,10 +66,6 @@ ignore = [
     # `IterMut`. See `.cargo/audit.toml` for the full rationale.
     "RUSTSEC-2026-0002",
 
-    # rand 0.8.5 — unsound only when a custom log::Log impl calls
-    # rand::thread_rng(). We install no custom logger.
-    "RUSTSEC-2026-0097",
-
     # rustls-pemfile — unmaintained shim around `rustls-pki-types::pem`.
     # Only path is dev-dep `axum-server` for the mTLS / pinning test
     # servers; production migrated to `PemObject`.

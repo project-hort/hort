@@ -924,6 +924,16 @@
             "schedule": {"type": "string", "minLength": 1}
           }
         },
+        "scannerRegistryPrune": {
+          "description": "executionPath: admin-task. Scanner-worker registry housekeeping — periodic DELETE FROM scanner_registry WHERE last_heartbeat < now() - 7d. DEFAULT-ENABLED (like replaySeenPrune): steady-state cleanup of rows left by retired worker pods, gated only by the `adminTasksEnabled` master toggle. No extra worker-side provisioning is needed (it reuses the heartbeat's scanner_registry handle). Cleanup degrades safe — disabling it only grows the table; worker liveness is recomputed from last_heartbeat on every admin-list read, independent of pruning.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
         "verifyEventChain": {
           "description": "executionPath: admin-task (gating only — it actually runs the `hort-server` binary directly with the runtime DSN, no svc-token PAT). Event-chain tamper-evidence verifier CronJob. Runs `hort-server verify-event-chain --format json` DIRECTLY (an in-process reader using the runtime DML DSN + anchor object store, NOT a worker-dispatched task). Records a `kind='verify-event-chain'` liveness breadcrumb on each completed run; the boot-time `hort_event_chain_verify_overdue` gauge reads the newest one. DEFAULT-DISABLED. Keep the schedule consistent with HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS (default 86400 s = daily).",
           "type": "object",

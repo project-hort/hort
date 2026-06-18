@@ -708,71 +708,71 @@ fn push_duplicates<'a, I>(
     }
 }
 
-/// Apply-time validation that every `ScanPolicy.scanBackends` entry
-/// matches a backend name registered in the live `scanner_registry`.
+/// Apply-time validation that every `ScanPolicy.scanBackends` entry names a
+/// scanner backend this build actually supports.
 ///
-/// `live_backends` is the union of `backends` arrays across every
-/// row in `scanner_registry` whose `last_heartbeat` falls inside the
-/// 5-minute liveness window. The caller — gitops apply
-/// — reads the registry once per apply via
-/// [`hort_domain::ports::scanner_registry_repository::ScannerRegistryRepository::list_live`]
-/// and flattens the result before invoking this function. We take a
-/// `&[String]` rather than the live registry handle so this module
-/// stays free of async / port traits and remains a pure validation
-/// surface.
+/// `valid_backends` is the set of backend names the caller considers valid.
+/// The gitops apply pipeline passes the **compiled-in** capability set
+/// (`hort_app::scanning::KNOWN_SCAN_BACKENDS`) — NOT a live `scanner_registry`
+/// snapshot. Validating a *name* against the live worker registry was a
+/// boot-ordering hazard (regression **H20**): on a fresh deployment the apply
+/// runs before any worker has registered, so the live set is transiently
+/// empty and a correct `scanBackends: [trivy]` policy was rejected
+/// fail-closed, parking the server with no retry. A backend name is valid or
+/// not as a permanent property of the build, independent of worker-liveness
+/// timing; whether a worker advertising it is *running* is a runtime-liveness
+/// concern for metrics/health, not a config-validity error. We take a
+/// `&[String]` rather than any port handle so this module stays free of
+/// async / port traits and remains a pure validation surface.
 ///
 /// Behaviour:
 /// - An empty `scanBackends: []` declaration is **valid** — operators
 ///   may opt out of scanning entirely. The function never returns an
-///   error for an empty list, regardless of `live_backends`.
+///   error for an empty list, regardless of `valid_backends`.
 /// - A non-empty `scanBackends` entry that does not appear in
-///   `live_backends` produces one [`ValidationError::Invalid`] per
+///   `valid_backends` produces one [`ValidationError::Invalid`] per
 ///   offending value; the error detail names the offending value and
-///   the registered names so operators can spot a typo immediately.
-/// - **Empty-registry behaviour**: when `live_backends.is_empty()`
-///   (no workers ever booted, or every worker's heartbeat is stale),
-///   any non-empty `scanBackends` declaration is rejected — apply
-///   fails loud rather than silently writing a policy that would
-///   never produce findings. The error detail surfaces the empty
-///   registered-set so operators see "no live workers" rather than a
-///   confusing "got X, expected []" message.
+///   the supported names so operators can spot a typo immediately.
+/// - When `valid_backends.is_empty()` (a build with no scanner adapters
+///   compiled in — not reachable through the production caller, whose
+///   capability set is non-empty), any non-empty `scanBackends`
+///   declaration is rejected; the detail surfaces a `<none compiled in>`
+///   sentinel rather than a confusing "got X, expected []" message.
 ///
 /// This function is exposed publicly so the gitops pipeline
-/// (`ApplyConfigUseCase::apply`) can invoke it after fetching the
-/// live registry snapshot. It is intentionally NOT folded into
-/// [`DesiredState::validate_against`] because that signature is
-/// snapshot-only; threading the registry through `CurrentSnapshot`
-/// would conflate the read-side `ManagedBy=Local` snapshot with the
-/// write-side worker-coordination table.
+/// (`ApplyConfigUseCase::apply`) can invoke it. It is intentionally NOT folded
+/// into [`DesiredState::validate_against`] because that signature is
+/// snapshot-only; the supported-backend set is a deployment capability fact,
+/// not part of the read-side `ManagedBy=Local` snapshot.
 pub fn validate_scan_policy_backends(
     state: &DesiredState,
-    live_backends: &[String],
+    valid_backends: &[String],
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let live_set: std::collections::HashSet<&str> =
-        live_backends.iter().map(String::as_str).collect();
+    let valid_set: std::collections::HashSet<&str> =
+        valid_backends.iter().map(String::as_str).collect();
 
-    // Stable, comma-separated list of registered names for the error
+    // Stable, comma-separated list of supported names for the error
     // detail. Sorting keeps the message deterministic across runs so
     // the same misconfiguration produces the same error string.
-    let mut sorted_live: Vec<&str> = live_set.iter().copied().collect();
-    sorted_live.sort_unstable();
-    let registered_summary = if sorted_live.is_empty() {
-        "<no live worker registered>".to_string()
+    let mut sorted_valid: Vec<&str> = valid_set.iter().copied().collect();
+    sorted_valid.sort_unstable();
+    let supported_summary = if sorted_valid.is_empty() {
+        "<none compiled in>".to_string()
     } else {
-        sorted_live.join(", ")
+        sorted_valid.join(", ")
     };
 
     for env in &state.scan_policies {
         for backend in &env.spec.scan_backends {
-            if !live_set.contains(backend.as_str()) {
+            if !valid_set.contains(backend.as_str()) {
                 errors.push(ValidationError::Invalid {
                     kind: Kind::ScanPolicy,
                     name: env.metadata.name.clone(),
                     detail: format!(
-                        "spec.scanBackends entry `{backend}` is not a registered scanner \
-                         backend (registered: {registered_summary}) — start an \
-                         hort-worker advertising `{backend}` or remove the entry"
+                        "spec.scanBackends entry `{backend}` is not a supported scanner \
+                         backend (supported: {supported_summary}) — remove it or use a \
+                         supported backend"
                     ),
                 });
             }
@@ -1711,11 +1711,11 @@ spec:
             sp_yaml_with_backends("strict", &["trivy", "osv"]),
         )];
         let state = DesiredState::parse_files(files).unwrap();
-        let live = vec!["trivy".to_string(), "osv".to_string()];
-        let errors = validate_scan_policy_backends(&state, &live);
+        let supported = vec!["trivy".to_string(), "osv".to_string()];
+        let errors = validate_scan_policy_backends(&state, &supported);
         assert!(
             errors.is_empty(),
-            "every entry resolves against the live registry: {errors:?}"
+            "every entry is in the supported set: {errors:?}"
         );
     }
 
@@ -1726,23 +1726,23 @@ spec:
             sp_yaml_with_backends("strict", &["trivy", "ghost"]),
         )];
         let state = DesiredState::parse_files(files).unwrap();
-        let live = vec!["trivy".to_string(), "osv".to_string()];
-        let errors = validate_scan_policy_backends(&state, &live);
+        let supported = vec!["trivy".to_string(), "osv".to_string()];
+        let errors = validate_scan_policy_backends(&state, &supported);
         assert_eq!(errors.len(), 1);
         let detail = errors[0].to_string();
         assert!(
             detail.contains("`ghost`"),
             "error must name the offending entry: {detail}"
         );
-        // Both registered backends must surface so the operator can
+        // Both supported backends must surface so the operator can
         // spot a typo immediately.
         assert!(
             detail.contains("trivy"),
-            "error must list registered backends: {detail}"
+            "error must list supported backends: {detail}"
         );
         assert!(
             detail.contains("osv"),
-            "error must list registered backends: {detail}"
+            "error must list supported backends: {detail}"
         );
         assert!(
             detail.contains("scanBackends"),
@@ -1751,32 +1751,34 @@ spec:
     }
 
     #[test]
-    fn validate_scan_policy_backends_empty_list_is_valid_under_any_registry() {
+    fn validate_scan_policy_backends_empty_list_is_always_valid() {
         // Empty list = "operator opted out of scanning". Must not
-        // surface an error regardless of what's in the registry.
+        // surface an error regardless of the supported set.
         let files = vec![(p("p.yaml"), sp_yaml_with_backends("noscan", &[]))];
         let state = DesiredState::parse_files(files).unwrap();
-        // With backends registered:
+        // With backends supported:
         assert!(validate_scan_policy_backends(&state, &["trivy".into()]).is_empty());
-        // With no backends registered:
+        // With an empty supported set:
         assert!(validate_scan_policy_backends(&state, &[]).is_empty());
     }
 
     #[test]
-    fn validate_scan_policy_backends_empty_registry_rejects_non_empty_declaration() {
-        // Empty registry but non-empty `scanBackends:` declaration —
-        // apply must fail loud rather than silently writing a policy
-        // that would never produce findings.
+    fn validate_scan_policy_backends_empty_supported_set_rejects_non_empty_declaration() {
+        // Defensive: a build with NO scanner adapters compiled in (empty
+        // supported set) rejects any non-empty `scanBackends:` declaration
+        // rather than silently writing a policy that could never be
+        // satisfied. Not reachable through the production caller, whose
+        // capability set (`KNOWN_SCAN_BACKENDS`) is non-empty.
         let files = vec![(p("p.yaml"), sp_yaml_with_backends("strict", &["trivy"]))];
         let state = DesiredState::parse_files(files).unwrap();
         let errors = validate_scan_policy_backends(&state, &[]);
         assert_eq!(errors.len(), 1);
         let detail = errors[0].to_string();
-        // The "no live worker" sentinel must surface so operators
-        // diagnose missing workers rather than chasing a typo.
+        // The `<none compiled in>` sentinel must surface so the message
+        // reads sensibly rather than "got X, expected []".
         assert!(
-            detail.contains("no live worker"),
-            "error must mention that no live workers are registered: {detail}"
+            detail.contains("none compiled in"),
+            "error must surface the empty-supported-set sentinel: {detail}"
         );
     }
 
@@ -1804,17 +1806,16 @@ spec:
     }
 
     #[test]
-    fn validate_scan_policy_backends_default_yaml_resolves_against_default_registry() {
+    fn validate_scan_policy_backends_default_yaml_resolves_against_supported_set() {
         // The minimal `sp_yaml` (no scanBackends key) defaults to
-        // `["trivy"]`. With a live worker advertising `trivy`, the
-        // policy must validate — proving the default + happy path
-        // hook up correctly.
+        // `["trivy"]`. With `trivy` in the supported set, the policy must
+        // validate — proving the default + happy path hook up correctly.
         let files = vec![(p("p.yaml"), sp_yaml("default-backends"))];
         let state = DesiredState::parse_files(files).unwrap();
         let errors = validate_scan_policy_backends(&state, &["trivy".to_string()]);
         assert!(
             errors.is_empty(),
-            "default scanBackends must validate against a trivy-only registry: {errors:?}"
+            "default scanBackends must validate against a trivy-only supported set: {errors:?}"
         );
     }
 

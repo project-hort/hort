@@ -18,6 +18,7 @@
 //! POST   /service-account-rotation   → invoke::<ServiceAccountRotationRawParams>
 //! POST   /eventstore-checkpoint      → invoke::<EventstoreCheckpointRawParams>
 //! POST   /replay-seen-prune          → invoke::<ReplaySeenPruneRawParams>
+//! POST   /scanner-registry-prune     → invoke::<ScannerRegistryPruneRawParams>
 //! GET    /                           → list_tasks
 //! GET    /:id                        → get_task
 //! ```
@@ -48,7 +49,7 @@ use params::{
     AdvisoryWatchTickRawParams, CronRescanTickRawParams, EventstoreArchiveRawParams,
     EventstoreCheckpointRawParams, NoopParams, ReplaySeenPruneRawParams,
     RetentionEvaluateRawParams, RetentionPurgeRawParams, ScanRawParams,
-    ServiceAccountRotationRawParams, StagingSweepParams,
+    ScannerRegistryPruneRawParams, ServiceAccountRotationRawParams, StagingSweepParams,
 };
 
 pub mod dto;
@@ -93,6 +94,10 @@ pub fn router() -> Router<Arc<AppContext>> {
         .route(
             "/replay-seen-prune",
             post(invoke::<ReplaySeenPruneRawParams>),
+        )
+        .route(
+            "/scanner-registry-prune",
+            post(invoke::<ScannerRegistryPruneRawParams>),
         )
         // --- list + get ---
         .route("/", get(list_tasks))

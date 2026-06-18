@@ -155,6 +155,18 @@ pub(super) async fn serve(
             Err(e) => return *e,
         }
     } else {
+        // Tag branch. Validate the tag against the OCI Distribution Spec
+        // grammar `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` BEFORE the
+        // `RefUseCase::get` lookup or any upstream pull-through URL
+        // construction. The digest branch above is already validated by
+        // `parse_digest`; this is its tag-branch sibling. An out-of-grammar
+        // tag is a malformed reference — 400 `MANIFEST_INVALID` via the
+        // shared `tag_invalid_response` (the same mapping the PUT / DELETE
+        // tag branches use); the reason never echoes the offending bytes
+        // (log-injection defence; mirrors `validate_oci_name`).
+        if let Err(e) = super::tag::validate_oci_tag(reference) {
+            return super::tag_invalid_response(e);
+        }
         match resolve_tag_reference(&ctx, &repo.id, name, reference).await {
             TagResolveOutcome::Resolved(h) => (h, None),
             TagResolveOutcome::Failed(resp) => return *resp,
@@ -440,13 +452,25 @@ async fn resolve_media_type(ctx: &AppContext, artifact_id: Uuid) -> String {
 /// Real OCI clients do not send `q=0` on the manifest media-type, so
 /// the omission does not block correctness.
 fn accept_matches(headers: &HeaderMap, media_type: &str) -> bool {
-    let Some(accept) = headers.get(ACCEPT) else {
-        return true; // Absent Accept header — treated as */*.
-    };
-    let Ok(accept_str) = accept.to_str() else {
-        return false;
-    };
-    if accept_str.trim().is_empty() {
+    // Gather entries across ALL `Accept` header lines (see `accept_values` —
+    // a client may split its `Accept` over multiple header lines). A non-UTF8
+    // `Accept` value is a malformed request → no match. Absent `Accept`, or
+    // present-but-empty, is treated as `*/*` per RFC 9110 §12.5.1.
+    let mut saw_header = false;
+    let mut entries: Vec<&str> = Vec::new();
+    for value in headers.get_all(ACCEPT) {
+        saw_header = true;
+        let Ok(s) = value.to_str() else {
+            return false;
+        };
+        for part in s.split(',') {
+            let part = part.trim();
+            if !part.is_empty() {
+                entries.push(part);
+            }
+        }
+    }
+    if !saw_header || entries.is_empty() {
         return true;
     }
     // Extract the type half of the stored media-type once. Needed for
@@ -454,7 +478,7 @@ fn accept_matches(headers: &HeaderMap, media_type: &str) -> bool {
     // `/`) falls through with `None`, which only the exact-match and
     // `*/*` arms can satisfy — the subtype-wildcard arm can't.
     let media_type_main = media_type.split_once('/').map(|(t, _)| t);
-    accept_str.split(',').any(|entry| {
+    entries.into_iter().any(|entry| {
         let entry = entry.split(';').next().unwrap_or("").trim();
         if entry == "*/*" || entry == media_type {
             return true;
@@ -882,27 +906,20 @@ async fn try_upstream_manifest_pull_by_tag(
     // correctly single-flight. The HTTP path shape mirrors the OCI
     // Distribution Spec wire (`/v2/<name>/manifests/<tag>`).
     //
-    // KNOWN RESIDUAL (bounded — not a poisoning vector). The client's
-    // `Accept` is intentionally NOT part of this key, yet it is
-    // forwarded to the upstream fetch below, so the *leader's* `Accept`
-    // fixes which manifest the tag resolves to — the ingested digest,
-    // the tag→digest ref, and the stored `oci_media_type` then persist.
-    // For a multi-arch tag a narrow-Accept leader could pin the tag to a
-    // single-platform manifest instead of the index. Why this is
-    // tolerated rather than keyed:
-    //   - the manifest is digest-verified on ingest (ADR 0006), so only
-    //     *legitimate* upstream manifests are selectable — there is no
-    //     arbitrary-content injection, only selection among them;
-    //   - real OCI clients (docker / containerd / crane / skopeo /
-    //     podman) all send a BROAD `Accept` incl. the index media-types,
-    //     so they converge and the divergence is an edge case;
-    //   - the failure mode is a clean serve-time 406 (`accept_matches`
-    //     against the stored media-type), never a silent wrong body.
-    // The deterministic fix — always fetch upstream with a canonical
-    // broad `Accept` and 406 narrow clients at serve time, so the cached
-    // representation is Accept-independent — is a tracked OCI follow-up,
-    // deliberately not bundled here. (Alpha-walk finding; cf. the PyPI
-    // PEP 503/691 cache-key fix where the split was genuinely per-client.)
+    // The client's `Accept` is intentionally NOT part of this dedup key,
+    // and it no longer needs to be: the upstream manifest fetch
+    // (`do_fetch_manifest`) now always advertises the full canonical
+    // manifest media-type set regardless of the client's (possibly
+    // narrower) `Accept`, so the cached representation is
+    // Accept-independent — a multi-arch tag always resolves to its
+    // index/list, never to a single-platform manifest a narrow leader
+    // happened to request. Narrow clients are negotiated at serve time
+    // (`accept_matches` → 406, with manifest-pair leniency), never by
+    // changing what gets fetched and stored. This is the deterministic
+    // fix that was previously deferred (the prior `Accept`-forwarding
+    // behaviour 404'd against strict-content-negotiation registries —
+    // Artifact Registry, which backs registry.k8s.io — when the client's
+    // first `Accept` type omitted the manifest's real media type).
     let manifest_path = format!("/v2/{name}/manifests/{tag}");
     let meta_dedup_key = DedupKey::metadata("oci", repo.id, &manifest_path);
     let meta_proxy = ctx.upstream_proxy.clone();
@@ -1343,16 +1360,22 @@ async fn finalise_manifest_pull(
 /// forward the caller's media-type preferences to the upstream
 /// proxy. Empty Vec → adapter falls back to its default Accept set.
 fn accept_values(headers: &HeaderMap) -> Vec<String> {
+    // Collect entries across ALL `Accept` header lines, not just the first.
+    // A client may send its `Accept` as multiple header lines rather than one
+    // comma-joined line — Go's `http.Header.Add(...)`-per-media-type does
+    // exactly this, and containerd's resolver uses it — so `headers.get`
+    // (first value only) would silently drop every type after the first. That
+    // narrowing surfaces downstream as an upstream 404 from a strict-content-
+    // negotiation registry (Artifact Registry, which backs registry.k8s.io)
+    // when the surviving first type omits the manifest's real media type.
     headers
-        .get(ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// Map an [`UpstreamManifestPullOutcome::*`] non-`Ingested` variant
@@ -1593,6 +1616,43 @@ mod tests {
     }
 
     #[test]
+    fn accept_matches_checks_all_header_lines() {
+        // A client may split its `Accept` across multiple header lines
+        // (Go's `Header.Add` per media type — containerd does this). The
+        // matching type is on the SECOND line; `accept_matches` must still
+        // match it, not just look at the first line.
+        let mut headers = HeaderMap::new();
+        headers.append(ACCEPT, "application/json".parse().unwrap());
+        headers.append(ACCEPT, DEFAULT_MEDIA_TYPE.parse().unwrap());
+        assert!(
+            accept_matches(&headers, DEFAULT_MEDIA_TYPE),
+            "accept_matches must consider every Accept header line, not just the first"
+        );
+    }
+
+    #[test]
+    fn accept_values_collects_all_header_lines() {
+        // Regression: `headers.get(ACCEPT)` returned only the first line,
+        // silently narrowing a multi-line client `Accept` (the registry.k8s.io
+        // / Artifact Registry 404 — the manifest's real type was on a later
+        // line). `get_all` must collect every line.
+        let index = "application/vnd.oci.image.index.v1+json";
+        let list = "application/vnd.docker.distribution.manifest.list.v2+json";
+        let mut headers = HeaderMap::new();
+        headers.append(ACCEPT, index.parse().unwrap());
+        headers.append(ACCEPT, list.parse().unwrap());
+        let vals = accept_values(&headers);
+        assert!(
+            vals.iter().any(|v| v == index),
+            "first line missing: {vals:?}"
+        );
+        assert!(
+            vals.iter().any(|v| v == list),
+            "later Accept lines must be collected, not dropped: {vals:?}"
+        );
+    }
+
+    #[test]
     fn accept_ignores_q_parameter() {
         // We strip everything after `;` in each entry, so q=0.5 and
         // other parameters don't trip the match.
@@ -1816,6 +1876,107 @@ mod tests {
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body)
         });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+    }
+
+    // ---------------- Tag-grammar rejection (INJ-4) ----------------
+
+    /// Drive several out-of-grammar tags through the full pull dispatch.
+    /// Each MUST reject with 400 `MANIFEST_INVALID` BEFORE any ref lookup
+    /// or pull-through — no tag/artifact is seeded, so an unvalidated path
+    /// would 404 (`get_manifest_missing_tag_returns_404_manifest_unknown`),
+    /// not 400. The 400 therefore proves the validator fired pre-lookup.
+    /// The response body must NOT echo the offending bytes.
+    #[test]
+    fn get_manifest_out_of_grammar_tag_rejected_400_before_lookup() {
+        // (uri_tag, label) — `uri_tag` is already a single path segment
+        // (no `/`, no raw control bytes that the router would reject) so it
+        // reaches the manifest dispatcher intact.
+        let cases = [
+            ("..", "double-dot path traversal"),
+            (".leadingdot", "leading dot"),
+            ("-leadinghyphen", "leading hyphen"),
+            (&"a".repeat(129), "129-byte over-cap tag"),
+        ];
+        for (uri_tag, label) in cases {
+            let (status, body) = run(async {
+                let h = harness();
+                h.repositories.insert(oci_repo("myrepo"));
+                let router = manifest_router(h.ctx);
+                let uri = format!("/v2/myrepo/library/nginx/manifests/{uri_tag}");
+                let resp = router
+                    .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+                (status, body)
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "case: {label}");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["errors"][0]["code"], "MANIFEST_INVALID",
+                "case: {label}"
+            );
+            // The reason is carried in `detail.reason` and must be a
+            // deterministic `oci.tag:` string, never the offending bytes.
+            let reason = parsed["errors"][0]["detail"]["reason"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                reason.starts_with("oci.tag: "),
+                "case {label}: reason must be tagged `oci.tag:` ({reason})"
+            );
+        }
+    }
+
+    /// A space inside the tag is out-of-grammar; percent-encode it so it
+    /// survives URI parsing and reaches the handler as a literal space.
+    #[test]
+    fn get_manifest_tag_with_space_rejected_400() {
+        let (status, body) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let router = manifest_router(h.ctx);
+            // `%20` decodes to a space in the captured path segment.
+            let uri = "/v2/myrepo/library/nginx/manifests/foo%20bar";
+            let resp = router
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_INVALID");
+    }
+
+    /// A valid tag that simply does not exist still returns 404
+    /// `MANIFEST_UNKNOWN` — the validator must not reject legal tags.
+    /// (Complements `get_manifest_missing_tag_returns_404_manifest_unknown`
+    /// with a dotted/underscored/hyphenated tag that exercises the full
+    /// trailing alphabet.)
+    #[test]
+    fn get_manifest_valid_complex_tag_passes_validation_then_404s() {
+        let (status, body) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let router = manifest_router(h.ctx);
+            let uri = "/v2/myrepo/library/nginx/manifests/v1.2.3_rc1-build";
+            let resp = router
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        // Passed grammar validation, then missed the local ref lookup →
+        // 404, NOT 400. Proves a legal tag is not over-rejected.
         assert_eq!(status, StatusCode::NOT_FOUND);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");

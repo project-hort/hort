@@ -8,7 +8,8 @@
 # debugging during early E2E shake-out.
 
 # ---------- Stage 1: builder ----------
-FROM rust:1.94-bookworm AS builder
+# Digest-pinned (B10/INFRA-8); Dependabot (docker ecosystem) bumps tag+digest.
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 
 WORKDIR /src
 
@@ -46,7 +47,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/hort-server /usr/local/bin/hort-server
 
 # ---------- Stage 2: runtime ----------
-FROM debian:bookworm-slim AS runtime
+# Digest-pinned (B10/INFRA-8).
+FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
 
 # Runtime deps: CA roots for outbound TLS (upstream fetch), nothing else.
 RUN apt-get update && \

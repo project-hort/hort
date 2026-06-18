@@ -16,7 +16,8 @@
 //! - `upsert_self_preserves_registered_at_on_conflict`
 //! - `upsert_self_rewrites_backends_on_conflict`
 //! - `refresh_heartbeat_updates_last_heartbeat`
-//! - `list_live_filters_by_liveness_window`
+//! - `list_all_returns_every_registered_worker`
+//! - `prune_stale_deletes_only_rows_older_than_horizon`
 
 #![allow(clippy::expect_used)]
 
@@ -188,43 +189,91 @@ async fn refresh_heartbeat_updates_last_heartbeat() {
 }
 
 #[tokio::test]
-async fn list_live_filters_by_liveness_window() {
+async fn list_all_returns_every_registered_worker() {
     let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
     let repo = PgScannerRegistryRepository::new(pool.clone());
 
-    // Seed one row with a fresh heartbeat (live) and one with a stale
-    // heartbeat (dead). We tamper with `last_heartbeat` directly so we
-    // don't have to actually sleep 5+ minutes in the test.
-    let live_worker = fresh_worker_id();
-    let dead_worker = fresh_worker_id();
-    repo.upsert_self(&live_worker, vec!["trivy".into()])
+    // Seed one row with a fresh heartbeat and one with a stale (backdated)
+    // heartbeat. `list_all` does NOT filter on liveness — both rows must
+    // come back; deciding alive-vs-stale is the consuming use case's job.
+    // We tamper with `last_heartbeat` directly rather than sleeping.
+    let fresh_worker = fresh_worker_id();
+    let stale_worker = fresh_worker_id();
+    repo.upsert_self(&fresh_worker, vec!["trivy".into()])
         .await
-        .expect("seed live");
-    repo.upsert_self(&dead_worker, vec!["osv".into()])
+        .expect("seed fresh");
+    repo.upsert_self(&stale_worker, vec!["osv".into()])
         .await
-        .expect("seed dead");
+        .expect("seed stale");
 
     sqlx::query("UPDATE public.scanner_registry SET last_heartbeat = now() - interval '1 hour' WHERE worker_id = $1")
-        .bind(&dead_worker)
+        .bind(&stale_worker)
         .execute(&pool)
         .await
-        .expect("backdate dead worker");
+        .expect("backdate stale worker");
 
-    let live = repo
-        .list_live(Duration::from_secs(300))
-        .await
-        .expect("list_live");
-    let live_ids: Vec<&str> = live.iter().map(|e| e.worker_id.as_str()).collect();
+    let all = repo.list_all().await.expect("list_all");
+    let ids: Vec<&str> = all.iter().map(|e| e.worker_id.as_str()).collect();
 
     assert!(
-        live_ids.contains(&live_worker.as_str()),
-        "live worker must appear in list_live (got {live_ids:?})"
+        ids.contains(&fresh_worker.as_str()),
+        "fresh worker must appear in list_all (got {ids:?})"
     );
     assert!(
-        !live_ids.contains(&dead_worker.as_str()),
-        "dead worker must NOT appear in list_live (got {live_ids:?})"
+        ids.contains(&stale_worker.as_str()),
+        "stale worker must ALSO appear in list_all — no liveness filter (got {ids:?})"
+    );
+}
+
+#[tokio::test]
+async fn prune_stale_deletes_only_rows_older_than_horizon() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = PgScannerRegistryRepository::new(pool.clone());
+
+    // One fresh worker (heartbeat now) and one backdated 1 hour. A 30-minute
+    // prune horizon must delete the backdated one and keep the fresh one.
+    let fresh_worker = fresh_worker_id();
+    let stale_worker = fresh_worker_id();
+    repo.upsert_self(&fresh_worker, vec!["trivy".into()])
+        .await
+        .expect("seed fresh");
+    repo.upsert_self(&stale_worker, vec!["osv".into()])
+        .await
+        .expect("seed stale");
+    sqlx::query("UPDATE public.scanner_registry SET last_heartbeat = now() - interval '1 hour' WHERE worker_id = $1")
+        .bind(&stale_worker)
+        .execute(&pool)
+        .await
+        .expect("backdate stale worker");
+
+    let deleted = repo
+        .prune_stale(Duration::from_secs(30 * 60))
+        .await
+        .expect("prune_stale");
+    assert!(
+        deleted >= 1,
+        "prune must report at least the one backdated row it deleted (got {deleted})"
+    );
+
+    let ids: Vec<String> = repo
+        .list_all()
+        .await
+        .expect("list_all")
+        .into_iter()
+        .map(|e| e.worker_id)
+        .collect();
+    assert!(
+        ids.contains(&fresh_worker),
+        "fresh worker must survive the prune (got {ids:?})"
+    );
+    assert!(
+        !ids.contains(&stale_worker),
+        "stale worker must be pruned (got {ids:?})"
     );
 }

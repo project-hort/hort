@@ -63,6 +63,12 @@ pub mod prefetch_ingest;
 // the high-churn `jobs` table does not grow unbounded under cascade
 // load.
 pub mod prefetch_row_retention_sweep;
+// Scanner-worker registry housekeeping (kind
+// `scanner-registry-prune`). Deletes `scanner_registry` rows whose
+// `last_heartbeat` is older than the retention horizon so pod churn does
+// not grow the worker-coordination table without bound. Helm CronJob
+// ships default-enabled.
+pub mod scanner_registry_prune;
 pub mod staging_sweep;
 // PEP 658 wheel-metadata backfill (kind
 // `wheel-metadata-backfill`). Operator-opt-in retrofit: walks PyPI
@@ -89,6 +95,7 @@ pub use replay_seen_prune::ReplaySeenPruneHandler;
 pub use retention_evaluate::RetentionEvaluateHandler;
 pub use retention_purge::RetentionPurgeHandler;
 pub use scan::ScanTaskHandler;
+pub use scanner_registry_prune::ScannerRegistryPruneHandler;
 pub use seed_import::SeedImportHandler;
 pub use service_account_rotation::ServiceAccountRotationHandler;
 pub use staging_sweep::StagingSweepHandler;

@@ -84,6 +84,7 @@ CREATE TABLE public.jobs (
         'prefetch-row-retention-sweep', -- terminal prefetch* row GC
         'wheel-metadata-backfill',      -- PEP 658 metadata backfill for pre-existing wheels
         'provenance-verify',            -- Sigstore/cosign provenance verify; enqueued at ingest
+        'scanner-registry-prune',       -- scanner_registry stale-row GC (mirrors replay-seen-prune)
         -- Liveness breadcrumb written by the `hort-server verify-event-chain`
         -- CLI's `JobsRepository::record_run_completion` after a run completes.
         -- NOT a worker-dispatched `TaskHandler` kind (the verify run is a

@@ -928,9 +928,11 @@ A clean `validate-config` does **not** guarantee a clean apply. It runs the
 structural (parse + cross-validate), per-envelope domain, and static-linter
 checks. It does **not** run the **current-state** checks (managed-by
 ownership, immutable-field changes — they need the live `ManagedBy=Local`
-snapshot) nor the **live-worker `scanBackends`** registry check (it needs a
-running worker fleet). Those run at apply/boot against the running
-deployment. The command prints a one-line footer saying so.
+snapshot), which run at apply/boot against the running deployment. It also
+does not currently run the `scanBackends` supported-backend check (apply
+validates each entry against the binary's compiled-in scanner set,
+`KNOWN_SCAN_BACKENDS` — a static set the offline validator could check but
+does not yet). The command prints a one-line footer saying so.
 
 The validating binary **is** the version validated against: the
 provenance-capable format set and the linter defaults are baked into the same

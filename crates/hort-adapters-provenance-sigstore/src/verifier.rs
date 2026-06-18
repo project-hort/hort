@@ -5,14 +5,19 @@
 //! and folds the result — together with the domain glob identity match —
 //! into one [`ProvenanceVerdict`].
 //!
-//! The cryptographic verification (Fulcio chain → trust root, embedded
-//! SCT, Rekor SET from the bundle, signature) is `sigstore`'s; the
-//! **identity decision** is the domain's exact-or-bounded-glob
+//! The Fulcio chain → trust root, embedded SCT, signature, and digest
+//! binding are `sigstore`'s `verify_digest`; the **Rekor Merkle inclusion
+//! proof + checkpoint signature** are verified by [`crate::inclusion`]
+//! immediately after `verify_digest` succeeds (sigstore 0.14 does not — see
+//! the crate-level "Rekor inclusion verification" note); the **identity
+//! decision** is the domain's exact-or-bounded-glob
 //! [`SignerIdentityPattern::matches`] applied to the observed `{issuer,
 //! san}` read out of the verified leaf cert ([`crate::identity`]). We drive
 //! `sigstore` with a pass-through [`AllowAllPolicy`] precisely so the
 //! bounded-glob half of the policy is not silently bypassed by
 //! `sigstore`'s exact-literal `Identity` policy.
+
+use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 use sigstore::bundle::verify::{policy::VerificationPolicy, Verifier};
@@ -28,6 +33,7 @@ use hort_domain::ports::provenance::{
 };
 
 use crate::identity::observed_identity;
+use crate::inclusion::{verify_inclusion, TlogInclusionMaterial};
 
 /// Build an offline [`Verifier`] from an owned trust root. Fails when the
 /// trust root carries no Fulcio certs / CTFE keys (an un-trustable chain).
@@ -87,6 +93,7 @@ pub(crate) async fn verify_bundles<F>(
     payload: &[u8],
     bundles: &[AttestationBundle],
     allowed: &[SignerIdentityPattern],
+    rekor_keys: &BTreeMap<String, Vec<u8>>,
 ) -> ProvenanceVerdict
 where
     F: Fn() -> DomainResult<Verifier>,
@@ -94,7 +101,7 @@ where
     let mut best: Option<ProvenanceRejectReason> = None;
 
     for bundle in bundles {
-        match verify_one(&make_verifier, payload, &bundle.bytes, allowed).await {
+        match verify_one(&make_verifier, payload, &bundle.bytes, allowed, rekor_keys).await {
             BundleVerify::Verified {
                 signer,
                 predicate_type,
@@ -144,16 +151,22 @@ enum BundleVerify {
 }
 
 /// Verify a single bundle offline. No network — `offline = true` uses the
-/// bundle's embedded SET; the `async` is only `sigstore`'s API shape.
+/// bundle's embedded tlog material; the `async` is only `sigstore`'s API
+/// shape.
 ///
 /// Parsing + identity extraction happen **first** so a malformed bundle is
 /// reported as `BundleMalformed` regardless of trust-root health; only a
-/// well-formed bundle reaches the trust-root-dependent crypto step.
+/// well-formed bundle reaches the trust-root-dependent crypto step. After
+/// `verify_digest` passes, the Rekor Merkle inclusion proof + checkpoint
+/// signature are verified ([`verify_inclusion`]) against the trust root's
+/// Rekor key — a failure here is `RekorNotFound`, short-circuiting before
+/// the identity match can yield `Verified`.
 async fn verify_one<F>(
     make_verifier: &F,
     payload: &[u8],
     bundle_bytes: &[u8],
     allowed: &[SignerIdentityPattern],
+    rekor_keys: &BTreeMap<String, Vec<u8>>,
 ) -> BundleVerify
 where
     F: Fn() -> DomainResult<Verifier>,
@@ -189,6 +202,15 @@ where
 
     let predicate_type = predicate_type_of(&bundle);
 
+    // Extract the transparency-log inclusion material from the bundle
+    // BEFORE `verify_digest` consumes it. A v0.3 bundle that reached this
+    // point structurally carries an inclusion proof with a checkpoint
+    // (`check_02_bundle` enforces it at parse); a bundle that does not (a
+    // v0.1 SET-only shape, or a malformed entry) yields an extraction
+    // error → fail closed as `RekorNotFound` after the crypto step. We
+    // clone the (small) tlog material so it outlives the consumed bundle.
+    let tlog_material = TlogInclusionMaterial::from_bundle(&bundle);
+
     // `verify_digest` finalizes this hasher and uses the result as BOTH the
     // subject digest (compared against the bundle) and the prehash the
     // signature is verified over (sigstore-0.14 `verifier.rs:127`). It must
@@ -205,9 +227,33 @@ where
 
     match result {
         Ok(()) => {
-            // 4) Crypto passed. Apply the domain glob identity match. An
-            //    empty allow-list never matches (the any-signer footgun is
-            //    apply-rejected upstream under `Required`; under
+            // 4) Fulcio chain / SCT / signature / digest-binding passed.
+            //    Now verify — fully offline — the Rekor Merkle inclusion
+            //    proof + checkpoint signature against the pinned trust
+            //    root's Rekor key (sigstore 0.14's `verify_digest` does
+            //    NOT do this; sigstore-rs#285). A bundle whose tlog entry
+            //    is not provably in the log can never reach `Verified`.
+            //    Any extraction / conversion / crypto failure is
+            //    fail-closed `RekorNotFound` — never a skip, never a live
+            //    fetch.
+            //    The `InclusionError` variant distinguishes the fail-closed
+            //    branch (e.g. `NoMatchingRekorKey` — a trust-root
+            //    misprovision — vs `VerifyFailed` — a forged/non-included
+            //    proof); it is recorded at `debug!` (the variants carry no
+            //    key bytes) so operators can tell those apart. The verdict
+            //    itself is logged at the use-case layer.
+            let inclusion = match tlog_material.as_ref() {
+                Ok(m) => verify_inclusion(m, rekor_keys),
+                Err(e) => Err(e.clone()),
+            };
+            if let Err(reason) = inclusion {
+                tracing::debug!(?reason, "rekor inclusion verification rejected the bundle");
+                return BundleVerify::Rejected(ProvenanceRejectReason::RekorNotFound);
+            }
+
+            // 5) Crypto + inclusion passed. Apply the domain glob identity
+            //    match. An empty allow-list never matches (the any-signer
+            //    footgun is apply-rejected upstream under `Required`; under
             //    `VerifyIfPresent` an empty list rejects forged/untrusted
             //    signers).
             let identity_ok = allowed
@@ -329,6 +375,14 @@ mod tests {
         }
     }
 
+    /// An empty Rekor-key map — the minimal fixture trust root carries no
+    /// `tlogs`, so its Rekor keys are empty. The crypto rejections in these
+    /// tests happen at or before `verify_digest`, never reaching the
+    /// inclusion step, so the empty map is inert for them.
+    fn no_rekor_keys() -> BTreeMap<String, Vec<u8>> {
+        BTreeMap::new()
+    }
+
     #[test]
     fn allow_all_policy_accepts_any_cert() {
         // Construct via the real fixture leaf so we exercise the policy on
@@ -360,7 +414,14 @@ mod tests {
     async fn unparseable_bundle_is_malformed() {
         // Even though the trust root is empty (factory would fail), a
         // malformed bundle is rejected BEFORE the factory is consulted.
-        let v = verify_one(&empty_root_factory(), &[0u8; 32], b"}{not json", &[]).await;
+        let v = verify_one(
+            &empty_root_factory(),
+            &[0u8; 32],
+            b"}{not json",
+            &[],
+            &no_rekor_keys(),
+        )
+        .await;
         assert!(matches!(
             v,
             BundleVerify::Rejected(ProvenanceRejectReason::BundleMalformed)
@@ -376,6 +437,7 @@ mod tests {
             &[0u8; 32],
             b"{\"mediaType\":\"x\"}",
             &[],
+            &no_rekor_keys(),
         )
         .await;
         assert!(matches!(
@@ -397,6 +459,7 @@ mod tests {
             &[7u8; 32],
             bundle_json.as_bytes(),
             &[pat],
+            &no_rekor_keys(),
         )
         .await;
         match v {
@@ -483,7 +546,14 @@ mod tests {
         ];
         // Both bundles fail to parse / have no leaf → all BundleMalformed;
         // the trust-root factory is never consulted.
-        let verdict = verify_bundles(empty_root_factory(), &[0u8; 32], &bundles, &[]).await;
+        let verdict = verify_bundles(
+            empty_root_factory(),
+            &[0u8; 32],
+            &bundles,
+            &[],
+            &no_rekor_keys(),
+        )
+        .await;
         assert_eq!(
             verdict,
             ProvenanceVerdict::rejected(ProvenanceRejectReason::BundleMalformed)
@@ -494,7 +564,14 @@ mod tests {
     async fn verify_bundles_real_bundle_empty_root_is_cert_chain_invalid() {
         let bundle_json = include_str!("../tests/fixtures/cosign_bundle_v03_kubewarden.json");
         let bundles = [AttestationBundle::new(bundle_json.as_bytes().to_vec())];
-        let verdict = verify_bundles(empty_root_factory(), &[7u8; 32], &bundles, &[]).await;
+        let verdict = verify_bundles(
+            empty_root_factory(),
+            &[7u8; 32],
+            &bundles,
+            &[],
+            &no_rekor_keys(),
+        )
+        .await;
         assert_eq!(
             verdict,
             ProvenanceVerdict::rejected(ProvenanceRejectReason::CertChainInvalid)

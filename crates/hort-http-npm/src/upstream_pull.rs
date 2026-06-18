@@ -121,6 +121,16 @@ pub(crate) enum UpstreamPullError {
     #[error("upstream checksum mismatch")]
     ChecksumMismatch,
 
+    /// `IngestUseCase::ingest_verified` returned `CurationBlocked` — a
+    /// curation rule matched the artifact. The ingest use case already
+    /// emitted the audit `tracing::info!`. Wire-map collapses this to
+    /// 404 (byte-identical to a genuine upstream miss) so an
+    /// unauthenticated prober cannot distinguish a curation-blocked
+    /// package from a non-existent one — the anti-enumeration contract
+    /// (`hort_http_core::error`) and the Cargo / OCI prior art.
+    #[error("upstream artifact blocked by curation rule")]
+    CurationBlocked,
+
     /// Any other ingest-time error — storage failure, event-store
     /// failure, repo lookup failure after ingest. Wire to 500.
     #[error("ingest failed: {cause}")]
@@ -206,12 +216,18 @@ pub(crate) async fn try_upstream_tarball_pull(
         }
         Err(
             e @ (PackumentFetchError::MetadataMalformed { .. }
-            | PackumentFetchError::VersionObjectTooLarge { .. }),
+            | PackumentFetchError::VersionObjectTooLarge { .. }
+            | PackumentFetchError::InvalidName { .. }),
         ) => {
-            // A malformed / over-cap packument body is a metadata fault
-            // (parse-class), not an outage — same `MetadataMalformed`
-            // shape the pre-amendment `parse_upstream_checksum` reject
-            // produced.
+            // A malformed / over-cap packument body — or an illegal
+            // package name rejected by `validate_npm_name` before key
+            // construction (INJ-3; effectively unreachable here because
+            // the download route already validated via
+            // `parse_download_path`, but handled explicitly so it never
+            // folds into the `UpstreamUnavailable` outage bucket) — is a
+            // metadata fault (parse-class), not an outage. Same
+            // `MetadataMalformed` shape the pre-amendment
+            // `parse_upstream_checksum` reject produced.
             tracing::warn!(
                 cause = %e,
                 format = "npm",
@@ -487,6 +503,21 @@ pub(crate) async fn try_upstream_tarball_pull(
             );
             return Err(UpstreamPullError::ChecksumMismatch);
         }
+        // Leader-side curation block: a curation rule matched the
+        // upstream artifact during `ingest_verified`. Collapse to 404
+        // (byte-identical to a genuine miss) at the wire-map so a probe
+        // cannot distinguish a blocked package from a non-existent one
+        // — mirrors the Cargo prior art and the anti-enumeration
+        // contract (`hort_http_core::error`). Must precede the catch-all
+        // `Err(e)` arm, which would otherwise route this to a 500.
+        Err(AppError::Domain(DomainError::CurationBlocked { .. })) => {
+            tracing::warn!(
+                format = "npm",
+                repository_id = %repo.id,
+                "npm upstream artifact blocked by curation rule",
+            );
+            return Err(UpstreamPullError::CurationBlocked);
+        }
         Err(e) => {
             // `fetch_artifact` errors and any other ingest-time
             // infrastructure failure converge here. The original
@@ -668,7 +699,7 @@ fn tarball_basename(url: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// | Variant | Status | `X-Hort-Reason` |
 /// |---|---|---|
-/// | `NoUpstream` | 404 | — |
+/// | `NoUpstream` / `CurationBlocked` | 404 | — |
 /// | `UpstreamUnavailable` | 502 | `upstream-unavailable` |
 /// | `MetadataMalformed` | 502 | `upstream-metadata-malformed` |
 /// | `TarballUrlInvalid` | 502 | `upstream-metadata-malformed` |
@@ -695,7 +726,12 @@ fn tarball_basename(url: &str) -> std::borrow::Cow<'_, str> {
 ///   contract in `hort_http_core::error`.
 pub(crate) fn map_upstream_pull_error(e: &UpstreamPullError) -> Response {
     match e {
-        UpstreamPullError::NoUpstream => Response::builder()
+        // `CurationBlocked` collapses to the SAME 404 envelope as a
+        // genuine `NoUpstream` miss (byte-identical body + status, no
+        // distinguishing header) so an unauthenticated prober cannot
+        // tell a curation-blocked package from a non-existent one —
+        // the anti-enumeration contract and the Cargo / OCI prior art.
+        UpstreamPullError::NoUpstream | UpstreamPullError::CurationBlocked => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("Content-Type", "application/json")
             .body(Body::from(
@@ -1202,6 +1238,76 @@ mod tests {
         assert_eq!(
             mismatch_count_all, 0,
             "ChecksumMismatch must NOT fire on the happy path"
+        );
+    }
+
+    // ---- Branch 7b: ingest_verified returns CurationBlocked → 404 -----------
+
+    /// A curation rule blocks the upstream tarball during
+    /// `ingest_verified`. The orchestrator must surface
+    /// `CurationBlocked` (NOT `IngestFailed`), and the wire-map must
+    /// render it as a 404 that is **byte-identical** (status + headers +
+    /// body) to a genuine `NoUpstream` miss — the anti-enumeration
+    /// contract (LOG-1/LOG-2). Mirrors the Cargo
+    /// `ingest_verified_returns_curation_blocked_returns_curation_blocked`
+    /// test.
+    #[tokio::test]
+    async fn try_upstream_tarball_pull_curation_blocked_returns_404_identical_to_miss() {
+        use axum::body::to_bytes;
+        use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
+
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = npm_proxy_repo("npm-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // Valid packument + matching tarball bytes — the pull reaches
+        // `ingest_verified`, where the curation gate fires.
+        let bytes = b"the actual express 4.18.2 tarball".to_vec();
+        let sri = sri_sha512(&bytes);
+        let url = "https://registry.npmjs.org/express/-/express-4.18.2.tgz";
+        let body = packument_json("4.18.2", &sri, url);
+        mocks.upstream_proxy.insert_metadata("", "/express", body);
+        mocks.upstream_proxy.insert_artifact("", url, bytes);
+
+        // Curation rule that matches everything in this repo.
+        let rule = CurationRule {
+            id: Uuid::new_v4(),
+            name: "block-all".into(),
+            format: None,
+            package_pattern: "*".into(),
+            action: CurationRuleAction::Block,
+            reason: "policy".into(),
+            managed_by: ManagedBy::GitOps,
+            managed_by_digest: Some([0xab; 32]),
+        };
+        mocks.curation_rules.set_rules_for_repo(repo.id, vec![rule]);
+
+        let err = try_upstream_tarball_pull(&ctx, &repo, "express", "4.18.2", "express-4.18.2.tgz")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::CurationBlocked),
+            "expected CurationBlocked, got {err:?}"
+        );
+
+        // The rendered response must be a 404 byte-identical to a
+        // genuine `NoUpstream` miss — no enumeration oracle.
+        let blocked = map_upstream_pull_error(&UpstreamPullError::CurationBlocked);
+        let miss = map_upstream_pull_error(&UpstreamPullError::NoUpstream);
+        assert_eq!(blocked.status(), StatusCode::NOT_FOUND);
+        assert_eq!(blocked.status(), miss.status());
+        assert_eq!(
+            blocked.headers(),
+            miss.headers(),
+            "curation-blocked headers must match a genuine miss"
+        );
+        let blocked_body = to_bytes(blocked.into_body(), usize::MAX).await.unwrap();
+        let miss_body = to_bytes(miss.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            blocked_body, miss_body,
+            "curation-blocked body must be byte-identical to a genuine miss"
         );
     }
 

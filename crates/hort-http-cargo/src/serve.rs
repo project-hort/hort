@@ -121,6 +121,19 @@ pub(crate) async fn serve_index_unified(
         .await
         .map_err(ApiError::from)?;
 
+    // ---- Crate-name validation (serve-path parity, INJ-2) ------------
+    // The download / publish paths validate the crate name via
+    // `validate_cargo_name` before any path construction; the
+    // sparse-index serve path historically only lowercase-normalised it.
+    // A `..` / `..%2f`-shaped name would otherwise flow unvalidated into
+    // `index_path_for` → the Redis cache key + composed upstream URL.
+    // There is no filesystem escape (CAS + `reject_traversal` backstop),
+    // but the cache key / upstream path would be polluted. Reject here,
+    // BEFORE any cache-key / upstream-URL construction, returning the
+    // SAME `DomainError::Validation` envelope the download path emits.
+    hort_formats::cargo::validate_cargo_name(crate_name)
+        .map_err(|e| ApiError::from(AppError::Domain(e)))?;
+
     // ---- Step 1: Source dispatch -------------------------------------
     let (output, index_source_label): (IndexSourceOutput, &'static str) = match repo.repo_type {
         RepositoryType::Proxy => {
@@ -654,6 +667,60 @@ mod tests {
             .expect_err("missing crate must 404");
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------
+    // 6b. Serve-path crate-name validation (INJ-2). A traversal-shaped
+    //     name (`..`, `../etc`) on the sparse-index serve path must be
+    //     rejected by `validate_cargo_name` BEFORE any cache-key /
+    //     upstream-URL construction, returning the SAME 400
+    //     `DomainError::Validation` envelope the download path emits —
+    //     not a normalised name that flows into `index_path_for`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn serve_rejects_traversal_crate_name_before_key_construction() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let _repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+
+        // `..` and `../etc` are both rejected by `validate_cargo_name`
+        // (the cargo grammar forbids `.` / `/`); the serve path must
+        // surface that as a 400, not lowercase-normalise it onward.
+        for bad in ["..", "../etc", "..%2fetc"] {
+            let err = serve_index_unified(&ctx, "cargo-test", bad, None)
+                .await
+                .expect_err("traversal name must be rejected");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "traversal name {bad:?} must map to 400, got {}",
+                response.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_accepts_valid_crate_name_after_validation_gate() {
+        // The validation gate must not regress the happy path: a normal
+        // crate name still resolves through the source pipeline.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "serde",
+            "1.0.0",
+            1,
+            QuarantineStatus::Released,
+        );
+
+        let res = serve_index_unified(&ctx, "cargo-test", "serde", None)
+            .await
+            .unwrap_or_else(|_| panic!("valid name must pass the validation gate and serve"));
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     // -----------------------------------------------------------------

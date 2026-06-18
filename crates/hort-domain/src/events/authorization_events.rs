@@ -450,6 +450,17 @@ pub const VALID_TASK_KINDS: &[&str] = &[
     // `{ "result": "verified" | "rejected:<reason>" |
     // "no_attestation" | "skipped:off" | "skipped:no_verifier" }`.
     "provenance-verify",
+    // Scanner-worker registry housekeeping — consumed by
+    // `ScannerRegistryPruneHandler` in the worker. Periodically deletes
+    // `scanner_registry` rows whose `last_heartbeat < now() - $horizon`
+    // (default 7 days): pod churn (rollouts, HPA scaling) leaves a row per
+    // retired `worker_id` that never heartbeats again, so without this the
+    // worker-coordination table grows without bound. **Non-destructive** —
+    // a live worker heartbeats every 60 s so it is never deleted; only
+    // long-dead rows are GC'd, and a worker that comes back simply
+    // re-registers. Mirrors `prefetch-row-retention-sweep` (the other
+    // table-growth sweep). Run summary: `{ "deleted_rows": <n> }`.
+    "scanner-registry-prune",
 ];
 
 // ---------------------------------------------------------------------------

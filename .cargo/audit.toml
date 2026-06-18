@@ -72,19 +72,6 @@ ignore = [
     # API stabilises and hort-app can absorb the upgrade in its own PR.
     "RUSTSEC-2026-0002",
 
-    # rand 0.8.5 - Unsound with a custom log::Log impl calling rand's
-    # thread-local RNG (2026-04-09). Patched in 0.9.3 / 0.10.1 (both
-    # already bumped in Cargo.lock); no 0.8.x patch published. The 0.8.5
-    # path persists because sqlx and a handful of other transitive deps
-    # still pin rand 0.8. The unsoundness requires installing a custom
-    # `log::Log` implementation whose `log` method calls
-    # `rand::thread_rng()` / `rand::rng()`. Hort uses
-    # tracing-subscriber and installs no custom logger; the transitive
-    # consumers emit log records but do not install loggers themselves.
-    # Triggering condition therefore never holds. Tracks for removal once
-    # the upstream ecosystem rolls forward off rand 0.8.
-    "RUSTSEC-2026-0097",
-
     # rustls-pemfile - Unmaintained; thin wrapper around the same code
     # in rustls-pki-types since 1.9.0. The repo was archived 2025-08;
     # there is no fix to apply. We migrated our own PEM parsing

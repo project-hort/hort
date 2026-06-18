@@ -11,7 +11,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $GhRepo        = 'project-hort/hort'
-$IdentityRegex = if ($env:HORT_TEST_BAD_IDENTITY -eq '1') { 'https://github.com/definitely-not-project-hort/.*' } else { 'https://github.com/project-hort/.*' }
+# _HORT_INTERNAL_TEST_BAD_IDENTITY (INFRA-15): CI-test-only, internal (leading underscore),
+# not for operators. Only swaps in a NON-matching identity -> verification STRICTER
+# (fail-closed); it can never weaken or bypass verify.
+$IdentityRegex = if ($env:_HORT_INTERNAL_TEST_BAD_IDENTITY -eq '1') { 'https://github.com/definitely-not-project-hort/.*' } else { 'https://github.com/project-hort/.*' }
 $OidcIssuer    = 'https://token.actions.githubusercontent.com'
 $Api           = if ($env:HORT_API) { $env:HORT_API } else { 'https://api.github.com' }
 $DlBase        = if ($env:HORT_DL_BASE) { $env:HORT_DL_BASE } else { "https://github.com/$GhRepo/releases/download" }

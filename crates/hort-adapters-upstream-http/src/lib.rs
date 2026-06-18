@@ -47,6 +47,13 @@
 //! See `docs/architecture/how-to/oci-pull-through.md`.
 
 mod challenge;
+// Connect-time guarded DNS resolver — closes the SSRF / DNS-rebind TOCTOU
+// between `check_ssrf_safe` (URL-validation-time resolve) and reqwest's
+// independent dial-time resolve (security audit finding INJ-1). Bound to
+// the upstream artifact / metadata / manifest clients at the two
+// `Client::builder()` sites. Mirrors the webhook crate's connect-time
+// `GuardedDnsResolver`; reuses `hort_net_egress::is_routable`.
+mod dns_guard;
 mod extra_ca;
 // Caching upstream resolver. General — not OCI-specific — though it
 // first landed in `hort-http-oci` by accident of first use. Relocated
@@ -66,10 +73,15 @@ pub use resolver::CachingResolver;
 // import below; callers who imported from this crate's old `ssrf` module
 // path must switch to `hort_net_egress` directly.
 //
-// The connect-time `GuardedDnsResolver` and `build_egress_redirect_policy`
-// are retired — the settled posture is to accept operator-vetted upstream
-// target trust without a connect-time guard. `check_ssrf_safe`
-// (URL-input validation) and `Policy::limited(max_redirect_hops)` remain.
+// SSRF defence is layered: `check_ssrf_safe` validates the initial
+// absolute URL at parse time, `build_redirect_policy` re-checks every
+// redirect hop, and the connect-time `dns_guard::GuardedDnsResolver`
+// (security audit finding INJ-1) re-runs `is_routable` on every dial-time
+// resolution so a DNS-rebind between check and dial cannot smuggle an
+// internal address past the URL-validation check. All three reuse this one
+// `is_routable` predicate; the guard does NOT reimplement it.
+// `build_egress_redirect_policy` (the old `hort-net-egress` redirect-policy
+// export) stays retired — this crate builds its own redirect policy.
 use hort_net_egress::is_routable;
 
 use std::collections::HashMap;
@@ -558,13 +570,15 @@ pub struct HttpUpstreamProxy {
     /// The explicit assumption is that rotation is a rare,
     /// operator-scheduled event.
     tls_client_cache: Arc<tokio::sync::RwLock<HashMap<Uuid, Client>>>,
-    /// Addresses the per-hop redirect SSRF policy
-    /// ([`build_redirect_policy`]) treats as routable in addition to
-    /// the real `is_routable` check. **Always empty in production**
-    /// (built via [`HttpUpstreamProxy::new`]); only the `#[cfg(test)]`
-    /// constructor populates it with the wiremock loopback `SocketAddr`s
-    /// so the allow / hop-cap test paths can run on loopback. Scoped
-    /// private to this crate, never re-exported.
+    /// Addresses both SSRF guards treat as routable in addition to the
+    /// real `is_routable` check: the per-hop redirect SSRF policy
+    /// ([`build_redirect_policy`]) and the connect-time DNS guard
+    /// ([`dns_guard::GuardedDnsResolver`], security audit finding INJ-1).
+    /// **Always empty in production** (built via [`HttpUpstreamProxy::new`]);
+    /// only the `#[cfg(test)]` constructor populates it with the wiremock
+    /// loopback `SocketAddr`s so the allow / hop-cap / host-name-on-loopback
+    /// test paths can run on loopback. Scoped private to this crate, never
+    /// re-exported.
     redirect_test_allowlist: Arc<Vec<SocketAddr>>,
 }
 
@@ -603,15 +617,27 @@ impl HttpUpstreamProxy {
         secret_port: Arc<dyn SecretPort>,
         redirect_test_allowlist: Arc<Vec<SocketAddr>>,
     ) -> DomainResult<Self> {
-        // The redirect policy re-runs `is_routable` on every hop's
-        // resolved host and stops the chain when a hop resolves
-        // non-routable, while still enforcing the `max_redirect_hops`
-        // cap. The connect-time `GuardedDnsResolver` is deliberately NOT
-        // reintroduced. Cross-origin Authorization-strip and
-        // `check_ssrf_safe` on the initial URL remain.
+        // SSRF defence, three layers, all reusing `is_routable`:
+        //  - `check_ssrf_safe` validates the initial absolute URL at parse
+        //    time;
+        //  - the redirect policy re-runs `is_routable` on every hop's
+        //    resolved host and stops the chain when a hop resolves
+        //    non-routable, while still enforcing the `max_redirect_hops` cap;
+        //  - the connect-time `dns_guard::GuardedDnsResolver` re-runs
+        //    `is_routable` at dial time so a DNS-rebind between the
+        //    `check_ssrf_safe` resolve and reqwest's independent dial-time
+        //    resolve cannot pivot to IMDS / RFC1918 / loopback (security
+        //    audit finding INJ-1). Cross-origin Authorization-strip remains.
+        // The guard shares the same `redirect_test_allowlist` seam (empty in
+        // production) the redirect policy uses, so wiremock host-name tests
+        // can drive it on loopback while production refuses every
+        // loopback / RFC1918 / link-local resolution.
         let base_builder = Client::builder()
             .timeout(config.timeout)
             .user_agent(config.user_agent.as_str())
+            .dns_resolver(Arc::new(dns_guard::GuardedDnsResolver::new(
+                redirect_test_allowlist.clone(),
+            )))
             .redirect(build_redirect_policy(
                 config.max_redirect_hops,
                 redirect_test_allowlist.clone(),
@@ -653,12 +679,17 @@ impl HttpUpstreamProxy {
     /// written, allowing a retry on the next request.
     fn base_client_builder(&self) -> DomainResult<reqwest::ClientBuilder> {
         // Per-mapping (TLS) clients get the same per-hop redirect SSRF
-        // policy as the base client so the redirect-following surface is
-        // closed uniformly across every upstream-http client. Same
-        // allowlist instance as the base client (empty in production).
+        // policy AND the same connect-time DNS guard as the base client so
+        // the redirect-following surface and the dial-time DNS-rebind
+        // surface are closed uniformly across every upstream-http client
+        // (security audit finding INJ-1). Same allowlist instance as the
+        // base client (empty in production).
         let builder = Client::builder()
             .timeout(self.config.timeout)
             .user_agent(self.config.user_agent.as_str())
+            .dns_resolver(Arc::new(dns_guard::GuardedDnsResolver::new(
+                self.redirect_test_allowlist.clone(),
+            )))
             .redirect(build_redirect_policy(
                 self.config.max_redirect_hops,
                 self.redirect_test_allowlist.clone(),
@@ -843,6 +874,17 @@ fn parse_last_modified(value: Option<&str>) -> Option<DateTime<Utc>> {
 /// absolute URL — operators rely on the registry not being a footgun for
 /// cross-host pivoting from a poisoned index.
 ///
+/// This is the URL-validation-time check. It necessarily resolves the host
+/// itself, and reqwest re-resolves independently at dial time — a
+/// DNS-rebind/TOCTOU window between the two. That window is closed by the
+/// connect-time [`dns_guard::GuardedDnsResolver`] (security audit finding
+/// INJ-1) bound to the same clients, which re-runs the identical
+/// [`hort_net_egress::is_routable`] predicate on every dial-time
+/// resolution and fails the dial closed before any bytes leave the
+/// process. This check stays as the cheap first gate (it rejects an
+/// obviously-internal literal/host before a connection is even attempted)
+/// and as the parse-time URL validator.
+///
 /// Refusal returns [`DomainError::Validation`] (mapped to
 /// `UpstreamErrorKind::ParseError` by the outer fetch metric — refusal
 /// is a content-validation outcome, not a network failure).
@@ -912,16 +954,25 @@ const REDIRECT_SSRF_SENTINEL: &str = "hort-upstream-redirect-ssrf-blocked";
 ///
 /// This is bound **only** to the `hort-adapters-upstream-http` artifact /
 /// metadata / manifest `reqwest::Client`(s) at the two `Client::builder()`
-/// sites in this crate. It is NOT a connect-time `GuardedDnsResolver`,
-/// is NOT re-exported, is NOT placed in `hort-net-egress`, and is never
-/// threaded to the S3 (`hort-adapters-storage`) or OIDC
-/// (`hort-adapters-oidc`) clients — those use operator-vetted base targets.
+/// sites in this crate. It is NOT re-exported, is NOT placed in
+/// `hort-net-egress`, and is never threaded to the S3
+/// (`hort-adapters-storage`) or OIDC (`hort-adapters-oidc`) clients —
+/// those use operator-vetted base targets.
 ///
-/// Accepted residual: this is a per-hop `is_routable` check on the
-/// resolved address, not a connect-time resolver, so a DNS-rebind/TOCTOU
-/// between this check and the actual dial is inherently not closed here.
-/// The compensating layers are Authorization-strip, upstream checksum
-/// verification (ADR 0006), and TLS-cert validation.
+/// # Relationship to the connect-time DNS guard
+///
+/// This per-hop policy guards the *redirect* leg. The DNS-rebind/TOCTOU on
+/// the **initial dial** — the gap between [`check_ssrf_safe`]'s
+/// URL-validation-time resolution and reqwest's independent dial-time
+/// resolution — is now closed by the connect-time
+/// [`dns_guard::GuardedDnsResolver`] bound to the same clients (security
+/// audit finding INJ-1): it re-runs [`hort_net_egress::is_routable`] on
+/// every dial-time resolution and fails the dial closed before any bytes
+/// leave the process. The redirect path is itself re-guarded per hop here;
+/// reqwest re-resolves each followed hop through the bound DNS guard too,
+/// so a rebind on a redirect target is caught at connect time as well. The
+/// compensating layers (Authorization-strip, upstream checksum
+/// verification per ADR 0006, TLS-cert validation) remain.
 fn build_redirect_policy(
     max_hops: usize,
     allowlist: Arc<Vec<SocketAddr>>,
@@ -1330,18 +1381,22 @@ fn map_reqwest_send_error(e: &reqwest::Error) -> DomainError {
         return classified_error(tls_kind, &e.to_string());
     }
     // A per-hop redirect SSRF refusal surfaces here as a redirect-class
-    // `reqwest::Error` wrapping the `build_redirect_policy` message.
-    // Classify it identically to a `check_ssrf_safe` refusal
-    // (`ParseError`) — it is a content-validation outcome, not a network
-    // failure — so the existing
+    // `reqwest::Error` wrapping the `build_redirect_policy` message; a
+    // connect-time DNS-guard refusal (INJ-1) surfaces as a connect-class
+    // `reqwest::Error` wrapping the `dns_guard::GuardedDnsResolver` message.
+    // Both are content-validation refusals — a poisoned/rebinding upstream
+    // target, not a network failure — so classify them identically to a
+    // `check_ssrf_safe` refusal (`ParseError`); the existing
     // `hort_upstream_fetch_total{result="parse_error"}` row is reused and
     // no new error/metric variant is introduced. Walk the error source
-    // chain because reqwest wraps the redirect-policy message inside its
-    // own `Error`.
-    if error_chain_contains(e, REDIRECT_SSRF_SENTINEL) {
+    // chain because reqwest wraps the sentinel message inside its own
+    // `Error`.
+    if error_chain_contains(e, REDIRECT_SSRF_SENTINEL)
+        || error_chain_contains(e, dns_guard::CONNECT_SSRF_SENTINEL)
+    {
         return classified_error(
             UpstreamErrorKind::ParseError,
-            &format!("upstream redirect blocked (SSRF): {e}"),
+            &format!("upstream fetch blocked (SSRF): {e}"),
         );
     }
     let kind = if e.is_timeout() {
@@ -1852,19 +1907,34 @@ impl HttpUpstreamProxy {
             accept_types = accept.len(),
             "fetching manifest"
         );
-        // Caller-supplied Accept wins — pass-through means our
-        // pull-through behaves indistinguishably from a direct upstream
-        // pull from the operator's perspective. Empty list → fall back
-        // to the OCI + Docker v2 union so existing callers stay green.
-        let accept_header = if accept.is_empty() {
-            "application/vnd.oci.image.manifest.v1+json, \
-             application/vnd.oci.image.index.v1+json, \
-             application/vnd.docker.distribution.manifest.v2+json, \
-             application/vnd.docker.distribution.manifest.list.v2+json"
-                .to_string()
-        } else {
-            accept.join(", ")
-        };
+        // Always advertise the full canonical manifest media-type set to the
+        // upstream — NOT the (possibly narrower) client `Accept`. A
+        // pull-through cache must fetch the canonical manifest it will STORE
+        // and re-serve, not a per-client projection: a strict-content-
+        // negotiation registry (Artifact Registry, which backs
+        // registry.k8s.io) returns 404 — not the manifest — when the `Accept`
+        // omits the manifest's actual media type (e.g. a Docker manifest-list
+        // tag fetched with an OCI-only `Accept`). Serve-time `accept_matches`
+        // still 406s a client that genuinely can't accept the stored type,
+        // and the cached representation is now Accept-independent (closes the
+        // dedup-key residual where a narrow leader `Accept` could pin a
+        // multi-arch tag to a single-platform manifest). Any extra
+        // client-requested types are unioned in after the canonical set for
+        // forward-compatibility. (Was: forward the client `Accept` verbatim.)
+        const CANONICAL_MANIFEST_ACCEPT: [&str; 4] = [
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        ];
+        let mut accept_types: Vec<&str> = CANONICAL_MANIFEST_ACCEPT.to_vec();
+        for t in accept {
+            let t = t.trim();
+            if !t.is_empty() && !accept_types.iter().any(|c| c.eq_ignore_ascii_case(t)) {
+                accept_types.push(t);
+            }
+        }
+        let accept_header = accept_types.join(", ");
         let extras = [("accept", accept_header)];
         let resp = self
             .fetch_with_challenge(client, mapping, upstream_name, &url, "manifest", &extras)
@@ -2565,7 +2635,7 @@ mod tests {
     use hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE;
     use hort_domain::ports::upstream_proxy::ReferrerDescriptor;
     use uuid::Uuid;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{header, header_regex, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mapping(url: &str, path_prefix: &str, auth: UpstreamAuth) -> RepositoryUpstreamMapping {
@@ -2991,6 +3061,52 @@ mod tests {
             Some("application/vnd.oci.image.manifest.v1+json")
         );
         assert_eq!(result.declared_digest.as_deref(), Some("sha256:deadbeef"));
+    }
+
+    /// Regression: a narrow client `Accept` must NOT narrow the upstream
+    /// fetch. The mock 200s ONLY when the outbound `Accept` advertises the
+    /// Docker manifest-list type (mirroring Artifact Registry / registry.k8s.io
+    /// strict content negotiation — a `pause`-style tag is a Docker manifest
+    /// list). Called with an OCI-index-only client `Accept`, hort must still
+    /// widen to the canonical set and get 200 — not forward the narrow
+    /// `Accept` and 404.
+    #[tokio::test]
+    async fn fetch_manifest_widens_narrow_client_accept_to_canonical_set() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/pause/manifests/3.9"))
+            .and(header_regex(
+                "accept",
+                r"application/vnd\.docker\.distribution\.manifest\.list\.v2\+json",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        CONTENT_TYPE,
+                        "application/vnd.docker.distribution.manifest.list.v2+json",
+                    )
+                    .insert_header("docker-content-digest", "sha256:feedface")
+                    .set_body_bytes(br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json"}"#.as_slice()),
+            )
+            .mount(&server)
+            .await;
+        let proxy = proxy_for(&server);
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        // Narrow, OCI-only client Accept — the bug case. With the old
+        // pass-through this reached the upstream verbatim → no match → 404.
+        let result = proxy
+            .fetch_manifest(
+                m,
+                "pause".into(),
+                "3.9".into(),
+                vec!["application/vnd.oci.image.index.v1+json".to_string()],
+            )
+            .await
+            .expect("hort must widen the upstream Accept to the canonical set and get 200");
+        assert_eq!(
+            result.media_type.as_deref(),
+            Some("application/vnd.docker.distribution.manifest.list.v2+json")
+        );
     }
 
     // -------------------------------------------------------------------
@@ -5176,17 +5292,21 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
-        // Stream 20 MiB in 64 KiB chunks against a 4 MiB cap. With
-        // the streaming implementation bailing at the cap, the server
-        // should observe < 3x cap = 12 MiB pushed (the slack absorbs
-        // reqwest's internal stream read-ahead + OS-level kernel send/
-        // receive buffer state on fast loopback); the buffered shape
-        // would read all 20 MiB before the length check. The 5x
-        // oversize ratio + 3x slack threshold keeps zero ambiguity in
-        // the streaming-vs-buffered distinction without being noise-
-        // sensitive to kernel buffer sizing.
+        // Stream 64 MiB in 64 KiB chunks against a 4 MiB cap. The
+        // streaming implementation bails at the cap and closes the
+        // connection, so the server observes only the cap plus a
+        // transient in-flight window (kernel TCP send/receive buffers +
+        // reqwest's `bytes_stream` read-ahead) — empirically ~3x cap on
+        // fast loopback, and notably larger under CI buffer sizing. A
+        // buffered `resp.bytes().await` shape, by contrast, reads the
+        // full 64 MiB (16x cap) before the length check. We assert the
+        // server pushed < 8x cap = 32 MiB: comfortably above realistic
+        // in-flight buffering, yet far below the 16x-cap full body, so the
+        // streaming-vs-buffered distinction stays unambiguous without
+        // being fragile to kernel/CI buffer variance (the prior 3x-cap
+        // threshold flaked when CI buffered ~3.1x cap).
         const STREAMING_TEST_CAP: u64 = 4 * 1024 * 1024;
-        const TOTAL_BODY_BYTES: usize = 20 * 1024 * 1024;
+        const TOTAL_BODY_BYTES: usize = 64 * 1024 * 1024;
         const CHUNK_SIZE: usize = 64 * 1024;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5290,17 +5410,16 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 
         let pushed = bytes_pushed.load(Ordering::SeqCst);
-        // Memory-bounding assertion. With streaming + bail, the
-        // server pushed roughly cap + a transient prefetch window
-        // (kernel TCP send + receive buffers + reqwest's
-        // `bytes_stream` read-ahead). We assert the observation is
-        // < 2x the cap. The buffered shape (`resp.bytes().await`)
-        // pushes the full TOTAL_BODY_BYTES = 5x cap = 50 MiB, so
-        // any threshold strictly between 1x cap and 5x cap
-        // distinguishes streaming from buffered. 2x is a comfortable
-        // middle that absorbs kernel-buffer variation on fast
-        // loopback writes without false positives.
-        let upper = (3 * STREAMING_TEST_CAP) as usize;
+        // Memory-bounding assertion. With streaming + bail, the server
+        // pushed roughly cap + a transient in-flight window (kernel TCP
+        // send + receive buffers + reqwest's `bytes_stream` read-ahead).
+        // The buffered shape (`resp.bytes().await`) pushes the full
+        // TOTAL_BODY_BYTES = 16x cap = 64 MiB, so any threshold strictly
+        // between the in-flight noise and 16x cap distinguishes streaming
+        // from buffered. We use 8x cap (= TOTAL/2 = 32 MiB): a wide middle
+        // that absorbs kernel/CI buffer variation without false positives
+        // (the prior 3x-cap threshold flaked at ~3.1x cap).
+        let upper = (8 * STREAMING_TEST_CAP) as usize;
         assert!(
             pushed < upper,
             "streaming bail must close the connection near the cap; \
@@ -5681,6 +5800,107 @@ mod tests {
             ..Default::default()
         };
         HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
+    }
+
+    /// INJ-1 regression — the connect-time DNS guard closes the
+    /// SSRF/DNS-rebind TOCTOU on the **initial dial** of a *host name*
+    /// upstream, which `check_ssrf_safe` never re-validates at dial time.
+    ///
+    /// A **relative**-path fetch composes onto `mapping.upstream_url` and
+    /// deliberately does NOT run `check_ssrf_safe` (only absolute URLs hit
+    /// that gate — see `resolve_artifact_url`). So a mapping whose
+    /// `upstream_url` host *name* resolves to a non-routable address is a
+    /// pure exercise of the connect-time guard: nothing else stands between
+    /// the request and the internal target. `localhost` is a host name
+    /// (not an IP literal — hyper-util's connector routes host names through
+    /// the bound `reqwest::dns::Resolve`, IP literals bypass it), resolving
+    /// to loopback. With the production proxy (empty test-allowlist) the
+    /// guard must refuse the dial and the failure must classify as
+    /// `ParseError` (the SSRF-refusal contract), proving the dial never
+    /// completed against the internal address.
+    #[tokio::test]
+    async fn fetch_relative_path_to_hostname_resolving_nonroutable_is_blocked_at_connect() {
+        let proxy = proxy_with_no_server();
+        // Host *name* (goes through the DNS guard) resolving to loopback,
+        // reached via a RELATIVE path so `check_ssrf_safe` is bypassed and
+        // only the connect-time guard can stop it. Port 9 (discard) so even
+        // if the guard were absent the connect would not reach a real
+        // server — but the assertion is on the classification, which only
+        // the guard produces.
+        let m = mapping("http://localhost:9", "", UpstreamAuth::Anonymous);
+        let Err(err) = proxy.fetch_artifact(m, "/internal-secret".into()).await else {
+            panic!(
+                "a relative-path fetch to a host name resolving to loopback must be \
+                 refused by the connect-time DNS guard"
+            );
+        };
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "connect-time SSRF refusal must classify as ParseError (the \
+             check_ssrf_safe refusal contract), got {err:?}"
+        );
+    }
+
+    /// INJ-1 positive — the connect-time guard does NOT break a legitimate
+    /// public-host dial. wiremock binds on loopback (an IP literal that
+    /// bypasses the resolver), so to drive the *resolver* path against a
+    /// permitted address we point the proxy at the wiremock server via its
+    /// loopback `SocketAddr` placed in the test-allowlist AND reference it
+    /// by the host *name* `localhost`. The guard resolves `localhost` →
+    /// loopback, finds the address allowlisted, and permits the dial; the
+    /// body must reach the caller. This is the analogue of "public host
+    /// resolves and is permitted" that is offline-safe.
+    #[tokio::test]
+    async fn fetch_relative_path_to_allowlisted_hostname_is_permitted_at_connect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"public-bytes".as_slice()))
+            .mount(&server)
+            .await;
+
+        // Allowlist every address `localhost` resolves to (v4 + v6),
+        // normalised to the `:0` port the connect-time guard resolves with,
+        // so the guard treats `localhost` → loopback as routable. The guard
+        // rejects a resolution if ANY returned address is non-routable and
+        // not allowlisted, so all of localhost's answers must be listed.
+        let allow: Vec<SocketAddr> = tokio::net::lookup_host("localhost:0")
+            .await
+            .expect("localhost resolves")
+            .map(|a| SocketAddr::new(a.ip(), 0))
+            .collect();
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            format_label: "oci".to_string(),
+            ..Default::default()
+        };
+        let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(AnonymousFallbackPort),
+            allow,
+        )
+        .unwrap();
+
+        // Reach the server by host NAME (so the guard's resolver fires)
+        // while the actual bound port comes from wiremock.
+        let upstream = format!("http://localhost:{}", server.address().port());
+        let m = mapping(&upstream, "", UpstreamAuth::Anonymous);
+
+        let mut stream = proxy
+            .fetch_artifact(m, "/pkg.tgz".into())
+            .await
+            .expect("allowlisted host-name dial must be permitted by the connect guard")
+            .stream;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            bytes, b"public-bytes",
+            "a permitted host-name upstream's body must reach the caller \
+             (no false-positive over-block)"
+        );
     }
 
     #[test]

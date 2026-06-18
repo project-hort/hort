@@ -153,8 +153,9 @@ jobs:
       # Unpatched UBI base image CVEs (Red Hat's responsibility) are still
       # reported in SARIF for visibility but don't block the build.
       # Trivy scans upload SARIF to GitHub Security tab for visibility.
-      # exit-code: 0 means scan results are informational — unfixed base image
-      # CVEs (Red Hat's responsibility) should not block image publishing.
+      # The publish-path scan below is BLOCKING on fixable CRITICALs (exit-code
+      # 1, INFRA-3); unfixed base-image CVEs still pass (`ignore-unfixed: true`)
+      # and accepted ones are tracked in `.trivyignore`.
       # NOTE: trivy binary extracted from official GHCR image because the
       # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
       - name: Install Trivy
@@ -164,15 +165,20 @@ jobs:
           docker rm "$CONTAINER_ID"
           trivy --version
 
+      # Publish-path gate: fail the build on any CRITICAL CVE that has a fix
+      # available upstream (`ignore-unfixed: true` still lets unpatched base-image
+      # CVEs through — those are tracked in `.trivyignore` / the scheduled scan).
+      # The SARIF is still produced and uploaded (`if: always()` below) so the
+      # Security tab keeps full visibility even when this step fails.
       - name: Trivy scan - Backend
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ steps.refs.outputs.backend }}
           format: 'sarif'
           output: 'backend-trivy.sarif'
-          severity: 'CRITICAL,HIGH'
+          severity: 'CRITICAL'
           ignore-unfixed: true
-          exit-code: '0'
+          exit-code: '1'
           skip-setup-trivy: true
 
       - name: Upload Backend Trivy SARIF

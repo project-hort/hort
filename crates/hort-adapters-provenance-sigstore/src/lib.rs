@@ -6,10 +6,14 @@
 //! verifying each stored Sigstore bundle **offline** against a cached,
 //! injectable trust root — there is **no live Rekor/Fulcio lookup on the
 //! verify path**. Each bundle already carries its Fulcio certificate chain
-//! (with embedded SCT) and the Rekor inclusion proof / SignedEntryTimestamp
-//! (SET); the adapter validates that material against the cached Sigstore
-//! trust root (Fulcio CA certs + Rekor/CT-log public keys) refreshed
-//! periodically via TUF — *not* per verify (see [`trust_root`]).
+//! (with embedded SCT) and the Rekor inclusion proof + signed checkpoint.
+//! The adapter validates the **Fulcio certificate chain, the embedded SCT,
+//! the artifact signature, the digest binding, and the Rekor Merkle
+//! inclusion proof + checkpoint signature** against the cached Sigstore
+//! trust root (Fulcio CA certs + CT-log + Rekor public keys) refreshed
+//! periodically via TUF — *not* per verify (see [`trust_root`]). A bundle
+//! whose transparency-log entry is not provably in the Rekor log can never
+//! reach `Verified` (see "Rekor inclusion verification" below).
 //!
 //! ## Verdict flow ([`SigstoreProvenanceAdapter::verify`])
 //! - empty `bundles` → [`NoAttestation`] (the unsigned case — **not** an
@@ -17,8 +21,12 @@
 //! - a bundle that does not parse / carries no leaf cert / no offline
 //!   material → [`Rejected(BundleMalformed)`];
 //! - cert chain that does not validate to the trust root → [`Rejected(CertChainInvalid)`];
-//! - a missing / invalid Rekor SET (offline) → [`Rejected(RekorNotFound)`]
-//!   — **never** a fall-back to a live Rekor fetch;
+//! - a bundle whose Rekor Merkle inclusion proof or checkpoint signature
+//!   does not cryptographically verify against the trust root's Rekor key
+//!   (or whose tlog material is structurally absent / unparseable) →
+//!   [`Rejected(RekorNotFound)`] — **never** a fall-back to a live Rekor
+//!   fetch. This catches both a *structurally* absent proof and a
+//!   forged-but-well-formed one whose entry is not provably in the log;
 //! - a cryptographically-valid signature whose observed `{issuer, san}`
 //!   matches no allowed [`SignerIdentityPattern`] → [`Rejected(UntrustedIdentity)`];
 //! - valid + trusted + identity-match → [`Verified { signer, predicate_type }`].
@@ -44,9 +52,33 @@
 //! (for OCI cosign, the manifest bytes the orchestrator streams from the
 //! `StoragePort`); the adapter feeds **that** to the hasher and defensively
 //! asserts the subject invariant `sha256(payload) == content_hash` before
-//! verifying. The cert-chain / SCT / SET / signature crypto runs **for
-//! real** against the injected trust root (it is *not* a stub). The
+//! verifying. The cert-chain / SCT / signature / digest-binding crypto runs
+//! **for real** against the injected trust root (it is *not* a stub). The
 //! **offline** and **injectable-trust-root** guarantees are fully met here.
+//!
+//! ## Rekor inclusion verification (closes sigstore-rs#285 for v0.3)
+//!
+//! The pinned `sigstore` 0.14 `Verifier::verify_digest` implements the Fulcio
+//! chain, SCT, signature, digest-binding, and cert-validity-window checks, but
+//! its Rekor **Merkle inclusion proof** + checkpoint/SET steps are upstream
+//! `TODO`s (`sigstore-rs#285`). This adapter closes that gap **offline** for
+//! the Sigstore **v0.3** bundle format (ADR 0027): after `verify_digest`
+//! succeeds, [`inclusion::verify_inclusion`] reconstructs the public
+//! `rekor::models::InclusionProof` from the bundle's protobuf
+//! transparency-log entry (fail-closed `Vec<u8> → [u8; 32]` width checks; the
+//! checkpoint signed-note envelope parsed via `SignedCheckpoint`) and runs the
+//! crate's cryptographically-complete `InclusionProof::verify` — full RFC-6962
+//! Merkle inclusion over the entry's `canonicalized_body` leaf, **plus** the
+//! checkpoint signature, **plus** root/tree-size consistency — against the
+//! Rekor public key selected from the pinned trust root by the entry's
+//! `logID`. Any failure (absent proof/checkpoint, no matching Rekor key,
+//! unparseable material, bad width, failed Merkle/signature check) is
+//! fail-closed [`Rejected(RekorNotFound)`] — never a panic, never a skip,
+//! never a live Rekor fetch. So this adapter now proves that a valid Fulcio
+//! cert with SCT for a policy-allowed identity signed these bytes **and**
+//! that the entry is provably in the public Rekor transparency log. The
+//! older v0.1 SET-only (`inclusion_promise`) path is out of scope
+//! (ADR 0027:168) and rejected.
 //!
 //! [`NoAttestation`]: hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
 //! [`Rejected(BundleMalformed)`]: hort_domain::ports::provenance::ProvenanceRejectReason::BundleMalformed
@@ -60,6 +92,7 @@
 
 mod extra_ca;
 mod identity;
+mod inclusion;
 pub mod trust_root;
 mod verifier;
 
@@ -157,6 +190,15 @@ impl ProvenancePort for SigstoreProvenanceAdapter {
                 verifier::build_verifier(trust_root)
             };
 
+            // Snapshot the trust root's Rekor public keys (owned) for the
+            // offline Rekor Merkle inclusion-proof + checkpoint-signature
+            // verification each bundle runs *after* `verify_digest`
+            // succeeds (ADR 0027; the `verify_digest` consume forces the
+            // keys to be extracted before the verifier is built). An empty
+            // map fails every verify closed (`RekorNotFound`); the worker
+            // boot check surfaces a Rekor-keyless trust root up front.
+            let rekor_keys = self.trust_root.rekor_keys()?;
+
             // Fold across the supplied bundles: the first bundle that
             // yields a terminal verdict (Verified or a non-malformed
             // Rejected) wins; otherwise we keep the "most informative"
@@ -167,6 +209,7 @@ impl ProvenancePort for SigstoreProvenanceAdapter {
                 artifact.payload,
                 bundles,
                 policy.allowed_identities,
+                &rekor_keys,
             )
             .await;
             Ok(verdict)

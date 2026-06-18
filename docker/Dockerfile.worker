@@ -69,7 +69,8 @@ ARG TRIVY_SHA256=8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa
 ARG OSV_SCANNER_SHA256=bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc
 
 # ---------- Stage 1: builder ----------
-FROM rust:${RUST_VERSION}-slim AS builder
+# Digest-pinned (B10/INFRA-7); Dependabot (docker ecosystem) bumps tag+digest.
+FROM rust:${RUST_VERSION}-slim@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a AS builder
 
 WORKDIR /src
 
@@ -101,7 +102,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/hort-worker /usr/local/bin/hort-worker
 
 # ---------- Stage 2: Trivy CLI ----------
-FROM debian:trixie-slim AS trivy
+# Digest-pinned (B10/INFRA-7).
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS trivy
 
 ARG TRIVY_VERSION
 ARG TRIVY_SHA256
@@ -132,7 +134,8 @@ RUN set -eu && \
     rm -f /tmp/trivy.tar.gz /tmp/trivy
 
 # ---------- Stage 3: osv-scanner CLI ----------
-FROM debian:trixie-slim AS osv
+# Digest-pinned (B10/INFRA-7).
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS osv
 
 ARG OSV_SCANNER_VERSION
 ARG OSV_SCANNER_SHA256
@@ -175,7 +178,8 @@ RUN set -eu && \
 # teardown that survive their immediate parent reparent to PID 1
 # (the worker process). The worker's tokio runtime does not waitpid
 # on grandchildren; tini does.
-FROM debian:trixie-slim AS tini
+# Digest-pinned (B10/INFRA-7).
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS tini
 RUN apt-get update && \
     apt-get install -y --no-install-recommends tini && \
     rm -rf /var/lib/apt/lists/*
@@ -199,7 +203,8 @@ RUN apt-get update && \
 # Rust binary's reqwest builds layer it on. Trivy / osv-scanner
 # subprocesses pick up the same bundle via `SSL_CERT_FILE` at
 # spawn-time.
-FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+# Digest-pinned (B10/INFRA-7).
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d3cda6e91129130d7229a1806b6a73d292ef245ab032da7851907798024cefba AS runtime
 
 # OCI Image Spec v1.1 labels. The two below are static; CI passes the
 # rest (`source`, `revision`, `version`, `created`) via `--label` on

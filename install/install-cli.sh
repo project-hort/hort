@@ -156,9 +156,12 @@ cosign_verify() {
   # No verification bypass exists in the shipped script. Tests stub cosign by putting a
   # fake `cosign` on PATH (see install/tests/), so this real path always runs.
   # shellcheck disable=SC2034  # intentional: tests can override the regexp via env
-  # HORT_TEST_BAD_IDENTITY only swaps in a NON-matching identity (makes verify stricter →
-  # fail-closed), used by the deferred real-cosign negative CI test. It cannot weaken verify.
-  [ "${HORT_TEST_BAD_IDENTITY:-}" = "1" ] && COSIGN_IDENTITY_REGEXP='https://github.com/definitely-not-project-hort/.*'
+  # _HORT_INTERNAL_TEST_BAD_IDENTITY (INFRA-15): a CI-test-only knob — leading
+  # underscore marks it internal; it is NOT for operators and is deliberately
+  # absent from --help. It only swaps in a NON-matching signer identity, which
+  # makes verification STRICTER (fail-closed); it can never weaken or bypass
+  # verify. Used by the real-cosign negative CI test.
+  [ "${_HORT_INTERNAL_TEST_BAD_IDENTITY:-}" = "1" ] && COSIGN_IDENTITY_REGEXP='https://github.com/definitely-not-project-hort/.*'
   cosign_bin="$(ensure_cosign)"
   "$cosign_bin" verify-blob \
     --certificate-oidc-issuer="$COSIGN_OIDC_ISSUER" \
