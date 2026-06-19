@@ -107,25 +107,22 @@ jobs:
     name: 📊 Code Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    services:
-      postgres:
-        # Public Docker Hub official image. (The private GHCR mirror that
-        # previously fronted this isn't readable from the public mirror's CI;
-        # an anonymous pull of one small Postgres image per run is acceptable.)
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: registry
-          POSTGRES_PASSWORD: registry
-          POSTGRES_DB: artifact_registry
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    # No Postgres / migrations needed: `--lib` coverage runs without a DB —
+    # hort-domain / hort-app are zero-I/O, and the DB-gated adapter inline
+    # tests skip when DATABASE_URL is unset (parity with the GitLab
+    # `test:coverage` job, which also runs no Postgres / no migrations).
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
+        with:
+          tool: cargo-llvm-cov
 
       # Skip the expensive coverage build on PRs that touch no Rust source.
       # Dependency bumps (Cargo.toml/Cargo.lock only), workflow edits, and
@@ -147,16 +144,9 @@ jobs:
             echo "### Coverage: skipped (no Rust source changes in this PR)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Run database migrations
-        if: steps.detect.outputs.rust_changed == 'true'
-        run: sqlx migrate run --source migrations
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-
       - name: Generate coverage report
         if: steps.detect.outputs.rust_changed == 'true'
         env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
         run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
@@ -467,10 +457,17 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: EmbarkStudios/cargo-deny-action@d6d27f1b02f0c07f9db6ffc34e7871bba5ab5816 # v2.0.9
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          command: check
-          arguments: --workspace
+          toolchain: stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
+        with:
+          tool: cargo-deny
+
+      - name: cargo-deny (blocking)
+        run: cargo deny --workspace check
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BINARY BUILD VERIFICATION (build-only, never releases)
