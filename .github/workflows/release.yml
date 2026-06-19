@@ -287,16 +287,36 @@ jobs:
           find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
           ls -la release-assets/
 
-      - name: Create Release
+      # Always create as a DRAFT first. GitHub's "Immutable releases" setting
+      # freezes a release the moment it is published, so assets can only be
+      # uploaded while the release is still a mutable draft. The publish step
+      # below then publishes it — but only when all gates passed, so a gate
+      # failure still leaves an unpublished draft (same outcome as before).
+      - name: Create draft Release (assets upload while mutable)
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Hort ${{ steps.version.outputs.version }}
           generate_release_notes: true
-          draft: ${{ steps.gates.outputs.all_passed != 'true' }}
+          draft: true
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           files: release-assets/*
           fail_on_unmatched_files: true
+
+      # Publish the draft (fires release.published). `gh release edit` only
+      # changes the flags passed, so re-assert prerelease/latest to match the
+      # create-step intent (stable → latest, `-`-versioned → prerelease).
+      - name: Publish release (gates passed only)
+        if: steps.gates.outputs.all_passed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          if [[ '${{ steps.version.outputs.version }}' == *-* ]]; then
+            gh release edit "$tag" --draft=false --prerelease
+          else
+            gh release edit "$tag" --draft=false --latest
+          fi
 
   # ════════════════════════════════════════════════════════════════════════════
   # NOTE: Docker images are published by .github/workflows/docker-publish.yml,
