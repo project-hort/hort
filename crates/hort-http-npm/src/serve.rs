@@ -78,7 +78,7 @@ use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
 use hort_http_core::middleware::trust::RequestTrust;
 
-use crate::index_source::{HostedNpmSource, IndexSource, IndexSourceOutput, ProxyNpmSource};
+use crate::index_source::{select_source, IndexSourceOutput};
 
 /// Unified npm packument serve — the npm-side of the Source →
 /// Filter → Builder pipeline.
@@ -129,25 +129,20 @@ pub(crate) async fn serve_packument_unified(
         repo_key
     );
 
-    // ---- Step 1: Source dispatch -------------------------------------
-    let (output, index_source_label): (IndexSourceOutput, &'static str) = match repo.repo_type {
-        RepositoryType::Proxy => {
-            let src = ProxyNpmSource;
-            let out = src
-                .fetch(ctx, &repo, pkg_name, caller)
-                .await
-                .map_err(map_source_error)?;
-            (out, "proxy")
-        }
-        _ => {
-            let src = HostedNpmSource;
-            let out = src
-                .fetch(ctx, &repo, pkg_name, caller)
-                .await
-                .map_err(ApiError::from)?;
-            (out, "hosted")
-        }
+    // ---- Step 1: Source dispatch (transparent to repo type) ----------
+    // `select_source` returns the hosted / proxy / virtual source. The virtual
+    // source aggregates its members behind this same seam (ADR 0031), so this
+    // handler never special-cases `Virtual` — it dispatches by type for the
+    // tracing label only, then runs the unchanged filter pipeline + builder.
+    let index_source_label = match repo.repo_type {
+        RepositoryType::Proxy => "proxy",
+        RepositoryType::Virtual => "virtual",
+        _ => "hosted",
     };
+    let output: IndexSourceOutput = select_source(&repo)
+        .fetch(ctx, &repo, pkg_name, caller)
+        .await
+        .map_err(map_source_error)?;
 
     // Empty hosted results → 404.
     // For proxy the equivalent path was: `NoUpstream` → 404 (raised
@@ -380,6 +375,134 @@ mod tests {
         };
         mocks.artifacts.insert(artifact.clone());
         artifact
+    }
+
+    /// Insert a `type: virtual` npm repo aggregating `members` (in priority
+    /// order — first = highest). Seeds the membership edges; the access default
+    /// in `build_mock_ctx` is `RbacAccess::Disabled`, so all members resolve.
+    fn insert_virtual_repo(
+        mocks: &hort_http_core::test_support::MockPorts,
+        key: &str,
+        members: &[&Repository],
+    ) -> Repository {
+        let mut repo = sample_repository();
+        repo.key = key.into();
+        repo.format = RepositoryFormat::Npm;
+        repo.repo_type = RepositoryType::Virtual;
+        repo.index_mode = IndexMode::ReleasedOnly;
+        mocks.repositories.insert(repo.clone());
+        for member in members {
+            mocks.repositories.seed_virtual_member(repo.id, member.id);
+        }
+        repo
+    }
+
+    async fn served_versions(res: Response) -> serde_json::Map<String, serde_json::Value> {
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["versions"].as_object().cloned().unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // Virtual (aggregating) serve — ADR 0031. The serve handler is
+    // transparent (no `Virtual` branch); these drive it end-to-end through
+    // `select_source` → `VirtualNpmSource` → `aggregate_index_members`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn virtual_merges_member_packuments() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let a = insert_hosted_repo(&mocks, "npm-a", IndexMode::ReleasedOnly);
+        let b = insert_hosted_repo(&mocks, "npm-b", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            a.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            b.id,
+            "pkg",
+            "2.0.0",
+            "pkg-2.0.0.tgz",
+            "bbb",
+            QuarantineStatus::Released,
+        );
+        insert_virtual_repo(&mocks, "npm-virt", &[&a, &b]);
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-virt", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions = served_versions(res).await;
+        assert!(versions.contains_key("1.0.0"), "member a's version served");
+        assert!(versions.contains_key("2.0.0"), "member b's version served");
+    }
+
+    #[tokio::test]
+    async fn virtual_same_version_held_primary_not_replaced_by_secondary() {
+        // Dependency-confusion regression (same-version): the higher-priority
+        // member holds 1.0.0 Quarantined; a lower-priority member has the SAME
+        // version Released. The held copy wins the authoritative merge and is
+        // then filtered out — it is NOT replaced by the secondary's released
+        // copy.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let primary = insert_hosted_repo(&mocks, "npm-primary", IndexMode::ReleasedOnly);
+        let secondary = insert_hosted_repo(&mocks, "npm-secondary", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            primary.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Quarantined,
+        );
+        insert_artifact(
+            &mocks,
+            secondary.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "bbb",
+            QuarantineStatus::Released,
+        );
+        insert_virtual_repo(&mocks, "npm-virt", &[&primary, &secondary]);
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-virt", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions = served_versions(res).await;
+        assert!(
+            !versions.contains_key("1.0.0"),
+            "held primary copy filtered out, NOT replaced by the secondary's released copy"
+        );
+        assert!(versions.is_empty(), "no servable version remains");
+    }
+
+    #[tokio::test]
+    async fn virtual_with_no_matching_versions_is_404() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let a = insert_hosted_repo(&mocks, "npm-a", IndexMode::ReleasedOnly);
+        insert_virtual_repo(&mocks, "npm-virt", &[&a]);
+        // No artifacts seeded → member returns empty → merged empty → 404.
+        let trust = trust_for_tests();
+        let err = serve_packument_unified(&ctx, "npm-virt", "pkg", &trust, None)
+            .await
+            .expect_err("empty virtual must 404");
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }
 
     // -----------------------------------------------------------------

@@ -1071,6 +1071,10 @@ pub struct MockRepositoryRepository {
     /// fails, the first one is NOT rolled back (no rollback in v1)
     /// but the use case still returns Err.
     next_save_managed_error: Mutex<Option<DomainError>>,
+    /// One-shot failure injection for `find_by_id` (infra-error paths).
+    next_find_by_id_error: Mutex<Option<DomainError>>,
+    /// One-shot failure injection for `get_virtual_members`.
+    next_get_virtual_members_error: Mutex<Option<DomainError>>,
 }
 
 /// One entry in `MockRepositoryRepository::call_log`.
@@ -1082,6 +1086,7 @@ pub enum MockCall {
     DeleteManaged(Uuid),
     AddMember(Uuid, Uuid),
     RemoveMember(Uuid, Uuid),
+    ReplaceMembers(Uuid, Vec<Uuid>),
 }
 
 impl MockRepositoryRepository {
@@ -1092,6 +1097,8 @@ impl MockRepositoryRepository {
             virtual_members: Mutex::new(HashMap::new()),
             call_log: Mutex::new(Vec::new()),
             next_save_managed_error: Mutex::new(None),
+            next_find_by_id_error: Mutex::new(None),
+            next_get_virtual_members_error: Mutex::new(None),
         }
     }
 
@@ -1106,6 +1113,16 @@ impl MockRepositoryRepository {
     /// missing key produces anyway.
     pub fn fail_next_find_by_key(&self, err: DomainError) {
         *self.next_find_by_key_error.lock().unwrap() = Some(err);
+    }
+
+    /// Seed a single failure for the next `find_by_id` call (consumed once).
+    pub fn fail_next_find_by_id(&self, err: DomainError) {
+        *self.next_find_by_id_error.lock().unwrap() = Some(err);
+    }
+
+    /// Seed a single failure for the next `get_virtual_members` call.
+    pub fn fail_next_get_virtual_members(&self, err: DomainError) {
+        *self.next_get_virtual_members_error.lock().unwrap() = Some(err);
     }
 
     /// Seed a managed virtual-member edge. Used by tests that
@@ -1135,6 +1152,9 @@ impl MockRepositoryRepository {
 
 impl RepositoryRepository for MockRepositoryRepository {
     fn find_by_id(&self, id: Uuid) -> BoxFut<'_, DomainResult<Repository>> {
+        if let Some(err) = self.next_find_by_id_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(err) });
+        }
         let result = self
             .repositories
             .lock()
@@ -1218,6 +1238,9 @@ impl RepositoryRepository for MockRepositoryRepository {
         &self,
         virtual_repo_id: Uuid,
     ) -> BoxFut<'_, DomainResult<Vec<Repository>>> {
+        if let Some(err) = self.next_get_virtual_members_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(err) });
+        }
         let edges = self
             .virtual_members
             .lock()
@@ -1268,6 +1291,25 @@ impl RepositoryRepository for MockRepositoryRepository {
         {
             members.retain(|id| *id != member_repo_id);
         }
+        Box::pin(async { Ok(()) })
+    }
+
+    fn replace_virtual_members(
+        &self,
+        virtual_repo_id: Uuid,
+        ordered_member_ids: &[Uuid],
+    ) -> BoxFut<'_, DomainResult<()>> {
+        // Atomic from a reader's perspective: the whole set is swapped in one
+        // locked section (mirrors the adapter's single transaction).
+        let ids = ordered_member_ids.to_vec();
+        self.call_log
+            .lock()
+            .unwrap()
+            .push(MockCall::ReplaceMembers(virtual_repo_id, ids.clone()));
+        self.virtual_members
+            .lock()
+            .unwrap()
+            .insert(virtual_repo_id, ids);
         Box::pin(async { Ok(()) })
     }
 

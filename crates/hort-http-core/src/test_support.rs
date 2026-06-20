@@ -57,6 +57,7 @@ use hort_app::use_cases::ref_use_case::RefUseCase;
 use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
 use hort_app::use_cases::repository_use_case::RepositoryUseCase;
 use hort_app::use_cases::security_score_use_case::SecurityScoreUseCase;
+use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 // Repo-keyed self-service prefetch use case.
 // Wired into the mock `AppContext` so the `hort-http-discovery` handler
 // tests can drive `POST /api/v1/repositories/:repo_key/prefetch` through
@@ -1289,10 +1290,16 @@ pub fn build_mock_ctx_with_label_flag(
         discovery_rbac.clone(),
     ));
 
+    let virtual_resolution_use_case = Arc::new(VirtualResolutionUseCase::new(
+        repositories.clone(),
+        repository_access_use_case.clone(),
+    ));
+
     let mut ctx_inner = AppContext {
         repository_use_case,
         artifact_use_case,
         repository_access_use_case,
+        virtual_resolution_use_case,
         content_reference_use_case,
         ingest_use_case,
         user_use_case,
@@ -1514,6 +1521,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         repository_use_case: base.repository_use_case.clone(),
         artifact_use_case: base.artifact_use_case.clone(),
         repository_access_use_case: base.repository_access_use_case.clone(),
+        virtual_resolution_use_case: base.virtual_resolution_use_case.clone(),
         content_reference_use_case: base.content_reference_use_case.clone(),
         ingest_use_case: base.ingest_use_case.clone(),
         user_use_case: base.user_use_case.clone(),

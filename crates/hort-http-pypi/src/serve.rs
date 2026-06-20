@@ -80,7 +80,7 @@ use hort_formats::pypi::index::{PypiHtmlIndexBuilder, PypiJsonIndexBuilder};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
 
-use crate::index_source::{HostedPypiSource, IndexSource, IndexSourceOutput, ProxyPypiSource};
+use crate::index_source::{select_source, IndexSourceOutput};
 use crate::simple_index::SimpleIndexFormat;
 
 /// Unified PyPI simple-index serve handler (Source → Filter → Builder
@@ -120,25 +120,21 @@ pub(crate) async fn serve_simple_index_unified(
         .await
         .map_err(ApiError::from)?;
 
-    // ---- Step 1: Source dispatch -------------------------------------
-    let (output, index_source_label): (IndexSourceOutput, &'static str) = match repo.repo_type {
-        RepositoryType::Proxy => {
-            let src = ProxyPypiSource { format };
-            let out = src
-                .fetch(ctx, &repo, project, caller)
-                .await
-                .map_err(ApiError::from)?;
-            (out, "proxy")
-        }
-        _ => {
-            let src = HostedPypiSource;
-            let out = src
-                .fetch(ctx, &repo, project, caller)
-                .await
-                .map_err(ApiError::from)?;
-            (out, "hosted")
-        }
+    // ---- Step 1: Source dispatch (transparent to repo type) ----------
+    // `select_source` returns the hosted / proxy / virtual source. The
+    // virtual source aggregates its members behind this same seam
+    // (ADR 0031), so this handler never special-cases `Virtual` — it
+    // dispatches by type for the tracing label only, then runs the
+    // unchanged filter pipeline + builder.
+    let index_source_label = match repo.repo_type {
+        RepositoryType::Proxy => "proxy",
+        RepositoryType::Virtual => "virtual",
+        _ => "hosted",
     };
+    let output: IndexSourceOutput = select_source(&repo, format)
+        .fetch(ctx, &repo, project, caller)
+        .await
+        .map_err(ApiError::from)?;
 
     // Empty hosted results → 404 (package not found in this repository).
     // For proxy the equivalent path was: `NoUpstream` → 404 (raised
@@ -812,5 +808,135 @@ mod tests {
                 .expect_err("missing package must 404");
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------
+    // Virtual (aggregating) serve — ADR 0031. The serve handler is
+    // transparent (no `Virtual` branch); these drive it end-to-end through
+    // `select_source` → `VirtualPypiSource` → `aggregate_index_members`.
+    // -----------------------------------------------------------------
+
+    fn insert_virtual_repo(
+        mocks: &hort_http_core::test_support::MockPorts,
+        key: &str,
+        members: &[&Repository],
+    ) -> Repository {
+        let mut repo = sample_repository();
+        repo.key = key.into();
+        repo.format = RepositoryFormat::Pypi;
+        repo.repo_type = RepositoryType::Virtual;
+        repo.index_mode = IndexMode::ReleasedOnly;
+        mocks.repositories.insert(repo.clone());
+        for m in members {
+            mocks.repositories.seed_virtual_member(repo.id, m.id);
+        }
+        repo
+    }
+
+    async fn served_versions_json(res: Response) -> Vec<String> {
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn virtual_merges_member_simple_indexes() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let a = insert_hosted_repo(&mocks, "pypi-a", IndexMode::ReleasedOnly);
+        let b = insert_hosted_repo(&mocks, "pypi-b", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            a.id,
+            "req",
+            "1.0.0",
+            "req-1.0.0.tar.gz",
+            &fake_sha256(1),
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            b.id,
+            "req",
+            "2.0.0",
+            "req-2.0.0.tar.gz",
+            &fake_sha256(2),
+            QuarantineStatus::Released,
+        );
+        insert_virtual_repo(&mocks, "pypi-virt", &[&a, &b]);
+
+        let res =
+            serve_simple_index_unified(&ctx, "pypi-virt", "req", SimpleIndexFormat::Json, None)
+                .await
+                .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions = served_versions_json(res).await;
+        assert!(versions.contains(&"1.0.0".to_string()), "member a served");
+        assert!(versions.contains(&"2.0.0".to_string()), "member b served");
+    }
+
+    #[tokio::test]
+    async fn virtual_same_version_held_primary_not_replaced_by_secondary() {
+        // Dependency-confusion regression (same-version): the higher-priority
+        // member holds 1.0.0 Quarantined; a lower-priority member has the SAME
+        // version Released. The held copy wins the authoritative merge and is
+        // then filtered out — it is NOT replaced by the secondary's released
+        // copy. Raw entries are non-empty (so no 404), but the served
+        // versions[] is empty.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let primary = insert_hosted_repo(&mocks, "pypi-primary", IndexMode::ReleasedOnly);
+        let secondary = insert_hosted_repo(&mocks, "pypi-secondary", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            primary.id,
+            "req",
+            "1.0.0",
+            "req-1.0.0.tar.gz",
+            &fake_sha256(1),
+            QuarantineStatus::Quarantined,
+        );
+        insert_artifact(
+            &mocks,
+            secondary.id,
+            "req",
+            "1.0.0",
+            "req-1.0.0.tar.gz",
+            &fake_sha256(2),
+            QuarantineStatus::Released,
+        );
+        insert_virtual_repo(&mocks, "pypi-virt", &[&primary, &secondary]);
+
+        let res =
+            serve_simple_index_unified(&ctx, "pypi-virt", "req", SimpleIndexFormat::Json, None)
+                .await
+                .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions = served_versions_json(res).await;
+        assert!(
+            versions.is_empty(),
+            "held primary copy filtered out, NOT replaced by the secondary's released copy: {versions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_with_no_matching_versions_is_404() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let a = insert_hosted_repo(&mocks, "pypi-a", IndexMode::ReleasedOnly);
+        insert_virtual_repo(&mocks, "pypi-virt", &[&a]);
+        // No artifacts seeded → member returns empty → merged empty → 404.
+        let err =
+            serve_simple_index_unified(&ctx, "pypi-virt", "req", SimpleIndexFormat::Json, None)
+                .await
+                .expect_err("empty virtual must 404");
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }
 }

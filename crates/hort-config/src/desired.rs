@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use crate::claim_mapping::{parse_claim_mapping, ClaimMappingSpec};
 use crate::curation_rule::{parse_curation_rule, validate_curation_rule, CurationRuleSpec};
@@ -364,6 +365,18 @@ impl DesiredState {
             .iter()
             .map(|e| e.metadata.name.as_str())
             .collect();
+        // Name → declared `spec.type` string, so a member reference can
+        // be resolved to the referenced repo's type for the
+        // no-nested-virtuals rule below. This is the cross-spec
+        // resolution the per-spec validator cannot do (it sees one
+        // envelope at a time). `from_str` failures are ignored here — an
+        // unknown `spec.type` on the member is already reported by that
+        // member's own per-spec `validate_repository` pass.
+        let declared_repo_types: HashMap<&str, &str> = self
+            .repositories
+            .iter()
+            .map(|e| (e.metadata.name.as_str(), e.spec.repo_type.as_str()))
+            .collect();
         for env in &self.repositories {
             if let Some(members) = env.spec.virtual_members.as_ref() {
                 for member in members {
@@ -372,6 +385,31 @@ impl DesiredState {
                             virtual_repo: env.metadata.name.clone(),
                             missing_member: member.clone(),
                         });
+                        continue;
+                    }
+                    // No nested virtuals (ADR 0031 rule 5, spec §7.5):
+                    // a member that is itself `type: virtual` would force
+                    // recursive resolution; v1 keeps resolution a single
+                    // flat priority list, so reject at apply. Resolved
+                    // cross-spec: the member is another declared
+                    // `ArtifactRepository` whose type we look up here.
+                    if let Some(member_type) = declared_repo_types.get(member.as_str()) {
+                        use hort_domain::entities::repository::RepositoryType;
+                        if matches!(
+                            RepositoryType::from_str(member_type),
+                            Ok(RepositoryType::Virtual)
+                        ) {
+                            errors.push(ValidationError::Invalid {
+                                kind: Kind::ArtifactRepository,
+                                name: env.metadata.name.clone(),
+                                detail: format!(
+                                    "virtualMembers entry `{member}` is itself \
+                                     type=virtual — nested virtual repositories are \
+                                     not supported; a member must be a non-virtual \
+                                     repository (see ADR 0031)"
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -1212,6 +1250,50 @@ spec: {}
                 missing_member, ..
             } if missing_member == "a"
         )));
+    }
+
+    #[test]
+    fn validate_catches_nested_virtual_member() {
+        // ADR 0031 rule 5 / spec §7.5: a `virtualMembers` entry that is itself
+        // `type: virtual` is rejected at apply — v1 keeps resolution a single
+        // flat priority list (no recursive member resolution).
+        let files = vec![
+            (p("v.yaml"), repo_yaml("v", "virtual", Some(&["inner"]))),
+            (p("inner.yaml"), repo_yaml("inner", "virtual", Some(&["a"]))),
+            (p("a.yaml"), repo_yaml("a", "hosted", None)),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        assert!(
+            err.0.iter().any(|e| matches!(
+                e,
+                ValidationError::Invalid { detail, .. } if detail.contains("nested virtual")
+            )),
+            "should reject `inner` (type=virtual) as a member: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_non_virtual_members() {
+        // The nested-virtual check must NOT fire when every member is a
+        // non-virtual repo (exercises the `Ok(Virtual)`-false arm of the
+        // member-type match).
+        let files = vec![
+            (p("v.yaml"), repo_yaml("v", "virtual", Some(&["a", "b"]))),
+            (p("a.yaml"), repo_yaml("a", "hosted", None)),
+            (p("b.yaml"), repo_yaml("b", "proxy", None)),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        // Other errors may be present (e.g. the serve-support stopgap), so
+        // inspect the error set directly rather than asserting Ok/Err.
+        let errs = state.validate().err().map(|e| e.0).unwrap_or_default();
+        assert!(
+            !errs.iter().any(|e| matches!(
+                e,
+                ValidationError::Invalid { detail, .. } if detail.contains("nested virtual")
+            )),
+            "non-virtual members must not raise the nested-virtual error: {errs:?}"
+        );
     }
 
     #[test]

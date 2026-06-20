@@ -78,6 +78,7 @@ use hort_app::use_cases::security_score_use_case::SecurityScoreUseCase;
 use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase;
 use hort_app::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
 use hort_app::use_cases::task_use_case::TaskUseCase;
+use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 // Application-layer adapter for the
 // `UpstreamIndexCacheInvalidator` port. Wired into the three
 // `ArtifactRejected` emitter use cases (curation/block, quarantine/
@@ -2149,6 +2150,13 @@ pub async fn build_app_context(
         rbac_access.clone(),
         include_repository_label,
     ));
+    // Virtual-repo member resolution (ADR 0031). Composed over the repository
+    // port (member listing) + the access use case (per-member Read visibility);
+    // the npm/pypi/cargo serve + download paths reach it via `AppContext`.
+    let virtual_resolution_use_case = Arc::new(VirtualResolutionUseCase::new(
+        repo_repo.clone(),
+        repository_access_use_case.clone(),
+    ));
     // `ContentReferenceUseCase` (ADR 0008). Composed over the
     // existing `content_references` adapter + the access use case
     // constructed above; `hort-http-oci` calls the use case rather
@@ -2719,6 +2727,7 @@ pub async fn build_app_context(
         repository_use_case,
         artifact_use_case,
         repository_access_use_case,
+        virtual_resolution_use_case,
         content_reference_use_case,
         ingest_use_case,
         user_use_case,

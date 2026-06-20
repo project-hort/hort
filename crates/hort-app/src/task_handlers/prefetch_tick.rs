@@ -953,6 +953,13 @@ mod tests {
         fn remove_virtual_member(&self, _v: Uuid, _m: Uuid) -> BoxFuture<'_, DomainResult<()>> {
             panic!("remove_virtual_member should not be called by the prefetch-tick handler")
         }
+        fn replace_virtual_members(
+            &self,
+            _v: Uuid,
+            _ordered: &[Uuid],
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            panic!("replace_virtual_members should not be called by the prefetch-tick handler")
+        }
         fn get_storage_usage(&self, _r: Uuid) -> BoxFuture<'_, DomainResult<u64>> {
             panic!("get_storage_usage should not be called by the prefetch-tick handler")
         }

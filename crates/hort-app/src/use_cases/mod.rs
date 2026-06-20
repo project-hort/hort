@@ -161,6 +161,7 @@ pub mod task_use_case;
 // (`docs/architecture/explanation/index-construction.md`).
 pub mod upstream_index_cache_invalidator;
 pub mod user_use_case;
+pub mod virtual_resolution;
 // PEP 658 `.metadata` read-path use case.
 // Resolves the wheel artifact via the visibility-gated
 // `find_visible_by_path` hop, gates on the same per-artifact

@@ -31,6 +31,22 @@ pub trait RepositoryRepository: Send + Sync {
         virtual_repo_id: Uuid,
         member_repo_id: Uuid,
     ) -> BoxFuture<'_, DomainResult<()>>;
+    /// **Atomically** replace a virtual repo's entire member set with
+    /// `ordered_member_ids`, assigning `priority` = list index (0 = highest).
+    ///
+    /// Used by `ApplyConfigUseCase` to reconcile a changed member list. The
+    /// clear-then-re-add MUST be one transaction: a concurrent reader (another
+    /// replica serving against the shared DB during a rolling deploy) must see
+    /// either the old set or the new set, **never a partial set**. A partial
+    /// set with the owner edge transiently removed would make an owned name
+    /// look unowned, momentarily un-suppressing proxies and re-opening the
+    /// dependency-confusion window (ADR 0031 rule 2b). Replacing the prior
+    /// non-transactional remove-loop-then-add-loop closes that window.
+    fn replace_virtual_members(
+        &self,
+        virtual_repo_id: Uuid,
+        ordered_member_ids: &[Uuid],
+    ) -> BoxFuture<'_, DomainResult<()>>;
     fn get_storage_usage(&self, repo_id: Uuid) -> BoxFuture<'_, DomainResult<u64>>;
 
     /// Managed-write path used exclusively by

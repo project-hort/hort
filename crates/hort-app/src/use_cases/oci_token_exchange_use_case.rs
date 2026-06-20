@@ -1203,6 +1203,13 @@ mod tests {
         fn remove_virtual_member(&self, _v: Uuid, _m: Uuid) -> BoxFuture<'_, DomainResult<()>> {
             unreachable!("OCI test does not call remove_virtual_member")
         }
+        fn replace_virtual_members(
+            &self,
+            _v: Uuid,
+            _ordered: &[Uuid],
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            unreachable!("OCI test does not call replace_virtual_members")
+        }
         fn get_storage_usage(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<u64>> {
             unreachable!("OCI test does not call get_storage_usage")
         }

@@ -56,6 +56,7 @@ use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseC
 use hort_app::use_cases::subscription_use_case::SubscriptionUseCase;
 use hort_app::use_cases::task_use_case::TaskUseCase;
 use hort_app::use_cases::user_use_case::UserUseCase;
+use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 // PEP 658 `.metadata` read-path use case
 // consumed by the per-format serve site in `hort-http-pypi`.
 use hort_app::use_cases::wheel_metadata_use_case::WheelMetadataUseCase;
@@ -245,6 +246,10 @@ pub struct AppContext {
     /// than reaching for `ctx.repositories.find_by_key` directly — the
     /// underlying data ports are `pub(crate)` (ADR 0008).
     pub repository_access_use_case: Arc<RepositoryAccessUseCase>,
+    /// Resolves a `type: virtual` repo's members (ordered, access-filtered) for
+    /// serve-time aggregation. Format crates call this rather than reaching for
+    /// the `pub(crate)` `repositories` port directly (ADR 0008). See ADR 0031.
+    pub virtual_resolution_use_case: Arc<VirtualResolutionUseCase>,
     /// Composition over the
     /// `ContentReferenceIndex` port and the `RepositoryAccessUseCase`.
     /// Replaces direct `ctx.content_references.*` access in
@@ -821,6 +826,8 @@ pub struct AppContextParts {
     pub repository_use_case: Arc<RepositoryUseCase>,
     pub artifact_use_case: Arc<ArtifactUseCase>,
     pub repository_access_use_case: Arc<RepositoryAccessUseCase>,
+    /// See [`AppContext::virtual_resolution_use_case`].
+    pub virtual_resolution_use_case: Arc<VirtualResolutionUseCase>,
     pub content_reference_use_case: Arc<ContentReferenceUseCase>,
     pub ingest_use_case: Arc<IngestUseCase>,
     pub user_use_case: Arc<UserUseCase>,
@@ -951,6 +958,7 @@ impl AppContext {
             repository_use_case: parts.repository_use_case,
             artifact_use_case: parts.artifact_use_case,
             repository_access_use_case: parts.repository_access_use_case,
+            virtual_resolution_use_case: parts.virtual_resolution_use_case,
             content_reference_use_case: parts.content_reference_use_case,
             ingest_use_case: parts.ingest_use_case,
             user_use_case: parts.user_use_case,

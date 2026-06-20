@@ -66,7 +66,7 @@ use async_trait::async_trait;
 use hort_app::error::AppError;
 use hort_app::use_cases::index_serve::{CargoVersionPayload, PerVersionPayload, VersionEntry};
 use hort_domain::entities::caller::CallerPrincipal;
-use hort_domain::entities::repository::Repository;
+use hort_domain::entities::repository::{Repository, RepositoryType};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_formats::cargo::projection::CargoVersionLine;
 use hort_formats::cargo::CargoFormatHandler;
@@ -370,4 +370,63 @@ fn projection_to_entries(
         });
     }
     entries
+}
+
+// ---------------------------------------------------------------------------
+// Virtual (aggregating)
+// ---------------------------------------------------------------------------
+
+/// `IndexSource` impl for `RepositoryType::Virtual` (ADR 0031).
+///
+/// A thin shim over the shared
+/// [`VirtualResolutionUseCase::aggregate_virtual_index`](hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase::aggregate_virtual_index):
+/// it supplies only the per-member fetch closure (each member's OWN source
+/// via [`select_source`], so the member's hosted/proxy gate + parsing apply
+/// unchanged). The name-level pinning, authoritative-member merge, and the
+/// fail-closed member-failure classification all live once in `hort-app`
+/// (the dependency-confusion security boundary) — this crate cannot diverge
+/// it. The serve handler runs the unchanged filter pipeline + builder on the
+/// result; it never special-cases `Virtual`.
+///
+/// `resolve_members` yields only non-virtual members, so the
+/// `select_source(member)` recursion bottoms out at hosted/proxy.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VirtualCargoSource;
+
+#[async_trait]
+impl IndexSource for VirtualCargoSource {
+    #[tracing::instrument(skip(self, ctx, caller), fields(repo_key = %repo.key))]
+    async fn fetch(
+        &self,
+        ctx: &Arc<AppContext>,
+        repo: &Repository,
+        crate_name: &str,
+        caller: Option<&CallerPrincipal>,
+    ) -> Result<IndexSourceOutput, AppError> {
+        let entries = ctx
+            .virtual_resolution_use_case
+            .aggregate_virtual_index(repo, caller, move |member| async move {
+                Ok(select_source(&member)
+                    .fetch(ctx, &member, crate_name, caller)
+                    .await?
+                    .entries)
+            })
+            .await?;
+
+        Ok(IndexSourceOutput {
+            entries,
+            truncated: false,
+        })
+    }
+}
+
+/// Pick the [`IndexSource`] for `repo` by type — the single dispatch point
+/// the serve handler uses (so it stays virtual-agnostic) and that
+/// [`VirtualCargoSource`] reuses per member.
+pub(crate) fn select_source(repo: &Repository) -> Box<dyn IndexSource> {
+    match repo.repo_type {
+        RepositoryType::Proxy => Box::new(ProxyCargoSource),
+        RepositoryType::Virtual => Box::new(VirtualCargoSource),
+        RepositoryType::Hosted | RepositoryType::Staging => Box::new(HostedCargoSource),
+    }
 }

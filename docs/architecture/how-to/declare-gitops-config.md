@@ -137,27 +137,77 @@ Fields map 1:1 to the persisted `Repository` shape. Notable rules:
 
 ### Virtual repositories
 
+A `type: virtual` repository aggregates several **member** repositories
+behind a single URL (one registry endpoint serving your private packages
+*and* a public mirror). It is **read-only**: it has no own store and
+resolves every request by composing its members' existing, already-gated
+serve paths (ADR 0031).
+
 ```yaml
 spec:
-  name: "All npm"
+  name: "npm (private + public)"
   format: npm
   type: virtual
-  storage:
-    backend: filesystem
-    path: /var/lib/hort-server/cas/all-npm
   virtualMembers:
-    - npm-public
+    - npm-internal     # private hosted owner (highest priority)
+    - npm-public       # public pull-through proxy (lowest priority)
   isPublic: true
   replicationPriority: on_demand
 ```
 
+**Serve-supported formats: `npm`, `pypi`, `cargo`.** A `type: virtual`
+repo on any other format (`oci`, `maven`, …) is **rejected at apply** —
+its `virtualMembers` would be accepted but never served (the ADR 0015
+inert-field guard). The supported set is the single source of truth in
+`crates/hort-config/src/repository.rs` (`VIRTUAL_SERVE_SUPPORTED_FORMATS`).
+
 Members must reference other ArtifactRepository objects in the same
 `$HORT_CONFIG_DIR`. Mixing a managed virtual with `Local` (API-created)
-members is rejected — keep the gitops surface self-contained, or
-keep the virtual itself `Local`.
+members is rejected — keep the gitops surface self-contained, or keep the
+virtual itself `Local`. A member that is itself `type: virtual` is rejected
+(no nested virtuals in v1).
 
-Reordering `virtualMembers` in YAML is a no-op (the digest sorts
-the list before hashing); add/remove triggers an `update` outcome.
+> **⚠️ Member order is load-bearing — and repo type is the ownership
+> signal.** `virtualMembers` is an **ordered priority list** (index 0 =
+> highest priority). Two security-critical rules follow, both designed to
+> stop dependency-confusion substitution; understand them before composing
+> a virtual:
+>
+> - **Same-version (authoritative member).** For a coordinate that exists
+>   in more than one member, the **highest-priority member that has it
+>   wins — in any quarantine status**. A version held (quarantined /
+>   rejected) in a higher-priority member is *never* silently replaced by
+>   a lower-priority member's released copy; the held member's gate is
+>   surfaced (503 / 403) instead. Put your trusted/private members first.
+> - **New-version (name-level pinning).** A package **name** owned by any
+>   **non-proxy** member (a `hosted`/`staging` member with ≥1 version of
+>   that name) is **never served from a proxy member, for any version** —
+>   index *or* download. So an attacker publishing `internal-pkg@9.9.9` to
+>   a public registry cannot have it served through a virtual that includes
+>   your private `internal-pkg` owner: the proxy is excluded for that name
+>   entirely. Repo type (non-proxy = owner) is the ownership signal.
+> - **Fail-closed.** If a non-proxy member's fetch *errors* (an
+>   infrastructure failure, distinct from a clean "absent"), it is treated
+>   as a *potential owner* and proxies stay suppressed for that name — a
+>   transient outage of the trusted owner cannot re-open the confusion
+>   window.
+>
+> Quarantine + scan is the *backstop*, not the substitution defence —
+> pinning is. A clean-scanning typosquat would pass a scan; pinning stops
+> it from ever being served under an owned name.
+
+Auth composes per member: a caller needs Read on the virtual, and each
+member is resolved with the *same* caller. A member the caller cannot Read
+is **skipped** (not errored) — so a public virtual that includes a private
+member never leaks the private member's contents to an anonymous client.
+
+Reordering `virtualMembers` **does** change serving — it re-pins the
+resolution priority on the next apply (the member-edge reconcile compares
+declared order against the persisted order and re-pins deterministically).
+Note that a *pure reorder* (same set, different order) is reported as
+`unchanged` for the repository object itself, because the repo-spec digest
+sorts the member list before hashing; the priority is still re-pinned by
+the unconditional member reconcile.
 
 ---
 

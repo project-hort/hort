@@ -1,0 +1,18 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: npm-virt-e2e
+spec:
+  name: "npm Virtual (private + public)"
+  description: "Virtual aggregating a private hosted member + the public mirror (ADR 0031); scripts/native-tests/scenarios/clients/virtual.sh"
+  format: npm
+  type: virtual
+  # Order is the resolution priority (index 0 = highest). The private
+  # member is first so it OWNS its package names: name-level pinning then
+  # excludes the public proxy for those names (dependency-confusion
+  # defence, ADR 0031 rule 2b).
+  virtualMembers:
+    - npm-virt-internal
+    - npm-public
+  isPublic: true
+  replicationPriority: local_only

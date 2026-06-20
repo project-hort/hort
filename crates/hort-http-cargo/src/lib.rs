@@ -30,7 +30,7 @@ use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ArtifactCoords;
 use hort_formats::cargo::CargoFormatHandler;
 
-use hort_http_core::authz::write::resolve_actor_user_id;
+use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_id};
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
@@ -287,27 +287,62 @@ async fn download(
                 .repository_access_use_case
                 .resolve(&repo_key, actor, AccessLevel::Read)
                 .await?;
-            if !matches!(repo.repo_type, RepositoryType::Proxy) {
-                // Hosted / Staging / Virtual cache miss → 404. Match the
-                // envelope the use case would have produced
-                // (`{"error":"not found: Artifact <repo>:<path>"}`) so
-                // the `download_not_found_returns_404` regression stays
-                // green and clients see no observable change.
-                return Err(ApiError::from(hort_app::error::AppError::Domain(
-                    hort_domain::error::DomainError::NotFound {
-                        entity: "Artifact",
-                        id: format!("{repo_key}:{artifact_path}"),
-                    },
-                )));
-            }
-            match upstream_pull::try_upstream_crate_pull(&ctx, &repo, &name, &version).await {
-                Ok(artifact) => (repo, artifact),
-                Err(e) => return Ok(upstream_pull::map_upstream_pull_error(&e)),
+            match repo.repo_type {
+                RepositoryType::Proxy => {
+                    match upstream_pull::try_upstream_crate_pull(&ctx, &repo, &name, &version).await
+                    {
+                        Ok(artifact) => (repo, artifact),
+                        Err(e) => return Ok(upstream_pull::map_upstream_pull_error(&e)),
+                    }
+                }
+                RepositoryType::Virtual => {
+                    // Transparent aggregation (ADR 0031): the member sources
+                    // already enforce visibility + quarantine; the resolver
+                    // picks the authoritative member and we render its gate
+                    // through the SAME `render_cargo_crate_response` tail.
+                    return serve_virtual_cargo_crate(
+                        &ctx,
+                        &repo,
+                        &name,
+                        &version,
+                        &artifact_path,
+                        actor,
+                    )
+                    .await;
+                }
+                RepositoryType::Hosted | RepositoryType::Staging => {
+                    // Hosted / Staging cache miss → 404. Match the envelope the
+                    // use case would have produced
+                    // (`{"error":"not found: Artifact <repo>:<path>"}`) so the
+                    // `download_not_found_returns_404` regression stays green
+                    // and clients see no observable change.
+                    return Err(ApiError::from(hort_app::error::AppError::Domain(
+                        hort_domain::error::DomainError::NotFound {
+                            entity: "Artifact",
+                            id: format!("{repo_key}:{artifact_path}"),
+                        },
+                    )));
+                }
             }
         }
         Err(other) => return Err(other.into()),
     };
 
+    render_cargo_crate_response(&ctx, artifact, actor).await
+}
+
+/// Render the final crate-file HTTP response for a resolved artifact:
+/// surface the quarantine gate (`Quarantined` → 503 + `Retry-After`,
+/// `Rejected` / `ScanIndeterminate` → 403) or stream the bytes from CAS.
+///
+/// Shared by the hosted/proxy direct path and the virtual aggregation path
+/// (ADR 0031) so the gate render + streaming live in exactly one place; the
+/// virtual layer only chooses which member's artifact reaches here.
+async fn render_cargo_crate_response(
+    ctx: &Arc<AppContext>,
+    artifact: hort_domain::entities::artifact::Artifact,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
     match artifact.quarantine_status {
         QuarantineStatus::Quarantined => {
             // The use-case layer hydrates the transient computed
@@ -354,10 +389,9 @@ async fn download(
         QuarantineStatus::None | QuarantineStatus::Released => {}
     }
 
-    // Thread the already-resolved request principal so the opt-in
-    // download-audit emit can attribute the pull (no per-handler auth
-    // code; `actor` was resolved above for the `find_visible_by_path`
-    // visibility hop).
+    // Thread the resolved principal for opt-in download-audit attribution.
+    // No per-handler auth code; the caller already proved Read on the
+    // (member) repo via `find_visible_by_path`.
     let (_artifact, stream) = ctx.artifact_use_case.download(artifact.id, actor).await?;
     let body = stream_blob(stream, DEFAULT_STREAM_CAPACITY);
 
@@ -378,6 +412,162 @@ async fn download(
     out_headers.insert(CONTENT_LENGTH, artifact.size_bytes.into());
 
     Ok((StatusCode::OK, out_headers, body).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Virtual (aggregating) download — ADR 0031
+// ---------------------------------------------------------------------------
+
+/// One virtual member's download outcome for the first-authoritative walk
+/// (ADR 0031 §4.2): either the authoritative artifact, or a pre-rendered
+/// response (a proxy member's upstream-pull error surfaced verbatim — 502 /
+/// tampering / ingest-fail). The hosted/proxy member paths already enforce
+/// visibility + quarantine; the virtual layer only chooses the member.
+enum VirtualMemberDownload {
+    Found(hort_domain::entities::artifact::Artifact),
+    Rendered(Response),
+}
+
+/// Transparent virtual crate download (ADR 0031). Resolves the authoritative
+/// member via
+/// [`VirtualResolutionUseCase::resolve_download`](hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase::resolve_download)
+/// (name-level pinning + first-authoritative walk + the fail-closed member
+/// rule all live in `hort-app`), then renders the chosen artifact's gate
+/// through the same [`render_cargo_crate_response`] tail the hosted/proxy
+/// path uses. `download` never special-cases `Virtual` past the dispatch.
+async fn serve_virtual_cargo_crate(
+    ctx: &Arc<AppContext>,
+    virtual_repo: &hort_domain::entities::repository::Repository,
+    name: &str,
+    version: &str,
+    artifact_path: &str,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
+    let resolved: Option<VirtualMemberDownload> = ctx
+        .virtual_resolution_use_case
+        .resolve_download(
+            virtual_repo,
+            actor,
+            // Phase 1 — non-proxy name presence (reuses the member's own
+            // index source so the pinning signal matches the index path).
+            move |member| async move { cargo_member_name_presence(ctx, &member, name, actor).await },
+            // Phase 2 — per-member coordinate fetch (hosted lookup / proxy
+            // pull), classified for the first-authoritative walk.
+            move |member| async move {
+                cargo_member_coord_fetch(ctx, &member, name, version, artifact_path, actor).await
+            },
+        )
+        .await?;
+
+    match resolved {
+        Some(VirtualMemberDownload::Found(artifact)) => {
+            render_cargo_crate_response(ctx, artifact, actor).await
+        }
+        Some(VirtualMemberDownload::Rendered(resp)) => Ok(resp),
+        // No eligible member has the coordinate (or an owned name had the
+        // version absent from every owner) → 404, never a proxy fall-through.
+        None => Err(ApiError::from(hort_app::error::AppError::Domain(
+            hort_domain::error::DomainError::NotFound {
+                entity: "Artifact",
+                id: format!("{}:{}", virtual_repo.key, artifact_path),
+            },
+        ))),
+    }
+}
+
+/// Non-proxy member name presence for the download pinning decision
+/// (ADR 0031 rule 2b). Reuses the member's own [`IndexSource`] — the same
+/// path the index aggregation uses — so the ownership signal is identical
+/// across the index and download paths. Only invoked for non-proxy members.
+async fn cargo_member_name_presence(
+    ctx: &Arc<AppContext>,
+    member: &hort_domain::entities::repository::Repository,
+    name: &str,
+    actor: Option<&CallerPrincipal>,
+) -> hort_app::use_cases::virtual_resolution::MemberNamePresence {
+    use hort_app::use_cases::virtual_resolution::MemberNamePresence;
+
+    match index_source::select_source(member)
+        .fetch(ctx, member, name, actor)
+        .await
+    {
+        Ok(out) if !out.entries.is_empty() => MemberNamePresence::Present,
+        Ok(_) => MemberNamePresence::Absent,
+        // A definitive "absent here" (invisible / missing repo / no rows)
+        // collapses to `NotFound` → the member does not own the name.
+        Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
+            ..
+        })) => MemberNamePresence::Absent,
+        // Any other error is an infrastructure failure → ownership is
+        // indeterminate; a non-proxy member that errors is treated
+        // fail-closed as a potential owner (proxies suppressed for the name).
+        Err(_) => MemberNamePresence::Unavailable,
+    }
+}
+
+/// Per-member coordinate fetch for the first-authoritative walk
+/// (ADR 0031 §4.2). Returns `Ok(Some(Found))` when the member has the
+/// coordinate (cache hit, or a proxy pull mints it), `Ok(Some(Rendered))`
+/// when an authoritative proxy member's pull failed (surfaced verbatim —
+/// no fall-through), `Ok(None)` when the member definitively lacks it (the
+/// walk continues), or `Err` on infrastructure failure (propagated).
+async fn cargo_member_coord_fetch(
+    ctx: &Arc<AppContext>,
+    member: &hort_domain::entities::repository::Repository,
+    name: &str,
+    version: &str,
+    artifact_path: &str,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Option<VirtualMemberDownload>, hort_app::error::AppError> {
+    // Local CAS hit on the member (any type) → authoritative.
+    match ctx
+        .artifact_use_case
+        .find_visible_by_path(&member.key, artifact_path, actor)
+        .await
+    {
+        Ok((_repo, artifact)) => return Ok(Some(VirtualMemberDownload::Found(artifact))),
+        // Local path miss: a proxy member tries the upstream pull below; a
+        // hosted/staging member simply lacks the coordinate.
+        Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
+            entity: "Artifact",
+            ..
+        })) => {}
+        // Member vanished between resolve and fetch (Repository NotFound) →
+        // treat as absent (continue the walk); other infra errors propagate.
+        Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
+            ..
+        })) => return Ok(None),
+        Err(other) => return Err(other),
+    }
+
+    if !matches!(member.repo_type, RepositoryType::Proxy) {
+        return Ok(None);
+    }
+
+    // Proxy member: verified upstream pull (the same path the non-virtual
+    // proxy download uses).
+    match upstream_pull::try_upstream_crate_pull(ctx, member, name, version).await {
+        Ok(_artifact) => {
+            let (_repo, artifact) = ctx
+                .artifact_use_case
+                .find_visible_by_path(&member.key, artifact_path, actor)
+                .await?;
+            Ok(Some(VirtualMemberDownload::Found(artifact)))
+        }
+        // A genuine upstream miss / no mapping / curation block means this
+        // member cannot serve the coordinate → continue the walk (the
+        // virtual's own 404 renders if no member serves it). CurationBlocked
+        // already collapses to 404 (anti-enumeration).
+        Err(upstream_pull::UpstreamPullError::NoUpstreamMapping)
+        | Err(upstream_pull::UpstreamPullError::NotFoundUpstream)
+        | Err(upstream_pull::UpstreamPullError::CurationBlocked) => Ok(None),
+        // Any other failure (5xx-class, tampering, ingest fail) is the
+        // authoritative proxy member's failure → surface it verbatim, never
+        // fall through to a lower-priority member.
+        Err(e) => Ok(Some(VirtualMemberDownload::Rendered(
+            upstream_pull::map_upstream_pull_error(&e),
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +614,12 @@ async fn publish(
         Ok(id) => id,
         Err(response) => return Ok(*response),
     };
+
+    // Read-only aggregator (ADR 0031): reject a publish to a `type: virtual`
+    // repo, which would otherwise fall into the hosted arm below and write
+    // the virtual's own (never-served) store. After the authz gate so a
+    // caller without Write still sees the stable 403, not a repo-type oracle.
+    reject_write_to_virtual(&repo)?;
 
     let (metadata_bytes, crate_bytes) = parse_publish_body(&body)?;
 
@@ -1588,6 +1784,280 @@ mod tests {
                 "parse-fail must short-circuit before any storage.put"
             );
         }
+
+        // -- Virtual (aggregating) download — ADR 0031 --------------------
+        //
+        // The download handler is transparent (no `Virtual` branch past the
+        // source dispatch); these drive `download` end-to-end through
+        // `serve_virtual_cargo_crate` → `resolve_download` → member sources,
+        // reusing this submodule's proxy-upstream helpers for proxy members.
+
+        use hort_domain::entities::artifact::QuarantineStatus;
+
+        /// crates.io sparse-index sharding for 4+ char names: `/ab/cd/name`.
+        /// All test crate names below are 4+ chars.
+        fn index_path(name: &str) -> String {
+            let b = name.as_bytes();
+            format!(
+                "/{}{}/{}{}/{name}",
+                b[0] as char, b[1] as char, b[2] as char, b[3] as char
+            )
+        }
+
+        /// Seed a hosted cargo member with one crate artifact (+ CAS bytes).
+        fn hosted_member_with_crate(
+            mocks: &MockPorts,
+            key: &str,
+            name: &str,
+            version: &str,
+            bytes: &[u8],
+            status: QuarantineStatus,
+        ) -> Repository {
+            use hort_app::use_cases::test_support::sample_artifact;
+            let mut repo = sample_repository();
+            repo.key = key.into();
+            repo.format = RepositoryFormat::Cargo;
+            repo.repo_type = RepositoryType::Hosted;
+            mocks.repositories.insert(repo.clone());
+
+            let sha256 = format!("{:x}", Sha256::digest(bytes)).parse().unwrap();
+            let mut artifact = sample_artifact(status);
+            artifact.repository_id = repo.id;
+            artifact.name = name.into();
+            artifact.version = Some(version.into());
+            artifact.path = format!("crates/{name}/{version}/{name}-{version}.crate");
+            artifact.sha256_checksum = sha256;
+            artifact.size_bytes = bytes.len() as i64;
+            mocks.artifacts.insert(artifact.clone());
+            mocks
+                .storage
+                .insert_content(artifact.sha256_checksum.clone(), bytes.to_vec());
+            repo
+        }
+
+        /// Seed an empty hosted cargo member (no artifacts).
+        fn empty_hosted_member(mocks: &MockPorts, key: &str) -> Repository {
+            let mut repo = sample_repository();
+            repo.key = key.into();
+            repo.format = RepositoryFormat::Cargo;
+            repo.repo_type = RepositoryType::Hosted;
+            mocks.repositories.insert(repo.clone());
+            repo
+        }
+
+        /// Insert a proxy cargo member with an upstream mapping seeded.
+        fn proxy_member(mocks: &MockPorts, key: &str) -> Repository {
+            let repo = proxy_cargo_repo(key);
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(mocks, repo.id);
+            repo
+        }
+
+        /// Seed a `type: virtual` cargo repo aggregating `members` (priority
+        /// order, first = highest).
+        fn virtual_member_repo(
+            mocks: &MockPorts,
+            key: &str,
+            members: &[&Repository],
+        ) -> Repository {
+            let mut repo = sample_repository();
+            repo.key = key.into();
+            repo.format = RepositoryFormat::Cargo;
+            repo.repo_type = RepositoryType::Virtual;
+            mocks.repositories.insert(repo.clone());
+            for m in members {
+                mocks.repositories.seed_virtual_member(repo.id, m.id);
+            }
+            repo
+        }
+
+        /// Seed the upstream config.json + NDJSON index + crate file for a
+        /// proxy member so a virtual pull through it succeeds (verified).
+        fn seed_upstream_crate(mocks: &MockPorts, name: &str, version: &str, bytes: &[u8]) {
+            let cksum = format!("{:x}", Sha256::digest(bytes));
+            mocks
+                .upstream_proxy
+                .insert_metadata("", "/config.json", CRATES_IO_CONFIG.to_vec());
+            mocks.upstream_proxy.insert_metadata(
+                "",
+                &index_path(name),
+                ndjson_entry(name, version, &cksum),
+            );
+            mocks
+                .upstream_proxy
+                .insert_artifact("", &artifact_url(name, version), bytes.to_vec());
+        }
+
+        async fn get_download(ctx: Arc<AppContext>, path: &str) -> Response {
+            router_for(ctx)
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn virtual_download_served_from_hosted_member() {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let a = hosted_member_with_crate(
+                &mocks,
+                "cargo-a",
+                "mycrate",
+                "1.0.0",
+                b"from-a",
+                QuarantineStatus::Released,
+            );
+            let b = empty_hosted_member(&mocks, "cargo-b");
+            virtual_member_repo(&mocks, "cargo-virt", &[&a, &b]);
+
+            let res = get_download(
+                ctx,
+                "/cargo/cargo-virt/api/v1/crates/mycrate/1.0.0/download",
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(&body[..], b"from-a");
+        }
+
+        #[tokio::test]
+        async fn virtual_download_first_authoritative_prefers_higher_priority() {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let hi = hosted_member_with_crate(
+                &mocks,
+                "cargo-hi",
+                "mycrate",
+                "1.0.0",
+                b"hi-bytes",
+                QuarantineStatus::Released,
+            );
+            let lo = hosted_member_with_crate(
+                &mocks,
+                "cargo-lo",
+                "mycrate",
+                "1.0.0",
+                b"lo-bytes",
+                QuarantineStatus::Released,
+            );
+            virtual_member_repo(&mocks, "cargo-virt", &[&hi, &lo]);
+
+            let res = get_download(
+                ctx,
+                "/cargo/cargo-virt/api/v1/crates/mycrate/1.0.0/download",
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(
+                &body[..],
+                b"hi-bytes",
+                "highest-priority holder is authoritative"
+            );
+        }
+
+        #[tokio::test]
+        async fn virtual_download_held_primary_returns_503_not_secondary_copy() {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let hi = hosted_member_with_crate(
+                &mocks,
+                "cargo-hi",
+                "mycrate",
+                "1.0.0",
+                b"held",
+                QuarantineStatus::Quarantined,
+            );
+            let lo = hosted_member_with_crate(
+                &mocks,
+                "cargo-lo",
+                "mycrate",
+                "1.0.0",
+                b"released",
+                QuarantineStatus::Released,
+            );
+            virtual_member_repo(&mocks, "cargo-virt", &[&hi, &lo]);
+
+            let res = get_download(
+                ctx,
+                "/cargo/cargo-virt/api/v1/crates/mycrate/1.0.0/download",
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "held primary's gate surfaces; never the secondary's released copy"
+            );
+        }
+
+        #[tokio::test]
+        async fn virtual_download_new_version_pinning_excludes_proxy() {
+            // Dependency-confusion regression (new-version): the hosted member
+            // OWNS `internalpkg` (has 1.0.0). The proxy upstream WOULD serve
+            // `internalpkg@9.9.9` (the attacker's public publish). The virtual
+            // MUST 404 — pinning excludes the proxy for the owned name.
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let private = hosted_member_with_crate(
+                &mocks,
+                "cargo-private",
+                "internalpkg",
+                "1.0.0",
+                b"legit",
+                QuarantineStatus::Released,
+            );
+            let proxy = proxy_member(&mocks, "cargo-proxy");
+            seed_upstream_crate(&mocks, "internalpkg", "9.9.9", b"ATTACKER-PAYLOAD");
+            virtual_member_repo(&mocks, "cargo-virt", &[&private, &proxy]);
+
+            let res = get_download(
+                ctx,
+                "/cargo/cargo-virt/api/v1/crates/internalpkg/9.9.9/download",
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "owned name: the attacker's proxy-only version is NOT served"
+            );
+        }
+
+        #[tokio::test]
+        async fn virtual_download_unowned_name_served_from_proxy() {
+            // Positive control: the hosted member does NOT own `leftpad`, so
+            // the proxy participates and serves it (verified pull).
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let private = hosted_member_with_crate(
+                &mocks,
+                "cargo-private",
+                "otherpkg",
+                "1.0.0",
+                b"x",
+                QuarantineStatus::Released,
+            );
+            let proxy = proxy_member(&mocks, "cargo-proxy");
+            seed_upstream_crate(&mocks, "leftpad", "1.0.0", b"LEFTPAD-BYTES");
+            virtual_member_repo(&mocks, "cargo-virt", &[&private, &proxy]);
+
+            let res = get_download(
+                ctx,
+                "/cargo/cargo-virt/api/v1/crates/leftpad/1.0.0/download",
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(&body[..], b"LEFTPAD-BYTES", "served from the proxy member");
+        }
+
+        #[tokio::test]
+        async fn virtual_download_missing_everywhere_returns_404() {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let a = empty_hosted_member(&mocks, "cargo-a");
+            virtual_member_repo(&mocks, "cargo-virt", &[&a]);
+
+            let res = get_download(
+                ctx,
+                "/cargo/cargo-virt/api/v1/crates/missing/1.0.0/download",
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     // -- publish --------------------------------------------------------------
@@ -1611,6 +2081,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn publish_to_virtual_repo_is_rejected() {
+        // Virtual repos are read-only aggregators (ADR 0031): a publish must
+        // be rejected, not silently written to the virtual's own store.
+        let h = harness();
+        let mut repo = sample_repository();
+        repo.key = "cargo-virt".into();
+        repo.format = RepositoryFormat::Cargo;
+        repo.repo_type = RepositoryType::Virtual;
+        h.repositories.insert(repo);
+        let router = router(h.ctx.clone());
+
+        let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
+        let body = build_publish_body(metadata, b"fake crate tarball content");
+        let res = router
+            .oneshot(
+                Request::put("/cargo/cargo-virt/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     /// `cargo publish` on a repository with a matching `Block` curation

@@ -1010,6 +1010,14 @@ mod tests {
             {
                 Box::pin(async { Ok(()) })
             }
+            fn replace_virtual_members(
+                &self,
+                _v: Uuid,
+                _ordered: &[Uuid],
+            ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>>
+            {
+                Box::pin(async { Ok(()) })
+            }
             fn get_storage_usage(
                 &self,
                 _id: Uuid,

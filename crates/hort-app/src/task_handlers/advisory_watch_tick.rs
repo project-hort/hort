@@ -854,6 +854,13 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
+        fn replace_virtual_members(
+            &self,
+            _virtual_repo_id: Uuid,
+            _ordered_member_ids: &[Uuid],
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
         fn get_storage_usage(&self, _repo_id: Uuid) -> BoxFuture<'_, DomainResult<u64>> {
             Box::pin(async { Ok(0) })
         }

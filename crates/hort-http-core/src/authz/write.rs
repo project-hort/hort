@@ -26,8 +26,10 @@ use uuid::Uuid;
 
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
+use hort_domain::entities::repository::{Repository, RepositoryType};
 
 use crate::context::{AppContext, AuthContext};
+use crate::error::ApiError;
 use crate::middleware::auth::AuthenticatedPrincipal;
 
 /// `hort_authz_decisions_total{result, permission}` — emitted after every
@@ -145,4 +147,65 @@ fn internal_error_response_body() -> Response {
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"error":"internal error"}"#))
         .expect("static response")
+}
+
+/// Reject a write (publish / upload) to a `type: virtual` repository
+/// (ADR 0031). Returns `Err(ApiError)` (400 Bad Request) when
+/// `repo.repo_type` is [`RepositoryType::Virtual`], `Ok(())` otherwise.
+///
+/// Virtual repositories are read-only aggregators: they have no own store
+/// and resolve reads by composing their members. A publish that reaches a
+/// format write handler would otherwise fall into the hosted arm and
+/// silently write the *virtual's* own (never-served) store. Every per-format
+/// write path calls this **after** [`resolve_actor_user_id`] (so a caller
+/// without Write still gets the stable 403 rather than a repo-type oracle)
+/// and surfaces the returned [`ApiError`] verbatim via `?`.
+///
+/// Shared here rather than re-implemented per format crate so the rejection
+/// envelope stays identical across npm / PyPI / Cargo.
+pub fn reject_write_to_virtual(repo: &Repository) -> Result<(), ApiError> {
+    if matches!(repo.repo_type, RepositoryType::Virtual) {
+        return Err(ApiError::from(hort_app::error::AppError::Domain(
+            hort_domain::error::DomainError::Validation(format!(
+                "cannot publish to virtual repository `{}`: virtual repositories are \
+                 read-only aggregators; publish to a member repository instead",
+                repo.key
+            )),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+    use hort_app::use_cases::test_support::sample_repository;
+
+    use super::*;
+
+    fn repo_of_type(t: RepositoryType) -> Repository {
+        let mut r = sample_repository();
+        r.repo_type = t;
+        r
+    }
+
+    #[test]
+    fn reject_write_to_virtual_rejects_virtual_with_400() {
+        let err = reject_write_to_virtual(&repo_of_type(RepositoryType::Virtual)).unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn reject_write_to_virtual_allows_non_virtual_types() {
+        for t in [
+            RepositoryType::Hosted,
+            RepositoryType::Proxy,
+            RepositoryType::Staging,
+        ] {
+            assert!(
+                reject_write_to_virtual(&repo_of_type(t)).is_ok(),
+                "non-virtual type {t:?} must be allowed"
+            );
+        }
+    }
 }

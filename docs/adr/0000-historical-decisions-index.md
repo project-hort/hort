@@ -52,6 +52,7 @@ accepted?*
 | [0006](0006-mandatory-upstream-verification.md) | Mandatory upstream checksum verification |
 | [0011](0011-authority-hierarchy-and-api-versioning.md) | Authority hierarchy, and first-party API versioning |
 | [0025](0025-state-precondition-violations-return-409.md) | Caller-reachable state-precondition violations return 409, not 500 |
+| [0031](0031-virtual-repository-aggregation.md) | Virtual (aggregated) repository resolution: composition over members' gated serve paths, authoritative-member rule |
 
 ### Auth, RBAC, and sessions
 
@@ -103,6 +104,7 @@ these rows is moot.
 | Claim-grant linter residual | The gitops apply-time linter for single-claim grants is fan-out-bypassable and not claim-mapping-provenance-aware. The durable fix is IdP-authoritative refresh, not a linter patch (relates [0012](0012-claim-based-rbac-claimless-static-tokens.md), [0013](0013-idp-authoritative-cli-sessions.md), [0015](0015-apply-time-linter-inert-fields-and-naming.md)). Do not close as moot. |
 | Second authenticated advisory feed (GHSA) | Only OSV adapters exist (`crates/hort-adapters-advisory-osv`). A second, authenticated feed remains unscheduled hardening for advisory-source diversity. |
 | Combined real-verifier provenance E2E | Provenance verification is composition-proven (in-crate fixture tests + offline cosign smoke), but no live-stack worker-to-release-gate E2E exists (relates [0027](0027-artifact-provenance-verification.md)). |
+| Virtual-repo per-name routing patterns | Virtual aggregation ([0031](0031-virtual-repository-aggregation.md)) closes new-version dependency confusion in v1 via name-level pinning (a name owned by any non-proxy member is unreachable from proxy members). The deferred enhancement is finer-grained operator-specified per-name include/exclude *patterns* (e.g. pin `@acme/*` to a member) beyond the repo-type ownership signal. Not a vulnerability. Revisit trigger: an operator needs name-pattern routing that repo-type ownership cannot express. |
 | `ScanIndeterminate` proxy-status mapping | Both OCI (`crates/hort-http-oci/src/quarantine.rs:46`) and npm (`crates/hort-http-npm/src/lib.rs:314-330`) return `503 + Retry-After` for `Quarantined` and `403` for `Rejected`. However, the terminal `ScanIndeterminate` status has no defined proxy-facing mapping — npm currently returns `403` for it (same shape as `Rejected`), but the correct client-visible contract for a scanner failure is unspecified. |
 | Cargo served-index name case fidelity (Low) | Hosted index entries emit the stored name (`crates/hort-http-cargo/src/index_source.rs:173`) rather than the re-normalised request parameter; spec-fidelity question. |
 | Subscription update-path SSRF denial audit asymmetry (Low) | Update-path refusals emit only a metric (`crates/hort-app/src/use_cases/subscription_use_case.rs:839`), where the create path appends a durable denial event. |

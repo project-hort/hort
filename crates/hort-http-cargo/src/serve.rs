@@ -82,7 +82,7 @@ use hort_formats::index_serve::IndexBuilder;
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
 
-use crate::index_source::{HostedCargoSource, IndexSource, IndexSourceOutput, ProxyCargoSource};
+use crate::index_source::{select_source, IndexSourceOutput};
 
 /// Unified cargo sparse-index serve — the cargo-side of the
 /// Source → Filter → Builder pipeline.
@@ -134,25 +134,23 @@ pub(crate) async fn serve_index_unified(
     hort_formats::cargo::validate_cargo_name(crate_name)
         .map_err(|e| ApiError::from(AppError::Domain(e)))?;
 
-    // ---- Step 1: Source dispatch -------------------------------------
-    let (output, index_source_label): (IndexSourceOutput, &'static str) = match repo.repo_type {
-        RepositoryType::Proxy => {
-            let src = ProxyCargoSource;
-            let out = src
-                .fetch(ctx, &repo, crate_name, caller)
-                .await
-                .map_err(map_source_error)?;
-            (out, "proxy")
-        }
-        _ => {
-            let src = HostedCargoSource;
-            let out = src
-                .fetch(ctx, &repo, crate_name, caller)
-                .await
-                .map_err(ApiError::from)?;
-            (out, "hosted")
-        }
+    // ---- Step 1: Source dispatch (transparent to repo type) ----------
+    // `select_source` returns the hosted / proxy / virtual source. The
+    // virtual source aggregates its members behind this same seam
+    // (ADR 0031), so this handler never special-cases `Virtual` — it
+    // dispatches by type for the tracing label only, then runs the
+    // unchanged filter pipeline + builder. `map_source_error` handles the
+    // proxy-only `External` → 502 arm and falls through to `ApiError::from`
+    // for hosted/virtual errors.
+    let index_source_label = match repo.repo_type {
+        RepositoryType::Proxy => "proxy",
+        RepositoryType::Virtual => "virtual",
+        _ => "hosted",
     };
+    let output: IndexSourceOutput = select_source(&repo)
+        .fetch(ctx, &repo, crate_name, caller)
+        .await
+        .map_err(map_source_error)?;
 
     // Empty hosted results → 404. For proxy the equivalent path is
     // `NoUpstream` → 404 (raised at the source layer above); a
@@ -775,5 +773,123 @@ mod tests {
             "Legacy-Crate",
             "NDJSON `name` must carry the STORED form (drift-resilience pin)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Virtual (aggregating) serve — ADR 0031. The serve handler is
+    // transparent (no `Virtual` branch); these drive it end-to-end through
+    // `select_source` → `VirtualCargoSource` → `aggregate_virtual_index`.
+    // -----------------------------------------------------------------
+
+    fn insert_virtual_repo(
+        mocks: &hort_http_core::test_support::MockPorts,
+        key: &str,
+        members: &[&Repository],
+    ) -> Repository {
+        let mut repo = sample_repository();
+        repo.key = key.into();
+        repo.format = RepositoryFormat::Cargo;
+        repo.repo_type = RepositoryType::Virtual;
+        repo.index_mode = IndexMode::ReleasedOnly;
+        mocks.repositories.insert(repo.clone());
+        for m in members {
+            mocks.repositories.seed_virtual_member(repo.id, m.id);
+        }
+        repo
+    }
+
+    async fn served_versions(res: Response) -> Vec<String> {
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        parse_lines(&body)
+            .iter()
+            .map(|l| l["vers"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn virtual_merges_member_sparse_indexes() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let a = insert_hosted_repo(&mocks, "cargo-a", IndexMode::ReleasedOnly);
+        let b = insert_hosted_repo(&mocks, "cargo-b", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            a.id,
+            "serde",
+            "1.0.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            b.id,
+            "serde",
+            "2.0.0",
+            2,
+            QuarantineStatus::Released,
+        );
+        insert_virtual_repo(&mocks, "cargo-virt", &[&a, &b]);
+
+        let res = serve_index_unified(&ctx, "cargo-virt", "serde", None)
+            .await
+            .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions = served_versions(res).await;
+        assert!(versions.contains(&"1.0.0".to_string()), "member a served");
+        assert!(versions.contains(&"2.0.0".to_string()), "member b served");
+    }
+
+    #[tokio::test]
+    async fn virtual_same_version_held_primary_not_replaced_by_secondary() {
+        // Dependency-confusion regression (same-version): the higher-priority
+        // member holds 1.0.0 Quarantined; a lower-priority member has the SAME
+        // version Released. The held copy wins the authoritative merge and is
+        // then filtered out — NOT replaced by the secondary's released copy.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let primary = insert_hosted_repo(&mocks, "cargo-primary", IndexMode::ReleasedOnly);
+        let secondary = insert_hosted_repo(&mocks, "cargo-secondary", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            primary.id,
+            "serde",
+            "1.0.0",
+            1,
+            QuarantineStatus::Quarantined,
+        );
+        insert_artifact(
+            &mocks,
+            secondary.id,
+            "serde",
+            "1.0.0",
+            2,
+            QuarantineStatus::Released,
+        );
+        insert_virtual_repo(&mocks, "cargo-virt", &[&primary, &secondary]);
+
+        let res = serve_index_unified(&ctx, "cargo-virt", "serde", None)
+            .await
+            .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions = served_versions(res).await;
+        assert!(
+            versions.is_empty(),
+            "held primary copy filtered out, NOT replaced by the secondary's released copy: {versions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_with_no_matching_versions_is_404() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let a = insert_hosted_repo(&mocks, "cargo-a", IndexMode::ReleasedOnly);
+        insert_virtual_repo(&mocks, "cargo-virt", &[&a]);
+        // No artifacts seeded → member returns empty → merged empty → 404.
+        let err = serve_index_unified(&ctx, "cargo-virt", "serde", None)
+            .await
+            .expect_err("empty virtual must 404");
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }
 }

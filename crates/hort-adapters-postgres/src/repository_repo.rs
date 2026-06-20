@@ -388,6 +388,59 @@ impl RepositoryRepository for PgRepositoryRepository {
         })
     }
 
+    fn replace_virtual_members(
+        &self,
+        virtual_repo_id: Uuid,
+        ordered_member_ids: &[Uuid],
+    ) -> BoxFuture<'_, DomainResult<()>> {
+        // Own the ids so the returned future is `'static` (the borrowed slice
+        // would otherwise have to outlive the call).
+        let members: Vec<Uuid> = ordered_member_ids.to_vec();
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Repository",
+                %virtual_repo_id,
+                member_count = members.len(),
+                "replace_virtual_members (atomic)"
+            );
+            // One transaction: the DELETE + ordered re-INSERT commit together,
+            // so a concurrent reader (another replica on the shared DB) sees
+            // either the old set or the new set — never a partial set with the
+            // owner edge transiently removed (ADR 0031 rule 2b).
+            let mut tx = self.pool.begin().await.map_err(|e| {
+                map_sqlx_error(&e, "VirtualRepoMember", &virtual_repo_id.to_string())
+            })?;
+            sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(virtual_repo_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "VirtualRepoMember", &virtual_repo_id.to_string())
+                })?;
+            for (idx, member_repo_id) in members.iter().enumerate() {
+                // `priority` = list index (0 = highest), so persisted order
+                // tracks the declared `virtualMembers` order (ADR 0031 rule 3);
+                // `get_virtual_members` reads `ORDER BY priority` ASC.
+                sqlx::query(
+                    r#"INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
+                       VALUES ($1, $2, $3)"#,
+                )
+                .bind(virtual_repo_id)
+                .bind(member_repo_id)
+                .bind(idx as i32)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "VirtualRepoMember", &member_repo_id.to_string())
+                })?;
+            }
+            tx.commit().await.map_err(|e| {
+                map_sqlx_error(&e, "VirtualRepoMember", &virtual_repo_id.to_string())
+            })?;
+            Ok(())
+        })
+    }
+
     fn get_storage_usage(&self, repo_id: Uuid) -> BoxFuture<'_, DomainResult<u64>> {
         Box::pin(async move {
             tracing::debug!(entity = "Repository", %repo_id, "get_storage_usage");
@@ -727,6 +780,73 @@ mod tests {
             msg.contains("repositories_index_mode_check") || msg.contains("23514"),
             "expected index_mode CHECK violation, got: {msg}"
         );
+    }
+
+    // -- virtual-member atomic replace (ADR 0031 / S-2) ------------------------
+
+    /// `replace_virtual_members` swaps the entire member set to exactly the
+    /// declared ids, in declared priority order, in one transaction. This pins
+    /// the behavioural contract (final state + ordering); the *atomicity* it
+    /// adds (a concurrent reader never sees a partial set) is structural — the
+    /// single `begin()`/`commit()` — and is not reproduced here as a race.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn replace_virtual_members_swaps_to_declared_set_and_order() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = PgRepositoryRepository::new(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let vroot = sample_repository(&format!("it-vroot-{suffix}"), IndexMode::ReleasedOnly);
+        let a = sample_repository(&format!("it-vm-a-{suffix}"), IndexMode::ReleasedOnly);
+        let b = sample_repository(&format!("it-vm-b-{suffix}"), IndexMode::ReleasedOnly);
+        let c = sample_repository(&format!("it-vm-c-{suffix}"), IndexMode::ReleasedOnly);
+        for r in [&vroot, &a, &b, &c] {
+            adapter
+                .save_managed(r, &[0u8; 32])
+                .await
+                .expect("save_managed");
+        }
+        // Seed an initial member set [a, b, c] via the per-edge add path.
+        for m in [&a, &b, &c] {
+            adapter
+                .add_virtual_member(vroot.id, m.id)
+                .await
+                .expect("add_virtual_member");
+        }
+
+        // Atomic replace → [c, a]: drops b and re-pins the priority order.
+        adapter
+            .replace_virtual_members(vroot.id, &[c.id, a.id])
+            .await
+            .expect("replace_virtual_members");
+
+        let ordered: Vec<Uuid> = adapter
+            .get_virtual_members(vroot.id)
+            .await
+            .expect("get_virtual_members")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![c.id, a.id],
+            "replace swaps to exactly the declared set, in declared priority order"
+        );
+
+        // Replacing with an empty list clears the set entirely.
+        adapter
+            .replace_virtual_members(vroot.id, &[])
+            .await
+            .expect("replace_virtual_members empty");
+        let empty: Vec<Uuid> = adapter
+            .get_virtual_members(vroot.id)
+            .await
+            .expect("get_virtual_members")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(empty.is_empty(), "empty replace clears all edges");
     }
 
     // -- prefetch policy round-trip --------------------------------------------

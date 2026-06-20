@@ -35,9 +35,11 @@
 //!   already lives in `hort-app` despite being consumed by format
 //!   crates through the same re-export pattern.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use hort_domain::entities::artifact::QuarantineStatus;
-use hort_domain::entities::repository::IndexMode;
+use hort_domain::entities::repository::{IndexMode, RepositoryType};
 use hort_domain::types::ContentHash;
 
 pub use crate::use_cases::index_serve_filter::VersionOrdering;
@@ -374,6 +376,100 @@ pub struct CargoVersionPayload {
     pub features2: Option<serde_json::Value>,
 }
 
+// ---------------------------------------------------------------------------
+// Virtual-repository aggregation primitives (ADR 0031)
+// ---------------------------------------------------------------------------
+//
+// Format-agnostic — both operate on the `VersionEntry` spine, so npm / PyPI /
+// Cargo reuse them. They run BEFORE the `IndexFilter` pipeline, on RAW entries:
+// the dependency-confusion defences require an entry's `Quarantined`/`Rejected`
+// status to survive into the merge, which a per-member `NonServableStatusFilter`
+// pass would already have dropped (ADR 0031 §Decision; spec §4 / §7).
+
+/// One member's index-fetch outcome, as the aggregation helper sees it.
+///
+/// `Present(entries)` — the member responded; an empty vec means the package is
+/// genuinely absent *there*. `Unavailable` — the member's fetch errored (an
+/// infrastructure failure), so whether it owns the name is **indeterminate**.
+/// The per-format `IndexSource` maps its `Result` into this (a "package absent"
+/// miss → `Present(vec![])`; an infra error → `Unavailable`).
+#[derive(Debug, Clone)]
+pub enum MemberFetch {
+    Present(Vec<VersionEntry>),
+    Unavailable,
+}
+
+/// Index aggregation for a virtual repo (ADR 0031) — the single home of the two
+/// substitution defences plus the fail-closed member-failure rule.
+///
+/// Members are supplied highest-priority-first. On RAW entries:
+///
+/// 1. **Name-level pinning (rule 2b).** The name is *owned* if any non-proxy
+///    member (`Hosted`/`Staging`) is `Present(non-empty)` **or** `Unavailable`.
+///    The `Unavailable` case is the fail-closed rule: a non-proxy owner that
+///    errored is treated as a *potential* owner, so proxies stay suppressed —
+///    a transient outage of the trusted owner cannot re-open the confusion
+///    window by making the name look unowned. When the name is owned, every
+///    `Proxy` member is dropped.
+/// 2. **Authoritative merge (rule 2a).** [`merge_members_authoritative`] over
+///    the surviving members: dedup by version, higher-priority wins (status
+///    included). An `Unavailable` member contributes no entries.
+///
+/// Runs BEFORE the `NonServableStatusFilter` / `IndexModeFilter` pipeline. Pure
+/// transform, no I/O.
+pub fn aggregate_index_members(
+    per_member_in_priority_order: Vec<(RepositoryType, MemberFetch)>,
+) -> Vec<VersionEntry> {
+    let name_is_owned = per_member_in_priority_order
+        .iter()
+        .any(|(repo_type, fetch)| {
+            !matches!(repo_type, RepositoryType::Proxy)
+                && match fetch {
+                    MemberFetch::Present(entries) => !entries.is_empty(),
+                    MemberFetch::Unavailable => true,
+                }
+        });
+    let surviving: Vec<Vec<VersionEntry>> = per_member_in_priority_order
+        .into_iter()
+        .filter_map(|(repo_type, fetch)| {
+            if name_is_owned && matches!(repo_type, RepositoryType::Proxy) {
+                return None;
+            }
+            Some(match fetch {
+                MemberFetch::Present(entries) => entries,
+                MemberFetch::Unavailable => Vec::new(),
+            })
+        })
+        .collect();
+    merge_members_authoritative(surviving)
+}
+
+/// Merge per-member version entries under the authoritative-member rule — the
+/// same-version dependency-confusion defence (ADR 0031 rule 2a).
+///
+/// Members are supplied highest-priority-first. The first member to carry a
+/// given `version` wins it, **including that entry's `status`**; a lower-priority
+/// member's copy of the same version is dropped, not merged. So a coordinate
+/// held (`Quarantined`/`Rejected`) in a higher-priority member is never silently
+/// replaced by a lower-priority member's released copy. Runs on RAW entries,
+/// BEFORE the `NonServableStatusFilter` / `IndexModeFilter` pipeline. The dedup
+/// key is the `version` string within the single requested name. Pure transform,
+/// no I/O.
+pub fn merge_members_authoritative(
+    per_member_in_priority_order: Vec<Vec<VersionEntry>>,
+) -> Vec<VersionEntry> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut merged: Vec<VersionEntry> = Vec::new();
+    for member_entries in per_member_in_priority_order {
+        for entry in member_entries {
+            if seen.insert(entry.version.clone()) {
+                merged.push(entry);
+            }
+        }
+    }
+    merged
+}
+
 /// Format-agnostic filter.
 ///
 /// Operates on the [`VersionEntry`] spine only. Implementations live
@@ -547,6 +643,145 @@ mod tests {
         // adapters that materialise an entry per row / per upstream
         // version).
         let _ = payload.clone();
+    }
+
+    // --- Virtual-repository aggregation primitives (ADR 0031) -----------
+
+    /// Minimal `VersionEntry` for the pinning/merge tests — both primitives
+    /// key on `version` + `status` only; the payload is opaque to them.
+    fn ve(version: &str, status: Option<QuarantineStatus>) -> VersionEntry {
+        VersionEntry {
+            version: version.into(),
+            status,
+            payload: PerVersionPayload::Npm(NpmVersionPayload {
+                name_as_published: "p".into(),
+                tarball_basename: format!("p-{version}.tgz"),
+                integrity: None,
+                shasum: "x".into(),
+            }),
+        }
+    }
+
+    /// Version strings of a merged entry list, in order.
+    fn vers(entries: Vec<VersionEntry>) -> Vec<String> {
+        entries.into_iter().map(|e| e.version).collect()
+    }
+
+    use MemberFetch::{Present, Unavailable};
+
+    #[test]
+    fn aggregate_owned_name_drops_all_proxy_members() {
+        // A non-proxy member owns the name → the proxy's (attacker-published)
+        // version is excluded entirely.
+        let merged = aggregate_index_members(vec![
+            (RepositoryType::Proxy, Present(vec![ve("9.9.9", None)])),
+            (
+                RepositoryType::Hosted,
+                Present(vec![ve("1.0.0", Some(QuarantineStatus::Released))]),
+            ),
+        ]);
+        assert_eq!(vers(merged), vec!["1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn aggregate_unowned_name_keeps_proxy_members() {
+        // No non-proxy member has the name → proxy participates normally.
+        let merged = aggregate_index_members(vec![(
+            RepositoryType::Proxy,
+            Present(vec![ve("1.0.0", None)]),
+        )]);
+        assert_eq!(vers(merged), vec!["1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn aggregate_empty_non_proxy_member_does_not_own() {
+        // A non-proxy member that responded with NO entries does not own the
+        // name, so the proxy is kept.
+        let merged = aggregate_index_members(vec![
+            (RepositoryType::Hosted, Present(vec![])),
+            (RepositoryType::Proxy, Present(vec![ve("1.0.0", None)])),
+        ]);
+        assert_eq!(vers(merged), vec!["1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn aggregate_staging_counts_as_owner_and_drops_proxy() {
+        let merged = aggregate_index_members(vec![
+            (RepositoryType::Proxy, Present(vec![ve("9", None)])),
+            (
+                RepositoryType::Staging,
+                Present(vec![ve("1", Some(QuarantineStatus::Quarantined))]),
+            ),
+        ]);
+        assert_eq!(vers(merged), vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn aggregate_unavailable_non_proxy_is_failclosed_owner() {
+        // The trusted owner errored — ownership indeterminate → proxies stay
+        // suppressed (no confusion window during the outage). The errored
+        // member contributes nothing, so the package looks absent rather than
+        // being served from the proxy.
+        let merged = aggregate_index_members(vec![
+            (RepositoryType::Hosted, Unavailable),
+            (RepositoryType::Proxy, Present(vec![ve("9.9.9", None)])),
+        ]);
+        assert!(
+            vers(merged).is_empty(),
+            "proxy must not serve a name a failed non-proxy member might own"
+        );
+    }
+
+    #[test]
+    fn aggregate_unavailable_proxy_is_skipped_when_unowned() {
+        // No non-proxy owner; one proxy errored (contributes nothing), another
+        // proxy serves normally.
+        let merged = aggregate_index_members(vec![
+            (RepositoryType::Proxy, Unavailable),
+            (RepositoryType::Proxy, Present(vec![ve("2.0.0", None)])),
+        ]);
+        assert_eq!(vers(merged), vec!["2.0.0".to_string()]);
+    }
+
+    #[test]
+    fn aggregate_empty_input_is_empty() {
+        assert!(aggregate_index_members(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn merge_collision_higher_priority_wins_including_status() {
+        // Higher-priority member holds 1.0.0 Quarantined; lower-priority has it
+        // Released. The held entry wins — no substitution.
+        let merged = merge_members_authoritative(vec![
+            vec![ve("1.0.0", Some(QuarantineStatus::Quarantined))],
+            vec![ve("1.0.0", Some(QuarantineStatus::Released))],
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].version, "1.0.0");
+        assert!(matches!(
+            merged[0].status,
+            Some(QuarantineStatus::Quarantined)
+        ));
+    }
+
+    #[test]
+    fn merge_disjoint_versions_union_in_priority_order() {
+        let merged = merge_members_authoritative(vec![vec![ve("1", None)], vec![ve("2", None)]]);
+        let got: Vec<String> = merged.into_iter().map(|e| e.version).collect();
+        assert_eq!(got, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn merge_single_member_passthrough() {
+        let merged = merge_members_authoritative(vec![vec![ve("1", None), ve("2", None)]]);
+        let got: Vec<String> = merged.into_iter().map(|e| e.version).collect();
+        assert_eq!(got, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn merge_empty_inputs_are_empty() {
+        assert!(merge_members_authoritative(Vec::new()).is_empty());
+        assert!(merge_members_authoritative(vec![vec![], vec![]]).is_empty());
     }
 
     /// Sister test to

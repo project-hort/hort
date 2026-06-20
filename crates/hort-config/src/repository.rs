@@ -365,6 +365,32 @@ fn is_posix_env_var_name(s: &str) -> bool {
         .all(|&b| b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+/// Formats whose `type: virtual` **serve-time** member resolution has
+/// shipped. A `type: virtual` repo whose `format` is **not** in this set
+/// is rejected at gitops apply (see [`validate_repository`]).
+///
+/// This is the structural close for the ADR 0015 "apply-accepted,
+/// runtime-inert field" anti-pattern that `virtualMembers` was the
+/// canonical instance of: until a format's serve path consults the
+/// members, accepting + persisting the membership edges while serving
+/// nothing is exactly the inert-field violation. Rejecting at apply makes
+/// the operator surface honest until resolution lands.
+///
+/// **Grows per format as serve-time resolution ships** (ADR 0031). Phase 1
+/// added `Npm`, Phase 2 `Pypi`, Phase 3 `Cargo` — the three formats on the
+/// shared Source → Filter → Builder `VersionEntry` pipeline. The steady
+/// state rejects only the not-yet-specced formats (OCI/Maven/etc.), which is
+/// correct — not an inert field. A future format joins this list when its
+/// serve-time member resolution ships.
+///
+/// `pub` so later-phase serve code and tests can assert against the
+/// single source of truth rather than re-listing the supported formats.
+pub const VIRTUAL_SERVE_SUPPORTED_FORMATS: &[RepositoryFormat] = &[
+    RepositoryFormat::Npm,
+    RepositoryFormat::Pypi,
+    RepositoryFormat::Cargo,
+];
+
 /// Per-spec validation: applies only to one envelope's content.
 ///
 /// Cross-spec rules (duplicate names, dangling members across files,
@@ -528,6 +554,32 @@ pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationErro
                 }
             }
             RepositoryType::Virtual => {
+                // ADR 0015 / ADR 0031 inert-field stopgap: reject a
+                // `type: virtual` repo whose format has no serve-time
+                // member resolution yet. `VIRTUAL_SERVE_SUPPORTED_FORMATS`
+                // is the single source of truth (npm/pypi/cargo today); the
+                // set grows per format as resolution ships (see the const's
+                // doc + ADR 0031).
+                // Skip when the format itself is unknown — the
+                // `Other(_)` check above already reported that and adding
+                // this on top is noise.
+                if !matches!(format, RepositoryFormat::Other(_))
+                    && !VIRTUAL_SERVE_SUPPORTED_FORMATS.contains(&format)
+                {
+                    errors.push(ValidationError::Invalid {
+                        kind,
+                        name: name.clone(),
+                        detail: format!(
+                            "type=virtual is not yet serve-supported for format \
+                             `{}` — virtualMembers would be accepted but never \
+                             served (ADR 0015 inert-field). Serve-time aggregation \
+                             ships per format (npm/pypi/cargo today); see ADR 0031 \
+                             and docs/architecture/how-to/declare-gitops-config.md",
+                            env.spec.format
+                        ),
+                    });
+                }
+
                 let proxy_present = env.spec.proxy.is_some();
                 let members = env.spec.virtual_members.as_deref().unwrap_or(&[]);
                 if proxy_present {
@@ -1019,6 +1071,92 @@ spec:
         assert!(errors
             .iter()
             .any(|e| e.to_string().contains("must not declare virtualMembers")));
+    }
+
+    #[test]
+    fn type_virtual_unsupported_format_is_validation_error() {
+        // ADR 0015 inert-field stopgap (spec §9 part A): a format absent from
+        // `VIRTUAL_SERVE_SUPPORTED_FORMATS` is rejected at apply rather than
+        // accepted with an inert `virtualMembers`. npm/pypi/cargo are lifted
+        // (Phases 1-3); `maven` is a known, still-unsupported format — the
+        // correct steady state. The repo below is otherwise valid (members
+        // present, no dup, no self-reference), so the unsupported-format
+        // rejection is the operative error.
+        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: vroot
+spec:
+  name: vroot
+  format: maven
+  type: virtual
+  storage: { backend: filesystem, path: /x }
+  virtualMembers: [a, b]
+  isPublic: true
+  replicationPriority: immediate
+";
+        let env = parse_repository(&p(), yaml_doc.as_bytes()).unwrap();
+        let errors = validate_repository(&env);
+        assert!(errors
+            .iter()
+            .any(|e| e.to_string().contains("not yet serve-supported")));
+    }
+
+    #[test]
+    fn type_virtual_npm_is_serve_supported() {
+        // Phase 1 lifted npm into `VIRTUAL_SERVE_SUPPORTED_FORMATS`, so a
+        // valid `type: virtual` npm repo no longer trips the inert-field
+        // stopgap — `virtualMembers` is now genuinely served (ADR 0031).
+        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: vroot
+spec:
+  name: vroot
+  format: npm
+  type: virtual
+  storage: { backend: filesystem, path: /x }
+  virtualMembers: [a, b]
+  isPublic: true
+  replicationPriority: immediate
+";
+        let env = parse_repository(&p(), yaml_doc.as_bytes()).unwrap();
+        let errors = validate_repository(&env);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.to_string().contains("not yet serve-supported")),
+            "npm virtual is serve-supported and must not trip the stopgap: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn type_virtual_unknown_format_skips_serve_support_error() {
+        // The unsupported-format check is suppressed when the format itself is
+        // unknown (`Other(_)`) — that is reported by the format check, and
+        // stacking "not yet serve-supported" on top would be noise. Exercises
+        // the `!matches!(format, Other(_))` short-circuit (cond-false arm).
+        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: vroot
+spec:
+  name: vroot
+  format: madeupformat
+  type: virtual
+  storage: { backend: filesystem, path: /x }
+  virtualMembers: [a, b]
+  isPublic: true
+  replicationPriority: immediate
+";
+        let env = parse_repository(&p(), yaml_doc.as_bytes()).unwrap();
+        let errors = validate_repository(&env);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.to_string().contains("not yet serve-supported")),
+            "unknown format must not also raise the serve-support error"
+        );
     }
 
     #[test]

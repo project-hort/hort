@@ -31,7 +31,7 @@ use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ArtifactCoords;
 use hort_formats::npm::NpmFormatHandler;
 
-use hort_http_core::authz::write::resolve_actor_user_id;
+use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_id};
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
@@ -263,52 +263,90 @@ async fn serve_tarball(
                 .repository_access_use_case
                 .resolve(repo_key, actor, AccessLevel::Read)
                 .await?;
-            if !matches!(repo.repo_type, RepositoryType::Proxy) {
-                // Hosted / Staging / Virtual cache miss → 404. Match the
-                // envelope the use case would have produced
-                // (`{"error":"not found: Artifact <repo>:<path>"}`) so
-                // the `download_not_found_returns_404` regression stays
-                // green and clients see no observable change.
-                return Err(ApiError::from(hort_app::error::AppError::Domain(
-                    hort_domain::error::DomainError::NotFound {
-                        entity: "Artifact",
-                        id: format!("{repo_key}:{artifact_path}"),
-                    },
-                )));
-            }
-            // Filename → version inference: `{basename}-{version}.tgz`.
-            // For scoped names the basename is the post-slash segment
-            // (`@types/node` → `node`), matching the public-registry
-            // download URL convention (`@scope/pkg/-/pkg-{ver}.tgz`).
-            let basename = unscoped_basename(pkg_name);
-            let Some(version) = extract_version(filename, basename) else {
-                // The wire filename does not parse as `{basename}-{ver}.tgz`.
-                // Fall through to the same 404 envelope as the local-miss
-                // path: there is nothing to fetch upstream.
-                return Err(ApiError::from(hort_app::error::AppError::Domain(
-                    hort_domain::error::DomainError::NotFound {
-                        entity: "Artifact",
-                        id: format!("{repo_key}:{artifact_path}"),
-                    },
-                )));
-            };
-            match upstream_pull::try_upstream_tarball_pull(ctx, &repo, pkg_name, &version, filename)
-                .await
-            {
-                Ok(_artifact) => {
-                    // The orchestrator minted the row; re-fetch via the
-                    // same use case the local-CAS path uses. This keeps
-                    // the response body read-from-CAS path identical.
-                    ctx.artifact_use_case
-                        .find_visible_by_path(repo_key, &artifact_path, actor)
-                        .await?
+            match repo.repo_type {
+                RepositoryType::Proxy => {
+                    // Filename → version inference: `{basename}-{version}.tgz`.
+                    // For scoped names the basename is the post-slash segment
+                    // (`@types/node` → `node`), matching the public-registry
+                    // download URL convention (`@scope/pkg/-/pkg-{ver}.tgz`).
+                    let basename = unscoped_basename(pkg_name);
+                    let Some(version) = extract_version(filename, basename) else {
+                        // The wire filename does not parse as
+                        // `{basename}-{ver}.tgz`. Fall through to the same 404
+                        // envelope as the local-miss path: there is nothing to
+                        // fetch upstream.
+                        return Err(ApiError::from(hort_app::error::AppError::Domain(
+                            hort_domain::error::DomainError::NotFound {
+                                entity: "Artifact",
+                                id: format!("{repo_key}:{artifact_path}"),
+                            },
+                        )));
+                    };
+                    match upstream_pull::try_upstream_tarball_pull(
+                        ctx, &repo, pkg_name, &version, filename,
+                    )
+                    .await
+                    {
+                        Ok(_artifact) => {
+                            // The orchestrator minted the row; re-fetch via the
+                            // same use case the local-CAS path uses. This keeps
+                            // the response body read-from-CAS path identical.
+                            ctx.artifact_use_case
+                                .find_visible_by_path(repo_key, &artifact_path, actor)
+                                .await?
+                        }
+                        Err(e) => return Ok(upstream_pull::map_upstream_pull_error(&e)),
+                    }
                 }
-                Err(e) => return Ok(upstream_pull::map_upstream_pull_error(&e)),
+                RepositoryType::Virtual => {
+                    // Transparent aggregation (ADR 0031): the member sources
+                    // already enforce visibility + quarantine; the resolver
+                    // picks the authoritative member and we render its gate
+                    // through the SAME `render_artifact_response` tail — no
+                    // `Virtual` branch leaks into the gate/stream code.
+                    return serve_virtual_tarball(
+                        ctx,
+                        &repo,
+                        pkg_name,
+                        &artifact_path,
+                        filename,
+                        actor,
+                    )
+                    .await;
+                }
+                RepositoryType::Hosted | RepositoryType::Staging => {
+                    // Hosted / Staging cache miss → 404. Match the envelope the
+                    // use case would have produced
+                    // (`{"error":"not found: Artifact <repo>:<path>"}`) so the
+                    // `download_not_found_returns_404` regression stays green
+                    // and clients see no observable change.
+                    return Err(ApiError::from(hort_app::error::AppError::Domain(
+                        hort_domain::error::DomainError::NotFound {
+                            entity: "Artifact",
+                            id: format!("{repo_key}:{artifact_path}"),
+                        },
+                    )));
+                }
             }
         }
         Err(other) => return Err(other.into()),
     };
 
+    render_artifact_response(ctx, artifact, actor).await
+}
+
+/// Render the final tarball HTTP response for a resolved artifact: surface
+/// the quarantine gate (`Quarantined` → 503 + `Retry-After`,
+/// `Rejected` / `ScanIndeterminate` → 403) or stream the bytes from CAS.
+///
+/// Shared by the hosted/proxy direct path and the virtual aggregation path
+/// (ADR 0031) so the gate render + streaming live in exactly one place; the
+/// virtual layer only chooses which member's artifact reaches here.
+async fn render_artifact_response(
+    ctx: &Arc<AppContext>,
+    artifact: hort_domain::entities::artifact::Artifact,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
     match artifact.quarantine_status {
         QuarantineStatus::Quarantined => {
             // The use-case layer hydrates the transient computed
@@ -352,8 +390,9 @@ async fn serve_tarball(
         QuarantineStatus::None | QuarantineStatus::Released => {}
     }
 
-    // Thread the resolved principal (`serve_tarball`'s `actor` fn param)
-    // for opt-in download-audit attribution. No per-handler auth code.
+    // Thread the resolved principal for opt-in download-audit attribution.
+    // No per-handler auth code; the caller already proved Read on the
+    // (member) repo via `find_visible_by_path`.
     let (_artifact, stream) = ctx.artifact_use_case.download(artifact.id, actor).await?;
     let body = stream_blob(stream, DEFAULT_STREAM_CAPACITY);
 
@@ -373,6 +412,173 @@ async fn serve_tarball(
     // (`crates/hort-http-oci/src/blobs.rs::build_response`).
     out_headers.insert(CONTENT_LENGTH, artifact.size_bytes.into());
     Ok((StatusCode::OK, out_headers, body).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Virtual (aggregating) download — ADR 0031
+// ---------------------------------------------------------------------------
+
+/// One virtual member's download outcome for the first-authoritative walk
+/// (ADR 0031 §4.2): either the authoritative artifact, or a pre-rendered
+/// response (a proxy member's upstream-pull error surfaced verbatim — 502 /
+/// tampering / ingest-fail). The hosted/proxy member paths already enforce
+/// visibility + quarantine; the virtual layer only chooses the member.
+enum VirtualMemberDownload {
+    Found(hort_domain::entities::artifact::Artifact),
+    Rendered(Response),
+}
+
+/// Transparent virtual tarball download (ADR 0031). Resolves the
+/// authoritative member via
+/// [`VirtualResolutionUseCase::resolve_download`](hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase::resolve_download)
+/// (name-level pinning + first-authoritative walk + the fail-closed member
+/// rule all live in `hort-app`), then renders the chosen artifact's gate
+/// through the same [`render_artifact_response`] tail the hosted/proxy path
+/// uses. `serve_tarball` never special-cases `Virtual` past the source
+/// dispatch.
+async fn serve_virtual_tarball(
+    ctx: &Arc<AppContext>,
+    virtual_repo: &hort_domain::entities::repository::Repository,
+    pkg_name: &str,
+    artifact_path: &str,
+    filename: &str,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
+    let resolved: Option<VirtualMemberDownload> =
+        ctx.virtual_resolution_use_case
+            .resolve_download(
+                virtual_repo,
+                actor,
+                // Phase 1 — non-proxy name presence (reuses the member's own
+                // index source so the pinning signal matches the index path).
+                move |member| async move {
+                    npm_member_name_presence(ctx, &member, pkg_name, actor).await
+                },
+                // Phase 2 — per-member coordinate fetch (hosted lookup / proxy
+                // pull), classified for the first-authoritative walk.
+                move |member| async move {
+                    npm_member_coord_fetch(ctx, &member, pkg_name, artifact_path, filename, actor)
+                        .await
+                },
+            )
+            .await?;
+
+    match resolved {
+        Some(VirtualMemberDownload::Found(artifact)) => {
+            render_artifact_response(ctx, artifact, actor).await
+        }
+        Some(VirtualMemberDownload::Rendered(resp)) => Ok(resp),
+        // No eligible member has the coordinate (or an owned name had the
+        // version absent from every owner) → 404, never a proxy fall-through.
+        None => Err(ApiError::from(hort_app::error::AppError::Domain(
+            hort_domain::error::DomainError::NotFound {
+                entity: "Artifact",
+                id: format!("{}:{}", virtual_repo.key, artifact_path),
+            },
+        ))),
+    }
+}
+
+/// Non-proxy member name presence for the download pinning decision
+/// (ADR 0031 rule 2b). Reuses the member's own [`IndexSource`] — the same
+/// path the index aggregation uses — so the ownership signal is identical
+/// across the index and download paths. Only invoked for non-proxy members.
+async fn npm_member_name_presence(
+    ctx: &Arc<AppContext>,
+    member: &hort_domain::entities::repository::Repository,
+    pkg_name: &str,
+    actor: Option<&CallerPrincipal>,
+) -> hort_app::use_cases::virtual_resolution::MemberNamePresence {
+    use crate::index_source::select_source;
+    use hort_app::use_cases::virtual_resolution::MemberNamePresence;
+
+    match select_source(member)
+        .fetch(ctx, member, pkg_name, actor)
+        .await
+    {
+        Ok(out) if !out.entries.is_empty() => MemberNamePresence::Present,
+        Ok(_) => MemberNamePresence::Absent,
+        // A definitive "absent here" (invisible / missing repo / no rows)
+        // collapses to `NotFound` → the member does not own the name.
+        Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
+            ..
+        })) => MemberNamePresence::Absent,
+        // Any other error is an infrastructure failure → ownership is
+        // indeterminate; a non-proxy member that errors is treated
+        // fail-closed as a potential owner (proxies suppressed for the name).
+        Err(_) => MemberNamePresence::Unavailable,
+    }
+}
+
+/// Per-member coordinate fetch for the first-authoritative walk
+/// (ADR 0031 §4.2). Returns `Ok(Some(Found))` when the member has the
+/// coordinate (cache hit, or a proxy pull mints it), `Ok(Some(Rendered))`
+/// when an authoritative proxy member's pull failed (surfaced verbatim —
+/// no fall-through), `Ok(None)` when the member definitively lacks it (the
+/// walk continues), or `Err` on infrastructure failure (propagated).
+async fn npm_member_coord_fetch(
+    ctx: &Arc<AppContext>,
+    member: &hort_domain::entities::repository::Repository,
+    pkg_name: &str,
+    artifact_path: &str,
+    filename: &str,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Option<VirtualMemberDownload>, hort_app::error::AppError> {
+    use hort_domain::entities::repository::RepositoryType;
+
+    // Local CAS hit on the member (any type) → authoritative.
+    match ctx
+        .artifact_use_case
+        .find_visible_by_path(&member.key, artifact_path, actor)
+        .await
+    {
+        Ok((_repo, artifact)) => return Ok(Some(VirtualMemberDownload::Found(artifact))),
+        // Local path miss: a proxy member tries the upstream pull below; a
+        // hosted/staging member simply lacks the coordinate.
+        Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
+            entity: "Artifact",
+            ..
+        })) => {}
+        // Member vanished between resolve and fetch (Repository NotFound) →
+        // treat as absent (continue the walk); other infra errors propagate.
+        Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
+            ..
+        })) => return Ok(None),
+        Err(other) => return Err(other),
+    }
+
+    if !matches!(member.repo_type, RepositoryType::Proxy) {
+        return Ok(None);
+    }
+
+    // Proxy member: verified upstream pull (the same path the non-virtual
+    // proxy download uses).
+    let basename = unscoped_basename(pkg_name);
+    let Some(version) = extract_version(filename, basename) else {
+        return Ok(None);
+    };
+    match upstream_pull::try_upstream_tarball_pull(ctx, member, pkg_name, &version, filename).await
+    {
+        Ok(_artifact) => {
+            let (_repo, artifact) = ctx
+                .artifact_use_case
+                .find_visible_by_path(&member.key, artifact_path, actor)
+                .await?;
+            Ok(Some(VirtualMemberDownload::Found(artifact)))
+        }
+        // A genuine upstream miss / no mapping / curation block means this
+        // member cannot serve the coordinate → continue the walk (the
+        // virtual's own 404 renders if no member serves it). CurationBlocked
+        // already collapses to 404 (anti-enumeration).
+        Err(upstream_pull::UpstreamPullError::NoUpstream)
+        | Err(upstream_pull::UpstreamPullError::CurationBlocked) => Ok(None),
+        // Any other failure (502-class, tampering, ingest fail) is the
+        // authoritative proxy member's failure → surface it verbatim, never
+        // fall through to a lower-priority member.
+        Err(e) => Ok(Some(VirtualMemberDownload::Rendered(
+            upstream_pull::map_upstream_pull_error(&e),
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +663,12 @@ async fn do_publish(
         Ok(id) => id,
         Err(response) => return Ok(*response),
     };
+
+    // Read-only aggregator (ADR 0031): reject a publish to a `type: virtual`
+    // repo, which would otherwise fall into the hosted arm below and write
+    // the virtual's own (never-served) store. After the authz gate so a
+    // caller without Write still sees the stable 403, not a repo-type oracle.
+    reject_write_to_virtual(&repo)?;
 
     // Stream-decode the publish body. Peak heap stays
     // O(envelope-without-base64); the decoded tarball spools to a
@@ -792,6 +1004,31 @@ mod tests {
     }
 
     // -- publish --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_to_virtual_repo_is_rejected() {
+        // Virtual repos are read-only aggregators (ADR 0031): a publish must
+        // be rejected, not silently written to the virtual's own store.
+        let h = harness();
+        let mut repo = sample_repository();
+        repo.key = "npm-virt".into();
+        repo.format = RepositoryFormat::Npm;
+        repo.repo_type = hort_domain::entities::repository::RepositoryType::Virtual;
+        h.repositories.insert(repo);
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body("express", "1.0.0", b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-virt/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn publish_unscoped_happy_path() {
@@ -3427,6 +3664,330 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+
+        // -- Virtual (aggregating) download — ADR 0031 ----------------------
+        //
+        // The download handler is transparent (no `Virtual` branch past the
+        // source dispatch); these drive `serve_tarball` end-to-end through
+        // `serve_virtual_tarball` → `resolve_download` → member sources,
+        // reusing this submodule's proxy-upstream helpers for proxy members.
+
+        use hort_domain::entities::artifact::QuarantineStatus;
+
+        /// Seed a Hosted npm member with one tarball artifact (+ CAS bytes).
+        #[allow(clippy::too_many_arguments)]
+        fn hosted_member_with_tarball(
+            mocks: &MockPorts,
+            key: &str,
+            pkg: &str,
+            version: &str,
+            filename: &str,
+            bytes: &[u8],
+            status: QuarantineStatus,
+        ) -> Repository {
+            use hort_app::use_cases::test_support::sample_artifact;
+            use sha2::Sha256;
+            let mut repo = sample_repository();
+            repo.key = key.into();
+            repo.format = RepositoryFormat::Npm;
+            repo.repo_type = RepositoryType::Hosted;
+            mocks.repositories.insert(repo.clone());
+
+            let sha256 = format!("{:x}", Sha256::digest(bytes)).parse().unwrap();
+            let mut artifact = sample_artifact(status);
+            artifact.repository_id = repo.id;
+            artifact.name = pkg.into();
+            artifact.version = Some(version.into());
+            artifact.path = format!("{pkg}/-/{filename}");
+            artifact.sha256_checksum = sha256;
+            artifact.size_bytes = bytes.len() as i64;
+            mocks.artifacts.insert(artifact.clone());
+            mocks
+                .storage
+                .insert_content(artifact.sha256_checksum.clone(), bytes.to_vec());
+            repo
+        }
+
+        /// Seed an empty Hosted npm member (no artifacts).
+        fn empty_hosted_member(mocks: &MockPorts, key: &str) -> Repository {
+            let mut repo = sample_repository();
+            repo.key = key.into();
+            repo.format = RepositoryFormat::Npm;
+            repo.repo_type = RepositoryType::Hosted;
+            mocks.repositories.insert(repo.clone());
+            repo
+        }
+
+        /// Insert a proxy npm member with an upstream mapping seeded.
+        fn proxy_member(mocks: &MockPorts, key: &str) -> Repository {
+            let repo = proxy_npm_repo(key);
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(mocks, repo.id);
+            repo
+        }
+
+        /// Seed a `type: virtual` npm repo aggregating `members` (priority
+        /// order, first = highest).
+        fn virtual_member_repo(
+            mocks: &MockPorts,
+            key: &str,
+            members: &[&Repository],
+        ) -> Repository {
+            let mut repo = sample_repository();
+            repo.key = key.into();
+            repo.format = RepositoryFormat::Npm;
+            repo.repo_type = RepositoryType::Virtual;
+            mocks.repositories.insert(repo.clone());
+            for m in members {
+                mocks.repositories.seed_virtual_member(repo.id, m.id);
+            }
+            repo
+        }
+
+        /// Seed the upstream packument + tarball for `pkg@version` on a proxy
+        /// member so a virtual pull through it succeeds (verified).
+        fn seed_upstream_tarball(mocks: &MockPorts, pkg: &str, version: &str, bytes: &[u8]) {
+            let url = format!("https://registry.npmjs.org/{pkg}/-/{pkg}-{version}.tgz");
+            let sri = sri_sha512(bytes);
+            let json = packument_json(version, &sri, &url);
+            mocks
+                .upstream_proxy
+                .insert_metadata("", &format!("/{pkg}"), json);
+            mocks
+                .upstream_proxy
+                .insert_artifact("", &url, bytes.to_vec());
+        }
+
+        async fn get_download(ctx: Arc<AppContext>, path: &str) -> Response {
+            router_for(ctx)
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn virtual_download_served_from_hosted_member() {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let a = hosted_member_with_tarball(
+                &mocks,
+                "npm-a",
+                "lib",
+                "1.0.0",
+                "lib-1.0.0.tgz",
+                b"from-a",
+                QuarantineStatus::Released,
+            );
+            let b = empty_hosted_member(&mocks, "npm-b");
+            virtual_member_repo(&mocks, "npm-virt", &[&a, &b]);
+
+            let res = get_download(ctx, "/npm/npm-virt/lib/-/lib-1.0.0.tgz").await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(&body[..], b"from-a");
+        }
+
+        #[tokio::test]
+        async fn virtual_download_first_authoritative_prefers_higher_priority() {
+            // Same coordinate in both members; the higher-priority member is
+            // authoritative — its bytes are served, never the secondary's.
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let hi = hosted_member_with_tarball(
+                &mocks,
+                "npm-hi",
+                "lib",
+                "1.0.0",
+                "lib-1.0.0.tgz",
+                b"hi-bytes",
+                QuarantineStatus::Released,
+            );
+            let lo = hosted_member_with_tarball(
+                &mocks,
+                "npm-lo",
+                "lib",
+                "1.0.0",
+                "lib-1.0.0.tgz",
+                b"lo-bytes",
+                QuarantineStatus::Released,
+            );
+            virtual_member_repo(&mocks, "npm-virt", &[&hi, &lo]);
+
+            let res = get_download(ctx, "/npm/npm-virt/lib/-/lib-1.0.0.tgz").await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(
+                &body[..],
+                b"hi-bytes",
+                "highest-priority holder is authoritative"
+            );
+        }
+
+        #[tokio::test]
+        async fn virtual_download_held_primary_returns_503_not_secondary_copy() {
+            // Same-version substitution defence on the download path: the
+            // higher-priority member holds 1.0.0 Quarantined; the
+            // lower-priority member has 1.0.0 Released. The held copy is
+            // authoritative → 503; the secondary's released copy NEVER
+            // substitutes it.
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let hi = hosted_member_with_tarball(
+                &mocks,
+                "npm-hi",
+                "lib",
+                "1.0.0",
+                "lib-1.0.0.tgz",
+                b"held",
+                QuarantineStatus::Quarantined,
+            );
+            let lo = hosted_member_with_tarball(
+                &mocks,
+                "npm-lo",
+                "lib",
+                "1.0.0",
+                "lib-1.0.0.tgz",
+                b"released",
+                QuarantineStatus::Released,
+            );
+            virtual_member_repo(&mocks, "npm-virt", &[&hi, &lo]);
+
+            let res = get_download(ctx, "/npm/npm-virt/lib/-/lib-1.0.0.tgz").await;
+            assert_eq!(
+                res.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "held primary's gate surfaces; never the secondary's released copy"
+            );
+        }
+
+        #[tokio::test]
+        async fn virtual_download_scan_indeterminate_member_returns_403() {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let a = hosted_member_with_tarball(
+                &mocks,
+                "npm-a",
+                "lib",
+                "1.0.0",
+                "lib-1.0.0.tgz",
+                b"x",
+                QuarantineStatus::ScanIndeterminate,
+            );
+            virtual_member_repo(&mocks, "npm-virt", &[&a]);
+
+            let res = get_download(ctx, "/npm/npm-virt/lib/-/lib-1.0.0.tgz").await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn virtual_download_missing_everywhere_returns_404() {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let a = empty_hosted_member(&mocks, "npm-a");
+            virtual_member_repo(&mocks, "npm-virt", &[&a]);
+
+            let res = get_download(ctx, "/npm/npm-virt/missing/-/missing-1.0.0.tgz").await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn virtual_download_new_version_pinning_excludes_proxy() {
+            // Dependency-confusion regression (new-version): the hosted member
+            // OWNS `internal-pkg` (has 1.0.0). The proxy upstream WOULD serve
+            // `internal-pkg@9.9.9` (the attacker's public publish). The
+            // virtual MUST 404 — pinning excludes the proxy for the owned
+            // name, for every version.
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let private = hosted_member_with_tarball(
+                &mocks,
+                "npm-private",
+                "internal-pkg",
+                "1.0.0",
+                "internal-pkg-1.0.0.tgz",
+                b"legit",
+                QuarantineStatus::Released,
+            );
+            let proxy = proxy_member(&mocks, "npm-proxy");
+            seed_upstream_tarball(&mocks, "internal-pkg", "9.9.9", b"ATTACKER-PAYLOAD");
+            virtual_member_repo(&mocks, "npm-virt", &[&private, &proxy]);
+
+            let res =
+                get_download(ctx, "/npm/npm-virt/internal-pkg/-/internal-pkg-9.9.9.tgz").await;
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "owned name: the attacker's proxy-only version is NOT served"
+            );
+        }
+
+        #[tokio::test]
+        async fn virtual_download_unowned_name_served_from_proxy() {
+            // Positive control for the pinning test: the hosted member does
+            // NOT own `leftpad`, so the proxy participates and serves it
+            // (verified pull). Proves the 404 above is pinning, not a broken
+            // proxy path.
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let private = hosted_member_with_tarball(
+                &mocks,
+                "npm-private",
+                "other",
+                "1.0.0",
+                "other-1.0.0.tgz",
+                b"x",
+                QuarantineStatus::Released,
+            );
+            let proxy = proxy_member(&mocks, "npm-proxy");
+            seed_upstream_tarball(&mocks, "leftpad", "1.0.0", b"LEFTPAD-BYTES");
+            virtual_member_repo(&mocks, "npm-virt", &[&private, &proxy]);
+
+            let res = get_download(ctx, "/npm/npm-virt/leftpad/-/leftpad-1.0.0.tgz").await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(&body[..], b"LEFTPAD-BYTES", "served from the proxy member");
+        }
+
+        #[tokio::test]
+        async fn virtual_download_proxy_member_tampered_surfaces_502() {
+            // An authoritative proxy member whose upstream tampers (advertised
+            // SRI disagrees with served bytes) surfaces its 502 verbatim — the
+            // walk does NOT fall through to a lower-priority member.
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let private = hosted_member_with_tarball(
+                &mocks,
+                "npm-private",
+                "other",
+                "1.0.0",
+                "other-1.0.0.tgz",
+                b"x",
+                QuarantineStatus::Released,
+            );
+            let proxy = proxy_member(&mocks, "npm-proxy");
+            // Advertise the SRI of `lying-bytes`, serve `actual-bytes`.
+            let url = "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz";
+            let json = packument_json("1.0.0", &sri_sha512(b"lying-bytes"), url);
+            mocks.upstream_proxy.insert_metadata("", "/evil", json);
+            mocks
+                .upstream_proxy
+                .insert_artifact("", url, b"actual-bytes".to_vec());
+            virtual_member_repo(&mocks, "npm-virt", &[&private, &proxy]);
+
+            let res = get_download(ctx, "/npm/npm-virt/evil/-/evil-1.0.0.tgz").await;
+            assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                res.headers().get("X-Hort-Reason").unwrap(),
+                "upstream-checksum-mismatch"
+            );
+        }
+
+        #[tokio::test]
+        async fn virtual_download_proxy_only_no_mapping_returns_404() {
+            // A proxy member with no upstream mapping cannot serve the
+            // coordinate (`NoUpstream`) → the walk continues; with no other
+            // member the virtual renders its own 404 (never a stray 502).
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let proxy = proxy_npm_repo("npm-proxy");
+            mocks.repositories.insert(proxy.clone());
+            // Deliberately NO `seed_mapping`.
+            virtual_member_repo(&mocks, "npm-virt", &[&proxy]);
+
+            let res = get_download(ctx, "/npm/npm-virt/leftpad/-/leftpad-1.0.0.tgz").await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND);
         }
     }
 

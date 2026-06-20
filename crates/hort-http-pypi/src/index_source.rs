@@ -74,7 +74,7 @@ use hort_app::use_cases::index_serve::{
     PerVersionPayload, PypiVersionFile, PypiVersionPayload, VersionEntry,
 };
 use hort_domain::entities::caller::CallerPrincipal;
-use hort_domain::entities::repository::Repository;
+use hort_domain::entities::repository::{Repository, RepositoryType};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_formats::pypi::projection::PypiSimpleIndexProjection;
 use hort_formats::pypi::PyPiFormatHandler;
@@ -541,6 +541,71 @@ pub(crate) fn projection_to_entries(
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Virtual (aggregating)
+// ---------------------------------------------------------------------------
+
+/// `IndexSource` impl for `RepositoryType::Virtual` (ADR 0031).
+///
+/// A thin shim over the shared
+/// [`VirtualResolutionUseCase::aggregate_virtual_index`](hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase::aggregate_virtual_index):
+/// it supplies only the per-member fetch closure (each member's OWN source
+/// via [`select_source`], threading the requested [`SimpleIndexFormat`] so a
+/// proxy member fetches the right upstream representation). The name-level
+/// pinning, authoritative-member merge, and the fail-closed member-failure
+/// classification all live once in `hort-app` (the dependency-confusion
+/// security boundary) — this crate cannot diverge it. The serve handler runs
+/// the unchanged filter pipeline + builder on the result; it never
+/// special-cases `Virtual`.
+///
+/// `resolve_members` yields only non-virtual members, so the
+/// `select_source(member, _)` recursion bottoms out at hosted/proxy.
+pub(crate) struct VirtualPypiSource {
+    /// Forwarded to each proxy member's source (hosted members ignore it).
+    pub format: SimpleIndexFormat,
+}
+
+#[async_trait]
+impl IndexSource for VirtualPypiSource {
+    #[tracing::instrument(skip(self, ctx, caller), fields(repo_key = %repo.key))]
+    async fn fetch(
+        &self,
+        ctx: &Arc<AppContext>,
+        repo: &Repository,
+        package_name: &str,
+        caller: Option<&CallerPrincipal>,
+    ) -> Result<IndexSourceOutput, AppError> {
+        let format = self.format;
+        let entries = ctx
+            .virtual_resolution_use_case
+            .aggregate_virtual_index(repo, caller, move |member| async move {
+                Ok(select_source(&member, format)
+                    .fetch(ctx, &member, package_name, caller)
+                    .await?
+                    .entries)
+            })
+            .await?;
+
+        Ok(IndexSourceOutput {
+            entries,
+            truncated: false,
+            canonical_name: package_name.to_string(),
+        })
+    }
+}
+
+/// Pick the [`IndexSource`] for `repo` by type — the single dispatch point
+/// the serve handler uses (so it stays virtual-agnostic) and that
+/// [`VirtualPypiSource`] reuses per member. `format` is forwarded to the
+/// proxy source (hosted ignores it; virtual re-threads it to members).
+pub(crate) fn select_source(repo: &Repository, format: SimpleIndexFormat) -> Box<dyn IndexSource> {
+    match repo.repo_type {
+        RepositoryType::Proxy => Box::new(ProxyPypiSource { format }),
+        RepositoryType::Virtual => Box::new(VirtualPypiSource { format }),
+        RepositoryType::Hosted | RepositoryType::Staging => Box::new(HostedPypiSource),
+    }
 }
 
 /// Test-/compat helper: project an in-memory simple-index body (HTML or
