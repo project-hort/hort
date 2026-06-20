@@ -88,17 +88,24 @@ jobs:
           # so we wait rather than fail-fast.
           DEADLINE=$(($(date +%s) + 30*60))
 
-          # Required image set. Each entry is "<registry>|<name>:<tag>".
-          # docker-publish.yml publishes the server image to ghcr.io under the
-          # project-hort org (the docker.io mirror was retired).
+          # Required artifact set. Each entry is "<registry>|<name>:<tag>".
+          # docker-publish.yml publishes the server + worker images AND the
+          # Helm chart to ghcr.io under the project-hort org (the docker.io
+          # mirror was retired). The chart references BOTH images, so a release
+          # that ships only the server (the v1.1.8 hort-web failure mode) must
+          # stay a draft — hence all three are gated here.
           IMAGES=(
             "ghcr.io|project-hort/hort-server:${VERSION}"
+            "ghcr.io|project-hort/hort-worker:${VERSION}"
+            "ghcr.io|project-hort/charts/hort-server:${VERSION}"
           )
 
-          # Common Accept headers cover OCI index, Docker manifest list,
-          # and Docker manifest v2 (different registries return different
+          # Common Accept headers cover OCI index + OCI single manifest (the
+          # latter required for the Helm chart, which `helm push` writes as an
+          # image.manifest.v1 artifact rather than an index), Docker manifest
+          # list, and Docker manifest v2 (different registries return different
           # default media types).
-          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.oci.image.manifest.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
 
           probe_ghcr() {
             local name="$1"; local tag="$2"
@@ -286,6 +293,23 @@ jobs:
           find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
           find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
           ls -la release-assets/
+
+      # Immutable-releases (a repo setting) freezes a release — and bars all
+      # asset uploads — the instant it is published. If a release for this tag
+      # already exists in a published state (e.g. one created via the GitHub
+      # "Draft a new release" UI, which makes the tag and a release together),
+      # the create step below would "find" it and be unable to upload, the
+      # failure that produced empty 0-asset releases for v0.9.0/0.9.2-beta.1.
+      # Delete any pre-existing release for this tag — keeping the git tag — so
+      # the create step always starts from a fresh, mutable draft. No-op when
+      # none exists; a published immutable release that cannot be deleted still
+      # leaves the run to fail loudly at the create step, same as before.
+      - name: Remove any pre-existing release for this tag (start from a clean draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false || true
 
       # Always create as a DRAFT first. GitHub's "Immutable releases" setting
       # freezes a release the moment it is published, so assets can only be

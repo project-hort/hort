@@ -48,25 +48,30 @@ ARG RUST_VERSION=1.94
 ARG TRIVY_VERSION=0.70.0
 ARG OSV_SCANNER_VERSION=2.3.8
 
-# SHA256 hashes of the upstream binaries we install. Mandatory upstream
-# verification requires every external download to be checksum-verified
-# against a value pinned at the call site — Trivy and osv-scanner are
-# no exception. When the
-# `*_VERSION` ARG above is bumped, the matching `*_SHA256` ARG MUST be bumped
-# to the new release's published checksum. Find them at:
-#   Trivy:       https://github.com/aquasecurity/trivy/releases (look for
-#                trivy_${VERSION}_checksums.txt and grep for
-#                "trivy_${VERSION}_Linux-64bit.tar.gz").
-#   osv-scanner: https://github.com/google/osv-scanner/releases (look for
-#                osv-scanner_SHA256SUMS and grep for
-#                "osv-scanner_linux_amd64").
+# SHA256 hashes of the upstream binaries we install, per target architecture.
+# Mandatory upstream verification requires every external download to be
+# checksum-verified against a value pinned at the call site — Trivy and
+# osv-scanner are no exception. The trivy / osv stages pick the matching pair
+# at build time from buildx's `TARGETARCH` (amd64 or arm64), so BOTH arch
+# checksums must be present for a multi-arch (`linux/amd64,linux/arm64`) build.
+# When a `*_VERSION` ARG above is bumped, ALL four `*_SHA256_*` ARGs MUST be
+# bumped to the new release's published checksums. Find them at:
+#   Trivy:       https://github.com/aquasecurity/trivy/releases — file
+#                trivy_${VERSION}_checksums.txt, lines
+#                "trivy_${VERSION}_Linux-64bit.tar.gz" (amd64) and
+#                "trivy_${VERSION}_Linux-ARM64.tar.gz" (arm64).
+#   osv-scanner: https://github.com/google/osv-scanner/releases — file
+#                osv-scanner_SHA256SUMS, lines "osv-scanner_linux_amd64"
+#                and "osv-scanner_linux_arm64".
 #
 # A wrong/stale SHA256 here causes `sha256sum -c -` in stages 2 and 3 to
 # exit non-zero, which aborts the build. That is the desired behaviour — a
 # silently-substituted scanner binary changes scan output, which the
 # operator depends on as part of the rejection contract.
-ARG TRIVY_SHA256=8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
-ARG OSV_SCANNER_SHA256=bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc
+ARG TRIVY_SHA256_AMD64=8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+ARG TRIVY_SHA256_ARM64=2f6bb988b553a1bbac6bdd1ce890f5e412439564e17522b88a4541b4f364fc8d
+ARG OSV_SCANNER_SHA256_AMD64=bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc
+ARG OSV_SCANNER_SHA256_ARM64=8158b18edd2d03b1a30d905ca91b032bc62262167be8f206c27114f08823e27c
 
 # ---------- Stage 1: builder ----------
 # Digest-pinned (B10/INFRA-7); Dependabot (docker ecosystem) bumps tag+digest.
@@ -105,28 +110,39 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Digest-pinned (B10/INFRA-7).
 FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS trivy
 
+# TARGETARCH is auto-populated by buildx from the build `--platform`
+# (amd64 / arm64). Declared here so the RUN below can map it to the
+# upstream asset suffix + matching pinned checksum.
+ARG TARGETARCH
 ARG TRIVY_VERSION
-ARG TRIVY_SHA256
+ARG TRIVY_SHA256_AMD64
+ARG TRIVY_SHA256_ARM64
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Aqua Security publishes Linux-64bit tarballs under a stable URL
-# scheme. Extract just the `trivy` binary and install it; the rest of
-# the tarball (LICENSE, contrib/, etc.) is dropped to keep the runtime
-# image lean. `install` sets executable mode + 0755 in one shot.
+# Aqua Security publishes per-arch Linux tarballs under a stable URL scheme
+# (Linux-64bit = amd64, Linux-ARM64 = arm64). Map buildx's TARGETARCH to the
+# asset suffix and the matching pinned checksum, then extract just the `trivy`
+# binary; the rest of the tarball (LICENSE, contrib/, etc.) is dropped to keep
+# the runtime image lean. `install` sets executable mode + 0755 in one shot.
 #
 # Verify the tarball SHA256 against the value pinned at the top of
 # this file BEFORE extracting. `sha256sum -c -` exits non-zero on
 # mismatch, which fails the build under `set -e`.
 RUN set -eu && \
+    case "${TARGETARCH}" in \
+      amd64) TRIVY_ASSET="Linux-64bit"; TRIVY_SHA256="${TRIVY_SHA256_AMD64}" ;; \
+      arm64) TRIVY_ASSET="Linux-ARM64"; TRIVY_SHA256="${TRIVY_SHA256_ARM64}" ;; \
+      *) echo "ERROR: unsupported TARGETARCH='${TARGETARCH}' (expected amd64|arm64)." >&2; exit 1 ;; \
+    esac && \
     if [ -z "${TRIVY_SHA256}" ] || [ "${TRIVY_SHA256}" = "__REPLACE_ME__" ]; then \
-        echo "ERROR: TRIVY_SHA256 build-arg is unset or still set to __REPLACE_ME__." >&2; \
+        echo "ERROR: Trivy SHA256 for ${TARGETARCH} is unset or still __REPLACE_ME__." >&2; \
         echo "       Look up the SHA256 in trivy_${TRIVY_VERSION}_checksums.txt and pass it via --build-arg." >&2; \
         exit 1; \
     fi && \
-    curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+    curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_${TRIVY_ASSET}.tar.gz" \
         -o /tmp/trivy.tar.gz && \
     echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/trivy.tar.gz -C /tmp trivy && \
@@ -137,29 +153,37 @@ RUN set -eu && \
 # Digest-pinned (B10/INFRA-7).
 FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS osv
 
+ARG TARGETARCH
 ARG OSV_SCANNER_VERSION
-ARG OSV_SCANNER_SHA256
+ARG OSV_SCANNER_SHA256_AMD64
+ARG OSV_SCANNER_SHA256_ARM64
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Google's osv-scanner releases ship as static x86_64 Linux binaries
-# under a stable URL pattern. No tarball — pull the binary directly
-# and chmod +x.
+# Google's osv-scanner ships static per-arch Linux binaries
+# (osv-scanner_linux_amd64 / osv-scanner_linux_arm64) under a stable URL
+# pattern — the asset suffix is exactly buildx's TARGETARCH. No tarball: pull
+# the binary directly, select the matching pinned checksum, and chmod +x.
 #
 # Verify the binary SHA256 against the value pinned at the top of
 # this file BEFORE chmod-ing. `sha256sum -c -` exits non-zero on
 # mismatch, which fails the build under `set -e`.
 RUN set -eu && \
-    if [ -z "${OSV_SCANNER_SHA256}" ] || [ "${OSV_SCANNER_SHA256}" = "__REPLACE_ME__" ]; then \
-        echo "ERROR: OSV_SCANNER_SHA256 build-arg is unset or still set to __REPLACE_ME__." >&2; \
+    case "${TARGETARCH}" in \
+      amd64) OSV_SHA256="${OSV_SCANNER_SHA256_AMD64}" ;; \
+      arm64) OSV_SHA256="${OSV_SCANNER_SHA256_ARM64}" ;; \
+      *) echo "ERROR: unsupported TARGETARCH='${TARGETARCH}' (expected amd64|arm64)." >&2; exit 1 ;; \
+    esac && \
+    if [ -z "${OSV_SHA256}" ] || [ "${OSV_SHA256}" = "__REPLACE_ME__" ]; then \
+        echo "ERROR: osv-scanner SHA256 for ${TARGETARCH} is unset or still __REPLACE_ME__." >&2; \
         echo "       Look up the SHA256 in osv-scanner_SHA256SUMS and pass it via --build-arg." >&2; \
         exit 1; \
     fi && \
     curl -fsSL -o /tmp/osv-scanner \
-        "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" && \
-    echo "${OSV_SCANNER_SHA256}  /tmp/osv-scanner" | sha256sum -c - && \
+        "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_${TARGETARCH}" && \
+    echo "${OSV_SHA256}  /tmp/osv-scanner" | sha256sum -c - && \
     install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner && \
     rm -f /tmp/osv-scanner
 
@@ -190,8 +214,9 @@ RUN apt-get update && \
 # (see `docker/Dockerfile.hort-server`). It ships:
 #   - `/etc/ssl/certs/ca-certificates.crt` (public CA roots — what
 #     osv-scanner and the Rust worker's reqwest both need),
-#   - `/lib/x86_64-linux-gnu/libc.so.6` and friends (glibc, matching
-#     the rust:slim builder's link target),
+#   - `/lib/<arch>-linux-gnu/libc.so.6` and friends (glibc, matching
+#     the rust:slim builder's link target for the same TARGETARCH —
+#     x86_64-linux-gnu on amd64, aarch64-linux-gnu on arm64),
 #   - the `nonroot` user at UID 65532 / GID 65532 (default `USER`).
 # It does NOT ship: shell, package manager, `pgrep`, `ps`. Liveness
 # is therefore checked via the worker's own `healthcheck` subcommand

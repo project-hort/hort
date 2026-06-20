@@ -142,17 +142,16 @@ Container image reference. The chart does not enforce image signatures
 itself; admission control (Kyverno / sigstore policy-controller /
 Connaisseur) verifies against `image.cosign.publicKey` if set.
 
-> **`image.repository` and `worker.image.repository` are placeholder
-> defaults** (`hort/hort-server` / `hort/hort-worker`). They must be
-> overridden to the canonical registry paths for a real install:
-> `ghcr.io/project-hort/hort-server` and
-> `ghcr.io/project-hort/hort-worker`. Leaving the bare placeholders
-> will fail with an image-pull error unless a local registry alias is
-> configured.
+> **`image.repository` and `worker.image.repository` default to the public
+> distribution images** (`ghcr.io/project-hort/hort-server` /
+> `ghcr.io/project-hort/hort-worker`), published by the GitHub release
+> pipeline. A bare `helm install` pulls these public images with no
+> override. Override only to point at a private registry mirror or a
+> locally-built image.
 
 | sub-key | type | default | required | notes |
 |---|---|---|---|---|
-| `image.repository` | string | `hort/hort-server` | yes | override at install time |
+| `image.repository` | string | `ghcr.io/project-hort/hort-server` | no | override only for a private mirror |
 | `image.tag` | string | `""` | no | empty resolves to `.Chart.appVersion` |
 | `image.pullPolicy` | enum | `IfNotPresent` | no | `Always` / `IfNotPresent` / `Never` |
 | `image.pullSecrets` | list | `[]` | no | required for private registries |
@@ -1029,7 +1028,7 @@ advisory-watch-tick, staging-sweep, etc.).
 | `worker.enabled` | boolean | `true` | no |
 | `worker.replicas` | integer | `1` | no |
 | `worker.workerIdOverride` | string | `""` | no |
-| `worker.image.repository` | string | `hort/hort-worker` | no |
+| `worker.image.repository` | string | `ghcr.io/project-hort/hort-worker` | no |
 | `worker.image.tag` | string | `""` | no (empty ⇒ `.Chart.appVersion`) |
 | `worker.image.pullPolicy` | enum | `IfNotPresent` | no |
 | `worker.resources` | object | `{cpu, memory}` | no |

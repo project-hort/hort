@@ -16,9 +16,11 @@
 # image signatures; consumers (Kyverno, sigstore policy-controller,
 # Connaisseur) verify against `image.cosign.publicKey` if set.
 image:
-  # ${REGISTRY}/${IMAGE_PREFIX}/hort-server is the publish target produced
-  # by the GitLab pipeline; operators override at install time.
-  repository: hort/hort-server
+  # Public distribution image published by the GitHub release pipeline
+  # (.github/workflows/docker-publish.yml). The GitLab pipeline publishes the
+  # same image to its internal mirror under ${REGISTRY}/${IMAGE_PREFIX}; mirror
+  # operators override `image.repository` at install time.
+  repository: ghcr.io/project-hort/hort-server
   # "" ⇒ Chart.appVersion (resolved in `_helpers.tpl`).
   tag: ""
   pullPolicy: IfNotPresent
@@ -800,11 +802,12 @@ worker:
   image:
     # Distinct from the main server image — the worker image bundles
     # the Trivy + osv-scanner CLI binaries on top of the standard Rust
-    # build stage. `${REGISTRY}/${IMAGE_PREFIX}/hort-worker` is the
-    # publish target produced by the GitLab pipeline's
-    # `build-images:hort-worker` job; operators override at install time
-    # (e.g. with a private registry mirror or their own pre-build).
-    repository: hort/hort-worker
+    # build stage. Public distribution image published by the GitHub
+    # release pipeline's `build-images` matrix; the GitLab pipeline
+    # publishes the same image to its internal mirror under
+    # `${REGISTRY}/${IMAGE_PREFIX}/hort-worker`. Operators override at
+    # install time (e.g. with a private registry mirror or their own pre-build).
+    repository: ghcr.io/project-hort/hort-worker
     # "" ⇒ Chart.appVersion (resolved in `_helpers.tpl`).
     tag: ""
     pullPolicy: IfNotPresent

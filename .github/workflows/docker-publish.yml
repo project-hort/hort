@@ -29,10 +29,18 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   SERVER_IMAGE: ${{ github.repository }}-server
+  WORKER_IMAGE: ${{ github.repository }}-worker
 
 jobs:
-  build-server:
-    name: Server (${{ matrix.platform }})
+  # Build EVERY published image (server + worker) on EVERY supported arch in a
+  # single matrix. The image axis (`server`/`worker`) and the platform axis
+  # (`amd64`/`arm64`) are independent, so a worker-specific build failure does
+  # not fail the server entries (`fail-fast: false`). The build/sign/attest
+  # logic lives once here and in `merge` below — both images stay in lockstep
+  # by construction, mirroring the GitLab `.docker` template that the
+  # `build-images:hort-server` / `build-images:hort-worker` twins extend.
+  build-images:
+    name: ${{ matrix.image }} (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -43,17 +51,31 @@ jobs:
       # directly). Empty on the public mirror → that step is skipped and
       # base images pull anonymously.
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      # Fully-qualified ghcr.io name for this matrix entry's image. Resolves
+      # to project-hort/hort-server or project-hort/hort-worker.
+      IMAGE_NAME: ${{ github.repository }}-${{ matrix.image }}
     strategy:
       fail-fast: false
+      # Both images build on both arches. The server is a pure-Rust build; the
+      # worker selects arch-appropriate Trivy + osv-scanner binaries via
+      # buildx's TARGETARCH (see docker/Dockerfile.worker). Each leg runs on a
+      # native runner (no QEMU): amd64 on ubuntu-latest, arm64 on
+      # ubuntu-24.04-arm. `fail-fast: false` keeps a per-leg failure from
+      # cancelling the others.
       matrix:
+        image: [server, worker]
+        platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
+            arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
-    outputs:
-      digest-amd64: ${{ steps.build.outputs.digest }}
-      digest-arm64: ${{ steps.build.outputs.digest }}
+            arch: arm64
+          - image: server
+            dockerfile: ./docker/Dockerfile.hort-server
+          - image: worker
+            dockerfile: ./docker/Dockerfile.worker
 
     steps:
       - name: Checkout
@@ -83,19 +105,19 @@ jobs:
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          file: ./docker/Dockerfile.hort-server
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=server-${{ matrix.platform }}
-          cache-to: type=gha,scope=server-${{ matrix.platform }},mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.image }}-${{ matrix.platform }},mode=max
           sbom: true
           provenance: mode=max
           build-args: |
@@ -111,7 +133,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: server-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          name: ${{ matrix.image }}-digests-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -119,7 +141,7 @@ jobs:
   scan-containers:
     name: Security Scan
     runs-on: ubuntu-24.04
-    needs: [build-server]
+    needs: [build-images]
     permissions:
       contents: read
       packages: read
@@ -206,23 +228,32 @@ jobs:
           echo "- **Policy**: CRITICAL / HIGH CVEs reported (informational; unfixed base-image CVEs do not block)" >> $GITHUB_STEP_SUMMARY
           echo "- **Server**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
 
-  merge-server:
-    name: Backend Multi-Arch Manifest
+  # One manifest-list merge + cosign-sign + provenance attestation per image.
+  # Matrixed over the same image axis as `build-images`; each entry fans in its
+  # own per-arch digests (`<image>-digests-*`) into a single multi-arch tag set.
+  merge:
+    name: ${{ matrix.image }} Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [build-server]
+    needs: [build-images]
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
       artifact-metadata: write   # emit the storage record for the pushed image
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [server, worker]
+    env:
+      IMAGE_NAME: ${{ github.repository }}-${{ matrix.image }}
 
     steps:
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: /tmp/digests
-          pattern: server-digests-*
+          pattern: ${{ matrix.image }}-digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -242,7 +273,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -254,30 +285,124 @@ jobs:
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}@sha256:%s ' *)
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
 
       - name: Inspect image
         id: inspect
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
-            ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Sign image with cosign (keyless)
         run: |
           cosign sign --yes \
-            ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}@${{ steps.inspect.outputs.digest }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.inspect.outputs.digest }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.inspect.outputs.digest }}
           push-to-registry: true
         continue-on-error: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PUBLISH-CHART: package and push the hort-server Helm chart as an OCI
+  # artifact to ghcr.io, mirroring the GitLab `helm:lint-and-publish` job. The
+  # chart lands at ghcr.io/<owner>/charts/hort-server:<version>. Runs after the
+  # images merge so a chart is never published pointing at images that failed
+  # to build. helm is preinstalled on the GitHub-hosted ubuntu runner image.
+  # ════════════════════════════════════════════════════════════════════════════
+  publish-chart:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    needs: [merge]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Resolve chart version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/v}" ]; then
+            # Tag push: vX.Y.Z[-pre] → X.Y.Z[-pre].
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            # workflow_dispatch: use the provided tag input, stripping any
+            # leading 'v'. The 'latest' sentinel is not a chart version.
+            VERSION="${INPUT_TAG#v}"
+          fi
+          if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::notice::'${VERSION}' is not a SemVer chart version (e.g. a 'latest' dispatch); skipping chart publish."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "Chart version: ${VERSION}"
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+
+      - name: Verify helm is available
+        if: steps.ver.outputs.publish == 'true'
+        run: helm version
+
+      - name: Log in to GitHub Container Registry (Helm OCI)
+        if: steps.ver.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "${GH_TOKEN}" | helm registry login "${REGISTRY}" --username "${ACTOR}" --password-stdin
+
+      # §3.4 invariant: on a SemVer tag the in-tree Chart.yaml must already
+      # declare the tag's version on BOTH `version` and `appVersion` (chart and
+      # binary are versioned together). `helm package --version/--app-version`
+      # overrides at publish time, but a stale Chart.yaml drifts from §3.4 for
+      # source-tree consumers (`helm install ./deploy/...`, `helm template`).
+      # Skipped on workflow_dispatch where the version is operator-supplied.
+      - name: Assert Chart.yaml matches tag (§3.4)
+        if: steps.ver.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          chart_version=$(grep -E '^version:' deploy/helm/hort-server/Chart.yaml \
+            | sed -E 's/^version:[[:space:]]*//;s/^"//;s/"$//')
+          chart_app_version=$(grep -E '^appVersion:' deploy/helm/hort-server/Chart.yaml \
+            | sed -E 's/^appVersion:[[:space:]]*//;s/^"//;s/"$//')
+          if [ "${chart_version}" != "${VERSION}" ] || [ "${chart_app_version}" != "${VERSION}" ]; then
+            echo "::error::Chart.yaml drifted from tag v${VERSION} (§3.4 invariant)."
+            echo "  Chart.yaml version    = ${chart_version}"
+            echo "  Chart.yaml appVersion = ${chart_app_version}"
+            echo "  Expected (tag minus 'v') = ${VERSION}"
+            echo "Bump deploy/helm/hort-server/Chart.yaml and re-tag."
+            exit 1
+          fi
+          echo "§3.4 invariant ok: Chart.yaml version + appVersion = ${VERSION}"
+
+      - name: Lint, package, and push chart
+        if: steps.ver.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          # values.yaml defaults are intentionally invalid (publicBaseUrl empty)
+          # so the schema fails on bare values; lint against test-values.yaml.
+          helm lint deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values.yaml
+          helm package deploy/helm/hort-server/ \
+            --app-version "${VERSION}" \
+            --version "${VERSION}"
+          helm push hort-server-*.tgz "oci://${REGISTRY}/${OWNER}/charts"
+          echo "Pushed chart to oci://${REGISTRY}/${OWNER}/charts/hort-server:${VERSION}"
+        env:
+          OWNER: ${{ github.repository_owner }}
 
   # ════════════════════════════════════════════════════════════════════════════
   # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually
@@ -301,19 +426,24 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: read
-    needs: [merge-server]
+    needs: [merge, publish-chart]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Probe ghcr.io manifests for expected semver tags
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SERVER_IMAGE: ${{ env.SERVER_IMAGE }}
+          WORKER_IMAGE: ${{ env.WORKER_IMAGE }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -u
           VERSION="${GITHUB_REF#refs/tags/v}"
           echo "Verifying ghcr.io semver tags for version: ${VERSION}"
 
-          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+          # The OCI single-manifest accept type is required for the Helm chart
+          # probe — `helm push` writes an `image.manifest.v1` artifact, not an
+          # index/manifest-list. Harmless for the multi-arch image probes.
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.oci.image.manifest.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
 
           probe_ghcr() {
             local name="$1"; local tag="$2"
@@ -329,10 +459,13 @@ jobs:
               "https://ghcr.io/v2/${name}/manifests/${tag}"
           }
 
-          # Tags this workflow promises to publish on a tag push. Mirror the
-          # metadata-action `tags:` blocks above.
+          # Everything this workflow promises to publish on a tag push: both
+          # multi-arch images (mirror the metadata-action `tags:` blocks above)
+          # and the Helm chart pushed by `publish-chart`.
           EXPECTED=(
             "${SERVER_IMAGE}:${VERSION}"
+            "${WORKER_IMAGE}:${VERSION}"
+            "${OWNER}/charts/hort-server:${VERSION}"
           )
 
           missing=()
@@ -348,25 +481,29 @@ jobs:
           done
 
           if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::Tag-triggered publish completed but some expected semver tags are not present on ghcr.io. Inspect the merge-* jobs for silent imagetools failures."
+            echo "::error::Tag-triggered publish completed but some expected artifacts are not present on ghcr.io. Inspect the merge / publish-chart jobs for silent imagetools / helm-push failures."
             printf '  - %s\n' "${missing[@]}"
             exit 1
           fi
-          echo "All expected ghcr.io semver tags present for ${VERSION}."
+          echo "All expected ghcr.io artifacts present for ${VERSION}."
 
   summary:
     name: Publish Summary
     runs-on: ubuntu-latest
     permissions: {}
-    needs: [merge-server]
+    needs: [merge, publish-chart]
     if: always()
     steps:
       - name: Summary
         run: |
-          echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY
+          echo "## Published Artifacts" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Server" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "### Images" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.WORKER_IMAGE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Helm Chart" >> $GITHUB_STEP_SUMMARY
+          echo "- \`oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hort-server\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
           echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC)" >> $GITHUB_STEP_SUMMARY
