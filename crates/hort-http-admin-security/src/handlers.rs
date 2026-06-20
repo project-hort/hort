@@ -58,9 +58,13 @@ pub struct ListParams {
 pub async fn get_repo_score(
     State(ctx): State<Arc<AppContext>>,
     Path(name): Path<String>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET reads the `Option<AuthenticatedPrincipal>` slot that
+    // `extract_optional_principal` writes (NOT the bare slot `require_principal`
+    // writes on writes); the outer `Option` tolerates the no-auth-layer test
+    // case → anonymous.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<(http::StatusCode, Json<SecurityScoreDto>), ApiError> {
-    let principal = extract_caller(principal.as_ref().map(|p| &p.0));
+    let principal = extract_caller(principal.as_deref().and_then(|opt| opt.as_ref()));
     let score = ctx
         .security_score_use_case
         .find_for_repo(&name, principal)
@@ -76,9 +80,12 @@ pub async fn get_repo_score(
 pub async fn list_repo_scores(
     State(ctx): State<Arc<AppContext>>,
     Query(params): Query<ListParams>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET reads the `Option<AuthenticatedPrincipal>` slot that
+    // `extract_optional_principal` writes; the outer `Option` tolerates the
+    // no-auth-layer test case → anonymous.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<(http::StatusCode, Json<SecurityScoreListDto>), ApiError> {
-    let principal = extract_caller(principal.as_ref().map(|p| &p.0));
+    let principal = extract_caller(principal.as_deref().and_then(|opt| opt.as_ref()));
     let limit = params.limit.unwrap_or(0);
     let page = ctx
         .security_score_use_case

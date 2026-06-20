@@ -399,7 +399,10 @@ async fn upload(
 async fn simple_root(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath(repo_key): BoundedPath<String>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET reads the `Option<AuthenticatedPrincipal>` slot that
+    // `extract_optional_principal` writes; the outer `Option` tolerates the
+    // no-auth-layer test case → anonymous.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap before this
     // handler body runs.
@@ -412,7 +415,10 @@ async fn simple_root(
     // returns the entire package roster of the repo.
     // Unwrap the `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`
     // for the use-case API.
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     let (_repo, names_list) = ctx
         .artifact_use_case
         .list_distinct_names_visible(&repo_key, actor)
@@ -461,7 +467,10 @@ async fn simple_project(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, project)): BoundedPath<(String, String)>,
     headers: HeaderMap,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET reads the `Option<AuthenticatedPrincipal>` slot that
+    // `extract_optional_principal` writes; the outer `Option` tolerates the
+    // no-auth-layer test case → anonymous.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap before this
     // handler body runs.
@@ -473,7 +482,10 @@ async fn simple_project(
     // the `Accept` header via `SimpleIndexFormat::from_accept`.
     // Unwrap the `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`
     // for the use-case API.
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     let format = simple_index::SimpleIndexFormat::from_accept(
         headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
     );
@@ -498,7 +510,10 @@ async fn simple_project(
 async fn download(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, project, filename)): BoundedPath<(String, String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET reads the `Option<AuthenticatedPrincipal>` slot that
+    // `extract_optional_principal` writes; the outer `Option` tolerates the
+    // no-auth-layer test case → anonymous.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs — a malicious client
@@ -511,7 +526,10 @@ async fn download(
     // fall through to the normal artifact download below.
     // Unwrap the `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`
     // for the use-case API.
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     if let Some(stripped) = filename.strip_suffix(".metadata") {
         // PEP 658 `.metadata` endpoint (PEP 658 + PEP 491). Dispatches
         // by `RepositoryType` to either the hosted CAS-backed serve

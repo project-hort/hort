@@ -143,12 +143,19 @@ async fn packument_unscoped(
     State(ctx): State<Arc<AppContext>>,
     Extension(trust): Extension<RequestTrust>,
     BoundedPath((repo_key, name)): BoundedPath<(String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET routes through `extract_optional_principal`, which writes the
+    // `Option<AuthenticatedPrincipal>` slot (NOT the bare slot that
+    // `require_principal` writes on writes). The outer `Option` tolerates the
+    // no-auth-layer case (e.g. unit tests that inject neither slot) → anonymous.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs.
     let pkg = NpmFormatHandler.normalize_name(&name);
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     dispatch_packument(&ctx, &repo_key, &pkg, &trust, actor).await
 }
 
@@ -156,7 +163,10 @@ async fn packument_scoped(
     State(ctx): State<Arc<AppContext>>,
     Extension(trust): Extension<RequestTrust>,
     BoundedPath((repo_key, scope, name)): BoundedPath<(String, String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See
+    // `packument_unscoped`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs.
@@ -164,7 +174,10 @@ async fn packument_scoped(
         return Err(validation_error("scoped npm name must start with '@'"));
     }
     let full = format!("{scope}/{name}");
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     dispatch_packument(&ctx, &repo_key, &full, &trust, actor).await
 }
 
@@ -190,7 +203,10 @@ async fn dispatch_packument(
 async fn download_unscoped(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, name, filename)): BoundedPath<(String, String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See
+    // `packument_unscoped`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs.
@@ -199,14 +215,20 @@ async fn download_unscoped(
     // clients following those URLs carry the stored form — re-normalising
     // here would break drift resilience under a non-idempotent plugin
     // update.
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     serve_tarball(&ctx, &repo_key, &name, &filename, actor).await
 }
 
 async fn download_scoped(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, scope, name, filename)): BoundedPath<(String, String, String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See
+    // `packument_unscoped`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs.
@@ -214,7 +236,10 @@ async fn download_scoped(
         return Err(validation_error("scoped npm name must start with '@'"));
     }
     let full = format!("{scope}/{name}");
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     serve_tarball(&ctx, &repo_key, &full, &filename, actor).await
 }
 
@@ -648,7 +673,9 @@ async fn do_publish(
     // gate with its existing 403 + `{"error":"insufficient permissions"}`
     // body, so the deny envelope on the WRITE permission stays verbatim.
     // Unwrap the `AuthenticatedPrincipal` newtype to
-    // `Option<&CallerPrincipal>`.
+    // `Option<&CallerPrincipal>`. WRITE path: `require_principal` writes the
+    // bare `AuthenticatedPrincipal` slot, so `as_deref()` (Extension→inner)
+    // yields the principal directly.
     let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
     let repo = ctx
         .repository_access_use_case
@@ -2561,6 +2588,94 @@ mod tests {
             assert_anti_enumeration_envelope(
                 &(private_status, private_body),
                 &(missing_status, missing_body),
+            );
+        }
+
+        /// Read-path principal-propagation regression. An authenticated
+        /// caller holding a Read grant on a PRIVATE repo MUST be able to
+        /// read its packument through the **production GET middleware
+        /// shape** — `Option<AuthenticatedPrincipal> = Some(..)`, which is
+        /// exactly what `extract_optional_principal` writes on GET/HEAD.
+        ///
+        /// The handler previously extracted `Option<Extension<
+        /// AuthenticatedPrincipal>>` — the *bare* `AuthenticatedPrincipal`
+        /// slot that only `require_principal` (the write path) populates.
+        /// On the GET path that slot is never written, so the principal was
+        /// silently dropped and every authenticated read fell back to
+        /// anonymous: private-repo reads 404'd even for a caller who was
+        /// explicitly granted Read. Injecting via `inject_optional_principal_some`
+        /// (NOT `inject_principal`) is load-bearing — it reproduces the GET
+        /// shape the bare-slot extractor cannot see.
+        #[tokio::test]
+        async fn authenticated_reader_get_packument_on_private_repo_succeeds() {
+            use hort_domain::entities::caller::CallerPrincipal;
+            use hort_domain::entities::managed_by::ManagedBy;
+            use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+
+            // RBAC enabled with a global Read grant for the `developer` claim.
+            let base = harness();
+            let read_grant = PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::Claims(vec!["developer".into()]),
+                repository_id: None,
+                permission: Permission::Read,
+                created_at: Utc::now(),
+                managed_by: ManagedBy::Local,
+                managed_by_digest: None,
+            };
+            let access = Arc::new(RepositoryAccessUseCase::new(
+                base.repositories.clone(),
+                RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
+                    RbacEvaluator::new(vec![read_grant]),
+                ))),
+                true,
+            ));
+            let h = TestHarness {
+                ctx: with_repository_access(&base.ctx, access),
+                artifacts: base.artifacts,
+                repositories: base.repositories,
+                storage: base.storage,
+                lifecycle: base.lifecycle,
+                curation_rules: base.curation_rules,
+            };
+
+            let repo = insert_private_repo(&h, "private-npm");
+            insert_tarball_artifact(
+                &h,
+                repo.id,
+                "secret-pkg",
+                "1.0.0",
+                "secret-pkg-1.0.0.tgz",
+                b"secret bytes",
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                QuarantineStatus::None,
+            );
+
+            let principal = CallerPrincipal {
+                user_id: Uuid::from_u128(0xCAFE),
+                external_id: "kc:carol".into(),
+                username: "carol".into(),
+                email: "carol@example.com".into(),
+                claims: vec!["developer".into()],
+                token_kind: None,
+                issued_at: Utc::now(),
+                token_cap: None,
+            };
+
+            let mut req = Request::get("/npm/private-npm/secret-pkg")
+                .header("host", "registry.example.com")
+                .body(Body::empty())
+                .unwrap();
+            hort_http_core::middleware::auth::test_support::inject_optional_principal_some(
+                &mut req, principal,
+            );
+
+            let resp = router(h.ctx.clone()).oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "authenticated reader holding a Read grant MUST read a private repo's \
+                 packument — the GET-path principal must be threaded, not dropped"
             );
         }
     }

@@ -106,7 +106,11 @@ async fn config_json(
     State(ctx): State<Arc<AppContext>>,
     Extension(trust): Extension<RequestTrust>,
     BoundedPath(repo_key): BoundedPath<String>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET routes through `extract_optional_principal`, which writes the
+    // `Option<AuthenticatedPrincipal>` slot (NOT the bare slot that
+    // `require_principal` writes on writes). The outer `Option` tolerates the
+    // no-auth-layer case (e.g. unit tests that inject neither slot) → anonymous.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap before this
     // handler body runs.
@@ -118,7 +122,10 @@ async fn config_json(
     // exists, here's its dl/api URL" — enough to confirm a guessed private
     // repo key.
     // Unwrap the `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`.
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     let _repo = ctx
         .repository_access_use_case
         .resolve(&repo_key, actor, AccessLevel::Read)
@@ -151,33 +158,45 @@ async fn config_json(
 async fn sparse_index(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, crate_name)): BoundedPath<(String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See `config_json`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs. Unwrap the
     // `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`.
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     serve_index(&ctx, &repo_key, &crate_name, actor).await
 }
 
 async fn sparse_index_with_first_char(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, first_char, crate_name)): BoundedPath<(String, String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See `config_json`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment (including `first_char`, which the handler itself
     // doesn't read but still protects logging/tracing). Unwrap the
     // `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`.
     let _ = first_char;
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     serve_index(&ctx, &repo_key, &crate_name, actor).await
 }
 
 async fn sparse_index_4plus(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, aa, bb, crate_name)): BoundedPath<(String, String, String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See `config_json`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment. `aa`/`bb` are index-layout segments the handler
@@ -185,7 +204,10 @@ async fn sparse_index_4plus(
     // keeps every extraction systematically capped. Unwrap the
     // `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`.
     let _ = (aa, bb);
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     serve_index(&ctx, &repo_key, &crate_name, actor).await
 }
 
@@ -229,7 +251,9 @@ async fn serve_index(
 async fn download(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath((repo_key, name, version)): BoundedPath<(String, String, String)>,
-    principal: Option<Extension<AuthenticatedPrincipal>>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See `config_json`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs.
@@ -267,7 +291,10 @@ async fn download(
     // access use case to inspect `repo_type` (mirrors the OCI prior art
     // at `crates/hort-http-oci/src/blobs.rs:260`).
     // Unwrap the `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`.
-    let actor = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
     let (_repo, artifact) = match ctx
         .artifact_use_case
         .find_visible_by_path(&repo_key, &artifact_path, actor)
@@ -3337,6 +3364,92 @@ mod tests {
             assert_anti_enumeration_envelope(
                 &(private_status, private_body),
                 &(missing_status, missing_body),
+            );
+        }
+
+        /// Positive counterpart to the anonymous-private-repo 404 tests: an
+        /// authenticated reader holding a Read grant MUST be able to read a
+        /// private repo's sparse index. This pins the GET-path principal-
+        /// threading fix.
+        ///
+        /// The GET read handlers route through `extract_optional_principal`,
+        /// which writes the `Option<AuthenticatedPrincipal>` extension slot —
+        /// exactly what `inject_optional_principal_some` reproduces here. The
+        /// handlers previously extracted `Option<Extension<AuthenticatedPrincipal>>`
+        /// (the *bare* slot only `require_principal` populates on writes), so on
+        /// GET the principal was silently dropped and every authenticated read
+        /// fell back to anonymous: a private-repo read 404'd even for a caller
+        /// explicitly granted Read. Injecting via `inject_optional_principal_some`
+        /// (NOT `inject_principal`) is load-bearing — it reproduces the GET
+        /// shape the bare-slot extractor cannot see.
+        #[tokio::test]
+        async fn authenticated_reader_get_sparse_index_on_private_repo_succeeds() {
+            use chrono::Utc;
+            use hort_domain::entities::caller::CallerPrincipal;
+            use hort_domain::entities::managed_by::ManagedBy;
+            use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+
+            // RBAC enabled with a global Read grant for the `developer` claim.
+            let base = harness();
+            let read_grant = PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::Claims(vec!["developer".into()]),
+                repository_id: None,
+                permission: Permission::Read,
+                created_at: Utc::now(),
+                managed_by: ManagedBy::Local,
+                managed_by_digest: None,
+            };
+            let access = Arc::new(RepositoryAccessUseCase::new(
+                base.repositories.clone(),
+                RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
+                    RbacEvaluator::new(vec![read_grant]),
+                ))),
+                true,
+            ));
+            let h = TestHarness {
+                ctx: with_repository_access(&base.ctx, access),
+                artifacts: base.artifacts,
+                repositories: base.repositories,
+                storage: base.storage,
+                curation_rules: base.curation_rules,
+            };
+
+            let repo = insert_private_repo(&h, "private-cargo");
+            insert_crate_artifact(
+                &h,
+                repo.id,
+                "secret-crate",
+                "1.0.0",
+                b"secret bytes",
+                QuarantineStatus::None,
+            );
+
+            let principal = CallerPrincipal {
+                user_id: Uuid::from_u128(0xCAFE),
+                external_id: "kc:carol".into(),
+                username: "carol".into(),
+                email: "carol@example.com".into(),
+                claims: vec!["developer".into()],
+                token_kind: None,
+                issued_at: Utc::now(),
+                token_cap: None,
+            };
+
+            let mut req = Request::get("/cargo/private-cargo/se/cr/secret-crate")
+                .header("host", "registry.example.com")
+                .body(Body::empty())
+                .unwrap();
+            hort_http_core::middleware::auth::test_support::inject_optional_principal_some(
+                &mut req, principal,
+            );
+
+            let resp = router(h.ctx.clone()).oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "authenticated reader holding a Read grant MUST read a private repo's \
+                 sparse index — the GET-path principal must be threaded, not dropped"
             );
         }
     }

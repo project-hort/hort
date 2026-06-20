@@ -1,0 +1,23 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: npm-virt-internal-permissive
+spec:
+  # Per-repo operator opt-out of quarantine-by-default. The virtual-repo
+  # native test (scripts/native-tests/scenarios/clients/virtual.sh) publishes
+  # to this PRIVATE hosted member and immediately reads it back THROUGH the
+  # virtual (npm-virt-e2e). Without a 0s quarantine the member's freshly
+  # published package stays quarantined (the 24h DEFAULT_QUARANTINE_DURATION_SECS
+  # fallback, since no ScanPolicy scoped it), so the virtual aggregation sees no
+  # servable owner entry, treats the name as unowned, falls through to the public
+  # proxy, and 404s. Mirrors npm-e2e-permissive.yaml / npm-public-permissive.yaml
+  # (every publish-then-immediately-read E2E repo carries this opt-out).
+  scope:
+    repository: npm-virt-internal
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  # Provenance off for permissive e2e (no per-ingest verify job).
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}
