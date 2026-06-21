@@ -1,0 +1,57 @@
+[package]
+name = "hort-http-maven"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort inbound HTTP adapter for the Maven / Gradle repository protocol"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain    = { path = "../hort-domain" }
+hort-app       = { path = "../hort-app" }
+hort-formats   = { path = "../hort-formats" }
+hort-http-core = { path = "../hort-http-core" }
+
+axum         = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+bytes        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
+url          = { workspace = true }
+metrics      = { workspace = true }
+thiserror    = { workspace = true }
+# The internal `MavenIndexSource` trait
+# (`crates/hort-http-maven/src/serve.rs`) is `pub(crate)` and dispatched
+# dynamically per `RepositoryType` in the metadata serve handler.
+# `async-trait` is the lowest-friction way to ship an async trait with
+# dyn-dispatch; the workspace already pins it. Mirrors hort-http-cargo.
+async-trait  = { workspace = true }
+# On-demand checksum-sidecar generation (Item 7): `.sha256` short-circuits
+# to the CAS ContentHash, but `.sha1`/`.sha512`/`.md5` stream the stored
+# blob through one of these hashers. These are PURE hashing crates, NOT
+# adapters — a format crate may depend on them (it must not depend on
+# `hort-adapters-*`/`sqlx`/`reqwest`). `hex` hex-encodes the digest.
+sha1         = { workspace = true }
+sha2         = { workspace = true }
+md-5         = { workspace = true }
+hex          = { workspace = true }
+
+[dev-dependencies]
+tokio                       = { workspace = true, features = ["test-util"] }
+hort-app                      = { path = "../hort-app", features = ["test-support"] }
+hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+metrics-util                = { workspace = true, features = ["debugging"] }
+sha2                        = { workspace = true }
+# Inline test module drives routers through tower's ServiceExt::oneshot.
+tower                       = { workspace = true }
+# `AuthContext::Enabled` fixtures in the test harness wrap the RBAC
+# evaluator snapshot in Arc<ArcSwap<_>>.
+arc-swap                    = { workspace = true }
+# Tests scope a Prometheus recorder to verify metric emission paths fire.
+metrics-exporter-prometheus = { workspace = true }

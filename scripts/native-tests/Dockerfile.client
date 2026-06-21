@@ -45,6 +45,32 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Python publish/build tooling baked in so scenarios never pip-install at runtime.
 # (The base image's pip is not externally-managed, so no --break-system-packages.)
 RUN python3 -m pip install --no-cache-dir build twine
+# JDK + Maven + Gradle for the maven/gradle scenario (clients/maven.sh:
+# `mvn deploy`/`dependency:get` + `gradle publish`/resolve). openjdk-17 is the
+# bookworm default JDK and matches the scenario's maven.compiler.target=17.
+# Maven + Gradle are installed from PINNED, CHECKSUM-VERIFIED distributions
+# (Debian's maven package is stale and pulls a large dep tree). The daemon is
+# disabled at runtime via `gradle --no-daemon` in the scenario.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-17-jdk-headless unzip \
+    && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ARG MAVEN_VERSION=3.9.9
+ARG MAVEN_SHA512=a555254d6b53d267965a3404ecb14e53c3827c09c3b94b5678835887ab404556bfaf78dcfe03ba76fa2508649dca8531c74bca4d5846513522404d48e8c4ac8b
+RUN curl -fsSL -o /tmp/maven.tar.gz \
+      "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+    && echo "${MAVEN_SHA512}  /tmp/maven.tar.gz" | sha512sum -c - \
+    && tar -xzf /tmp/maven.tar.gz -C /opt \
+    && ln -s "/opt/apache-maven-${MAVEN_VERSION}/bin/mvn" /usr/local/bin/mvn \
+    && rm -f /tmp/maven.tar.gz
+ARG GRADLE_VERSION=8.10.2
+ARG GRADLE_SHA256=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26
+RUN curl -fsSL -o /tmp/gradle.zip \
+      "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
+    && echo "${GRADLE_SHA256}  /tmp/gradle.zip" | sha256sum -c - \
+    && unzip -q /tmp/gradle.zip -d /opt \
+    && ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
+    && rm -f /tmp/gradle.zip
 # The hort-cli admin client (built in stage 1) — used by the quarantine +
 # scanning scenarios that drive admin/release/rescan flows over HTTP.
 COPY --from=cli-builder /usr/local/bin/hort-cli /usr/local/bin/hort-cli

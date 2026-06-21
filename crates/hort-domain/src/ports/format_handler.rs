@@ -606,6 +606,33 @@ pub trait FormatHandler: Send + Sync {
         let _ = (upstream_url, package, version);
         Ok(Vec::new())
     }
+
+    /// Resolve a mutable (re-deployable) version request to the concrete,
+    /// immutable stored path among `available_paths`. Maven SNAPSHOT is the
+    /// only v1 implementer: a request for the base
+    /// `…/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.jar` resolves to the highest
+    /// timestamped build `foo-1.0-20231201.120000-3.jar` for the matching
+    /// (classifier, extension). `available_paths` are the stored logical
+    /// paths under the same (group, artifact, base-version) the use case
+    /// loaded from the artifact group.
+    ///
+    /// Default `Ok(None)` — immutable-version formats never resolve, and a
+    /// non-mutable request also returns `None` (caller treats the requested
+    /// path as already concrete). This is the MultiFileArtifact capability's
+    /// `resolve_mutable_version` member, realised on the flat trait.
+    ///
+    /// WIT-mappable as written (strings + `list<string>` only — no format
+    /// structs cross the boundary): `func(requested-path: string,
+    /// available-paths: list<string>) -> result<option<string>, string>`.
+    /// See ADR 0005 (MultiFileArtifact capability group).
+    fn resolve_mutable_version(
+        &self,
+        requested_path: &str,
+        available_paths: &[&str],
+    ) -> DomainResult<Option<String>> {
+        let _ = (requested_path, available_paths);
+        Ok(None)
+    }
 }
 
 /// One declared runtime dependency from an
@@ -825,6 +852,40 @@ mod tests {
         assert!(DefaultsOnlyHandler
             .classify_group_member(&coords, &coords.path)
             .is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // `resolve_mutable_version` default impl
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn default_resolve_mutable_version_returns_none() {
+        // Default for every format without an explicit override — immutable
+        // formats never resolve a mutable request, and a non-mutable request
+        // also yields `None` (the caller treats the requested path as already
+        // concrete). Maven SNAPSHOT is the only v1 implementer. Regression
+        // guard: changing the default to return `Some` would silently start
+        // rewriting requested paths for every handler that inherits it.
+        let r = DefaultsOnlyHandler.resolve_mutable_version(
+            "com/x/x/1.0-SNAPSHOT/x-1.0-SNAPSHOT.jar",
+            &["com/x/x/1.0-SNAPSHOT/x-1.0-20231201.120000-1.jar"],
+        );
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn default_resolve_mutable_version_ignores_inputs() {
+        // The default does not inspect requested_path or available_paths —
+        // an empty set, a populated set, and a non-snapshot request all
+        // yield `Ok(None)`. Pins the no-inspection contract for reviewers.
+        for available in [
+            &[][..],
+            &["a/b/1.0/b-1.0.jar"][..],
+            &["x-20231201.120000-1.jar", "x-20231201.120000-2.jar"][..],
+        ] {
+            let r = DefaultsOnlyHandler.resolve_mutable_version("anything", available);
+            assert!(matches!(r, Ok(None)));
+        }
     }
 
     // -------------------------------------------------------------------

@@ -9,7 +9,21 @@ HTTP-crate topology is
 Use the Cargo implementation (`crates/hort-formats/src/cargo.rs` +
 `crates/hort-http-cargo/`) as the reference — it's the smallest end-to-end
 example, and it demonstrates the full wiring without the OCI
-stateful-upload complexity.
+stateful-upload complexity. For a **multi-file** format (one published unit =
+several sibling files under one coordinate, server-generated metadata,
+on-demand sidecars, mutable SNAPSHOT versions), the worked example is
+**Maven/Gradle** (`crates/hort-formats/src/maven/` + `crates/hort-http-maven/`),
+covered in the dedicated sections below
+([ADR 0032](../../adr/0032-maven-gradle-multi-file-handler.md)).
+
+This guide is the comprehensive `FormatHandler` reference: the
+[full method catalog](#the-full-formathandler-method-catalog) (every trait
+method, its default, and when to override it), the
+[verification matrix](#verification-matrix-case-a-case-b-and-the-sha-1-floor)
+(the only proxy-verification shapes that exist), and — for multi-file formats —
+the [artifact-groups](#multifileartifact-artifact-groups-maven-worked-example),
+[on-demand sidecar](#server-generated-checksum-sidecars), and
+[mutable-version](#snapshot--mutable-versions) sections.
 
 ## Prerequisites
 
@@ -180,15 +194,29 @@ fn parse_upstream_checksum(
 
 The handler builds `VerifiedIngestRequest::UpstreamPublished` from the
 parsed checksum. The use case rehashes (SHA-256 always, plus SHA-512
-via `Sha512HashingRead` when the algorithm is SHA-512) and compares.
+via `Sha512HashingRead` when the algorithm is SHA-512, or SHA-1 via
+`Sha1HashingRead` for the floor — see Case B-floor below) and compares.
 
-**There is no third case.** A format that cannot do either is by
-design not proxiable; operators who need such content publish it via
-direct upload (`ingest_direct`) and own out-of-band verification. Do
-not invent an "unverified proxy" path — the type system rejects it
-(`VerifiedIngestRequest` has no `Unverified` variant), and
+**Case B-floor — SHA-1 transfer-verification floor (Maven only).** A
+narrow, format-scoped variant of Case B: a format whose upstream
+guarantees **only** a SHA-1 digest on every artifact (Maven Central
+publishes only `.sha1`/`.md5` universally; `.sha256`/`.sha512` are
+per-publisher and absent on most artifacts). SHA-1 is permitted **strictly
+as a transfer-verification floor** with opportunistic upgrade —
+[ADR 0033](../../adr/0033-sha1-upstream-transfer-verification-floor.md).
+This is **not** a general relaxation; see the verification matrix and the
+checklist note below.
+
+**There is no fourth case.** A format that cannot do A, B, or the SHA-1
+floor (where the floor applies) is by design not proxiable; operators who
+need such content publish it via direct upload (`ingest_direct`) and own
+out-of-band verification. Do not invent an "unverified proxy" path — the
+type system rejects it (`VerifiedIngestRequest` has no `Unverified`
+variant), and
 [ADR 0006](../../adr/0006-mandatory-upstream-verification.md)
-explicitly closes that loophole.
+explicitly closes that loophole. The full decision table is the
+[verification matrix](#verification-matrix-case-a-case-b-and-the-sha-1-floor)
+below.
 
 **Wire pull-through coalescing.** Every upstream-
 fetch call site in `hort-http-<format>` — metadata fetch, blob fetch,
@@ -238,10 +266,16 @@ file), and `crates/hort-http-oci/src/manifests.rs` +
 - [ ] SRI / base64-encoded checksums (npm) are decoded to bytes and
       hex-encoded before constructing `UpstreamPublishedChecksum`.
       The struct stores hex.
-- [ ] SHA-1 fallback is **not** added. SHA-1 is collision-broken
-      (SHAttered, 2017) and is not a supported verification algorithm.
-      Legacy artifacts with only `dist.shasum` cannot be proxied;
-      users upload them directly.
+- [ ] SHA-1 fallback is **not** added **where a stronger signal exists**.
+      SHA-1 is collision-broken (SHAttered, 2017). For npm — which
+      publishes `dist.integrity` (SHA-512) alongside the legacy
+      `dist.shasum` (SHA-1) — falling back to SHA-1 is a needless
+      downgrade: legacy artifacts with only `dist.shasum` cannot be
+      proxied; users upload them directly. The **only** exception is the
+      Case B-floor (Maven), where the upstream guarantees *only* SHA-1 —
+      there SHA-1 is the floor, not a fallback from something stronger.
+      See [ADR 0033](../../adr/0033-sha1-upstream-transfer-verification-floor.md)
+      before adding `HashAlgorithm::Sha1` to any new format.
 
 ### 3 — Create the `hort-http-{format}` crate skeleton
 
@@ -535,6 +569,263 @@ cargo tree -p hort-http-myfmt --edges normal --prefix none \
 ```
 
 Coverage: `hort-domain` and `hort-app` stay at 100 %; other crates at ≥ 85 %.
+
+## The full `FormatHandler` method catalog
+
+`FormatHandler` (`crates/hort-domain/src/ports/format_handler.rs`) is a
+**flat trait with defaults**: three required methods and ~18 with inert
+defaults you override only when your format needs them. A handler that does
+nothing but identity + path parsing (the direct-upload-only Generic case)
+implements the three required methods and inherits everything else. The table
+below is the complete catalog, grouped by concern. "Default" is what a
+non-overriding handler gets; "Override when" is the trigger.
+
+### Identity, path, and registration
+
+| Method | Default | Override when |
+|---|---|---|
+| `format_key(&self) -> &str` | *required* | always — the format's stable key (`"maven"`, `"npm"`). |
+| `parse_download_path(&self, path) -> DomainResult<ArtifactCoords>` | *required* | always — parse the wire path into coords; populate `name_as_published` (raw form) for the drift-resilience fallback. Maven additionally tags a `maven_path_kind` marker on `coords.metadata` to distinguish file / A-level / V-level shapes. |
+| `normalize_name(&self, name) -> String` | *required* | always — the identity/lookup key. Maven is the identity function (case-sensitive); PyPI folds `[-_.]→-` + lowercase. Its output is part of the **wire contract** (see [normalisation stability](../explanation/format-handlers.md#normalisation-stability)). |
+| `collision_key(&self, name) -> Option<String>` | `None` | the registry enforces a registration-uniqueness fold *distinct* from the lookup key. **cargo only** (crates.io's `-`/`_`-folded uniqueness). npm/pypi/maven inherit `None`. |
+| `build_artifact_logical_path(&self, name, version, filename) -> DomainResult<String>` | `Err(Validation)` (fail-loud) | the format has a logical-path projection. The inverse of `parse_download_path`; every write site calls it so read/write can never diverge. `filename` is REQUIRED for multi-distribution formats (pypi, maven), ignored by single-artifact formats (npm/cargo derive it). OCI inherits the error default (digest/descriptor-addressed). |
+
+### Metadata-persistence strategy
+
+| Method | Default | Override when |
+|---|---|---|
+| `metadata_expected_max_bytes(&self) -> usize` | `64 * 1024` | the format's real-world metadata exceeds 64 KB (PyPI 128 KB, npm 5 MB). The middle of the three-layer size model (DB ceiling ≥ format-declared ≥ operator override). |
+| `metadata_strategy(&self) -> MetadataStrategy` | `Inline` | the p99 payload occasionally crosses the 1 MB event-payload ceiling — flip to `HashReference { inline_threshold_bytes }` (npm). |
+| `extract_metadata_summary(&self, full) -> Value` | identity | `metadata_strategy` is `HashReference`: extract the subset that must stay inline for index rendering. |
+
+### Groups / multi-file (MultiFileArtifact)
+
+| Method | Default | Override when |
+|---|---|---|
+| `classify_group_member(&self, coords, path) -> Option<GroupMembership>` | `None` | files group under one logical identity (Maven GAV, OCI image). Return `Some` (with identity-only `group_coords`, a `role`, and `is_primary`) for content files, `None` for non-members (sidecars, generated metadata). See the [artifact-groups section](#multifileartifact-artifact-groups-maven-worked-example). |
+| `resolve_mutable_version(&self, requested_path, available_paths) -> DomainResult<Option<String>>` | `Ok(None)` | the format has mutable (re-deployable) versions. **Maven SNAPSHOT only.** See [SNAPSHOT / mutable versions](#snapshot--mutable-versions). |
+
+### Upstream verification (pull-through)
+
+| Method | Default | Override when |
+|---|---|---|
+| `protocol_native_integrity(&self) -> bool` | `false` | the protocol embeds the digest in the request (OCI). Case A. |
+| `upstream_checksum_metadata_path(&self, coords) -> Option<String>` | `None` | Case B / B-floor: the path of the metadata body carrying the published checksum (npm packument, PyPI per-version JSON, cargo NDJSON, Maven `.sha1` sidecar = the floor). Returning `Some` mandates overriding `parse_upstream_checksum` too. |
+| `parse_upstream_checksum(&self, body: &mut dyn Read, coords) -> DomainResult<UpstreamPublishedChecksum>` | `Err(Invariant)` | Case B / B-floor: parse the body → checksum. **Streaming** (`&mut dyn Read`, ADR 0026). No soft-fail — a malformed body or a well-formed body without a checksum is `Err(Validation)` → 502. |
+
+### Dependency extraction / prefetch (transitive cascade)
+
+These back the scheduled/transitive prefetch cascade. Every one is an inert
+default today for Maven (Maven prefetch is deferred — ADR 0000 open-items);
+npm/cargo/pypi implement them.
+
+| Method | Default | Override when |
+|---|---|---|
+| `extract_upstream_versions(&self, body: &mut dyn Read) -> DomainResult<Vec<String>>` | `Ok(vec![])` | scheduled prefetch-tick needs the upstream version set (npm packument keys, cargo NDJSON `vers`, PyPI anchors). **Streaming** (ADR 0026). |
+| `upstream_metadata_path(&self, package) -> Option<String>` | `None` | the version-AGNOSTIC metadata-index path (npm packument, cargo sparse-index entry, PyPI simple index). |
+| `upstream_metadata_accept(&self) -> Vec<String>` | `vec![]` | the metadata fetch needs an `Accept` header (PyPI PEP 691 JSON negotiation). |
+| `extract_dependency_specs(&self, content: &mut dyn Read) -> DomainResult<Vec<DependencySpec>>` | `Ok(vec![])` | the format declares runtime deps inside its archive (npm `package.json`, cargo `Cargo.toml`, PyPI `METADATA`). **Runtime classes only** — never dev/test/peer. **Streaming** (ADR 0026, archive-aware). |
+| `resolve_range_max(&self, range, available) -> DomainResult<Option<String>>` | `Ok(None)` | the format has a version-range grammar (`^1.2`, `>=2,<3`, `[1.0,2.0)`). Range-max only, not a SAT solver. |
+| `build_pull_url(&self, upstream_url, package, version) -> DomainResult<Vec<String>>` | `Ok(vec![])` | the leaf prefetch needs composed pull URL(s) (npm tarball path, cargo `…/download`). PyPI returns `vec![]` (re-fetches the per-version JSON instead). |
+
+### SBOM / content extraction
+
+| Method | Default | Override when |
+|---|---|---|
+| `extract_sbom(&self, coords, format_metadata, payload) -> DomainResult<Option<Sbom>>` | `Ok(None)` | the format has a machine-readable dependency manifest (npm/PyPI/cargo). Pure over its inputs; `PayloadAccess` is per-call. |
+| `extract_wheel_metadata_bytes(&self, coords, payload) -> DomainResult<Option<Bytes>>` | `Ok(None)` | **PyPI wheels only** (PEP 658 `.metadata` endpoint). Every other format keeps the inert default. |
+
+A regression guard in `crates/hort-formats/src/lib.rs` pins which formats
+*override* vs *inherit* the group/mutable-version members:
+`classify_group_member_default_tests` + `resolve_mutable_version_default_tests`
+assert pypi/cargo/npm inherit the `None`/`Ok(None)` defaults, and
+`maven_overrides_multifile_defaults_tests` asserts Maven overrides both. Adding a
+new multi-file format means adding it to the overrides guard.
+
+## Verification matrix: Case A, Case B, and the SHA-1 floor
+
+Upstream-checksum verification is a type-system invariant
+([ADR 0006](../../adr/0006-mandatory-upstream-verification.md)): every proxy
+fetch verifies, or the format is not proxiable. There are exactly three shapes —
+pick the one your protocol publishes. The CAS key is **always SHA-256**,
+independent of which digest verified the transfer ([ADR 0003](../../adr/0003-streaming-enforced-cas.md)).
+
+| | **Case A — protocol-native** | **Case B — upstream-published metadata** | **Case B-floor — SHA-1 floor** |
+|---|---|---|---|
+| Example | OCI | cargo, npm, PyPI | **Maven / Gradle** |
+| Digest source | embedded in the request (`/v2/{n}/blobs/sha256:<d>`) + `Docker-Content-Digest` | a fetched metadata body (NDJSON / packument / per-version JSON) | a fetched checksum sidecar (`.sha512`→`.sha256`→`.sha1`) |
+| Override | `protocol_native_integrity → true` | `upstream_checksum_metadata_path` + `parse_upstream_checksum` | same as Case B; the serve path negotiates strength |
+| Algorithm | SHA-256 | SHA-256 (npm decodes SRI; SHA-512 via `Sha512HashingRead`) | strongest available; SHA-1 only as the floor (`Sha1HashingRead`) |
+| Request variant | `VerifiedIngestRequest::ProtocolNative` | `VerifiedIngestRequest::UpstreamPublished` | `VerifiedIngestRequest::UpstreamPublished` |
+| All digests absent/malformed | n/a | 502 (no soft-fail) | 502 (no soft-fail) |
+
+**Why the SHA-1 floor is a separate, scoped case — not a general relaxation.**
+Maven Central (and every Maven-layout repo) guarantees only the `.sha1` (+
+`.md5`) sidecar universally; `.sha256`/`.sha512` are per-publisher and absent on
+most artifacts. SHA-1 is therefore the *only universally-available* digest on
+the Maven surface — not a downgrade from a stronger one. The npm `dist.shasum`
+no-SHA-1 rule is **unchanged**: npm has `dist.integrity` (SHA-512), so for npm
+SHA-1 is still forbidden.
+
+The Maven serve-path pull-through (`crates/hort-http-maven/src/upstream_pull.rs`)
+fetches the sidecar **preferring strength** — `.sha512` → `.sha256` → `.sha1` —
+and uses the strongest one that fetches AND parses to a valid digest; a
+present-but-malformed stronger sidecar falls through to the next (a corrupt
+`.sha512` must not block a valid `.sha1`). Only when all three are absent or
+malformed is the artifact unproxiable → 502. The threat-model bound (SHA-1 is
+collision-broken; the floor catches transport corruption + casual tampering;
+TLS verified against the system trust store + `HORT_EXTRA_CA_BUNDLE` is the real
+transport-integrity control; this matches what every Maven client already does)
+is recorded in
+[ADR 0033](../../adr/0033-sha1-upstream-transfer-verification-floor.md). Do not
+generalise the floor to a new format without re-running that analysis in an ADR.
+
+## MultiFileArtifact artifact-groups (Maven worked example)
+
+A **multi-file** format publishes several sibling files under one logical
+coordinate. Maven is the worked example: a release of `com.example:foo:1.0`
+publishes `foo-1.0.pom`, `foo-1.0.jar`, `foo-1.0-sources.jar`,
+`foo-1.0-javadoc.jar` (+ the Gradle `.module` GMM descriptor), each with its
+own checksum sidecars, plus a generated `maven-metadata.xml`. The realisation
+is the **`classify_group_member` push model** on the existing
+[`ArtifactGroup`](../explanation/domain-model.md) aggregate
+([ADR 0032](../../adr/0032-maven-gradle-multi-file-handler.md)) — not an
+`artifact_files` pull. The flow:
+
+1. **Each file is ingested independently** via `ingest_direct` — its own
+   immutable CAS artifact, keyed on its stored logical path. PUT order is **not
+   guaranteed**: a sidecar can arrive before its artifact, a `.pom` before the
+   `.jar`. The handler must accept any file before/without its siblings.
+
+2. **Post-commit, the ingest path asks `classify_group_member(coords, path)`.**
+   `IngestUseCase::ingest_inner` calls it after the artifact row + event are
+   committed. Return:
+
+   ```rust
+   fn classify_group_member(&self, coords: &ArtifactCoords, path: &str)
+       -> Option<GroupMembership>
+   {
+       // None for non-members: checksum sidecars and maven-metadata.xml.
+       // Some for real content files, with the GROUP's canonical coords,
+       // the file's role, and whether it is the group's primary file.
+       Some(GroupMembership {
+           group_coords: /* identity-only: name, name_as_published,
+                            version, format; path EMPTY; metadata Null */,
+           role: "jar".into(),           // pom/jar/sources/javadoc/module
+           is_primary: true,             // Maven: only the binary jar
+       })
+   }
+   ```
+
+   **Canonicalisation contract (load-bearing):** `group_coords` carries ONLY
+   the identity fields with `path` empty and `metadata` Null. Divergence
+   creates *duplicate groups*. For a SNAPSHOT, the group version is the **base**
+   `X-SNAPSHOT` (not the timestamped form), so every timestamped build collapses
+   into one group.
+
+3. **The membership is pushed to `ArtifactGroupUseCase::add_member`**, which
+   creates the group on the first member and attaches thereafter. Race-handling
+   and primary-role assignment (the first `is_primary = true` member fixes the
+   group's `primary_role`; a later disagreeing primary is a `Conflict`) are the
+   aggregate's, reused unchanged. The handler never calls `add_member` itself —
+   the ingest hook does.
+
+The group is therefore a **bottom-up projection assembled from members**, not a
+manifest the handler enumerates top-down. The member role is a free `String` on
+`GroupMembership`; the metrics layer classifies it via
+`GroupMemberRole::classify` (`crates/hort-app/src/metrics.rs` — Maven's
+`pom`/`jar`/`sources`/`javadoc` + Gradle's `module`). The
+`is_primary` choice matters: Maven marks only the binary `jar` primary because
+packaging is not knowable from the path alone (it lives in the POM XML, which a
+pure path-level handler does not parse), and a pom-only artifact (parent POM,
+BOM) simply has no primary until a jar arrives — the aggregate tolerates an
+unset `primary_role`.
+
+**Server-generated `maven-metadata.xml`.** Maven's per-artifact version index is
+*generated*, never trusted from the client — a client-PUT copy is accepted and
+discarded (it could advertise quarantined versions). GET regenerates it through
+the same Source → Filter → Builder index pipeline the SimpleIndex formats use:
+a new `MavenMetadataXmlBuilder` (`crates/hort-formats/src/maven/metadata.rs`,
+an `IndexBuilder` impl) consumes post-filter `VersionEntry`s
+(`NonServableStatusFilter` drops non-servable versions, `IndexModeFilter`
+applies the repo's index mode) sorted by `MavenVersionOrdering`. The builder is
+**pure** — no I/O, no tracing, no system clock (`<lastUpdated>` is derived from
+the inputs). It carries a Maven-only `PerVersionPayload::Maven` variant on the
+shared spine (the Nth of npm/pypi/cargo, not a new generic field) and dispatches
+on the case: `MavenVersionPayload::Artifact` → A-level
+(`<latest>`/`<release>`/`<versions>`), `::Snapshot` → V-level
+(`<snapshot>`/`<snapshotVersions>`).
+
+## Server-generated checksum sidecars
+
+A multi-file format like Maven serves a checksum sidecar
+(`<file>.{sha1,sha256,sha512,md5}`) for every file. Hort generates these **on
+demand from the stored bytes** — it never serves a client-uploaded copy
+(`crates/hort-http-maven/src/sidecar.rs`). The rules:
+
+- **`.sha256` short-circuits to the CAS `ContentHash`** — free, no read, no
+  compute, no cache entry. It is already on the artifact row.
+- **`.sha1`/`.sha512`/`.md5` stream the stored blob through the hasher** and
+  memoise the hex in a new **Evictable** ephemeral keyspace
+  `mavensum:{content_hash}:{algorithm}` (register it in `KEYSPACE_REGISTRY` and
+  update the `ephemeral_keyspace_exhaustive` guard — mirror the
+  `cargo_index_proj:` pattern). The digest of immutable content is itself
+  immutable, so the cache is purely recomputable: loss under memory pressure
+  costs a re-hash, never correctness, and it bounds a re-hash
+  CPU-amplification vector (repeated `.sha1` GETs of a large blob hash it at
+  most once until eviction).
+- **No precompute at ingest, nothing persisted on the artifact, no
+  `payload_metadata` write, no per-format branch in the shared ingest path** —
+  sidecars are purely a serve-path concern. (Conflating server-computed digests
+  into the client-supplied ingest input is the bug this avoids.)
+- **Client sidecar PUTs are accepted (`200`) and discarded** — the generated
+  value is authoritative, so a sidecar always matches the served bytes for any
+  algorithm a client requests (the Nexus/Artifactory model).
+- **Quarantine inheritance.** A sidecar GET resolves the **same target file**
+  and applies the **same status gate** as the file GET *before* any CAS read or
+  cache lookup: quarantined → 503 + `Retry-After`; rejected / indeterminate →
+  403; only released/None serves the digest. A sidecar therefore never leaks the
+  digest (or the existence beyond the file's own 503) of a held version.
+
+The generated `maven-metadata.xml` gets sidecars too — but over the
+*regenerated* bytes (the document is recomputed per request, so there is no
+immutable content hash to cache on; its sidecars are recomputed fresh, including
+`.sha256`).
+
+## SNAPSHOT / mutable versions
+
+Most formats publish only immutable versions, so a version request is always
+already concrete — they inherit `resolve_mutable_version → Ok(None)`. Maven
+SNAPSHOT is the one v1 format with **mutable** versions:
+
+- A `-SNAPSHOT` deploy uploads **unique timestamped files**
+  (`foo-1.0-20231201.120000-3.jar` + sidecars + `.pom`) and a V-level
+  `maven-metadata.xml`. Hort stores the timestamped files as group members under
+  the **base** version `1.0-SNAPSHOT` (`classify_group_member` canonicalises the
+  group coords to the base; the file's own stored `path` keeps the timestamped
+  name).
+- **V-level `maven-metadata.xml` GET** is server-generated from the stored
+  timestamped members: `<snapshot><timestamp><buildNumber>` for the highest
+  build, and `<snapshotVersions>` mapping each `(classifier, extension)` to its
+  resolved `value` and `updated`. Two timestamp formats are distinct and must
+  NOT be unified: `<snapshot><timestamp>` = `yyyyMMdd.HHmmss` (dotted);
+  `<updated>`/`<lastUpdated>` = `yyyyMMddHHmmss` (no separators).
+- **Unresolved-SNAPSHOT GET** (`foo-1.0-SNAPSHOT.jar`) loads the base version's
+  stored timestamped paths and calls
+  `resolve_mutable_version(requested_path, available_paths)`, which picks the
+  highest `(timestamp, buildNumber)` build matching the requested
+  `(classifier, extension)` — the **unique resolution key** is
+  `(classifier, extension)`, not the base version (different classifiers can
+  carry different timestamps). The resolved concrete path is then served through
+  the normal exact-path lookup + quarantine gate, so a resolved-but-held build
+  still 503s/403s.
+
+`resolve_mutable_version` is WIT-mappable as written (strings + `list<string>`,
+no format structs cross the boundary), so it maps cleanly onto the future WASM
+boundary (ADR 0005). The snapshot-filename grammar (timestamped-build parse +
+resolution) lives in `crates/hort-formats/src/maven/snapshot.rs` — the
+format-layer home, keeping all Maven-specific logic behind the trait + the
+inbound crate.
 
 ## What you will *not* do
 

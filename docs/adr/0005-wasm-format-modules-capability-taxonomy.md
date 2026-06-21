@@ -16,6 +16,8 @@ Format handlers are **modules selected by a capability taxonomy**, with deploy-t
 - **SimpleIndex** (npm, PyPI, Cargo, …): realised by the `IndexBuilder` + `BuildContext` spine in `hort-formats`/`hort-app`.
 - **SignedIndex** (Debian, RPM), **MultiFileArtifact** (Maven, Go), **ProtocolNativeIntegrity** (OCI), **StatefulUpload** (OCI blob upload, Git LFS).
 
+**Realisation note (MultiFileArtifact — shipped).** MultiFileArtifact is realised today via the `classify_group_member` → `GroupMembership` → `ArtifactGroup` **push model** on the compiled-in `FormatHandler` trait (each uploaded file is classified post-commit and pushed to the group aggregate, bottom-up), NOT the original `{artifact_files, primary_file, …}` sketch above. **Maven/Gradle is the shipped instance** ([ADR 0032](0032-maven-gradle-multi-file-handler.md)): its realised members are `classify_group_member`, `build_artifact_logical_path`, and `resolve_mutable_version`, all WIT-mappable as written (strings + `list<string>`; no format structs cross the boundary). WASM remains the future target boundary — the realised members map cleanly onto it.
+
 WASM modules run in a wasmtime sandbox, receive only declared capabilities, and reach all I/O (storage, event log) exclusively through host-provided ports — never direct network/filesystem/DB access. Stateful-upload protocols (OCI, Git LFS) may remain compiled-in (Tier C) where the request/response Core interface cannot model them.
 
 ## Consequences

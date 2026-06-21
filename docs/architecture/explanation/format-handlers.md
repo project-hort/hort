@@ -76,22 +76,29 @@ component "hort-http-npm" as npm_h <<done>>
 component "hort-formats::npm\n(NpmFormatHandler)" as npm_f <<done>>
 component "hort-http-oci" as oci_h <<done>>
 component "hort-formats::oci\n(OciFormatHandler)" as oci_f <<done>>
+component "hort-http-maven\n(serves Maven + Gradle)" as maven_h <<done>>
+component "hort-formats::maven\n(MavenFormatHandler)" as maven_f <<done>>
 component "WASM host\n(wasmtime + WIT)" as wasm <<planned>>
 component "Tier A simple formats\n(helm, rubygems, ...)" as tiera <<planned>>
-component "Tier B signed / multi-file\n(debian, rpm, maven, go)" as tierb <<planned>>
+component "Tier B signed / multi-file\n(debian, rpm, go)" as tierb <<planned>>
 
 pypi_h  --> pypi_f  : parse_download_path
 cargo_h --> cargo_f : parse_download_path
 npm_h   --> npm_f   : parse_download_path
 oci_h   --> oci_f   : OCI coords built explicitly\nby the /v2/* classifier
+maven_h --> maven_f : parse_download_path\n+ classify_group_member\n+ resolve_mutable_version
 wasm --> tiera
 wasm --> tierb
 @enduml
 ```
 
-PyPI, Cargo, npm, and OCI are wired in today. `hort-server::http::build_router_with_oci_config`
+PyPI, Cargo, npm, OCI, and Maven/Gradle are wired in today.
+`hort-server::http::build_router_with_oci_config`
 nests each per-format crate's `routes()` under its path prefix
-(`/cargo`, `/npm`, `/pypi`) and merges OCI's `/v2/*` subtree. The plan
+(`/cargo`, `/npm`, `/pypi`, `/maven` — the last serves both
+`RepositoryFormat::Maven` and `RepositoryFormat::Gradle`) and merges OCI's
+`/v2/*` subtree. Maven is the first **MultiFileArtifact** format
+([ADR 0032](../../adr/0032-maven-gradle-multi-file-handler.md)); the plan
 from here:
 
 1. WASM modules loaded from `$WASM_PLUGIN_DIR` replace the compiled-in
@@ -232,8 +239,8 @@ class SignedIndex {
 }
 
 class MultiFileArtifact {
-  artifact_files
-  primary_file
+  classify_group_member
+  build_artifact_logical_path
   resolve_mutable_version
 }
 
@@ -261,7 +268,7 @@ Each format declares the groups it implements via its module manifest:
 | Format(s) | Groups |
 |---|---|
 | npm, PyPI, Cargo, Helm, NuGet, RubyGems, Conda, Composer, Hex, Pub, Terraform, Ansible, CRAN | Core + SimpleIndex |
-| Maven | Core + MultiFileArtifact |
+| Maven, **Gradle** (Maven-handler alias) | Core + MultiFileArtifact |
 | Go | Core + SimpleIndex + MultiFileArtifact |
 | Debian, RPM, Alpine | Core + SimpleIndex + SignedIndex |
 | OCI / Docker | Core + ProtocolNativeIntegrity + StatefulUpload |
@@ -270,6 +277,52 @@ Each format declares the groups it implements via its module manifest:
 Three migration tiers correspond to these groupings: Tier A (simple
 index — ~14 formats), Tier B (signed or multi-file — ~4 formats),
 Tier C (stateful — OCI, Git LFS).
+
+### MultiFileArtifact, as built (Maven / Gradle)
+
+MultiFileArtifact is **shipped** — Maven (and Gradle, which is a Maven-handler
+alias serving the identical wire protocol) is the first realisation, compiled-in
+in `hort-formats::maven` + `hort-http-maven`
+([ADR 0032](../../adr/0032-maven-gradle-multi-file-handler.md)). The capability's
+realised members differ from the original ADR 0005 sketch
+(`{artifact_files, primary_file, …}`) — the as-built realisation is authoritative:
+
+- **`classify_group_member` (a push model, not an `artifact_files` pull).** Each
+  uploaded file is ingested independently as its own immutable CAS artifact;
+  the ingest path's **post-commit** hook then asks
+  `handler.classify_group_member(coords, path)`, which returns a
+  `GroupMembership { group_coords, role, is_primary }` for real content files
+  (Maven: `pom` / `jar` / `sources` / `javadoc` / `module`) and `None` for
+  checksum sidecars and the generated `maven-metadata.xml`. That membership is
+  pushed to `ArtifactGroupUseCase::add_member`, which creates the
+  [`ArtifactGroup`](domain-model.md) aggregate on the first member and attaches
+  thereafter. The group is a **projection assembled bottom-up from members**,
+  not a manifest the handler enumerates top-down — so files can arrive in any
+  PUT order. `group_coords` carries only the GAV identity (the trait's
+  canonicalisation contract); `is_primary` fixes the group's `primary_role`
+  (Maven marks only the binary `jar` primary).
+- **`build_artifact_logical_path` (read/write path symmetry).** The single
+  logical-path constructor — `parse_download_path`'s inverse — so every write
+  site and the read lookup produce the same stored path. Maven: GAV + filename
+  ⇄ `{group-path}/{artifact}/{version}/{filename}`.
+- **`resolve_mutable_version`.** Resolves a mutable (re-deployable) version
+  request to the concrete immutable stored path among the group's members. Maven
+  SNAPSHOT is the only v1 implementer: a request for the base
+  `…/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.jar` resolves to the highest
+  `(timestamp, buildNumber)` timestamped build matching the requested
+  `(classifier, extension)`. Default `Ok(None)` — immutable-version formats
+  never resolve.
+
+`maven-metadata.xml` (A-level + V-level) is **server-generated** through the same
+Source → Filter → Builder index pipeline the SimpleIndex formats use (a new
+`MavenMetadataXmlBuilder` consuming filtered `VersionEntry`s ordered by
+`MavenVersionOrdering`), and checksum sidecars are **generated on demand** from
+the stored bytes (`.sha256` = the CAS hash; `.sha1`/`.sha512`/`.md5` streamed
+through the hasher, memoised in the Evictable `mavensum:` keyspace, inheriting
+the target file's quarantine status). Client-PUT metadata and sidecars are
+accepted-and-discarded — the server copy is authoritative. See the
+[format-implementer guide](../how-to/add-a-format-handler.md) for the worked
+walkthrough and ADR 0032 for the full decision.
 
 ## Upstream verification
 

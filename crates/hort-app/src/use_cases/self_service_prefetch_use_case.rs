@@ -720,6 +720,20 @@ fn ordering_for_format(format: &RepositoryFormat) -> &'static (dyn VersionOrderi
         // at gate 3 (OCI) or returns `UnsupportedFormat` from the
         // upstream port (so the planner sees `version = Some(_)` and
         // bypasses the ordering selection altogether).
+        //
+        // Maven is unreachable here TODAY: `hort-formats-upstream`
+        // rejects Maven `list_versions` with
+        // `UpstreamFetchError::UnsupportedFormat`, so the self-service
+        // planner never consults this ordering for a Maven repo and the
+        // wildcard `&NPM` default is dead for Maven. A `MavenVersionOrdering`
+        // exists (`index_serve_filter`) but is consumed only by the Maven
+        // serve/builder path. **Coupling (design §4(d)):** enabling Maven
+        // prefetch (Phase-2) MUST add the Maven arm HERE *and* to
+        // `prefetch_tick::ordering_for_format` *and* to the
+        // `hort-formats-upstream` dispatch + handler version-discovery —
+        // together. Adding upstream Maven discovery alone would route
+        // Maven through this wildcard and silently mis-order it with
+        // npm-semver, with no test to catch it.
         _ => &NPM,
     }
 }

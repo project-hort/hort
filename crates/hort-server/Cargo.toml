@@ -36,6 +36,7 @@ hort-http-cargo        = { path = "../hort-http-cargo" }
 hort-http-npm          = { path = "../hort-http-npm" }
 hort-http-pypi         = { path = "../hort-http-pypi" }
 hort-http-oci          = { path = "../hort-http-oci" }
+hort-http-maven        = { path = "../hort-http-maven" }
 # Admin security-score REST surface
 # (`/api/v1/repositories/:name/security-score` + `/api/v1/security-score`).
 # Same adapter-free invariant as the per-format crates above.

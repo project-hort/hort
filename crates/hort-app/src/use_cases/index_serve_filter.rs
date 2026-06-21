@@ -872,6 +872,476 @@ fn pep440_postpredev_key(v: &ParsedPep440Version) -> (u8, u8, u64, u8, u64, u8, 
 }
 
 // ---------------------------------------------------------------------------
+// MavenVersionOrdering — Maven ComparableVersion ordering
+// ---------------------------------------------------------------------------
+
+/// Maven version ordering — a faithful port of Maven's
+/// [`ComparableVersion`][cv] algorithm (the shipped `maven-artifact`
+/// 3.9.x implementation; the "Version Order Specification" in Maven's
+/// `pom.html`). Behaviour was cross-checked against real `maven-artifact`
+/// 3.9.11 over the full official vector set.
+///
+/// Maven ordering is **not** semver: there is no special-casing of
+/// `+build` metadata, and the qualifier vocabulary and trailing-null
+/// trimming are Maven-specific. The algorithm:
+///
+/// 1. **Lowercase** the whole string — comparison is case-insensitive
+///    (`3.2-ALPHA1` == `3.2-alpha1`).
+/// 2. **Tokenise** into a tree of `Int`/`Str`/`List` items. `.` continues
+///    the current list; `-` flushes the token and opens a new nested
+///    sub-list. `.` and `-` are the ONLY separators — `_` is *not* a
+///    separator (it is an ordinary qualifier character, so `1_0` parses to
+///    `1-_`, not `1.0`; this matches the cited `ComparableVersion.java`,
+///    which only branches on `.` and `-`). A digit↔letter transition with
+///    no separator *also* splits — and, for the `.X`/letter→digit case,
+///    opens a sub-list (Maven's "treat `.X` as `-X` for any string
+///    qualifier"). Empty tokens become numeric `0`.
+/// 3. **Classify** each token: all-ASCII-digits → numeric (arbitrary
+///    precision); else → qualifier. Aliases are applied in the qualifier
+///    constructor: `ga`/`final`/`release` → `""`; `cr` → `rc`; and a
+///    single-char `a`/`b`/`m` → `alpha`/`beta`/`milestone` *when it is
+///    immediately followed by a digit* (so `a1` = `alpha-1`, but a bare
+///    trailing `a` stays an unknown qualifier).
+/// 4. **Trim trailing nulls** at the end of every sub-list (Maven's
+///    `normalize`): from the end, drop null items (numeric `0`, the empty
+///    `""`-equivalent qualifier, and empty/all-null lists), stopping at
+///    the first non-null *scalar* (trailing nested lists are recursed
+///    into and skipped past). Hence `1.ga` == `1-0` == `1.0` == `1`.
+/// 5. **Compare** token-by-token; the shorter list compares its remaining
+///    items against `null` (inverted when the null is on the left).
+///
+/// Qualifier order (the canonical `QUALIFIERS` list):
+/// `alpha < beta < milestone < rc(=cr) < snapshot < (""=ga=final=release) < sp`.
+/// An unknown qualifier sorts *after* every known one, then lexically
+/// (Maven encodes it as `"{len}-{qualifier}"`, which collates after every
+/// single-digit known index). A qualifier sorts *before* a numeric at the
+/// same position (`1.K < 1.7`).
+///
+/// **Robustness:** the algorithm is total over all input — it never
+/// panics. Numeric tokens are compared as arbitrary-precision decimals
+/// (leading zeros stripped, then length-then-lexical), which exactly
+/// reproduces Maven's `IntItem`/`LongItem`/`BigIntegerItem` magnitude-tier
+/// cascade without a bignum dependency (a value needing a wider tier has
+/// strictly more digits, so length-compare orders the tiers; equal length
+/// compares lexically == numerically).
+///
+/// **Wiring:** consumed by the Maven serve/builder path only (constructed
+/// directly into the index builder's `ordering`). It is deliberately
+/// **not** registered in either `ordering_for_format` selector — Maven
+/// scheduled/self-service prefetch is deferred (design §4(d), §15).
+///
+/// [cv]: https://maven.apache.org/pom.html#version-order-specification
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MavenVersionOrdering;
+
+/// Self-bounding cap on the byte length of either input to
+/// [`MavenVersionOrdering::compare`].
+///
+/// The `ComparableVersion` parse opens one nested `List` level per `-`
+/// separator, and the downstream `normalize`/`is_null`/`compare` recurse to
+/// that nesting depth. A pathological version (e.g. tens of thousands of
+/// `-`) would recurse deep enough to overflow the thread stack — a SIGABRT
+/// that is process-wide and uncatchable, not a recoverable panic. This guard
+/// makes the ordering panic-/overflow-safe **independent of any caller**: an
+/// over-cap input falls back to a non-recursive byte-lexical compare.
+///
+/// In practice every real request is already kept far under this cap by
+/// `MAX_ROUTE_PARAM_BYTES` (512) in `hort-http-core`'s `BoundedPath`
+/// extractor, and a legitimate Maven version is orders of magnitude shorter
+/// still. This constant is the *local, self-contained* invariant so the
+/// ordering's totality does not depend on that upstream extractor being
+/// present. The value (1024) sits comfortably below the recursion-overflow
+/// floor and far above any real Maven version.
+///
+/// Over-cap inputs are pathological and never legitimate, so the cross-cap
+/// fallback's consistency with the structured order is immaterial — the
+/// contract this guard upholds is "total + never panics" (the fallback is
+/// itself a total order, and `x` vs `x` is `Equal`).
+const MAVEN_VERSION_PARSE_MAX_BYTES: usize = 1024;
+
+impl VersionOrdering for MavenVersionOrdering {
+    fn compare(&self, a: &str, b: &str) -> Ordering {
+        // Self-bounding guard (see `MAVEN_VERSION_PARSE_MAX_BYTES`): if either
+        // input exceeds the cap, fall back to a deterministic, non-recursive
+        // byte-lexical compare rather than the depth-recursive structured
+        // parse. This keeps `compare` total and panic/overflow-safe even if a
+        // caller has not bounded its input.
+        if a.len() > MAVEN_VERSION_PARSE_MAX_BYTES || b.len() > MAVEN_VERSION_PARSE_MAX_BYTES {
+            return a.as_bytes().cmp(b.as_bytes());
+        }
+        let pa = MavenItem::parse(a);
+        let pb = MavenItem::parse(b);
+        pa.compare(Some(&pb))
+    }
+}
+
+/// A parsed Maven version item — a port of `ComparableVersion`'s `Item`
+/// hierarchy (`IntItem`/`LongItem`/`BigIntegerItem` collapsed into one
+/// arbitrary-precision `Int`, plus `Str` and `List`).
+///
+/// The three numeric Java tiers collapse to a single decimal-string `Int`
+/// because the cross-tier compare rules are pure magnitude ordering and a
+/// leading-zero-stripped decimal string carries that magnitude in its
+/// (length, lexical) order. See the type docs above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MavenItem {
+    /// Numeric token, stored leading-zero-stripped (`"0"` is canonical
+    /// zero — the numeric-null sentinel). Arbitrary precision.
+    Int(String),
+    /// Qualifier token (already lowercased + aliased).
+    Str(String),
+    /// A (possibly nested) list of items.
+    List(Vec<MavenItem>),
+}
+
+/// The canonical Maven qualifier ordering table. The release-equivalent
+/// position (`""` / `ga` / `final` / `release`) is [`MAVEN_RELEASE_INDEX`].
+const MAVEN_QUALIFIERS: [&str; 7] = [
+    "alpha",     // 0
+    "beta",      // 1
+    "milestone", // 2
+    "rc",        // 3
+    "snapshot",  // 4
+    "",          // 5  (== ga == final == release)
+    "sp",        // 6
+];
+
+/// Index in [`MAVEN_QUALIFIERS`] of the release-equivalent qualifier
+/// (`""`). A qualifier whose key is below this sorts before "nothing"
+/// (a `null` pad); equal sorts equal; above sorts after.
+const MAVEN_RELEASE_INDEX: usize = 5;
+
+/// Compare two qualifiers by their Maven `comparableQualifier` keys.
+fn maven_compare_qualifiers(a: &str, b: &str) -> Ordering {
+    maven_comparable_qualifier(a).cmp(&maven_comparable_qualifier(b))
+}
+
+/// Maven's `comparableQualifier`: a lexically-comparable key for a
+/// qualifier. Known qualifiers map to their index (`"0".."6"`); an
+/// unknown qualifier maps to `"{len}-{qualifier}"` so it sorts *after*
+/// every known one (because `QUALIFIERS.len() == 7 > 6`), then lexically.
+///
+/// The `ga`/`final`/`release` → `""` and `cr` → `rc` aliases are applied
+/// in [`maven_string_value`] (the `StringItem` constructor), so by the
+/// time a qualifier reaches here it is already `""` / `rc` / etc.
+fn maven_comparable_qualifier(qualifier: &str) -> String {
+    match MAVEN_QUALIFIERS.iter().position(|&q| q == qualifier) {
+        Some(idx) => idx.to_string(),
+        None => format!("{}-{}", MAVEN_QUALIFIERS.len(), qualifier),
+    }
+}
+
+/// Maven's `RELEASE_VERSION_INDEX` — the comparable key of the empty
+/// qualifier, used when comparing a qualifier against `null` (nothing).
+fn maven_release_version_index() -> String {
+    MAVEN_RELEASE_INDEX.to_string()
+}
+
+/// Compare two leading-zero-stripped decimal digit strings as
+/// arbitrary-precision non-negative integers. The canonical form has no
+/// leading zeros (except the single `"0"`), so the longer string is the
+/// larger number and equal-length strings compare digit-by-digit
+/// lexically == numerically. This reproduces Maven's
+/// `IntItem`/`LongItem`/`BigIntegerItem` magnitude-tier cascade exactly
+/// (a value needing a wider tier has strictly more digits) without a
+/// bignum dependency.
+fn maven_int_cmp(a: &str, b: &str) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Strip leading zeros, returning Maven's `stripLeadingZeroes` canonical
+/// form: `"0"` for an empty/all-zero string, otherwise the digits from
+/// the first non-zero.
+fn maven_strip_leading_zeros(buf: &str) -> String {
+    if buf.is_empty() {
+        return "0".to_string();
+    }
+    match buf.find(|c| c != '0') {
+        Some(pos) => buf[pos..].to_string(),
+        None => "0".to_string(), // all zeros → canonical "0"
+    }
+}
+
+impl MavenItem {
+    /// Parse a version string into the root `List` item (Maven's
+    /// `parseVersion` + the `normalize` pass).
+    fn parse(input: &str) -> MavenItem {
+        let lower = input.to_lowercase();
+        let mut root = maven_parse_version(&lower);
+        maven_normalize(&mut root);
+        MavenItem::List(root)
+    }
+
+    /// Maven `Item.isNull`. `Int` zero, the empty/release-equivalent
+    /// `Str` (`""` after aliasing), and an empty/all-null `List` are null.
+    fn is_null(&self) -> bool {
+        match self {
+            MavenItem::Int(d) => d == "0",
+            // After aliasing, ga/final/release are already "" — but the
+            // `isNull` predicate is "comparableQualifier == release index"
+            // exactly, so a qualifier whose key equals index 5 is null.
+            MavenItem::Str(s) => maven_comparable_qualifier(s) == maven_release_version_index(),
+            MavenItem::List(items) => items.iter().all(MavenItem::is_null),
+        }
+    }
+
+    /// Maven `Item.compareTo(Item)`. `other == None` means "compare
+    /// against null" (a missing item on the other side / end of list).
+    fn compare(&self, other: Option<&MavenItem>) -> Ordering {
+        match self {
+            MavenItem::Int(_) => self.int_compare(other),
+            MavenItem::Str(_) => self.str_compare(other),
+            MavenItem::List(_) => self.list_compare(other),
+        }
+    }
+
+    fn int_compare(&self, other: Option<&MavenItem>) -> Ordering {
+        let MavenItem::Int(value) = self else {
+            unreachable!("int_compare on non-int")
+        };
+        let Some(item) = other else {
+            // vs null: 1.0 == 1, 1.1 > 1.
+            return if value == "0" {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            };
+        };
+        match item {
+            MavenItem::Int(other_value) => maven_int_cmp(value, other_value),
+            // 1.1 > 1-sp (Str) ; 1.1 > 1-1 (List).
+            MavenItem::Str(_) | MavenItem::List(_) => Ordering::Greater,
+        }
+    }
+
+    fn str_compare(&self, other: Option<&MavenItem>) -> Ordering {
+        let MavenItem::Str(value) = self else {
+            unreachable!("str_compare on non-str")
+        };
+        let Some(item) = other else {
+            // vs null: 1-rc < 1, 1-ga == 1.
+            return maven_comparable_qualifier(value).cmp(&maven_release_version_index());
+        };
+        match item {
+            // 1.any < 1.1.
+            MavenItem::Int(_) => Ordering::Less,
+            MavenItem::Str(other_value) => maven_compare_qualifiers(value, other_value),
+            // 1.any < 1-1.
+            MavenItem::List(_) => Ordering::Less,
+        }
+    }
+
+    fn list_compare(&self, other: Option<&MavenItem>) -> Ordering {
+        let MavenItem::List(items) = self else {
+            unreachable!("list_compare on non-list")
+        };
+        let Some(item) = other else {
+            // vs null: compare every element against null (MNG-6964).
+            if items.is_empty() {
+                return Ordering::Equal; // 1-0 = 1- (normalize) = 1
+            }
+            for child in items {
+                let result = child.compare(None);
+                if result != Ordering::Equal {
+                    return result;
+                }
+            }
+            return Ordering::Equal;
+        };
+        match item {
+            // 1-1 < 1.0.x.
+            MavenItem::Int(_) => Ordering::Less,
+            // 1-1 > 1-sp.
+            MavenItem::Str(_) => Ordering::Greater,
+            MavenItem::List(other_items) => maven_list_vs_list(items, other_items),
+        }
+    }
+}
+
+/// Maven `ListItem.compareTo(ListItem)` — element-wise, the shorter side
+/// comparing its tail against `null` (inverted when the null is on the
+/// left).
+fn maven_list_vs_list(left: &[MavenItem], right: &[MavenItem]) -> Ordering {
+    let max = left.len().max(right.len());
+    for i in 0..max {
+        let result = match (left.get(i), right.get(i)) {
+            (Some(l), r) => l.compare(r),
+            // left ran out: -1 * right.compareTo(null).
+            (None, Some(r)) => r.compare(None).reverse(),
+            (None, None) => Ordering::Equal,
+        };
+        if result != Ordering::Equal {
+            return result;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Build a single non-list item from a buffered token, mirroring Maven's
+/// `parseItem(isDigit, buf)`.
+fn maven_parse_item(is_digit: bool, buf: &str) -> MavenItem {
+    if is_digit {
+        MavenItem::Int(maven_strip_leading_zeros(buf))
+    } else {
+        maven_string_item(buf, false)
+    }
+}
+
+/// Maven `StringItem` constructor: apply the `a`/`b`/`m` →
+/// `alpha`/`beta`/`milestone` alias when `followed_by_digit` and the
+/// value is a single char, then the `ga`/`final`/`release` → `""` and
+/// `cr` → `rc` aliases.
+fn maven_string_item(value: &str, followed_by_digit: bool) -> MavenItem {
+    MavenItem::Str(maven_string_value(value, followed_by_digit))
+}
+
+/// The aliasing logic for a Maven `StringItem` value.
+fn maven_string_value(value: &str, followed_by_digit: bool) -> String {
+    let mut v = value.to_string();
+    if followed_by_digit && v.chars().count() == 1 {
+        v = match v.as_str() {
+            "a" => "alpha".to_string(),
+            "b" => "beta".to_string(),
+            "m" => "milestone".to_string(),
+            other => other.to_string(),
+        };
+    }
+    // ALIASES: ga/final/release → "" ; cr → rc.
+    match v.as_str() {
+        "ga" | "final" | "release" => String::new(),
+        "cr" => "rc".to_string(),
+        _ => v,
+    }
+}
+
+/// Port of `ComparableVersion.parseVersion` (maven-artifact 3.9.x) —
+/// returns the root list's items (without the outer `List` wrapper; the
+/// caller wraps + normalizes).
+///
+/// We keep an explicit stack of owned item-vectors and splice each child
+/// back into its parent on pop, matching the Java `Deque<ListItem>`. The
+/// "current list" is always `stack.last_mut()`.
+fn maven_parse_version(version: &str) -> Vec<MavenItem> {
+    let mut stack: Vec<Vec<MavenItem>> = vec![Vec::new()];
+    let chars: Vec<char> = version.chars().collect();
+    let mut is_digit = false;
+    let mut start_index = 0usize;
+
+    // Push a fresh nested list (becomes the new "current" list).
+    fn open_sublist(stack: &mut Vec<Vec<MavenItem>>) {
+        stack.push(Vec::new());
+    }
+    fn cur_is_empty(stack: &[Vec<MavenItem>]) -> bool {
+        stack.last().expect("nonempty").is_empty()
+    }
+    fn push_item(stack: &mut [Vec<MavenItem>], item: MavenItem) {
+        stack.last_mut().expect("nonempty").push(item);
+    }
+
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if c == '.' {
+            if i == start_index {
+                push_item(&mut stack, MavenItem::Int("0".to_string()));
+            } else {
+                let buf: String = chars[start_index..i].iter().collect();
+                push_item(&mut stack, maven_parse_item(is_digit, &buf));
+            }
+            start_index = i + 1;
+        } else if c == '-' {
+            // NOTE: `-` (and `.`) are the ONLY separators. `_` is NOT a
+            // separator in Maven's `ComparableVersion` — it is an ordinary
+            // qualifier character (so `1_0` parses to `1-_`, NOT `1.0`).
+            // The cited spec (`ComparableVersion.java`) only branches on
+            // `.` and `-`; this matches real maven-artifact 3.9.11.
+            if i == start_index {
+                push_item(&mut stack, MavenItem::Int("0".to_string()));
+            } else {
+                let buf: String = chars[start_index..i].iter().collect();
+                push_item(&mut stack, maven_parse_item(is_digit, &buf));
+            }
+            start_index = i + 1;
+            // Maven 3.9.x always opens a sub-list on '-'.
+            open_sublist(&mut stack);
+        } else if c.is_ascii_digit() {
+            if !is_digit && i > start_index {
+                // letter → digit with no separator: "treat .X as -X" —
+                // open a sub-list (if the current list is non-empty),
+                // flush the StringItem (followedByDigit = true), then open
+                // a fresh sub-list for the digit run.
+                if !cur_is_empty(&stack) {
+                    open_sublist(&mut stack);
+                }
+                let buf: String = chars[start_index..i].iter().collect();
+                push_item(&mut stack, maven_string_item(&buf, true));
+                start_index = i;
+                open_sublist(&mut stack);
+            }
+            is_digit = true;
+        } else {
+            if is_digit && i > start_index {
+                // digit → letter: flush the numeric token, then open a
+                // sub-list for the qualifier section.
+                let buf: String = chars[start_index..i].iter().collect();
+                push_item(&mut stack, maven_parse_item(true, &buf));
+                start_index = i;
+                open_sublist(&mut stack);
+            }
+            is_digit = false;
+        }
+    }
+
+    if chars.len() > start_index {
+        // Trailing token. "treat .X as -X" for a string qualifier: open a
+        // sub-list before flushing (Maven: `if (!isDigit && !list.isEmpty())`).
+        if !is_digit && !cur_is_empty(&stack) {
+            open_sublist(&mut stack);
+        }
+        let buf: String = chars[start_index..].iter().collect();
+        push_item(&mut stack, maven_parse_item(is_digit, &buf));
+    }
+
+    // Collapse the stack: each sub-list becomes the last child of its
+    // parent (nesting order preserved by splicing on pop).
+    while stack.len() > 1 {
+        let child = stack.pop().expect("len > 1");
+        stack
+            .last_mut()
+            .expect("parent")
+            .push(MavenItem::List(child));
+    }
+    stack.pop().expect("root list always present")
+}
+
+/// Port of `ListItem.normalize` (maven-artifact 3.9.x): from the end,
+/// remove null trailing items (numeric `0`, the empty `""`-equivalent
+/// qualifier, empty/all-null lists); stop at the first non-null item that
+/// is *not* a list (trailing nested lists are skipped past, so a null
+/// scalar buried behind a list still trims). Applied recursively so
+/// nested lists are normalized first.
+fn maven_normalize(items: &mut Vec<MavenItem>) {
+    // Recurse first so nested lists are normalized before this list's
+    // null-ness checks examine them.
+    for item in items.iter_mut() {
+        if let MavenItem::List(inner) = item {
+            maven_normalize(inner);
+        }
+    }
+    let mut i = items.len();
+    while i > 0 {
+        i -= 1;
+        let item_is_list = matches!(items[i], MavenItem::List(_));
+        if items[i].is_null() {
+            items.remove(i);
+        } else if !item_is_list {
+            // First non-null non-list scalar from the end: stop.
+            break;
+        }
+        // A non-null list: keep it, but continue scanning earlier items.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1310,6 +1780,275 @@ mod tests {
         let out =
             filter_served_versions(&upstream, &status, IndexMode::ReleasedOnly, &Pep440Ordering);
         assert_eq!(out.latest, Some("1.10.0".to_string()));
+    }
+
+    // ---------- MavenVersionOrdering ----------
+
+    fn mvn(a: &str, b: &str) -> Ordering {
+        MavenVersionOrdering.compare(a, b)
+    }
+
+    /// Assert `a < b` and, by antisymmetry, `b > a`.
+    fn assert_mvn_lt(a: &str, b: &str) {
+        assert_eq!(mvn(a, b), Ordering::Less, "expected {a} < {b}");
+        assert_eq!(mvn(b, a), Ordering::Greater, "antisymmetry: {b} > {a}");
+    }
+
+    /// Assert `a == b` in both directions.
+    fn assert_mvn_eq(a: &str, b: &str) {
+        assert_eq!(mvn(a, b), Ordering::Equal, "expected {a} == {b}");
+        assert_eq!(mvn(b, a), Ordering::Equal, "expected {b} == {a}");
+    }
+
+    #[test]
+    fn maven_basic_numeric_ordering() {
+        // Official: 1 < 1.1.
+        assert_mvn_lt("1", "1.1");
+        // Numeric tokens compare as integers, not lexically.
+        assert_mvn_lt("1-foo2", "1-foo10");
+    }
+
+    #[test]
+    fn maven_snapshot_and_sp_around_release() {
+        // Official: 1-snapshot < 1 < 1-sp.
+        assert_mvn_lt("1-snapshot", "1");
+        assert_mvn_lt("1", "1-sp");
+        assert_mvn_lt("1-snapshot", "1-sp");
+    }
+
+    #[test]
+    fn maven_qualifier_vs_subsequent_numeric_section() {
+        // Official: 1.foo = 1-foo < 1-1 < 1.1.
+        assert_mvn_eq("1.foo", "1-foo");
+        assert_mvn_lt("1-foo", "1-1");
+        assert_mvn_lt("1-1", "1.1");
+    }
+
+    #[test]
+    fn maven_trailing_null_equivalences() {
+        // Official: 1.ga = 1-ga = 1-0 = 1.0 = 1.
+        // (The original spec wording also chains `= 1_0`, but real
+        // maven-artifact does NOT treat `_` as a separator — `1_0`
+        // parses to `1-_` and is NOT equal to `1`. See
+        // `maven_underscore_is_not_a_separator` below. The authoritative
+        // `ComparableVersion.java` branches only on `.` and `-`, so this
+        // implementation follows the spec over the example's `_` link.)
+        assert_mvn_eq("1.ga", "1-ga");
+        assert_mvn_eq("1-ga", "1-0");
+        assert_mvn_eq("1-0", "1.0");
+        assert_mvn_eq("1.0", "1");
+        // Transitivity spot-check through the chain.
+        assert_mvn_eq("1.ga", "1");
+        // final / release are also release-equivalent nulls.
+        assert_mvn_eq("1.final", "1");
+        assert_mvn_eq("1.release", "1");
+    }
+
+    #[test]
+    fn maven_underscore_is_not_a_separator() {
+        // `_` is an ordinary qualifier character, NOT a separator —
+        // verified against real maven-artifact 3.9.11
+        // (`1_0` -> canonical `1-_`). So `1_0` is an *unknown* qualifier
+        // section and sorts ABOVE the bare release `1` (unknown > release),
+        // and is distinct from `1.0` / `1-0` (which equal `1`).
+        assert_mvn_lt("1", "1_0");
+        assert_ne!(mvn("1_0", "1.0"), Ordering::Equal);
+        assert_ne!(mvn("1_0", "1-0"), Ordering::Equal);
+        // `1_0` and `1_0` are of course equal (reflexive).
+        assert_mvn_eq("1_0", "1_0");
+    }
+
+    #[test]
+    fn maven_alias_before_digit() {
+        // Official: 1-a1 = 1-alpha-1 (a→alpha only before a digit; the
+        // digit↔letter transition then splits `1` into its own section).
+        assert_mvn_eq("1-a1", "1-alpha-1");
+        // b→beta, m→milestone, same rule.
+        assert_mvn_eq("1-b2", "1-beta-2");
+        assert_mvn_eq("1-m3", "1-milestone-3");
+        // cr→rc alias.
+        assert_mvn_eq("1-cr1", "1-rc1");
+    }
+
+    #[test]
+    fn maven_bare_letter_is_not_aliased() {
+        // A bare trailing `a` is NOT alpha — it is an unknown qualifier
+        // (the alias only fires before a digit). An unknown qualifier
+        // sorts AFTER all known ones and after release, so `1-a` > `1`
+        // (whereas `1-alpha` < `1`).
+        assert_mvn_lt("1-alpha", "1");
+        assert_mvn_lt("1", "1-a");
+        // Therefore alpha (known, < release) sorts below a bare `a`
+        // (unknown, > release).
+        assert_mvn_lt("1-alpha", "1-a");
+        // Same for bare `b` / `m`.
+        assert_mvn_lt("1", "1-b");
+        assert_mvn_lt("1", "1-m");
+    }
+
+    #[test]
+    fn maven_case_insensitive() {
+        // Official: 1.0-alpha1 = 1.0-ALPHA1.
+        assert_mvn_eq("1.0-alpha1", "1.0-ALPHA1");
+        assert_mvn_eq("3.2-ALPHA1", "3.2-alpha1");
+    }
+
+    #[test]
+    fn maven_qualifier_sorts_before_numeric() {
+        // Official: 1.7 > 1.K (a qualifier sorts before a numeric at the
+        // same position).
+        assert_eq!(mvn("1.7", "1.K"), Ordering::Greater);
+        assert_eq!(mvn("1.K", "1.7"), Ordering::Less);
+    }
+
+    #[test]
+    fn maven_unknown_qualifiers_lexical() {
+        // Official: 5.zebra > 5.aardvark (unknown qualifiers compare
+        // lexically among themselves).
+        assert_mvn_lt("5.aardvark", "5.zebra");
+    }
+
+    #[test]
+    fn maven_non_ascii_letters_are_unknown_qualifiers() {
+        // Official: 1.α > 1.b — a non-ASCII letter is an unknown
+        // qualifier, sorting after the known `beta`.
+        assert_eq!(mvn("1.\u{3b1}", "1.b"), Ordering::Greater);
+    }
+
+    #[test]
+    fn maven_ga_trims_but_sp_does_not() {
+        // Official: 1-sp-1 < 1-ga-1. `ga` is a release-equivalent null,
+        // so `1-ga-1` trims `ga` away from the section and compares as
+        // `1` then `1`; `sp` is a real qualifier above release, so
+        // `1-sp-1` carries the `sp` section and sorts below.
+        assert_mvn_lt("1-sp-1", "1-ga-1");
+    }
+
+    #[test]
+    fn maven_canonical_worked_example_equivalences() {
+        // The doc's worked tokenisation: 1-1.foo-bar1baz-.1 normalises to
+        // 1-1.foo-bar-1-baz-0.1 (the digit↔letter transitions split
+        // bar1baz, the empty token before `.1` becomes 0). The two
+        // spellings must therefore compare equal.
+        assert_mvn_eq("1-1.foo-bar1baz-.1", "1-1.foo-bar-1-baz-0.1");
+    }
+
+    #[test]
+    fn maven_reflexivity() {
+        for v in [
+            "1.0",
+            "1.0.0",
+            "1-SNAPSHOT",
+            "31.1-jre",
+            "1-alpha-1",
+            "2.0-rc2",
+            "",
+        ] {
+            assert_eq!(mvn(v, v), Ordering::Equal, "reflexivity for {v:?}");
+        }
+    }
+
+    #[test]
+    fn maven_sort_stability_check() {
+        // Sort a shuffled set and assert the ComparableVersion order.
+        let mut versions = vec![
+            "1.0",
+            "1-sp",
+            "2.0",
+            "1-snapshot",
+            "1.0-alpha1",
+            "1.0-beta1",
+            "1.0-rc1",
+            "1.0.1",
+            "1-milestone1",
+        ];
+        versions.sort_by(|a, b| MavenVersionOrdering.compare(a, b));
+        assert_eq!(
+            versions,
+            vec![
+                "1.0-alpha1",
+                "1.0-beta1",
+                "1-milestone1",
+                "1.0-rc1",
+                "1-snapshot",
+                "1.0",
+                "1-sp",
+                "1.0.1",
+                "2.0",
+            ],
+        );
+    }
+
+    #[test]
+    fn maven_empty_and_zero_equivalent() {
+        // Empty input and "0" are both the canonical zero/null.
+        assert_mvn_eq("", "0");
+        assert_mvn_eq("0", "0.0");
+    }
+
+    #[test]
+    fn maven_snapshot_lowercase_equivalence() {
+        // SNAPSHOT is a known qualifier; case-insensitive.
+        assert_mvn_eq("1.0-SNAPSHOT", "1.0-snapshot");
+        assert_mvn_lt("1.0-SNAPSHOT", "1.0");
+    }
+
+    #[test]
+    fn maven_self_bounding_guard_no_overflow_on_pathological_input() {
+        // A version made of ~10k '-' separators would, without the guard,
+        // recurse one List level per '-' through parse/normalize/compare and
+        // overflow the thread stack (an uncatchable SIGABRT). With the
+        // self-bounding guard it falls back to a non-recursive byte-lexical
+        // compare: the call must RETURN (not abort) and be deterministic.
+        let pathological = "1-".repeat(10_000);
+        assert!(pathological.len() > MAVEN_VERSION_PARSE_MAX_BYTES);
+
+        // Reflexive: x vs x is Equal (via the byte-lexical fallback).
+        assert_eq!(mvn(&pathological, &pathological), Ordering::Equal);
+
+        // a != b gives a stable, non-panicking result (over-cap on both legs).
+        let other = "2-".repeat(10_000);
+        let ab = mvn(&pathological, &other);
+        let ba = mvn(&other, &pathological);
+        assert_ne!(ab, Ordering::Equal);
+        assert_eq!(ab, ab.reverse().reverse(), "result is a concrete ordering");
+        assert_eq!(ba, ab.reverse(), "antisymmetric byte-lexical fallback");
+
+        // Mixed: one leg over-cap, the other a normal version — still returns.
+        let normal = "1.2.3";
+        let _ = mvn(&pathological, normal);
+        let _ = mvn(normal, &pathological);
+
+        // A version exactly at the cap still uses the structured parse and is
+        // reflexively Equal (boundary: `<=` cap → structured, `>` cap →
+        // fallback).
+        let at_cap = "a".repeat(MAVEN_VERSION_PARSE_MAX_BYTES);
+        assert_eq!(at_cap.len(), MAVEN_VERSION_PARSE_MAX_BYTES);
+        assert_eq!(mvn(&at_cap, &at_cap), Ordering::Equal);
+    }
+
+    #[test]
+    fn maven_used_via_filter_picks_maven_latest_not_lex() {
+        // Exercises MavenVersionOrdering through the shared
+        // filter_served_versions helper (its real consumer shape). With
+        // all versions released, the resolved latest is the Maven max
+        // (1.10) — not the lexicographic max (1.9) — and a -SNAPSHOT sorts
+        // below the corresponding release.
+        let upstream = ["1.9", "1.10", "2.0-SNAPSHOT"];
+        let status = vec![
+            ("1.9".to_string(), QuarantineStatus::Released),
+            ("1.10".to_string(), QuarantineStatus::Released),
+            ("2.0-SNAPSHOT".to_string(), QuarantineStatus::Released),
+        ];
+        let out = filter_served_versions(
+            &upstream,
+            &status,
+            IndexMode::ReleasedOnly,
+            &MavenVersionOrdering,
+        );
+        // 2.0-SNAPSHOT < 2.0 but here there is no 2.0 release; the served
+        // set's Maven max is 2.0-SNAPSHOT (> 1.10).
+        assert_eq!(out.latest, Some("2.0-SNAPSHOT".to_string()));
     }
 
     #[test]

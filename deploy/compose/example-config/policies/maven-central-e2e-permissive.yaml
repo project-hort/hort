@@ -1,0 +1,19 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: maven-central-e2e-permissive
+spec:
+  # Pull-through proxy: release pulled-through artifacts immediately so a Maven
+  # client can resolve them. Without a policy, pulled-through artifacts
+  # quarantine by default and the artifact GET 503s ("artifact is
+  # quarantined"). Mirrors npm-public-permissive.yaml — the maven scenario's
+  # SHA-1-floor leg (scripts/native-tests/scenarios/clients/maven.sh) resolves
+  # commons-logging:1.0.4 through this repo (proves the ADR 0033 SHA-1 floor).
+  scope:
+    repository: maven-central-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

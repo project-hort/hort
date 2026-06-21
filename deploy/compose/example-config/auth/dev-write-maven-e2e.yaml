@@ -1,0 +1,16 @@
+# PermissionGrant: a caller with BOTH `developer` AND `ci-pusher` claims may
+# write `maven-e2e`. Satisfies the dev-user (group test-developers) `mvn deploy`
+# in scripts/native-tests/scenarios/clients/maven.sh, which authenticates via
+# auth-catalog Entry 8 (Authorization: Basic <anything>:<token>, password = the
+# minted registry token). Per-repo scoped + two-claim subject both required to
+# pass the allowlist linter. Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-write-maven-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: maven-e2e

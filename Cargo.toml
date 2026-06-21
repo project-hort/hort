@@ -49,6 +49,7 @@ members = [
     "crates/hort-http-npm",
     "crates/hort-http-pypi",
     "crates/hort-http-oci",
+    "crates/hort-http-maven",
     # Admin security-score REST surface.
     "crates/hort-http-admin-security",
     # Admin-task invoke + list + get REST surface.

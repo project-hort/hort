@@ -37,7 +37,9 @@ use crate::metrics::{
     policy_decision_point, values, IngestResult, PolicyEvaluationResult, UpstreamChecksumResult,
 };
 use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
-use crate::use_cases::multi_hash::{Sha512DigestHandle, Sha512HashingRead};
+use crate::use_cases::multi_hash::{
+    Sha1DigestHandle, Sha1HashingRead, Sha512DigestHandle, Sha512HashingRead,
+};
 use crate::use_cases::read_expected_version;
 
 /// Request payload for [`IngestUseCase::ingest`].
@@ -131,19 +133,28 @@ pub struct IngestRequest {
 /// and upstream-value labels.
 ///
 /// `sha512_handle` is `Some` for the SHA-512 verification arm
-/// (`UpstreamPublished(Sha512)` — npm SRI). `ingest_inner` finalises
-/// the handle post-put to recover the SHA-512 hex of the bytes that
-/// flowed through the wrapped stream; the hex is then both compared to
-/// `upstream_value` (mismatch → rollback + `Conflict`) and embedded as
+/// (`UpstreamPublished(Sha512)` — npm SRI); `sha1_handle` is `Some` for
+/// the SHA-1 transfer-verification *floor* arm
+/// (`UpstreamPublished(Sha1)` — the Maven `.sha1` sidecar, ADR 0033). At
+/// most one of the two is `Some` (a single algorithm verifies a single
+/// ingest). For whichever is set, `ingest_inner` finalises the handle
+/// post-put to recover the digest hex of the bytes that flowed through
+/// the wrapped stream; the hex is then both compared to `upstream_value`
+/// (mismatch → rollback + `Conflict`) and embedded as
 /// `ChecksumVerified.computed_value` on the success path. SHA-256 paths
-/// leave the handle `None` and `ingest_inner` falls back to using
+/// leave both handles `None` and `ingest_inner` falls back to using
 /// `artifact.sha256_checksum` as the computed value (the storage CAS
 /// hash IS the verification hash for the SHA-256 arms).
+///
+/// Neither handle is ever a CAS key: SHA-512 and SHA-1 are
+/// verification-only digests at the ingest boundary; the content-address
+/// stays SHA-256 (ADR 0003 / ADR 0033).
 #[derive(Clone)]
 struct VerificationContext {
     algorithm: HashAlgorithm,
     upstream_value: String,
     sha512_handle: Option<Sha512DigestHandle>,
+    sha1_handle: Option<Sha1DigestHandle>,
 }
 
 /// Lowercase-hex-encode a byte slice. Used for SHA-512 digest values
@@ -1287,6 +1298,31 @@ impl IngestUseCase {
                     )
                     .await
                 }
+                // The SHA-1 transfer-verification *floor* (Maven `.sha1`
+                // sidecar, ADR 0033 — the only universally-available
+                // protocol-native digest on Maven Central). Dispatched on
+                // the *algorithm*, never the format: any handler emitting
+                // an `UpstreamPublished{Sha1}` uses this path. Mirrors the
+                // SHA-512 arm — `ingest_verified_sha1` wraps the stream in
+                // `Sha1HashingRead`, compares the finalised hex to the
+                // upstream value, rolls back the CAS blob + returns
+                // `Conflict` on mismatch, and appends `ChecksumVerified`
+                // atomically on success. The CAS key stays SHA-256.
+                HashAlgorithm::Sha1 => {
+                    self.ingest_verified_sha1(
+                        repository_id,
+                        coords,
+                        content_type,
+                        actor,
+                        payload_metadata,
+                        upstream_checksum.hex().to_string(),
+                        upstream_published_at,
+                        trust_upstream_publish_time,
+                        stream,
+                        handler,
+                    )
+                    .await
+                }
             },
         }
     }
@@ -1494,6 +1530,7 @@ impl IngestUseCase {
                 algorithm,
                 upstream_value,
                 sha512_handle: None,
+                sha1_handle: None,
             }),
             upstream_published_at,
             trust_upstream_publish_time,
@@ -1573,6 +1610,107 @@ impl IngestUseCase {
                 algorithm: HashAlgorithm::Sha512,
                 upstream_value,
                 sha512_handle: Some(handle),
+                sha1_handle: None,
+            }),
+            upstream_published_at,
+            trust_upstream_publish_time,
+        )
+        .await
+    }
+
+    /// Sha1 transfer-verification *floor* path (ADR 0033 — the Maven
+    /// `.sha1` sidecar, the only universally-available protocol-native
+    /// digest on Maven Central). The SHA-1 sibling of
+    /// [`Self::ingest_verified_sha512`]: the stream is wrapped in
+    /// [`Sha1HashingRead`]; the wrapper's [`Sha1DigestHandle`] is threaded
+    /// through `ingest_with_verification` and into `ingest_inner`, which
+    /// finalises it post-`storage.put` and compares the resulting hex to
+    /// `upstream_value`. The CAS hash remains SHA-256 — SHA-1 is
+    /// verification-only state at the boundary, **never** a content-address
+    /// (ADR 0003 / ADR 0033). SHA-1 is collision-broken; this floor catches
+    /// transport corruption + casual tampering, with TLS (system trust +
+    /// `HORT_EXTRA_CA_BUNDLE`) as the real transport-integrity control.
+    ///
+    /// - Mismatch: rollback CAS (guarded by `find_by_checksum` empty so
+    ///   shared blobs are not corrupted), append `ChecksumMismatch` to
+    ///   `StreamId::repository(repo_id)`, return `Conflict`. **No
+    ///   Artifact row is minted** (mint-after-verify).
+    /// - Match: mint Artifact, append `ArtifactIngested` and
+    ///   `ChecksumVerified { algorithm: Sha1, … }` in the same
+    ///   `commit_transition` batch on `StreamId::artifact(artifact_id)`
+    ///   — atomic with the mint.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip(self, payload_metadata, stream, handler))]
+    async fn ingest_verified_sha1(
+        &self,
+        repository_id: Uuid,
+        coords: ArtifactCoords,
+        content_type: String,
+        actor: ApiActor,
+        payload_metadata: serde_json::Value,
+        upstream_value: String,
+        // Best-effort upstream publish timestamp;
+        // threaded onto Artifact.upstream_published_at by ingest_inner.
+        upstream_published_at: Option<DateTime<Utc>>,
+        // Serving mapping's opt-in flag; consumed by
+        // ingest_inner's quarantine-anchor resolution.
+        trust_upstream_publish_time: bool,
+        stream: Box<dyn AsyncRead + Send + Unpin>,
+        handler: &dyn FormatHandler,
+    ) -> AppResult<IngestOutcome> {
+        // Audit signal (design §8/§12): record that this artifact's
+        // transfer was verified against the *weaker* SHA-1 floor — the
+        // format-forced acceptance ADR 0033 documents. `info!`, never
+        // `err`: the floor verification is a normal, expected path, not an
+        // error condition. A mismatch still surfaces as the Conflict +
+        // `ChecksumMismatch` audit event below; this log is the
+        // floor-was-used breadcrumb.
+        tracing::info!(
+            repository_id = %repository_id,
+            name = %coords.name,
+            version = ?coords.version,
+            "verifying upstream transfer against the SHA-1 floor (ADR 0033)"
+        );
+
+        // Wrap the input stream so SHA-1 is computed incrementally as
+        // bytes flow through the wrapper into `storage.put`. The digest
+        // handle survives the boxing (the hasher state lives in an
+        // `Arc<Mutex<Sha1>>` shared between wrapper and handle);
+        // `ingest_inner` finalises the handle post-put to recover the
+        // SHA-1 hex without buffering bytes anywhere. Mirrors the SHA-512
+        // path exactly.
+        let wrapped = Sha1HashingRead::new(stream);
+        let handle = wrapped.digest_handle();
+        let stream: Box<dyn AsyncRead + Send + Unpin> = Box::new(wrapped);
+
+        // The SHA-1 verification arm does NOT use `declared_sha256` — the
+        // storage CAS hash (SHA-256) is not the verification target.
+        // `declared_sha256: None` lets the SHA-256 short-circuit logic in
+        // `ingest_inner` stay inert; the SHA-1 comparison lives on its own
+        // branch keyed off `verification.sha1_handle.is_some()`.
+        let req = IngestRequest {
+            repository_id,
+            coords: coords.clone(),
+            content_type,
+            // SHA-1 floor verified-ingest path (Maven pull-through); no
+            // seed-import anchor override applies here.
+            quarantine_anchor_override: None,
+            actor: actor.clone(),
+            legacy_sha1: None,
+            legacy_md5: None,
+            declared_sha256: None,
+            payload_metadata,
+        };
+
+        self.ingest_with_verification(
+            req,
+            stream,
+            handler,
+            Some(VerificationContext {
+                algorithm: HashAlgorithm::Sha1,
+                upstream_value,
+                sha512_handle: None,
+                sha1_handle: Some(handle),
             }),
             upstream_published_at,
             trust_upstream_publish_time,
@@ -2268,6 +2406,49 @@ impl IngestUseCase {
             _ => None,
         };
 
+        // 5c. SHA-1 transfer-verification *floor* arm (ADR 0033 — the
+        // Maven `.sha1` sidecar). The SHA-1 sibling of the SHA-512 arm
+        // above; reached only for the `UpstreamPublished(Sha1)` path. The
+        // CAS key remains SHA-256 — SHA-1 is the transfer comparison only,
+        // never a content-address. Finalising the handle resets the shared
+        // hasher (see `Sha1DigestHandle::finalize`), so the value is
+        // captured here for reuse when constructing `ChecksumVerified`.
+        // At most one of `sha512_handle` / `sha1_handle` is `Some`, so
+        // these two arms are mutually exclusive.
+        let computed_sha1_hex: Option<String> = match verification.as_ref() {
+            Some(VerificationContext {
+                sha1_handle: Some(handle),
+                upstream_value,
+                ..
+            }) => {
+                let computed = lower_hex(&handle.finalize());
+                if computed != *upstream_value {
+                    self.rollback_unreferenced_cas(&put_result.hash, "sha1 upstream mismatch")
+                        .await;
+                    let source = AppError::Domain(DomainError::Conflict(format!(
+                        "upstream sha1 does not match computed hash \
+                         (upstream={upstream_value}, computed={computed})"
+                    )));
+                    // Typed-variant dispatch. See
+                    // the SHA-256 site above for the rationale: outer
+                    // layer matches on `VerificationMismatch`, not on
+                    // the message string.
+                    return Err((
+                        InnerIngestError::VerificationMismatch {
+                            algorithm: HashAlgorithm::Sha1,
+                            upstream_value: upstream_value.clone(),
+                            computed_value: computed.clone(),
+                            source,
+                        },
+                        Some(repo_key),
+                        Some(IngestResult::DeclaredHashMismatch),
+                    ));
+                }
+                Some(computed)
+            }
+            _ => None,
+        };
+
         // Resolve the deferred
         // metadata decision. The blob's `storage.put` happens HERE —
         // AFTER both dedup returns above — so a duplicate re-publish
@@ -2419,12 +2600,16 @@ impl IngestUseCase {
         if let Some(ctx) = verification.as_ref() {
             // For SHA-256 verification, the storage CAS hash IS the
             // verification hash, so `artifact.sha256_checksum` is the
-            // computed value. For SHA-512, the value was finalised at
-            // step 5b above (and pinned into `computed_sha512_hex`)
-            // because the SHA-512 hasher cannot be re-read after the
-            // boxed stream has been consumed.
+            // computed value. For SHA-512 the value was finalised at step
+            // 5b (pinned into `computed_sha512_hex`); for the SHA-1 floor
+            // at step 5c (pinned into `computed_sha1_hex`) — both because
+            // the streaming hasher cannot be re-read after the boxed
+            // stream has been consumed. At most one of the two is `Some`
+            // (one algorithm verifies one ingest), so the precedence is
+            // unambiguous; SHA-256 is the `None`/`None` fallthrough.
             let computed_value = computed_sha512_hex
                 .clone()
+                .or_else(|| computed_sha1_hex.clone())
                 .unwrap_or_else(|| artifact.sha256_checksum.to_string());
             events.push(EventToAppend {
                 event_id: Uuid::new_v4(),
@@ -10261,6 +10446,218 @@ mod tests {
             assert_eq!(verified.upstream_value, sha512_hex);
             assert_eq!(verified.computed_value, sha512_hex);
             assert_eq!(verified.artifact_id, outcome.artifact.id);
+        });
+    }
+
+    /// Lowercase-hex SHA-1 of `content`. Mirrors `sha512_of` for the
+    /// SHA-1 transfer-verification *floor* tests (ADR 0033) — used to
+    /// construct correct upstream-published checksums and to assert the
+    /// `computed_value` recorded in the emitted events.
+    fn sha1_of(content: &[u8]) -> String {
+        use sha1::Digest;
+        format!("{:x}", sha1::Sha1::digest(content))
+    }
+
+    /// UpstreamPublished(**Sha1**) success — the SHA-1 transfer floor
+    /// (ADR 0033, Maven `.sha1` sidecar). The stream is wrapped in
+    /// `Sha1HashingRead` so the use case can finalise the SHA-1 after
+    /// `storage.put` consumes the boxed reader; the finalised hex must
+    /// match the upstream value, the artifact row must be minted, and
+    /// `ArtifactIngested + ChecksumVerified` must land in the same
+    /// `commit_transition` batch on the artifact stream (ADR 0006 atomic
+    /// emission rule). **Crucially the CAS key stays SHA-256** — SHA-1 is
+    /// transfer-verification only, never a content-address.
+    #[test]
+    fn ingest_verified_upstream_published_sha1_success() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let sha1_hex = sha1_of(content);
+        let sha256_hex = sha256_of(content);
+        let upstream_checksum =
+            UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, sha1_hex.clone()).unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let outcome = uc
+                .ingest_verified(req, content_stream(content), &test_handler())
+                .await
+                .expect("sha1 floor success path");
+
+            // Storage saw the bytes once; no rollback.
+            assert_eq!(storage.put_call_count(), 1);
+            assert_eq!(storage.delete_call_count(), 0);
+
+            // The CAS hash on the row is the SHA-256 of the bytes — the
+            // CAS key remains SHA-256, SHA-1 is verification-only. This is
+            // the load-bearing assertion: the floor never becomes a
+            // content-address.
+            assert_eq!(outcome.artifact.sha256_checksum.to_string(), sha256_hex);
+            assert_ne!(
+                outcome.artifact.sha256_checksum.to_string(),
+                sha1_hex,
+                "CAS key must never be the SHA-1 floor value"
+            );
+
+            // Artifact row was minted — the repo can find it by id.
+            let row = artifacts.find_by_id(outcome.artifact.id).await.unwrap();
+            assert_eq!(row.id, outcome.artifact.id);
+
+            // Atomic emission: ArtifactIngested + ChecksumVerified land in
+            // the same `commit_transition` batch on the artifact stream.
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            let (_artifact, batch, _meta) = &transitions[0];
+            assert_eq!(batch.stream_id.category, StreamCategory::Artifact);
+            let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+            assert_eq!(
+                kinds,
+                vec!["ArtifactIngested", "ChecksumVerified", "ScanRequested"],
+                "ArtifactIngested + ChecksumVerified + ScanRequested (DefaultPolicy \
+                 fallback) must land in the same batch",
+            );
+
+            // ChecksumVerified carries the SHA-1 algorithm + finalised hex.
+            let verified = batch
+                .events
+                .iter()
+                .find_map(|e| match &e.event {
+                    DomainEvent::ChecksumVerified(v) => Some(v.clone()),
+                    _ => None,
+                })
+                .expect("ChecksumVerified must be present");
+            assert_eq!(verified.algorithm, HashAlgorithm::Sha1);
+            assert_eq!(verified.upstream_value, sha1_hex);
+            assert_eq!(
+                verified.computed_value, sha1_hex,
+                "computed_value records the finalised SHA-1, not the CAS SHA-256"
+            );
+            assert_eq!(verified.artifact_id, outcome.artifact.id);
+        });
+    }
+
+    /// UpstreamPublished(**Sha1**) mismatch — the finalised SHA-1
+    /// disagrees with the upstream-published hex. `Conflict` must surface,
+    /// no artifact row may be minted (mint-after-verify), `ChecksumMismatch`
+    /// must land on the **repository** stream, the CAS blob must be rolled
+    /// back via `storage.delete`, and `ChecksumVerified` must NOT fire.
+    /// Mirrors the SHA-512 mismatch test.
+    #[test]
+    fn ingest_verified_upstream_published_sha1_mismatch_emits_repository_event_and_rolls_back() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"actual content";
+
+        // 40 hex chars of zero — structurally valid, but definitely not
+        // the SHA-1 of `content`.
+        let bad_sha1_hex = "0".repeat(40);
+        let upstream_checksum =
+            UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, bad_sha1_hex.clone()).unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let err = uc
+                .ingest_verified(req, content_stream(content), &test_handler())
+                .await
+                .expect_err("sha1 floor mismatch must fail");
+
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Conflict(_))),
+                "expected Conflict, got {err:?}"
+            );
+
+            // No artifact row was minted (mint-after-verify).
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "no commit_transition must run on the sha1 mismatch path"
+            );
+
+            // Storage put ran (to compute the SHA-256 CAS hash and feed
+            // bytes through the SHA-1 hasher), then was rolled back.
+            assert_eq!(storage.put_call_count(), 1, "put ran to compute hashes");
+            assert_eq!(
+                storage.delete_call_count(),
+                1,
+                "rollback must delete the CAS blob"
+            );
+
+            // `ChecksumMismatch` lands on the REPOSITORY stream — no
+            // artifact stream because no row was minted.
+            let batches = events.appended_batches();
+            let mismatch_events: Vec<_> = batches
+                .iter()
+                .filter(|b| b.stream_id.category == StreamCategory::Repository)
+                .flat_map(|b| b.events.iter())
+                .filter_map(|e| match &e.event {
+                    DomainEvent::ChecksumMismatch(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                mismatch_events.len(),
+                1,
+                "exactly one ChecksumMismatch must land on the repository stream"
+            );
+            let mm = &mismatch_events[0];
+            assert_eq!(mm.algorithm, HashAlgorithm::Sha1);
+            assert_eq!(mm.upstream_value, bad_sha1_hex);
+            assert_eq!(mm.computed_value, sha1_of(content));
+            assert_eq!(mm.repository_id, repo_id);
+            assert_eq!(mm.format, "pypi");
+
+            // ChecksumVerified must NOT fire on the mismatch path.
+            let verified_count = batches
+                .iter()
+                .flat_map(|b| b.events.iter())
+                .filter(|e| matches!(e.event, DomainEvent::ChecksumVerified(_)))
+                .count();
+            assert_eq!(
+                verified_count, 0,
+                "ChecksumVerified must NOT fire on the mismatch path"
+            );
+
+            // No artifact row exists — `list_by_repository` returns an
+            // empty page (mint-after-verify).
+            let page = artifacts
+                .list_by_repository(
+                    repo_id,
+                    hort_domain::types::PageRequest {
+                        offset: 0,
+                        limit: 100,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                page.total, 0,
+                "no artifact row may be present after mismatch"
+            );
         });
     }
 

@@ -1378,7 +1378,7 @@ the validation counters or the validation `Result`.
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
 | `hort_artifact_groups_created_total` | counter | `repository`, `format` | — | — |
-| `hort_artifact_group_members_added_total` | counter | `repository`, `format`, `role` | — | `role` ∈ `pom`, `jar`, `sources`, `javadoc`, `signature`, `sha256`, `md5`, `mod`, `zip`, `info`, `manifest`, `config`, `layer`, `deb`, `dsc`, `changes`, `orig`, `other` |
+| `hort_artifact_group_members_added_total` | counter | `repository`, `format`, `role` | — | `role` ∈ `pom`, `jar`, `sources`, `javadoc`, `signature`, `sha256`, `md5`, `mod`, `zip`, `info`, `manifest`, `config`, `layer`, `deb`, `dsc`, `changes`, `orig`, `module`, `other` |
 
 Emitted by `hort_app::use_cases::artifact_group_use_case::ArtifactGroupUseCase`
 on successful `add_member` calls (first placement for the `_created`
