@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: oci-quarantine-e2e-quarantine
+spec:
+  # Deliberately QUARANTINING — the opposite of the `*-permissive` opt-outs.
+  # A 24h hold window keeps every pushed blob in `Quarantined` for the whole
+  # scenario, so the push-under-quarantine smoke
+  # (scripts/native-tests/scenarios/clients/oci-push-under-quarantine.sh) can
+  # drive a pre-flight blob HEAD against a held blob. `scanBackends: []` keeps
+  # the hold purely time-based: the compose stack runs no hort-worker, so no
+  # scan would ever complete anyway — the 24h window, not a scan result, is
+  # what holds the blob. (Repo-scoped, so no other scenario is affected.)
+  scope:
+    repository: oci-quarantine-e2e
+  severityThreshold: critical
+  quarantineDuration: 24h
+  requireApproval: false
+  # Provenance off for e2e (no per-ingest verify job).
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}
