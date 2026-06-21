@@ -289,6 +289,19 @@ services:
       # config.rs upstream_resolver_refresh_secs clamp) so the smoke
       # wait is ~8s instead of ~65s.
       HORT_UPSTREAM_RESOLVER_REFRESH_SECS: "5"
+      # DANGER (dev/CI only): lift the per-IP rate-limit caps above the smoke
+      # harness's per-IP burst. The limiter is per-IP (code defaults: auth
+      # 60-burst / write 300-burst, each refilling 1 token / 60s). The
+      # native-tests runner runs every scenario as its own `docker run --rm`
+      # container on this bridge; docker recycles bridge IPs across those
+      # sequential containers while the server's governor state is long-lived,
+      # so a request-heavy scenario (an OCI push issues >60 authenticated blob
+      # requests) drains the auth bucket for an IP the NEXT scenario inherits —
+      # spurious 429s in unrelated functional scenarios. 6000/min/IP clears the
+      # harness with headroom. NOT a production value — Helm runs the 60/300
+      # code defaults; never copy this into a real deployment.
+      HORT_RATELIMIT_AUTH_PER_MIN: "6000"
+      HORT_RATELIMIT_WRITE_PER_MIN: "6000"
     volumes:
       - cas:/var/lib/hort-server/cas
       - ./example-config:/etc/hort/config:ro
