@@ -329,8 +329,35 @@ pub(super) async fn serve(
     //    avoiding the CAS round-trip for a blob that won't be served.
     //    Rejected stays inline because the hidden-404 envelope is
     //    format-specific (`BLOB_UNKNOWN`).
-    if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
-        return resp;
+    //
+    //    Push-dedup exception: a write-authorized caller's blob-EXISTENCE
+    //    check (`HEAD`) must report 200 (exists) so an OCI push can dedup
+    //    and complete. The pre-flight HEAD every pusher (skopeo,
+    //    `docker push`) issues is a write-path precondition, NOT a download
+    //    — quarantine invariant #1 gates *downloads*, not the existence
+    //    probe. The 503 hold stays in force for: the content GET (every
+    //    caller, `head == false`), and pull/read HEADs (non-writers). So
+    //    the download block and the transparent-proxy contract (invariant
+    //    #5) are untouched; only the write-authorized existence probe is
+    //    released. Fail closed: ONLY a definitive `Write` authorization
+    //    skips the 503 — a denied or errored resolve keeps it. The extra
+    //    resolve fires solely on the narrow quarantined-blob-HEAD path (the
+    //    `matches!` short-circuits first), so the hot read path is unaffected.
+    let write_authorized_existence_probe = head
+        && matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
+        && ctx
+            .repository_access_use_case
+            .resolve(
+                repo_key,
+                actor,
+                hort_app::use_cases::repository_access::AccessLevel::Write,
+            )
+            .await
+            .is_ok();
+    if !write_authorized_existence_probe {
+        if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
+            return resp;
+        }
     }
     if matches!(artifact.quarantine_status, QuarantineStatus::Rejected) {
         return OciError::BlobUnknown {
@@ -1430,6 +1457,166 @@ mod tests {
         assert!(
             parsed["errors"][0]["detail"]["retry_after_seconds"].is_i64(),
             "detail.retry_after_seconds must be a number"
+        );
+    }
+
+    /// Build an RBAC-enabled context that grants `claim` repo-wide `Write`,
+    /// reusing the harness's `repositories` mock so seeded repos resolve.
+    /// Mirror of lib.rs `enabled_empty_rbac_ctx`, with one grant added.
+    fn write_grant_ctx(
+        base: &Arc<AppContext>,
+        repositories: Arc<MockRepositoryRepository>,
+        claim: &str,
+    ) -> Arc<AppContext> {
+        use hort_app::rbac::RbacEvaluator;
+        use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
+        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
+        use hort_app::use_cases::test_support::{MockIdentityProvider, MockUserRepository};
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+        use hort_domain::ports::identity_provider::IdentityProvider;
+        use hort_domain::ports::user_repository::UserRepository;
+        use hort_http_core::context::AuthContext;
+        use hort_http_core::test_support::{with_auth, with_repository_access};
+
+        let grant = PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(vec![claim.to_string()]),
+            repository_id: None,
+            permission: Permission::Write,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        };
+        let rbac_swap = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            grant,
+        ])));
+        let authenticate = Arc::new(AuthenticateUseCase::new(
+            Arc::new(MockIdentityProvider::new()) as Arc<dyn IdentityProvider>,
+            Arc::new(MockUserRepository::new()) as Arc<dyn UserRepository>,
+            Vec::new(),
+        ));
+        let ctx = with_auth(
+            base,
+            AuthContext::Enabled {
+                authenticate,
+                rbac: rbac_swap.clone(),
+                issuer_url: None,
+            },
+        );
+        let access = Arc::new(RepositoryAccessUseCase::new(
+            repositories,
+            RbacAccess::Enabled(rbac_swap),
+            true,
+        ));
+        with_repository_access(&ctx, access)
+    }
+
+    /// A `CallerPrincipal` carrying exactly `claim`.
+    fn principal_with_claim(claim: &str) -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: Uuid::from_u128(0xC1),
+            external_id: "kc:ci".into(),
+            username: "ci".into(),
+            email: "ci@example.com".into(),
+            claims: vec![claim.to_string()],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        }
+    }
+
+    /// Drive `serve()` for `blobs/sha256:<hex>` of a freshly-seeded
+    /// *quarantined* blob in a public OCI repo, returning the status. The
+    /// repo is public (anonymous Read is free) so the `Write`-grant is the
+    /// sole discriminator the quarantine gate sees.
+    fn quarantined_blob_serve_status(head: bool, actor_claim: Option<&str>) -> StatusCode {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+            );
+            // A `ci-pusher` Write grant always exists in the system; whether
+            // the *caller* carries it is the variable under test.
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = actor_claim.map(principal_with_claim);
+            serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                principal.as_ref(),
+            )
+            .await
+            .status()
+        })
+    }
+
+    /// Push-path regression: the OCI blob-existence check vs the quarantine gate.
+    ///
+    /// A write-authorized caller's `HEAD /v2/<repo>/<name>/blobs/<digest>` is the
+    /// pre-flight existence/dedup probe every OCI pusher (skopeo, `docker push`)
+    /// issues before uploading a blob. It MUST report that the blob EXISTS (200)
+    /// so the push can dedup and complete — even when the blob's artifact is
+    /// `Quarantined`. Quarantine gates the DOWNLOAD (GET), not the push-dedup
+    /// existence check (quarantine invariant #1: *downloads* are blocked while
+    /// held). Returning 503 here aborts the push — the production symptom on a
+    /// hosted repo under a global scan-gate.
+    #[test]
+    fn head_blob_quarantined_by_write_authorized_caller_reports_exists_not_503() {
+        let status = quarantined_blob_serve_status(/* head = */ true, Some("ci-pusher"));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a write-authorized pusher's blob-existence HEAD on a quarantined \
+             blob must report 200 (exists) so the push can dedup and complete — \
+             not 503, which aborts the push"
+        );
+    }
+
+    /// Security scope guard: the push-dedup exception is gated on WRITE
+    /// authorization. An anonymous (read-only) caller's HEAD on a quarantined
+    /// blob still 503s, so the fix never leaks a held blob's existence to a
+    /// non-writer or to the transparent-proxy pull path (invariant #5).
+    #[test]
+    fn head_blob_quarantined_anonymous_caller_still_returns_503() {
+        let status =
+            quarantined_blob_serve_status(/* head = */ true, /* anonymous */ None);
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "anonymous HEAD on a quarantined blob must stay 503 — the push-dedup \
+             exception is write-authorized only, never open to pull/read callers"
+        );
+    }
+
+    /// Security scope guard: the exception is HEAD-only. A write-authorized
+    /// caller's content GET of a quarantined blob still 503s — the quarantine
+    /// DOWNLOAD block (invariant #1) holds even for the pusher; only the
+    /// existence probe is released, never the held bytes.
+    #[test]
+    fn get_blob_quarantined_write_authorized_caller_still_returns_503() {
+        let status = quarantined_blob_serve_status(/* head = */ false, Some("ci-pusher"));
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write-authorized GET of a quarantined blob must stay 503 — only the \
+             HEAD existence probe is released; content download stays held"
         );
     }
 
