@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-06-21
+
+Beta release. The feature set is described in the documentation under `docs/`.
+
+### Added
+
+- **Maven / Gradle format handler.** Pull-through proxying for Maven Central and
+  Gradle repositories, covering the multi-file artifact shape (POM, JAR, and the
+  per-file `.sha1` / `.md5` sidecars) and Gradle module metadata. Upstream
+  transfers are checksum-verified against a SHA-1 floor — a Maven artifact whose
+  upstream checksum cannot be verified is not served (ADR 0032 *Maven/Gradle
+  multi-file handler*, ADR 0033 *SHA-1 upstream transfer-verification floor*).
+- **Public supply-chain deployment for `registry.hort.rs` (dogfood).** An
+  Ansible-based deployment (rootless-podman and native-systemd flavours) plus the
+  gitops config — repositories, upstream mappings, policies, service-account
+  federation — and CI workflows that run hort as its own public pull-through
+  registry (ADR 0034 *public dogfood deployment*).
+
+### Fixed
+
+- **OCI push no longer fails on the blob-existence pre-check under a quarantine
+  policy.** During an OCI push, a write-authorized client's blob-existence `HEAD`
+  was routed through the quarantine read-gate and returned `503`, blocking the
+  push. The existence pre-check for a write-authorized push is now exempt from
+  the quarantine gate, so pushes to a quarantined repository proceed while reads
+  stay gated.
+
 ## [0.9.3] - 2026-06-21
 
 Beta release. The feature set is described in the documentation under `docs/`.

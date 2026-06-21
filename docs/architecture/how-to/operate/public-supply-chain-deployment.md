@@ -5,7 +5,7 @@ the hort deployment that proxies, quarantines, and scans hort's own build
 dependencies and serves hort's first-party OCI images and Cargo crates.
 
 For the design rationale — *why* this topology, repo classes, scan posture, and
-identity model — see [ADR 0032](../../../adr/0032-public-dogfood-deployment.md).
+identity model — see [ADR 0034](../../../adr/0034-public-dogfood-deployment.md).
 
 ---
 
@@ -144,7 +144,7 @@ There is no manual migration step.
 
 ## 4. The warming invariant and window-ramp schedule
 
-The warming invariant is a load-bearing operational contract (ADR 0032):
+The warming invariant is a load-bearing operational contract (ADR 0034):
 **every developer's local build environment routes cargo, OCI, and npm pulls
 through this instance.** A dependency bump merged without a prior local build
 through hort means CI may race the quarantine window.

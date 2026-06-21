@@ -1,4 +1,4 @@
-# 0032 — Public dogfood deployment and supply-chain hardening posture
+# 0034 — Public dogfood deployment and supply-chain hardening posture
 
 - **Status:** Accepted
 - **Enforced by:** the gitops apply-time linter (rejects any `ServiceAccount`
