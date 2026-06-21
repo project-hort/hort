@@ -267,6 +267,64 @@ async fn list_repo_scores_returns_only_authorised_repos() {
     assert!(v["next_cursor"].is_null());
 }
 
+/// Read-path principal-propagation regression for `list_repo_scores` (the
+/// second changed GET handler). An authenticated caller holding a Read grant
+/// must see a PRIVATE repo's score in the list — proving the GET-path
+/// `Option<AuthenticatedPrincipal>` slot is threaded. A bare-slot read would
+/// drop the principal → anonymous → the private repo would be filtered out and
+/// the list would show only the public repo. Inject via
+/// `inject_optional_principal_some` (the GET shape), NOT the bare slot.
+#[tokio::test]
+async fn list_repo_scores_authenticated_reader_sees_private_repo() {
+    let (ctx_base, mocks) = new_ctx();
+
+    let pub1 = public_repo("public-1");
+    let priv1 = private_repo("private-1");
+    let pub_id = pub1.id;
+    let priv_id = priv1.id;
+    mocks.repositories.insert(pub1);
+    mocks.repositories.insert(priv1);
+    mocks.security_scores.seed(sample_score(pub_id));
+    mocks.security_scores.seed(sample_score(priv_id));
+
+    // `reader` granted global Read → an authenticated reader sees BOTH the
+    // public repo and the private repo it can read.
+    let grants = vec![claims_grant("reader", None, Permission::Read)];
+    let access = Arc::new(RepositoryAccessUseCase::new(
+        mocks.repositories.clone(),
+        RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
+            RbacEvaluator::new(grants),
+        ))),
+        true,
+    ));
+    let ctx = with_repository_access(&ctx_base, access);
+
+    let p = principal(&["reader"]);
+    let app = build_test_router(ctx);
+    let mut req = Request::builder()
+        .uri("/api/v1/security-score")
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(&mut req, p);
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let v = body_json(resp).await;
+    let mut repos: Vec<&str> = v["scores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["repository"].as_str().unwrap())
+        .collect();
+    repos.sort_unstable();
+    assert_eq!(
+        repos,
+        vec!["private-1", "public-1"],
+        "authenticated reader must see the private repo's score, not just the public one"
+    );
+}
+
 #[tokio::test]
 async fn list_repo_scores_pagination_returns_next_cursor_when_more() {
     let (ctx, mocks) = new_ctx();

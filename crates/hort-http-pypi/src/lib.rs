@@ -1062,6 +1062,87 @@ mod tests {
         artifact
     }
 
+    /// Read-path principal-propagation regression. An authenticated caller
+    /// holding a Read grant MUST see a PRIVATE repo's PEP 503 simple index
+    /// through the **production GET middleware shape** —
+    /// `Option<AuthenticatedPrincipal> = Some(..)`, which `extract_optional_principal`
+    /// writes on GET. The handler previously extracted
+    /// `Option<Extension<AuthenticatedPrincipal>>` (the bare slot only the write
+    /// path populates), so the principal was dropped and authenticated reads
+    /// fell back to anonymous → a private repo 404'd. Inject via
+    /// `inject_optional_principal_some` (NOT `inject_principal`) — load-bearing.
+    #[tokio::test]
+    async fn authenticated_reader_simple_project_on_private_repo_succeeds() {
+        use hort_app::rbac::RbacEvaluator;
+        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
+        use hort_domain::entities::caller::CallerPrincipal;
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+        use hort_domain::entities::repository::RepositoryFormat;
+        use hort_http_core::test_support::with_repository_access;
+
+        let h = harness();
+
+        // Private hosted pypi repo + a servable artifact.
+        let mut repo = sample_repository();
+        repo.key = "pypi-priv".into();
+        repo.format = RepositoryFormat::Pypi;
+        repo.is_public = false;
+        let repo_id = repo.id;
+        h.repositories.insert(repo);
+        insert_artifact(
+            &h,
+            repo_id,
+            "secret-pkg",
+            "secret-pkg-1.0.tar.gz",
+            QuarantineStatus::None,
+        );
+
+        // RBAC-enabled access with a global Read grant for the `developer` claim.
+        let grant = PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(vec!["developer".into()]),
+            repository_id: None,
+            permission: Permission::Read,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        };
+        let access = Arc::new(RepositoryAccessUseCase::new(
+            h.repositories.clone(),
+            RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
+                RbacEvaluator::new(vec![grant]),
+            ))),
+            true,
+        ));
+        let ctx = with_repository_access(&h.ctx, access);
+
+        let principal = CallerPrincipal {
+            user_id: Uuid::from_u128(0xA11CE),
+            external_id: "kc:alice".into(),
+            username: "alice".into(),
+            email: "alice@example.com".into(),
+            claims: vec!["developer".into()],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        };
+        let mut req = Request::get("/pypi/pypi-priv/simple/secret-pkg/")
+            .body(Body::empty())
+            .unwrap();
+        hort_http_core::middleware::auth::test_support::inject_optional_principal_some(
+            &mut req, principal,
+        );
+
+        let resp = router(ctx).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "authenticated reader holding a Read grant MUST see the private repo's \
+             simple index — the GET-path principal must be threaded, not dropped"
+        );
+    }
+
     // -- download tests -------------------------------------------------------
 
     #[tokio::test]
