@@ -1,0 +1,48 @@
+---
+# fail2ban role — brute-force protection for SSH and the hort HTTP API.
+#
+# Jails configured:
+#   sshd            — built-in; enabled in hort.local to make it explicit.
+#   hort-nginx-auth — custom filter matching nginx combined-log 401/403 on
+#                     hort auth/exchange/registry paths.  Ignores 200s (e.g.
+#                     anonymous hort-oci reads) which are never 401/403.
+#
+# Deploy-time validation (not runnable during Ansible provisioning because
+# fail2ban-regex requires a live fail2ban installation on the control node):
+#
+#   fail2ban-regex /var/log/nginx/access.log \
+#     /etc/fail2ban/filter.d/hort-nginx-auth.conf
+#
+# Run this on the target host after the play completes to confirm the filter
+# matches real auth failure lines and produces zero false positives on 200
+# anonymous reads.  See the report for a sample log line and expected output.
+
+- name: Install fail2ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+    update_cache: true
+
+- name: Template hort-nginx-auth filter
+  ansible.builtin.template:
+    src: hort-nginx-auth.conf.j2
+    dest: /etc/fail2ban/filter.d/hort-nginx-auth.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fail2ban
+
+- name: Template hort jail config
+  ansible.builtin.template:
+    src: jail-hort.local.j2
+    dest: /etc/fail2ban/jail.d/hort.local
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fail2ban
+
+- name: Enable and start fail2ban
+  ansible.builtin.service:
+    name: fail2ban
+    state: started
+    enabled: true

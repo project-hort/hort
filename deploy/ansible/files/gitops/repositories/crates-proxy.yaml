@@ -1,0 +1,24 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: crates-proxy
+spec:
+  name: "crates.io pull-through (hardened)"
+  description: "Private, quarantined+scanned crates.io proxy for hort's own builds. Read+ingest gated."
+  format: cargo
+  type: proxy
+  # SimpleIndex proxies (cargo/npm) MUST set include_pending: the default
+  # released_only serves an empty index on a cold mirror, so a range-based
+  # `cargo build` cannot resolve a never-ingested version and the pull-through
+  # (and the warming clock) never starts. Mirrors
+  # deploy/compose/example-config/repositories/npm-public.yaml. The additive set
+  # is the never-gate-eligible `Unknown` tier — benign per ADR 0016
+  # (NonServableStatusFilter runs first; quarantined/rejected are never served).
+  indexMode: include_pending
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/crates-proxy
+  proxy:
+    upstreamUrl: "https://index.crates.io"
+  isPublic: false
+  replicationPriority: local_only

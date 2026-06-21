@@ -1,0 +1,28 @@
+# Quadlet container unit — hort-worker (multi-kind job dispatcher).
+#
+# The worker shares the CAS volume with hort-server and needs write access
+# (record_outcome persists per-finding blobs).  No published ports — the worker
+# does not serve HTTP.  Drop all capabilities.
+#
+# Trivy and osv-scanner CLIs are baked into the image (see docker/Dockerfile.worker).
+
+[Unit]
+Description=hort-worker (scan / advisory / staging-sweep dispatcher)
+After=postgres.service hort-migrate.service
+Requires=postgres.service hort-migrate.service
+
+[Container]
+Image={{ hort_worker_image }}
+ContainerName=hort-worker
+# CAS shared volume — write access required for per-finding blob storage.
+Volume=hort-cas:{{ hort_cas_container_path }}:U
+EnvironmentFile=%h/.config/hort/hort-worker.env
+Network=hort.network
+User={{ hort_uid }}:{{ hort_gid }}
+DropCapability=all
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

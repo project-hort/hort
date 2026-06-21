@@ -1,0 +1,225 @@
+---
+# postgres_apt role — install PostgreSQL via Debian apt, create the hort
+# database and two ADR 0009 roles (runtime DML + DDL/migrate), and harden
+# pg_hba.conf to local-only scram-sha-256.
+#
+# Debian 13 ships PostgreSQL 17; hort requires >= PG 16.  PG 17 satisfies it.
+# The role is idempotent: psql DO $$ blocks guard against duplicate creation.
+# Uses ansible.builtin.command + psql to avoid a community.postgresql
+# collection dependency that may not be installed on the control node.
+
+# ── Install PostgreSQL ────────────────────────────────────────────────────────
+
+- name: Install PostgreSQL package
+  ansible.builtin.apt:
+    name: postgresql
+    state: present
+    update_cache: true
+
+- name: Ensure PostgreSQL service is started and enabled
+  ansible.builtin.service:
+    name: postgresql
+    state: started
+    enabled: true
+
+# ── DDL/migrate role ──────────────────────────────────────────────────────────
+
+- name: Create DDL/migrate role (idempotent)
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_ddl_role }}') THEN
+            CREATE ROLE {{ postgres_apt_ddl_role }}
+              LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+              PASSWORD '{{ hort_db_ddl_password }}';
+          ELSE
+            ALTER ROLE {{ postgres_apt_ddl_role }} PASSWORD '{{ hort_db_ddl_password }}';
+          END IF;
+        END $$;
+  become: true
+  become_user: postgres
+  changed_when: true
+  no_log: true
+
+# ── Runtime role ──────────────────────────────────────────────────────────────
+
+- name: Create runtime DML role (idempotent)
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_runtime_role }}') THEN
+            CREATE ROLE {{ postgres_apt_runtime_role }}
+              LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+              PASSWORD '{{ hort_db_runtime_password }}';
+          ELSE
+            ALTER ROLE {{ postgres_apt_runtime_role }} PASSWORD '{{ hort_db_runtime_password }}';
+          END IF;
+        END $$;
+  become: true
+  become_user: postgres
+  changed_when: true
+  no_log: true
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+- name: Check if hort database exists
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -tAc
+      - SELECT 1 FROM pg_database WHERE datname = '{{ postgres_apt_db_name }}'
+  become: true
+  become_user: postgres
+  changed_when: false
+  register: postgres_apt_db_exists
+
+- name: Create hort database with DDL role as owner
+  ansible.builtin.command:
+    argv:
+      - createdb
+      - --owner={{ postgres_apt_ddl_role }}
+      - --encoding=UTF8
+      - --lc-collate=C
+      - --lc-ctype=C
+      - --template=template0
+      - "{{ postgres_apt_db_name }}"
+  become: true
+  become_user: postgres
+  when: postgres_apt_db_exists.stdout.strip() != "1"
+  changed_when: true
+
+# ── Grants ────────────────────────────────────────────────────────────────────
+# GRANT CONNECT + USAGE + DML on existing objects + ALTER DEFAULT PRIVILEGES
+# so future objects (created by migrations) are also accessible.
+#
+# All GRANT / ALTER DEFAULT PRIVILEGES tasks below use `changed_when: true`.
+# This is a deliberate conservative choice: GRANT is an idempotent no-op when
+# the privilege already exists, but raw psql output does not include a
+# "already granted" signal that we could reliably parse to detect a true no-op.
+# Avoiding fragile check-queries (e.g. querying pg_class/information_schema) is
+# the safer trade-off — the cosmetic "changed" noise is preferable to a brittle
+# idempotency check.  If the community.postgresql collection were available its
+# postgresql_privs module would handle this transparently, but we intentionally
+# avoid that collection dependency.
+
+- name: Grant CONNECT on database to runtime role
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "GRANT CONNECT ON DATABASE {{ postgres_apt_db_name }} TO {{ postgres_apt_runtime_role }};"
+  become: true
+  become_user: postgres
+  # See "Grants" block comment above for why changed_when: true is intentional.
+  changed_when: true
+
+- name: Grant USAGE on public schema to runtime role
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - "GRANT USAGE ON SCHEMA public TO {{ postgres_apt_runtime_role }};"
+  become: true
+  become_user: postgres
+  # See "Grants" block comment above for why changed_when: true is intentional.
+  changed_when: true
+
+- name: Grant DML on existing tables to runtime role
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - >-
+        GRANT SELECT, INSERT, UPDATE, DELETE
+          ON ALL TABLES IN SCHEMA public
+          TO {{ postgres_apt_runtime_role }};
+  become: true
+  become_user: postgres
+  # See "Grants" block comment above for why changed_when: true is intentional.
+  changed_when: true
+
+- name: Grant USAGE/SELECT on existing sequences to runtime role
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {{ postgres_apt_runtime_role }};"
+  become: true
+  become_user: postgres
+  # See "Grants" block comment above for why changed_when: true is intentional.
+  changed_when: true
+
+- name: Set default privileges for future tables (DDL role creates, runtime role gets DML)
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - >-
+        ALTER DEFAULT PRIVILEGES FOR ROLE {{ postgres_apt_ddl_role }}
+          IN SCHEMA public
+          GRANT SELECT, INSERT, UPDATE, DELETE
+          ON TABLES TO {{ postgres_apt_runtime_role }};
+  become: true
+  become_user: postgres
+  # See "Grants" block comment above for why changed_when: true is intentional.
+  changed_when: true
+
+- name: Set default privileges for future sequences
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - >-
+        ALTER DEFAULT PRIVILEGES FOR ROLE {{ postgres_apt_ddl_role }}
+          IN SCHEMA public
+          GRANT USAGE, SELECT
+          ON SEQUENCES TO {{ postgres_apt_runtime_role }};
+  become: true
+  become_user: postgres
+  # See "Grants" block comment above for why changed_when: true is intentional.
+  changed_when: true
+
+# ── Harden pg_hba.conf ────────────────────────────────────────────────────────
+# Replace the default pg_hba.conf with our hardened template.
+# Reload (not restart) is sufficient for hba changes.
+
+- name: Deploy hardened pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "{{ postgres_apt_hba_conf }}"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: Reload PostgreSQL

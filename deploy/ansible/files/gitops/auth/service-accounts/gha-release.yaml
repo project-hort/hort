@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: gha-release
+spec:
+  # Push access for the release workflow: publishes first-party images to
+  # hort-oci and crates to hort-crates.
+  role: developer
+  repositories:
+    - hort-oci
+    - hort-crates
+  federatedIdentities:
+    - issuer: github-actions          # references OidcIssuer metadata.name
+      claims:
+        repository: project-hort/hort
+        # `environment: release` is emitted only when the GitHub Actions job
+        # targets a protected environment named "release". The environment
+        # enforces tag-only trigger + required reviewers — hort does not need
+        # a `ref:` glob because the environment gate is authoritative.
+        # (A ref glob would require exact-match anyway — globs are not
+        # supported by the SA claim matcher.)
+        environment: release

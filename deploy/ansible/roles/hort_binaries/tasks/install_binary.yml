@@ -1,0 +1,74 @@
+---
+# install_binary.yml — download, verify, and install a single hort binary.
+# Called from main.yml with loop_var: hort_binaries_bin.
+
+- name: Set per-binary asset name for binary
+  ansible.builtin.set_fact:
+    hort_binaries_asset_name: "{{ hort_binaries_bin }}-linux-{{ hort_arch }}"
+
+- name: Download release tarball for binary
+  ansible.builtin.get_url:
+    url: "{{ hort_binaries_github_release_url }}/{{ hort_binaries_asset_name }}.tar.gz"
+    dest: "{{ hort_binaries_tmp_dir }}/{{ hort_binaries_asset_name }}.tar.gz"
+    mode: "0600"
+    force: true
+
+- name: Download sha256 checksum for binary
+  ansible.builtin.get_url:
+    url: "{{ hort_binaries_github_release_url }}/{{ hort_binaries_asset_name }}.tar.gz.sha256"
+    dest: "{{ hort_binaries_tmp_dir }}/{{ hort_binaries_asset_name }}.tar.gz.sha256"
+    mode: "0600"
+    force: true
+
+- name: Download Sigstore bundle for binary
+  ansible.builtin.get_url:
+    url: "{{ hort_binaries_github_release_url }}/{{ hort_binaries_asset_name }}.tar.gz.bundle"
+    dest: "{{ hort_binaries_tmp_dir }}/{{ hort_binaries_asset_name }}.tar.gz.bundle"
+    mode: "0600"
+    force: true
+
+# Verify SHA-256 integrity.  The .sha256 file contains a line of the form:
+#   <hex>  <filename>
+# sha256sum --check resolves filenames relative to cwd, so we set chdir.
+
+- name: Verify sha256 checksum of binary tarball
+  ansible.builtin.command:
+    cmd: "sha256sum --check {{ hort_binaries_asset_name }}.tar.gz.sha256"
+    chdir: "{{ hort_binaries_tmp_dir }}"
+  changed_when: false
+  register: hort_binaries_sha256_result
+  failed_when: hort_binaries_sha256_result.rc != 0
+
+# Verify cosign provenance.  The identity pin is the load-bearing control:
+# --certificate-identity-regexp rejects any signing identity that is not the
+# release workflow triggered from a v* tag.  Failure is hard (no fallback).
+
+- name: Verify cosign provenance of binary tarball
+  ansible.builtin.command:
+    argv:
+      - cosign
+      - verify-blob
+      - "--bundle={{ hort_binaries_tmp_dir }}/{{ hort_binaries_asset_name }}.tar.gz.bundle"
+      - "--certificate-identity-regexp={{ hort_binaries_cosign_cert_identity_regexp | trim }}"
+      - "--certificate-oidc-issuer={{ hort_binaries_cosign_cert_oidc_issuer }}"
+      - "{{ hort_binaries_tmp_dir }}/{{ hort_binaries_asset_name }}.tar.gz"
+  changed_when: false
+  register: hort_binaries_cosign_result
+  failed_when: hort_binaries_cosign_result.rc != 0
+
+# Extract and install only after both checks pass.
+
+- name: Extract binary tarball to temp directory
+  ansible.builtin.unarchive:
+    src: "{{ hort_binaries_tmp_dir }}/{{ hort_binaries_asset_name }}.tar.gz"
+    dest: "{{ hort_binaries_tmp_dir }}"
+    remote_src: true
+
+- name: Install verified binary to system path
+  ansible.builtin.copy:
+    src: "{{ hort_binaries_tmp_dir }}/{{ hort_binaries_asset_name }}"
+    dest: "{{ hort_binaries_install_dir }}/{{ hort_binaries_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+    remote_src: true

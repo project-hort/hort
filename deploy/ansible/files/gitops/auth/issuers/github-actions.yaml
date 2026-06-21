@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: OidcIssuer
+metadata:
+  name: github-actions
+spec:
+  issuerUrl: https://token.actions.githubusercontent.com
+  # The accepted `aud` allow-list. CI MUST request this audience
+  # (core.getIDToken('hort-server')); a default-audience token is rejected.
+  audiences: ["hort-server"]
+  # Defaults (left implicit): allowedAlgorithms ["RS256"]; requireJti true
+  # (fail-closed replay protection — GitHub Actions OIDC tokens carry `jti`);
+  # jwksRefreshInterval 1h. JWKS is auto-discovered over TLS (system trust +
+  # HORT_EXTRA_CA_BUNDLE) — there is no insecure-JWKS knob.

@@ -1,0 +1,28 @@
+# hort-server.service — managed by Ansible (hort-systemd role).
+# The hort artifact registry API server.  Runs as non-root user `hort`
+# with the isolation directives below (replacing the container boundary
+# that the Podman flavor uses).
+
+[Unit]
+Description=hort-server
+Requires=hort-migrate.service postgresql.service
+After=hort-migrate.service postgresql.service
+
+[Service]
+User={{ hort_user }}
+Group={{ hort_user }}
+ExecStart={{ hort_systemd_server_bin }} serve
+EnvironmentFile={{ hort_systemd_env_dir }}/hort-server.env
+
+# Isolation boundary (replaces the container):
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths={{ hort_systemd_cas_dir }}
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

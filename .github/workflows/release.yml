@@ -237,6 +237,107 @@ jobs:
           retention-days: 365
 
   # ════════════════════════════════════════════════════════════════════════════
+  # PUBLISH CRATES TO HORT REGISTRY
+  #
+  # Publishes the workspace's first-party crates to the hosted `hort-crates`
+  # repository on registry.hort.rs. Gated by vars.HORT_PROXY_ENABLED == 'true'
+  # (default off) so merging before the live instance exists does not fail the
+  # release. Any value other than exactly 'true' (absent, empty, 'false', etc.)
+  # is treated as disabled.
+  #
+  # The `environment: release` declaration causes this job's OIDC token to
+  # carry the `environment: release` claim, which is the exact discriminator
+  # that `gha-release` ServiceAccount matches (Task 2). Without this
+  # declaration the OIDC token lacks the `environment` claim and the exchange
+  # is rejected by hort with `no_sa_match`.
+  #
+  # Protected environment setup (required before go-live — document in README):
+  #   GitHub → Settings → Environments → release:
+  #     - Deployment branch/tag rule: refs/tags/v* (tag refs only)
+  #     - Required reviewer: at least one approver
+  #   This ensures only a reviewed, tagged release can trigger this job.
+  #
+  # cargo publish mechanics for a path-dep workspace:
+  #   - `cargo publish --no-verify` is required: the workspace uses path deps
+  #     (each crate's Cargo.toml has `crate-name = { path = "../..." }`).
+  #     Without --no-verify, cargo tries to build the crate in isolation, which
+  #     fails because the path deps are not yet on the registry. --no-verify
+  #     skips the pre-publish build check; the actual build already passed CI.
+  #   - Crates must be published in topological (dependency) order: a crate
+  #     that depends on another must be published AFTER its dependency has been
+  #     indexed, otherwise the version-resolution step fails.
+  #   - `--registry hort-crates` targets the hosted `hort-crates` repo; the
+  #     token is CARGO_REGISTRIES_HORT_CRATES_TOKEN (set by hort-auth).
+  # ════════════════════════════════════════════════════════════════════════════
+
+  hort-publish:
+    name: Publish Crates to hort-crates
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write   # required to mint the OIDC token for the gha-release SA
+    needs: [e2e-gate, build-binaries]
+    if: |
+      always() &&
+      needs.build-binaries.result == 'success' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      vars.HORT_PROXY_ENABLED == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      # Authenticate via the gha-release SA (environment: release ↔ SA claim).
+      # Writes CARGO_REGISTRIES_HORT_CRATES_TOKEN into the environment.
+      - uses: ./.github/actions/hort-auth
+
+      # Publish in dependency order. hort-domain has no intra-workspace deps so
+      # it goes first; each subsequent crate may depend on earlier entries.
+      # --no-verify: required for a path-dep workspace (path deps are not yet
+      # available on the registry when the pre-publish build check runs; the CI
+      # build already verified correctness). --registry hort-crates: targets the
+      # hosted first-party registry, not the default crates.io.
+      #
+      # The sleep between publishes gives the sparse-index time to propagate the
+      # newly-published crate before the next publish resolves its dependency.
+      # 10 s is conservative; the hort index-serve path is synchronous so the
+      # entry is typically available within 1–2 s of the upload completing.
+      - name: Publish hort crates to hort-crates (dependency order)
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+
+          publish_crate() {
+            local crate_path="$1"
+            echo "Publishing ${crate_path} ..."
+            cargo publish \
+              --no-verify \
+              --registry hort-crates \
+              --manifest-path "${crate_path}/Cargo.toml"
+            # Allow the sparse index to propagate the new entry before the next
+            # dependent crate's publish resolves it.
+            sleep 10
+          }
+
+          # Topological order: leaf deps first, binaries last.
+          # hort-domain: no intra-workspace deps
+          publish_crate crates/hort-domain
+          # hort-app: depends on hort-domain
+          publish_crate crates/hort-app
+          # hort-config: depends on hort-domain + hort-app
+          publish_crate crates/hort-config
+          # hort-http-core: depends on hort-domain + hort-app
+          publish_crate crates/hort-http-core
+          # hort-formats: depends on hort-domain + hort-app
+          publish_crate crates/hort-formats
+
+  # ════════════════════════════════════════════════════════════════════════════
   # CREATE RELEASE
   # ════════════════════════════════════════════════════════════════════════════
 

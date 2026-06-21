@@ -1,0 +1,8 @@
+# pg_hba.conf — managed by Ansible (postgres-apt role).
+# Authentication: local-socket connections use scram-sha-256.
+# No wide-trust lines; the postgres superuser is local-only.
+#
+# TYPE  DATABASE           USER                   ADDRESS    METHOD
+local   all                postgres                          peer
+local   {{ postgres_apt_db_name }}  {{ postgres_apt_ddl_role }}  scram-sha-256
+local   {{ postgres_apt_db_name }}  {{ postgres_apt_runtime_role }}  scram-sha-256

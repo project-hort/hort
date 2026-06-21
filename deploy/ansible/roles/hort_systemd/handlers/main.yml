@@ -1,0 +1,11 @@
+---
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: system
+
+- name: Reload hort-systemd units
+  ansible.builtin.systemd:
+    name: hort-server.service
+    state: restarted
+    scope: system

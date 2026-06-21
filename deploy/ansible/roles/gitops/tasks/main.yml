@@ -1,0 +1,104 @@
+---
+# gitops role — place the gitops config tree + (re)start hort-server + mint
+# operator service-account tokens.
+#
+# Boot-time apply: hort-server reads the gitops tree on startup via
+# gitops_boot.rs (ApplyConfigUseCase::apply).  The way to trigger a re-apply
+# is to restart the server — there is NO `admin bootstrap` subcommand and NO
+# `apply` CLI.  The apply-time linter is the audited validation gate.
+#
+# Token minting:
+#   hort-svc-maintainer-dev     — read permission  → /run/secrets/hort-dev.token
+#   hort-svc-maintainer-curator — curate permission → /run/secrets/hort-curator.token
+#
+#   Both tokens are idempotent (exit 0, no reissue) unless --rotate is passed.
+#   Tokens must be stored in Ansible Vault / the maintainer's secret store after
+#   minting — they are NEVER committed to the repo.
+#
+# Flavor-aware invocation:
+#   gitops_admin_cmd is set by the caller:
+#     native:  "hort-server admin"
+#     podman:  "podman exec hort-server hort-server admin"
+#
+# Required variables:
+#   hort_config_dir   — host path where hort-server reads its gitops config
+#   gitops_admin_cmd    — prefix for admin subcommands (see defaults/main.yml)
+#   hort_user         — service user that owns hort_config_dir
+
+- name: Assert gitops_admin_cmd is configured
+  ansible.builtin.assert:
+    that:
+      - gitops_admin_cmd | length > 0
+    fail_msg: >-
+      gitops_admin_cmd must be set (e.g. "hort-server admin" for native flavor
+      or "podman exec hort-server hort-server admin" for Podman flavor).
+
+# ── Config tree ───────────────────────────────────────────────────────────────
+
+- name: Ensure hort config directory exists
+  ansible.builtin.file:
+    path: "{{ hort_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0750"
+
+# Synchronise the gitops tree.  The `delete: true` flag removes stale files
+# so the host tree always matches the committed Ansible repo state exactly.
+- name: Sync gitops config tree to host
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/files/gitops/"
+    dest: "{{ hort_config_dir }}/"
+    delete: true
+    recursive: true
+    rsync_opts:
+      - "--chown=root:{{ hort_user }}"
+      - "--chmod=D750,F640"
+  notify:
+    - Restart hort-server (system scope)
+    - Restart hort-server (user scope)
+
+# ── Boot-time apply (restart → ApplyConfigUseCase::apply) ─────────────────────
+
+- name: Flush handlers (restart hort-server to trigger boot-time apply)
+  ansible.builtin.meta: flush_handlers
+
+# ── Operator service-account tokens ──────────────────────────────────────────
+# Mint tokens for the two operator service accounts.  Both invocations are
+# idempotent: if the named token already exists the command exits 0 without
+# rotation.  Pass --rotate to replace an existing token.
+#
+# Tokens are written to /run/secrets/ (tmpfs, cleared on reboot) and must be
+# retrieved from there and stored in Ansible Vault / the operator's secret
+# store immediately after provisioning.
+
+- name: Ensure /run/secrets directory exists
+  ansible.builtin.file:
+    path: /run/secrets
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Issue maintainer-dev service-account token (read permission)
+  ansible.builtin.command:
+    cmd: >-
+      {{ gitops_admin_cmd }} issue-svc-token
+      --name maintainer-dev
+      --permission read
+      --output file:/run/secrets/hort-dev.token
+  changed_when: true
+  # Note: idempotency is enforced by hort-server itself (exit 0, no reissue
+  # if the token already exists).  changed_when: true is intentional — we
+  # cannot distinguish "already existed" from "freshly issued" without parsing
+  # stderr, and the conservative choice is to always report changed so
+  # operators know a provisioning run touched the token slot.
+
+- name: Issue maintainer-curator service-account token (curate permission)
+  ansible.builtin.command:
+    cmd: >-
+      {{ gitops_admin_cmd }} issue-svc-token
+      --name maintainer-curator
+      --permission curate
+      --output file:/run/secrets/hort-curator.token
+  changed_when: true

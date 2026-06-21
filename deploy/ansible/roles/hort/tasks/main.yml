@@ -1,0 +1,144 @@
+---
+# hort role — Quadlet container units, env-files, CAS volume, migrate ordering.
+#
+# Depends on the podman role having already created the hort service user,
+# the Quadlet directory, and the hort_config_dir.
+#
+# Secrets arrive via Ansible Vault in group_vars/production/ and are written
+# to env-files on the host (mode 0600, owned by the hort user).  They never
+# appear in this role's task list.
+
+# ── Directories ──────────────────────────────────────────────────────────────
+
+- name: Ensure env-file directory exists
+  ansible.builtin.file:
+    path: "{{ hort_env_dir }}"
+    state: directory
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0700"
+
+- name: Ensure postgres data directory exists
+  ansible.builtin.file:
+    path: "{{ hort_postgres_data_dir }}"
+    state: directory
+    owner: "{{ hort_uid }}"
+    group: "{{ hort_gid }}"
+    mode: "0700"
+
+# ── env-files (non-secret subset) ────────────────────────────────────────────
+# Secret values injected here from group_vars/production/ (gitignored Vault).
+# Each template has a "SECRET PLACEHOLDER" comment explaining where to source
+# the value.
+
+- name: Write hort-server env-file
+  ansible.builtin.template:
+    src: hort-server.env.j2
+    dest: "{{ hort_env_dir }}/hort-server.env"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0600"
+  notify: Reload hort-server
+
+- name: Write hort-worker env-file
+  ansible.builtin.template:
+    src: hort-worker.env.j2
+    dest: "{{ hort_env_dir }}/hort-worker.env"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0600"
+  notify: Reload hort-worker
+
+# ── Quadlet unit files ────────────────────────────────────────────────────────
+
+- name: Install hort.network Quadlet unit
+  ansible.builtin.template:
+    src: hort.network.j2
+    dest: "{{ hort_quadlet_dir }}/hort.network"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0644"
+  notify: Reload systemd user daemon
+
+- name: Install cas.volume Quadlet unit
+  ansible.builtin.template:
+    src: cas.volume.j2
+    dest: "{{ hort_quadlet_dir }}/hort-cas.volume"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0644"
+  notify: Reload systemd user daemon
+
+- name: Install postgres.container Quadlet unit
+  ansible.builtin.template:
+    src: postgres.container.j2
+    dest: "{{ hort_quadlet_dir }}/postgres.container"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0644"
+  notify: Reload systemd user daemon
+
+- name: Install hort-migrate.container Quadlet unit
+  ansible.builtin.template:
+    src: hort-migrate.container.j2
+    dest: "{{ hort_quadlet_dir }}/hort-migrate.container"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0644"
+  notify: Reload systemd user daemon
+
+- name: Install hort-server.container Quadlet unit
+  ansible.builtin.template:
+    src: hort-server.container.j2
+    dest: "{{ hort_quadlet_dir }}/hort-server.container"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0644"
+  notify: Reload systemd user daemon
+
+- name: Install hort-worker.container Quadlet unit
+  ansible.builtin.template:
+    src: hort-worker.container.j2
+    dest: "{{ hort_quadlet_dir }}/hort-worker.container"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0644"
+  notify: Reload systemd user daemon
+
+# ── Flush handlers before enabling units ─────────────────────────────────────
+# daemon-reload must complete before systemctl enable --now so that systemd
+# sees the freshly generated unit files.
+
+- name: Flush handlers (reload systemd before enable)
+  ansible.builtin.meta: flush_handlers
+
+# ── Enable and start units ────────────────────────────────────────────────────
+# postgres and hort-server are long-running services; hort-migrate is
+# Type=oneshot and is triggered as a dependency of hort-server on each start.
+
+- name: Enable and start postgres container
+  ansible.builtin.systemd:
+    name: postgres
+    state: started
+    enabled: true
+    scope: user
+  become: true
+  become_user: "{{ hort_user }}"
+
+- name: Enable and start hort-server container
+  ansible.builtin.systemd:
+    name: hort-server
+    state: started
+    enabled: true
+    scope: user
+  become: true
+  become_user: "{{ hort_user }}"
+
+- name: Enable and start hort-worker container
+  ansible.builtin.systemd:
+    name: hort-worker
+    state: started
+    enabled: true
+    scope: user
+  become: true
+  become_user: "{{ hort_user }}"

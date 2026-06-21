@@ -1,0 +1,11 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: quay-proxy
+spec:
+  repository: quay-proxy
+  pathPrefix: ""
+  upstreamUrl: https://quay.io
+  # quay.io issues a bearer token for anonymous pulls of public repos.
+  auth:
+    type: bearer_challenge

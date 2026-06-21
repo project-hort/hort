@@ -38,6 +38,11 @@ workflow:
 # ---------------------------------------------------------------------------
 
 variables:
+  # Route CI deps through registry.hort.rs.
+  # Set to exactly "true" to enable; any other value (absent, empty, "false")
+  # is treated as disabled so merging before the live instance exists does not
+  # break CI. Mirrors the gate in .github/actions/hort-auth/action.yml.
+  HORT_PROXY_ENABLED: ""
   # OCI registry host for images AND Helm charts. REQUIRED for the
   # build-images / helm-publish / sign jobs — no default (the former
   # internal-mirror value only resolved on the original runner). Set as
@@ -170,6 +175,88 @@ variables:
     - if: $CI_COMMIT_BRANCH =~ /^release\//
     - if: $CI_COMMIT_TAG
 
+# ---------------------------------------------------------------------------
+# registry.hort.rs proxy auth — id_tokens + tool config
+# ---------------------------------------------------------------------------
+#
+# Gated by HORT_PROXY_ENABLED == "true" (default-off). The shell guard inside
+# the before_script anchor is strict-equality so merging before the live
+# instance exists does not break CI. Mirrors .github/actions/hort-auth.
+#
+# How it wires together:
+#   • .hort-auth declares HORT_OIDC_TOKEN (aud: hort-server). Test/build
+#     jobs pull it via id_tokens: !reference [.hort-auth, id_tokens].
+#   • &hort-auth-steps is a before_script YAML anchor consumed as
+#     - *hort-auth-steps in each job's before_script list.
+#   • The buildah jobs (.docker) have their own id_tokens block;
+#     HORT_OIDC_TOKEN is added there alongside VAULT/SIGSTORE tokens.
+#
+# Exchange endpoint (RFC 8693 token exchange, confirmed from exchange.rs):
+#   POST https://registry.hort.rs/api/v1/auth/exchange
+#   form-encoded: grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+#                 subject_token=$HORT_OIDC_TOKEN
+#                 subject_token_type=urn:ietf:params:oauth:token-type:jwt
+#   response: { "access_token": "..." }
+#
+# Cargo source: sparse+https://registry.hort.rs/cargo/cargo-virtual/ (the
+# virtual aggregation repo). Fallback until cargo-virtual lands: crates-proxy
+# (change HORT_CARGO_SOURCE_REPO to "crates-proxy").
+.hort-auth:
+  id_tokens:
+    HORT_OIDC_TOKEN:
+      aud: hort-server
+  before_script: &hort-auth-steps
+    - |
+      if [ "${HORT_PROXY_ENABLED:-}" = "true" ]; then
+        echo "[hort-auth] exchanging OIDC token for hort bearer token"
+        _hort_url="${HORT_URL:-https://registry.hort.rs}"
+        _hort_cargo_repo="${HORT_CARGO_SOURCE_REPO:-cargo-virtual}"
+        _hort_gt="urn:ietf:params:oauth:grant-type:token-exchange"
+        _hort_stt="urn:ietf:params:oauth:token-type:jwt"
+        _hort_response=$(curl -sSf \
+          -X POST "${_hort_url}/api/v1/auth/exchange" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data-urlencode "grant_type=${_hort_gt}" \
+          --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
+          --data-urlencode "subject_token_type=${_hort_stt}")
+        HORT_TOKEN=$(echo "${_hort_response}" \
+          | grep -o '"access_token":"[^"]*"' \
+          | cut -d'"' -f4)
+        if [ -z "${HORT_TOKEN}" ]; then
+          echo "[hort-auth] ERROR: no access_token in response (omitted)"
+          exit 1
+        fi
+        echo "[hort-auth] token exchange succeeded"
+
+        # Cargo: sparse index via cargo-virtual (or crates-proxy fallback)
+        mkdir -p .cargo
+        printf '[source.crates-io]\nreplace-with = "hort"\n\n' \
+          > .cargo/config.toml
+        printf '[registries.hort]\nindex = "sparse+%s/cargo/%s/"\n\n' \
+          "${_hort_url}" "${_hort_cargo_repo}" >> .cargo/config.toml
+        # hort-crates: first-party hosted registry (cargo publish target)
+        _hort_crates_idx="sparse+${_hort_url}/cargo/hort-crates/"
+        printf '[registries.hort-crates]\nindex = "%s"\n' \
+          "${_hort_crates_idx}" >> .cargo/config.toml
+        export CARGO_REGISTRIES_HORT_TOKEN="${HORT_TOKEN}"
+        export CARGO_REGISTRIES_HORT_CRATES_TOKEN="${HORT_TOKEN}"
+
+        # npm: npm-proxy pull-through
+        _hort_host="${_hort_url#https://}"
+        printf 'registry=%s/npm/npm-proxy/\n' "${_hort_url}" > .npmrc
+        printf '//%s/npm/npm-proxy/:_authToken=%s\n' \
+          "${_hort_host}" "${HORT_TOKEN}" >> .npmrc
+
+        # OCI: log in via buildah (dockerhub-proxy / quay-proxy mirror)
+        if command -v buildah >/dev/null 2>&1; then
+          echo "${HORT_TOKEN}" | buildah login "${_hort_host}" \
+            --username hort-ci \
+            --password-stdin
+        fi
+      else
+        echo "[hort-auth] HORT_PROXY_ENABLED != 'true' — proxy disabled"
+      fi
+
 # ===========================================================================
 # Stage 1: test — fmt, clippy, unit tests, coverage, integration (reserved)
 # ===========================================================================
@@ -184,7 +271,9 @@ test:lint:
   stage: test
   image: ${RUST_IMAGE}
   <<: *rust-cache
+  id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
+    - *hort-auth-steps
     - *rust-apt-deps
     - rustup component add rustfmt clippy
   script:
@@ -199,7 +288,9 @@ test:unit:
   needs:
     - job: test:lint
       artifacts: false
+  id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
+    - *hort-auth-steps
     - *rust-apt-deps
   script:
     - cargo test --workspace --lib --verbose
@@ -218,7 +309,9 @@ test:coverage:
     # cargo-llvm-cov drives rustc directly; sccache or other wrappers break
     # instrumentation.
     RUSTC_WRAPPER: ""
+  id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
+    - *hort-auth-steps
     - *rust-apt-deps
     - rustup component add llvm-tools-preview
     - cargo install --locked cargo-llvm-cov || true
@@ -264,7 +357,9 @@ test:integration:
     POSTGRES_USER: "registry"
     POSTGRES_PASSWORD: "registry"
     DATABASE_URL: "postgresql://registry:registry@postgres:5432/artifact_registry"
+  id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
+    - *hort-auth-steps
     - *rust-apt-deps
     - apt-get install -y -qq --no-install-recommends postgresql-client
     - for i in $(seq 1 30); do pg_isready -h postgres -U "${POSTGRES_USER}" && break; sleep 1; done
@@ -496,7 +591,14 @@ quality:helm-template-test:
       aud: "${VAULT_ADDR}"
     SIGSTORE_ID_TOKEN:
       aud: sigstore
+    # hort registry.hort.rs federation token — audience must match
+    # OidcIssuer.audiences on the server ("hort-server"). Only used when
+    # HORT_PROXY_ENABLED == "true"; minted unconditionally because id_tokens are
+    # job-level declarations, not conditional on runtime variables.
+    HORT_OIDC_TOKEN:
+      aud: hort-server
   before_script:
+    - *hort-auth-steps
     - *platform-ca-rhel
     - mkdir -p ${CI_PROJECT_DIR}/build_info
     - *resolve-registry-creds
@@ -809,7 +911,10 @@ release:sbom:
       aud: "${VAULT_ADDR}"
     SIGSTORE_ID_TOKEN:
       aud: sigstore
+    HORT_OIDC_TOKEN:
+      aud: hort-server
   before_script:
+    - *hort-auth-steps
     - *rust-apt-deps
     # cosign-setup.sh's `apk add jq` / `dnf install jq` fallback does
     # not cover debian-based images. The rust-apt-deps anchor above

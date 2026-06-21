@@ -1,0 +1,27 @@
+# hort-migrate.service — managed by Ansible (hort-systemd role).
+# Applies sqlx database migrations and exits.  Runs as the DDL/migrate
+# role DSN (hort_db_ddl_password) which holds CREATE/ALTER/DROP on the
+# artifact_registry database.  hort-server and hort-worker require this
+# service to have completed successfully before they start.
+
+[Unit]
+Description=hort database migrations
+Requires=postgresql.service
+After=postgresql.service
+Before=hort-server.service hort-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User={{ hort_user }}
+Group={{ hort_user }}
+ExecStart={{ hort_systemd_server_bin }} migrate
+EnvironmentFile={{ hort_systemd_env_dir }}/hort-migrate.env
+
+# Isolation boundary
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

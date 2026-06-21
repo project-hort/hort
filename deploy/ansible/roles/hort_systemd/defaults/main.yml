@@ -1,0 +1,30 @@
+---
+# Defaults for the hort-systemd role.
+
+# CAS filesystem path on the host (hort-server and hort-worker write here).
+hort_systemd_cas_dir: /var/lib/hort/cas
+
+# systemd env-file directory (mode 0600, owned by hort user).
+hort_systemd_env_dir: /etc/hort
+
+# hort-server binary PATH (installed by hort-binaries role).
+hort_systemd_server_bin: /usr/local/bin/hort-server
+
+# hort-worker binary PATH (installed by hort-binaries role).
+hort_systemd_worker_bin: /usr/local/bin/hort-worker
+
+# Scanner binary paths used by the worker.
+hort_systemd_trivy_bin: /usr/local/bin/trivy
+hort_systemd_osv_bin: /usr/local/bin/osv-scanner
+
+# Pinned scanner versions.
+# Override in host_vars or group_vars when a newer version is validated.
+#
+# hort_systemd_osv_version: pinned to a known-good release tag (without "v").
+# Verify against https://github.com/google/osv-scanner/releases
+hort_systemd_osv_version: "1.9.1"
+#
+# hort_systemd_trivy_version: pinned to a known-good version string accepted by
+# the aquasecurity apt repository (https://aquasecurity.github.io/trivy-repo/).
+# Use `apt-cache madison trivy` after adding the repo to confirm availability.
+hort_systemd_trivy_version: "0.60.0"

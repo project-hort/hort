@@ -1,0 +1,215 @@
+---
+# hort-systemd role — hardened systemd units for hort-server, hort-worker,
+# and hort-migrate (Type=oneshot DDL migration before serve).
+#
+# Units run as non-root `hort` user with:
+#   ProtectSystem=strict, ProtectHome=true, PrivateTmp=true,
+#   NoNewPrivileges=true, CapabilityBoundingSet= (empty),
+#   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+#   ReadWritePaths={{ hort_systemd_cas_dir }} (CAS directory)
+#
+# Ordering: hort-migrate (oneshot) → hort-server + hort-worker
+# both declare Requires=hort-migrate.service After=hort-migrate.service.
+
+# ── Directories ───────────────────────────────────────────────────────────────
+
+- name: Ensure CAS directory exists
+  ansible.builtin.file:
+    path: "{{ hort_systemd_cas_dir }}"
+    state: directory
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0750"
+
+- name: Ensure env-file directory exists
+  ansible.builtin.file:
+    path: "{{ hort_systemd_env_dir }}"
+    state: directory
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0750"
+
+# ── Env-files (mode 0600 — contain DSN passwords) ────────────────────────────
+
+- name: Write hort-migrate env-file
+  ansible.builtin.template:
+    src: hort-migrate.env.j2
+    dest: "{{ hort_systemd_env_dir }}/hort-migrate.env"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0600"
+  notify: Reload hort-systemd units
+
+- name: Write hort-server env-file
+  ansible.builtin.template:
+    src: hort-server.env.j2
+    dest: "{{ hort_systemd_env_dir }}/hort-server.env"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0600"
+  notify: Reload hort-systemd units
+
+- name: Write hort-worker env-file
+  ansible.builtin.template:
+    src: hort-worker.env.j2
+    dest: "{{ hort_systemd_env_dir }}/hort-worker.env"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0600"
+  notify: Reload hort-systemd units
+
+# ── systemd unit files ────────────────────────────────────────────────────────
+
+- name: Install hort-migrate.service unit
+  ansible.builtin.template:
+    src: hort-migrate.service.j2
+    dest: /etc/systemd/system/hort-migrate.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd daemon
+
+- name: Install hort-server.service unit
+  ansible.builtin.template:
+    src: hort-server.service.j2
+    dest: /etc/systemd/system/hort-server.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd daemon
+
+- name: Install hort-worker.service unit
+  ansible.builtin.template:
+    src: hort-worker.service.j2
+    dest: /etc/systemd/system/hort-worker.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd daemon
+
+# ── Flush handlers (daemon-reload before enable) ──────────────────────────────
+
+- name: Flush handlers (daemon-reload before enabling units)
+  ansible.builtin.meta: flush_handlers
+
+# ── trivy + osv-scanner (scan_backends: [trivy|osv] for the worker) ───────────
+
+- name: Install trivy via apt
+  block:
+    - name: Add trivy apt key
+      ansible.builtin.get_url:
+        url: https://aquasecurity.github.io/trivy-repo/deb/public.key
+        dest: /usr/share/keyrings/trivy.asc
+        mode: "0644"
+
+    - name: Add trivy apt repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by=/usr/share/keyrings/trivy.asc]
+          https://aquasecurity.github.io/trivy-repo/deb generic main
+        state: present
+        filename: trivy
+
+    - name: Install trivy (pinned version)
+      # Pin to an exact version for deterministic installs across re-runs.
+      # The version string must exist in the aquasecurity apt repository at
+      # https://aquasecurity.github.io/trivy-repo/ — verify with
+      # `apt-cache madison trivy` after adding the repo above.
+      # Override hort_systemd_trivy_version in host_vars/group_vars to upgrade.
+      ansible.builtin.apt:
+        name: "trivy={{ hort_systemd_trivy_version }}"
+        state: present
+        update_cache: true
+
+- name: Install osv-scanner binary (pinned, checksum-verified)
+  # Downloads the binary for the pinned version from GitHub Releases and
+  # verifies it against the upstream checksums.txt before installing.
+  # hort_systemd_osv_version is set in defaults/main.yml and is overridable.
+  # See https://github.com/google/osv-scanner/releases for available tags.
+  block:
+    - name: Download osv-scanner binary (amd64)
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_linux_amd64
+        dest: /var/tmp/osv-scanner
+        mode: "0600"
+        force: true
+      when: hort_arch == 'amd64'
+
+    - name: Download osv-scanner binary (arm64)
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_linux_arm64
+        dest: /var/tmp/osv-scanner
+        mode: "0600"
+        force: true
+      when: hort_arch == 'arm64'
+
+    - name: Download osv-scanner checksums file
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_{{ hort_systemd_osv_version }}_checksums.txt
+        dest: /var/tmp/osv-scanner_checksums.txt
+        mode: "0600"
+        force: true
+
+    - name: Extract expected checksum for this arch
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          grep "osv-scanner_linux_{{ hort_arch }}$"
+          /var/tmp/osv-scanner_checksums.txt
+          | awk '{print $1}'
+        executable: /bin/bash
+      register: hort_systemd_osv_expected_sha256
+      changed_when: false
+
+    - name: Compute actual checksum of downloaded binary
+      ansible.builtin.stat:
+        path: /var/tmp/osv-scanner
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: hort_systemd_osv_stat
+
+    - name: Fail if osv-scanner checksum does not match
+      ansible.builtin.fail:
+        msg: >-
+          osv-scanner checksum mismatch for v{{ hort_systemd_osv_version }} ({{ hort_arch }}):
+          expected {{ hort_systemd_osv_expected_sha256.stdout }},
+          got {{ hort_systemd_osv_stat.stat.checksum }}
+      when: hort_systemd_osv_stat.stat.checksum != hort_systemd_osv_expected_sha256.stdout
+
+    - name: Install osv-scanner to /usr/local/bin
+      ansible.builtin.copy:
+        src: /var/tmp/osv-scanner
+        dest: "{{ hort_systemd_osv_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+# ── Enable and start units ────────────────────────────────────────────────────
+# hort-migrate is Type=oneshot; we enable it so the ordering dependency fires
+# automatically when hort-server starts.  We do NOT start it standalone here
+# because it requires the DB passwords (env-file) which are ready now, but
+# the postgres-apt role has already started PostgreSQL earlier in the play.
+
+- name: Enable hort-migrate.service
+  ansible.builtin.systemd:
+    name: hort-migrate.service
+    enabled: true
+    scope: system
+
+- name: Enable and start hort-server.service
+  ansible.builtin.systemd:
+    name: hort-server.service
+    state: started
+    enabled: true
+    scope: system
+
+- name: Enable and start hort-worker.service
+  ansible.builtin.systemd:
+    name: hort-worker.service
+    state: started
+    enabled: true
+    scope: system

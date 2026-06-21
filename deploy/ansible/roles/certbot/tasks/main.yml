@@ -1,0 +1,42 @@
+---
+# certbot role — Let's Encrypt TLS certificate issuance + renewal.
+#
+# Installs certbot and the nginx plugin, then runs certbot --nginx for the
+# registry FQDN.  The issuance task is guarded by `creates:` so it only
+# fires when the live certificate does not yet exist (idempotent).  The
+# systemd renewal timer is enabled so certificates renew automatically.
+#
+# Required variables (set in group_vars/production/ or --extra-vars):
+#   registry_fqdn  — the FQDN to certify (default: registry.hort.rs)
+#   le_email       — Let's Encrypt registration email (no default; must be set)
+
+- name: Install certbot and nginx plugin
+  ansible.builtin.apt:
+    name:
+      - certbot
+      - python3-certbot-nginx
+    state: present
+    update_cache: true
+
+# Idempotency guard: the live chain file only exists after a successful
+# issuance.  If it is absent certbot runs; if it is present the task is
+# a no-op (creates: semantics).
+- name: Issue Let's Encrypt certificate for {{ registry_fqdn }}
+  ansible.builtin.command:
+    cmd: >-
+      certbot --nginx
+      -d {{ registry_fqdn }}
+      --non-interactive
+      --agree-tos
+      -m {{ le_email }}
+    creates: /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem
+  notify: Reload nginx
+
+# Debian ships certbot with a systemd timer (certbot.timer) that invokes
+# certbot renew twice daily.  Ensure it is enabled and running.
+- name: Enable and start certbot renewal timer
+  ansible.builtin.systemd:
+    name: certbot.timer
+    state: started
+    enabled: true
+    daemon_reload: false

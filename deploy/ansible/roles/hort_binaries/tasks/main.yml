@@ -1,0 +1,41 @@
+---
+# hort-binaries role — fetch, verify, and install hort-server and hort-worker
+# release binaries.
+#
+# Provenance gate (load-bearing):
+#   1. Download the .tar.gz + .sha256 + .bundle from the GitHub release.
+#   2. Verify the sha256 checksum (integrity).
+#   3. cosign verify-blob with --certificate-identity-regexp and
+#      --certificate-oidc-issuer pinned (provenance).  Verifying signed-by-
+#      anyone is NOT enough; the identity pin is the security control.
+# The play fails on any verification failure — there is no fallback path.
+#
+# Signature artifact form (confirmed from .github/workflows/build-binaries.yml):
+#   cosign sign-blob --yes --bundle <name>.tar.gz.bundle <name>.tar.gz
+# Verification: cosign verify-blob --bundle <name>.tar.gz.bundle ...
+
+# ── Prerequisites ─────────────────────────────────────────────────────────────
+
+- name: Install cosign
+  ansible.builtin.apt:
+    name: cosign
+    state: present
+    update_cache: true
+
+- name: Ensure download temp directory exists
+  ansible.builtin.file:
+    path: "{{ hort_binaries_tmp_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# ── Download + verify each binary ────────────────────────────────────────────
+
+- name: Download, verify, and install hort-server and hort-worker
+  ansible.builtin.include_tasks: install_binary.yml
+  loop:
+    - hort-server
+    - hort-worker
+  loop_control:
+    loop_var: hort_binaries_bin

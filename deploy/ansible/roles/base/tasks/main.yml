@@ -1,0 +1,83 @@
+---
+# base role — OS hardening common to both Podman and native flavors.
+#
+# Responsibilities:
+#   1. Create a dedicated system user/group for hort (used by the gitops role
+#      to own the config directory; the podman role creates it independently
+#      for rootless containers but here we ensure it exists for the native
+#      flavor too).
+#   2. Install and configure ufw — the podman role's ufw rules are gated on
+#      ufw presence, so ufw must be installed before that role runs.
+#   3. Apply the firewall policy: allow 80 (ACME) + 443 (HTTPS), deny the
+#      high API port from the internet.
+#   4. Enable unattended-upgrades for security patches.
+
+# ── System user/group ─────────────────────────────────────────────────────────
+
+- name: Create hort system group
+  ansible.builtin.group:
+    name: "{{ hort_user }}"
+    gid: "{{ hort_gid }}"
+    system: true
+    state: present
+
+- name: Create hort system user
+  ansible.builtin.user:
+    name: "{{ hort_user }}"
+    uid: "{{ hort_uid }}"
+    group: "{{ hort_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/hort
+    create_home: true
+    state: present
+
+# ── Firewall ──────────────────────────────────────────────────────────────────
+
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+
+- name: Allow SSH through firewall
+  community.general.ufw:
+    rule: allow
+    name: OpenSSH
+
+- name: Allow HTTP (80) through firewall
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+
+- name: Allow HTTPS (443) through firewall
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+
+- name: Deny external access to hort API port ({{ hort_api_port }})
+  community.general.ufw:
+    rule: deny
+    port: "{{ hort_api_port }}"
+    proto: tcp
+
+- name: Enable ufw with default deny-incoming policy
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming
+
+# ── Unattended upgrades ───────────────────────────────────────────────────────
+
+- name: Install unattended-upgrades
+  ansible.builtin.apt:
+    name: unattended-upgrades
+    state: present
+
+- name: Enable unattended-upgrades
+  ansible.builtin.service:
+    name: unattended-upgrades
+    state: started
+    enabled: true
