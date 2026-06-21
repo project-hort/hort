@@ -1,0 +1,17 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: crates-scan
+spec:
+  scope:
+    repository: crates-proxy
+  severityThreshold: high
+  # THE observation window (humantime). Starts at 1 day; the ramp edits this
+  # field + restart-to-apply — it is a gitops field, NOT a deployment env var.
+  quarantineDuration: 24h
+  requireApproval: false
+  # Provenance off (no per-ingest verify job); avoids the empty-identities
+  # verify_if_present apply-time WARN.
+  provenanceMode: off
+  scanBackends: ["osv"]
+  licensePolicy: {}

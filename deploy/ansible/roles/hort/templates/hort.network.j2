@@ -1,0 +1,7 @@
+# Quadlet network unit — hort internal bridge.
+# All hort containers attach to this network so they can reach each other by
+# container name (postgres, hort-server, hort-worker) without publishing ports
+# to the host except the API high port (127.0.0.1:{{ hort_api_port }}).
+
+[Network]
+NetworkName=hort

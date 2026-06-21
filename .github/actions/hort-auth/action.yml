@@ -1,0 +1,155 @@
+name: Hort Registry Auth
+description: >
+  Exchange a GitHub Actions OIDC token for a hort bearer token, then write
+  tool-specific credential files so subsequent cargo / npm / docker steps
+  pull dependencies through registry.hort.rs.
+
+  Gated by the HORT_PROXY_ENABLED repo variable: the action is a no-op unless
+  the variable is set to exactly 'true'. Any other value (absent, empty, 'false',
+  etc.) is treated as disabled, so merging before the live instance exists does
+  not break CI.
+
+inputs:
+  hort_url:
+    description: Base URL of the hort instance (no trailing slash)
+    required: false
+    default: 'https://registry.hort.rs'
+  cargo_source_repo:
+    description: >
+      Cargo source repo key to use as the sparse-index source.
+      Default is 'cargo-virtual' (the virtual aggregation repo). Set to
+      'crates-proxy' for a one-line fallback until cargo-virtual
+      aggregation lands (§3 Class C).
+    required: false
+    default: 'cargo-virtual'
+
+outputs:
+  token:
+    description: Minted hort bearer token (access_token from RFC 8693 response)
+    value: ${{ steps.exchange.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    # ── guard ──────────────────────────────────────────────────────────────────
+    # Skip the entire action when the instance is not yet live. All subsequent
+    # steps check this output so callers do not need a wrapper `if:`.
+    # Gate is strict equality: only the exact string 'true' enables the action.
+    # A non-empty value such as 'false' must NOT enable it — hence `= "true"`,
+    # not `[ -n ... ]`.
+    - name: Check HORT_PROXY_ENABLED
+      id: guard
+      shell: bash
+      run: |
+        if [ "${{ vars.HORT_PROXY_ENABLED }}" = "true" ]; then
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "HORT_PROXY_ENABLED is not 'true' — hort-auth action is a no-op (instance not yet live)"
+        fi
+
+    # ── OIDC token ─────────────────────────────────────────────────────────────
+    # audience MUST be 'hort-server' — this is what OidcIssuer.audiences
+    # validates against. A default-audience token is rejected with AudMismatch.
+    - name: Request OIDC token (audience=hort-server)
+      id: oidc
+      if: steps.guard.outputs.enabled == 'true'
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      with:
+        script: |
+          const token = await core.getIDToken('hort-server');
+          core.setSecret(token);
+          core.setOutput('oidc_token', token);
+
+    # ── token exchange ─────────────────────────────────────────────────────────
+    # POST /api/v1/auth/exchange — RFC 8693 form-encoded token exchange.
+    # subject_token_type=urn:ietf:params:oauth:token-type:jwt routes into the
+    # federation branch (handle_federated_jwt) in exchange.rs.
+    # Response field confirmed from exchange.rs ExchangeResponseBody: access_token.
+    - name: Exchange OIDC token for hort bearer token
+      id: exchange
+      if: steps.guard.outputs.enabled == 'true'
+      shell: bash
+      env:
+        OIDC_TOKEN: ${{ steps.oidc.outputs.oidc_token }}
+        HORT_URL: ${{ inputs.hort_url }}
+      run: |
+        response=$(curl -sSf \
+          -X POST "${HORT_URL}/api/v1/auth/exchange" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+          --data-urlencode "subject_token=${OIDC_TOKEN}" \
+          --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt")
+
+        token=$(echo "${response}" | jq -r '.access_token // empty')
+        if [ -z "${token}" ]; then
+          echo "::error::hort token exchange failed — no access_token in response"
+          echo "Response: ${response}"
+          exit 1
+        fi
+        echo "::add-mask::${token}"
+        echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+    # ── cargo config ───────────────────────────────────────────────────────────
+    # Sparse-index URL form confirmed from hort-http-cargo/src/lib.rs:
+    #   GET /cargo/{repo_key}/config.json
+    #   GET /cargo/{repo_key}/{prefix}/{name}     ← sparse-index entries
+    # The sparse+https:// prefix is the Cargo RFC 2789 sparse-registry scheme.
+    # Default source is cargo-virtual; set input.cargo_source_repo='crates-proxy'
+    # as the one-line fallback until the virtual aggregation path lands.
+    - name: Write .cargo/config.toml
+      if: steps.guard.outputs.enabled == 'true'
+      shell: bash
+      env:
+        HORT_TOKEN: ${{ steps.exchange.outputs.token }}
+        HORT_URL: ${{ inputs.hort_url }}
+        CARGO_SOURCE_REPO: ${{ inputs.cargo_source_repo }}
+      run: |
+        mkdir -p .cargo
+        # Write .cargo/config.toml using printf to avoid heredoc indentation
+        # issues (the YAML `run: |` block indents all lines; a heredoc inside
+        # it would carry leading whitespace into the TOML file).
+        printf '[source.crates-io]\nreplace-with = "hort"\n\n' > .cargo/config.toml
+        printf '[registries.hort]\nindex = "sparse+%s/cargo/%s/"\n\n' \
+          "${HORT_URL}" "${CARGO_SOURCE_REPO}" >> .cargo/config.toml
+        printf '# hort-crates: first-party hosted registry (cargo publish target)\n' \
+          >> .cargo/config.toml
+        printf '[registries.hort-crates]\nindex = "sparse+%s/cargo/hort-crates/"\n' \
+          "${HORT_URL}" >> .cargo/config.toml
+
+        # Export tokens so they survive into subsequent steps. Both get the
+        # same session token (the hort auth model: one token, per-repo RBAC).
+        echo "CARGO_REGISTRIES_HORT_TOKEN=${HORT_TOKEN}" >> "$GITHUB_ENV"
+        echo "CARGO_REGISTRIES_HORT_CRATES_TOKEN=${HORT_TOKEN}" >> "$GITHUB_ENV"
+
+    # ── npm config ─────────────────────────────────────────────────────────────
+    # npm-proxy is the pull-through npm registry.
+    # _authToken is the npm Bearer token format for scoped/unscoped auth.
+    - name: Write .npmrc
+      if: steps.guard.outputs.enabled == 'true'
+      shell: bash
+      env:
+        HORT_TOKEN: ${{ steps.exchange.outputs.token }}
+        HORT_URL: ${{ inputs.hort_url }}
+      run: |
+        # Use printf to avoid heredoc indentation issues in YAML run blocks.
+        registry_bare="${HORT_URL#https://}"
+        printf 'registry=%s/npm/npm-proxy/\n' "${HORT_URL}" > .npmrc
+        printf '//%s/npm/npm-proxy/:_authToken=%s\n' \
+          "${registry_bare}" "${HORT_TOKEN}" >> .npmrc
+
+    # ── container registry login ───────────────────────────────────────────────
+    # Log in to registry.hort.rs so `docker pull` / buildx base-image fetches
+    # are served through dockerhub-proxy and quay-proxy.
+    # Username is arbitrary for token auth; password is the hort bearer token.
+    - name: Log in to hort OCI registry (dockerhub-proxy / quay-proxy mirror)
+      if: steps.guard.outputs.enabled == 'true'
+      shell: bash
+      env:
+        HORT_TOKEN: ${{ steps.exchange.outputs.token }}
+        HORT_URL: ${{ inputs.hort_url }}
+      run: |
+        registry_host="${HORT_URL#https://}"
+        echo "${HORT_TOKEN}" | docker login "${registry_host}" \
+          --username hort-ci \
+          --password-stdin

@@ -1,0 +1,12 @@
+# Quadlet volume unit — hort CAS (content-addressable storage).
+#
+# Rootless: the :U mount flag in hort-server.container and hort-worker.container
+# instructs Podman to chown the volume root to the container's mapped UID at
+# mount time.  This is the correct rootless approach — NOT a root init container
+# that pre-chowns the volume (which would require a privileged helper).
+#
+# The volume name matches the Volume= references in hort-server.container and
+# hort-worker.container (hort-cas).
+
+[Volume]
+VolumeName=hort-cas

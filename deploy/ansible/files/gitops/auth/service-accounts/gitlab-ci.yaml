@@ -1,0 +1,20 @@
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: gitlab-ci
+spec:
+  # Pull access for GitLab CI builds: same scope as gha-ci.
+  role: reader
+  repositories:
+    - cargo-virtual
+    - crates-proxy
+    - dockerhub-proxy
+    - quay-proxy
+    - npm-proxy
+  federatedIdentities:
+    - issuer: gitlab                  # references OidcIssuer metadata.name
+      claims:
+        # CONFIRM: verify the exact claim name from a real id_token on
+        # gitlab.kdp.kloni.cloud before go-live. GitLab OIDC id_tokens
+        # typically emit `project_path` as `<namespace>/<project>`.
+        project_path: "REPLACE_ME/hort"  # CONFIRM: set to actual GitLab group/namespace

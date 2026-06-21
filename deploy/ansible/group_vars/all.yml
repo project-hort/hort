@@ -1,0 +1,47 @@
+---
+# Non-secret defaults shared by both Podman and native flavors.
+# Secret values (DB password, svc-tokens, Vault'd) MUST live in the gitignored
+# group_vars/production/ tree — never here.
+
+# Public FQDN served by nginx (TLS-terminating reverse proxy).
+registry_fqdn: registry.hort.rs
+
+# Container images — override per-host or in group_vars/production/.
+hort_server_image: ghcr.io/project-hort/hort-server:latest
+hort_worker_image: ghcr.io/project-hort/hort-worker:latest
+postgres_image: postgres:15
+
+# hort_version is used by the native flavor (Task 9) to pin the downloaded
+# release binary.  The Podman flavor uses OCI image tags above instead.
+hort_version: "0.9.3-beta.2"
+
+# Target CPU architecture for native binary downloads (hort_binaries role).
+# Matches the system architecture: amd64 for x86-64 hosts, arm64 for aarch64.
+hort_arch: amd64
+
+# Rootless Podman service user created by the podman role.
+hort_user: hort
+hort_uid: 65532
+hort_gid: 65532
+
+# CAS (content-addressable storage) filesystem path inside the container.
+# Matches HORT_STORAGE_FILESYSTEM_PATH in compose + the Dockerfiles.
+hort_cas_container_path: /var/lib/hort-server/cas
+
+# Gitops config directory mounted into hort-server (read-only).
+# Populated by the gitops role (Task 4) from files/gitops/.
+hort_config_dir: /etc/hort/config
+
+# Port hort-server listens on inside the container; nginx proxies to
+# 127.0.0.1:{{ hort_api_port }} on the host.
+hort_api_port: 8080
+
+# Metrics listener port (internal; NOT exposed to the internet).
+hort_metrics_port: 9090
+
+# OIDC — issuer URL. Override in group_vars/production/ or host_vars/.
+# NOTE: the observation window is NOT a group_vars value — it lives in each
+# Class B ScanPolicy's quarantineDuration field in the gitops tree (Task 1 Step 7).
+hort_oidc_issuer_url: "https://{{ registry_fqdn }}/realms/hort"
+hort_oidc_audience: hort-server
+hort_oidc_groups_claim: groups

@@ -1,0 +1,15 @@
+---
+# gitops role defaults.
+#
+# gitops_admin_cmd is set by the caller (playbook vars or group_vars) to
+# the flavor-appropriate prefix for `hort-server admin` subcommands:
+#
+#   Native flavor (site-native.yml):
+#     gitops_admin_cmd: "hort-server admin"
+#
+#   Podman flavor (site-podman.yml):
+#     gitops_admin_cmd: "podman exec hort-server hort-server admin"
+#
+# This default is intentionally left empty so a missing override causes an
+# explicit error rather than silently running the wrong command.
+gitops_admin_cmd: ""

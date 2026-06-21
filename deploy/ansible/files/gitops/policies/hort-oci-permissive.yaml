@@ -1,0 +1,19 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: hort-oci-permissive
+spec:
+  # Class A first-party hosted repo. Without an explicit policy a hosted PUSH
+  # quarantines by default (24h + trivy) and the pull 503s — which would make
+  # `hort-oci` unusable as the world-readable release-distribution face. These
+  # are our own cosign-signed release images (CI already gates them), so we
+  # opt out of quarantine-by-default for immediate availability. Mirrors the
+  # publish-then-immediately-pull pattern of the *-e2e-permissive fixtures.
+  scope:
+    repository: hort-oci
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

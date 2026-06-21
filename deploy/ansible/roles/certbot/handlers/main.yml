@@ -1,0 +1,8 @@
+---
+# certbot role handlers.
+# Reload nginx after certbot patches the vhost with ssl_certificate directives.
+
+- name: Reload nginx
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

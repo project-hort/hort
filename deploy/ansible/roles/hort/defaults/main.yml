@@ -1,0 +1,15 @@
+---
+# Defaults for the hort role.  All values can be overridden in group_vars/,
+# host_vars/, or --extra-vars.
+#
+# Secret values (DATABASE_URL, hort_svc_* tokens) must live only in the
+# gitignored group_vars/production/ tree — never in defaults.
+
+# Quadlet unit directory for the rootless hort service user.
+hort_quadlet_dir: /var/lib/hort/.config/containers/systemd
+
+# env-file directory (also under the hort user's home, mode 0600).
+hort_env_dir: /var/lib/hort/.config/hort
+
+# Postgres container data volume host path.
+hort_postgres_data_dir: /var/lib/hort/postgres-data

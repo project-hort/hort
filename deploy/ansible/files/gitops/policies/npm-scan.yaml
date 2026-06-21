@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: npm-scan
+spec:
+  scope:
+    repository: npm-proxy
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["osv"]
+  licensePolicy: {}

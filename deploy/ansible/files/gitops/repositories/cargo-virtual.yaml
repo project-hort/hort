@@ -1,0 +1,17 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: cargo-virtual
+spec:
+  name: "Cargo build endpoint (own crates + crates.io mirror)"
+  description: "Single cargo source CI/dev builds resolve against. Private (contains the private crates-proxy member); public fetch of own crates is via hort-crates."
+  format: cargo
+  type: virtual
+  # The cold-start fix lives on the member (crates-proxy's indexMode:
+  # include_pending); cargo-virtual's served index is the union of member
+  # indexes, so it needs no indexMode of its own. NOTE: the cargo serve-path
+  # member aggregation is in progress separately — until it lands, builds point
+  # at crates-proxy directly for mirror deps. The type + members validate now.
+  virtualMembers: [hort-crates, crates-proxy]
+  isPublic: false
+  replicationPriority: local_only

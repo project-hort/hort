@@ -1,0 +1,37 @@
+---
+# Defaults for the hort-binaries role.
+#
+# hort_version is set in group_vars/all.yml (currently "0.9.3-beta.2").
+# Override here if you need to pin a different version for this role specifically.
+# Must be a published v* tag on github.com/project-hort/hort.
+#
+# Signature artifact form: cosign sign-blob writes a self-contained Sigstore
+# bundle (--bundle, cosign v3+).  Each release asset ships:
+#   hort-<bin>-linux-<arch>.tar.gz
+#   hort-<bin>-linux-<arch>.tar.gz.sha256
+#   hort-<bin>-linux-<arch>.tar.gz.bundle   ← Sigstore bundle (sig + cert + chain)
+#
+# verify: cosign verify-blob --bundle <file>.bundle \
+#           --certificate-identity-regexp <regexp> \
+#           --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#           <file>.tar.gz
+
+# GitHub release download base URL (no trailing slash).
+# hort_arch (amd64|arm64) is set in group_vars/all.yml — override per-host.
+hort_binaries_github_release_url: >-
+  https://github.com/project-hort/hort/releases/download/v{{ hort_version }}
+
+# Cosign identity pin — the regexp must match the Actions workflow ref that
+# signed the release.  Pinning to refs/tags/v* ensures only a tag-triggered
+# release workflow identity is accepted; a branch or PR build is rejected.
+hort_binaries_cosign_cert_identity_regexp: >-
+  ^https://github\.com/project-hort/hort/\.github/workflows/build-binaries\.yml@refs/tags/v
+
+# Cosign OIDC issuer — GitHub Actions keyless signing always uses this issuer.
+hort_binaries_cosign_cert_oidc_issuer: https://token.actions.githubusercontent.com
+
+# Directory where binaries are installed.
+hort_binaries_install_dir: /usr/local/bin
+
+# Temporary download directory on the target host.
+hort_binaries_tmp_dir: /var/tmp/hort-binaries

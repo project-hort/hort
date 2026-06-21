@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: dockerhub-proxy
+spec:
+  repository: dockerhub-proxy
+  # Single dedicated upstream → catch-all empty prefix (unlike the multi-upstream
+  # oci-mirror-e2e example which splits dockerhub/ vs ghcr/ by prefix).
+  pathPrefix: ""
+  upstreamUrl: https://registry-1.docker.io
+  # Docker Hub gates even anonymous pulls behind a token challenge (auth.docker.io).
+  auth:
+    type: bearer_challenge

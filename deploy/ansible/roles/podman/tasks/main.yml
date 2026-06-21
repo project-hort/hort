@@ -1,0 +1,100 @@
+---
+# podman role — rootless Podman runtime, service user, linger, Quadlet dir.
+#
+# Targets Debian 13 (trixie) which ships Podman 5.x in main.
+# The role is idempotent: every task uses a module or check that no-ops on
+# re-run.
+
+- name: Install podman
+  ansible.builtin.apt:
+    name: podman
+    state: present
+    update_cache: true
+
+- name: Create hort service group
+  ansible.builtin.group:
+    name: "{{ hort_user }}"
+    gid: "{{ hort_gid }}"
+    system: true
+    state: present
+
+- name: Create hort service user
+  ansible.builtin.user:
+    name: "{{ hort_user }}"
+    uid: "{{ hort_uid }}"
+    group: "{{ hort_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/hort
+    create_home: true
+    state: present
+
+# loginctl enable-linger lets the user's systemd session start at boot without
+# a login session.  Required for rootless Quadlet units under
+# ~/.config/containers/systemd/ to be managed by systemd --user.
+#
+# Idempotency: stat the linger file; only run loginctl (and report changed)
+# when the file is absent.  loginctl enable-linger always exits 0 whether or
+# not linger was already enabled, so changed_when: rc == 0 always fires —
+# this stat-gate makes the task a true no-op on re-runs.
+- name: Check whether linger is already enabled for hort service user
+  ansible.builtin.stat:
+    path: /var/lib/systemd/linger/{{ hort_user }}
+  register: podman_linger_stat
+
+- name: Enable linger for hort service user
+  ansible.builtin.command:
+    cmd: loginctl enable-linger {{ hort_user }}
+  when: not podman_linger_stat.stat.exists
+  changed_when: true
+
+- name: Ensure Quadlet drop-in directory exists
+  ansible.builtin.file:
+    path: "{{ hort_quadlet_dir }}"
+    state: directory
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0750"
+
+- name: Ensure hort config directory exists
+  ansible.builtin.file:
+    path: "{{ hort_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0750"
+
+# Firewall: only 80 (HTTP → certbot ACME) and 443 (HTTPS) are reachable from
+# the internet.  The high API port (8080) must NOT be exposed externally —
+# nginx proxies it.
+#
+# Gate: skip cleanly when ufw is absent (e.g. isolated --tags podman run
+# before the base role has installed it).  When ufw IS present the rules are
+# applied and failures are fatal — silent swallowing could leave port 8080
+# unrestricted on the public internet.
+- name: Check whether ufw is installed
+  ansible.builtin.command: command -v ufw
+  register: podman_ufw_check
+  changed_when: false
+  failed_when: false
+
+- name: Allow HTTP (80) through firewall
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+  when: podman_ufw_check.rc == 0
+
+- name: Allow HTTPS (443) through firewall
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+  when: podman_ufw_check.rc == 0
+
+- name: Deny external access to hort API port (8080)
+  community.general.ufw:
+    rule: deny
+    port: "8080"
+    proto: tcp
+  when: podman_ufw_check.rc == 0

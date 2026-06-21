@@ -1,0 +1,49 @@
+---
+# nginx role — TLS-terminating reverse proxy for hort-server.
+#
+# Installs nginx, templates the registry.hort.rs vhost with streaming/large-
+# body tuning (client_max_body_size 0, proxy_request_buffering off, etc.),
+# and enables the site.  certbot fills in the SSL directives after issuance.
+#
+# The site template is placed under sites-available/ and symlinked into
+# sites-enabled/ (Debian nginx convention).
+
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: Ensure nginx is started and enabled
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Template registry vhost (sites-available)
+  ansible.builtin.template:
+    src: registry.hort.rs.conf.j2
+    dest: /etc/nginx/sites-available/registry.hort.rs.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Enable registry vhost (sites-enabled symlink)
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/registry.hort.rs.conf
+    dest: /etc/nginx/sites-enabled/registry.hort.rs.conf
+    state: link
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Remove default nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify:
+    - Validate nginx config
+    - Reload nginx

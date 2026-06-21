@@ -77,6 +77,7 @@ accepted?*
 | [0020](0020-single-flight-seal-pool-backstop.md) | Single-flight backstop for the unbounded seal/retention append |
 | [0028](0028-destructive-task-idempotency.md) | Durable single-flight idempotency for destructive task kinds |
 | [0029](0029-operator-config-hard-rename.md) | Operator-config renames are hard renames |
+| [0032](0032-public-dogfood-deployment.md) | Public dogfood deployment and supply-chain hardening posture: three repo classes, CI OIDC federation with claim-bound SAs, no-IdP operator tokens, non-empty `scan_backends` + no-`trust_upstream_publish_time` posture, two deployment flavors |
 
 ### Process and structural guards
 
@@ -100,6 +101,11 @@ these rows is moot.
 
 | Item | Detail |
 |---|---|
+| GitLab CI `project_path` placeholder | `deploy/ansible/files/gitops/auth/service-accounts/gitlab-ci.yaml` contains `project_path: REPLACE_ME/hort` — substitute the real GitLab project path before enabling the proxy in production. Without this, GitLab CI OIDC tokens will not match the `gitlab-ci` ServiceAccount. (ADR 0032, Task 2 M1) |
+| GitLab issuer `requireJti` caveat | The `gitlab` OidcIssuer uses `requireJti: true` (the default). If the self-hosted GitLab instance predates v15.7 (which introduced `jti` in CI tokens), set `requireJti: false` in `deploy/ansible/files/gitops/auth/issuers/gitlab.yaml`. Cannot be verified without a live GitLab instance. (ADR 0032, Task 2 M2) |
+| GitLab CI error-path token leak | In `.gitlab-ci.yml`, the `echo "${_hort_response}"` line in the `.hort_auth` error path can print the `access_token` in cleartext if the exchange response is malformed (a valid JSON object with an unexpected shape). Sanitize the error output before enabling `HORT_PROXY_ENABLED` in production. (ADR 0032, Task 6 M3) |
+| Proxy quarantine path coverage (warm-instance) | The dogfood smoke scenario (b) soft-passes on a pre-existing released artifact — the quarantine path is not exercised on a long-lived instance. Consider a nonce-versioned probe artifact to exercise the full ingest → quarantine → release path. (ADR 0032, Task 7 follow-up) |
+| `cargo-virtual` aggregation dependency | The `cargo-virtual` build endpoint depends on ADR 0031 serve-time member aggregation. Until that is available in the deployed version, builds resolve against `crates-proxy` directly. Track the ADR 0031 rollout and update the `.cargo/config.toml` source replacement when the virtual aggregation path lands. (ADR 0032) |
 | Rescan-amplification rate cap | The manual rescan trigger surface has no per-repo fairness cap or `429` response. Mitigated by the worker per-kind concurrency=1 queue serialisation (`crates/hort-worker/src/composition.rs:539`) and the generic IP-keyed rate limit (`crates/hort-http-core/src/middleware/rate_limit.rs`). |
 | Claim-grant linter residual | The gitops apply-time linter for single-claim grants is fan-out-bypassable and not claim-mapping-provenance-aware. The durable fix is IdP-authoritative refresh, not a linter patch (relates [0012](0012-claim-based-rbac-claimless-static-tokens.md), [0013](0013-idp-authoritative-cli-sessions.md), [0015](0015-apply-time-linter-inert-fields-and-naming.md)). Do not close as moot. |
 | Second authenticated advisory feed (GHSA) | Only OSV adapters exist (`crates/hort-adapters-advisory-osv`). A second, authenticated feed remains unscheduled hardening for advisory-source diversity. |

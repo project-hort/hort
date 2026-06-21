@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: hort-oci
+spec:
+  name: "Hort first-party OCI images"
+  description: "World-readable distribution of hort-server / hort-worker images. Push restricted to the gha-release ServiceAccount (tagged releases only)."
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/hort-oci
+  isPublic: true
+  replicationPriority: local_only

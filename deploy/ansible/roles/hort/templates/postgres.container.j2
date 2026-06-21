@@ -1,0 +1,27 @@
+# Quadlet container unit — PostgreSQL.
+# Runs as non-root (uid {{ hort_uid }}).  Data is persisted on the host at
+# {{ hort_postgres_data_dir }} — bind-mounted with :U so Podman chowns it to
+# the container's mapped UID on first use.
+#
+# The postgres password is written into the env-file by the gitops/secrets
+# provisioning step (not here — secrets live in the gitignored
+# group_vars/production/ Vault tree).
+
+[Unit]
+Description=PostgreSQL for hort
+After=network-online.target
+
+[Container]
+Image={{ postgres_image }}
+ContainerName=postgres
+Network=hort.network
+Volume={{ hort_postgres_data_dir }}:/var/lib/postgresql/data:U
+EnvironmentFile=%h/.config/hort/hort-server.env
+# POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB are pulled from the env-file.
+# The env-file also carries DATABASE_URL which hort-server and hort-migrate use.
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

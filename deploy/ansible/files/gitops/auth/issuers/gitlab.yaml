@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: OidcIssuer
+metadata:
+  name: gitlab
+spec:
+  issuerUrl: https://gitlab.kdp.kloni.cloud
+  audiences: ["hort-server"]
+  # Defaults: allowedAlgorithms ["RS256"], requireJti true, jwksRefreshInterval 1h.
+  # CONFIRM (plan Task 0 Step 5): this instance exposes a standard OIDC discovery
+  # doc + JWKS reachable from the VPS, and its id_tokens carry `jti`. If GitLab's
+  # id_tokens do NOT include `jti`, set `requireJti: false` here (accepts the
+  # weaker composite anti-replay key). If JWKS is behind an internal CA, add it to
+  # HORT_EXTRA_CA_BUNDLE — there is no insecure-JWKS knob.

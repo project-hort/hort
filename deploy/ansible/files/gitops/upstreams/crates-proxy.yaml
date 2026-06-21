@@ -1,0 +1,12 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: crates-proxy
+spec:
+  repository: crates-proxy
+  # Empty pathPrefix → catch-all single-upstream mapping (the cargo orchestrator
+  # passes "" on every resolve(), mirroring the PyPI/cargo example fixtures).
+  pathPrefix: ""
+  upstreamUrl: https://index.crates.io
+  auth:
+    type: anonymous

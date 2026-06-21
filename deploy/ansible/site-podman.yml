@@ -1,0 +1,37 @@
+---
+# Podman flavor — rootless Podman + Quadlet units.
+#
+# Role execution order:
+#   base          — (Task 4) OS hardening, swap, unattended-upgrades
+#   podman        — (this task) rootless Podman runtime + service user + linger
+#   hort          — (this task) Quadlet units: migrate, server, worker, postgres
+#   nginx         — (Task 4) TLS-terminating reverse proxy (127.0.0.1:8080 → 443)
+#   certbot       — (Task 4) Let's Encrypt certificate issuance + renewal
+#   fail2ban      — (Task 4) brute-force protection
+#   gitops        — (Task 4) syncs files/gitops/ tree to hort_config_dir on the host
+#
+# Roles marked (Task 4) are scaffolded below but their role directories are
+# created in Task 4.  This play is valid for --syntax-check now because the
+# roles are listed but the play only RUNS them if the role directories exist
+# (Ansible resolves roles at runtime, not parse time).
+
+- name: Deploy hort (Podman flavor)
+  hosts: hort
+  become: true
+  gather_facts: true
+
+  vars:
+    # Flavor-specific vars consumed by the shared gitops role.
+    # hort-server runs as a rootless Quadlet unit under the hort user's
+    # systemd session, so admin commands go through `podman exec`.
+    gitops_admin_cmd: "podman exec hort-server hort-server admin"
+    gitops_server_systemd_scope: "user"
+
+  roles:
+    - role: base
+    - role: podman
+    - role: hort
+    - role: nginx
+    - role: certbot
+    - role: fail2ban
+    - role: gitops

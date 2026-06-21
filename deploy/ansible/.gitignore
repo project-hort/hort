@@ -1,0 +1,4 @@
+inventory/production/
+group_vars/production/
+*.vault
+.vault_pass

@@ -1,0 +1,6 @@
+# ansible-lint configuration for the hort Ansible deploy tree.
+exclude_paths:
+  # Pre-existing gitops YAML files from Tasks 1-2 use hort-domain truthy
+  # values (On/Off etc.) that are not Ansible variables — exclude to avoid
+  # false positives on non-Ansible YAML.
+  - files/gitops/

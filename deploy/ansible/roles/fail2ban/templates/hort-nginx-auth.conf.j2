@@ -1,0 +1,40 @@
+# fail2ban filter: hort-nginx-auth
+# Managed by Ansible — do not edit by hand.
+#
+# Matches nginx access_log lines (combined format) where the client received
+# a 401 or 403 on authentication-sensitive hort paths:
+#   /api/v1/auth/       — OIDC callback + token exchange endpoint
+#   /api/v1/admin/      — admin API (requires admin token)
+#   /v2/                — OCI Distribution Spec (registry push/pull with auth)
+#   /crates/            — Cargo sparse index + upload (registry-scoped)
+#   /pypi/              — PyPI upload/download (requires write token)
+#   /npm/               — npm publish/install (requires write token)
+#
+# The regex matches ONLY 401 and 403 status codes.  Anonymous hort-oci reads
+# return 200 and are therefore never matched — no false positives on public
+# pull-through traffic.
+#
+# nginx combined log format (reference):
+#   $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent
+#   "$http_referer" "$http_user_agent"
+#
+# Example line that MATCHES (401 on OCI auth):
+#   1.2.3.4 - - [21/Jun/2026:10:00:00 +0000] "GET /v2/ HTTP/1.1" 401 0 "-" "docker/24.0"
+#
+# Example line that does NOT match (200 on anonymous OCI read):
+#   1.2.3.4 - - [21/Jun/2026:10:00:00 +0000] "GET /v2/hort-oci/manifests/latest HTTP/1.1" 200 1234 "-" "crane/0.19"
+#
+# Deploy-time validation (run on the target host after provisioning):
+#   fail2ban-regex /var/log/nginx/access.log \
+#     /etc/fail2ban/filter.d/hort-nginx-auth.conf
+# Expected: matched lines count > 0 if auth failures have occurred; zero
+# false positives on 200 lines.
+
+[Definition]
+
+# <HOST> is the fail2ban placeholder for the client IP; it maps to the first
+# field ($remote_addr) in the nginx combined log line.
+
+failregex = ^<HOST> - \S+ \[.*?\] "(?:GET|POST|PUT|DELETE|PATCH|HEAD) /(?:api/v1/auth/|api/v1/admin/|v2/|crates/|pypi/|npm/).*?" (?:401|403) \d+
+
+ignoreregex =

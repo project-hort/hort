@@ -1,0 +1,13 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: quay-scan
+spec:
+  scope:
+    repository: quay-proxy
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["trivy"]
+  licensePolicy: {}

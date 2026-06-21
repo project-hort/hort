@@ -1,0 +1,15 @@
+---
+# Handlers run after all tasks notify them (at end of play or after
+# meta: flush_handlers).  The validate step is listed first so it runs
+# before the reload — Ansible executes handlers in notification order
+# but deduplicates, so a task that notifies both gets validate → reload
+# as long as validate is registered first here.
+
+- name: Validate nginx config
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Reload nginx
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

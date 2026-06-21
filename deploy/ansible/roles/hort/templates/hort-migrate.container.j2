@@ -1,0 +1,32 @@
+# Quadlet container unit — hort-server migrate (one-shot DDL runner).
+#
+# Type=oneshot: the container runs `hort-server migrate`, applies pending
+# migrations, then exits 0.  hort-server.container has
+#   Requires=hort-migrate.service
+#   After=hort-migrate.service
+# so systemd will not start hort-server until migrate has completed
+# successfully.
+#
+# The DDL DSN (DATABASE_URL) comes from the gitignored group_vars/production/
+# Vault and is written into the env-file at {{ hort_env_dir }}/hort-server.env.
+
+[Unit]
+Description=hort-server database migration (one-shot)
+After=postgres.service
+Requires=postgres.service
+
+[Container]
+Image={{ hort_server_image }}
+Exec=migrate
+ContainerName=hort-migrate
+Network=hort.network
+EnvironmentFile=%h/.config/hort/hort-server.env
+# DATABASE_URL is the DDL DSN sourced from the env-file.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  name: npm-proxy
+spec:
+  repository: npm-proxy
+  pathPrefix: ""
+  upstreamUrl: https://registry.npmjs.org
+  auth:
+    type: anonymous

@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: hort-crates
+spec:
+  name: "Hort first-party crates"
+  description: "World-readable distribution of hort's own published crates. Push restricted to the gha-release ServiceAccount (tagged releases only)."
+  format: cargo
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/hort-crates
+  isPublic: true
+  replicationPriority: local_only

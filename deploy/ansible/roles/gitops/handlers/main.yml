@@ -1,0 +1,26 @@
+---
+# gitops role handlers.
+# Restart hort-server so the boot-time ApplyConfigUseCase::apply runs against
+# the freshly synced config tree.
+#
+# The restart is flavor-aware via a systemd unit name that is the same for
+# both flavors (the Podman Quadlet unit is also named "hort-server").
+# The podman flavor runs the unit under the hort user's systemd session
+# (scope: user); the native flavor runs it at system scope.
+# Both playbooks set gitops_server_systemd_scope appropriately.
+
+- name: Restart hort-server (system scope)
+  ansible.builtin.systemd:
+    name: hort-server
+    state: restarted
+    scope: system
+  when: (gitops_server_systemd_scope | default('system')) == 'system'
+
+- name: Restart hort-server (user scope)
+  ansible.builtin.systemd:
+    name: hort-server
+    state: restarted
+    scope: user
+  become: true
+  become_user: "{{ hort_user }}"
+  when: (gitops_server_systemd_scope | default('system')) == 'user'

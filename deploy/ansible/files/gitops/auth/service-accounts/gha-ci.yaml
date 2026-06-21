@@ -1,0 +1,23 @@
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: gha-ci
+spec:
+  # Pull access for CI builds: cargo fetch / docker pull from the four
+  # proxies, and cargo add / resolution via cargo-virtual.
+  role: reader
+  repositories:
+    - cargo-virtual
+    - crates-proxy
+    - dockerhub-proxy
+    - quay-proxy
+    - npm-proxy
+  federatedIdentities:
+    - issuer: github-actions          # references OidcIssuer metadata.name
+      claims:
+        repository: project-hort/hort # scope-narrowing: any workflow in this repo
+        # NOTE: this is intentionally repo-scope only (no environment/ref pin).
+        # Any workflow in project-hort/hort can assume reader on these proxies.
+        # This is acceptable: the proxies are pull-through caches; read access
+        # confers no publish power. Add `environment:` or `ref:` here if the
+        # threat model later tightens.

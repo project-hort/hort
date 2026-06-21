@@ -1,0 +1,39 @@
+# Quadlet container unit — hort-server.
+#
+# Key rootless-correctness points:
+#   - PublishPort binds on 127.0.0.1 only (nginx terminates TLS externally).
+#   - Volume CAS mount uses :U — Podman chowns the named volume root to the
+#     container's mapped UID (65532) at mount time.  No root init-container.
+#   - User=65532:65532 matches the distroless nonroot convention in the image.
+#   - hort-migrate.service is an ordering dependency: migrate must complete
+#     before hort-server starts.
+
+[Unit]
+Description=hort-server
+Requires=hort-migrate.service postgres.service
+After=hort-migrate.service postgres.service
+
+[Container]
+Image={{ hort_server_image }}
+ContainerName=hort-server
+# Publish the API high port on localhost only — nginx proxies it.
+PublishPort=127.0.0.1:{{ hort_api_port }}:{{ hort_api_port }}
+# CAS volume: :U chowns the mount root to the container user on first attach.
+Volume=hort-cas:{{ hort_cas_container_path }}:U
+# Gitops config tree (read-only; populated by the gitops role).
+Volume={{ hort_config_dir }}:/etc/hort/config:ro
+EnvironmentFile=%h/.config/hort/hort-server.env
+Network=hort.network
+User={{ hort_uid }}:{{ hort_gid }}
+# Drop all Linux capabilities — hort-server binds high ports and needs none.
+DropCapability=all
+# Mount HORT_EXTRA_CA_BUNDLE if the operator sets hort_extra_ca_bundle_path
+# in group_vars/production/ (for internal CAs).  The variable is optional;
+# leave the Volume line commented if not using an internal CA.
+# Volume={{ hort_extra_ca_bundle_path | default('/dev/null') }}:/etc/ssl/certs/extra/ca.crt:ro
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,35 @@
+# fail2ban jail configuration for hort
+# Managed by Ansible — do not edit by hand.
+#
+# Jails:
+#   [sshd]            — built-in fail2ban SSH protection (enabled explicitly).
+#   [hort-nginx-auth] — custom filter for hort HTTP auth failure banning.
+#
+# Ban action: nftables-multiport (preferred on Debian 13; falls back to
+# iptables-multiport if nftables is not available).
+
+[DEFAULT]
+# Use nftables where available (Debian 13 default firewall backend).
+# The banaction_allports variant bans all ports from the offending IP, which
+# is appropriate for an auth brute-force — the attacker should be fully blocked.
+banaction     = nftables-multiport
+banaction_allports = nftables-allports
+
+[sshd]
+enabled  = true
+port     = ssh
+filter   = sshd
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+backend  = systemd
+
+[hort-nginx-auth]
+enabled  = true
+port     = http,https
+filter   = hort-nginx-auth
+logpath  = /var/log/nginx/access.log
+# 10 auth failures within 5 minutes triggers a 1-hour ban.
+maxretry = {{ fail2ban_maxretry | default(10) }}
+findtime = {{ fail2ban_findtime | default('5m') }}
+bantime  = {{ fail2ban_bantime  | default('1h') }}

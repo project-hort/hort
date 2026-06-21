@@ -1,0 +1,21 @@
+---
+# Defaults for the postgres-apt role.
+#
+# Debian 13 (Trixie) ships PostgreSQL 17 via the main apt repository.
+# Hort's minimum Postgres major is 16 (CI runs PG 16); PG 17 satisfies it.
+# The Debian package name is `postgresql` (which pulls the version-specific
+# meta-package, e.g. postgresql-17 on Debian 13).
+
+# Postgres cluster / database
+postgres_apt_db_name: artifact_registry
+
+# Runtime role — least-privilege DML only (SELECT/INSERT/UPDATE/DELETE).
+# This is the DSN that hort-server (serve path) and hort-worker use.
+postgres_apt_runtime_role: hort_runtime
+
+# DDL/migrate role — CONNECT + CREATE + ALTER + DROP on the hort database.
+# Used exclusively by hort-migrate (Type=oneshot) before hort-server starts.
+postgres_apt_ddl_role: hort_ddl
+
+# pg_hba.conf path for the Debian-packaged cluster (version-independent symlink).
+postgres_apt_hba_conf: /etc/postgresql/17/main/pg_hba.conf
