@@ -54,6 +54,8 @@ jobs:
       # Route cargo fetches through registry.hort.rs when the instance is live.
       # No-op when vars.HORT_PROXY_ENABLED is unset (see action guard step).
       - uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -110,6 +112,8 @@ jobs:
 
       # Route cargo fetches through registry.hort.rs when the instance is live.
       - uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
 
       - name: Run unit tests
         env:
@@ -132,6 +136,8 @@ jobs:
 
       # Route cargo fetches through registry.hort.rs when the instance is live.
       - uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -399,6 +405,8 @@ jobs:
 
       # Route cargo fetches through registry.hort.rs when the instance is live.
       - uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
 
       - name: Run integration tests
         env:

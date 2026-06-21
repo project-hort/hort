@@ -295,6 +295,8 @@ jobs:
       # Authenticate via the gha-release SA (environment: release ↔ SA claim).
       # Writes CARGO_REGISTRIES_HORT_CRATES_TOKEN into the environment.
       - uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
 
       # Publish in dependency order. hort-domain has no intra-workspace deps so
       # it goes first; each subsequent crate may depend on earlier entries.

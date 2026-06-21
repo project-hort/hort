@@ -10,6 +10,14 @@ description: >
   not break CI.
 
 inputs:
+  proxy_enabled:
+    description: >
+      Value of the `HORT_PROXY_ENABLED` repo variable, threaded in by the
+      caller. The `vars` context is NOT available inside a composite action
+      (only in workflow files), so the gate value must be passed as an input.
+      The action is a no-op unless this is exactly 'true'.
+    required: false
+    default: 'false'
   hort_url:
     description: Base URL of the hort instance (no trailing slash)
     required: false
@@ -41,7 +49,7 @@ runs:
       id: guard
       shell: bash
       run: |
-        if [ "${{ vars.HORT_PROXY_ENABLED }}" = "true" ]; then
+        if [ "${{ inputs.proxy_enabled }}" = "true" ]; then
           echo "enabled=true" >> "$GITHUB_OUTPUT"
         else
           echo "enabled=false" >> "$GITHUB_OUTPUT"
