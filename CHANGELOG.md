@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-06-21
+
+Beta release. The feature set is described in the documentation under `docs/`.
+
+### Added
+
+- **Virtual (aggregated) repositories** for npm, PyPI, and Cargo (ADR 0031). A
+  `type: virtual` repository aggregates several member repositories — for
+  example a private hosted member plus the public pull-through mirror — behind a
+  single registry URL. Serve-time resolution merges the members' indexes
+  (packument / simple-index / sparse-index) and resolves concrete downloads
+  *first-authoritative*: the highest-priority member that holds a coordinate
+  serves it, and that member's release/quarantine gate is surfaced verbatim.
+  Name-level pinning is a dependency-confusion defence — a package name owned by
+  a higher-priority (e.g. private) member is never shadowed or substituted by a
+  lower-priority public proxy. Per-member visibility is enforced on every read
+  (ADR 0021): a caller who cannot see a private member never learns it exists,
+  so a public virtual cannot leak a private member's contents. Virtuals are
+  read-only; publishing to one is rejected.
+
+### Fixed
+
+- **Authenticated reads of private repositories returned 404.** Authenticated
+  callers — admins included — were wrongly denied read access to private
+  repositories: npm packuments and tarballs, PyPI simple indexes and files,
+  Cargo config / sparse-index and crate downloads, and the admin security-score
+  endpoints. The GET read path resolved the request principal from the wrong
+  request-extension slot (the write-path "bare" slot instead of the optional
+  slot the read middleware populates), so every authenticated read silently fell
+  back to anonymous and a private repository appeared absent. Fail-closed —
+  authenticated users were denied and no private data was disclosed — but it
+  broke legitimate authenticated access (and blocked the virtual-repository
+  feature, whose private member could never be read). Write paths
+  (publish / upload) were unaffected.
+- **GitHub release pipeline now ships assets.** Releases are created as a draft
+  and then published, so they succeed under GitHub's "Immutable releases"
+  setting; earlier releases could publish with zero assets. The multi-arch
+  (amd64 / arm64) `hort-worker` image and the Helm chart are now published on
+  release, and the CI coverage and `cargo-deny` jobs were repaired.
+
 ## [0.9.2] - 2026-06-17
 
 Beta release. The feature set is described in the documentation under `docs/`.
