@@ -257,22 +257,23 @@ Every commit must pass these checks locally before pushing. Do NOT use "push and
 ```bash
 cargo fmt --check                                          # formatting
 cargo clippy --workspace --all-targets -- -D warnings      # linting
-cargo test --workspace --lib                               # unit tests
-cargo test -p hort-server --test ephemeral_keyspace_exhaustive   # keyspace-registry guard
-cargo test -p hort-app --test no_bcrypt                          # "no bcrypt" invariant guard
-cargo test -p hort-config --test alpha_fixtures                  # alpha gitops fixtures parse + cross-validate
-cargo test -p hort-domain --test streaming_metadata_port         # streaming-metadata port contract (no &[u8] body / no metadata_body_bytes)
-cargo test -p hort-app --test no_sensitive_drops                 # migration sensitive-table drop guard
-cargo test -p hort-app --test retention_registration_guard       # eventstore-retention permitted-category guard
-cargo test -p hort-app --test no_retired_config_names            # retired env-var / Helm-key straggler guard
+cargo test --workspace                                     # full suite: lib + ALL tests/ integration targets (DB-gated tests self-skip w/o DATABASE_URL)
 cargo audit --deny warnings                                # advisories (ALWAYS — see note)
 cargo deny check                                           # advisories+bans+licenses+sources (ALWAYS — see note)
 ```
 
-**The seven `--test` lines are structural guard rails, not ordinary integration
-tests.** `cargo test --workspace --lib` deliberately excludes `tests/` integration
-targets — most need a database, which is Tier-2 (`cargo test --workspace`,
-main/release only). But `ephemeral_keyspace_exhaustive` (keyspace-registry
+**`cargo test --workspace` is the default pre-push test command — NOT `--lib`.**
+It runs the full local suite — every crate's `--lib` unit tests AND every
+`tests/` integration target. DB-gated tests self-skip without `DATABASE_URL`
+(they report `ignored, requires DATABASE_URL`), so no database is needed: a bare
+`cargo test --workspace` runs every DB-free test and ignores the rest (a typical
+run is ~9.4k run / ~45 DB-gated ignored / 0 failed). This SUPERSEDES the old
+`--lib`-only gate, which silently excluded **every** `tests/` integration target
+— including the DB-free mock-based ones (the per-format HTTP-handler tests under
+`hort-http-*/tests/`, *and* the structural guards below). That blind spot let a
+change pass the local gate but fail CI's integration job — exactly how the
+read-path auth fix's masked admin-security handler test slipped through. Among
+the structural guard rails `--workspace` now runs automatically: `ephemeral_keyspace_exhaustive` (keyspace-registry
 exhaustiveness), `no_bcrypt` ("Argon2id, not bcrypt" invariant, ADR 0028-adjacent),
 `alpha_fixtures` (alpha-fixture gitops-tree parse + cross-validate
 regression guard), `streaming_metadata_port`
@@ -297,11 +298,12 @@ is silently ignored at boot and a retired Helm key now fails the strict
 becomes a red test; the upgrade note and the deliberate-typo Helm
 fixtures are the only allowed homes for the old names) are pure source-/fixture-scan
 guards — no database, sub-second — enforcing structural invariants that a
-rename or a stray `use` silently breaks. They belong in the per-push gate, not
-Tier-2-only (a stale keyspace registry once shipped undetected exactly because
-this gate ran only `--lib`).
-**Any new DB-free structural guard test added under `crates/*/tests/` must
-be added to this list too.**
+rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
+undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`
+now runs every `tests/` target automatically, a new DB-free structural guard
+under `crates/*/tests/` needs **no** manual gate-list entry — it runs by virtue
+of being a `tests/` target. Keep such guards DB-free (or `DATABASE_URL`-self-
+skipping) so the gate stays runnable without a database.
 
 **`cargo audit` is an unconditional pre-push check — NOT conditional on touching
 `Cargo.toml`/`Cargo.lock`.** It scans the locked dependency graph against the
