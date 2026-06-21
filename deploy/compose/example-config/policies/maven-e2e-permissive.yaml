@@ -1,0 +1,19 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: maven-e2e-permissive
+spec:
+  # Per-repo operator opt-out of quarantine-by-default. See
+  # `cargo-e2e-permissive.yaml` for the full rationale — the maven native test
+  # (`scripts/native-tests/scenarios/clients/maven.sh`) follows the same
+  # publish-then-immediately-resolve pattern (mvn deploy → mvn dependency:get),
+  # so the deployed artifacts must release immediately rather than quarantine.
+  scope:
+    repository: maven-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  # Provenance off for permissive e2e (no per-ingest verify job).
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

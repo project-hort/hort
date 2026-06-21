@@ -1,0 +1,29 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  # UpstreamMapping for the `repository_upstream_mappings` row that
+  # crates/hort-http-maven/src/upstream_pull.rs::try_upstream_maven_pull
+  # resolves via UpstreamResolver. Maven uses a registry-wide upstream per
+  # repo (no path-prefix routing), mirroring Cargo/PyPI's catch-all mapping
+  # rather than OCI's multi-namespace split — the orchestrator passes "" as
+  # the prefix on every resolve() call and composes the requested Maven path
+  # (`{group-path}/{artifact}/{version}/{filename}`) onto upstreamUrl verbatim.
+  #
+  # Without this envelope the runtime has no upstream to fetch from and every
+  # pull-through fetch 404s, even though the maven-central-e2e
+  # ArtifactRepository declares spec.type: proxy with a spec.proxy.upstreamUrl
+  # (that field is validator-only; the runtime never reads it).
+  name: maven-central-e2e
+spec:
+  repository: maven-central-e2e
+  # Empty pathPrefix → catch-all single-upstream mapping.
+  pathPrefix: ""
+  # Maven Central. The `/maven2` segment is part of the base; the adapter
+  # appends the requested artifact path with exactly one `/` separator.
+  # HTTPS upstream → no insecureUpstreamUrl opt-in (production posture). The
+  # SHA-1-floor verify (ADR 0033) catches transport corruption; TLS verified
+  # against the system trust store + HORT_EXTRA_CA_BUNDLE is the real
+  # transport-integrity control.
+  upstreamUrl: https://repo1.maven.org/maven2
+  auth:
+    type: anonymous

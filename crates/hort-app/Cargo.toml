@@ -50,6 +50,10 @@ tempfile = { workspace = true }
 # Streaming SHA-256 in the CAS scrub use case;
 # also used by the `test-support` feature's mock storage.
 sha2 = { workspace = true }
+# Streaming SHA-1 for the upstream transfer-verification floor
+# (`Sha1HashingRead`, ADR 0033 — Maven `.sha1` sidecar). SHA-1 is a
+# transfer-verify comparison only; the CAS key stays SHA-256.
+sha1 = { workspace = true }
 # Probabilistic sampling for the CAS scrub use case.
 # `ScrubOpts::sample_fraction` rolls a uniform `f64` per listed hash.
 rand = { workspace = true }
@@ -107,6 +111,9 @@ test-support = ["dep:metrics-util"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 sha2 = { workspace = true }
+# Computes the expected SHA-1 of the test payload in the
+# `ingest_verified_sha1` happy-path / mismatch tests (ADR 0033 floor).
+sha1 = { workspace = true }
 serde_json = { workspace = true }
 metrics-util = { workspace = true, features = ["debugging"] }
 # Captures `tracing` events in the

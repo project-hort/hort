@@ -613,6 +613,8 @@ pub enum GroupMemberRole {
     Changes,
     /// Debian — `.orig.tar.*` original upstream tarball.
     Orig,
+    /// Gradle — `.module` Gradle Module Metadata (GMM) descriptor.
+    Module,
     /// Cardinality-safe fall-through. Emitted when a handler declared a
     /// role that is not one of the enumerated values above — the raw
     /// string stays out of the metric label to prevent blow-up.
@@ -640,6 +642,7 @@ impl GroupMemberRole {
             Self::Dsc => "dsc",
             Self::Changes => "changes",
             Self::Orig => "orig",
+            Self::Module => "module",
             Self::Other => "other",
         }
     }
@@ -666,6 +669,7 @@ impl GroupMemberRole {
             "dsc" => Self::Dsc,
             "changes" => Self::Changes,
             "orig" => Self::Orig,
+            "module" => Self::Module,
             _ => Self::Other,
         }
     }
@@ -4680,6 +4684,7 @@ mod tests {
             (R::Dsc, "dsc"),
             (R::Changes, "changes"),
             (R::Orig, "orig"),
+            (R::Module, "module"),
             (R::Other, "other"),
         ];
         let set: HashSet<&'static str> = pairs.iter().map(|(_, s)| *s).collect();
@@ -4710,6 +4715,7 @@ mod tests {
             ("dsc", R::Dsc),
             ("changes", R::Changes),
             ("orig", R::Orig),
+            ("module", R::Module),
         ] {
             assert_eq!(R::classify(input), expected, "classify({input})");
         }

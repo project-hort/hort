@@ -1,0 +1,31 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  # Key matches the MAVEN_PROXY_REPO_KEY env default in
+  # scripts/native-tests/scenarios/clients/maven.sh (pull-through SHA-1-floor
+  # leg). The scenario resolves a real Maven Central artifact whose ONLY
+  # upstream checksum sidecar is `.sha1` (no `.sha256`), proving the ADR 0033
+  # SHA-1 transfer-verification floor proxies real Central content.
+  name: maven-central-e2e
+spec:
+  name: "Maven Central pull-through smoke"
+  description: "Proxy Maven repo used by scripts/native-tests/scenarios/clients/maven.sh; upstream is Maven Central (repo1.maven.org). Resolving an old artifact (commons-logging 1.0.4) whose only sidecar is .sha1 exercises the SHA-1 floor (ADR 0033). requires: egress."
+  format: maven
+  type: proxy
+  # Serve never-ingested upstream versions so a Maven client can request (and
+  # thereby pull-through-cache) an artifact the local cache has not yet seen.
+  # Mirrors npm-public.yaml — the default `released_only` lists only
+  # already-ingested versions, so a fresh proxy cannot bootstrap a first fetch.
+  indexMode: include_pending
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/maven-central-e2e
+  proxy:
+    # Required by the gitops validator (crates/hort-config/src/repository.rs)
+    # for type=proxy. The standalone UpstreamMapping resource at
+    # deploy/compose/example-config/upstreams/maven-central-e2e.yaml is what
+    # populates the repository_upstream_mappings table that the Maven
+    # upstream-pull path's UpstreamResolver actually reads at runtime.
+    upstreamUrl: "https://repo1.maven.org/maven2"
+  isPublic: true
+  replicationPriority: immediate

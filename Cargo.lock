@@ -2436,6 +2436,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
@@ -2713,6 +2714,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "hort-http-maven"
+version = "0.9.3-beta.3"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "axum 0.7.9",
+ "bytes",
+ "chrono",
+ "hex",
+ "hort-app",
+ "hort-domain",
+ "hort-formats",
+ "hort-http-core",
+ "md-5",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "hort-http-npm"
 version = "0.9.3-beta.3"
 dependencies = [
@@ -2916,6 +2948,7 @@ dependencies = [
  "hort-http-core",
  "hort-http-discovery",
  "hort-http-events",
+ "hort-http-maven",
  "hort-http-npm",
  "hort-http-oci",
  "hort-http-pypi",

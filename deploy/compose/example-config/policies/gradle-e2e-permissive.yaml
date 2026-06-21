@@ -1,0 +1,17 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: gradle-e2e-permissive
+spec:
+  # Per-repo opt-out of quarantine-by-default for the Gradle alias repo. The
+  # Gradle leg of scripts/native-tests/scenarios/clients/maven.sh publishes a
+  # `.module` GMM + POM marker then immediately resolves it back, so the
+  # published files must release immediately. Mirrors maven-e2e-permissive.yaml.
+  scope:
+    repository: gradle-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

@@ -148,10 +148,10 @@ Part II(3) effectiveness into the catalog's done-criteria.
 ### Entry 8 — HTTP Basic
 
 - **Credential form:** `Authorization: Basic` carrying `__token__:<hort_pat_*>` (token-as-password).
-- **Purpose / allowed use:** carrier transport for a native token on package-manager tooling (npm/pip/cargo).
-- **Restrictions & caps:** Basic is **not** an identity source — it only carries a native token, which is then validated as Entry 2/4.
+- **Purpose / allowed use:** carrier transport for a native token on package-manager tooling (npm/pip/cargo/maven/gradle).
+- **Restrictions & caps:** Basic is **not** an identity source — it only carries a native token, which is then validated as Entry 2/4. The username field is **ignored** on the artifact plane (it is decorative carrier metadata, not an identity claim).
 - **Protection:** inherits the carried token's protections (Entry 2/4); in transit — TLS.
-- **Allowed call paths / surfaces:** package-manager artifact surfaces.
+- **Allowed call paths / surfaces:** package-manager artifact surfaces — npm/pip/cargo and **maven/gradle** (`mvn deploy` / `gradle publish` deploy `PUT`s authenticate here via `Authorization: Basic base64(<anything>:<hort_pat_*>)`, username ignored, password = PAT validated as Entry 2; the Maven handler serves both `RepositoryFormat::Maven` and `RepositoryFormat::Gradle` repos on one wire protocol). Maven/Gradle introduce **no new auth mechanism** — they reuse this carrier unchanged.
 - **Enforcement owner:** `Hort-enforced`.
 - **Status:** Basic-as-token-carrier is `Active`. Basic carrying a raw username+password as an identity source is **`Forbidden-in-release`**: there is no DB password-check-per-request identity path in the unified auth middleware (`crates/hort-http-core/src/middleware/auth.rs::require_principal`) — it was removed with no compat shim. Native tokens fully cover the tooling; this keeps a password-brute-force surface off the public artifact plane. A raw username+password reaches the bearer validator (token not valid) → `401`, with no DB password check. The password-hash producer chain is gone end-to-end (no `admin bootstrap` subcommand, no `UserUseCase::create_or_rotate_admin`, no `users.password_hash` column, no `AdminBootstrapped`/`AdminPasswordRotated` events) — see the Entry 9 tombstone.
 - **Mandatory guardrails:** [OWASP A07/A01 · NIS2 21(2)(i) · CRA I(1),(2)(a) · BSI ORP.4] no new call site may treat Basic username+password as an identity source (architect anti-pattern, §4) — a `Deprecated` / `Forbidden-in-release` mechanism gaining a new call site is a hard block.

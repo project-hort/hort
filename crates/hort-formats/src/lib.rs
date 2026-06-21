@@ -22,7 +22,10 @@
 //! - Core (all formats): parse_coords, build_index, verify_upstream_checksum
 //! - SimpleIndex: generate_index
 //! - SignedIndex: generate_unsigned_index (host signs with repo key)
-//! - MultiFileArtifact: file_group_key, artifact_is_complete, resolve_mutable_version
+//! - MultiFileArtifact: classify_group_member, build_artifact_logical_path, resolve_mutable_version
+//!   (realised today via the `classify_group_member`→`ArtifactGroup` push model;
+//!   Maven/Gradle is the shipped instance — see ADR 0032. The earlier
+//!   `file_group_key, artifact_is_complete` sketch is stale.)
 //! - StatefulUpload: handle_request (OCI, Git LFS — full HTTP request/response)
 //!
 //! Modules in groups 1–4 receive no I/O capabilities beyond function arguments.
@@ -48,6 +51,12 @@ pub mod cargo;
 // Per-format builder modules live in npm/index.rs, pypi/index.rs,
 // cargo/index.rs. See explanation/index-construction.md.
 pub mod index_serve;
+// Maven / Gradle format handler: GA:V identity, path build/parse, multi-file
+// group classification (pom/jar/sources/javadoc/module), and SNAPSHOT
+// mutable-version resolution. Gradle is served by the same handler (Maven
+// layout + GMM `.module` member). See explanation/format-handlers.md + the
+// Maven design doc; ADR 0005 (MultiFileArtifact) / ADR 0032 / ADR 0033.
+pub mod maven;
 pub mod npm;
 pub mod oci;
 pub mod pypi;
@@ -118,5 +127,88 @@ mod classify_group_member_default_tests {
         assert!(NpmFormatHandler
             .classify_group_member(&c, &c.path)
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod resolve_mutable_version_default_tests {
+    //! Regression guard: the three compiled-in format handlers (PyPI,
+    //! cargo, npm) MUST inherit the trait-level default of
+    //! [`FormatHandler::resolve_mutable_version`]. That default returns
+    //! `Ok(None)` — these formats publish only immutable versions, so a
+    //! version request is always already concrete and never gets rewritten.
+    //! Maven SNAPSHOT is the only v1 implementer. An accidental override
+    //! here would start resolving (and silently redirecting) version
+    //! requests for formats that have no mutable-version concept.
+    use hort_domain::ports::format_handler::FormatHandler;
+
+    use crate::cargo::CargoFormatHandler;
+    use crate::npm::NpmFormatHandler;
+    use crate::pypi::PyPiFormatHandler;
+
+    #[test]
+    fn pypi_handler_inherits_default_none() {
+        let r =
+            PyPiFormatHandler.resolve_mutable_version("pkg-1.0.0.tar.gz", &["pkg-1.0.0.tar.gz"]);
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn cargo_handler_inherits_default_none() {
+        let r = CargoFormatHandler
+            .resolve_mutable_version("pkg/1.0.0/download", &["pkg/1.0.0/download"]);
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn npm_handler_inherits_default_none() {
+        let r = NpmFormatHandler
+            .resolve_mutable_version("pkg/-/pkg-1.0.0.tgz", &["pkg/-/pkg-1.0.0.tgz"]);
+        assert!(matches!(r, Ok(None)));
+    }
+}
+
+#[cfg(test)]
+mod maven_overrides_multifile_defaults_tests {
+    //! Counterpart guard to the `*_default_tests` modules above: the Maven
+    //! handler is the ONE v1 format that MUST OVERRIDE the MultiFileArtifact
+    //! trait members ([`FormatHandler::classify_group_member`] and
+    //! [`FormatHandler::resolve_mutable_version`]) rather than inherit their
+    //! inert defaults. If a refactor accidentally deleted Maven's overrides,
+    //! the default `None`/`Ok(None)` would silently disable Maven grouping
+    //! and SNAPSHOT resolution — these tests pin that the overrides are live.
+    use hort_domain::ports::format_handler::FormatHandler;
+    use hort_domain::types::ArtifactCoords;
+
+    use crate::maven::{MavenFormatHandler, MAVEN_KIND_FILE, MAVEN_PATH_KIND_KEY};
+
+    #[test]
+    fn maven_overrides_classify_group_member() {
+        // A jar file IS classified as a group member (override is live).
+        let path = "com/example/foo/1.0/foo-1.0.jar";
+        let coords = ArtifactCoords {
+            name: "com.example:foo".into(),
+            name_as_published: "com.example:foo".into(),
+            version: Some("1.0".into()),
+            path: path.into(),
+            format: hort_domain::entities::repository::RepositoryFormat::Maven,
+            metadata: serde_json::json!({ MAVEN_PATH_KIND_KEY: MAVEN_KIND_FILE }),
+        };
+        let m = MavenFormatHandler
+            .classify_group_member(&coords, path)
+            .expect("maven must classify a jar as a group member");
+        assert_eq!(m.role, "jar");
+        assert!(m.is_primary);
+    }
+
+    #[test]
+    fn maven_overrides_resolve_mutable_version() {
+        // A SNAPSHOT request resolves to a timestamped build (override live).
+        let avail = ["com/example/foo/1.0-SNAPSHOT/foo-1.0-20231201.120000-1.jar"];
+        let refs: Vec<&str> = avail.to_vec();
+        let got = MavenFormatHandler
+            .resolve_mutable_version("com/example/foo/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.jar", &refs)
+            .unwrap();
+        assert_eq!(got, Some(avail[0].to_string()));
     }
 }

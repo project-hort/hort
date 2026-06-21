@@ -123,6 +123,20 @@ pub enum PerVersionPayload {
     /// record is itself a flat JSON object with a fixed key set —
     /// see [`CargoVersionPayload`].
     Cargo(CargoVersionPayload),
+    /// Maven `maven-metadata.xml` per-version data. Carried by
+    /// [`VersionEntry`]s the hosted Maven source produces; consumed by
+    /// `MavenMetadataXmlBuilder` in `hort-formats::maven::metadata` to
+    /// emit either the **A-level** (`g/a/maven-metadata.xml`) or
+    /// **V-level** (`g/a/X-SNAPSHOT/maven-metadata.xml`) document.
+    ///
+    /// Unlike the other formats, Maven serves two structurally different
+    /// metadata documents off the same builder, so the payload is itself
+    /// a two-case enum ([`MavenVersionPayload`]): the A-level case carries
+    /// only an optional per-version `last_updated`; the V-level case
+    /// carries one [`MavenSnapshotArtifact`] describing a single stored
+    /// timestamped build (`(classifier, extension)` key + resolved
+    /// `value` + `updated` + the build's `(timestamp, build_number)`).
+    Maven(MavenVersionPayload),
 }
 
 /// npm packument per-version data.
@@ -374,6 +388,92 @@ pub struct CargoVersionPayload {
     /// `features2` — v2-extra features map. `None` → omitted from
     /// the line.
     pub features2: Option<serde_json::Value>,
+}
+
+/// Maven `maven-metadata.xml` per-version data.
+///
+/// Maven is the one format that serves **two** structurally different
+/// metadata documents through the same [`IndexBuilder`]:
+///
+/// - **A-level** (`g/a/maven-metadata.xml`) — the artifact-level version
+///   list. One [`VersionEntry`] per Maven version (release or the base
+///   `X-SNAPSHOT`); the builder reads only the spine `version` and the
+///   optional [`MavenVersionPayload::Artifact::last_updated`].
+/// - **V-level** (`g/a/X-SNAPSHOT/maven-metadata.xml`) — the per-snapshot
+///   build list for one base `X-SNAPSHOT`. One [`VersionEntry`] per stored
+///   timestamped build (per `(classifier, extension)`); the builder reads
+///   the [`MavenSnapshotArtifact`] in [`MavenVersionPayload::Snapshot`].
+///
+/// A two-case enum (rather than a struct of all-optional fields) makes the
+/// "which metadata document is this entry for" distinction non-bypassable
+/// at the type level: an A-level entry cannot accidentally carry V-level
+/// snapshot data and vice versa. Which case the source produces is decided
+/// by the request's path-shape marker (`maven_path_kind`), not by the
+/// builder — the builder dispatches on the case it finds (see the
+/// module-level factoring note on `MavenMetadataXmlBuilder`).
+///
+/// # Dep-graph note
+///
+/// Like the other per-format payload structs, this lives in `hort-app`
+/// (not `hort-formats::maven`) because the dep edge runs
+/// `hort-formats → hort-app`; `hort-formats::maven::metadata` re-exports
+/// it so format-crate consumers see the expected import path.
+#[derive(Debug, Clone)]
+pub enum MavenVersionPayload {
+    /// A-level entry — one Maven version in `g/a/maven-metadata.xml`.
+    Artifact {
+        /// The version's last-updated timestamp in Maven's
+        /// `yyyyMMddHHmmss` (14-digit, no-separator) form, if the source
+        /// can derive one (e.g. from the artifact's ingest/commit time).
+        /// `None` when the source has no per-version timestamp; the
+        /// builder then derives the document `<lastUpdated>` from whatever
+        /// per-version values are present (or the caller-supplied fallback
+        /// in [`BuildContext`]). NEVER read from a system clock — the
+        /// value is data the source materialised at row-construction time.
+        last_updated: Option<String>,
+    },
+    /// V-level entry — one stored timestamped snapshot build in
+    /// `g/a/X-SNAPSHOT/maven-metadata.xml`.
+    Snapshot(MavenSnapshotArtifact),
+}
+
+/// One stored timestamped snapshot build — a single
+/// `<snapshotVersion>` row of a V-level `maven-metadata.xml`, plus the
+/// `(timestamp, build_number)` the document's `<snapshot>` block needs.
+///
+/// The V-level builder keeps, per `(classifier, extension)` key, only the
+/// most-recent build (highest `(timestamp, build_number)`), and derives
+/// the document-level `<snapshot><timestamp>`/`<buildNumber>` from the
+/// single highest build across all keys. So the payload carries the build
+/// coordinate (`timestamp` + `build_number`) on every entry, not just the
+/// per-`(classifier, extension)` resolved row.
+#[derive(Debug, Clone)]
+pub struct MavenSnapshotArtifact {
+    /// The Maven classifier (`sources`, `javadoc`, …) or `None` for the
+    /// main artifact. Emitted as `<snapshotVersion><classifier>` only
+    /// when `Some` (the main artifact omits the element entirely).
+    pub classifier: Option<String>,
+    /// The file extension (`jar`, `pom`, `module`, …). Emitted as
+    /// `<snapshotVersion><extension>`.
+    pub extension: String,
+    /// The resolved timestamped version string Maven clients request the
+    /// concrete file by (e.g. `1.0-20231201.120000-3`). Emitted as
+    /// `<snapshotVersion><value>`.
+    pub value: String,
+    /// This build's last-updated timestamp in Maven's `yyyyMMddHHmmss`
+    /// (14-digit, NO dot) form. Emitted as `<snapshotVersion><updated>`.
+    /// Note this is the NON-dotted form — distinct from the dotted
+    /// `timestamp` below; the two formats must not be unified.
+    pub updated: String,
+    /// The build's dotted timestamp `yyyyMMdd.HHmmss` (WITH the dot) —
+    /// the `<snapshot><timestamp>` value for the highest build. Carried
+    /// on every entry so the builder can pick the document-level
+    /// `<snapshot>` block from the highest `(timestamp, build_number)`.
+    pub timestamp: String,
+    /// The build number `N`. Used both to order builds within a
+    /// `(classifier, extension)` key (highest wins) and to fill the
+    /// document-level `<snapshot><buildNumber>` for the highest build.
+    pub build_number: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -629,13 +729,12 @@ mod tests {
                 assert_eq!(p.integrity.as_deref(), Some("sha512-aGVsbG8="));
                 assert_eq!(p.shasum, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
             }
-            // The `Pypi` and `Cargo` variants have their own sister
-            // tests; the npm test explicitly only exercises the `Npm`
-            // arm. A mis-construction would be a test-side bug.
-            PerVersionPayload::Pypi(_) => {
-                unreachable!("npm fixture must produce an Npm payload")
-            }
-            PerVersionPayload::Cargo(_) => {
+            // The `Pypi` / `Cargo` / `Maven` variants have their own
+            // sister tests; the npm test explicitly only exercises the
+            // `Npm` arm. A mis-construction would be a test-side bug.
+            PerVersionPayload::Pypi(_)
+            | PerVersionPayload::Cargo(_)
+            | PerVersionPayload::Maven(_) => {
                 unreachable!("npm fixture must produce an Npm payload")
             }
         }
@@ -808,10 +907,9 @@ mod tests {
                 assert_eq!(p.files[0].hash_sha256.as_deref(), Some("abc123"));
                 assert_eq!(p.files[0].requires_python.as_deref(), Some(">=3.7"));
             }
-            PerVersionPayload::Npm(_) => {
-                unreachable!("pypi fixture must produce a Pypi payload")
-            }
-            PerVersionPayload::Cargo(_) => {
+            PerVersionPayload::Npm(_)
+            | PerVersionPayload::Cargo(_)
+            | PerVersionPayload::Maven(_) => {
                 unreachable!("pypi fixture must produce a Pypi payload")
             }
         }
@@ -852,10 +950,74 @@ mod tests {
                 assert!(p.v.is_none());
                 assert!(p.features2.is_none());
             }
-            PerVersionPayload::Npm(_) | PerVersionPayload::Pypi(_) => {
+            PerVersionPayload::Npm(_)
+            | PerVersionPayload::Pypi(_)
+            | PerVersionPayload::Maven(_) => {
                 unreachable!("cargo fixture must produce a Cargo payload")
             }
         }
         let _ = payload.clone();
+    }
+
+    /// Sister test to the `npm`/`pypi`/`cargo`
+    /// `*_per_version_payload_has_required_fields` tests. Pins the
+    /// `Maven` variant carries a [`MavenVersionPayload`] in both its
+    /// A-level (`Artifact`) and V-level (`Snapshot`) shapes — the
+    /// closed-sum contract the `MavenMetadataXmlBuilder` consumes.
+    #[test]
+    fn maven_per_version_payload_has_required_fields() {
+        // A-level shape: only an optional last-updated.
+        let a_level = MavenVersionPayload::Artifact {
+            last_updated: Some("20231201120000".into()),
+        };
+        let wrapped_a = PerVersionPayload::Maven(a_level.clone());
+        match wrapped_a {
+            PerVersionPayload::Maven(MavenVersionPayload::Artifact { last_updated }) => {
+                assert_eq!(last_updated.as_deref(), Some("20231201120000"));
+            }
+            PerVersionPayload::Maven(MavenVersionPayload::Snapshot(_)) => {
+                unreachable!("A-level fixture must produce an Artifact payload")
+            }
+            PerVersionPayload::Npm(_)
+            | PerVersionPayload::Pypi(_)
+            | PerVersionPayload::Cargo(_) => {
+                unreachable!("maven fixture must produce a Maven payload")
+            }
+        }
+
+        // V-level shape: one stored timestamped build.
+        let snap = MavenSnapshotArtifact {
+            classifier: Some("sources".into()),
+            extension: "jar".into(),
+            value: "1.0-20231201.120000-3".into(),
+            updated: "20231201120000".into(),
+            timestamp: "20231201.120000".into(),
+            build_number: 3,
+        };
+        let v_level = MavenVersionPayload::Snapshot(snap.clone());
+        let wrapped_v = PerVersionPayload::Maven(v_level.clone());
+        match wrapped_v {
+            PerVersionPayload::Maven(MavenVersionPayload::Snapshot(s)) => {
+                assert_eq!(s.classifier.as_deref(), Some("sources"));
+                assert_eq!(s.extension, "jar");
+                assert_eq!(s.value, "1.0-20231201.120000-3");
+                assert_eq!(s.updated, "20231201120000");
+                assert_eq!(s.timestamp, "20231201.120000");
+                assert_eq!(s.build_number, 3);
+            }
+            PerVersionPayload::Maven(MavenVersionPayload::Artifact { .. }) => {
+                unreachable!("V-level fixture must produce a Snapshot payload")
+            }
+            PerVersionPayload::Npm(_)
+            | PerVersionPayload::Pypi(_)
+            | PerVersionPayload::Cargo(_) => {
+                unreachable!("maven fixture must produce a Maven payload")
+            }
+        }
+
+        // Smoke: `Clone` is on both the enum and the inner struct.
+        let _ = a_level.clone();
+        let _ = v_level.clone();
+        let _ = snap.clone();
     }
 }

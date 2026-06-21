@@ -268,7 +268,8 @@ pub fn build_router_with_oci_config(
         .nest(
             "/pypi",
             hort_http_pypi::pypi_routes_with_publish_limit(publish_limit),
-        );
+        )
+        .nest("/maven", hort_http_maven::maven_routes());
     // Control-plane placement.
     //
     // When the control split is OFF (`HORT_CONTROL_BIND` unset — the

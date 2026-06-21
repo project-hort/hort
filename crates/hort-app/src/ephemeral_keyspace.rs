@@ -94,6 +94,20 @@ pub const KEYSPACE_REGISTRY: &[(&str, EphemeralKeyspaceClass)] = &[
     // pre-amendment `pypi_simple:` base64-JSON raw-body envelope. Source:
     // `crates/hort-http-pypi/src/simple_index.rs`.
     ("pypi_simple_proj:", EphemeralKeyspaceClass::Evictable),
+    // Maven on-demand checksum-sidecar digest cache (ADR 0032 / §6).
+    // Memoises the hex digest of a STORED Maven artifact computed on a
+    // sidecar GET (`<file>.{sha1,sha512,md5}`). Key shape:
+    // `mavensum:{content_hash}:{algorithm}` where `content_hash` is the
+    // artifact's CAS SHA-256 (the immutable identity of the bytes) and
+    // `algorithm` is the lowercase sidecar token (`sha1`/`sha512`/`md5` —
+    // `sha256` is the CAS hash itself, served free without a hash or a
+    // cache entry). Evictable: the digest of immutable content is itself
+    // immutable, so cache loss costs at most one re-hash, never
+    // correctness — exactly the `cargo_index_proj:` recomputable-cache
+    // rationale. The cache also bounds a re-hash CPU-amplification vector
+    // (repeated `.sha1` GETs of a large blob hash it at most once until
+    // eviction). Source: `crates/hort-http-maven/src/sidecar.rs`.
+    ("mavensum:", EphemeralKeyspaceClass::Evictable),
     // npm upstream-packument PROJECTION cache (ADR 0026).
     // Replaced `npm_packument_raw:` — the entry now holds the small
     // serialized `NpmProjection` (versions + dist.tarball/integrity/time,
@@ -253,6 +267,21 @@ mod tests {
     }
 
     #[test]
+    fn mavensum_resolves_to_evictable() {
+        // The Maven on-demand sidecar-digest cache holds the recomputable
+        // hex of a stored artifact under
+        // `mavensum:{content_hash}:{algorithm}`. Evictable: cache loss
+        // costs a re-hash, never correctness.
+        assert_eq!(
+            keyspace_class(&format!(
+                "mavensum:{}:sha1",
+                "a".repeat(64) // a 64-hex content hash placeholder
+            )),
+            Some(EphemeralKeyspaceClass::Evictable),
+        );
+    }
+
+    #[test]
     fn pulldedup_resolves_to_evictable() {
         assert_eq!(
             keyspace_class("pulldedup:abc123"),
@@ -387,8 +416,10 @@ mod tests {
         // Guards against accidental additions / deletions; if the
         // count changes, this assertion must be updated together with
         // the registry edit (and the change reviewed deliberately).
-        // Current shape: 14 entries — 8 durable, 6 evictable.
-        assert_eq!(KEYSPACE_REGISTRY.len(), 14);
+        // Current shape: 15 entries — 8 durable, 7 evictable (the
+        // Maven on-demand sidecar-digest cache `mavensum:` added the
+        // 7th evictable entry).
+        assert_eq!(KEYSPACE_REGISTRY.len(), 15);
 
         let evictable = KEYSPACE_REGISTRY
             .iter()
@@ -398,7 +429,7 @@ mod tests {
             .iter()
             .filter(|(_, c)| *c == EphemeralKeyspaceClass::Durable)
             .count();
-        assert_eq!(evictable, 6, "expected 6 evictable entries");
+        assert_eq!(evictable, 7, "expected 7 evictable entries");
         assert_eq!(durable, 8, "expected 8 durable entries");
     }
 

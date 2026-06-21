@@ -12,6 +12,21 @@ use crate::error::{DomainError, DomainResult};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HashAlgorithm {
+    /// SHA-1 (40 hex chars). **Transfer-verification target ONLY.**
+    ///
+    /// `Sha1` is valid solely as a
+    /// [`crate::ports::format_handler`]-driven
+    /// `VerifiedIngestRequest::UpstreamPublished` checksum — the weaker
+    /// floor Maven Central guarantees on every artifact (`.sha1` sidecar).
+    /// It is **never** a `ContentHash` (the CAS key is always SHA-256,
+    /// independent of the transfer floor) and is never produced by a
+    /// `ProtocolNative` request. SHA-1 is collision-broken; the floor
+    /// catches transport corruption and casual tampering only, with TLS
+    /// (system trust store + `HORT_EXTRA_CA_BUNDLE`) as the real
+    /// transport-integrity control. See ADR 0033 (SHA-1 transfer-
+    /// verification floor). This invariant is a doc/review contract — there
+    /// is no consumer in this module to enforce it.
+    Sha1,
     Sha256,
     Sha512,
 }
@@ -20,6 +35,7 @@ impl HashAlgorithm {
     /// Hex-encoded length of a checksum produced by this algorithm.
     fn hex_len(self) -> usize {
         match self {
+            HashAlgorithm::Sha1 => 40,
             HashAlgorithm::Sha256 => 64,
             HashAlgorithm::Sha512 => 128,
         }
@@ -84,6 +100,8 @@ mod tests {
 
     #[test]
     fn hash_algorithm_serializes_as_lowercase_string() {
+        let s = serde_json::to_string(&HashAlgorithm::Sha1).unwrap();
+        assert_eq!(s, "\"sha1\"");
         let s = serde_json::to_string(&HashAlgorithm::Sha256).unwrap();
         assert_eq!(s, "\"sha256\"");
         let s = serde_json::to_string(&HashAlgorithm::Sha512).unwrap();
@@ -92,6 +110,8 @@ mod tests {
 
     #[test]
     fn hash_algorithm_deserializes_from_lowercase_string() {
+        let a: HashAlgorithm = serde_json::from_str("\"sha1\"").unwrap();
+        assert_eq!(a, HashAlgorithm::Sha1);
         let a: HashAlgorithm = serde_json::from_str("\"sha256\"").unwrap();
         assert_eq!(a, HashAlgorithm::Sha256);
         let a: HashAlgorithm = serde_json::from_str("\"sha512\"").unwrap();
@@ -100,7 +120,11 @@ mod tests {
 
     #[test]
     fn hash_algorithm_round_trips_through_serde() {
-        for alg in [HashAlgorithm::Sha256, HashAlgorithm::Sha512] {
+        for alg in [
+            HashAlgorithm::Sha1,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha512,
+        ] {
             let json = serde_json::to_string(&alg).unwrap();
             let back: HashAlgorithm = serde_json::from_str(&json).unwrap();
             assert_eq!(back, alg);
@@ -109,9 +133,11 @@ mod tests {
 
     #[test]
     fn hash_algorithm_partial_eq_holds() {
+        assert_eq!(HashAlgorithm::Sha1, HashAlgorithm::Sha1);
         assert_eq!(HashAlgorithm::Sha256, HashAlgorithm::Sha256);
         assert_eq!(HashAlgorithm::Sha512, HashAlgorithm::Sha512);
         assert_ne!(HashAlgorithm::Sha256, HashAlgorithm::Sha512);
+        assert_ne!(HashAlgorithm::Sha1, HashAlgorithm::Sha256);
     }
 
     #[test]
@@ -125,17 +151,61 @@ mod tests {
 
     #[test]
     fn hash_algorithm_is_debug() {
+        assert_eq!(format!("{:?}", HashAlgorithm::Sha1), "Sha1");
         assert_eq!(format!("{:?}", HashAlgorithm::Sha256), "Sha256");
         assert_eq!(format!("{:?}", HashAlgorithm::Sha512), "Sha512");
     }
 
     // ----- UpstreamPublishedChecksum ---------------------------------------
 
+    /// SHA-1 of "" (empty input) — 40 hex chars.
+    const SHA1_EMPTY: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
     /// SHA-256 of "" (empty input) — 64 hex chars.
     const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     /// SHA-512 of "" (empty input) — 128 hex chars.
     const SHA512_EMPTY: &str = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
          47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
+
+    #[test]
+    fn published_checksum_constructs_sha1() {
+        // SHA-1 is a valid transfer-verification target (Maven `.sha1`
+        // floor, ADR 0033): a 40-char lowercase-hex string constructs.
+        let cs = UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, SHA1_EMPTY).unwrap();
+        assert_eq!(cs.algorithm(), HashAlgorithm::Sha1);
+        assert_eq!(cs.hex(), SHA1_EMPTY);
+        // The SHA-1 hex length is exactly 40.
+        assert_eq!(cs.hex().len(), 40);
+    }
+
+    #[test]
+    fn hash_algorithm_sha1_hex_len_is_40() {
+        assert_eq!(HashAlgorithm::Sha1.hex_len(), 40);
+    }
+
+    #[test]
+    fn published_checksum_rejects_wrong_length_sha1() {
+        // A 64-char hex (sha256 length) for the sha1 algorithm — must reject.
+        let err = UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, SHA256_EMPTY).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        // A too-short string is also rejected.
+        let err = UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, "deadbeef").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn published_checksum_rejects_uppercase_hex_sha1() {
+        let upper = SHA1_EMPTY.to_ascii_uppercase();
+        let err = UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, &upper).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn published_checksum_rejects_non_hex_chars_sha1() {
+        // 40 chars but contains 'g' which is not hex.
+        let bad = "g".repeat(40);
+        let err = UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, &bad).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
 
     #[test]
     fn published_checksum_constructs_sha256() {
