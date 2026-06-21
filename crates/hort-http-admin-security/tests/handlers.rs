@@ -445,15 +445,17 @@ async fn get_repo_score_returns_200_for_authenticated_reader_on_private_repo() {
     ));
     let ctx = with_repository_access(&ctx_base, access);
 
-    // Inject an authenticated principal via auth_test helper.
+    // GET routes through `extract_optional_principal`, which writes the
+    // `Option<AuthenticatedPrincipal>` slot — inject THAT shape, not the bare
+    // `authenticated_principal` slot (only the write path produces it).
+    // Injecting the bare slot here would mask the handler's slot bug.
     let p = principal(&["reader"]);
     let app = build_test_router(ctx);
     let mut req = Request::builder()
         .uri("/api/v1/repositories/vault/security-score")
         .body(Body::empty())
         .unwrap();
-    req.extensions_mut()
-        .insert(auth_test::authenticated_principal(p));
+    auth_test::inject_optional_principal_some(&mut req, p);
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
