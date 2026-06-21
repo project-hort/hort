@@ -53,9 +53,8 @@ Run this every time, no exceptions:
 
 1. **Grep prior backlogs** for deferral markers — at minimum `deferred`, `follow-on`, `follow up`, `next initiative`, `placeholder`, `out of scope`. Cover every shipped design cycle, not just the most recent. On a feature branch, prior `docs/plans/` files may still be present; also grep the open-items register in `docs/adr/0000-historical-decisions-index.md`.
    ```bash
-   grep -rn -i "deferred\|follow-on\|follow up\|next initiative\|placeholder\|out of scope" \
-       docs/plans/0[01]*-initiative-*-backlog.md \
-       docs/plans/0[01]*-initiative-*.md
+   grep -rn -i "deferred\|follow-on\|follow up\|next plan\|placeholder\|out of scope" \
+       docs/plans/*.md
    grep -n "open\|deferred\|carry" docs/adr/0000-historical-decisions-index.md
    ```
 2. **Cross-reference design docs' "Explicitly out of scope" sections.** The gap is that deferred sections are not re-read when the next initiative is scoped.
@@ -68,7 +67,7 @@ Run this every time, no exceptions:
 
 The sweep is cheap (one grep, decisions a handful of lines each) and the cost of the gap it catches is large (broken smoke tests, dormant production paths, a credentialed pull-through path dormant for months while an apparent "follow-on" went unscheduled). Skip it and the same class of gap recurs.
 
-### Output 1 — Design document (`docs/plans/<directory-index-nnn>-initiative-N-<name>.md`, branch-local)
+### Output 1 — Design document (`docs/plans/<name>.md`, branch-local)
 
 Narrow scope — two to three pages maximum. Covers only the implementation decisions that would otherwise be made inconsistently across backlog items. Does NOT restate the architectural direction document. Concrete decisions only:
 
@@ -82,7 +81,7 @@ Read the relevant existing source files before writing. The design doc must be g
 
 **Before merging to main:** distill durable decisions into ADRs (`docs/adr/`) and Diátaxis pages (`docs/architecture/`), then delete the `docs/plans/` files. The ADR and architecture page are the durable record; the design doc is branch-lifetime scaffolding only.
 
-### Output 2 — Backlog (`docs/plans/<directory-index-nnn>-initiative-N-backlog.md`, branch-local)
+### Output 2 — Backlog (`docs/plans/<name>-backlog.md`, branch-local)
 
 PR-sized items ordered by dependency. Each item contains:
 
@@ -664,7 +663,7 @@ When reviewing a spec (Step 2 output):
 When reviewing a new initiative's design doc + backlog (Planning Mode output):
 
 - [ ] **Step 0 deferred-items sweep is recorded.** §1 lists every grep hit against `deferred` / `follow-on` / `next initiative` / `placeholder` in prior backlogs and design docs, and states the decision per hit (include now / carry forward / close as moot). "No inherited deferred items" is recorded explicitly — silence is ambiguous. If §1 is silent, send the spec back; this is a hard block.
-- [ ] Every "carry forward" decision names the exact target initiative (or "scope a new initiative N+1") so a future sweep finds the breadcrumb.
+- [ ] Every "carry forward" decision names the exact target follow-on plan (or "scope a follow-on plan") so a future sweep finds the breadcrumb.
 - [ ] **Finish the dead-surface inventory in the file/surface you're already editing.** When an initiative's backlog item edits file F or schema S, dead-surface adjacent to that item's named scope is in scope by default. Deferring an in-area orphan requires a *substantive* justification: it must be a genuinely different concern (different reviewer cohort, different design question, different file). The reasons that DO NOT qualify as substantive: "predates this initiative" (dead surface has no allegiance to initiative boundaries); "could be a future schema-tidy / cleanup pass" (that future pass is exactly the in-area-but-deferred footgun this rule prevents); "fits cleanly if it lands cleanly" (hedge, not a reason); "not explicitly approved in the original spec" (the original spec didn't name every dead surface; the audit pass did). The canonical case study: a *consumer-side* cutover (commit `b7fd6d65`) deferred the *producer-side* surface as "follow-on" and the follow-on was not scheduled because the next initiative was scoped from the original-backlog deferred-items list, not from the consumer-side PR's deferred-items list. The producer survived for ~5 days until alpha-tester evidence exposed five different documentation surfaces claiming a working code path that had been deleted. This rule is the structural-discipline version of what Step 0 enforces retroactively — apply it before deferring, not just before starting a new initiative.
 - [ ] The "Explicitly out of scope" section in §1 is exhaustive — items the architect considered and dropped are listed, not just absent.
 
