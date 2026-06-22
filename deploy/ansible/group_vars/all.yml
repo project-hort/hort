@@ -45,3 +45,41 @@ hort_metrics_port: 9090
 hort_oidc_issuer_url: "https://{{ registry_fqdn }}/realms/hort"
 hort_oidc_audience: hort-server
 hort_oidc_groups_claim: groups
+
+# ── PostgreSQL performance tuning ─────────────────────────────────────────────
+# Values are scaled from ansible_memtotal_mb (a gathered fact; both playbooks
+# have gather_facts: true).  They are intentionally CONSERVATIVE because
+# Postgres co-locates with hort-server, hort-worker, and the Trivy/OSV scanners
+# on a single VPS — Postgres does not own the box.
+#
+# Co-location sizing rationale:
+#   shared_buffers     12.5% RAM  (not the 25% solo-server recommendation)
+#   effective_cache    45%  RAM   (OS page-cache estimate for the planner)
+#   work_mem           floor(RAM/512, 8) MB — kept low: per-sort-node × per-conn
+#   maintenance_work_mem  min(5% RAM, 256 MB) — single autovac/index-build cap
+#
+# Workload notes:
+#   - append-heavy event store + JSONB payloads → wal_compression on
+#   - high-churn jwt_replay_seen/jobs tables → autovacuum_*_scale_factor 0.05
+#   - SSD storage → random_page_cost 1.1, effective_io_concurrency 200
+#
+# Target values on a 4 GB box:
+#   shared_buffers 512 MB, effective_cache_size ~1843 MB, work_mem 8 MB,
+#   maintenance_work_mem 204 MB
+# Target values on an 8 GB box:
+#   shared_buffers 1024 MB, effective_cache_size ~3686 MB, work_mem 16 MB,
+#   maintenance_work_mem 256 MB (capped)
+#
+# Override any of these in group_vars/production/ or host_vars/ if needed.
+
+pg_shared_buffers_mb: "{{ (ansible_memtotal_mb * 0.125) | int }}"
+pg_effective_cache_size_mb: "{{ (ansible_memtotal_mb * 0.45) | int }}"
+pg_work_mem_mb: "{{ [(ansible_memtotal_mb // 512), 8] | max }}"
+pg_maintenance_work_mem_mb: "{{ [(ansible_memtotal_mb * 0.05) | int, 256] | min }}"
+pg_max_wal_size: "2GB"
+pg_random_page_cost: "1.1"
+pg_effective_io_concurrency: 200
+pg_wal_compression: "on"
+pg_checkpoint_completion_target: "0.9"
+pg_autovacuum_vacuum_scale_factor: "0.05"
+pg_autovacuum_analyze_scale_factor: "0.05"

@@ -223,3 +223,18 @@
     group: postgres
     mode: "0640"
   notify: Reload PostgreSQL
+
+# ── Performance tuning drop-in ────────────────────────────────────────────────
+# Deploy a conf.d drop-in with RAM-scaled performance settings.
+# shared_buffers and max_wal_size require a full restart (not just reload);
+# the handler below issues a restart, which also covers any reload-only params.
+# The drop-in is applied AFTER the cluster is confirmed running (task above).
+
+- name: Deploy performance tuning conf.d drop-in
+  ansible.builtin.template:
+    src: 10-hort-tuning.conf.j2
+    dest: "{{ postgres_apt_conf_dir }}/10-hort-tuning.conf"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  notify: Restart PostgreSQL

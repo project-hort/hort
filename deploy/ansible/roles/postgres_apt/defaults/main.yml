@@ -19,3 +19,8 @@ postgres_apt_ddl_role: hort_ddl
 
 # pg_hba.conf path for the Debian-packaged cluster (version-independent symlink).
 postgres_apt_hba_conf: /etc/postgresql/17/main/pg_hba.conf
+
+# conf.d drop-in directory — Debian's postgresql.conf already has
+# include_dir = 'conf.d', so any .conf file here is picked up automatically.
+# Mirrors the PG major version (17) hardcoded above in postgres_apt_hba_conf.
+postgres_apt_conf_dir: /etc/postgresql/17/main/conf.d

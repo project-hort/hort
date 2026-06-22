@@ -1,0 +1,32 @@
+# 10-hort-tuning.conf — managed by Ansible (postgres_apt role).
+# Loaded automatically via the include_dir = 'conf.d' directive already present
+# in Debian's default postgresql.conf.
+#
+# Values are RAM-scaled from ansible_memtotal_mb (gathered fact).
+# Co-location-conservative: Postgres shares the VPS with hort-server,
+# hort-worker, and the Trivy/OSV scanners.  Override via group_vars/all.yml.
+#
+# NOTE: surgical per-table autovacuum tuning for high-churn tables
+# (jwt_replay_seen, jobs) belongs in a hort schema migration once the tables
+# exist.  The global scale factors below benefit those tables and are harmless
+# for the append-only events table (near-zero dead tuples → autovacuum rarely
+# triggers on it regardless).
+
+# Memory
+shared_buffers = {{ pg_shared_buffers_mb }}MB
+effective_cache_size = {{ pg_effective_cache_size_mb }}MB
+work_mem = {{ pg_work_mem_mb }}MB
+maintenance_work_mem = {{ pg_maintenance_work_mem_mb }}MB
+
+# WAL
+max_wal_size = {{ pg_max_wal_size }}
+wal_compression = {{ pg_wal_compression }}
+checkpoint_completion_target = {{ pg_checkpoint_completion_target }}
+
+# Planner — SSD
+random_page_cost = {{ pg_random_page_cost }}
+effective_io_concurrency = {{ pg_effective_io_concurrency }}
+
+# Autovacuum — global scale factors (co-located; do NOT raise cost_limit)
+autovacuum_vacuum_scale_factor = {{ pg_autovacuum_vacuum_scale_factor }}
+autovacuum_analyze_scale_factor = {{ pg_autovacuum_analyze_scale_factor }}
