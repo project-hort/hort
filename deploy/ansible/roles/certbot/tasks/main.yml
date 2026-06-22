@@ -12,10 +12,11 @@
 #      omitted by Jinja gate).
 #   2. This role runs certbot --webroot; the ACME challenge is served from
 #      /var/www/html via the port-80 location block.
-#   3. On success the live cert now exists.  The "certbot issued cert" handler
-#      re-templates the vhost with nginx_cert_exists=true, then notifies
-#      "Validate nginx config" and "Reload nginx" from the nginx role's handlers
-#      (play-scoped) → validate + reload → 443 comes up in the same play.
+#   3. On success the live cert now exists.  The cert-issuance task notifies
+#      "Render nginx vhost (cert present)", "Validate nginx config", and
+#      "Reload nginx" — all handlers from the nginx role (play-scoped, so
+#      reachable here).  Ansible runs them in notification order within the
+#      flush: re-render → validate → reload → 443 comes up in the same play.
 #
 # Renewal: the deploy hook (written below) reloads nginx after every successful
 # renewal so the new cert is picked up without manual intervention.
@@ -43,7 +44,10 @@
       --agree-tos
       -m {{ le_email }}
     creates: /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem
-  notify: Certbot issued cert
+  notify:
+    - Render nginx vhost (cert present)
+    - Validate nginx config
+    - Reload nginx
 
 # Deploy hook: reload nginx after every successful certbot renew so the live
 # cert is picked up immediately without manual intervention.

@@ -28,7 +28,7 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
+    include /etc/letsencrypt/options-ssl-nginx.conf;  # certbot-generated artifact, written alongside fullchain.pem by `certbot certonly`
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
     # Large OCI blobs / Cargo crates — no limit.
