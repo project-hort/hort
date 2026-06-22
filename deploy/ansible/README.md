@@ -89,12 +89,11 @@ OIDC_TOKEN=$(curl -sSf \
 GitLab CI (CI_JOB_JWT_V2 provides an OIDC-compatible JWT):
 ```bash
 OIDC_TOKEN="$CI_JOB_JWT_V2"
-# Ensure the audience claim matches hort_oidc_audience (default: hort-server).
 # GitLab 16+: use id_token with aud: hort-server in .gitlab-ci.yml instead.
 ```
 
-The OIDC token must carry `aud: hort-server` (the value of `hort_oidc_audience`
-in `group_vars/all.yml`).
+The OIDC token must carry `aud: hort-server` (the audience value declared in
+the gitops `OidcIssuer` resources under `files/gitops/auth/issuers/`).
 
 **Step 2 — exchange for a hort bearer token**
 

@@ -39,13 +39,6 @@ hort_api_port: 8080
 # Metrics listener port (internal; NOT exposed to the internet).
 hort_metrics_port: 9090
 
-# OIDC — issuer URL. Override in group_vars/production/ or host_vars/.
-# NOTE: the observation window is NOT a group_vars value — it lives in each
-# Class B ScanPolicy's quarantineDuration field in the gitops tree (Task 1 Step 7).
-hort_oidc_issuer_url: "https://{{ registry_fqdn }}/realms/hort"
-hort_oidc_audience: hort-server
-hort_oidc_groups_claim: groups
-
 # ── PostgreSQL performance tuning ─────────────────────────────────────────────
 # Values are scaled from ansible_memtotal_mb (a gathered fact; both playbooks
 # have gather_facts: true).  They are intentionally CONSERVATIVE because
