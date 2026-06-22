@@ -1,20 +1,32 @@
 ---
 # certbot role — Let's Encrypt TLS certificate issuance + renewal.
 #
-# Installs certbot and the nginx plugin, then runs certbot --nginx for the
-# registry FQDN.  The issuance task is guarded by `creates:` so it only
-# fires when the live certificate does not yet exist (idempotent).  The
-# systemd renewal timer is enabled so certificates renew automatically.
+# Uses certbot certonly --webroot so that ALL ssl_certificate / ssl_* directives
+# remain Ansible-managed (the nginx template renders them once the cert exists).
+# This avoids the --nginx plugin's in-place vhost mutation, which conflicts with
+# Ansible's template ownership and caused the H1 bootstrap defect (commented-out
+# ssl_certificate on a live listen 443 ssl block).
+#
+# Bootstrap sequence (fresh host):
+#   1. nginx role starts nginx with port-80-only config (cert absent → 443 block
+#      omitted by Jinja gate).
+#   2. This role runs certbot --webroot; the ACME challenge is served from
+#      /var/www/html via the port-80 location block.
+#   3. On success the live cert now exists.  The "certbot issued cert" handler
+#      re-templates the vhost with nginx_cert_exists=true, then notifies
+#      "Validate nginx config" and "Reload nginx" from the nginx role's handlers
+#      (play-scoped) → validate + reload → 443 comes up in the same play.
+#
+# Renewal: the deploy hook (written below) reloads nginx after every successful
+# renewal so the new cert is picked up without manual intervention.
 #
 # Required variables (set in group_vars/production/ or --extra-vars):
 #   registry_fqdn  — the FQDN to certify (default: registry.hort.rs)
 #   le_email       — Let's Encrypt registration email (no default; must be set)
 
-- name: Install certbot and nginx plugin
+- name: Install certbot (webroot plugin is built-in; no nginx plugin needed)
   ansible.builtin.apt:
-    name:
-      - certbot
-      - python3-certbot-nginx
+    name: certbot
     state: present
     update_cache: true
 
@@ -24,13 +36,28 @@
 - name: Issue Let's Encrypt certificate for {{ registry_fqdn }}
   ansible.builtin.command:
     cmd: >-
-      certbot --nginx
+      certbot certonly --webroot
+      -w /var/www/html
       -d {{ registry_fqdn }}
       --non-interactive
       --agree-tos
       -m {{ le_email }}
     creates: /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem
-  notify: Reload nginx
+  notify: Certbot issued cert
+
+# Deploy hook: reload nginx after every successful certbot renew so the live
+# cert is picked up immediately without manual intervention.
+- name: Install certbot deploy hook to reload nginx on renewal
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+    content: |
+      #!/bin/sh
+      # Managed by Ansible — do not edit by hand.
+      # Reloads nginx after certbot successfully renews a certificate.
+      systemctl reload nginx
+    owner: root
+    group: root
+    mode: "0750"
 
 # Debian ships certbot with a systemd timer (certbot.timer) that invokes
 # certbot renew twice daily.  Ensure it is enabled and running.

@@ -11,7 +11,7 @@
 server {
     listen 80;
     server_name {{ registry_fqdn }};
-    # Let certbot's ACME challenge through on port 80;
+    # Let certbot's webroot ACME challenge through on port 80;
     # redirect everything else to HTTPS.
     location /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -21,15 +21,15 @@ server {
     }
 }
 
+{% if nginx_cert_exists %}
 server {
     listen 443 ssl;
     server_name {{ registry_fqdn }};
 
-    # certbot fills these in after first issuance.
-    # ssl_certificate     /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem;
-    # ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
-    # include /etc/letsencrypt/options-ssl-nginx.conf;
-    # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    ssl_certificate     /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
     # Large OCI blobs / Cargo crates — no limit.
     client_max_body_size 0;
@@ -54,3 +54,4 @@ server {
         proxy_set_header X-Real-IP         $remote_addr;
     }
 }
+{% endif %}

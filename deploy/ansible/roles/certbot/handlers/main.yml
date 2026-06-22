@@ -1,8 +1,20 @@
 ---
 # certbot role handlers.
-# Reload nginx after certbot patches the vhost with ssl_certificate directives.
+#
+# On first issuance, re-render the nginx vhost with nginx_cert_exists=true so
+# the 443 server block is included, then validate and reload nginx.
+# The "Validate nginx config" and "Reload nginx" handler names are play-scoped
+# (resolved from the nginx role's handlers/main.yml).
 
-- name: Reload nginx
-  ansible.builtin.service:
-    name: nginx
-    state: reloaded
+- name: Certbot issued cert
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/roles/nginx/templates/registry.hort.rs.conf.j2"
+    dest: /etc/nginx/sites-available/registry.hort.rs.conf
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    nginx_cert_exists: true
+  notify:
+    - Validate nginx config
+    - Reload nginx
