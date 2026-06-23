@@ -24,6 +24,44 @@ CapabilityBoundingSet=
 # Worker needs AF_UNIX for the local postgres socket and AF_INET/AF_INET6
 # for scanner advisory API calls and upstream registry fetches.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── M1 additional hardening (security audit 2026-06) ──────────────────────────
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# STAGING VALIDATION REQUIRED before production rollout:
+# The worker spawns trivy and osv-scanner as subprocesses.  SystemCallFilter
+# is applied here (matching the server unit) but its interaction with the
+# scanner child processes has NOT been verified in a live scan run.  In
+# particular, the deny-list (~@privileged @resources) may block syscalls used
+# by trivy/osv-scanner (e.g. setrlimit, getrlimit, clone3 flags).  Run a
+# full scan cycle in staging with "journalctl -u hort-worker -f" before
+# promoting to production.  If scanners fail with SIGSYS, either expand the
+# allow-list (add specific syscalls) or remove the ~@privileged @resources
+# deny-list from this unit and leave only the @system-service allow-set.
+# TODO: remove this comment once staging validation is complete.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+LimitNOFILE=65536
+TasksMax=4096
+# NOTE: MemoryDenyWriteExecute is intentionally OMITTED.
+# wasmtime uses a JIT that requires W+X memory mappings at runtime; MDWX
+# would cause an immediate SIGSYS on the first WASM module load.  Do NOT
+# add MemoryDenyWriteExecute to this unit without first replacing wasmtime
+# with an AOT-only runtime that makes no W+X mappings.
+
 Restart=always
 
 [Install]
