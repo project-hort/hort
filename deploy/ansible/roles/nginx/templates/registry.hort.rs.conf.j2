@@ -60,8 +60,20 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;  # certbot-generated artifact, written alongside fullchain.pem by `certbot certonly`
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # TLS policy — Mozilla intermediate profile.  Defined at server level so
+    # this context wins over the http-level baseline in conf.d/ssl-hardening.conf
+    # (nginx: server-level directive overrides http-level).  The certbot-generated
+    # options-ssl-nginx.conf is intentionally NOT included here; this role owns
+    # the TLS policy.  Cipher list and protocol sourced from nginx_ssl_ciphers /
+    # nginx_ssl_protocols in group_vars/all.yml — single definition, no duplication.
+    ssl_protocols {{ nginx_ssl_protocols }};
+    ssl_prefer_server_ciphers off;
+    ssl_ciphers {{ nginx_ssl_ciphers }};
+    ssl_session_cache shared:le_nginx_SSL:10m;
+    ssl_session_timeout 1440m;
+    ssl_session_tickets off;
 
     # HSTS — instruct browsers to use HTTPS for this domain for 2 years.
     # 'always' ensures the header is sent on all responses, including errors.
