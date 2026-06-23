@@ -370,11 +370,20 @@
     scope: system
 
 # Post-migrate grant: hort_retention_role is created by migration 004_events.sql
-# and only exists after the migration above completes successfully.
-# GRANT hort_retention_role TO hort_app_role lets the worker (which logs in as
-# hort_app_role) call `SET LOCAL ROLE hort_retention_role` inside the sanctioned
-# retention sweep transaction (ADR 0020).  GRANT ROLE is idempotent in Postgres.
-- name: Grant hort_retention_role to hort_app_role (post-migrate, ADR 0020)
+# and only exists after the migration above completes successfully. Membership
+# lets the worker (logging in as hort_app_role) call `SET LOCAL ROLE
+# hort_retention_role` inside the sanctioned retention sweep transaction (ADR 0020).
+#
+# WITH INHERIT FALSE is REQUIRED (PG16+). A plain GRANT makes hort_app_role
+# *inherit* hort_retention_role's SELECT+DELETE on the events table, and
+# hort-server's event-store boot probe — has_table_privilege(current_user,
+# 'events','DELETE') — counts inherited privileges, so it refuses to boot:
+# "runtime role holds forbidden 'DELETE' privilege on events table". INHERIT
+# FALSE grants membership for SET ROLE only (SET defaults TRUE), with no passive
+# privilege inheritance — the probe passes, and the sweep still assumes the role
+# explicitly. Re-granting updates the inherit flag (self-heals a membership
+# previously granted WITH INHERIT).
+- name: Grant hort_retention_role to hort_app_role (SET ROLE only, no inherit — ADR 0020)
   ansible.builtin.command:
     argv:
       - psql
@@ -383,7 +392,7 @@
       - -d
       - "{{ postgres_apt_db_name }}"
       - -c
-      - "GRANT {{ postgres_apt_retention_role }} TO {{ postgres_apt_runtime_role }};"
+      - "GRANT {{ postgres_apt_retention_role }} TO {{ postgres_apt_runtime_role }} WITH INHERIT FALSE;"
   become: true
   become_user: postgres
   changed_when: true
