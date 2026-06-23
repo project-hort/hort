@@ -147,14 +147,16 @@
   block:
     # ── Step 0: bootstrap slsa-verifier (pinned + checksum-verified) ────────
     # Sentinel guard: assert checksums are set before downloading.
-    # The regex_search matches exactly 64 lower-hex characters — a valid SHA-256
-    # digest.  Sentinel strings, truncated hashes, and empty values all fail,
-    # giving an actionable error before any network fetch.
+    # The `match` test requires exactly 64 lower-hex characters — a valid SHA-256
+    # digest — and returns a boolean (regex_search returns the matched string,
+    # which newer ansible-core rejects as a non-boolean conditional).  Sentinel
+    # strings, truncated hashes, and empty values all fail, giving an actionable
+    # error before any network fetch.
     - name: Assert slsa-verifier SHA-256 checksums have been configured (not sentinels)
       ansible.builtin.assert:
         that:
-          - hort_systemd_slsa_verifier_sha256_amd64 | regex_search('^[0-9a-f]{64}$')
-          - hort_systemd_slsa_verifier_sha256_arm64 | regex_search('^[0-9a-f]{64}$')
+          - hort_systemd_slsa_verifier_sha256_amd64 is match('^[0-9a-f]{64}$')
+          - hort_systemd_slsa_verifier_sha256_arm64 is match('^[0-9a-f]{64}$')
         fail_msg: >-
           hort_systemd_slsa_verifier_sha256_amd64 and/or
           hort_systemd_slsa_verifier_sha256_arm64 are not valid SHA-256 hashes
