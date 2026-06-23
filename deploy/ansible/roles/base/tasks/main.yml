@@ -69,6 +69,17 @@
     policy: deny
     direction: incoming
 
+# ── Sysctl hardening ──────────────────────────────────────────────────────────
+
+- name: Deploy sysctl hardening drop-in (CIS network + kernel set)
+  ansible.builtin.template:
+    src: 60-hort.conf.j2
+    dest: /etc/sysctl.d/60-hort.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctl settings
+
 # ── Unattended upgrades ───────────────────────────────────────────────────────
 
 - name: Install unattended-upgrades
@@ -76,9 +87,37 @@
     name: unattended-upgrades
     state: present
 
-- name: Enable unattended-upgrades
+- name: Deploy apt periodic config (20auto-upgrades)
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy unattended-upgrades policy (50unattended-upgrades)
+  ansible.builtin.template:
+    src: 50unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/50unattended-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable unattended-upgrades service
   ansible.builtin.service:
     name: unattended-upgrades
+    state: started
+    enabled: true
+
+- name: Enable apt-daily timer (package index refresh)
+  ansible.builtin.service:
+    name: apt-daily.timer
+    state: started
+    enabled: true
+
+- name: Enable apt-daily-upgrade timer (unattended upgrade trigger)
+  ansible.builtin.service:
+    name: apt-daily-upgrade.timer
     state: started
     enabled: true
 

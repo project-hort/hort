@@ -3,3 +3,7 @@
   ansible.builtin.service:
     name: sshd
     state: reloaded
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  changed_when: true
