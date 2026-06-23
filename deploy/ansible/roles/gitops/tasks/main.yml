@@ -33,6 +33,76 @@
       gitops_admin_cmd must be set (e.g. "hort-server admin" for native flavor
       or "podman exec hort-server hort-server admin" for Podman flavor).
 
+# ── Placeholder guard (M8) ────────────────────────────────────────────────────
+# Scan the gitops SOURCE tree (files/gitops/ in the Ansible repo) for residual
+# placeholder tokens before syncing to the host.  If any are found the play
+# aborts with a clear message pointing the operator at the substitution step.
+#
+# What is checked:
+#   REPLACE_ME   — literal marker used in example service-account fixtures
+#                  (e.g. gitlab-ci.yaml project_path: "REPLACE_ME/hort")
+#   <...>        — angle-bracket style markers (e.g. <YOUR_VALUE>)
+#
+# Why scan the SOURCE tree, not the destination:
+#   The destination tree is written by this role — if placeholders are in the
+#   source they will be in the destination after sync.  Scanning source before
+#   sync gives an early, actionable failure rather than silently deploying a
+#   broken config that fails only at hort-server boot.
+#
+# The committed example (gitlab-ci.yaml) legitimately contains REPLACE_ME; the
+# guard is intended to catch an operator who copied the example into a real
+# deployment inventory without substituting the value.  A correctly substituted
+# operator tree has no REPLACE_ME or <...> tokens and passes the guard.
+
+- name: Scan gitops source tree for residual placeholder tokens
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/files/gitops"
+    patterns: "*.yaml,*.yml,*.json,*.toml"
+    recurse: true
+    file_type: file
+  register: gitops_tree_files
+
+- name: Check each gitops file for placeholder tokens
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      grep -nE 'REPLACE_ME|<[A-Z_][A-Z0-9_]*>' "{{ gitops_item.path }}" || true
+    executable: /bin/bash
+  loop: "{{ gitops_tree_files.files }}"
+  loop_control:
+    loop_var: gitops_item
+    label: "{{ gitops_item.path | basename }}"
+  register: gitops_placeholder_hits
+  changed_when: false
+
+- name: Collect files that still contain placeholder tokens
+  ansible.builtin.set_fact:
+    gitops_placeholder_files: >-
+      {{
+        gitops_placeholder_hits.results
+        | selectattr('stdout', 'ne', '')
+        | map(attribute='gitops_item')
+        | map(attribute='path')
+        | list
+      }}
+
+- name: Fail if any gitops file contains residual placeholder tokens
+  ansible.builtin.fail:
+    msg: >-
+      Residual placeholder tokens found in the gitops tree — the play is aborted
+      to prevent deploying an incomplete configuration.
+
+      Files with placeholders:
+      {% for gitops_path in gitops_placeholder_files %}
+        - {{ gitops_path }}
+      {% endfor %}
+
+      Action required: substitute all REPLACE_ME / <...> markers with real
+      values before running this play.  See the README and the per-file comments
+      for the expected values (e.g. gitlab-ci.yaml requires
+      project_path: "<namespace>/<project>" for your GitLab installation).
+  when: gitops_placeholder_files | length > 0
+
 # ── Config tree ───────────────────────────────────────────────────────────────
 
 - name: Ensure hort config directory exists
