@@ -13,3 +13,9 @@
 # This default is intentionally left empty so a missing override causes an
 # explicit error rather than silently running the wrong command.
 gitops_admin_cmd: ""
+
+# Path to the gitops source tree to scan for placeholder tokens (M8 guard) and
+# to synchronise to the managed host.  Defaults to the co-located files/gitops/
+# directory relative to the playbook.  Override if your operator tree lives
+# elsewhere (e.g. a separate inventory overlay).
+gitops_source_dir: "{{ playbook_dir }}/files/gitops"

@@ -52,10 +52,13 @@ hort_binaries_tmp_dir: /var/tmp/hort-binaries
 # Verify at https://github.com/sigstore/cosign/releases
 # When upgrading, update the version and both checksums together.
 hort_binaries_cosign_version: "2.4.3"
-hort_binaries_cosign_sha256_amd64: "6ba32e532c497e9c9c21d4d8bc0c7a62e0df42c0dfda9b5f517d92191da02849"
-hort_binaries_cosign_sha256_arm64: "ffa74b6e0e68f9e3aa63ff200db8e4e1f9b90e8048f1c0d35c98e0e43d0de9e8"
-# NOTE: The SHA-256 values above are TEMPLATE PLACEHOLDERS.  Before deploying,
-# replace them with the real values from:
+hort_binaries_cosign_sha256_amd64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+hort_binaries_cosign_sha256_arm64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+# ACTION REQUIRED: replace the sentinel values above with the real SHA-256
+# checksums before deploying.  See README "Obtaining binary checksums" for
+# the step-by-step runbook.  Obtain the values from:
 #   https://github.com/sigstore/cosign/releases/tag/v2.4.3
 #   (files: cosign-linux-amd64  /  cosign-linux-arm64)
 # Run: sha256sum cosign-linux-amd64  to confirm locally.
+# Store the verified values in host_vars/ or group_vars/production/ (vault),
+# NOT in this committed defaults file.

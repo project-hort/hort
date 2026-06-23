@@ -34,13 +34,14 @@
       or "podman exec hort-server hort-server admin" for Podman flavor).
 
 # ── Placeholder guard (M8) ────────────────────────────────────────────────────
-# Scan the gitops SOURCE tree (files/gitops/ in the Ansible repo) for residual
-# placeholder tokens before syncing to the host.  If any are found the play
-# aborts with a clear message pointing the operator at the substitution step.
+# Scan the gitops SOURCE tree (gitops_source_dir, defaults to files/gitops/ in
+# the Ansible repo) for residual placeholder tokens before syncing to the host.
+# If any are found the play aborts with a clear message pointing the operator at
+# the substitution step.
 #
 # What is checked:
 #   REPLACE_ME   — literal marker used in example service-account fixtures
-#                  (e.g. gitlab-ci.yaml project_path: "REPLACE_ME/hort")
+#                  (e.g. gitlab-ci.yaml.example project_path: "REPLACE_ME/hort")
 #   <...>        — angle-bracket style markers (e.g. <YOUR_VALUE>)
 #
 # Why scan the SOURCE tree, not the destination:
@@ -49,15 +50,19 @@
 #   sync gives an early, actionable failure rather than silently deploying a
 #   broken config that fails only at hort-server boot.
 #
-# The committed example (gitlab-ci.yaml) legitimately contains REPLACE_ME; the
-# guard is intended to catch an operator who copied the example into a real
-# deployment inventory without substituting the value.  A correctly substituted
-# operator tree has no REPLACE_ME or <...> tokens and passes the guard.
+# *.example files are excluded from the scan — they are committed operator
+# templates that legitimately contain REPLACE_ME markers.  The operator copies
+# the .example to a real YAML file and substitutes the value; the guard then
+# catches any un-substituted copy.  See README "Customising the gitops tree".
+#
+# The scan path is parameterised via gitops_source_dir (set in defaults/main.yml).
+# Override in host_vars/group_vars if your operator tree lives elsewhere.
 
 - name: Scan gitops source tree for residual placeholder tokens
   ansible.builtin.find:
-    paths: "{{ playbook_dir }}/files/gitops"
+    paths: "{{ gitops_source_dir }}"
     patterns: "*.yaml,*.yml,*.json,*.toml"
+    excludes: "*.example"
     recurse: true
     file_type: file
   register: gitops_tree_files
@@ -98,9 +103,10 @@
       {% endfor %}
 
       Action required: substitute all REPLACE_ME / <...> markers with real
-      values before running this play.  See the README and the per-file comments
-      for the expected values (e.g. gitlab-ci.yaml requires
-      project_path: "<namespace>/<project>" for your GitLab installation).
+      values before running this play.  See the README "Customising the gitops
+      tree" section for per-file instructions (e.g. copy
+      auth/service-accounts/gitlab-ci.yaml.example →
+      auth/service-accounts/gitlab-ci.yaml and set the project_path value).
   when: gitops_placeholder_files | length > 0
 
 # ── Config tree ───────────────────────────────────────────────────────────────
@@ -115,15 +121,17 @@
 
 # Synchronise the gitops tree.  The `delete: true` flag removes stale files
 # so the host tree always matches the committed Ansible repo state exactly.
+# *.example files are excluded: they are operator templates, not live config.
 - name: Sync gitops config tree to host
   ansible.posix.synchronize:
-    src: "{{ playbook_dir }}/files/gitops/"
+    src: "{{ gitops_source_dir }}/"
     dest: "{{ hort_config_dir }}/"
     delete: true
     recursive: true
     rsync_opts:
       - "--chown=root:{{ hort_user }}"
       - "--chmod=D750,F640"
+      - "--exclude=*.example"
   notify:
     - Restart hort-server (system scope)
     - Restart hort-server (user scope)

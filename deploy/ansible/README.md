@@ -24,6 +24,8 @@ Debian 13 (trixie).  Two flavors are provided:
 4. **Control node:** Ansible 2.15+, `community.general` and `ansible.posix`
    collections installed (`ansible-galaxy collection install community.general
    ansible.posix`).
+5. **Customise the gitops tree** (see *Customising the gitops tree* below).
+6. **Set binary checksums** (see *Obtaining binary checksums* below).
 
 ## Vault variables (`group_vars/production/`)
 
@@ -44,6 +46,107 @@ hort_postgres_password: CHANGEME
 
 Never commit plaintext secrets.  The `group_vars/production/` path is
 gitignored.
+
+## Customising the gitops tree
+
+The `files/gitops/` directory is synchronised verbatim to the managed host on
+every playbook run.  It ships a set of base resources for `registry.hort.rs`
+plus example templates for site-specific customisation.
+
+### GitLab CI service account
+
+`files/gitops/auth/service-accounts/gitlab-ci.yaml.example` is an example
+`ServiceAccount` resource for GitLab CI pipelines.  The `project_path` claim
+value must be set to your actual GitLab namespace/project before deploying.
+
+**Steps:**
+
+1. Copy the example to a real resource file:
+   ```bash
+   cp files/gitops/auth/service-accounts/gitlab-ci.yaml.example \
+      files/gitops/auth/service-accounts/gitlab-ci.yaml
+   ```
+
+2. Open `gitlab-ci.yaml` and replace the `REPLACE_ME` placeholder:
+   ```yaml
+   project_path: "REPLACE_ME/hort"   # ← change to your actual namespace/project
+   ```
+   Example: if your GitLab group is `myorg` and the project is `hort`, set:
+   ```yaml
+   project_path: "myorg/hort"
+   ```
+   Verify the exact claim name from a real `CI_JOB_JWT_V2` token on your GitLab
+   instance — the claim is typically `project_path` on GitLab 16+.
+
+3. The M8 placeholder guard (in `roles/gitops/tasks/main.yml`) scans
+   `files/gitops/` for any remaining `REPLACE_ME` or `<...>` tokens before
+   syncing to the host.  The play will abort with a clear error if any are found.
+   `*.example` files are excluded from the scan.
+
+Do NOT commit `gitlab-ci.yaml` with a real project path — it is gitignored
+alongside `group_vars/production/`.
+
+## Obtaining binary checksums
+
+The `hort_binaries` and `hort_systemd` roles pin specific versions of `cosign`
+and `slsa-verifier` and verify their SHA-256 checksums before installation.
+The default values in `roles/*/defaults/main.yml` ship with sentinel strings
+(`REPLACE_WITH_SHA256_FROM_RELEASE_PAGE`) rather than placeholder hex values,
+so the play aborts immediately with an actionable error if the real checksums
+have not been configured.
+
+Store the verified checksum values in `host_vars/<hostname>.yml` or
+`group_vars/production/vault.yml` (vault-encrypted) — NOT in the committed
+defaults files.
+
+### cosign (`hort_binaries_cosign_sha256_amd64` / `_arm64`)
+
+Pinned version: `hort_binaries_cosign_version` (default `2.4.3`).
+
+```bash
+# 1. Download the binaries from the release page:
+COSIGN_VER="2.4.3"
+curl -fsSLO "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VER}/cosign-linux-amd64"
+curl -fsSLO "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VER}/cosign-linux-arm64"
+
+# 2. Compute checksums:
+sha256sum cosign-linux-amd64 cosign-linux-arm64
+
+# 3. Cross-check against the published checksums on the GitHub release page:
+#    https://github.com/sigstore/cosign/releases/tag/v2.4.3
+#    (look for the SHA-256 values in the release notes or a checksums file)
+
+# 4. Set in your vault:
+#    hort_binaries_cosign_sha256_amd64: "<verified 64-hex value>"
+#    hort_binaries_cosign_sha256_arm64: "<verified 64-hex value>"
+```
+
+### slsa-verifier (`hort_systemd_slsa_verifier_sha256_amd64` / `_arm64`)
+
+Pinned version: `hort_systemd_slsa_verifier_version` (default `2.7.0`).
+
+```bash
+# 1. Download the binaries from the release page:
+SLSA_VER="2.7.0"
+curl -fsSLO "https://github.com/slsa-framework/slsa-verifier/releases/download/v${SLSA_VER}/slsa-verifier-linux-amd64"
+curl -fsSLO "https://github.com/slsa-framework/slsa-verifier/releases/download/v${SLSA_VER}/slsa-verifier-linux-arm64"
+
+# 2. Compute checksums:
+sha256sum slsa-verifier-linux-amd64 slsa-verifier-linux-arm64
+
+# 3. Cross-check against the published checksums on the GitHub release page:
+#    https://github.com/slsa-framework/slsa-verifier/releases/tag/v2.7.0
+
+# 4. Set in your vault:
+#    hort_systemd_slsa_verifier_sha256_amd64: "<verified 64-hex value>"
+#    hort_systemd_slsa_verifier_sha256_arm64: "<verified 64-hex value>"
+```
+
+**Do not set these values from the downloaded binary's checksum alone.**  Always
+cross-check the `sha256sum` output against the value published on the official
+GitHub release page.  Setting the value from the download without cross-checking
+defeats the trust anchor: the checksum is the only thing preventing a
+MITM-substituted binary from passing the integrity gate.
 
 ## Running the playbook
 

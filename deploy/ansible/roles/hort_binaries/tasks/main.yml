@@ -26,6 +26,27 @@
 # IMPORTANT: update those SHA-256 values from the official release page when
 # upgrading cosign.
 
+# ── Sentinel guard: assert checksums are set before downloading ───────────────
+# Fails immediately if the default sentinel values have not been replaced.
+# The regex_search matches exactly 64 lower-hex characters — the format of a
+# real SHA-256 digest.  A sentinel string, truncated hash, or empty value all
+# fail this check, producing an actionable error before any network fetch.
+- name: Assert cosign SHA-256 checksums have been configured (not sentinels)
+  ansible.builtin.assert:
+    that:
+      - hort_binaries_cosign_sha256_amd64 | regex_search('^[0-9a-f]{64}$')
+      - hort_binaries_cosign_sha256_arm64 | regex_search('^[0-9a-f]{64}$')
+    fail_msg: >-
+      hort_binaries_cosign_sha256_amd64 and/or hort_binaries_cosign_sha256_arm64
+      are not valid SHA-256 hashes (expected 64 lowercase hex characters).
+      Set the real values for cosign v{{ hort_binaries_cosign_version }} from:
+        https://github.com/sigstore/cosign/releases/tag/v{{ hort_binaries_cosign_version }}
+        (files: cosign-linux-amd64 / cosign-linux-arm64)
+      Download locally, run sha256sum, cross-check against the release page,
+      then store the verified values in host_vars/ or group_vars/production/
+      (vault-encrypted).  See README "Obtaining binary checksums" for the
+      step-by-step runbook.
+
 - name: Download pinned cosign binary (amd64)
   ansible.builtin.get_url:
     url: >-
@@ -86,6 +107,12 @@
   # Fail-closed: if cosign is older than v2, verify-blob --bundle semantics
   # differ and the provenance gate cannot be trusted.  This guard fires before
   # any verify-blob call so a version regression is caught immediately.
+  #
+  # The lookbehind `(?<=GitVersion:\s{1,16}v)` is valid PCRE2 (GNU grep -P).
+  # Variable-width lookbehinds are supported in PCRE2 / grep -P but not in
+  # POSIX ERE.  If sigstore changes the `cosign version` output format, this
+  # pattern may return empty stdout — which is fail-closed: Jinja2 evaluates
+  # `'' | int` as 0, `0 < 2` is true, and the task fails.  Correct behavior.
   ansible.builtin.shell:
     cmd: >-
       set -o pipefail &&

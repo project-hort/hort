@@ -39,13 +39,16 @@ hort_systemd_trivy_version: "0.60.0"
 # Verify at https://github.com/slsa-framework/slsa-verifier/releases
 # When upgrading, update the version and both checksums together.
 hort_systemd_slsa_verifier_version: "2.7.0"
-hort_systemd_slsa_verifier_sha256_amd64: "f0daf8f6b2b4c7be96e50f43a7de8e28a6c2b64c5a9e08f0b46e9b08d0c5f9a2"
-hort_systemd_slsa_verifier_sha256_arm64: "3a7c2e8d5f1b4c6e9a0d8f2b5c7e1a3d6f8b0c2e4a6c8d0f2b4e6a8c0d2e4f6a"
-# NOTE: The SHA-256 values above are TEMPLATE PLACEHOLDERS.  Before deploying,
-# replace them with the real values from:
+hort_systemd_slsa_verifier_sha256_amd64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+hort_systemd_slsa_verifier_sha256_arm64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+# ACTION REQUIRED: replace the sentinel values above with the real SHA-256
+# checksums before deploying.  See README "Obtaining binary checksums" for
+# the step-by-step runbook.  Obtain the values from:
 #   https://github.com/slsa-framework/slsa-verifier/releases/tag/v2.7.0
 #   (file: slsa-verifier-linux-amd64  /  slsa-verifier-linux-arm64)
 # Run: sha256sum slsa-verifier-linux-amd64  to confirm locally.
+# Store the verified values in host_vars/ or group_vars/production/ (vault),
+# NOT in this committed defaults file.
 
 # SLSA source URI for osv-scanner provenance verification.
 # Must match the GitHub repo that built the release.
