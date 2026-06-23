@@ -66,6 +66,11 @@
     recurse: true
     file_type: file
   register: gitops_tree_files
+  # The gitops SOURCE tree lives in the Ansible repo on the control node, not on
+  # the managed host — scan it there. become:false so we read it as the local
+  # user (no sudo prompt on the control node from the play-level become:true).
+  delegate_to: localhost
+  become: false
 
 - name: Check each gitops file for placeholder tokens
   ansible.builtin.shell:
@@ -79,6 +84,8 @@
     label: "{{ gitops_item.path | basename }}"
   register: gitops_placeholder_hits
   changed_when: false
+  delegate_to: localhost
+  become: false
 
 - name: Collect files that still contain placeholder tokens
   ansible.builtin.set_fact:
@@ -118,6 +125,14 @@
     owner: root
     group: "{{ hort_user }}"
     mode: "0750"
+
+# The synchronize module needs rsync on BOTH ends; a minimal Debian image ships
+# none on the managed host. Install it before the sync.
+- name: Ensure rsync is installed (required by the synchronize module)
+  ansible.builtin.apt:
+    name: rsync
+    state: present
+    update_cache: true
 
 # Synchronise the gitops tree.  The `delete: true` flag removes stale files
 # so the host tree always matches the committed Ansible repo state exactly.
