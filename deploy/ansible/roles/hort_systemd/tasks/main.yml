@@ -339,16 +339,54 @@
         remote_src: true
 
 # ── Enable and start units ────────────────────────────────────────────────────
-# hort-migrate is Type=oneshot; we enable it so the ordering dependency fires
-# automatically when hort-server starts.  We do NOT start it standalone here
-# because it requires the DB passwords (env-file) which are ready now, but
-# the postgres-apt role has already started PostgreSQL earlier in the play.
+# Ordering is explicit to ensure the migration and the post-migrate grant
+# both complete before hort-server and hort-worker are started:
+#
+#   1. Enable hort-migrate.service (so the systemd ordering dep is registered).
+#   2. Start hort-migrate.service explicitly and WAIT for it to finish.
+#      The systemd module with state=started on a Type=oneshot service blocks
+#      until the unit reaches the `dead` (success) state — the play fails here
+#      if the migration exits non-zero, giving a clear error before any server
+#      starts.  sqlx migrations are idempotent, so hort-server re-triggering
+#      hort-migrate.service via its Requires=/After= dependency on subsequent
+#      invocations is a harmless no-op.
+#   3. Grant hort_retention_role TO hort_app_role (post-migrate: the role is
+#      created by migration 004_events.sql and does not exist before that).
+#      This lets the worker (login as hort_app_role) issue
+#      `SET LOCAL ROLE hort_retention_role` for the sanctioned retention sweep
+#      (ADR 0020) without needing a separate login role for the worker.
+#   4. Enable and start hort-server.service and hort-worker.service.
 
 - name: Enable hort-migrate.service
   ansible.builtin.systemd:
     name: hort-migrate.service
     enabled: true
     scope: system
+
+- name: Run hort-migrate.service (oneshot — blocks until migration completes)
+  ansible.builtin.systemd:
+    name: hort-migrate.service
+    state: started
+    scope: system
+
+# Post-migrate grant: hort_retention_role is created by migration 004_events.sql
+# and only exists after the migration above completes successfully.
+# GRANT hort_retention_role TO hort_app_role lets the worker (which logs in as
+# hort_app_role) call `SET LOCAL ROLE hort_retention_role` inside the sanctioned
+# retention sweep transaction (ADR 0020).  GRANT ROLE is idempotent in Postgres.
+- name: Grant hort_retention_role to hort_app_role (post-migrate, ADR 0020)
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - "GRANT {{ postgres_apt_retention_role }} TO {{ postgres_apt_runtime_role }};"
+  become: true
+  become_user: postgres
+  changed_when: true
 
 - name: Enable and start hort-server.service
   ansible.builtin.systemd:
