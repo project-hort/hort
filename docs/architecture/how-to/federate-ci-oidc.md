@@ -120,6 +120,40 @@ concurrently.
 
 ---
 
+## 2b. Server enablement — federation works with or without an interactive IdP
+
+CI federation is served by the `POST /api/v1/auth/exchange` endpoint, which is
+off by default. Enabling it needs **three** server flags. The exchange mints a
+short-lived `hort_*` native token, so native tokens must be on, and the validator
+needs a signing key:
+
+```bash
+HORT_TOKEN_EXCHANGE_ENABLED=true     # mount /api/v1/auth/exchange
+HORT_NATIVE_TOKENS_ENABLED=true      # mint+validate the hort_* token it returns
+HORT_OCI_TOKEN_SIGNING_KEY(_FILE)=…  # the signing key (resolved active key)
+```
+
+Federation validates the CI JWT against your gitops `OidcIssuer` rows (declared
+below) — **not** against an interactive identity provider. So there are two
+deployment shapes:
+
+| Mode | `HORT_AUTH_PROVIDER` | Also required | What you get |
+|---|---|---|---|
+| **With an interactive IdP** (Keycloak, etc.) | `oidc` | `HORT_OIDC_ISSUER_URL`, `HORT_OIDC_CLI_CLIENT_ID`, `HORT_PUBLIC_BASE_URL` | CI federation **and** the `hort-cli` device-flow login (`/.well-known/hort-client-config` is served). |
+| **Federation-only / no Keycloak** | `disabled` | *(none of the OIDC vars)* | CI federation only. Human users authenticate with PATs (`hort_pat_*`). The `/.well-known/hort-client-config` doc is not served, and the interactive `access_token` branch of `/exchange` returns `400 invalid_request` pointing callers at the `jwt` branch. |
+
+The federation security guarantees are identical in both modes — the three
+ship-gate guardrails (JWT-replay seen-set, `aud`→ServiceAccount binding,
+empty-claims fail-closed) live in the exchange handler and do not depend on
+`HORT_AUTH_PROVIDER`. The public-supply-chain deployment (`registry.hort.rs`)
+runs **federation-only**: PATs for developers, federation for CI, no Keycloak.
+
+> If you set `HORT_TOKEN_EXCHANGE_ENABLED=true` with `HORT_NATIVE_TOKENS_ENABLED`
+> unset/false, boot fails closed (`TokenExchangeRequiresNativeTokens`) — the
+> server refuses to mint tokens it could not then validate.
+
+---
+
 ## 3. GitHub Actions
 
 ### 3a. Declare the `OidcIssuer`

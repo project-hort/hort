@@ -1957,34 +1957,43 @@ pub async fn build_app_context(
     // Multi-issuer JWT validator (ADR 0018) for the
     // federation branch of `/auth/token-exchange`.
     // Built only when auth is
-    // enabled: the federation flow has no meaning without an auth
-    // context. The validator owns its own `reqwest::Client` (built
-    // via `internal::build_http_client` — extra-CA layered + redirect
+    // Always wire federation slots from the DB pool — the federation
+    // flow is independent of the interactive-OIDC auth mode.
+    // `AuthConfig::Disabled` + `enable_native_tokens=true` enables the
+    // federated-JWT branch of `/exchange` without configuring an
+    // interactive IdP; the three ship-gate guardrails (anti-replay,
+    // `aud`→SA binding, empty-claims fail-closed) are unaffected by
+    // this auth-mode split and remain wired unconditionally.
+    //
+    // The validator owns its own `reqwest::Client` (built via
+    // `internal::build_http_client` — extra-CA layered + redirect
     // cap + timeout + TLS-version pin), so operator trust anchors
     // declared via `HORT_EXTRA_CA_BUNDLE` apply to JWKS fetches against
-    // private IdPs the same way they apply to the user-login
-    // path. The `OidcIssuerRepository` is constructed against the same
+    // private IdPs the same way they apply to the user-login path.
+    // The `OidcIssuerRepository` is constructed against the same
     // pool the apply pipeline uses (`gitops_boot.rs`) so apply-time
     // changes to trusted issuers take effect on the very next
     // `validate()` call without bouncing the validator.
-    // The `OidcIssuerRepository` is shared three ways when auth is
-    // enabled: the JWT validator, the federation
-    // handler's `require_jti` resolution (threaded
-    // onto `AppContext`), and the apply pipeline. One Arc, one pool, so
-    // an apply-time issuer change takes effect everywhere on the next
-    // request without bouncing the server.
+    // The `OidcIssuerRepository` is shared three ways: the JWT
+    // validator, the federation handler's `require_jti` resolution
+    // (threaded onto `AppContext`), and the apply pipeline. One Arc,
+    // one pool, so an apply-time issuer change takes effect everywhere
+    // on the next request without bouncing the server.
+    // Build the issuer repo once and share it: the federation validator
+    // takes it directly, and `AppContext` keeps an `Option`-wrapped clone
+    // for the handler's `require_jti` resolution. Both are unconditionally
+    // wired, so the previous `Option`/`expect` round-trip is unnecessary.
+    let oidc_issuers_repo: Arc<
+        dyn hort_domain::ports::oidc_issuer_repository::OidcIssuerRepository,
+    > = Arc::new(PgOidcIssuerRepository::new(db.clone()));
     let oidc_issuers: Option<
         Arc<dyn hort_domain::ports::oidc_issuer_repository::OidcIssuerRepository>,
-    > = if auth_enabled {
-        Some(Arc::new(PgOidcIssuerRepository::new(db.clone())))
-    } else {
-        None
-    };
+    > = Some(oidc_issuers_repo.clone());
     let federated_jwt_validator: Option<
         Arc<dyn hort_domain::ports::federated_jwt_validator::FederatedJwtValidator>,
-    > = if let Some(issuers) = oidc_issuers.clone() {
+    > = {
         let v = hort_adapters_oidc::MultiIssuerJwksValidator::new(
-            issuers,
+            oidc_issuers_repo,
             extra_trust_anchors.as_ref(),
         )
         .map_err(|e| {
@@ -1994,41 +2003,29 @@ pub async fn build_app_context(
         })?;
         tracing::info!("federation JWT validator wired");
         Some(Arc::new(v))
-    } else {
-        None
     };
 
-    // Durable anti-replay
-    // seen-set. Wired iff federation is enabled (same condition as the
-    // validator); the federation system-mint path then always has a
-    // `Some` guard and a federation mint can never bypass the replay
-    // check. Non-federation issuance paths set `federation_source =
-    // None` and never touch it.
+    // Durable anti-replay seen-set. Always wired — the federation
+    // system-mint path always has a `Some` guard and a federation mint
+    // can never bypass the replay check. Non-federation issuance paths
+    // set `federation_source = None` and never touch it.
     let replay_guard: Option<Arc<dyn hort_domain::ports::replay_guard::ReplayGuardPort>> =
-        if auth_enabled {
-            Some(Arc::new(
-                hort_adapters_postgres::replay_guard_repo::PgReplayGuardRepository::new(db.clone()),
-            ))
-        } else {
-            None
-        };
+        Some(Arc::new(
+            hort_adapters_postgres::replay_guard_repo::PgReplayGuardRepository::new(db.clone()),
+        ));
 
     // `ServiceAccountRepository` consumed by the
     // federation branch of `/auth/token-exchange`. Wired against the
     // same Postgres pool the apply pipeline uses (`gitops_boot.rs`) so
     // apply-time changes to declared SAs take effect on the next
     // federation `/exchange` call without bouncing the server.
+    // Always wired — federation is independent of the interactive-OIDC
+    // auth mode.
     let service_accounts: Option<
         Arc<dyn hort_domain::ports::service_account_repository::ServiceAccountRepository>,
-    > = if auth_enabled {
-        Some(Arc::new(
-            hort_adapters_postgres::service_account_repo::PgServiceAccountRepository::new(
-                db.clone(),
-            ),
-        ))
-    } else {
-        None
-    };
+    > = Some(Arc::new(
+        hort_adapters_postgres::service_account_repo::PgServiceAccountRepository::new(db.clone()),
+    ));
 
     // Fallback-PAT-rotation reconciler's
     // outbound k8s Secret writer. Opt-in via

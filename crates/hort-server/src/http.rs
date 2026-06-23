@@ -196,7 +196,9 @@ pub fn build_router_with_oci_config(
     // the `/auth/exchange` route (ADR 0013) into the same `/api/v1`
     // subtree as the existing token endpoints. When `false`, the route
     // is not mounted and axum's default 404 fires (matches the
-    // "no surface advertised" requirement).
+    // "no surface advertised" requirement). The `/exchange` route is
+    // mounted regardless of `AuthConfig` variant — the federated-JWT
+    // branch works without an interactive IdP configured.
     let mut api_v1: Router<Arc<AppContext>> =
         hort_http_core::handlers::api_tokens::api_token_routes();
     if enable_token_exchange {
@@ -284,12 +286,16 @@ pub fn build_router_with_oci_config(
     }
     // Anonymous client-bootstrap discovery
     // doc at the absolute path `/.well-known/hort-client-config`
-    // (ADR 0013). Gated
-    // on the same `enable_token_exchange` flag as the `/exchange`
-    // route — a deployment that has the discovery doc
-    // advertised but no exchange endpoint to back it would be
-    // pathological. Off → axum's default 404 (no surface advertised).
-    if enable_token_exchange {
+    // (ADR 0013). Only served when the interactive-OIDC path is fully
+    // configured (`client_config` present in `AppContext`). Under
+    // federation-only deployments (`AuthConfig::Disabled`),
+    // `client_config` is `None` and the discovery doc is absent —
+    // `hort-cli` device-flow is not supported and serving a half-formed
+    // doc would be misleading.
+    // `/exchange` itself is mounted unconditionally when
+    // `enable_token_exchange=true` (the federated-JWT branch works
+    // without the interactive config).
+    if ctx.client_config.is_some() {
         non_oci = non_oci.merge(hort_http_core::handlers::well_known::well_known_routes());
     }
     let non_oci = non_oci.layer(middleware::request_timeout::request_timeout_layer(

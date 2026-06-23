@@ -701,45 +701,47 @@ async fn run_async() -> anyhow::Result<()> {
             oci_token_signing_key_pem: cfg.oci_token_signing_key_pem.clone(),
             oci_token_signing_key_prev_pem: cfg.oci_token_signing_key_prev_pem.clone(),
         },
-        // Pre-render the client-bootstrap
-        // config when the feature is on (ADR 0013). The boot-time fail-closed
-        // validation in `Config::from_env` (variant
-        // `ConfigError::TokenExchangeRequiresVars`) guarantees that
-        // when `enable_token_exchange` is `true`, `auth` is OIDC with
-        // a non-empty `cli_client_id` AND `public_base_url` is `Some`;
-        // anything else returned `Err` before we got here. The
-        // `expect`s below therefore document invariants the validator
-        // already enforced.
+        // Pre-render the client-bootstrap config only when the
+        // interactive path is fully configured (`AuthConfig::Oidc` with
+        // cli_client_id + public_base_url). Under `AuthConfig::Disabled`,
+        // the `/.well-known/hort-client-config` doc is NOT served (no
+        // interactive IdP to point `hort-cli` at); the
+        // federated-JWT branch of `/exchange` still works without it.
+        // The `Config::from_env` validator ensures that under
+        // `AuthConfig::Oidc` all three fields are present when
+        // `enable_token_exchange=true`
+        // (`ConfigError::TokenExchangeRequiresVars` fires otherwise),
+        // so the `expect`s below remain valid for that branch.
         if cfg.enable_token_exchange {
-            let oidc = match &cfg.auth {
-                AuthConfig::Oidc(o) => o,
-                AuthConfig::Disabled => {
-                    unreachable!(
-                        "the fail-closed config validator must reject \
-                         enable_token_exchange=true with AuthConfig::Disabled \
-                         (ConfigError::TokenExchangeRequiresVars); reaching here \
-                         would indicate a regression in `Config::from_env`."
+            match &cfg.auth {
+                AuthConfig::Oidc(oidc) => {
+                    let cli_client_id = oidc.cli_client_id.clone().expect(
+                        "fail-closed config validator guarantees \
+                             Some(_) when feature on under Oidc",
+                    );
+                    let base = cfg.public_base_url.as_ref().expect(
+                        "fail-closed config validator guarantees \
+                             Some(_) when feature on under Oidc",
+                    );
+                    let endpoint = base
+                        .join("/api/v1/auth/exchange")
+                        .expect("static path joins cleanly with a parsed Url");
+                    Some(
+                        hort_http_core::handlers::well_known::ClientBootstrapConfig {
+                            idp_issuer: oidc.issuer_url.clone(),
+                            idp_cli_client_id: cli_client_id,
+                            exchange_endpoint: endpoint.into(),
+                        },
                     )
                 }
-            };
-            let cli_client_id = oidc
-                .cli_client_id
-                .clone()
-                .expect("fail-closed config validator guarantees Some(_) when feature on");
-            let base = cfg
-                .public_base_url
-                .as_ref()
-                .expect("fail-closed config validator guarantees Some(_) when feature on");
-            let endpoint = base
-                .join("/api/v1/auth/exchange")
-                .expect("static path joins cleanly with a parsed Url");
-            Some(
-                hort_http_core::handlers::well_known::ClientBootstrapConfig {
-                    idp_issuer: oidc.issuer_url.clone(),
-                    idp_cli_client_id: cli_client_id,
-                    exchange_endpoint: endpoint.into(),
-                },
-            )
+                AuthConfig::Disabled => {
+                    // Federation-only deployment: no interactive IdP
+                    // configured. The discovery doc is not served (no
+                    // `hort-cli` device flow); the federated-JWT branch
+                    // of `/exchange` works without it.
+                    None
+                }
+            }
         } else {
             None
         },

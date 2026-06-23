@@ -237,7 +237,7 @@ for the timeout knobs in depth.
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
 | `HORT_NATIVE_TOKENS_ENABLED` | bool | `false` | No | Enable the native `Bearer hort_<kind>_*` token surface. Requires a resolved signing key. |
-| `HORT_TOKEN_EXCHANGE_ENABLED` | bool | `false` | No | Mount `POST /api/v1/auth/exchange` (RFC 8693). Requires OIDC + `HORT_OIDC_CLI_CLIENT_ID` + `HORT_PUBLIC_BASE_URL` + native tokens. |
+| `HORT_TOKEN_EXCHANGE_ENABLED` | bool | `false` | No | Mount `POST /api/v1/auth/exchange` (RFC 8693). Requires `HORT_NATIVE_TOKENS_ENABLED=true` **always**; under `HORT_AUTH_PROVIDER=oidc` *additionally* requires `HORT_OIDC_ISSUER_URL` + `HORT_OIDC_CLI_CLIENT_ID` + `HORT_PUBLIC_BASE_URL` (these back the interactive discovery doc and are **not** consulted under `disabled` — federation-only mode). |
 | `HORT_OCI_TOKEN_SIGNING_KEY` | inline PEM | _unset → none_ | Cond. | Active OCI-token Ed25519 PKCS#8 signing key (inline). Redacted. |
 | `HORT_OCI_TOKEN_SIGNING_KEY_FILE` | path | _unset → none_ | Cond. | Active signing key from a file (preferred over inline; mutually exclusive with it). |
 | `HORT_OCI_TOKEN_SIGNING_KEY_PREV` | inline PEM | _unset → none_ | No | Previous signing key (verify-only, for rotation). |
@@ -504,10 +504,15 @@ rather than run misconfigured.
 8. **Native tokens need a key.** `HORT_NATIVE_TOKENS_ENABLED=true` with no
    resolved active signing key → error.
 9. **Token exchange dependency set.**
-   `HORT_TOKEN_EXCHANGE_ENABLED=true` requires OIDC configured
-   (`HORT_OIDC_ISSUER_URL`), `HORT_OIDC_CLI_CLIENT_ID`,
-   `HORT_PUBLIC_BASE_URL`, **and** `HORT_NATIVE_TOKENS_ENABLED=true`;
-   the error names every missing variable.
+   `HORT_TOKEN_EXCHANGE_ENABLED=true` requires `HORT_NATIVE_TOKENS_ENABLED=true`
+   **always** (the exchange mints `hort_*` native tokens the server must be able
+   to validate). Under `HORT_AUTH_PROVIDER=oidc` it *additionally* requires
+   `HORT_OIDC_ISSUER_URL`, `HORT_OIDC_CLI_CLIENT_ID`, and `HORT_PUBLIC_BASE_URL`
+   (they back the `/.well-known/hort-client-config` discovery doc + the
+   interactive device flow). Under `HORT_AUTH_PROVIDER=disabled` none of those
+   three are required — the federated-JWT branch validates against the gitops
+   `OidcIssuer` rows, not the interactive IdP config (federation-only /
+   no-Keycloak mode). The error names every missing variable.
 10. **Redis URL under the Redis backend.**
     `HORT_EPHEMERAL_STORE_BACKEND=redis` requires `HORT_REDIS_URL` (the
     per-class overrides fall back to it at composition time).
