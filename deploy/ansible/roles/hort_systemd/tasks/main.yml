@@ -29,6 +29,32 @@
     group: "{{ hort_user }}"
     mode: "0750"
 
+# ── OCI token signing key (Ed25519) ──────────────────────────────────────────
+# HORT_NATIVE_TOKENS_ENABLED=true requires a signing key for the OCI /v2 bearer
+# token path (hort-server refuses to boot otherwise). Generate an Ed25519 PKCS#8
+# key on the host ONCE (creates: guard — regenerating would invalidate every
+# already-issued OCI token). It is read-only at runtime; /etc is readable under
+# ProtectSystem=strict, so the hardened unit can load it.
+- name: Ensure hort key directory exists
+  ansible.builtin.file:
+    path: "{{ hort_systemd_key_dir }}"
+    state: directory
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0750"
+
+- name: Generate OCI token signing key (Ed25519 PKCS#8 PEM, once)
+  ansible.builtin.command:
+    cmd: openssl genpkey -algorithm ed25519 -out {{ hort_systemd_oci_signing_key_file }}
+    creates: "{{ hort_systemd_oci_signing_key_file }}"
+
+- name: Secure the OCI signing key (root:hort 0640)
+  ansible.builtin.file:
+    path: "{{ hort_systemd_oci_signing_key_file }}"
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0640"
+
 # ── Env-files (mode 0640 root:hort — contain DSN passwords) ──────────────────
 # Owned by root so the hort service process cannot rewrite its own secrets;
 # group-readable by the hort group so systemd (which reads EnvironmentFile= as

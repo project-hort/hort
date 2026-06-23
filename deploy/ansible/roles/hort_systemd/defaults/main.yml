@@ -14,8 +14,16 @@ hort_systemd_server_bin: /usr/local/bin/hort-server
 hort_systemd_worker_bin: /usr/local/bin/hort-worker
 
 # Scanner binary paths used by the worker.
-hort_systemd_trivy_bin: /usr/local/bin/trivy
+# trivy is installed by apt (the aquasecurity .deb lands in /usr/bin); osv-scanner
+# is installed by this role as a release binary in /usr/local/bin.
+hort_systemd_trivy_bin: /usr/bin/trivy
 hort_systemd_osv_bin: /usr/local/bin/osv-scanner
+
+# OCI token signing key (Ed25519 PKCS#8 PEM). HORT_NATIVE_TOKENS_ENABLED=true
+# requires a signing key for the OCI /v2 bearer-token path; this role generates
+# one on the host (once) and points HORT_OCI_TOKEN_SIGNING_KEY_FILE at it.
+hort_systemd_key_dir: /etc/hort/keys
+hort_systemd_oci_signing_key_file: "{{ hort_systemd_key_dir }}/oci-signing.pem"
 
 # Pinned scanner versions.
 # Override in host_vars or group_vars when a newer version is validated.
