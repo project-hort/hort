@@ -64,6 +64,7 @@ accepted?*
 | [0013](0013-idp-authoritative-cli-sessions.md) | IdP-authoritative, short-lived CLI sessions |
 | [0018](0018-auth-catalog-canonical.md) | The authentication catalog is canonical |
 | [0021](0021-read-handler-anonymous-by-default.md) | Read handlers are anonymous-by-default; per-resource visibility is the only gate |
+| [0035](0035-cargo-config-json-anon-readable-auth-required.md) | Cargo `config.json` is anonymously readable and advertises `auth-required` for gated proxies (bounded anti-enum give-up; index/download stay gated; RFC 3231) |
 
 ### TLS and trust
 
