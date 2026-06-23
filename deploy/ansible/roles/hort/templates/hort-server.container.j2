@@ -22,6 +22,10 @@ PublishPort=127.0.0.1:{{ hort_api_port }}:{{ hort_api_port }}
 Volume=hort-cas:{{ hort_cas_container_path }}:U
 # Gitops config tree (read-only; populated by the gitops role).
 Volume={{ hort_config_dir }}:/etc/hort/config:ro
+# OCI token signing key (read-only). :U chowns the host key to the container's
+# mapped UID so the rootless process can read it; ro stops the container from
+# rewriting its own signing key. Required by HORT_NATIVE_TOKENS_ENABLED=true.
+Volume={{ hort_oci_key_dir }}:/etc/hort/keys:U,ro
 EnvironmentFile=%h/.config/hort/hort-server.env
 Network=hort.network
 User={{ hort_uid }}:{{ hort_gid }}
