@@ -110,26 +110,49 @@ async fn config_json(
     // `Option<AuthenticatedPrincipal>` slot (NOT the bare slot that
     // `require_principal` writes on writes). The outer `Option` tolerates the
     // no-auth-layer case (e.g. unit tests that inject neither slot) → anonymous.
-    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
+    // `config.json` is now an anonymous-readable bootstrap endpoint (ADR 0035);
+    // the principal slot is accepted by the extractor but not used here.
+    _principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
     // `BoundedPath` enforces the route-parameter length cap before this
     // handler body runs.
     //
-    // Resolve the repo through the visibility-aware use case so anonymous
-    // reads on private repos collapse to the same `NotFound` envelope as
-    // missing-repo (anti-enumeration). Cargo clients hit this first when
-    // bootstrapping a registry; the leak shape would otherwise be "registry
-    // exists, here's its dl/api URL" — enough to confirm a guessed private
-    // repo key.
-    // Unwrap the `AuthenticatedPrincipal` newtype to `Option<&CallerPrincipal>`.
-    let actor = principal
-        .as_deref()
-        .and_then(|opt| opt.as_ref())
-        .map(AuthenticatedPrincipal::as_caller);
-    let _repo = ctx
+    // **Anti-enumeration reversal — deliberate, bounded give-up (ADR 0035).**
+    //
+    // Previously this handler resolved through the visibility-aware
+    // `resolve(.., Read)` use case, which collapsed missing-repo and
+    // invisible-private-repo into the same `NotFound` envelope. That is the
+    // correct posture for content endpoints (index, download). It is WRONG for
+    // the bootstrap endpoint.
+    //
+    // Cargo (RFC 3231) fetches `config.json` *anonymously* to learn
+    // `auth-required`. It does NOT retry `config.json` with a configured token
+    // on a 401/404 — so a gated repo that returns `NotFound` here produces a
+    // dead-end: `error: config.json not found`. Cargo never gets to attach its
+    // token.
+    //
+    // The bounded give-up: `config.json` now reveals to anonymous callers that
+    // a repo exists, its `dl`/`api` URLs, and whether it requires auth. It does
+    // NOT reveal any crate content — the sparse-index and download endpoints
+    // still go through `resolve(.., Read)` and remain fully gated. The leak is
+    // strictly "existence + auth shape"; the content plane is unchanged. This
+    // trade-off is recorded in ADR 0035.
+    //
+    // `find_by_key_unchecked` returns `Ok(None)` for a genuinely missing repo
+    // (→ 404) and `Ok(Some(repo))` for any existing repo regardless of
+    // visibility. The principal is not needed for this path.
+    let repo = ctx
         .repository_access_use_case
-        .resolve(&repo_key, actor, AccessLevel::Read)
-        .await?;
+        .find_by_key_unchecked(&repo_key)
+        .await?
+        .ok_or_else(|| {
+            ApiError::from(hort_app::error::AppError::Domain(
+                hort_domain::error::DomainError::NotFound {
+                    entity: "Repository",
+                    id: repo_key.clone(),
+                },
+            ))
+        })?;
 
     // Public URL comes from `RequestTrust` (see `hort_http_core::middleware::trust`).
     // The trust middleware resolves `HORT_PUBLIC_BASE_URL` ↦ trusted-proxy
@@ -139,9 +162,13 @@ async fn config_json(
     let base_url = ctx.url_resolver.resolve(&trust);
     let base = base_url.as_str().trim_end_matches('/');
 
+    // `auth-required: true` on a private repo tells cargo (RFC 3231) to attach
+    // the configured registry token to every subsequent index/download request.
+    // `auth-required: false` on a public repo keeps the anonymous flow unchanged.
     let body = serde_json::json!({
         "dl":  format!("{base}/cargo/{repo_key}/api/v1/crates"),
         "api": format!("{base}/cargo/{repo_key}"),
+        "auth-required": !repo.is_public,
     });
 
     Ok(Response::builder()
@@ -931,8 +958,8 @@ mod tests {
             json["api"].as_str().unwrap(),
             "https://registry.example.com/cargo/cargo-test"
         );
-        // auth-required is intentionally omitted in 4A2 (no auth middleware yet).
-        assert!(json.get("auth-required").is_none());
+        // Public repo → auth-required: false (ADR 0035).
+        assert_eq!(json["auth-required"].as_bool(), Some(false));
     }
 
     /// `X-Forwarded-Proto` is ONLY honoured when the socket peer is in
@@ -1019,6 +1046,100 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Anonymous request on a **private** repo returns 200 with
+    /// `auth-required: true` (ADR 0035 — cargo RFC 3231 bootstrap).
+    #[tokio::test]
+    async fn config_json_private_repo_anon_returns_200_with_auth_required_true() {
+        let h = harness();
+        // Override is_public so the repo is private.
+        let mut repo = sample_repository();
+        repo.key = "gated-crates".to_string();
+        repo.format = RepositoryFormat::Cargo;
+        repo.is_public = false;
+        h.repositories.insert(repo);
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/cargo/gated-crates/config.json")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["auth-required"].as_bool(),
+            Some(true),
+            "private repo must advertise auth-required: true for cargo RFC 3231 bootstrap"
+        );
+        assert_eq!(
+            json["dl"].as_str().unwrap(),
+            "https://registry.example.com/cargo/gated-crates/api/v1/crates"
+        );
+    }
+
+    /// Anonymous request on a **public** repo returns 200 with
+    /// `auth-required: false` (no credentials needed).
+    #[tokio::test]
+    async fn config_json_public_repo_anon_returns_200_with_auth_required_false() {
+        let h = harness();
+        // insert_repo uses sample_repository() which has is_public: true
+        insert_repo(&h, "public-crates");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/cargo/public-crates/config.json")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["auth-required"].as_bool(),
+            Some(false),
+            "public repo must advertise auth-required: false"
+        );
+    }
+
+    /// Regression guard (ADR 0035): `sparse_index` anon on a private repo
+    /// must still return `NotFound` — only `config.json` is bootstrap-readable.
+    #[tokio::test]
+    async fn sparse_index_private_repo_anon_still_returns_404() {
+        let h = harness();
+        let mut repo = sample_repository();
+        repo.key = "gated-crates".to_string();
+        repo.format = RepositoryFormat::Cargo;
+        repo.is_public = false;
+        h.repositories.insert(repo);
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/cargo/gated-crates/se/rd/serde")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "sparse_index on a private repo must remain gated (ADR 0035 regression guard)"
+        );
     }
 
     // -- download -------------------------------------------------------------
@@ -3263,16 +3384,21 @@ mod tests {
             );
         }
 
-        /// Same invariant, on the `config.json` route. Cargo clients
-        /// hit this first when bootstrapping a registry; the leak shape
-        /// here would be "registry exists, here's its dl/api URL" —
-        /// enough to confirm a guessed private repo key.
+        /// `config.json` on a private repo now returns **200 + auth-required: true**
+        /// (ADR 0035 — cargo RFC 3231 bootstrap).
+        ///
+        /// The previous behavior was to return 404 (anti-enumeration), but cargo
+        /// does not retry `config.json` with a token after a 404, which made gated
+        /// proxy repos unreachable by `cargo build`.  The anti-enumeration give-up
+        /// is bounded: only repo existence + auth shape is revealed; index/download
+        /// remain fully gated.  A genuinely missing repo still returns 404.
         #[tokio::test]
-        async fn anonymous_get_config_json_on_private_repo_returns_404() {
+        async fn config_json_private_repo_returns_200_with_auth_required() {
             let h = enabled_rbac_harness();
             insert_private_repo(&h, "private-cargo");
             let router = router(h.ctx.clone());
 
+            // Private repo → 200 + auth-required: true (bootstrap-readable)
             let private_resp = router
                 .clone()
                 .oneshot(
@@ -3283,12 +3409,20 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let private_status = private_resp.status();
-            let private_body = to_bytes(private_resp.into_body(), 4 * 1024)
-                .await
-                .unwrap()
-                .to_vec();
+            assert_eq!(
+                private_resp.status(),
+                StatusCode::OK,
+                "private repo config.json must be 200 (bootstrap-readable, ADR 0035)"
+            );
+            let body = to_bytes(private_resp.into_body(), 4 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["auth-required"].as_bool(),
+                Some(true),
+                "private repo must advertise auth-required: true"
+            );
 
+            // Missing repo → 404 (genuinely absent, not a visibility collapse)
             let missing_resp = router
                 .oneshot(
                     Request::get("/cargo/ghost-cargo/config.json")
@@ -3298,15 +3432,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let missing_status = missing_resp.status();
-            let missing_body = to_bytes(missing_resp.into_body(), 4 * 1024)
-                .await
-                .unwrap()
-                .to_vec();
-
-            assert_anti_enumeration_envelope(
-                &(private_status, private_body),
-                &(missing_status, missing_body),
+            assert_eq!(
+                missing_resp.status(),
+                StatusCode::NOT_FOUND,
+                "genuinely missing repo must still return 404"
             );
         }
 

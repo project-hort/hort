@@ -218,6 +218,18 @@ method-based anonymous-by-default dispatch is **not** a defense layer
 read-authz review checklist). [OWASP A01/A04 · NIS2 21(2)(i) ·
 CRA I(2)(a)]
 
+### Cross-cutting note — cargo `config.json` bootstrap exception (ADR 0035)
+
+Not a mechanism. The cargo `GET /{repo_key}/config.json` endpoint is
+**intentionally anonymous-readable** for all repos, including private ones.
+This is a bounded anti-enumeration give-up required by RFC 3231: cargo reads
+`config.json` anonymously to learn `auth-required`, and will not retry with a
+token after a 404/401. The leak is limited to repo existence + `dl`/`api` URLs
++ auth-shape (`auth-required: true/false`). **Content endpoints (sparse index,
+download) remain fully gated through `resolve(.., AccessLevel::Read)` and are
+unaffected.** npm and PyPI do not have this conditional-token bootstrap gap and
+are not affected. See ADR 0035.
+
 ## §4 — How this catalog is enforced
 
 `.claude/commands/hort-architect.md` adds this doc to its

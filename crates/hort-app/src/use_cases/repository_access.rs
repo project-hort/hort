@@ -218,6 +218,39 @@ impl RepositoryAccessUseCase {
         }
     }
 
+    /// Public-metadata bootstrap lookup — returns the full [`Repository`] row
+    /// with **NO visibility gate**.
+    ///
+    /// Intended exclusively for format `config`/discovery endpoints (e.g.
+    /// the cargo `config.json` bootstrap) where the client needs the repository's
+    /// public metadata *before* it knows whether to send credentials.  The cargo
+    /// RFC 3231 bootstrap is the canonical use case: cargo fetches `config.json`
+    /// anonymously to learn `auth-required`; only after reading that field does it
+    /// attach the configured registry token to subsequent index/download requests.
+    ///
+    /// **Anti-enumeration trade-off (bounded give-up).** This method deliberately
+    /// omits the `is_public` gate that [`resolve`] enforces.  It leaks repo
+    /// existence + public-metadata fields (e.g. `dl`/`api` URLs, `auth-required`
+    /// flag) to anonymous callers on *private* repositories — a bounded sacrifice
+    /// recorded in ADR 0035.  Content (index entries, crate bytes, etc.) MUST
+    /// still be resolved through [`resolve`] with `AccessLevel::Read` so the
+    /// gating invariant is not compromised for actual package data.
+    ///
+    /// **Call-site discipline.** This method MUST NOT be used for any endpoint
+    /// that serves package content (index entries, tarballs, manifests, blobs).
+    /// Use [`resolve`] for every content path.
+    ///
+    /// Returns `Ok(Some(repo))` when the repo exists, `Ok(None)` on a
+    /// genuine miss, or propagates an infrastructure error.
+    #[tracing::instrument(skip(self))]
+    pub async fn find_by_key_unchecked(&self, repo_key: &str) -> AppResult<Option<Repository>> {
+        match self.repositories.find_by_key(repo_key).await {
+            Ok(r) => Ok(Some(r)),
+            Err(DomainError::NotFound { .. }) => Ok(None),
+            Err(other) => Err(AppError::Domain(other)),
+        }
+    }
+
     /// Cheap label-resolution helper for metric emission.
     ///
     /// Returns `repo.key` when the label is enabled and the lookup
@@ -1160,6 +1193,51 @@ mod tests {
         let uc = RepositoryAccessUseCase::new(repos, RbacAccess::Disabled, true);
         let label = uc.metric_label(Uuid::new_v4()).await;
         assert_eq!(label, values::REPOSITORY_UNKNOWN);
+    }
+
+    // -- find_by_key_unchecked --------------------------------------------
+
+    /// `find_by_key_unchecked` returns the full repo regardless of visibility.
+    #[tokio::test]
+    async fn find_by_key_unchecked_returns_private_repo() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let r = private_repo("vault");
+        repos.insert(r.clone());
+        let uc = RepositoryAccessUseCase::new(repos, enabled(RbacEvaluator::new(Vec::new())), true);
+        let result = uc.find_by_key_unchecked("vault").await.unwrap();
+        assert!(result.is_some(), "expected Some for existing private repo");
+        assert_eq!(result.unwrap().key, "vault");
+    }
+
+    /// `find_by_key_unchecked` returns the full repo for a public repo too.
+    #[tokio::test]
+    async fn find_by_key_unchecked_returns_public_repo() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let r = public_repo("open-crates");
+        repos.insert(r.clone());
+        let uc = RepositoryAccessUseCase::new(repos, enabled(RbacEvaluator::new(Vec::new())), true);
+        let result = uc.find_by_key_unchecked("open-crates").await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().key, "open-crates");
+    }
+
+    /// `find_by_key_unchecked` returns `None` for a genuinely missing repo.
+    #[tokio::test]
+    async fn find_by_key_unchecked_missing_repo_returns_none() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let uc = RepositoryAccessUseCase::new(repos, enabled(RbacEvaluator::new(Vec::new())), true);
+        let result = uc.find_by_key_unchecked("ghost").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    /// `find_by_key_unchecked` propagates non-NotFound port errors verbatim.
+    #[tokio::test]
+    async fn find_by_key_unchecked_propagates_port_error() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.fail_next_find_by_key(DomainError::Invariant("disk fault".into()));
+        let uc = RepositoryAccessUseCase::new(repos, enabled(RbacEvaluator::new(Vec::new())), true);
+        let err = uc.find_by_key_unchecked("anything").await.unwrap_err();
+        assert!(err.to_string().contains("disk fault"));
     }
 
     // -- not_found_repo helper --------------------------------------------
