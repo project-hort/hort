@@ -14,9 +14,8 @@
     state: restarted
 
 - name: Reload auditd rules
-  ansible.builtin.service:
-    name: auditd
-    state: restarted
+  ansible.builtin.command: augenrules --load
+  changed_when: true
 
 - name: Reload AppArmor profiles
   ansible.builtin.service:

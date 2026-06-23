@@ -29,11 +29,12 @@ base_unattended_reboot: "true"
 base_unattended_reboot_time: "03:30"
 
 # ── zram compressed-RAM swap (L6) ─────────────────────────────────────────────
-# Logical swap size for the zram0 device, in MB.  lz4 compression typically
+# Logical swap size for the zram0 device, in MiB.  lz4 compression typically
 # achieves 2:1–3:1 on mixed workloads, so the physical RAM consumption is
 # roughly half to one third of this value.
-# Default: min(RAM/2, 4096) MB — evaluated at play time via ansible_memtotal_mb.
-# Override in group_vars/ or host_vars/ with an explicit integer (MB).
+# Note: systemd-zram-generator interprets a bare integer as MiB.
+# Default: min(RAM/2, 4096) MiB — evaluated at play time via ansible_memtotal_mb.
+# Override in group_vars/ or host_vars/ with an explicit integer (MiB).
 base_zram_size: "{{ [ansible_memtotal_mb // 2, 4096] | min }}"
 
 # ── auditd (L7) ───────────────────────────────────────────────────────────────

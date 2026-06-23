@@ -239,6 +239,7 @@
     name:
       - apparmor
       - apparmor-utils
+      - apparmor-profiles-extra   # ships /etc/apparmor.d/usr.sbin.nginx on Debian
     state: present
 
 - name: Enable and start AppArmor service
