@@ -261,31 +261,24 @@
         force: true
       when: hort_arch == 'arm64'
 
+    # osv-scanner publishes one checksums file named `osv-scanner_SHA256SUMS`
+    # (not a versioned `_checksums.txt`); lines are `<sha256>  osv-scanner_linux_<arch>`.
     - name: Download osv-scanner checksums file
       ansible.builtin.get_url:
-        url: >-
-          {{ hort_systemd_osv_base_url }}/osv-scanner_{{ hort_systemd_osv_version }}_checksums.txt
+        url: "{{ hort_systemd_osv_base_url }}/osv-scanner_SHA256SUMS"
         dest: /var/tmp/osv-scanner_checksums.txt
         mode: "0600"
         force: true
 
-    - name: Download osv-scanner SLSA provenance attestation (amd64)
+    # osv-scanner ships ONE multi-subject SLSA provenance for all release
+    # artifacts (multiple.intoto.jsonl), not a per-arch file; slsa-verifier
+    # verify-artifact matches the given binary's digest against its subjects.
+    - name: Download osv-scanner SLSA provenance attestation
       ansible.builtin.get_url:
-        url: >-
-          {{ hort_systemd_osv_base_url }}/osv-scanner_{{ hort_systemd_osv_version }}_linux_amd64.intoto.jsonl
+        url: "{{ hort_systemd_osv_base_url }}/multiple.intoto.jsonl"
         dest: /var/tmp/osv-scanner.intoto.jsonl
         mode: "0600"
         force: true
-      when: hort_arch == 'amd64'
-
-    - name: Download osv-scanner SLSA provenance attestation (arm64)
-      ansible.builtin.get_url:
-        url: >-
-          {{ hort_systemd_osv_base_url }}/osv-scanner_{{ hort_systemd_osv_version }}_linux_arm64.intoto.jsonl
-        dest: /var/tmp/osv-scanner.intoto.jsonl
-        mode: "0600"
-        force: true
-      when: hort_arch == 'arm64'
 
     # ── Step 2: integrity check (checksums.txt) ───────────────────────────────
 
