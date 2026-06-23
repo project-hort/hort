@@ -124,6 +124,16 @@ spec:
                   # Postgres via `ArtifactLifecyclePort`, not in CAS.
                   readOnly: true
                 {{- end }}
+                # gitops-config configMap: scrub runs full `Config::from_env`,
+                # which validates that `HORT_CONFIG_DIR` (set to
+                # /etc/hort-server/config by the shared `runtimeEnv` helper) is an
+                # existing directory. Scrub never reads the gitops tree, but
+                # config-parse fails at boot if the directory is absent. Mirror
+                # the Deployment's mount so the env value the runtime accepts is
+                # also valid here (read-only — scrub is a CAS integrity check).
+                - name: gitops-config
+                  mountPath: /etc/hort-server/config
+                  readOnly: true
                 {{- if include "hort-server.extraCaBundle.autoMounted" . }}
                 {{- /* Gate the mount on the auto-mount source
                        (configMapName/secretName), NOT on `.path` alone:
@@ -147,6 +157,9 @@ spec:
               emptyDir: {}
               {{- end }}
             {{- end }}
+            - name: gitops-config
+              configMap:
+                name: {{ include "hort-server.fullname" . }}-config
             {{- if include "hort-server.extraCaBundle.autoMounted" . }}
             {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
             {{- end }}
