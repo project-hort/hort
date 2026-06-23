@@ -107,13 +107,29 @@
         dest: /usr/share/keyrings/trivy.asc
         mode: "0644"
 
-    - name: Add trivy apt repository
-      ansible.builtin.apt_repository:
-        repo: >-
-          deb [signed-by=/usr/share/keyrings/trivy.asc]
-          https://aquasecurity.github.io/trivy-repo/deb generic main
-        state: present
-        filename: trivy
+    # Write the repo as a deb822 .sources file directly. The apt_repository
+    # module requires apt-key or the gpg binary even with signed-by, and modern
+    # Debian (13/trixie) removed apt-key while a minimal image ships no gpg — so
+    # it fails "Either apt-key or gpg binary is required". A direct .sources write
+    # needs neither (and avoids the python3-debian dep that deb822_repository
+    # would pull in). This also clears the apt_repository deprecation warning.
+    - name: Remove legacy trivy .list (superseded by the deb822 .sources below)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/trivy.list
+        state: absent
+
+    - name: Add trivy apt repository (deb822 .sources)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/trivy.sources
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Types: deb
+          URIs: https://aquasecurity.github.io/trivy-repo/deb
+          Suites: generic
+          Components: main
+          Signed-By: /usr/share/keyrings/trivy.asc
 
     - name: Install trivy (pinned version)
       # Pin to an exact version for deterministic installs across re-runs.
