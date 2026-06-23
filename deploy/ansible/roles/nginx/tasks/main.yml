@@ -23,6 +23,28 @@
     state: started
     enabled: true
 
+- name: Deploy rate-limit zone config (conf.d/hort-ratelimit.conf)
+  ansible.builtin.template:
+    src: hort-ratelimit.conf.j2
+    dest: /etc/nginx/conf.d/hort-ratelimit.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Deploy TLS hardening config (conf.d/ssl-hardening.conf)
+  ansible.builtin.template:
+    src: ssl-hardening.conf.j2
+    dest: /etc/nginx/conf.d/ssl-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
 - name: Stat LE certificate (determines whether 443 block is rendered)
   ansible.builtin.stat:
     path: /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem

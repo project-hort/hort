@@ -2,12 +2,43 @@
 # Managed by Ansible — do not edit by hand.
 #
 # Streaming / large-body tuning:
-#   client_max_body_size 0       — allow arbitrarily large OCI blob uploads
+#   client_max_body_size {{ nginx_client_max_body_size }} — cap request body (OCI blobs + crates);
+#                                  set nginx_client_max_body_size: "0" to restore unlimited
 #   proxy_request_buffering off  — stream uploads directly to hort-server
 #   proxy_buffering off          — stream downloads directly to the client
 #   proxy_read_timeout 300s      — scan gate can hold a response open for
 #                                  up to 300 s before the release decision
+#
+# Default-server blocks (M7):
+#   - Port 443: ssl_reject_handshake on — silently drop TLS for unknown SNI/Host.
+#     Requires nginx ≥ 1.19.4 (Debian 13 ships 1.26.x).  No certificate is
+#     needed for this block; ssl_reject_handshake on handles the TLS layer
+#     before any certificate is consulted.
+#   - Port 80: return 444 (close without response) for any unknown Host.
+#
+# H1-invariant (pre-cert bootstrap):
+#   When nginx_cert_exists = false the {% if nginx_cert_exists %} block is
+#   omitted entirely, so there is no "listen 443 ssl" reference to a missing
+#   certificate.  The default 443 block below uses ssl_reject_handshake on and
+#   needs NO ssl_certificate directive, so it is safe to include in both states.
+#   The 80 default-server block has no TLS dependency at all.
 
+# ── Default-server: reject unknown SNI on port 80 ────────────────────────────
+server {
+    listen 80 default_server;
+    return 444;
+}
+
+# ── Default-server: reject unknown SNI on port 443 ───────────────────────────
+# ssl_reject_handshake on drops the TLS handshake for any ServerName that does
+# not match a named server block.  No ssl_certificate is required — this block
+# never completes a handshake.  Safe in both pre-cert and post-cert states.
+server {
+    listen 443 ssl default_server;
+    ssl_reject_handshake on;
+}
+
+# ── Registry vhost — port 80 (ACME + redirect) ───────────────────────────────
 server {
     listen 80;
     server_name {{ registry_fqdn }};
@@ -22,6 +53,7 @@ server {
 }
 
 {% if nginx_cert_exists %}
+# ── Registry vhost — port 443 (TLS) ─────────────────────────────────────────
 server {
     listen 443 ssl;
     server_name {{ registry_fqdn }};
@@ -35,10 +67,13 @@ server {
     # 'always' ensures the header is sent on all responses, including errors.
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
 
-    # Large OCI blobs / Cargo crates — no limit.
-    client_max_body_size 0;
+    # Security headers (M7)
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
 
+    # Bound the body — large enough for OCI base images and Cargo crates.
     # Stream uploads directly to hort-server; do not spool to disk.
+    client_max_body_size {{ nginx_client_max_body_size }};
     proxy_request_buffering off;
 
     # Stream downloads directly to the client; do not buffer in nginx.
@@ -49,6 +84,16 @@ server {
 
     access_log /var/log/nginx/access.log combined;
     error_log  /var/log/nginx/error.log;
+
+    # Rate-limit the auth surface — defined in conf.d/hort-ratelimit.conf.
+    location /api/v1/auth/ {
+        limit_req zone={{ nginx_ratelimit_zone }} burst={{ nginx_ratelimit_burst }} nodelay;
+        proxy_pass http://127.0.0.1:{{ hort_api_port }};
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP         $remote_addr;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:{{ hort_api_port }};
