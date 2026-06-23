@@ -31,6 +31,10 @@ server {
     include /etc/letsencrypt/options-ssl-nginx.conf;  # certbot-generated artifact, written alongside fullchain.pem by `certbot certonly`
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
+    # HSTS — instruct browsers to use HTTPS for this domain for 2 years.
+    # 'always' ensures the header is sent on all responses, including errors.
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
     # Large OCI blobs / Cargo crates — no limit.
     client_max_body_size 0;
 
