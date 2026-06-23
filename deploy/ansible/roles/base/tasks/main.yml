@@ -40,9 +40,9 @@
     state: present
     update_cache: true
 
-- name: Allow SSH through firewall
+- name: Rate-limit SSH through firewall (ufw limit)
   community.general.ufw:
-    rule: allow
+    rule: limit
     name: OpenSSH
 
 - name: Allow HTTP (80) through firewall
@@ -81,3 +81,26 @@
     name: unattended-upgrades
     state: started
     enabled: true
+
+# ── SSH hardening ─────────────────────────────────────────────────────────────
+# SAFETY: PasswordAuthentication no is safe here because Ansible connects via
+# key auth — if this play reaches this task, key-based login is confirmed to
+# work.  See roles/base/defaults/main.yml for override variables.
+
+- name: Deploy sshd drop-in validate helper
+  ansible.builtin.copy:
+    src: validate-sshd-dropin.sh
+    dest: /usr/local/bin/hort-validate-sshd-dropin
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Template sshd hardening drop-in
+  ansible.builtin.template:
+    src: 10-hort-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/10-hort-hardening.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/local/bin/hort-validate-sshd-dropin %s
+  notify: Reload sshd

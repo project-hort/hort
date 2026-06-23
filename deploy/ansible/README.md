@@ -12,6 +12,10 @@ Debian 13 (trixie).  Two flavors are provided:
 
 1. **Target host:** bare Debian 13 with SSH access (`ansible_user=debian` by
    default; adjust in `inventory/production/hosts.ini`).
+   **Ensure key-based SSH authentication works before applying** — the `base`
+   role disables password authentication (`PasswordAuthentication no`).  If the
+   play reaches that task, key auth is confirmed to work; password auth is then
+   disabled as a hardening measure.
 2. **DNS A record:** `registry.hort.rs` must resolve to the target host's
    public IP before running the play (certbot ACME challenge needs this).
 3. **Ansible Vault:** secret values live in the gitignored

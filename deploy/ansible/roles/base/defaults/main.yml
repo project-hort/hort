@@ -1,0 +1,21 @@
+---
+# base role defaults — SSH hardening knobs.
+#
+# SAFETY: PasswordAuthentication is disabled by default.  This is correct for
+# an internet-facing host provisioned via Ansible (key auth is verified if the
+# play reaches this task).  If you need to adjust these values, override in
+# group_vars/ or host_vars/ before running the play.
+#
+# base_sshd_allow_groups is intentionally UNSET (commented out) by default —
+# setting it to a specific group would lock out any user not in that group,
+# including the ansible_user.  Only set this if you have verified all required
+# users are members of the named group on the target host.
+#
+# base_sshd_allow_groups: wheel
+
+base_sshd_password_auth: "no"
+base_sshd_kbd_interactive_auth: "no"
+base_sshd_permit_root_login: "prohibit-password"
+base_sshd_max_auth_tries: 3
+base_sshd_client_alive_interval: 300
+base_sshd_client_alive_count_max: 2
