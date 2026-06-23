@@ -17,8 +17,10 @@
 #   - Port 80: return 444 (close without response) for any unknown Host.
 #
 # H1-invariant (pre-cert bootstrap):
-#   When nginx_cert_exists = false the {% if nginx_cert_exists %} block is
-#   omitted entirely, so there is no "listen 443 ssl" reference to a missing
+#   When nginx_cert_exists = false the cert-gated 443 block (guarded by the
+#   "if nginx_cert_exists" conditional) is omitted entirely — written without
+#   Jinja delimiters here so this comment is not itself parsed as a tag — so
+#   there is no "listen 443 ssl" reference to a missing
 #   certificate.  The default 443 block below uses ssl_reject_handshake on and
 #   needs NO ssl_certificate directive, so it is safe to include in both states.
 #   The 80 default-server block has no TLS dependency at all.
