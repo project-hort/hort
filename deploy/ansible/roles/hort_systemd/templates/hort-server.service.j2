@@ -31,6 +31,12 @@ ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
+# ProcSubset=pid VERIFIED SAFE for hort-server (M1 review follow-up, 2026-06):
+# /metrics is in-process metrics_exporter_prometheus counters
+# (telemetry.rs install_recorder -> handle.render()), the health check is a DB
+# ping, and there are NO non-pid /proc reads in source nor any
+# procfs/sysinfo/process-collector crate in Cargo.lock. So hiding /proc/net,
+# /proc/meminfo, etc. does not affect metrics/health here.
 ProcSubset=pid
 PrivateDevices=true
 RestrictNamespaces=true
