@@ -121,16 +121,89 @@
         state: present
         update_cache: true
 
-- name: Install osv-scanner binary (pinned, checksum-verified)
+- name: Install osv-scanner binary (pinned, checksum + SLSA-provenance verified)
   # Downloads the binary for the pinned version from GitHub Releases and
-  # verifies it against the upstream checksums.txt before installing.
-  # hort_systemd_osv_version is set in defaults/main.yml and is overridable.
-  # See https://github.com/google/osv-scanner/releases for available tags.
+  # verifies it in two steps before installing:
+  #
+  #   Step 1 — integrity:  checksums.txt co-located in the release (existing gate).
+  #   Step 2 — provenance: SLSA attestation (.intoto.jsonl) verified with a pinned
+  #             slsa-verifier binary, confirming the binary was built by the
+  #             google/osv-scanner release workflow — not merely that the bytes
+  #             match what was in the same release archive.
+  #
+  # This closes the supply-chain asymmetry where hort's own binaries had cosign
+  # provenance but the on-host scanner did not (M4).  Both steps are fail-closed:
+  # the play aborts on any verification failure.
+  #
+  # slsa-verifier itself is bootstrapped with a pinned-version + SHA-256 checksum
+  # (hort_systemd_slsa_verifier_version / hort_systemd_slsa_verifier_sha256_amd64|arm64
+  # in defaults/main.yml).  IMPORTANT: update those SHA-256 values from the
+  # official release page before deploying a new slsa-verifier version.
   block:
-    - name: Download osv-scanner binary (amd64)
+    # ── Step 0: bootstrap slsa-verifier (pinned + checksum-verified) ────────
+
+    - name: Download slsa-verifier binary (amd64)
       ansible.builtin.get_url:
         url: >-
-          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_linux_amd64
+          https://github.com/slsa-framework/slsa-verifier/releases/download/v{{ hort_systemd_slsa_verifier_version }}/slsa-verifier-linux-amd64
+        dest: /var/tmp/slsa-verifier
+        mode: "0600"
+        force: true
+      when: hort_arch == 'amd64'
+
+    - name: Download slsa-verifier binary (arm64)
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/slsa-framework/slsa-verifier/releases/download/v{{ hort_systemd_slsa_verifier_version }}/slsa-verifier-linux-arm64
+        dest: /var/tmp/slsa-verifier
+        mode: "0600"
+        force: true
+      when: hort_arch == 'arm64'
+
+    - name: Compute checksum of downloaded slsa-verifier
+      ansible.builtin.stat:
+        path: /var/tmp/slsa-verifier
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: hort_systemd_slsa_verifier_stat
+
+    - name: Fail if slsa-verifier checksum does not match (amd64)
+      ansible.builtin.fail:
+        msg: >-
+          slsa-verifier checksum mismatch for v{{ hort_systemd_slsa_verifier_version }} (amd64):
+          expected {{ hort_systemd_slsa_verifier_sha256_amd64 }},
+          got {{ hort_systemd_slsa_verifier_stat.stat.checksum }}.
+          Update hort_systemd_slsa_verifier_sha256_amd64 in defaults/main.yml.
+      when:
+        - hort_arch == 'amd64'
+        - hort_systemd_slsa_verifier_stat.stat.checksum != hort_systemd_slsa_verifier_sha256_amd64
+
+    - name: Fail if slsa-verifier checksum does not match (arm64)
+      ansible.builtin.fail:
+        msg: >-
+          slsa-verifier checksum mismatch for v{{ hort_systemd_slsa_verifier_version }} (arm64):
+          expected {{ hort_systemd_slsa_verifier_sha256_arm64 }},
+          got {{ hort_systemd_slsa_verifier_stat.stat.checksum }}.
+          Update hort_systemd_slsa_verifier_sha256_arm64 in defaults/main.yml.
+      when:
+        - hort_arch == 'arm64'
+        - hort_systemd_slsa_verifier_stat.stat.checksum != hort_systemd_slsa_verifier_sha256_arm64
+
+    - name: Make slsa-verifier executable
+      ansible.builtin.file:
+        path: /var/tmp/slsa-verifier
+        mode: "0700"
+
+    # ── Step 1: download osv-scanner binary + provenance artifacts ───────────
+
+    - name: Compute osv-scanner release base URL
+      ansible.builtin.set_fact:
+        hort_systemd_osv_base_url: >-
+          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}
+
+    - name: Download osv-scanner binary (amd64)
+      ansible.builtin.get_url:
+        url: "{{ hort_systemd_osv_base_url }}/osv-scanner_linux_amd64"
         dest: /var/tmp/osv-scanner
         mode: "0600"
         force: true
@@ -138,8 +211,7 @@
 
     - name: Download osv-scanner binary (arm64)
       ansible.builtin.get_url:
-        url: >-
-          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_linux_arm64
+        url: "{{ hort_systemd_osv_base_url }}/osv-scanner_linux_arm64"
         dest: /var/tmp/osv-scanner
         mode: "0600"
         force: true
@@ -148,10 +220,30 @@
     - name: Download osv-scanner checksums file
       ansible.builtin.get_url:
         url: >-
-          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_{{ hort_systemd_osv_version }}_checksums.txt
+          {{ hort_systemd_osv_base_url }}/osv-scanner_{{ hort_systemd_osv_version }}_checksums.txt
         dest: /var/tmp/osv-scanner_checksums.txt
         mode: "0600"
         force: true
+
+    - name: Download osv-scanner SLSA provenance attestation (amd64)
+      ansible.builtin.get_url:
+        url: >-
+          {{ hort_systemd_osv_base_url }}/osv-scanner_{{ hort_systemd_osv_version }}_linux_amd64.intoto.jsonl
+        dest: /var/tmp/osv-scanner.intoto.jsonl
+        mode: "0600"
+        force: true
+      when: hort_arch == 'amd64'
+
+    - name: Download osv-scanner SLSA provenance attestation (arm64)
+      ansible.builtin.get_url:
+        url: >-
+          {{ hort_systemd_osv_base_url }}/osv-scanner_{{ hort_systemd_osv_version }}_linux_arm64.intoto.jsonl
+        dest: /var/tmp/osv-scanner.intoto.jsonl
+        mode: "0600"
+        force: true
+      when: hort_arch == 'arm64'
+
+    # ── Step 2: integrity check (checksums.txt) ───────────────────────────────
 
     - name: Extract expected checksum for this arch
       ansible.builtin.shell:
@@ -178,6 +270,27 @@
           expected {{ hort_systemd_osv_expected_sha256.stdout }},
           got {{ hort_systemd_osv_stat.stat.checksum }}
       when: hort_systemd_osv_stat.stat.checksum != hort_systemd_osv_expected_sha256.stdout
+
+    # ── Step 3: SLSA provenance check ────────────────────────────────────────
+    # Verifies that the binary was produced by the google/osv-scanner release
+    # workflow — not just that the bytes are unchanged from the release archive.
+    # --source-uri pins the expected GitHub source repository; a binary signed
+    # by any other builder is rejected.  Fail-closed: no fallback path.
+
+    - name: Verify osv-scanner SLSA provenance
+      ansible.builtin.command:
+        argv:
+          - /var/tmp/slsa-verifier
+          - verify-artifact
+          - /var/tmp/osv-scanner
+          - "--provenance-path=/var/tmp/osv-scanner.intoto.jsonl"
+          - "--source-uri={{ hort_systemd_osv_slsa_source_uri }}"
+          - "--source-tag=v{{ hort_systemd_osv_version }}"
+      changed_when: false
+      register: hort_systemd_osv_slsa_result
+      failed_when: hort_systemd_osv_slsa_result.rc != 0
+
+    # ── Install only after both checks pass ───────────────────────────────────
 
     - name: Install osv-scanner to /usr/local/bin
       ansible.builtin.copy:
