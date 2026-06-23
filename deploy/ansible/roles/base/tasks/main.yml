@@ -87,6 +87,11 @@
 # key auth — if this play reaches this task, key-based login is confirmed to
 # work.  See roles/base/defaults/main.yml for override variables.
 
+- name: Install openssh-server
+  ansible.builtin.apt:
+    name: openssh-server
+    state: present
+
 - name: Deploy sshd drop-in validate helper
   ansible.builtin.copy:
     src: validate-sshd-dropin.sh
