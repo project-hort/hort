@@ -29,33 +29,38 @@
     group: "{{ hort_user }}"
     mode: "0750"
 
-# ── Env-files (mode 0600 — contain DSN passwords) ────────────────────────────
+# ── Env-files (mode 0640 root:hort — contain DSN passwords) ──────────────────
+# Owned by root so the hort service process cannot rewrite its own secrets;
+# group-readable by the hort group so systemd (which reads EnvironmentFile= as
+# root during unit setup) and any authorised ops tooling can read the file.
+# systemd reads EnvironmentFile= before dropping privileges, so root ownership
+# is transparent to the service startup sequence.
 
 - name: Write hort-migrate env-file
   ansible.builtin.template:
     src: hort-migrate.env.j2
     dest: "{{ hort_systemd_env_dir }}/hort-migrate.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-systemd units
 
 - name: Write hort-server env-file
   ansible.builtin.template:
     src: hort-server.env.j2
     dest: "{{ hort_systemd_env_dir }}/hort-server.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-systemd units
 
 - name: Write hort-worker env-file
   ansible.builtin.template:
     src: hort-worker.env.j2
     dest: "{{ hort_systemd_env_dir }}/hort-worker.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-systemd units
 
 # ── systemd unit files ────────────────────────────────────────────────────────

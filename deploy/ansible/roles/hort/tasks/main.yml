@@ -14,9 +14,9 @@
   ansible.builtin.file:
     path: "{{ hort_env_dir }}"
     state: directory
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0700"
+    mode: "0750"
 
 - name: Ensure postgres data directory exists
   ansible.builtin.file:
@@ -30,23 +30,27 @@
 # Secret values injected here from group_vars/production/ (gitignored Vault).
 # Each template has a "SECRET PLACEHOLDER" comment explaining where to source
 # the value.
+#
+# mode 0640 root:hort — root owns the file so the container process (running as
+# hort) cannot rewrite its own secrets; the hort group can read so the rootless
+# systemd session that launches the container picks up the env-file correctly.
 
 - name: Write hort-server env-file
   ansible.builtin.template:
     src: hort-server.env.j2
     dest: "{{ hort_env_dir }}/hort-server.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-server
 
 - name: Write hort-worker env-file
   ansible.builtin.template:
     src: hort-worker.env.j2
     dest: "{{ hort_env_dir }}/hort-worker.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-worker
 
 # ── Quadlet unit files ────────────────────────────────────────────────────────
