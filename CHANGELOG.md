@@ -38,6 +38,22 @@ Beta release. The feature set is described in the documentation under `docs/`.
 
 ### Fixed
 
+- **Gated cargo proxies are now reachable by a plain `cargo build`.** A gated
+  (`isPublic: false`) cargo pull-through proxy could not be used by the stock
+  `cargo` client: cargo only sends its token once it has read `auth-required`
+  from `config.json`, but the handler omitted that field and returned
+  `NotFound` to anonymous callers, so cargo's bootstrap failed with
+  `config.json not found in registry`. The cargo `config.json` endpoint is now
+  anonymously readable and advertises `auth-required: <!is_public>`; the crate
+  index and download endpoints stay gated (anonymous requests still collapse to
+  `NotFound`). This is a deliberate, bounded anti-enumeration give-up for
+  `config.json` only — repo existence + `dl`/`api` URLs become visible, never
+  crate content (ADR 0035 *cargo config.json anon-readable + auth-required*).
+  npm and pypi are unaffected (their clients always send credentials). Closes
+  #1.
+- **The config-scrub CronJob now mounts the gitops-config volume.** The Helm
+  scrub job started without the directory `HORT_CONFIG_DIR` points at; it now
+  mounts the same gitops-config volume the server uses, so the directory exists.
 - **OCI push no longer fails on the blob-existence pre-check under a quarantine
   policy.** During an OCI push, a write-authorized client's blob-existence `HEAD`
   was routed through the quarantine read-gate and returned `503`, blocking the

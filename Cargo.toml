@@ -98,7 +98,7 @@ members = [
 exclude = ["tools/*"]
 
 [workspace.package]
-version = "0.9.4-beta.2"
+version = "0.9.4-beta.3"
 edition = "2021"
 # MSRV — kept in sync with `.clippy.toml` (`msrv = "1.94.0"`) and with
 # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` default (asserted
