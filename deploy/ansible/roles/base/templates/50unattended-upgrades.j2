@@ -1,0 +1,28 @@
+# /etc/apt/apt.conf.d/50unattended-upgrades — managed by Ansible (base role).
+# Configures which package origins are upgraded automatically and the reboot
+# policy after security-critical updates (kernel, glibc, openssl, etc.).
+
+Unattended-Upgrade::Allowed-Origins {
+    // Debian security updates — the primary source of CVE fixes.
+    "${distro_id}:${distro_codename}-security";
+    // Debian stable updates — point-release bug fixes, often security-adjacent.
+    "${distro_id}:${distro_codename}-updates";
+};
+
+// Remove unused automatically-installed kernel packages after upgrades.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+
+// Remove unused dependency packages that are no longer needed.
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// Automatically reboot if the installed update requires it (e.g. new kernel,
+// glibc, openssl).  The reboot fires at {{ base_unattended_reboot_time }} (local
+// system clock).  Override base_unattended_reboot / base_unattended_reboot_time
+// in group_vars/ or host_vars/ to adjust per-environment.
+Unattended-Upgrade::Automatic-Reboot "{{ base_unattended_reboot }}";
+Unattended-Upgrade::Automatic-Reboot-Time "{{ base_unattended_reboot_time }}";
+
+// Send upgrade results to root's mail (or /var/mail/root if no MTA).
+// Set to "" to suppress.
+Unattended-Upgrade::Mail "root";
+Unattended-Upgrade::MailReport "on-change";

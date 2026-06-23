@@ -1,0 +1,9 @@
+# /etc/apt/apt.conf.d/20auto-upgrades — managed by Ansible (base role).
+# Enable the two timers that drive unattended-upgrades:
+#   apt-daily.timer          — refreshes the package index once a day
+#   apt-daily-upgrade.timer  — runs unattended-upgrades once a day
+# Setting these to "1" is the minimum required for security patches to be
+# applied automatically.  See /etc/apt/apt.conf.d/50unattended-upgrades for
+# which origins are upgraded and the reboot policy.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

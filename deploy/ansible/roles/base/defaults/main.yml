@@ -19,3 +19,11 @@ base_sshd_permit_root_login: "prohibit-password"
 base_sshd_max_auth_tries: 3
 base_sshd_client_alive_interval: 300
 base_sshd_client_alive_count_max: 2
+
+# ── Unattended-upgrades reboot window ─────────────────────────────────────────
+# Allow unattended-upgrades to reboot the host automatically after a security
+# update requires it (e.g. kernel, glibc).  The reboot fires at the time below
+# (local system clock).  Override in group_vars/production/ or host_vars/ if
+# the maintenance window differs per environment.
+base_unattended_reboot: "true"
+base_unattended_reboot_time: "03:30"
