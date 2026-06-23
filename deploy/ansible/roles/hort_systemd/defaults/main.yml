@@ -24,10 +24,10 @@ hort_systemd_osv_bin: /usr/local/bin/osv-scanner
 # Verify against https://github.com/google/osv-scanner/releases
 hort_systemd_osv_version: "1.9.1"
 #
-# hort_systemd_trivy_version: pinned to a known-good version string accepted by
-# the aquasecurity apt repository (https://aquasecurity.github.io/trivy-repo/).
-# Use `apt-cache madison trivy` after adding the repo to confirm availability.
-hort_systemd_trivy_version: "0.60.0"
+# trivy is installed UNPINNED from the aquasecurity apt repo: that repo's
+# "generic" suite is rolling-latest-only (it serves a single version), so a
+# version pin cannot hold. Integrity is via the signed-by keyring; latest is
+# the right posture for a vuln scanner. (No hort_systemd_trivy_version var.)
 
 # ── osv-scanner SLSA provenance verification ──────────────────────────────────
 # slsa-verifier is used to verify the SLSA provenance attestation

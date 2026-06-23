@@ -131,14 +131,15 @@
           Components: main
           Signed-By: /usr/share/keyrings/trivy.asc
 
-    - name: Install trivy (pinned version)
-      # Pin to an exact version for deterministic installs across re-runs.
-      # The version string must exist in the aquasecurity apt repository at
-      # https://aquasecurity.github.io/trivy-repo/ — verify with
-      # `apt-cache madison trivy` after adding the repo above.
-      # Override hort_systemd_trivy_version in host_vars/group_vars to upgrade.
+    - name: Install trivy (latest from the keyring-verified repo)
+      # NOT version-pinned: the aquasecurity "generic" suite is a rolling repo
+      # that serves only the current latest trivy (a pinned version 404s the
+      # moment a newer one ships). Integrity comes from the signed-by keyring
+      # above; latest is the right posture for a vulnerability scanner (freshest
+      # detection). For reproducible version pinning, install from the GitHub
+      # release tarball with a checksum instead (as osv-scanner does below).
       ansible.builtin.apt:
-        name: "trivy={{ hort_systemd_trivy_version }}"
+        name: trivy
         state: present
         update_cache: true
 
