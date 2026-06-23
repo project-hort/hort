@@ -63,6 +63,12 @@
     port: "{{ hort_api_port }}"
     proto: tcp
 
+- name: Deny external access to PostgreSQL port (5432) — belt-and-suspenders
+  community.general.ufw:
+    rule: deny
+    port: "5432"
+    proto: tcp
+
 - name: Enable ufw with default deny-incoming policy
   community.general.ufw:
     state: enabled

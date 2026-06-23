@@ -30,3 +30,15 @@ effective_io_concurrency = {{ pg_effective_io_concurrency }}
 # Autovacuum — global scale factors (co-located; do NOT raise cost_limit)
 autovacuum_vacuum_scale_factor = {{ pg_autovacuum_vacuum_scale_factor }}
 autovacuum_analyze_scale_factor = {{ pg_autovacuum_analyze_scale_factor }}
+
+# Security (M6)
+# password_encryption — require SCRAM-SHA-256 for all new passwords/auth.
+# log_connections/log_disconnections — audit trail for session events.
+# listen_addresses = '' — socket-only; TCP is disabled entirely because the
+#   native runtime DSN uses a Unix socket and there is no other host process
+#   that should reach Postgres over TCP.  NOT set for the Podman flavor
+#   (the postgres container must listen on the container network).
+password_encryption = {{ pg_password_encryption }}
+log_connections = {{ pg_log_connections }}
+log_disconnections = {{ pg_log_disconnections }}
+listen_addresses = ''

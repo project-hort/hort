@@ -76,3 +76,33 @@ pg_wal_compression: "on"
 pg_checkpoint_completion_target: "0.9"
 pg_autovacuum_vacuum_scale_factor: "0.05"
 pg_autovacuum_analyze_scale_factor: "0.05"
+
+# ── nginx edge hardening (M7) ─────────────────────────────────────────────────
+# nginx_client_max_body_size — cap request body size.  Default 10g is large
+#   enough for OCI base images and large Cargo crates while bounding abuse.
+#   Set to 0 to restore the unlimited legacy behaviour.
+nginx_client_max_body_size: "10g"
+
+# Rate-limit zone for the auth surface (/api/v1/auth/).
+# Zone size 10m ≈ 160 000 IP state slots; rate 30r/m prevents brute-force while
+# allowing normal interactive use.  burst absorbs short token bursts; nodelay
+# means excess requests are rejected immediately, not queued.
+nginx_ratelimit_zone: "hort_auth"
+nginx_ratelimit_size: "10m"
+nginx_ratelimit_rate: "30r/m"
+nginx_ratelimit_burst: 10
+
+# TLS protocols — Mozilla intermediate profile (TLSv1.2 + TLSv1.3).
+# The cipher list is a long security-policy constant embedded directly in
+# roles/nginx/templates/ssl-hardening.conf.j2 to keep this file lint-clean.
+nginx_ssl_protocols: "TLSv1.2 TLSv1.3"
+
+# ── PostgreSQL security settings ──────────────────────────────────────────────
+# Shared between both flavors: applied via conf.d drop-in (native) and -c args
+# (podman).  listen_addresses='' (socket-only) is native-ONLY — see the
+# postgres_apt template.  For podman the postgres container must listen on the
+# container network; TCP to the host is still blocked because the container
+# unit does not PublishPort 5432.
+pg_password_encryption: "scram-sha-256"
+pg_log_connections: "on"
+pg_log_disconnections: "on"
