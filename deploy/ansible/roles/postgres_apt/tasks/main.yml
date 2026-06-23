@@ -244,3 +244,13 @@
     group: postgres
     mode: "0644"
   notify: Restart PostgreSQL
+
+# ── Apply pending PostgreSQL config before dependent roles connect ────────────
+# The pg_hba reload (scram-sha-256) and the tuning restart are notified above but
+# would otherwise flush only at end-of-play — AFTER hort-migrate (hort_systemd
+# role) connects as the scram-auth'd hort_ddl role over the socket. Without this
+# flush, the Debian-default `local all all peer` is still active at migrate time
+# and the migrate fails with "Peer authentication failed for user hort_ddl".
+# Flushing here makes the hardened pg_hba live before any later role connects.
+- name: Apply pending PostgreSQL config (pg_hba + tuning) before dependents connect
+  ansible.builtin.meta: flush_handlers
