@@ -2246,40 +2246,43 @@ impl Config {
         // set this `false` explicitly (see the struct field doc).
         let refcount_reconcile_on_startup = parse_bool("HORT_REFCOUNT_RECONCILE_ON_STARTUP", true)?;
 
-        // Fail-closed when the feature is on
-        // but the discovery document at `/.well-known/hort-client-config`
-        // would be served with missing fields. The route renders three
+        // Fail-closed when the feature is on and the interactive-OIDC
+        // path would be served with missing fields. The
+        // `/.well-known/hort-client-config` discovery doc renders three
         // dependent values straight from process env; serving a
         // half-formed document would silently downgrade `hort-cli` into
         // guessing IdP coordinates out-of-band. Mirrors the
         // fail-closed pattern of `OciPublicBaseUrlMissing`.
+        //
+        // Under `AuthConfig::Disabled` + federation, these three vars
+        // are NOT required — the federation branch validates JWTs
+        // against gitops `OidcIssuer` rows, not the interactive IdP
+        // config. The discovery doc is simply not served in that mode.
         if enable_token_exchange {
-            let mut missing: Vec<&str> = Vec::new();
-            match &auth {
-                AuthConfig::Disabled => {
-                    // No OIDC provider → both issuer and cli_client_id
-                    // are unresolvable. Name the user-facing env vars
-                    // (operators set these, not `HORT_AUTH_PROVIDER`
-                    // which only switches the parse branch).
+            // Interactive-OIDC-path requirements: issuer URL, CLI client
+            // ID, and public base URL are only needed when
+            // `AuthConfig::Oidc` is in use (they back the
+            // `/.well-known/hort-client-config` discovery doc + the
+            // device-flow path). Under `AuthConfig::Disabled` +
+            // federation, none of these are consulted — the federation
+            // branch validates JWTs against gitops `OidcIssuer` rows,
+            // not the interactive IdP config.
+            if let AuthConfig::Oidc(o) = &auth {
+                let mut missing: Vec<&str> = Vec::new();
+                if o.issuer_url.is_empty() {
                     missing.push("HORT_OIDC_ISSUER_URL");
+                }
+                if o.cli_client_id.as_deref().unwrap_or("").is_empty() {
                     missing.push("HORT_OIDC_CLI_CLIENT_ID");
                 }
-                AuthConfig::Oidc(o) => {
-                    if o.issuer_url.is_empty() {
-                        missing.push("HORT_OIDC_ISSUER_URL");
-                    }
-                    if o.cli_client_id.as_deref().unwrap_or("").is_empty() {
-                        missing.push("HORT_OIDC_CLI_CLIENT_ID");
-                    }
+                if public_base_url.is_none() {
+                    missing.push("HORT_PUBLIC_BASE_URL");
                 }
-            }
-            if public_base_url.is_none() {
-                missing.push("HORT_PUBLIC_BASE_URL");
-            }
-            if !missing.is_empty() {
-                return Err(ConfigError::TokenExchangeRequiresVars {
-                    missing: missing.join(", "),
-                });
+                if !missing.is_empty() {
+                    return Err(ConfigError::TokenExchangeRequiresVars {
+                        missing: missing.join(", "),
+                    });
+                }
             }
             // Token-exchange mints `hort_cli_*`
             // (PAT-shape) tokens via `issue_cli_session`. Validation
@@ -2291,7 +2294,9 @@ impl Config {
             // validate — login succeeds, every subsequent call 401s.
             // Fail-closed at boot so the misconfig surfaces as a
             // single startup error instead of a confusing runtime
-            // pattern.
+            // pattern. This gate applies regardless of `AuthConfig`
+            // variant — both the interactive and federated branches
+            // mint `hort_*` native tokens.
             if !enable_native_tokens {
                 return Err(ConfigError::TokenExchangeRequiresNativeTokens);
             }
@@ -8081,27 +8086,112 @@ mod tests {
     }
 
     #[test]
-    fn config_boot_fails_when_token_exchange_on_and_auth_disabled() {
-        // No HORT_AUTH_PROVIDER → `Disabled`. Issuer URL and CLI client ID
-        // are unresolvable; both must surface in the missing list.
+    fn config_boot_succeeds_when_token_exchange_on_and_auth_disabled_with_native_tokens() {
+        // `AuthConfig::Disabled` + `enable_token_exchange=true` +
+        // `enable_native_tokens=true` → federation-only deployment.
+        // Issuer URL, CLI client ID, and public base URL are NOT
+        // required under `Disabled` (they back the interactive-OIDC
+        // path only; the federated-JWT branch uses gitops OidcIssuer
+        // rows instead). The signing-key inline value is opaque to
+        // Config::from_env (parse-validity is checked at composition
+        // time), so a placeholder string is enough to clear the
+        // OciTokenSigningKeyMissing gate at this layer.
+        // `fs_env` provides `HORT_PUBLIC_BASE_URL=http://hort-server:8080`
+        // (needed for `TrustUnconfigured` to not fire). We do NOT
+        // override it here — the goal is that interactive-OIDC vars
+        // are not required; the trust-config var is orthogonal.
         let env = fs_env_auth(&[
             ("HORT_TOKEN_EXCHANGE_ENABLED", Some("true")),
+            ("HORT_NATIVE_TOKENS_ENABLED", Some("true")),
+            ("HORT_OCI_TOKEN_SIGNING_KEY", Some("placeholder-pem")),
             ("HORT_AUTH_PROVIDER", None),
-            ("HORT_PUBLIC_BASE_URL", Some("https://hort.example.com")),
+            // Intentionally absent — must NOT cause boot-fail under Disabled.
+            ("HORT_OIDC_ISSUER_URL", None),
+            ("HORT_OIDC_CLI_CLIENT_ID", None),
+        ]);
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().expect(
+                "boot must succeed when HORT_TOKEN_EXCHANGE_ENABLED=true \
+                 under AuthConfig::Disabled with native tokens enabled",
+            );
+            assert!(cfg.enable_token_exchange);
+            assert!(cfg.enable_native_tokens);
+            assert!(
+                matches!(cfg.auth, AuthConfig::Disabled),
+                "expected AuthConfig::Disabled"
+            );
+        });
+    }
+
+    #[test]
+    fn config_boot_fails_when_token_exchange_on_and_auth_disabled_but_native_tokens_off() {
+        // `AuthConfig::Disabled` + `enable_token_exchange=true` +
+        // `enable_native_tokens=false` → boot-fail: exchange would
+        // mint `hort_cli_*` tokens the server cannot validate.
+        let env = fs_env_auth(&[
+            ("HORT_TOKEN_EXCHANGE_ENABLED", Some("true")),
+            // HORT_NATIVE_TOKENS_ENABLED unset → default false.
+            ("HORT_AUTH_PROVIDER", None),
         ]);
         temp_env::with_vars(env, || {
             let err = Config::from_env().expect_err(
-                "boot must fail when HORT_TOKEN_EXCHANGE_ENABLED=true under AuthConfig::Disabled",
+                "boot must fail when HORT_TOKEN_EXCHANGE_ENABLED=true under \
+                 AuthConfig::Disabled without native tokens",
+            );
+            assert!(
+                matches!(err, ConfigError::TokenExchangeRequiresNativeTokens),
+                "expected TokenExchangeRequiresNativeTokens, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn config_boot_fails_when_token_exchange_on_and_oidc_but_cli_client_id_and_base_url_missing() {
+        // Under `AuthConfig::Oidc`, both `HORT_OIDC_CLI_CLIENT_ID` and
+        // `HORT_PUBLIC_BASE_URL` are required when
+        // `enable_token_exchange=true` (they back the
+        // `/.well-known/hort-client-config` discovery doc). This test
+        // pins that the `Oidc` branch still validates its required vars
+        // even after the `Disabled` branch was freed from the same
+        // requirement (regression guard for the auth-mode split).
+        // Note: `HORT_OIDC_ISSUER_URL=None` causes `ConfigError::Missing`
+        // in `parse_oidc_config` before reaching the token-exchange gate,
+        // so we provide a real value and leave `cli_client_id` absent.
+        let env = fs_env_auth(&[
+            ("HORT_TOKEN_EXCHANGE_ENABLED", Some("true")),
+            ("HORT_NATIVE_TOKENS_ENABLED", Some("true")),
+            ("HORT_OCI_TOKEN_SIGNING_KEY", Some("placeholder-pem")),
+            ("HORT_AUTH_PROVIDER", Some("oidc")),
+            (
+                "HORT_OIDC_ISSUER_URL",
+                Some("https://idp.example.com/realms/hort"),
+            ),
+            ("HORT_OIDC_AUDIENCE", Some("hort-server")),
+            // Absent — must surface in missing list.
+            ("HORT_OIDC_CLI_CLIENT_ID", None),
+            // Empty string: parse_public_base_url falls through to None.
+            ("HORT_PUBLIC_BASE_URL", Some("")),
+            ("HORT_TRUSTED_PROXY_CIDRS", Some("10.0.0.0/8")),
+        ]);
+        temp_env::with_vars(env, || {
+            let err = Config::from_env().expect_err(
+                "boot must fail when HORT_TOKEN_EXCHANGE_ENABLED=true under \
+                 AuthConfig::Oidc with HORT_OIDC_CLI_CLIENT_ID and \
+                 HORT_PUBLIC_BASE_URL unset",
             );
             match err {
                 ConfigError::TokenExchangeRequiresVars { missing } => {
                     assert!(
-                        missing.contains("HORT_OIDC_ISSUER_URL"),
-                        "missing list must name HORT_OIDC_ISSUER_URL; got {missing:?}"
-                    );
-                    assert!(
                         missing.contains("HORT_OIDC_CLI_CLIENT_ID"),
                         "missing list must name HORT_OIDC_CLI_CLIENT_ID; got {missing:?}"
+                    );
+                    assert!(
+                        missing.contains("HORT_PUBLIC_BASE_URL"),
+                        "missing list must name HORT_PUBLIC_BASE_URL; got {missing:?}"
+                    );
+                    assert!(
+                        !missing.contains("HORT_OIDC_ISSUER_URL"),
+                        "missing list must NOT name a var that is set; got {missing:?}"
                     );
                 }
                 other => panic!("expected TokenExchangeRequiresVars, got {other:?}"),

@@ -500,21 +500,27 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
     let authenticate = match &ctx.auth {
         AuthContext::Enabled { authenticate, .. } => authenticate.clone(),
         AuthContext::Disabled | AuthContext::BearerOnly { .. } => {
-            // Federation (`/exchange`) requires an OIDC IdP for the
-            // subject-token validation step. Under Disabled there is
-            // no auth at all; under BearerOnly the IdP slot is `None`
-            // (native-token validation only). Either way, federation
-            // is not configured — surface 503 rather than crashing
-            // the validator.
-            tracing::error!(
+            // The interactive OIDC login path requires
+            // `AuthContext::Enabled` (an OIDC `IdentityProvider`
+            // wired). Under `Disabled` or `BearerOnly`, no interactive
+            // IdP is configured — this is a legitimate operator
+            // configuration (federation-only deployment), not a
+            // composition bug. Return a clean 4xx so the
+            // operator/user gets a helpful message rather than a
+            // misleading 503.
+            tracing::info!(
                 auth = ?ctx.auth,
-                "/exchange invoked without an OIDC IdentityProvider — composition bug"
+                "/exchange (interactive): OIDC login not configured \
+                 on this server (subject_token_type=access_token)"
             );
             return error_outcome(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "temporarily_unavailable",
-                "auth subsystem not configured".to_string(),
-                metrics::RESULT_IDP_UNAVAILABLE,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "interactive OIDC login not configured on this server; \
+                 use subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+                 for federated exchange"
+                    .to_string(),
+                metrics::RESULT_BAD_REQUEST,
             );
         }
     };
@@ -2242,6 +2248,104 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
     }
 
+    // -- (h2) interactive-OIDC not configured returns 400 (not 503) ----------
+
+    /// Under `AuthContext::BearerOnly` (no OIDC IdP — simulates
+    /// `AuthConfig::Disabled` + native tokens), the interactive branch of
+    /// `/exchange` must return a clean 4xx (`invalid_request`) rather
+    /// than a 503. This pins the change from `error!(…composition bug)`
+    /// + 503 to `info!(…not configured)` + 400.
+    #[test]
+    fn exchange_interactive_returns_400_when_oidc_not_configured() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+                let (base, mocks) = build_mock_ctx(metrics_handle);
+                // BearerOnly: no OIDC IdP wired — mirrors
+                // AuthConfig::Disabled + native-tokens deployment.
+                let authenticate = Arc::new(AuthenticateUseCase::new_local_only(
+                    mocks.users.clone() as Arc<dyn UserRepository>,
+                    Vec::new(),
+                ));
+                let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![])));
+                let bearer_only_ctx =
+                    with_auth(&base, AuthContext::BearerOnly { authenticate, rbac });
+                let router = Router::new()
+                    .nest("/api/v1", token_exchange_routes())
+                    .with_state(bearer_only_ctx);
+                let body = happy_form("some-idp-token");
+                let resp = post_form(router, body).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "expected 400 not 503 when interactive OIDC not configured"
+                );
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "invalid_request");
+                let desc = v["error_description"].as_str().unwrap_or("");
+                assert!(
+                    desc.contains("interactive OIDC login not configured"),
+                    "description should explain the config state: {desc}"
+                );
+            });
+        });
+        // Metric: bad_request counter must fire (not idp_unavailable).
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_BAD_REQUEST),
+            1,
+            "expected bad_request counter; saw: {snap:?}"
+        );
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_IDP_UNAVAILABLE),
+            0,
+            "idp_unavailable must NOT fire for legitimately-unconfigured \
+             interactive path; saw: {snap:?}"
+        );
+    }
+
+    // -- (h3) federated-JWT branch returns 503 when validator not wired -------
+
+    /// When `federated_jwt_validator = None` (composition bug / pre-wiring),
+    /// the federated-JWT branch must return 503. This pins the composition
+    /// guard that ensures the ship-gate guardrail (anti-replay) is always
+    /// wired when federation is called.
+    #[test]
+    fn exchange_federated_returns_503_when_validator_not_wired() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+                // build_mock_ctx returns federated_jwt_validator = None
+                // (the default un-wired state).
+                let (base, _mocks) = build_mock_ctx(metrics_handle);
+                let router = Router::new()
+                    .nest("/api/v1", token_exchange_routes())
+                    .with_state(base);
+                let body = form_body(&[
+                    ("grant_type", EXCHANGE_GRANT_TYPE),
+                    (
+                        "subject_token",
+                        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.\
+                         eyJzdWIiOiJ0ZXN0In0.sig",
+                    ),
+                    ("subject_token_type", TOKEN_TYPE_JWT),
+                ]);
+                let resp = post_form(router, body).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "federated path must 503 when validator not wired"
+                );
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "temporarily_unavailable");
+            });
+        });
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_INTERNAL_ERROR),
+            1,
+            "expected internal_error counter for federation composition bug; saw: {snap:?}"
+        );
+    }
+
     // -- (i) success path — JIT new user ------------------------------------
 
     #[test]
@@ -2984,15 +3088,14 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
 
     // -- AuthContext::Disabled fallback --
 
-    /// Pins the
-    /// composition-bug-guard arm. The handler exposes a 503
-    /// `temporarily_unavailable` + `idp_unavailable` metric label
-    /// when reached with `AuthContext::Disabled` (production wiring
-    /// declines to mount `/exchange` when auth is off, so this is
-    /// strictly defensive — but the arm is real and a regression
-    /// would silently swallow the misconfiguration).
+    /// Pins the interactive-path fallback arm for `AuthContext::Disabled`.
+    /// Under federation-only deployments (no interactive IdP configured),
+    /// the `access_token` branch returns 400 `invalid_request` with a
+    /// clear message directing the caller to the `jwt` branch.
+    /// This is a legitimate operator configuration, not a composition bug,
+    /// so the metric label is `bad_request` (not `idp_unavailable`).
     #[test]
-    fn exchange_metric_fires_idp_unavailable_when_auth_disabled() {
+    fn exchange_metric_fires_bad_request_when_auth_disabled_interactive() {
         let snap = capture_full_snapshot(|| {
             rt().block_on(async {
                 // `build_mock_ctx` defaults to `AuthContext::Disabled`,
@@ -3005,18 +3108,33 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                     .with_state(base);
                 let body = happy_form("any-token");
                 let resp = post_form(router, body).await;
-                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "expected 400 for interactive path under Disabled"
+                );
                 let v = body_json(resp).await;
-                assert_eq!(v["error"], "temporarily_unavailable");
+                assert_eq!(v["error"], "invalid_request");
+                let desc = v["error_description"].as_str().unwrap_or("");
+                assert!(
+                    desc.contains("interactive OIDC login not configured"),
+                    "description must explain the config state: {desc}"
+                );
             });
         });
         assert_eq!(
-            counter_value(&snap, metrics::COUNTER, metrics::RESULT_IDP_UNAVAILABLE),
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_BAD_REQUEST),
             1,
-            "expected exactly one idp_unavailable increment; saw: {snap:?}"
+            "expected exactly one bad_request increment; saw: {snap:?}"
+        );
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_IDP_UNAVAILABLE),
+            0,
+            "idp_unavailable must NOT fire for legitimately-unconfigured \
+             interactive path; saw: {snap:?}"
         );
         assert!(
-            histogram_sample_count(&snap, metrics::HISTOGRAM, metrics::RESULT_IDP_UNAVAILABLE) >= 1,
+            histogram_sample_count(&snap, metrics::HISTOGRAM, metrics::RESULT_BAD_REQUEST) >= 1,
             "histogram must record on the AuthContext::Disabled exit path",
         );
     }

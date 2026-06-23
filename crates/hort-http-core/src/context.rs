@@ -530,11 +530,11 @@ pub struct AppContext {
     pub event_store: Arc<EventStorePublisher>,
     /// Multi-issuer JWT validator port consumed by
     /// the federation branch of `/auth/token-exchange` (ADR 0018).
-    /// `Some(_)` whenever `auth_enabled = true` and at least one
-    /// `OidcIssuer` row is reachable (composition constructs the adapter
-    /// against the Postgres `OidcIssuerRepository` unconditionally; the
-    /// `Option` wrapper lets the auth-disabled path keep a slot-shaped
-    /// signature without forcing a no-op stub).
+    /// Always `Some(_)` — wired unconditionally at composition time
+    /// regardless of `AuthConfig`/`auth_enabled` (composition constructs
+    /// the adapter against the Postgres `OidcIssuerRepository` on every
+    /// boot; the `Option` wrapper is retained so the handler's `None`-guard
+    /// in `exchange.rs` remains valid defense-in-depth).
     ///
     /// `pub(crate)` per ADR 0008 + the anti-pattern checklist:
     /// federation HTTP handlers call the
@@ -545,8 +545,9 @@ pub struct AppContext {
     /// `ServiceAccountRepository` consumed by the
     /// federation branch of `/auth/token-exchange`. The handler in this
     /// crate walks every SA's `federated_identities[].claims` against the
-    /// validated JWT claims to resolve the target SA. `Some(_)` when
-    /// `auth_enabled = true` (composition wires it against the same
+    /// validated JWT claims to resolve the target SA. Always `Some(_)` —
+    /// wired unconditionally at composition time regardless of
+    /// `AuthConfig`/`auth_enabled` (composition wires it against the same
     /// Postgres pool the apply pipeline uses; reads are bounded by the
     /// operator's CRD count, typically <100).
     ///
@@ -563,8 +564,10 @@ pub struct AppContext {
     /// — identical wiring shape to `federated_jwt_validator` /
     /// `service_accounts` above; the dep-graph "no adapter import in
     /// `hort-http-core`" rule is preserved (the guard port itself is
-    /// invoked inside `hort-app`, not here). `Some(_)` when
-    /// `auth_enabled = true` (same condition as the validator slot).
+    /// invoked inside `hort-app`, not here). Always `Some(_)` — wired
+    /// unconditionally at composition time regardless of
+    /// `AuthConfig`/`auth_enabled` (same unconditional wiring as the
+    /// validator and service-accounts slots).
     ///
     /// `pub(crate)` per ADR 0008: only the federation handler in this
     /// crate consumes this slot.
