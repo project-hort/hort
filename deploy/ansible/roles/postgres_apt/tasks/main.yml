@@ -1,7 +1,20 @@
 ---
-# postgres_apt role — install PostgreSQL via Debian apt, create the hort
-# database and two ADR 0009 roles (runtime DML + DDL/migrate), and harden
-# pg_hba.conf to local-only scram-sha-256.
+# postgres_apt role — install PostgreSQL via Debian apt, provision the hort
+# database and ADR 0009 roles (hort_admin DDL + hort_app_role runtime DML),
+# and harden pg_hba.conf to local-only scram-sha-256.
+#
+# Role names mirror the hort Helm chart model exactly (postgres-roles.md):
+#   hort_admin    — LOGIN, CREATEROLE; owns public schema; used by hort-migrate.
+#   hort_app_role — LOGIN, no CREATEROLE/CREATEDB; DML only; used by hort-server
+#                   and hort-worker.
+#   hort_retention_role — NOLOGIN; created by migration 004_events.sql (NOT here).
+#
+# IMPORTANT: do NOT add GRANT … ON ALL TABLES … TO hort_app_role anywhere in
+# this role.  That bulk grant lands on the append-only `events` table and
+# re-grants UPDATE/DELETE, breaking the audit invariant — PgEventStore::new()
+# then refuses to boot (postgres-roles.md "Run this recipe against a fresh
+# database only").  The only grants this role sets are the DEFAULT PRIVILEGES
+# that forward from hort_admin to hort_app_role for future objects.
 #
 # Debian 13 ships PostgreSQL 17; hort requires >= PG 16.  PG 17 satisfies it.
 # The role is idempotent: psql DO $$ blocks guard against duplicate creation.
@@ -22,13 +35,17 @@
     state: started
     enabled: true
 
-# ── DDL/migrate role ──────────────────────────────────────────────────────────
+# ── DDL/migrate role (hort_admin) ─────────────────────────────────────────────
+# hort_admin needs CREATEROLE: migration 004_events.sql issues
+# `CREATE ROLE hort_retention_role NOLOGIN` (inside a pg_roles-guarded DO block).
+# Without CREATEROLE the migrate job aborts with "permission denied to create role".
+#
 # The password is fed to psql via stdin (the shell `stdin:` param) rather than
 # the -c flag so that it never appears on the process argv and is therefore not
 # visible in /proc/<pid>/cmdline or ps output.  psql reads from stdin when
 # invoked with -f - (filename "-" means standard input).
 
-- name: Create DDL/migrate role (idempotent)
+- name: Create DDL/migrate role hort_admin (idempotent, CREATEROLE)
   ansible.builtin.command:
     argv:
       - psql
@@ -38,12 +55,14 @@
       - "-"
     stdin: |
       DO $$ BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_ddl_role }}') THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{{ postgres_apt_ddl_role }}') THEN
           CREATE ROLE {{ postgres_apt_ddl_role }}
-            LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+            WITH LOGIN CREATEROLE NOSUPERUSER NOCREATEDB
             PASSWORD '{{ hort_db_ddl_password }}';
         ELSE
-          ALTER ROLE {{ postgres_apt_ddl_role }} PASSWORD '{{ hort_db_ddl_password }}';
+          ALTER ROLE {{ postgres_apt_ddl_role }}
+            WITH LOGIN CREATEROLE
+            PASSWORD '{{ hort_db_ddl_password }}';
         END IF;
       END $$;
   become: true
@@ -51,9 +70,11 @@
   changed_when: true
   no_log: true
 
-# ── Runtime role ──────────────────────────────────────────────────────────────
+# ── Runtime role (hort_app_role) ──────────────────────────────────────────────
+# hort_app_role must NOT hold CREATEROLE or CREATEDB (runtime never creates
+# roles; only the migrate path does).
 
-- name: Create runtime DML role (idempotent)
+- name: Create runtime DML role hort_app_role (idempotent, no CREATEROLE)
   ansible.builtin.command:
     argv:
       - psql
@@ -63,12 +84,14 @@
       - "-"
     stdin: |
       DO $$ BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_runtime_role }}') THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{{ postgres_apt_runtime_role }}') THEN
           CREATE ROLE {{ postgres_apt_runtime_role }}
-            LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+            WITH LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
             PASSWORD '{{ hort_db_runtime_password }}';
         ELSE
-          ALTER ROLE {{ postgres_apt_runtime_role }} PASSWORD '{{ hort_db_runtime_password }}';
+          ALTER ROLE {{ postgres_apt_runtime_role }}
+            WITH LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+            PASSWORD '{{ hort_db_runtime_password }}';
         END IF;
       END $$;
   become: true
@@ -89,7 +112,7 @@
   changed_when: false
   register: postgres_apt_db_exists
 
-- name: Create hort database with DDL role as owner
+- name: Create hort database with hort_admin as owner
   ansible.builtin.command:
     argv:
       - createdb
@@ -104,31 +127,43 @@
   when: postgres_apt_db_exists.stdout.strip() != "1"
   changed_when: true
 
-# ── Grants ────────────────────────────────────────────────────────────────────
-# GRANT CONNECT + USAGE + DML on existing objects + ALTER DEFAULT PRIVILEGES
-# so future objects (created by migrations) are also accessible.
+# ── Schema ownership + privilege revocation ───────────────────────────────────
+# Mirror the canonical recipe from postgres-roles.md exactly:
 #
-# All GRANT / ALTER DEFAULT PRIVILEGES tasks below use `changed_when: true`.
-# This is a deliberate conservative choice: GRANT is an idempotent no-op when
-# the privilege already exists, but raw psql output does not include a
-# "already granted" signal that we could reliably parse to detect a true no-op.
-# Avoiding fragile check-queries (e.g. querying pg_class/information_schema) is
-# the safer trade-off — the cosmetic "changed" noise is preferable to a brittle
-# idempotency check.  If the community.postgresql collection were available its
-# postgresql_privs module would handle this transparently, but we intentionally
-# avoid that collection dependency.
+#   ALTER SCHEMA public OWNER TO hort_admin;       — DDL role owns schema
+#   REVOKE CREATE ON SCHEMA public FROM PUBLIC;    — runtime cannot create tables
+#   GRANT  USAGE  ON SCHEMA public TO hort_app_role;
+#
+# GRANT / REVOKE are idempotent no-ops when the privilege state already matches.
+# We use changed_when: true conservatively (see the task comment in the original
+# grants block: raw psql output has no "already set" signal we can parse reliably).
 
-- name: Grant CONNECT on database to runtime role
+- name: Set public schema owner to hort_admin
   ansible.builtin.command:
     argv:
       - psql
       - -v
       - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
       - -c
-      - "GRANT CONNECT ON DATABASE {{ postgres_apt_db_name }} TO {{ postgres_apt_runtime_role }};"
+      - "ALTER SCHEMA public OWNER TO {{ postgres_apt_ddl_role }};"
   become: true
   become_user: postgres
-  # See "Grants" block comment above for why changed_when: true is intentional.
+  changed_when: true
+
+- name: Revoke CREATE on public schema from PUBLIC (runtime cannot create tables)
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+  become: true
+  become_user: postgres
   changed_when: true
 
 - name: Grant USAGE on public schema to runtime role
@@ -143,43 +178,19 @@
       - "GRANT USAGE ON SCHEMA public TO {{ postgres_apt_runtime_role }};"
   become: true
   become_user: postgres
-  # See "Grants" block comment above for why changed_when: true is intentional.
   changed_when: true
 
-- name: Grant DML on existing tables to runtime role
-  ansible.builtin.command:
-    argv:
-      - psql
-      - -v
-      - ON_ERROR_STOP=1
-      - -d
-      - "{{ postgres_apt_db_name }}"
-      - -c
-      - >-
-        GRANT SELECT, INSERT, UPDATE, DELETE
-          ON ALL TABLES IN SCHEMA public
-          TO {{ postgres_apt_runtime_role }};
-  become: true
-  become_user: postgres
-  # See "Grants" block comment above for why changed_when: true is intentional.
-  changed_when: true
+# ── Default privileges for future objects ─────────────────────────────────────
+# ALTER DEFAULT PRIVILEGES applies only to objects hort_admin creates AFTER this
+# point.  It does NOT touch existing objects — which is correct for a fresh DB
+# (there are none yet) and safe on a re-run (idempotent: re-running ALTER DEFAULT
+# PRIVILEGES for a role+schema combination that already has the privilege is a
+# no-op in Postgres).
+#
+# DO NOT add GRANT … ON ALL TABLES … here.  See the "IMPORTANT" comment at the
+# top of this file.
 
-- name: Grant USAGE/SELECT on existing sequences to runtime role
-  ansible.builtin.command:
-    argv:
-      - psql
-      - -v
-      - ON_ERROR_STOP=1
-      - -d
-      - "{{ postgres_apt_db_name }}"
-      - -c
-      - "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {{ postgres_apt_runtime_role }};"
-  become: true
-  become_user: postgres
-  # See "Grants" block comment above for why changed_when: true is intentional.
-  changed_when: true
-
-- name: Set default privileges for future tables (DDL role creates, runtime role gets DML)
+- name: Set default privileges — future tables (hort_admin creates, hort_app_role gets DML)
   ansible.builtin.command:
     argv:
       - psql
@@ -195,10 +206,9 @@
           ON TABLES TO {{ postgres_apt_runtime_role }};
   become: true
   become_user: postgres
-  # See "Grants" block comment above for why changed_when: true is intentional.
   changed_when: true
 
-- name: Set default privileges for future sequences
+- name: Set default privileges — future sequences (USAGE + SELECT + UPDATE)
   ansible.builtin.command:
     argv:
       - psql
@@ -210,11 +220,10 @@
       - >-
         ALTER DEFAULT PRIVILEGES FOR ROLE {{ postgres_apt_ddl_role }}
           IN SCHEMA public
-          GRANT USAGE, SELECT
+          GRANT USAGE, SELECT, UPDATE
           ON SEQUENCES TO {{ postgres_apt_runtime_role }};
   become: true
   become_user: postgres
-  # See "Grants" block comment above for why changed_when: true is intentional.
   changed_when: true
 
 # ── Harden pg_hba.conf ────────────────────────────────────────────────────────
@@ -248,9 +257,9 @@
 # ── Apply pending PostgreSQL config before dependent roles connect ────────────
 # The pg_hba reload (scram-sha-256) and the tuning restart are notified above but
 # would otherwise flush only at end-of-play — AFTER hort-migrate (hort_systemd
-# role) connects as the scram-auth'd hort_ddl role over the socket. Without this
+# role) connects as the scram-auth'd hort_admin role over the socket. Without this
 # flush, the Debian-default `local all all peer` is still active at migrate time
-# and the migrate fails with "Peer authentication failed for user hort_ddl".
+# and the migrate fails with "Peer authentication failed for user hort_admin".
 # Flushing here makes the hardened pg_hba live before any later role connects.
 - name: Apply pending PostgreSQL config (pg_hba + tuning) before dependents connect
   ansible.builtin.meta: flush_handlers

@@ -11,11 +11,20 @@ postgres_apt_db_name: artifact_registry
 
 # Runtime role — least-privilege DML only (SELECT/INSERT/UPDATE/DELETE).
 # This is the DSN that hort-server (serve path) and hort-worker use.
-postgres_apt_runtime_role: hort_runtime
+# Must match the hardcoded role name in the hort migrations (hort_app_role).
+postgres_apt_runtime_role: hort_app_role
 
-# DDL/migrate role — CONNECT + CREATE + ALTER + DROP on the hort database.
+# DDL/migrate role — owns the database/schema, holds CREATEROLE so that
+# migration 004_events.sql can issue `CREATE ROLE hort_retention_role NOLOGIN`.
 # Used exclusively by hort-migrate (Type=oneshot) before hort-server starts.
-postgres_apt_ddl_role: hort_ddl
+# Must match the hardcoded role name in the hort migrations (hort_admin).
+postgres_apt_ddl_role: hort_admin
+
+# Retention role — NOLOGIN; created by migration 004_events.sql (NOT this role).
+# Defined here so the hort_systemd post-migrate grant task can reference it
+# without hardcoding.  Do NOT create this role in this role's tasks — leave it
+# to the migration.
+postgres_apt_retention_role: hort_retention_role
 
 # pg_hba.conf path for the Debian-packaged cluster (version-independent symlink).
 postgres_apt_hba_conf: /etc/postgresql/17/main/pg_hba.conf
