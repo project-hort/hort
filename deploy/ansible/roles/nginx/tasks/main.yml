@@ -34,13 +34,17 @@
     - Validate nginx config
     - Reload nginx
 
-- name: Deploy TLS hardening config (conf.d/ssl-hardening.conf)
-  ansible.builtin.template:
-    src: ssl-hardening.conf.j2
-    dest: /etc/nginx/conf.d/ssl-hardening.conf
-    owner: root
-    group: root
-    mode: "0644"
+# The TLS policy lives in the named vhost's SERVER block
+# (registry.hort.rs.conf.j2), which overrides nginx.conf's http defaults without
+# conflict. An http-level conf.d baseline duplicated server_tokens / ssl_protocols
+# / ssl_prefer_server_ciphers that Debian's stock nginx.conf already sets in the
+# http context — a duplicate-directive error (nginx -t fails). The default_server
+# blocks need no TLS policy (the 443 one ssl_reject_handshakes; the 80 one 444s).
+# Remove any previously-deployed copy.
+- name: Remove redundant ssl-hardening conf.d (TLS policy lives in the vhost server block)
+  ansible.builtin.file:
+    path: /etc/nginx/conf.d/ssl-hardening.conf
+    state: absent
   notify:
     - Validate nginx config
     - Reload nginx

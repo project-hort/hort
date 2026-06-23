@@ -64,11 +64,12 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
-    # TLS policy — Mozilla intermediate profile.  Defined at server level so
-    # this context wins over the http-level baseline in conf.d/ssl-hardening.conf
-    # (nginx: server-level directive overrides http-level).  The certbot-generated
-    # options-ssl-nginx.conf is intentionally NOT included here; this role owns
-    # the TLS policy.  Cipher list and protocol sourced from nginx_ssl_ciphers /
+    # TLS policy — Mozilla intermediate profile, set at SERVER level so it
+    # overrides nginx.conf's http defaults for real client connections without
+    # duplicating them (an http-level conf.d clashes with the stock nginx.conf
+    # http directives — duplicate-directive error). The certbot-generated
+    # options-ssl-nginx.conf is intentionally NOT included; this role owns the
+    # TLS policy. Cipher list + protocols sourced from nginx_ssl_ciphers /
     # nginx_ssl_protocols in group_vars/all.yml — single definition, no duplication.
     ssl_protocols {{ nginx_ssl_protocols }};
     ssl_prefer_server_ciphers off;
@@ -84,6 +85,11 @@ server {
     # Security headers (M7)
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "no-referrer" always;
+
+    # Suppress the nginx version (Server header / error pages). Set at server
+    # level — NOT an http-level conf.d — so it does not duplicate the directive
+    # Debian's stock nginx.conf already sets in the http context.
+    server_tokens off;
 
     # Bound the body — large enough for OCI base images and Cargo crates.
     # Stream uploads directly to hort-server; do not spool to disk.
