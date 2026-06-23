@@ -1,0 +1,46 @@
+## /etc/audit/rules.d/hort-audit.rules
+## Managed by Ansible (base role) — do not edit by hand.
+##
+## Baseline audit ruleset (CIS-aligned, Debian default rules extended).
+## Covers: identity changes, privilege escalation, SSH config, audit config.
+## Custom hort-service AppArmor confinement profiles are a documented follow-on;
+## these rules capture the host-level incident-response telemetry surface.
+
+## ── Buffer sizing ─────────────────────────────────────────────────────────────
+-b 8192
+
+## ── Failure mode ─────────────────────────────────────────────────────────────
+## 1 = print failure to syslog (not panic); prevents DoS on audit subsystem
+-f 1
+
+## ── Identity and authentication changes ──────────────────────────────────────
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+
+## ── SSH configuration changes ────────────────────────────────────────────────
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+
+## ── Audit configuration self-protection ──────────────────────────────────────
+-w /etc/audit/ -p wa -k audit_config
+-w /etc/audit/rules.d/ -p wa -k audit_config
+-w /sbin/auditctl -p x -k audit_tools
+-w /sbin/auditd -p x -k audit_tools
+
+## ── Privileged command execution ─────────────────────────────────────────────
+-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=-1 -k priv_exec
+-a always,exit -F arch=b32 -S execve -F euid=0 -F auid>=1000 -F auid!=-1 -k priv_exec
+
+## ── Module load/unload ────────────────────────────────────────────────────────
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
+-a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules
+
+## ── Make the configuration immutable (must be last rule) ─────────────────────
+## Requires reboot to change rules — prevents an attacker from clearing audit.
+{% if base_audit_immutable | default(true) | bool %}
+-e 2
+{% endif %}

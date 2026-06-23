@@ -35,3 +35,18 @@ base_unattended_reboot_time: "03:30"
 # Default: min(RAM/2, 4096) MB — evaluated at play time via ansible_memtotal_mb.
 # Override in group_vars/ or host_vars/ with an explicit integer (MB).
 base_zram_size: "{{ [ansible_memtotal_mb // 2, 4096] | min }}"
+
+# ── auditd (L7) ───────────────────────────────────────────────────────────────
+# base_audit_immutable — append -e 2 (immutable ruleset) to the audit rules.
+# Requires a reboot to change rules; prevents an attacker who gains root from
+# disabling audit without a reboot.  Set to false if frequent rule changes are
+# needed on the host (not recommended for production).
+base_audit_immutable: true
+
+# ── Persistent journald (L7) ──────────────────────────────────────────────────
+# Maximum total disk usage for the persistent journal store (/var/log/journal).
+# Debian default (volatile) retains no post-reboot history; persistent storage
+# is essential for post-incident analysis.
+# 1G is a conservative cap for a single-service VPS; raise to 2G or more if
+# you have disk headroom and need longer incident history.
+base_journald_max_use: "1G"

@@ -179,3 +179,76 @@
     name: systemd-zram-setup@zram0.service
     state: started
     enabled: true
+
+# ── auditd baseline (L7) ──────────────────────────────────────────────────────
+
+- name: Install auditd
+  ansible.builtin.apt:
+    name: auditd
+    state: present
+
+- name: Ensure /etc/audit/rules.d directory exists
+  ansible.builtin.file:
+    path: /etc/audit/rules.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Deploy hort audit rules
+  ansible.builtin.template:
+    src: hort-audit.rules.j2
+    dest: /etc/audit/rules.d/hort-audit.rules
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Reload auditd rules
+
+- name: Enable and start auditd
+  ansible.builtin.service:
+    name: auditd
+    state: started
+    enabled: true
+
+# ── Persistent journald (L7) ──────────────────────────────────────────────────
+
+- name: Ensure journald drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy persistent journald drop-in
+  ansible.builtin.template:
+    src: hort-journald.conf.j2
+    dest: /etc/systemd/journald.conf.d/hort-persistent.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart journald
+
+# ── AppArmor — nginx enforce mode (L7) ────────────────────────────────────────
+# Install AppArmor and enforce the distro-provided nginx profile.
+# Custom hort-server/hort-worker AppArmor profiles are a documented follow-on
+# (the systemd isolation block in M1 already confines those services).
+
+- name: Install AppArmor packages
+  ansible.builtin.apt:
+    name:
+      - apparmor
+      - apparmor-utils
+    state: present
+
+- name: Enable and start AppArmor service
+  ansible.builtin.service:
+    name: apparmor
+    state: started
+    enabled: true
+
+- name: Enforce distro nginx AppArmor profile
+  ansible.builtin.command: aa-enforce /etc/apparmor.d/usr.sbin.nginx
+  register: base_aa_enforce_nginx
+  changed_when: "'Setting' in base_aa_enforce_nginx.stdout"
+  failed_when: base_aa_enforce_nginx.rc != 0
