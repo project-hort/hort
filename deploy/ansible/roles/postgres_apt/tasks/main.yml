@@ -23,6 +23,10 @@
     enabled: true
 
 # ── DDL/migrate role ──────────────────────────────────────────────────────────
+# The password is fed to psql via stdin (the shell `stdin:` param) rather than
+# the -c flag so that it never appears on the process argv and is therefore not
+# visible in /proc/<pid>/cmdline or ps output.  psql reads from stdin when
+# invoked with -f - (filename "-" means standard input).
 
 - name: Create DDL/migrate role (idempotent)
   ansible.builtin.command:
@@ -30,17 +34,18 @@
       - psql
       - -v
       - ON_ERROR_STOP=1
-      - -c
-      - >-
-        DO $$ BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_ddl_role }}') THEN
-            CREATE ROLE {{ postgres_apt_ddl_role }}
-              LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
-              PASSWORD '{{ hort_db_ddl_password }}';
-          ELSE
-            ALTER ROLE {{ postgres_apt_ddl_role }} PASSWORD '{{ hort_db_ddl_password }}';
-          END IF;
-        END $$;
+      - -f
+      - "-"
+    stdin: |
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_ddl_role }}') THEN
+          CREATE ROLE {{ postgres_apt_ddl_role }}
+            LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+            PASSWORD '{{ hort_db_ddl_password }}';
+        ELSE
+          ALTER ROLE {{ postgres_apt_ddl_role }} PASSWORD '{{ hort_db_ddl_password }}';
+        END IF;
+      END $$;
   become: true
   become_user: postgres
   changed_when: true
@@ -54,17 +59,18 @@
       - psql
       - -v
       - ON_ERROR_STOP=1
-      - -c
-      - >-
-        DO $$ BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_runtime_role }}') THEN
-            CREATE ROLE {{ postgres_apt_runtime_role }}
-              LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
-              PASSWORD '{{ hort_db_runtime_password }}';
-          ELSE
-            ALTER ROLE {{ postgres_apt_runtime_role }} PASSWORD '{{ hort_db_runtime_password }}';
-          END IF;
-        END $$;
+      - -f
+      - "-"
+    stdin: |
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ postgres_apt_runtime_role }}') THEN
+          CREATE ROLE {{ postgres_apt_runtime_role }}
+            LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+            PASSWORD '{{ hort_db_runtime_password }}';
+        ELSE
+          ALTER ROLE {{ postgres_apt_runtime_role }} PASSWORD '{{ hort_db_runtime_password }}';
+        END IF;
+      END $$;
   become: true
   become_user: postgres
   changed_when: true
