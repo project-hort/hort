@@ -57,12 +57,6 @@
     port: "443"
     proto: tcp
 
-- name: Deny external access to hort API port ({{ hort_api_port }})
-  community.general.ufw:
-    rule: deny
-    port: "{{ hort_api_port }}"
-    proto: tcp
-
 - name: Deny external access to PostgreSQL port (5432) — belt-and-suspenders
   community.general.ufw:
     rule: deny
