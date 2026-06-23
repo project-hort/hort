@@ -2,14 +2,16 @@
 # Native flavor — bare-metal hort-server binary + systemd units.
 #
 # Role execution order:
-#   base          — (Task 4) OS hardening, swap, unattended-upgrades
+#   base          — OS hardening: firewall (ufw), sysctl, SSH hardening,
+#                   unattended-upgrades, zram compressed-RAM swap,
+#                   auditd baseline, persistent journald, nginx AppArmor enforce
 #   postgres_apt  — (Task 9) PostgreSQL via apt (Debian 13); two ADR-0009 roles
 #   hort_binaries — (Task 9) download + cosign-verify hort-server/worker release binaries
 #   hort_systemd  — (Task 9) native systemd units (migrate.service → server.service)
-#   nginx         — (Task 4) TLS-terminating reverse proxy
-#   certbot       — (Task 4) Let's Encrypt certificate issuance + renewal
-#   fail2ban      — (Task 4) brute-force protection
-#   gitops        — (Task 4) syncs files/gitops/ tree to hort_config_dir on the host
+#   nginx         — TLS-terminating reverse proxy
+#   certbot       — Let's Encrypt certificate issuance + renewal
+#   fail2ban      — brute-force protection
+#   gitops        — syncs files/gitops/ tree to hort_config_dir on the host
 
 - name: Deploy hort (native flavor)
   hosts: hort

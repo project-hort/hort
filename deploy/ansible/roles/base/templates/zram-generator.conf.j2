@@ -1,0 +1,19 @@
+# /etc/systemd/zram-generator.conf
+# Managed by Ansible (base role) — do not edit by hand.
+#
+# systemd-zram-generator creates a compressed RAM swap device (/dev/zram0).
+# Compressed RAM swap keeps sensitive pages (secrets, DB buffers) off physical
+# disk while still giving the kernel a pressure-relief valve.
+#
+# base_zram_size controls the uncompressed logical size of the zram device.
+# The lz4 compressor typically achieves 2:1–3:1 on mixed workloads, so a
+# 2048 MB logical device consumes roughly 700–1000 MB of physical RAM.
+# Default: min(RAM/2, 4096) MB — evaluated in Ansible, not by the generator.
+#
+# Override in group_vars/ or host_vars/:
+#   base_zram_size: 1024   # explicit MB value
+
+[zram0]
+zram-size = {{ base_zram_size }}
+compression-algorithm = lz4
+swap-priority = 100

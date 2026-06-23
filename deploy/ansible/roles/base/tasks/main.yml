@@ -148,3 +148,34 @@
     mode: "0600"
     validate: /usr/local/bin/hort-validate-sshd-dropin %s
   notify: Reload sshd
+
+# ── zram compressed-RAM swap (L6) ─────────────────────────────────────────────
+# systemd-zram-generator is preferred over disk swap: no secrets/DB pages reach
+# physical storage, no writeback latency, no swap file/partition to size at
+# provision time.  lz4 compressor: lowest CPU overhead, suitable for mixed
+# Rust-service + PostgreSQL workloads.  dm-crypt random-key swap would also keep
+# secrets off disk, but adds a device-mapper dependency and boot-time complexity
+# that systemd-zram-generator avoids entirely.
+
+- name: Install systemd-zram-generator
+  ansible.builtin.apt:
+    name: systemd-zram-generator
+    state: present
+
+- name: Deploy zram-generator config
+  ansible.builtin.template:
+    src: zram-generator.conf.j2
+    dest: /etc/systemd/zram-generator.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Reload systemd unit files (picks up zram-setup@.service)
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start zram swap (zram0)
+  ansible.builtin.systemd:
+    name: systemd-zram-setup@zram0.service
+    state: started
+    enabled: true
