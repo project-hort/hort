@@ -62,7 +62,11 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    # No ssl_dhparam: the webroot ACME model (certbot certonly) does NOT create
+    # /etc/letsencrypt/ssl-dhparams.pem — only the --nginx plugin does, and we
+    # don't use it. nginx 1.11.0+ uses built-in RFC 7919 ffdhe2048 params when
+    # none is configured, so DHE suites still negotiate safe parameters (and
+    # TLS 1.3 uses none at all). Referencing the missing file fails nginx -t.
 
     # TLS policy — Mozilla intermediate profile, set at SERVER level so it
     # overrides nginx.conf's http defaults for real client connections without
