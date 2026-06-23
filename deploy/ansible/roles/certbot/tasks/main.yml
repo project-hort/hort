@@ -25,6 +25,20 @@
 #   registry_fqdn  — the FQDN to certify (default: registry.hort.rs)
 #   le_email       — Let's Encrypt registration email (no default; must be set)
 
+# Guard: fail early if le_email is missing or empty rather than letting certbot
+# fail with a cryptic upstream error.  Set le_email in group_vars/production/
+# or pass --extra-vars le_email=admin@example.com before running the play.
+- name: Assert le_email is defined and non-empty
+  ansible.builtin.assert:
+    that:
+      - le_email is defined
+      - le_email | length > 0
+    fail_msg: >-
+      le_email must be set to a valid email address before running the certbot role.
+      Set it in group_vars/production/ or pass --extra-vars le_email=<address>.
+      Let's Encrypt requires a registration email for certificate issuance and
+      expiry notifications.
+
 - name: Install certbot (webroot plugin is built-in; no nginx plugin needed)
   ansible.builtin.apt:
     name: certbot
@@ -34,6 +48,11 @@
 # Idempotency guard: the live chain file only exists after a successful
 # issuance.  If it is absent certbot runs; if it is present the task is
 # a no-op (creates: semantics).
+#
+# --staging flag: when certbot_staging is true the certificate is issued by
+# the Let's Encrypt staging CA (not trusted by browsers) so that test runs do
+# not consume production rate-limit quota.  Set certbot_staging: false (the
+# default in defaults/main.yml) for all production deployments.
 - name: Issue Let's Encrypt certificate for {{ registry_fqdn }}
   ansible.builtin.command:
     cmd: >-
@@ -43,6 +62,7 @@
       --non-interactive
       --agree-tos
       -m {{ le_email }}
+      {{ '--staging' if certbot_staging else '' }}
     creates: /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem
   notify:
     - Render nginx vhost (cert present)
