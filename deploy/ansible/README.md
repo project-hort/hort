@@ -177,6 +177,29 @@ ansible-playbook -i inventory/production/hosts.ini site-podman.yml \
 | `fail2ban` | 4 | SSH + nginx auth brute-force protection |
 | `gitops` | 4 | Sync gitops config tree; restart hort-server; mint operator tokens |
 
+## certbot operations
+
+### Switching from staging to production certificates
+
+Setting `certbot_staging: false` in your inventory after an initial staging run
+will **not** automatically re-issue a production certificate.  The issuance task
+uses a `creates:` guard (`/etc/letsencrypt/live/<fqdn>/fullchain.pem`) that skips
+certbot entirely while any certificate chain exists — staging or production.
+
+To force re-issuance with a production certificate:
+
+```bash
+# On the managed host:
+sudo certbot delete --cert-name <fqdn>
+# Or remove the live directory directly:
+sudo rm -rf /etc/letsencrypt/live/<fqdn> /etc/letsencrypt/archive/<fqdn> \
+            /etc/letsencrypt/renewal/<fqdn>.conf
+```
+
+Then re-run the playbook with `certbot_staging: false`.  The `creates:` guard
+will now find no existing chain and certbot will issue a fresh production
+certificate.
+
 ## CI token exchange recipe
 
 CI pipelines authenticate to hort-server using the RFC 8693 token exchange
