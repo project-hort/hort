@@ -23,6 +23,19 @@ Beta release. The feature set is described in the documentation under `docs/`.
   federation — and CI workflows that run hort as its own public pull-through
   registry (ADR 0034 *public dogfood deployment*).
 
+### Changed
+
+- **Federated CI OIDC token exchange is now independent of interactive-OIDC
+  configuration.** `POST /api/v1/auth/exchange` serves the federated-JWT branch
+  (GitHub Actions / GitLab CI → gitops `OidcIssuer` rows) with
+  `HORT_AUTH_PROVIDER=disabled`, requiring only `HORT_NATIVE_TOKENS_ENABLED=true`
+  — no interactive identity provider (`HORT_OIDC_ISSUER_URL` /
+  `HORT_OIDC_CLI_CLIENT_ID` / Keycloak) is needed. The interactive device-flow
+  path and its `/.well-known/hort-client-config` discovery doc stay gated on
+  `HORT_AUTH_PROVIDER=oidc`. The three federation ship-gate guardrails
+  (JWT-replay seen-set, `aud`→ServiceAccount binding, empty-claims fail-closed)
+  are unchanged.
+
 ### Fixed
 
 - **OCI push no longer fails on the blob-existence pre-check under a quarantine
