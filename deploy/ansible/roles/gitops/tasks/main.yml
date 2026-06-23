@@ -180,6 +180,7 @@
       --name maintainer-dev
       --permission read
       --output file:/run/secrets/hort-dev.token
+  environment: "{{ gitops_admin_env }}"
   changed_when: true
   # Note: idempotency is enforced by hort-server itself (exit 0, no reissue
   # if the token already exists).  changed_when: true is intentional — we
@@ -194,4 +195,5 @@
       --name maintainer-curator
       --permission curate
       --output file:/run/secrets/hort-curator.token
+  environment: "{{ gitops_admin_env }}"
   changed_when: true

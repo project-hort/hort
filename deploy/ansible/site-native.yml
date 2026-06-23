@@ -23,6 +23,13 @@
     # hort-server runs as a system service; admin commands are direct.
     gitops_admin_cmd: "hort-server admin"
     gitops_server_systemd_scope: "system"
+    # The bare `hort-server admin` process has no systemd EnvironmentFile, so it
+    # needs HORT_DATABASE_URL in its environment to reach the DB. issue-svc-token
+    # is a runtime CLI subcommand → the hort_app_role runtime DSN (postgres-roles.md).
+    # Mirrors hort-server.env.j2's HORT_DATABASE_URL (socket form, URL-encoded pw).
+    gitops_admin_env:
+      # yamllint disable-line rule:line-length
+      HORT_DATABASE_URL: "postgres://{{ postgres_apt_runtime_role }}:{{ hort_db_runtime_password | urlencode | regex_replace('/', '%2F') }}@%2Fvar%2Frun%2Fpostgresql/{{ postgres_apt_db_name }}"
 
   roles:
     - role: base
