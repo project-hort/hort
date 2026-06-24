@@ -737,9 +737,47 @@ async fn render_pypi_file_response(
 /// response (a proxy member's upstream-pull error surfaced verbatim — 502 /
 /// tampering / ingest-fail). The hosted/proxy member paths already enforce
 /// visibility + quarantine; the virtual layer only chooses the member.
-enum VirtualMemberDownload {
+pub(crate) enum VirtualMemberDownload {
     Found(hort_domain::entities::artifact::Artifact),
     Rendered(Response),
+}
+
+/// Resolve the authoritative virtual member for a coordinate — ADR 0031
+/// name-level pinning + first-authoritative walk, all in `hort-app`.
+///
+/// Shared by the wheel download ([`serve_virtual_pypi_file`]) and the PEP 658
+/// `.metadata` endpoint
+/// ([`crate::metadata_endpoint::serve_pep658_metadata`]'s virtual branch) so
+/// BOTH pick the SAME member: the served `.metadata` bytes always correspond
+/// to the wheel the download path would serve, never a different member's
+/// (a cross-member confusion vector). Returns the chosen artifact, a
+/// pre-rendered proxy-error response (surfaced verbatim — no fall-through), or
+/// `None` when no eligible member serves the coordinate.
+pub(crate) async fn resolve_virtual_member_artifact(
+    ctx: &Arc<AppContext>,
+    virtual_repo: &hort_domain::entities::repository::Repository,
+    project: &str,
+    artifact_path: &str,
+    filename: &str,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Option<VirtualMemberDownload>, ApiError> {
+    ctx.virtual_resolution_use_case
+        .resolve_download(
+            virtual_repo,
+            actor,
+            // Phase 1 — non-proxy name presence (reuses the member's own
+            // index source so the pinning signal matches the index path).
+            move |member| async move {
+                pypi_member_name_presence(ctx, &member, project, actor).await
+            },
+            // Phase 2 — per-member coordinate fetch (hosted lookup / proxy
+            // pull), classified for the first-authoritative walk.
+            move |member| async move {
+                pypi_member_coord_fetch(ctx, &member, project, artifact_path, filename, actor).await
+            },
+        )
+        .await
+        .map_err(ApiError::from)
 }
 
 /// Transparent virtual file download (ADR 0031). Resolves the authoritative
@@ -757,26 +795,16 @@ async fn serve_virtual_pypi_file(
     filename: &str,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    let resolved: Option<VirtualMemberDownload> =
-        ctx.virtual_resolution_use_case
-            .resolve_download(
-                virtual_repo,
-                actor,
-                // Phase 1 — non-proxy name presence (reuses the member's own
-                // index source so the pinning signal matches the index path).
-                move |member| async move {
-                    pypi_member_name_presence(ctx, &member, project, actor).await
-                },
-                // Phase 2 — per-member coordinate fetch (hosted lookup / proxy
-                // pull), classified for the first-authoritative walk.
-                move |member| async move {
-                    pypi_member_coord_fetch(ctx, &member, project, artifact_path, filename, actor)
-                        .await
-                },
-            )
-            .await?;
-
-    match resolved {
+    match resolve_virtual_member_artifact(
+        ctx,
+        virtual_repo,
+        project,
+        artifact_path,
+        filename,
+        actor,
+    )
+    .await?
+    {
         Some(VirtualMemberDownload::Found(artifact)) => {
             render_pypi_file_response(ctx, artifact, actor).await
         }
@@ -4860,6 +4888,92 @@ mod tests {
         // Body bytes match.
         let body = to_bytes(res.into_body(), 8192).await.unwrap();
         assert_eq!(body.as_ref(), payload);
+    }
+
+    /// PEP 658 `.metadata` through a VIRTUAL repo routes to the authoritative
+    /// member and serves ITS metadata bytes. Regression for the bug where the
+    /// endpoint served against the virtual repo key directly (no artifacts
+    /// there) and 404'd — which makes pip's PEP 658 fetch fail and blocks
+    /// install-through-virtual (surfaced by the `clients/pypi-virtual` E2E;
+    /// this pins it in fast CI without the full stack).
+    #[tokio::test]
+    async fn metadata_endpoint_virtual_routes_to_member_metadata() {
+        let h = harness();
+        // Hosted member with a released wheel + its wheel_metadata CAS row.
+        let member = insert_repo(&h, "pypi-member");
+        let payload = b"Metadata-Version: 2.1\nName: example\nVersion: 1.0.0\n";
+        let (_artifact, _hex) = seed_wheel_with_cas_metadata(
+            &h,
+            member.id,
+            "example",
+            "example-1.0.0-py3-none-any.whl",
+            QuarantineStatus::Released,
+            payload,
+        )
+        .await;
+        // Virtual repo aggregating the member.
+        let mut virt = sample_repository();
+        virt.key = "pypi-virt".into();
+        virt.format = RepositoryFormat::Pypi;
+        virt.repo_type = RepositoryType::Virtual;
+        h.repositories.insert(virt.clone());
+        h.repositories.seed_virtual_member(virt.id, member.id);
+
+        let router = router(h.ctx.clone());
+        let res = router
+            .oneshot(
+                Request::get(
+                    "/pypi/pypi-virt/simple/example/\
+                     example-1.0.0-py3-none-any.whl.metadata",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "virtual .metadata must route to the member (not 404 against the virtual)"
+        );
+        let body = to_bytes(res.into_body(), 8192).await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            payload,
+            "served bytes must be the member's wheel METADATA"
+        );
+    }
+
+    /// Virtual `.metadata` where no member holds the wheel → 404 (never a
+    /// proxy fall-through), matching the wheel-download virtual path.
+    #[tokio::test]
+    async fn metadata_endpoint_virtual_no_member_has_wheel_returns_404() {
+        let h = harness();
+        let member = insert_repo(&h, "pypi-member-empty");
+        let mut virt = sample_repository();
+        virt.key = "pypi-virt-empty".into();
+        virt.format = RepositoryFormat::Pypi;
+        virt.repo_type = RepositoryType::Virtual;
+        h.repositories.insert(virt.clone());
+        h.repositories.seed_virtual_member(virt.id, member.id);
+
+        let router = router(h.ctx.clone());
+        let res = router
+            .oneshot(
+                Request::get(
+                    "/pypi/pypi-virt-empty/simple/absent/\
+                     absent-1.0.0-py3-none-any.whl.metadata",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "no member serves the coordinate → 404"
+        );
     }
 
     /// Anti-enumeration on the `.metadata` endpoint. Anonymous caller
