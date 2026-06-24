@@ -431,15 +431,31 @@ impl OciTokenExchangeUseCase {
         let rbac = self.rbac.load();
         match scope.resource_type {
             ResourceType::Repository => {
-                // Resolve the repo by key. A miss means the user
-                // requested a scope on a repo they cannot see; per
-                // anti-enumeration discipline we surface "no grant"
-                // for that scope (NOT a 404), so the OCI client falls
-                // through to the storage layer's existing
-                // NAME_UNKNOWN handling.
+                // Resolve the OWNING repo. OCI routes are
+                // `/v2/:repo_key/*tail`, so the hort repo is keyed by the
+                // FIRST path segment while the Distribution-Spec scope
+                // `resource_name` is the FULL `<repo_key>/<image>` name a
+                // real client sends (e.g. `dockerhub-proxy/library/alpine`).
+                // Resolve by the first segment so the mint-side grant
+                // matches the consume-side gate, which resolves the same
+                // way (`WriteRepoAccess` / `ReadRepoAccess` use the
+                // `:repo_key` route param). Looking up the full name as a
+                // key would always miss for one-repo-many-images mounts —
+                // empty `access[]` — and silently deny gated pull-through
+                // and hosted push.
+                //
+                // A miss still means the user requested a scope on a repo
+                // they cannot see; per anti-enumeration discipline we
+                // surface "no grant" for that scope (NOT a 404), so the
+                // OCI client falls through to the storage layer's existing
+                // NAME_UNKNOWN handling. The echoed `AccessEntry.name`
+                // (built in `exchange`) stays the FULL `resource_name` per
+                // the Distribution Spec — only the authz lookup uses the
+                // first segment.
+                let repo_key = scope_name_to_repo_key(&scope.resource_name);
                 let repo_id = match self
                     .repo_access
-                    .find_repo_id_by_key_unchecked(&scope.resource_name)
+                    .find_repo_id_by_key_unchecked(repo_key)
                     .await
                 {
                     Ok(Some(id)) => id,
@@ -641,6 +657,25 @@ fn synthesize_principal_from_jwt(claims: &OciAccessClaims) -> CallerPrincipal {
 /// port is itself a misconfiguration and mismatches → 400.
 fn normalize_service(s: &str) -> String {
     s.trim().to_ascii_lowercase()
+}
+
+/// Map a Distribution-Spec repository scope `resource_name` to the hort
+/// repo key that owns it.
+///
+/// OCI routes are `/v2/:repo_key/*tail` — the hort repo is keyed by the
+/// FIRST path segment and the image lives in the tail. The scope's
+/// `resource_name` carries the FULL `<repo_key>/<image>` name (e.g.
+/// `dockerhub-proxy/library/alpine`), so the owning repo key is
+/// everything before the first `/`. A name with no `/` (a bare repo
+/// scope such as `hort-oci`) is its own key. This mirrors
+/// `hort_http_oci::v2_auth::path_to_scope`'s `split_once('/')` and the
+/// first-segment resolution the `/v2/*` consume path uses, so the
+/// mint-side grant and the consume-side gate agree on the same repo.
+fn scope_name_to_repo_key(resource_name: &str) -> &str {
+    resource_name
+        .split_once('/')
+        .map(|(key, _image)| key)
+        .unwrap_or(resource_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1737,6 +1772,71 @@ mod tests {
                 "exactly MAX_SCOPES must be accepted (cap is strictly greater-than): {:?}",
                 res.err()
             );
+        });
+    }
+
+    // -- scope_name_to_repo_key (first-segment resolution) -------------
+
+    #[test]
+    fn scope_name_to_repo_key_extracts_first_segment() {
+        // Full <repo_key>/<image> names resolve to the first segment.
+        assert_eq!(
+            scope_name_to_repo_key("dockerhub-proxy/library/alpine"),
+            "dockerhub-proxy"
+        );
+        assert_eq!(scope_name_to_repo_key("myrepo/library/nginx"), "myrepo");
+        assert_eq!(scope_name_to_repo_key("a/b/c/d"), "a");
+        // A bare name (no image) is its own key.
+        assert_eq!(scope_name_to_repo_key("hort-oci"), "hort-oci");
+        // Degenerate leading slash → empty first segment (harmless: an
+        // empty key misses find_by_key → no grant).
+        assert_eq!(scope_name_to_repo_key("/x"), "");
+    }
+
+    /// Scope→repo-key resolution: a realistic FULL Distribution-Spec
+    /// name `<repo_key>/<image>` resolves to the hort repo keyed by the
+    /// FIRST segment (`/v2/:repo_key/*tail`), grants the action, and
+    /// ECHOES the full name in the `AccessEntry` (spec conformance).
+    /// Regression for the empty-`access[]` bug where the full name was
+    /// looked up whole and always missed.
+    #[test]
+    fn exchange_resolves_repo_by_first_segment_of_full_scope_name() {
+        capture_async(|| async {
+            let (uc, tokens, users, repos) = make_use_case(vec![], true);
+            // admin → user-leg short-circuit; full cap → cap-leg allows.
+            let (plaintext, _user_id) = seed_pat_row(
+                &tokens,
+                &users,
+                true,
+                vec![Permission::Read, Permission::Write, Permission::Delete],
+            );
+            // hort repo keyed by the FIRST segment only.
+            repos.insert(build_repo("myrepo"));
+
+            let resp = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    // Full <repo_key>/<image> name, as crane/docker send.
+                    scopes: vec!["repository:myrepo/library/nginx:pull".into()],
+                    client_ip: Some(ip()),
+                })
+                .await
+                .expect("full-name scope must mint");
+
+            assert_eq!(
+                resp.granted_subset.len(),
+                1,
+                "the full-name scope must resolve and grant: {:?}",
+                resp.granted_subset
+            );
+            let entry = &resp.granted_subset[0];
+            assert_eq!(
+                entry.name, "myrepo/library/nginx",
+                "AccessEntry must echo the FULL requested name (spec), not the repo key"
+            );
+            assert_eq!(entry.resource_type, "repository");
+            assert_eq!(entry.actions, vec!["pull".to_string()]);
         });
     }
 

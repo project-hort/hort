@@ -843,6 +843,68 @@ fn v2_auth_single_scope_mints_200_with_granted_pull() {
     );
 }
 
+// Real-client-shaped scope: the FULL Distribution-Spec name
+// `<repo_key>/<image>` (what crane/docker actually send) must resolve to
+// the hort repo keyed by the FIRST segment (`/v2/:repo_key/*tail`), grant
+// the action, and the minted access[] echoes the full name. Regression for
+// the scope→repo-key resolution bug, where the full name was looked up
+// whole as a key → always missed → empty access[] → gated pull-through and
+// hosted push silently denied.
+#[test]
+fn v2_auth_full_image_name_scope_resolves_and_grants_pull() {
+    let (status, body_json) = run(async {
+        let h = build_harness();
+        let creds = format!("oauth2:{}", h.plaintext_pat);
+        let basic = base64::engine::general_purpose::STANDARD.encode(creds);
+        let router =
+            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        // repo key is "myrepo"; the image segment "library/nginx" rides
+        // the tail. The scope carries the FULL Distribution-Spec name.
+        let resp = router
+            .oneshot(
+                Request::get(
+                    "/v2/auth?service=hort.example.com\
+                     &scope=repository:myrepo/library/nginx:pull",
+                )
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    });
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "full-name scope must mint: {body_json}"
+    );
+    let jwt = body_json["token"].as_str().expect("token present");
+    let access = decode_jwt_access(jwt);
+    let entry = access
+        .iter()
+        .find(|e| e["name"] == "myrepo/library/nginx")
+        .unwrap_or_else(|| {
+            panic!("full-name scope must resolve to repo `myrepo` and grant pull: {access:?}")
+        });
+    assert_eq!(
+        entry["type"], "repository",
+        "AccessEntry echoes the full requested name: {access:?}"
+    );
+    assert!(
+        entry["actions"]
+            .as_array()
+            .map(|a| a.iter().any(|x| x == "pull"))
+            .unwrap_or(false),
+        "full-name scope must grant pull: {access:?}"
+    );
+}
+
 // Repeated `scope=a&scope=b` — serde_html_form (via axum_extra) aggregates
 // the repeated keys into a Vec; serde_urlencoded never could. Pull on the
 // granted `myrepo` is present; push on the unknown `other/x` is not.
