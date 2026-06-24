@@ -4,8 +4,14 @@
     daemon_reload: true
     scope: system
 
+# Restart BOTH units: hort-server.env, hort-worker.env, and hort-migrate.env all
+# notify this handler, so a hort-worker.env change must restart hort-worker too
+# (previously only hort-server was restarted, leaving worker env changes inert).
 - name: Reload hort-systemd units
   ansible.builtin.systemd:
-    name: hort-server.service
+    name: "{{ item }}"
     state: restarted
     scope: system
+  loop:
+    - hort-server.service
+    - hort-worker.service

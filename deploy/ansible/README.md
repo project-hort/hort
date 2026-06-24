@@ -308,6 +308,54 @@ crane pull --insecure-registry=false \
 # (crane uses ~/.docker/config.json; log in first with `crane auth login`)
 ```
 
+## Pointing a `cargo build` at the gated proxy (build-driven warming)
+
+A gated (`isPublic: false`) cargo pull-through proxy is reachable by stock
+`cargo`, but two things must line up:
+
+1. **The token must carry an auth scheme.** cargo sends its configured token
+   *verbatim* in the `Authorization` header (the crates.io / RFC 3231 convention
+   is a raw, scheme-less token), but hort accepts only `Bearer` / `Basic`. Bake
+   the scheme in — use the same Basic-with-dummy-user form the other clients use:
+
+   ```bash
+   export HORT_TOKEN="hort_svc_…"                 # a read-capable token
+   export CARGO_REGISTRIES_HORT_TOKEN="Basic $(printf 'x:%s' "$HORT_TOKEN" | base64 -w0)"
+   ```
+
+2. **A credential provider must be declared** (cargo ≥ 1.74 requires one for
+   `auth-required` registries). In the project (or `$CARGO_HOME`) `config.toml`:
+
+   ```toml
+   [registry]
+   global-credential-providers = ["cargo:token"]
+   [source.crates-io]
+   replace-with = "hort"
+   [registries.hort]
+   index = "sparse+https://registry.hort.rs/cargo/crates-proxy/"
+   ```
+
+`config.json` is anonymously readable and advertises `auth-required: true`
+(server-side, since 0.9.4-beta.3), so cargo bootstraps the registry without a
+token and then authenticates the index/download requests with the credential
+above.
+
+While the TLS cert is Let's Encrypt **staging** (see *certbot operations*), also
+point cargo at a CA bundle that trusts the staging roots:
+
+```bash
+export CARGO_HTTP_CAINFO=/path/to/ca-bundle-with-le-staging-roots.pem
+```
+
+Drop `CARGO_HTTP_CAINFO` once a real (production) cert is issued.
+
+**Warming behaviour.** The first build *warms* the proxy: each dependency is
+fetched from the upstream, ingested, and held in **quarantine** — so the crate
+download returns `503 {"error":"artifact is quarantined"}` and the build cannot
+complete yet. That is expected. After the quarantine window elapses and the scan
+passes, the artifacts release and later builds succeed. Run the build
+periodically to pull the dependency closure into quarantine ahead of time.
+
 ## GitHub protected `release` environment setup
 
 The `hort-publish` job in `.github/workflows/release.yml` declares

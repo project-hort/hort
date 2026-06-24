@@ -423,16 +423,20 @@
   become_user: postgres
   changed_when: true
 
-- name: Enable and start hort-server.service
+# `restarted` (not `started`) when hort_binaries swapped the binary this run —
+# `started` is a no-op on an already-running unit, which would leave the old
+# binary executing. This runs AFTER hort-migrate above, so a new binary's
+# migrations apply before the new server/worker process starts.
+- name: Enable and start (restart on binary change) hort-server.service
   ansible.builtin.systemd:
     name: hort-server.service
-    state: started
+    state: "{{ 'restarted' if hort_systemd_binary_changed | default(false) else 'started' }}"
     enabled: true
     scope: system
 
-- name: Enable and start hort-worker.service
+- name: Enable and start (restart on binary change) hort-worker.service
   ansible.builtin.systemd:
     name: hort-worker.service
-    state: started
+    state: "{{ 'restarted' if hort_systemd_binary_changed | default(false) else 'started' }}"
     enabled: true
     scope: system
