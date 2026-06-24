@@ -1,0 +1,30 @@
+apiVersion: project-hort.de/v1beta1
+kind: UpstreamMapping
+metadata:
+  # UpstreamMapping for the `repository_upstream_mappings` row that
+  # crates/hort-http-pypi/src/upstream_pull.rs::try_upstream_file_pull
+  # resolves via UpstreamResolver. Without this envelope the runtime has no
+  # upstream to fetch from and every pull-through fetch 404s — even though the
+  # `pypi-public` ArtifactRepository declares `spec.type: proxy` with a
+  # `spec.proxy.upstreamUrl` (that field is validator-only; the runtime never
+  # reads it).
+  #
+  # PyPI uses a single catch-all upstream per repo (no path-prefix routing),
+  # mirroring Cargo rather than OCI's multi-namespace split. The simple-index
+  # proxy fetches /simple/{name}/ under this root; the file leg uses the
+  # absolute URL embedded in the per-version JSON body.
+  name: pypi-public
+spec:
+  repository: pypi-public
+  # Empty pathPrefix → catch-all single-upstream mapping. The PyPI
+  # orchestrator passes "" as the prefix on every resolve() call.
+  pathPrefix: ""
+  # Real public index. https — no insecureUpstreamUrl opt-in (that flag is
+  # only for the HTTP-only wiremock smokes). NOTE: in the virtual-merge
+  # scenario this upstream is never actually consulted for the first-party
+  # package — the private member OWNS that name, so name-level pinning
+  # (ADR 0031 rule 2b) excludes this proxy. It is wired so the mirror is a
+  # realistic "hosted + upstream" shape, not so the happy path needs egress.
+  upstreamUrl: https://pypi.org
+  auth:
+    type: anonymous

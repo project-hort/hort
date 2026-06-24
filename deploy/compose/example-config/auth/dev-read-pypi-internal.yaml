@@ -1,0 +1,16 @@
+# PermissionGrant: [developer, ci-pusher] -> read pypi-internal
+# The private member is resolved through pypi-virt-e2e with the SAME caller
+# (ADR 0031 / ADR 0021 auth composition), so the dev needs explicit Read on
+# the member to see it merged into the virtual — Write does NOT imply Read.
+# scripts/native-tests/scenarios/clients/pypi-virtual.sh. Rationale: see
+# ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-read-pypi-internal
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: pypi-internal

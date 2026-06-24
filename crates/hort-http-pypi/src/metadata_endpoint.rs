@@ -179,7 +179,26 @@ pub(crate) async fn serve_pep658_metadata(
         .await;
     }
 
-    // (c) Hosted/Staging/Virtual — call through to the use case.
+    // (c) Virtual — a virtual repo owns no artifacts; the wheel and its
+    // extracted METADATA ContentReference live in a member. Route through the
+    // SAME authoritative member the wheel download picks, then serve that
+    // member's metadata. Calling the use case against the virtual repo key
+    // (as the hosted arm below does) would always 404 (no artifacts under the
+    // virtual), which makes pip's PEP 658 fetch fail and blocks
+    // install-through-virtual.
+    if matches!(repo.repo_type, RepositoryType::Virtual) {
+        return serve_virtual_pep658_metadata(
+            &ctx,
+            &repo,
+            &project,
+            &wheel_filename,
+            &artifact_path,
+            actor,
+        )
+        .await;
+    }
+
+    // (d) Hosted/Staging — call through to the use case.
     // The use case re-runs the visibility hop (defence in depth).
     let outcome = ctx
         .wheel_metadata_use_case
@@ -316,6 +335,73 @@ async fn serve_proxy_with_pull_fallback(
         // the two calls) — surface it indistinguishably from the
         // initial visibility check.
         Err(other) => Err(other.into()),
+    }
+}
+
+/// PEP 658 `.metadata` for a `RepositoryType::Virtual` repo (ADR 0031).
+///
+/// A virtual repo owns no artifacts, so this resolves the authoritative
+/// member via [`crate::resolve_virtual_member_artifact`] — the SAME
+/// name-level-pinning + first-authoritative walk the wheel download uses —
+/// then serves THAT member's wheel metadata. Picking the same member as the
+/// download guarantees the `.metadata` bytes correspond to the wheel that
+/// would be served; serving from a different member would be a confusion
+/// vector.
+///
+/// `#[tracing::instrument]` without `err` (architect observability rules:
+/// `err` would re-log the `ApiError` chain at error level).
+#[tracing::instrument(
+    skip(ctx, repo, actor),
+    fields(repo_key = %repo.key, wheel_filename = %wheel_filename),
+)]
+async fn serve_virtual_pep658_metadata(
+    ctx: &Arc<AppContext>,
+    repo: &hort_domain::entities::repository::Repository,
+    project: &str,
+    wheel_filename: &str,
+    artifact_path: &str,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
+    match crate::resolve_virtual_member_artifact(
+        ctx,
+        repo,
+        project,
+        artifact_path,
+        wheel_filename,
+        actor,
+    )
+    .await?
+    {
+        Some(crate::VirtualMemberDownload::Found(artifact)) => {
+            // Serve METADATA from the wheel's own (member) repo. The actor
+            // already cleared Read on that member during the walk, so
+            // resolve_by_id(Read) re-confirms visibility (defence in depth)
+            // and yields the member key the metadata use case needs.
+            let member = ctx
+                .repository_access_use_case
+                .resolve_by_id(
+                    artifact.repository_id,
+                    actor,
+                    hort_app::use_cases::repository_access::AccessLevel::Read,
+                )
+                .await
+                .map_err(ApiError::from)?;
+            let outcome = ctx
+                .wheel_metadata_use_case
+                .serve(&member.key, artifact_path, actor)
+                .await
+                .map_err(ApiError::from)?;
+            Ok(render_outcome(outcome))
+        }
+        // Authoritative proxy member's pull failed → surface verbatim (no
+        // fall-through), matching the wheel-download virtual path.
+        Some(crate::VirtualMemberDownload::Rendered(resp)) => Ok(resp),
+        // No eligible member serves the coordinate → 404 (never a proxy
+        // fall-through).
+        None => Err(ApiError::from(AppError::Domain(DomainError::NotFound {
+            entity: "Artifact",
+            id: format!("{}:{}.metadata", repo.key, artifact_path),
+        }))),
     }
 }
 

@@ -1,0 +1,18 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: pypi-virt-e2e
+spec:
+  name: "PyPI Virtual (private + public)"
+  description: "Virtual aggregating the private hosted member pypi-internal + the public mirror pypi-public (ADR 0031); scripts/native-tests/scenarios/clients/pypi-virtual.sh"
+  format: pypi
+  type: virtual
+  # Order is the resolution priority (index 0 = highest). The private member
+  # is first so it OWNS its package names: name-level pinning then excludes
+  # the public proxy for those names (dependency-confusion defence,
+  # ADR 0031 rule 2b). Mirrors npm-virt-e2e.yaml.
+  virtualMembers:
+    - pypi-internal
+    - pypi-public
+  isPublic: true
+  replicationPriority: local_only

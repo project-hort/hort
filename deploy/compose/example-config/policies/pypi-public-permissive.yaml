@@ -1,0 +1,20 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: pypi-public-permissive
+spec:
+  # Pull-through proxy: release ingested files immediately so clients can
+  # install them. Without a policy, pulled-through artifacts quarantine by
+  # default and the download 503s ("artifact is quarantined"). Mirrors
+  # npm-public-permissive.yaml. In the virtual-merge scenario this proxy is
+  # pinned out for the owned first-party name and never consulted; the policy
+  # is here so the mirror is usable for any other (non-owned) name and to
+  # mirror the npm-public shape.
+  scope:
+    repository: pypi-public
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}
