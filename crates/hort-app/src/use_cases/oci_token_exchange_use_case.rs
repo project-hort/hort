@@ -57,6 +57,18 @@ use crate::use_cases::repository_access::RepositoryAccessUseCase;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Maximum number of `scope=` parameters accepted on a single
+/// `/v2/auth` request. Each repository scope drives one indexed DB
+/// lookup in the Step-4 authorization loop, so an unbounded count is a
+/// (PAT-gated) DoS amplification surface; this cap is the
+/// defense-in-depth bound. Real OCI clients (crane / docker / oras) send
+/// 1–2 scopes — 64 is generous headroom, not a protocol limit. Enforced
+/// in [`OciTokenExchangeUseCase::exchange`] as a cheap, deterministic
+/// request-shape gate BEFORE the Argon2 PAT verify, so no inbound
+/// adapter can bypass it (mirrors the unbypassable `service=` Step-0
+/// gate).
+pub const MAX_SCOPES: usize = 64;
+
 /// Raw input the handler hands to the use case.
 ///
 /// `service` and `scopes` echo the query-string. `client_ip` is
@@ -70,7 +82,9 @@ pub struct OciTokenExchangeRequest {
     /// for routing (every hort-server instance answers for itself).
     pub service: String,
     /// Multi-`scope` query parameter values (the spec allows repeated
-    /// `scope=…` entries; axum surfaces them as a `Vec<String>`).
+    /// `scope=…` entries; the inbound handler extracts them with
+    /// `axum_extra::extract::Query` / `serde_html_form`, which surfaces
+    /// repeated keys as a `Vec<String>`).
     pub scopes: Vec<String>,
     /// Client IP for the brute-force-lockout gate. `None` for
     /// in-process callers (tests / CLI).
@@ -110,6 +124,17 @@ pub enum OciTokenExchangeError {
     /// the wire body — no reflected value in the response.
     #[error("service mismatch")]
     ServiceMismatch { requested: String, expected: String },
+    /// More than [`MAX_SCOPES`] `scope=` parameters were supplied in a
+    /// single request. Each repository scope drives one indexed DB
+    /// lookup in Step 4; an unbounded count is a (PAT-gated) DoS
+    /// amplification surface. Rejected as a cheap, deterministic
+    /// request-shape 400 BEFORE the Argon2 PAT verify — same tier as the
+    /// `service=` and malformed-scope gates. Maps to **HTTP 400** with
+    /// the Distribution-Spec `UNSUPPORTED` envelope and the constant
+    /// message `"too many scopes"`; the offending count goes to the
+    /// structured audit log only, never the wire body.
+    #[error("too many scopes")]
+    TooManyScopes,
     /// PAT validation rejected the supplied Basic credential. Maps to
     /// 401 with the Distribution-Spec error envelope + the Bearer
     /// challenge re-emitted (Distribution-Spec convention).
@@ -224,6 +249,28 @@ impl OciTokenExchangeUseCase {
                 requested,
                 expected,
             });
+        }
+
+        // Step 0.5: bound the scope count BEFORE parsing or the Argon2
+        // PAT verify. Each repository scope drives one indexed DB lookup
+        // in Step 4's authorization loop; an unbounded `scope=` count is
+        // a (PAT-gated) DoS amplification surface. Reject the largest
+        // input earliest — the same cheap, deterministic request-shape
+        // tier as the Step-0 service gate. Reuses the `invalid_scope`
+        // result label (a too-many-scopes request is a malformed request
+        // in aggregate) so no new metric label value is introduced; the
+        // distinct `reason="too_many_scopes"` rides the audit log.
+        if request.scopes.len() > MAX_SCOPES {
+            emit_result_metric(ResultLabel::InvalidScope);
+            emit_verify_metric(VerifyResultLabel::Denied);
+            tracing::info!(
+                event = "oci_v2_auth_denied",
+                reason = "too_many_scopes",
+                count = request.scopes.len(),
+                max = MAX_SCOPES,
+                "/v2/auth rejected: scope count exceeds MAX_SCOPES"
+            );
+            return Err(OciTokenExchangeError::TooManyScopes);
         }
 
         // Step 1: parse every scope BEFORE PAT validation. A malformed
@@ -384,15 +431,31 @@ impl OciTokenExchangeUseCase {
         let rbac = self.rbac.load();
         match scope.resource_type {
             ResourceType::Repository => {
-                // Resolve the repo by key. A miss means the user
-                // requested a scope on a repo they cannot see; per
-                // anti-enumeration discipline we surface "no grant"
-                // for that scope (NOT a 404), so the OCI client falls
-                // through to the storage layer's existing
-                // NAME_UNKNOWN handling.
+                // Resolve the OWNING repo. OCI routes are
+                // `/v2/:repo_key/*tail`, so the hort repo is keyed by the
+                // FIRST path segment while the Distribution-Spec scope
+                // `resource_name` is the FULL `<repo_key>/<image>` name a
+                // real client sends (e.g. `dockerhub-proxy/library/alpine`).
+                // Resolve by the first segment so the mint-side grant
+                // matches the consume-side gate, which resolves the same
+                // way (`WriteRepoAccess` / `ReadRepoAccess` use the
+                // `:repo_key` route param). Looking up the full name as a
+                // key would always miss for one-repo-many-images mounts —
+                // empty `access[]` — and silently deny gated pull-through
+                // and hosted push.
+                //
+                // A miss still means the user requested a scope on a repo
+                // they cannot see; per anti-enumeration discipline we
+                // surface "no grant" for that scope (NOT a 404), so the
+                // OCI client falls through to the storage layer's existing
+                // NAME_UNKNOWN handling. The echoed `AccessEntry.name`
+                // (built in `exchange`) stays the FULL `resource_name` per
+                // the Distribution Spec — only the authz lookup uses the
+                // first segment.
+                let repo_key = scope_name_to_repo_key(&scope.resource_name);
                 let repo_id = match self
                     .repo_access
-                    .find_repo_id_by_key_unchecked(&scope.resource_name)
+                    .find_repo_id_by_key_unchecked(repo_key)
                     .await
                 {
                     Ok(Some(id)) => id,
@@ -594,6 +657,25 @@ fn synthesize_principal_from_jwt(claims: &OciAccessClaims) -> CallerPrincipal {
 /// port is itself a misconfiguration and mismatches → 400.
 fn normalize_service(s: &str) -> String {
     s.trim().to_ascii_lowercase()
+}
+
+/// Map a Distribution-Spec repository scope `resource_name` to the hort
+/// repo key that owns it.
+///
+/// OCI routes are `/v2/:repo_key/*tail` — the hort repo is keyed by the
+/// FIRST path segment and the image lives in the tail. The scope's
+/// `resource_name` carries the FULL `<repo_key>/<image>` name (e.g.
+/// `dockerhub-proxy/library/alpine`), so the owning repo key is
+/// everything before the first `/`. A name with no `/` (a bare repo
+/// scope such as `hort-oci`) is its own key. This mirrors
+/// `hort_http_oci::v2_auth::path_to_scope`'s `split_once('/')` and the
+/// first-segment resolution the `/v2/*` consume path uses, so the
+/// mint-side grant and the consume-side gate agree on the same repo.
+fn scope_name_to_repo_key(resource_name: &str) -> &str {
+    resource_name
+        .split_once('/')
+        .map(|(key, _image)| key)
+        .unwrap_or(resource_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,6 +1701,143 @@ mod tests {
             1,
             "Malformed scope must emit result=invalid_scope"
         );
+    }
+
+    /// LOW-1 cap: more than [`MAX_SCOPES`] `scope=` params rejects with
+    /// `TooManyScopes`, and the gate fires BEFORE PAT validation — a
+    /// request with an INVALID credential (verifier=false) still gets
+    /// `TooManyScopes`, NOT `InvalidCredential`. This pins the "no
+    /// Argon2 verify, no per-scope DB lookups on the amplification path"
+    /// property. Reuses the `result=invalid_scope` metric label (no new
+    /// label value → no metrics-catalog churn).
+    #[test]
+    fn exchange_rejects_more_than_max_scopes_before_pat_validation() {
+        let snap = capture_async(|| async {
+            // verifier=false → had PAT validation run first, the result
+            // would be InvalidCredential. The count gate must pre-empt.
+            let (uc, _tokens, _users, _repos) = make_use_case(vec![], false);
+            let scopes: Vec<String> = (0..=MAX_SCOPES) // MAX_SCOPES + 1 entries
+                .map(|i| format!("repository:repo{i}:pull"))
+                .collect();
+            assert_eq!(scopes.len(), MAX_SCOPES + 1);
+            let res = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: "hort_pat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    service: "hort.test".into(),
+                    scopes,
+                    client_ip: Some(ip()),
+                })
+                .await;
+            assert!(
+                matches!(res, Err(OciTokenExchangeError::TooManyScopes)),
+                "MAX_SCOPES+1 scopes must reject with TooManyScopes before PAT validation, got {:?}",
+                res.err()
+            );
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_oci_v2_auth_total",
+                &[("result", "invalid_scope")],
+            ),
+            1,
+            "too-many-scopes must reuse the invalid_scope result label"
+        );
+    }
+
+    /// Boundary: exactly [`MAX_SCOPES`] scopes is ACCEPTED — the cap is
+    /// strictly `> MAX_SCOPES`. The repos do not exist, so every scope
+    /// resolves to an empty grant → `Ok` with an empty `access[]`; the
+    /// point is that the count gate does NOT fire at the boundary.
+    #[test]
+    fn exchange_allows_exactly_max_scopes() {
+        capture_async(|| async {
+            let (uc, tokens, users, _repos) = make_use_case(vec![], true);
+            let (plaintext, _user_id) =
+                seed_pat_row(&tokens, &users, false, vec![Permission::Read]);
+            let scopes: Vec<String> = (0..MAX_SCOPES)
+                .map(|i| format!("repository:repo{i}:pull"))
+                .collect();
+            assert_eq!(scopes.len(), MAX_SCOPES);
+            let res = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    scopes,
+                    client_ip: Some(ip()),
+                })
+                .await;
+            assert!(
+                res.is_ok(),
+                "exactly MAX_SCOPES must be accepted (cap is strictly greater-than): {:?}",
+                res.err()
+            );
+        });
+    }
+
+    // -- scope_name_to_repo_key (first-segment resolution) -------------
+
+    #[test]
+    fn scope_name_to_repo_key_extracts_first_segment() {
+        // Full <repo_key>/<image> names resolve to the first segment.
+        assert_eq!(
+            scope_name_to_repo_key("dockerhub-proxy/library/alpine"),
+            "dockerhub-proxy"
+        );
+        assert_eq!(scope_name_to_repo_key("myrepo/library/nginx"), "myrepo");
+        assert_eq!(scope_name_to_repo_key("a/b/c/d"), "a");
+        // A bare name (no image) is its own key.
+        assert_eq!(scope_name_to_repo_key("hort-oci"), "hort-oci");
+        // Degenerate leading slash → empty first segment (harmless: an
+        // empty key misses find_by_key → no grant).
+        assert_eq!(scope_name_to_repo_key("/x"), "");
+    }
+
+    /// Scope→repo-key resolution: a realistic FULL Distribution-Spec
+    /// name `<repo_key>/<image>` resolves to the hort repo keyed by the
+    /// FIRST segment (`/v2/:repo_key/*tail`), grants the action, and
+    /// ECHOES the full name in the `AccessEntry` (spec conformance).
+    /// Regression for the empty-`access[]` bug where the full name was
+    /// looked up whole and always missed.
+    #[test]
+    fn exchange_resolves_repo_by_first_segment_of_full_scope_name() {
+        capture_async(|| async {
+            let (uc, tokens, users, repos) = make_use_case(vec![], true);
+            // admin → user-leg short-circuit; full cap → cap-leg allows.
+            let (plaintext, _user_id) = seed_pat_row(
+                &tokens,
+                &users,
+                true,
+                vec![Permission::Read, Permission::Write, Permission::Delete],
+            );
+            // hort repo keyed by the FIRST segment only.
+            repos.insert(build_repo("myrepo"));
+
+            let resp = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    // Full <repo_key>/<image> name, as crane/docker send.
+                    scopes: vec!["repository:myrepo/library/nginx:pull".into()],
+                    client_ip: Some(ip()),
+                })
+                .await
+                .expect("full-name scope must mint");
+
+            assert_eq!(
+                resp.granted_subset.len(),
+                1,
+                "the full-name scope must resolve and grant: {:?}",
+                resp.granted_subset
+            );
+            let entry = &resp.granted_subset[0];
+            assert_eq!(
+                entry.name, "myrepo/library/nginx",
+                "AccessEntry must echo the FULL requested name (spec), not the repo key"
+            );
+            assert_eq!(entry.resource_type, "repository");
+            assert_eq!(entry.actions, vec!["pull".to_string()]);
+        });
     }
 
     // -- hort_oci_v2_auth_total — happy + grant-classification paths ---

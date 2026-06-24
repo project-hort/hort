@@ -41,10 +41,18 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
+// NOT `axum::extract::Query`: that extractor is backed by
+// `serde_urlencoded`, which has no sequence support and errors
+// `invalid type: string "…", expected a sequence` on the `Vec<String>`
+// `scope` field for EVERY scoped request. `axum_extra::extract::Query`
+// is backed by `serde_html_form`, which deserializes repeated keys
+// (`scope=a&scope=b` → `vec!["a","b"]`, a single `scope=a` → `vec!["a"]`,
+// an absent `scope` → `vec![]`).
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum_extra::extract::Query;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -62,11 +70,15 @@ use crate::middleware::oci_auth::v2_auth_challenge_value;
 
 /// Inbound `?service=…&scope=…[&scope=…]` parameters.
 ///
-/// `service` is required; `scope` is optional and may repeat. axum's
-/// `serde_urlencoded` materialises repeated `scope=` params into a
-/// `Vec<String>` when the field is a `Vec`. An entirely-omitted
-/// `scope` is acceptable — the response is a token with an empty
-/// `access[]` ("ping-style" anonymous-equivalent).
+/// `service` is required; `scope` is optional and may repeat. This DTO
+/// is extracted with [`axum_extra::extract::Query`] (NOT
+/// `axum::extract::Query`): its `serde_html_form` backend materialises
+/// repeated `scope=` params into a `Vec<String>`. Plain axum `Query`
+/// uses `serde_urlencoded`, which has no sequence support and would
+/// error `expected a sequence` on every request carrying a `scope`. An
+/// entirely-omitted `scope` deserialises to `vec![]` — the response is
+/// then a token with an empty `access[]` ("ping-style"
+/// anonymous-equivalent).
 #[derive(Debug, Deserialize)]
 pub struct V2AuthQuery {
     /// Registry hostname per Distribution-Spec convention. Echoed in
@@ -74,8 +86,13 @@ pub struct V2AuthQuery {
     /// authoritative; this string is used only for logging /
     /// future-debug).
     pub service: String,
-    /// Multi-`scope` field. `serde_urlencoded` flattens repeated
-    /// `scope=foo&scope=bar` into `vec!["foo", "bar"]`.
+    /// Multi-`scope` field. `serde_html_form` (via
+    /// [`axum_extra::extract::Query`]) flattens repeated
+    /// `scope=foo&scope=bar` into `vec!["foo", "bar"]`; a single
+    /// `scope=foo` into `vec!["foo"]`; an absent `scope` into `vec![]`.
+    /// Comma-separated *actions* within one scope
+    /// (`repository:foo:pull,push`) are NOT split here — they stay one
+    /// element and are split downstream by `parse_scope`.
     #[serde(default)]
     pub scope: Vec<String>,
 }
@@ -176,7 +193,20 @@ pub async fn handle_v2_auth(
             unauthorized_with_challenge(&ctx, &query, "invalid credential")
         }
         Err(OciTokenExchangeError::InvalidScope { raw }) => OciError::Unsupported {
+            // Reflects the caller's OWN malformed scope (JSON-escaped by
+            // serde — no injection), matching standard registry
+            // behaviour. Deliberately asymmetric with
+            // `service_mismatch_response`, which hides server config
+            // (the configured `aud`) behind a constant message: the
+            // service= path must not leak server state, whereas echoing
+            // the caller's own input is safe and aids client debugging.
             message: format!("invalid scope: {raw}"),
+        }
+        .into_response(),
+        Err(OciTokenExchangeError::TooManyScopes) => OciError::Unsupported {
+            // Constant message — the offending count is in the
+            // `hort-app` audit log, not the wire body.
+            message: "too many scopes".to_string(),
         }
         .into_response(),
         Err(OciTokenExchangeError::Mint(err)) => {
