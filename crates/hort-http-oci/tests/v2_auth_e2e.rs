@@ -37,14 +37,15 @@ use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
 use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::{
-    OciTokenExchangeConfig, OciTokenExchangeUseCase,
+    OciTokenExchangeConfig, OciTokenExchangeUseCase, MAX_SCOPES,
 };
 use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
 use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
 use hort_app::use_cases::test_support::{sample_repository, MockEventStore, MockIdentityProvider};
 
 use hort_domain::entities::api_token::{ApiToken, TokenKind};
-use hort_domain::entities::rbac::Permission;
+use hort_domain::entities::managed_by::ManagedBy;
+use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::error::{DomainError, DomainResult};
@@ -195,7 +196,7 @@ fn build_harness() -> Harness {
     repo.key = "myrepo".into();
     repo.format = RepositoryFormat::Oci;
     repo.is_public = true;
-    let _repo_id = repo.id;
+    let repo_id = repo.id;
     mocks.repositories.insert(repo);
 
     // -- 3. PAT plaintext + Argon2id hash + `token_prefix` row. ------
@@ -269,9 +270,23 @@ fn build_harness() -> Harness {
         AuthenticateUseCase::new(idp, users_for_auth.clone(), Vec::new())
             .with_pat_validation(pat_validation_uc.clone()),
     );
-    let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
-        Vec::new(),
-    )));
+    // alice holds a direct `User`-subject Read grant on `myrepo` (the
+    // service-account grant pattern — ADR 0012), so a scoped
+    // `repository:myrepo:pull` request mints a JWT whose `access[]`
+    // actually carries the granted pull action. `push` (Write) is NOT
+    // granted — no Write grant and the seeded PAT cap is Read-only — so
+    // the repeated-scope test can assert pull-granted / push-denied.
+    let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
+        PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::User(user_id),
+            repository_id: Some(repo_id),
+            permission: Permission::Read,
+            created_at: now,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        },
+    ])));
     let ctx = with_auth(
         &ctx,
         AuthContext::Enabled {
@@ -417,12 +432,16 @@ fn step1_invalid_bearer_emits_bearer_challenge_to_v2_auth() {
 
 #[test]
 fn step2_v2_auth_with_valid_pat_mints_jwt() {
-    // NOTE: scope is omitted (per the step3 explanation): a single
-    // `scope=…` query value fails serde_urlencoded's `Vec<String>`
-    // deserialise. Real `docker login` calls /v2/auth with no scope
-    // first (the "ping-style anonymous-equivalent" path),
-    // so the empty-scope mint path is itself a Distribution-Spec
-    // shape worth pinning here.
+    // This pins the no-scope "ping" path: `?service=…` with no
+    // `scope=` deserialises to `vec![]` and mints a token with an empty
+    // `access[]`. Real `docker login` opens with exactly this scope-less
+    // ping. The SCOPED paths (single + repeated `scope=`) — the ones a
+    // real pull/push token request carries — are pinned by
+    // `v2_auth_single_scope_mints_200_with_granted_pull` and
+    // `v2_auth_repeated_scope_mints_200` below. (Before the
+    // `axum_extra::extract::Query` fix those scoped requests 400'd with
+    // serde_urlencoded's "expected a sequence" — the regression these
+    // tests now guard.)
     let (status, body_json) = run(async {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
@@ -474,14 +493,9 @@ fn step2_v2_auth_with_valid_pat_mints_jwt() {
 
 #[test]
 fn step3_v2_auth_without_credentials_returns_401_with_challenge() {
-    // NOTE: send `service=…` only (no `scope=`). The handler's `Vec<String>`
-    // scope field is `#[serde(default)]`-friendly; sending no scope avoids
-    // the serde_urlencoded `string vs sequence` deserialise mismatch (a
-    // pre-existing handler behaviour: real clients pass `scope=` either
-    // omitted or repeated, but serde_urlencoded's default `Vec<String>`
-    // deserialise requires the bracket-array form for a single scope).
-    // The 401-Bearer-challenge invariant we're pinning here doesn't depend
-    // on scope being present.
+    // Send `service=…` only (no `scope=`). The 401-Bearer-challenge
+    // invariant pinned here is independent of scope; the scoped-request
+    // deserialisation is covered by the dedicated scope tests below.
     let (status, www, body_text) = run(async {
         let h = build_harness();
         let router =
@@ -720,11 +734,10 @@ fn step5_docker_login_dance_end_to_end_via_oneshot() {
         );
 
         // ---- (b) Build the /v2/auth request from the challenge.
-        //         Drop `scope` from the replay — see step3 for why a
-        //         single `scope=` value fails serde_urlencoded's
-        //         `Vec<String>` deserialise. The replay still
-        //         exercises the spec-required (realm, service,
-        //         credential) round-trip.
+        //         `scope` is omitted to keep this challenge-replay
+        //         minimal — it exercises the spec-required (realm,
+        //         service, credential) round-trip. The scoped /v2/auth
+        //         path is pinned by the dedicated scope tests below.
         let realm_url: url::Url = realm.parse().expect("realm is a URL");
         let auth_path = format!(
             "{}?service={}",
@@ -770,9 +783,278 @@ fn step5_docker_login_dance_end_to_end_via_oneshot() {
     });
 }
 
+// ===========================================================================
+// Scope-deserialisation regression suite (the `axum_extra::extract::Query`
+// fix). Before the fix, EVERY request carrying a `scope=` query parameter
+// — i.e. every real pull/push token request — failed query deserialisation
+// with HTTP 400 `Failed to deserialize query string: invalid type: string
+// "…", expected a sequence`, because `axum::extract::Query`
+// (serde_urlencoded) cannot deserialise repeated keys into a `Vec`. These
+// tests drive a real query string through the production router so the
+// extractor binding (not just `parse_scope`) is exercised.
+// ===========================================================================
+
+// PRIMARY REGRESSION: a SINGLE `scope=` (exactly what crane / docker / oras
+// send) must mint a 200 with a token whose `access[]` carries the granted
+// action — this is the exact request that returned `400 expected a
+// sequence` before the fix. `resource_name == "myrepo"` (the repo key) so
+// the grant resolves deterministically.
+#[test]
+fn v2_auth_single_scope_mints_200_with_granted_pull() {
+    let (status, body_json) = run(async {
+        let h = build_harness();
+        let creds = format!("oauth2:{}", h.plaintext_pat);
+        let basic = base64::engine::general_purpose::STANDARD.encode(creds);
+        let router =
+            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let resp = router
+            .oneshot(
+                Request::get("/v2/auth?service=hort.example.com&scope=repository:myrepo:pull")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    });
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a single scope= must mint (not 400 expected-a-sequence): {body_json}"
+    );
+    let jwt = body_json["token"].as_str().expect("token present");
+    let access = decode_jwt_access(jwt);
+    assert!(
+        access.iter().any(|e| {
+            e["type"] == "repository"
+                && e["name"] == "myrepo"
+                && e["actions"]
+                    .as_array()
+                    .map(|a| a.iter().any(|x| x == "pull"))
+                    .unwrap_or(false)
+        }),
+        "minted JWT must grant pull on myrepo: access={access:?}"
+    );
+}
+
+// Repeated `scope=a&scope=b` — serde_html_form (via axum_extra) aggregates
+// the repeated keys into a Vec; serde_urlencoded never could. Pull on the
+// granted `myrepo` is present; push on the unknown `other/x` is not.
+#[test]
+fn v2_auth_repeated_scope_mints_200() {
+    let (status, body_json) = run(async {
+        let h = build_harness();
+        let creds = format!("oauth2:{}", h.plaintext_pat);
+        let basic = base64::engine::general_purpose::STANDARD.encode(creds);
+        let router =
+            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let resp = router
+            .oneshot(
+                Request::get(
+                    "/v2/auth?service=hort.example.com\
+                     &scope=repository:myrepo:pull&scope=repository:other/x:push",
+                )
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    });
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "repeated scope= must mint (not 400 expected-a-sequence): {body_json}"
+    );
+    let jwt = body_json["token"].as_str().expect("token present");
+    let access = decode_jwt_access(jwt);
+    assert!(
+        access.iter().any(|e| e["name"] == "myrepo"),
+        "pull on the granted myrepo must appear: {access:?}"
+    );
+    assert!(
+        !access.iter().any(|e| e["name"] == "other/x"),
+        "push on an unknown repo must not be granted: {access:?}"
+    );
+}
+
+// A malformed scope must reach the INTENDED `UNSUPPORTED invalid scope`
+// 400 — and must be distinguishable from the old serde_urlencoded
+// "expected a sequence" 400. After the fix `not-a-valid-scope`
+// deserialises fine (a 1-element Vec) and `parse_scope` is what rejects it.
+#[test]
+fn v2_auth_malformed_scope_returns_400_invalid_scope() {
+    let (status, body_text) = run(async {
+        let h = build_harness();
+        let creds = format!("oauth2:{}", h.plaintext_pat);
+        let basic = base64::engine::general_purpose::STANDARD.encode(creds);
+        let router =
+            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let resp = router
+            .oneshot(
+                Request::get("/v2/auth?service=hort.example.com&scope=not-a-valid-scope")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    });
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a malformed scope must 400: {body_text}"
+    );
+    assert!(
+        body_text.contains("UNSUPPORTED") && body_text.contains("invalid scope"),
+        "must be the intended invalid-scope UNSUPPORTED envelope: {body_text}"
+    );
+    assert!(
+        !body_text.contains("expected a sequence"),
+        "must NOT be the serde_urlencoded deserialisation error: {body_text}"
+    );
+}
+
+// Over-grant prevention on a VISIBLE repo: alice holds Read (pull) on
+// `myrepo` but no Write. A `push` scope (which implies pull) must mint a
+// 200 whose `access[]` carries pull but NOT push — the repo is visible, the
+// action is denied, and the cap/grant AND-leg excludes it rather than
+// over-granting. Rounds out the matrix alongside the unknown-repo case in
+// `v2_auth_repeated_scope_mints_200`.
+#[test]
+fn v2_auth_scope_on_visible_repo_without_permission_excludes_push() {
+    let (status, body_json) = run(async {
+        let h = build_harness();
+        let creds = format!("oauth2:{}", h.plaintext_pat);
+        let basic = base64::engine::general_purpose::STANDARD.encode(creds);
+        let router =
+            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let resp = router
+            .oneshot(
+                Request::get("/v2/auth?service=hort.example.com&scope=repository:myrepo:push")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    });
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a partial grant is not an error — must mint: {body_json}"
+    );
+    let jwt = body_json["token"].as_str().expect("token present");
+    let access = decode_jwt_access(jwt);
+    let entry = access
+        .iter()
+        .find(|e| e["name"] == "myrepo")
+        .unwrap_or_else(|| {
+            panic!("expected a myrepo access entry with the granted pull: {access:?}")
+        });
+    let actions: Vec<&str> = entry["actions"]
+        .as_array()
+        .expect("actions array")
+        .iter()
+        .filter_map(|x| x.as_str())
+        .collect();
+    assert!(
+        actions.contains(&"pull"),
+        "pull must be granted on the visible repo: {access:?}"
+    );
+    assert!(
+        !actions.contains(&"push"),
+        "push must be EXCLUDED — no Write grant + Read-only cap (no over-grant): {access:?}"
+    );
+}
+
+// The LOW-1 scope-count cap, end-to-end through the real extractor:
+// `MAX_SCOPES + 1` repeated `scope=` params deserialise fine via
+// `axum_extra::extract::Query` (proving the repeated-key path scales to
+// many keys) and are THEN rejected by the use-case cap with `400 too many
+// scopes` — NOT a serde "expected a sequence" error and NOT a 200.
+#[test]
+fn v2_auth_too_many_scopes_returns_400() {
+    let (status, body_text) = run(async {
+        let h = build_harness();
+        let creds = format!("oauth2:{}", h.plaintext_pat);
+        let basic = base64::engine::general_purpose::STANDARD.encode(creds);
+        let router =
+            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let mut qs = String::from("/v2/auth?service=hort.example.com");
+        for i in 0..=MAX_SCOPES {
+            // MAX_SCOPES + 1 entries
+            qs.push_str(&format!("&scope=repository:repo{i}:pull"));
+        }
+        let resp = router
+            .oneshot(
+                Request::get(&qs)
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    });
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "more than MAX_SCOPES scope= params must 400: {body_text}"
+    );
+    assert!(
+        body_text.contains("UNSUPPORTED") && body_text.contains("too many scopes"),
+        "must be the too-many-scopes UNSUPPORTED envelope: {body_text}"
+    );
+    assert!(
+        !body_text.contains("expected a sequence"),
+        "must be the cap, not a serde deserialisation error: {body_text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Decode the `access[]` array from a minted OCI JWT's payload WITHOUT
+/// verifying the signature. The e2e test only needs to read the granted
+/// scopes back; the signing key is internal to the use case. JWT payloads
+/// are base64url (no padding) per RFC 7519.
+fn decode_jwt_access(jwt: &str) -> Vec<serde_json::Value> {
+    let payload_b64 = jwt.split('.').nth(1).expect("jwt has a payload segment");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .expect("jwt payload is base64url");
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("jwt payload is json");
+    payload
+        .get("access")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
 
 /// Pull `key="value"` (Distribution-Spec parameter shape) out of a
 /// `WWW-Authenticate: Bearer …` challenge string. Returns the raw

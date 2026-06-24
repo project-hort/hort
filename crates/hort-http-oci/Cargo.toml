@@ -15,6 +15,10 @@ hort-formats   = { path = "../hort-formats" }
 hort-http-core = { path = "../hort-http-core" }
 
 axum         = { workspace = true }
+# `axum_extra::extract::Query` (serde_html_form) for the OCI `/v2/auth`
+# repeatable `scope=…` parameter — plain axum `Query` (serde_urlencoded)
+# cannot deserialize repeated keys into a `Vec`. See `v2_auth.rs`.
+axum-extra   = { workspace = true }
 tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 bytes        = { workspace = true }

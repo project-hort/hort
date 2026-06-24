@@ -131,6 +131,12 @@ tokio = { version = "1.50", features = ["full"] }
 
 # Web framework
 axum = { version = "0.7", features = ["multipart", "tokio"] }
+# `axum_extra::extract::Query` (serde_html_form backend) for query strings
+# with repeated keys — the OCI `/v2/auth` `scope=…&scope=…` multi-value
+# parameter that plain axum `Query` (serde_urlencoded) cannot deserialize
+# into a `Vec`. Pinned to the 0.9 line: 0.9.x pairs with axum 0.7, 0.10.x
+# pairs with axum 0.8 — taking 0.10 would drag a second axum into the graph.
+axum-extra = { version = "0.9", features = ["query"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "timeout"] }
 # Explicit hyper-util Builder for the `axum::serve` replacement. We need
