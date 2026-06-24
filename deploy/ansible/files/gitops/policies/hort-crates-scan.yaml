@@ -5,14 +5,14 @@ metadata:
 spec:
   scope:
     repository: hort-crates
-  severityThreshold: critical
-  # First-party hosted repo (own published crates) — now SCANNED (osv) for
-  # advisories in the crates' dependency closure. Small 1h observation window
-  # (humantime) so a `cargo publish` from release CI is fetchable quickly, vs the
-  # proxies' 1-day ramp. quarantineDuration is a gitops field (restart-to-apply),
-  # NOT a deployment env var. Block bar kept at `critical` (vs the proxies'
-  # `high`) so a newly-disclosed high advisory is recorded but does not block the
-  # crate showcase; tighten to `high` for a stricter gate.
+  severityThreshold: high
+  # First-party hosted repo (own published crates) — SCANNED (osv) for advisories
+  # in the crates' dependency closure. Small 1h observation window (humantime) so
+  # a `cargo publish` from release CI is fetchable quickly, vs the proxies' 1-day
+  # ramp. quarantineDuration is a gitops field (restart-to-apply), NOT a
+  # deployment env var. Block bar `high`, matching the proxies: a high+ advisory
+  # HOLDS the crate (recorded AND blocked). We control the Cargo.toml, so the fix
+  # is to bump the flagged dependency (as with quinn-proto) before publishing.
   quarantineDuration: 1h
   requireApproval: false
   provenanceMode: off
