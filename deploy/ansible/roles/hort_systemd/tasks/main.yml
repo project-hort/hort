@@ -430,13 +430,13 @@
 - name: Enable and start (restart on binary change) hort-server.service
   ansible.builtin.systemd:
     name: hort-server.service
-    state: "{{ 'restarted' if hort_systemd_binary_changed | default(false) else 'started' }}"
+    state: "{{ 'restarted' if hort_binaries_changed | default(false) | bool else 'started' }}"
     enabled: true
     scope: system
 
 - name: Enable and start (restart on binary change) hort-worker.service
   ansible.builtin.systemd:
     name: hort-worker.service
-    state: "{{ 'restarted' if hort_systemd_binary_changed | default(false) else 'started' }}"
+    state: "{{ 'restarted' if hort_binaries_changed | default(false) | bool else 'started' }}"
     enabled: true
     scope: system
