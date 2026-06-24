@@ -1,0 +1,20 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: hort-crates-scan
+spec:
+  scope:
+    repository: hort-crates
+  severityThreshold: critical
+  # First-party hosted repo (own published crates) — now SCANNED (osv) for
+  # advisories in the crates' dependency closure. Small 1h observation window
+  # (humantime) so a `cargo publish` from release CI is fetchable quickly, vs the
+  # proxies' 1-day ramp. quarantineDuration is a gitops field (restart-to-apply),
+  # NOT a deployment env var. Block bar kept at `critical` (vs the proxies'
+  # `high`) so a newly-disclosed high advisory is recorded but does not block the
+  # crate showcase; tighten to `high` for a stricter gate.
+  quarantineDuration: 1h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["osv"]
+  licensePolicy: {}
