@@ -45,6 +45,31 @@
     state: present
     update_cache: true
 
+# ── Staging → production transition (gap-free, in-place) ─────────────────────
+# The issuance task below skips while ANY cert exists (creates: semantics), so a
+# host bootstrapped on --staging would keep its untrusted TEST cert even after
+# certbot_staging is flipped to false. Delete the staging cert HERE — after the
+# nginx role (which runs before this one) has already rendered the vhost with the
+# still-present cert, so the 443 block stays in place. nginx keeps serving the
+# previous cert from memory (nothing reloads it between this delete and the
+# re-issue); the issuance task then re-issues against production and its
+# post-issue handlers re-render + reload nginx to swap in the new cert. Net: no
+# manual `certbot delete`, and no 443 downtime during the switch.
+- name: Read existing renewal config (to detect a staging-issued certificate)
+  ansible.builtin.slurp:
+    src: "/etc/letsencrypt/renewal/{{ registry_fqdn }}.conf"
+  register: certbot_renewal_conf
+  failed_when: false
+
+- name: Remove the staging certificate when switching to production
+  ansible.builtin.command:
+    cmd: "certbot delete --cert-name {{ registry_fqdn }} --non-interactive"
+  changed_when: true
+  when:
+    - not certbot_staging
+    - certbot_renewal_conf.content is defined
+    - "'acme-staging' in (certbot_renewal_conf.content | b64decode)"
+
 # Idempotency guard: the live chain file only exists after a successful
 # issuance.  If it is absent certbot runs; if it is present the task is
 # a no-op (creates: semantics).

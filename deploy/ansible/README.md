@@ -233,24 +233,29 @@ ansible-playbook -i inventory/production/hosts.ini site-podman.yml \
 
 ### Switching from staging to production certificates
 
-Setting `certbot_staging: false` in your inventory after an initial staging run
-will **not** automatically re-issue a production certificate.  The issuance task
-uses a `creates:` guard (`/etc/letsencrypt/live/<fqdn>/fullchain.pem`) that skips
-certbot entirely while any certificate chain exists — staging or production.
+Set `certbot_staging: false` and **re-run the playbook** — that is the whole
+procedure. No manual `certbot delete` is needed.
 
-To force re-issuance with a production certificate:
+The certbot role detects a staging-issued certificate (the renewal config points
+at `acme-staging-v02`) and, when `certbot_staging` is now `false`, deletes it so
+the issuance task re-runs against production. This is **gap-free**: the delete
+happens *after* the nginx role has rendered the vhost with the still-present cert,
+so the `listen 443 ssl` block stays in place and nginx keeps serving the previous
+cert from memory; the re-issue's post-issue handlers (`Render nginx vhost (cert
+present)` → `Validate` → `Reload`) then swap in the production cert on a graceful
+reload. The transition is idempotent — on a host already holding a production
+cert, the detection is a no-op and the `creates:` guard skips re-issuance.
 
 ```bash
-# On the managed host:
-sudo certbot delete --cert-name <fqdn>
-# Or remove the live directory directly:
-sudo rm -rf /etc/letsencrypt/live/<fqdn> /etc/letsencrypt/archive/<fqdn> \
-            /etc/letsencrypt/renewal/<fqdn>.conf
+# group_vars/production/main.yml (or your inventory):
+certbot_staging: false
+
+ansible-playbook -i inventory/production/hosts.ini site-native.yml --ask-vault-pass
 ```
 
-Then re-run the playbook with `certbot_staging: false`.  The `creates:` guard
-will now find no existing chain and certbot will issue a fresh production
-certificate.
+(If you ever need to force a manual re-issue for another reason, `sudo certbot
+delete --cert-name <fqdn>` on the host followed by a playbook run still works —
+the role's detection simply finds no cert and issues a fresh one.)
 
 ## CI token exchange recipe
 
