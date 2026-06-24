@@ -38,6 +38,29 @@ Beta release. The feature set is described in the documentation under `docs/`.
 
 ### Fixed
 
+- **OCI registry is now usable by the standard clients (`crane`, `docker`,
+  `oras`).** The Distribution-Spec `/v2/auth` token endpoint declared its
+  repeatable `scope` query parameter as a list but parsed it with an extractor
+  that cannot decode repeated query keys, so every *scoped* token request — i.e.
+  every real pull or push — failed query deserialization with
+  `400 "expected a sequence"` and no bearer was ever issued. Scoped requests now
+  decode correctly (single and repeated `scope=`), and a per-request scope-count
+  cap bounds the (credential-gated) authorization work.
+- **OCI pull-through and hosted push now work for gated / private
+  repositories.** The `/v2/auth` scope→repository mapping resolved the full
+  Distribution-Spec name `<repo_key>/<image>` as a repository key, which never
+  matched the first-path-segment repo key, so a scoped token carried an empty
+  grant set and the consume-side cap denied every pull/push on a non-public
+  repo. The scope now resolves the owning repository by its first path segment,
+  matching the `/v2/*` request path; public-repo anonymous pulls were
+  unaffected.
+- **PyPI virtual (aggregated) repositories are now installable with `pip`.** A
+  `pip install` through a `type: virtual` PyPI repo failed on pip's PEP 658
+  `.metadata` fetch — the metadata endpoint served against the virtual repo
+  (which owns no artifacts) and returned `404`, which modern pip treats as a
+  hard error. The `.metadata` endpoint now routes through the same authoritative
+  member the wheel download resolves, so the served metadata always matches the
+  served wheel (ADR 0031 *virtual-repository dependency-confusion defences*).
 - **Gated cargo proxies are now reachable by a plain `cargo build`.** A gated
   (`isPublic: false`) cargo pull-through proxy could not be used by the stock
   `cargo` client: cargo only sends its token once it has read `auth-required`

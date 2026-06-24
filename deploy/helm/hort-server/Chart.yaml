@@ -6,9 +6,9 @@ type: application
 # hardening after every schema apply, so an operator or reconcile loop
 # running a bulk `GRANT … ON ALL TABLES … TO hort_app_role` cannot
 # leave `events` in a state the runtime probe refuses to boot against.
-version: 0.9.4-beta.3
+version: 0.9.4-beta.4
 # Application (binary) version. Chart and binary are versioned together.
-appVersion: "0.9.4-beta.3"
+appVersion: "0.9.4-beta.4"
 # Kubernetes 1.27 introduces the security primitives the chart relies on
 # (RuntimeDefault seccomp, restricted PSS as a hard baseline, native
 # `topologySpreadConstraints` v1).
