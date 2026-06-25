@@ -6370,16 +6370,15 @@ mod tests {
     async fn apply_rejects_virtual_repo_until_serve_supported() {
         // ADR 0015 inert-field stopgap (spec §9 part A): applying a
         // `type: virtual` repo fails pre-write validation when the format is
-        // absent from `VIRTUAL_SERVE_SUPPORTED_FORMATS`. npm/pypi/cargo are
-        // lifted (Phases 1-3); `maven` is a known, still-unsupported format —
-        // the correct steady state — so this exercises the stopgap through
-        // the real apply path
-        // (`run_pre_write_validation` → `validate_against` → `validate`).
+        // absent from `VIRTUAL_SERVE_SUPPORTED_FORMATS`. npm/pypi/cargo/maven/
+        // gradle are lifted; `oci` is a known, still-unsupported format — the
+        // correct steady state — so this exercises the stopgap through the real
+        // apply path (`run_pre_write_validation` → `validate_against` → `validate`).
         let h = build_harness();
         let mut desired = DesiredState::default();
         desired.repositories.push(repo_env("a", "hosted"));
         let mut vroot = virtual_env("vroot", &["a"]);
-        vroot.spec.format = "maven".into();
+        vroot.spec.format = "oci".into();
         desired.repositories.push(vroot);
         let err = h.uc.apply(desired, env_oidc()).await.unwrap_err();
         assert!(
@@ -6390,11 +6389,12 @@ mod tests {
 
     #[tokio::test]
     async fn apply_npm_virtual_passes_validation_and_reconciles_members() {
-        // Phase 1 lifted npm into `VIRTUAL_SERVE_SUPPORTED_FORMATS`, so a
-        // `type: virtual` npm repo now passes apply validation and the member
-        // reconcile runs end-to-end through `apply()` (no longer orphaned by
-        // the stopgap). pypi/cargo virtuals still trip the stopgap until
-        // Phases 2-3 land — see `apply_rejects_virtual_repo_until_serve_supported`.
+        // npm/pypi/cargo/maven/gradle are lifted into
+        // `VIRTUAL_SERVE_SUPPORTED_FORMATS`, so a `type: virtual` npm repo
+        // passes apply validation and the member reconcile runs end-to-end
+        // through `apply()` (no longer orphaned by the stopgap). A
+        // still-unsupported format (e.g. oci) trips the stopgap — see
+        // `apply_rejects_virtual_repo_until_serve_supported`.
         let h = build_harness();
         let mut desired = DesiredState::default();
         desired.repositories.push(repo_env("a", "hosted"));

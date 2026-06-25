@@ -253,6 +253,14 @@ async fn serve_file(
     is_head: bool,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
+    // A virtual repo owns no artifacts: resolve the authoritative member and
+    // serve the file from there (ADR 0031). Done before any local lookup so
+    // sidecar digest / SNAPSHOT resolution / proxy pull-through all run against
+    // the member through the recursed per-member `serve_file`.
+    if matches!(repo.repo_type, RepositoryType::Virtual) {
+        return serve_virtual_maven_file(ctx, repo, coords, artifact_path, is_head, actor).await;
+    }
+
     // A `<file>.{sha1,sha256,sha512,md5}` sidecar request → the digest of
     // the stored `<file>`, computed on demand (design §6). The base path is
     // the request tail with the sidecar extension stripped from the
@@ -322,6 +330,74 @@ async fn serve_file(
         }
         Err(other) => Err(other.into()),
     }
+}
+
+/// Transparent virtual file download (ADR 0031): resolve the authoritative
+/// member via [`VirtualResolutionUseCase::resolve_download`] (name-level
+/// pinning + first-authoritative walk, all in `hort-app`), then serve the file
+/// from that member through the SAME per-member [`serve_file`] path — so
+/// sidecar digests, SNAPSHOT resolution, quarantine gating, and proxy
+/// pull-through all apply unchanged.
+///
+/// A member whose `serve_file` renders a 404 is "absent here" → the walk
+/// continues; any other status (200 / 503 / 403 / 502) is the served outcome
+/// and stops the walk (no fall-through), mirroring the pypi virtual file path.
+/// `Box::pin` breaks the `serve_file → serve_virtual_maven_file → serve_file`
+/// async-recursion type cycle; `resolve_members` excludes virtual members, so
+/// the recursion is depth-1 (virtual → member).
+///
+/// [`VirtualResolutionUseCase::resolve_download`]: hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase::resolve_download
+async fn serve_virtual_maven_file(
+    ctx: &Arc<AppContext>,
+    virtual_repo: &Repository,
+    coords: &ArtifactCoords,
+    artifact_path: &str,
+    is_head: bool,
+    actor: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
+    let resolved: Option<Response> = ctx
+        .virtual_resolution_use_case
+        .resolve_download(
+            virtual_repo,
+            actor,
+            move |member| async move {
+                serve::maven_member_name_presence(ctx, &member, &coords.name, actor).await
+            },
+            move |member| async move {
+                // Serve against the member through the full per-member path.
+                let resp = match Box::pin(serve_file(
+                    ctx,
+                    &member,
+                    coords,
+                    artifact_path,
+                    is_head,
+                    actor,
+                ))
+                .await
+                {
+                    Ok(r) => r,
+                    Err(api) => api.into_response(),
+                };
+                // 404 = this member does not have the coordinate → continue the
+                // walk; anything else is the served outcome.
+                if resp.status() == StatusCode::NOT_FOUND {
+                    Ok::<Option<Response>, hort_app::error::AppError>(None)
+                } else {
+                    Ok(Some(resp))
+                }
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    resolved.ok_or_else(|| {
+        ApiError::from(hort_app::error::AppError::Domain(
+            hort_domain::error::DomainError::NotFound {
+                entity: "Artifact",
+                id: format!("{}:{}", virtual_repo.key, artifact_path),
+            },
+        ))
+    })
 }
 
 /// Resolve an unresolved base-`-SNAPSHOT` file request to the concrete

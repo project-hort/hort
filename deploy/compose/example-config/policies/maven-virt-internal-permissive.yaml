@@ -1,0 +1,20 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: maven-virt-internal-permissive
+spec:
+  # Per-repo operator opt-out of quarantine-by-default. The Maven virtual-repo
+  # native test (scripts/native-tests/scenarios/clients/maven-virtual.sh)
+  # deploys a first-party artifact to this PRIVATE hosted member and
+  # immediately resolves it back THROUGH the virtual (maven-virt-e2e). Without
+  # a 0s quarantine the freshly deployed artifact stays quarantined (the 24h
+  # default), so the virtual aggregation sees no servable owner entry and 404s.
+  # Mirrors maven-e2e-permissive.yaml / npm-virt-internal-permissive.yaml.
+  scope:
+    repository: maven-virt-internal
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

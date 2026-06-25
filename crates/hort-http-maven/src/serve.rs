@@ -49,7 +49,7 @@
 //! cargo serve handler).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -64,8 +64,9 @@ use hort_app::use_cases::index_serve::{
     BuildContext, IndexFilter, MavenVersionPayload, PerVersionPayload, VersionEntry,
 };
 use hort_app::use_cases::index_serve_filter::MavenVersionOrdering;
+use hort_app::use_cases::virtual_resolution::MemberNamePresence;
 use hort_domain::entities::caller::CallerPrincipal;
-use hort_domain::entities::repository::Repository;
+use hort_domain::entities::repository::{Repository, RepositoryType};
 use hort_formats::index_serve::IndexBuilder;
 use hort_formats::maven::coords::split_ga;
 use hort_formats::maven::metadata::MavenMetadataXmlBuilder;
@@ -152,6 +153,159 @@ impl MavenIndexSource for HostedMavenSource {
             // timestamped members for the base `-SNAPSHOT` version.
             MetadataLevel::Snapshot => Ok(materialise_v_level(name, &artifacts, version)),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual (aggregating) — ADR 0031
+// ---------------------------------------------------------------------------
+
+/// `MavenIndexSource` for `RepositoryType::Virtual` repos.
+///
+/// A virtual repo owns no artifacts; it aggregates its members. Both metadata
+/// levels reuse the shared `hort-app` resolution machinery so the
+/// dependency-confusion pinning (ADR 0031) lives in exactly one place — the
+/// per-format source supplies only the member fetch, never the merge:
+///
+/// - **A-level** (version list): [`VirtualResolutionUseCase::aggregate_virtual_index`]
+///   unions members' per-version `VersionEntry`s with name-level pinning + the
+///   authoritative-member merge. The document `<lastUpdated>` fallback is the
+///   max across members (Maven's fixed-width `yyyyMMddHHmmss` makes string-max
+///   == chronological-max).
+/// - **V-level** (one `-SNAPSHOT` version's timestamped builds): the
+///   authoritative member OWNS the snapshot version — interleaving builds from
+///   different members would yield an incoherent `<snapshot>` block — so this
+///   resolves the first owning member via
+///   [`VirtualResolutionUseCase::resolve_download`] and returns ITS V-level
+///   output verbatim.
+///
+/// `select_source` on a member bottoms out at [`HostedMavenSource`]
+/// (`resolve_members` excludes virtual members, so there is no recursion).
+///
+/// [`VirtualResolutionUseCase::aggregate_virtual_index`]: hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase::aggregate_virtual_index
+/// [`VirtualResolutionUseCase::resolve_download`]: hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase::resolve_download
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VirtualMavenSource;
+
+#[async_trait]
+impl MavenIndexSource for VirtualMavenSource {
+    async fn fetch(
+        &self,
+        ctx: &Arc<AppContext>,
+        repo: &Repository,
+        name: &str,
+        level: MetadataLevel,
+        version: Option<&str>,
+        caller: Option<&CallerPrincipal>,
+    ) -> Result<MavenSourceOutput, AppError> {
+        match level {
+            MetadataLevel::Artifact => {
+                // `aggregate_virtual_index` returns only the merged entries, so
+                // the document `<lastUpdated>` fallback is collected as the max
+                // across members through a shared accumulator the per-member
+                // fetch updates (fixed-width timestamp ⇒ string-max ==
+                // chronological-max).
+                let max_fallback = Arc::new(Mutex::new(String::new()));
+                let entries = ctx
+                    .virtual_resolution_use_case
+                    .aggregate_virtual_index(repo, caller, {
+                        let max_fallback = max_fallback.clone();
+                        move |member| {
+                            let max_fallback = max_fallback.clone();
+                            async move {
+                                let out = select_source(&member)
+                                    .fetch(
+                                        ctx,
+                                        &member,
+                                        name,
+                                        MetadataLevel::Artifact,
+                                        None,
+                                        caller,
+                                    )
+                                    .await?;
+                                {
+                                    let mut g = max_fallback.lock().expect("fallback mutex");
+                                    if out.last_updated_fallback > *g {
+                                        *g = out.last_updated_fallback;
+                                    }
+                                }
+                                Ok(out.entries)
+                            }
+                        }
+                    })
+                    .await?;
+                let last_updated_fallback = Arc::try_unwrap(max_fallback)
+                    .map(|m| m.into_inner().expect("fallback mutex"))
+                    .unwrap_or_default();
+                Ok(MavenSourceOutput {
+                    entries,
+                    last_updated_fallback,
+                })
+            }
+            MetadataLevel::Snapshot => {
+                // The authoritative member OWNS the `-SNAPSHOT` version; serve
+                // its V-level output verbatim (no cross-member build merge).
+                let resolved: Option<MavenSourceOutput> = ctx
+                    .virtual_resolution_use_case
+                    .resolve_download(
+                        repo,
+                        caller,
+                        move |member| async move {
+                            maven_member_name_presence(ctx, &member, name, caller).await
+                        },
+                        move |member| async move {
+                            let out = select_source(&member)
+                                .fetch(ctx, &member, name, MetadataLevel::Snapshot, version, caller)
+                                .await?;
+                            // V-level ownership signal: a member with stored
+                            // rows for the base `-SNAPSHOT` version ALWAYS
+                            // yields a non-empty `last_updated_fallback`
+                            // (`materialise_v_level` derives it from those
+                            // rows). Empty therefore means "no rows here" →
+                            // not the owner → continue the walk. If that
+                            // derivation ever changes (an empty fallback
+                            // despite stored rows), this skip silently
+                            // mis-resolves the snapshot owner.
+                            if out.last_updated_fallback.is_empty() {
+                                Ok(None)
+                            } else {
+                                Ok(Some(out))
+                            }
+                        },
+                    )
+                    .await?;
+                Ok(resolved.unwrap_or_else(|| MavenSourceOutput {
+                    entries: Vec::new(),
+                    last_updated_fallback: String::new(),
+                }))
+            }
+        }
+    }
+}
+
+/// Name-ownership probe for a virtual member: does `member` carry the
+/// `group:artifact` `name` (a non-empty A-level version list)? Mirrors the
+/// pypi/npm member-presence closures. A definitive miss → `Absent`; an
+/// infrastructure error → `Unavailable` (fail-closed: a non-proxy member that
+/// errors stays a potential owner so proxies are suppressed — ADR 0031).
+/// `pub(crate)` so the file-download virtual path (`crate::serve_virtual_maven_file`)
+/// shares the one ownership signal.
+pub(crate) async fn maven_member_name_presence(
+    ctx: &Arc<AppContext>,
+    member: &Repository,
+    name: &str,
+    caller: Option<&CallerPrincipal>,
+) -> MemberNamePresence {
+    match select_source(member)
+        .fetch(ctx, member, name, MetadataLevel::Artifact, None, caller)
+        .await
+    {
+        Ok(out) if !out.entries.is_empty() => MemberNamePresence::Present,
+        Ok(_) => MemberNamePresence::Absent,
+        Err(AppError::Domain(hort_domain::error::DomainError::NotFound { .. })) => {
+            MemberNamePresence::Absent
+        }
+        Err(_) => MemberNamePresence::Unavailable,
     }
 }
 
@@ -333,11 +487,17 @@ fn fmt_last_updated(t: DateTime<Utc>) -> String {
     t.format("%Y%m%d%H%M%S").to_string()
 }
 
-/// Pick the [`MavenIndexSource`] for `repo`. Hosted is the only v1 source
-/// (pull-through metadata is Item 9). Mirrors the cargo `select_source`
-/// dispatch seam so a future proxy source slots in here.
-fn select_source(_repo: &Repository) -> Box<dyn MavenIndexSource> {
-    Box::new(HostedMavenSource)
+/// Pick the [`MavenIndexSource`] for `repo` by type.
+///
+/// `Virtual` aggregates its members (ADR 0031). Hosted / Staging / Proxy all
+/// read the local artifact projection via [`HostedMavenSource`] — Maven proxy
+/// *metadata* is cache-only (Item 9: no upstream-metadata source yet), so a
+/// proxy member in a virtual contributes only its already-cached versions.
+fn select_source(repo: &Repository) -> Box<dyn MavenIndexSource> {
+    match repo.repo_type {
+        RepositoryType::Virtual => Box::new(VirtualMavenSource),
+        _ => Box::new(HostedMavenSource),
+    }
 }
 
 /// Build the server-generated `maven-metadata.xml` (A-level or V-level)
