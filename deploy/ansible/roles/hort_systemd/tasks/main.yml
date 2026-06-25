@@ -29,33 +29,64 @@
     group: "{{ hort_user }}"
     mode: "0750"
 
-# ── Env-files (mode 0600 — contain DSN passwords) ────────────────────────────
+# ── OCI token signing key (Ed25519) ──────────────────────────────────────────
+# HORT_NATIVE_TOKENS_ENABLED=true requires a signing key for the OCI /v2 bearer
+# token path (hort-server refuses to boot otherwise). Generate an Ed25519 PKCS#8
+# key on the host ONCE (creates: guard — regenerating would invalidate every
+# already-issued OCI token). It is read-only at runtime; /etc is readable under
+# ProtectSystem=strict, so the hardened unit can load it.
+- name: Ensure hort key directory exists
+  ansible.builtin.file:
+    path: "{{ hort_systemd_key_dir }}"
+    state: directory
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0750"
+
+- name: Generate OCI token signing key (Ed25519 PKCS#8 PEM, once)
+  ansible.builtin.command:
+    cmd: openssl genpkey -algorithm ed25519 -out {{ hort_systemd_oci_signing_key_file }}
+    creates: "{{ hort_systemd_oci_signing_key_file }}"
+
+- name: Secure the OCI signing key (root:hort 0640)
+  ansible.builtin.file:
+    path: "{{ hort_systemd_oci_signing_key_file }}"
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0640"
+
+# ── Env-files (mode 0640 root:hort — contain DSN passwords) ──────────────────
+# Owned by root so the hort service process cannot rewrite its own secrets;
+# group-readable by the hort group so systemd (which reads EnvironmentFile= as
+# root during unit setup) and any authorised ops tooling can read the file.
+# systemd reads EnvironmentFile= before dropping privileges, so root ownership
+# is transparent to the service startup sequence.
 
 - name: Write hort-migrate env-file
   ansible.builtin.template:
     src: hort-migrate.env.j2
     dest: "{{ hort_systemd_env_dir }}/hort-migrate.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-systemd units
 
 - name: Write hort-server env-file
   ansible.builtin.template:
     src: hort-server.env.j2
     dest: "{{ hort_systemd_env_dir }}/hort-server.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-systemd units
 
 - name: Write hort-worker env-file
   ansible.builtin.template:
     src: hort-worker.env.j2
     dest: "{{ hort_systemd_env_dir }}/hort-worker.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-systemd units
 
 # ── systemd unit files ────────────────────────────────────────────────────────
@@ -102,35 +133,147 @@
         dest: /usr/share/keyrings/trivy.asc
         mode: "0644"
 
-    - name: Add trivy apt repository
-      ansible.builtin.apt_repository:
-        repo: >-
-          deb [signed-by=/usr/share/keyrings/trivy.asc]
-          https://aquasecurity.github.io/trivy-repo/deb generic main
-        state: present
-        filename: trivy
+    # Write the repo as a deb822 .sources file directly. The apt_repository
+    # module requires apt-key or the gpg binary even with signed-by, and modern
+    # Debian (13/trixie) removed apt-key while a minimal image ships no gpg — so
+    # it fails "Either apt-key or gpg binary is required". A direct .sources write
+    # needs neither (and avoids the python3-debian dep that deb822_repository
+    # would pull in). This also clears the apt_repository deprecation warning.
+    - name: Remove legacy trivy .list (superseded by the deb822 .sources below)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/trivy.list
+        state: absent
 
-    - name: Install trivy (pinned version)
-      # Pin to an exact version for deterministic installs across re-runs.
-      # The version string must exist in the aquasecurity apt repository at
-      # https://aquasecurity.github.io/trivy-repo/ — verify with
-      # `apt-cache madison trivy` after adding the repo above.
-      # Override hort_systemd_trivy_version in host_vars/group_vars to upgrade.
+    - name: Add trivy apt repository (deb822 .sources)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/trivy.sources
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Types: deb
+          URIs: https://aquasecurity.github.io/trivy-repo/deb
+          Suites: generic
+          Components: main
+          Signed-By: /usr/share/keyrings/trivy.asc
+
+    - name: Install trivy (latest from the keyring-verified repo)
+      # NOT version-pinned: the aquasecurity "generic" suite is a rolling repo
+      # that serves only the current latest trivy (a pinned version 404s the
+      # moment a newer one ships). Integrity comes from the signed-by keyring
+      # above; latest is the right posture for a vulnerability scanner (freshest
+      # detection). For reproducible version pinning, install from the GitHub
+      # release tarball with a checksum instead (as osv-scanner does below).
       ansible.builtin.apt:
-        name: "trivy={{ hort_systemd_trivy_version }}"
+        name: trivy
         state: present
         update_cache: true
 
-- name: Install osv-scanner binary (pinned, checksum-verified)
+- name: Install osv-scanner binary (pinned, checksum + SLSA-provenance verified)
   # Downloads the binary for the pinned version from GitHub Releases and
-  # verifies it against the upstream checksums.txt before installing.
-  # hort_systemd_osv_version is set in defaults/main.yml and is overridable.
-  # See https://github.com/google/osv-scanner/releases for available tags.
+  # verifies it in two steps before installing:
+  #
+  #   Step 1 — integrity:  checksums.txt co-located in the release (existing gate).
+  #   Step 2 — provenance: SLSA attestation (.intoto.jsonl) verified with a pinned
+  #             slsa-verifier binary, confirming the binary was built by the
+  #             google/osv-scanner release workflow — not merely that the bytes
+  #             match what was in the same release archive.
+  #
+  # This closes the supply-chain asymmetry where hort's own binaries had cosign
+  # provenance but the on-host scanner did not (M4).  Both steps are fail-closed:
+  # the play aborts on any verification failure.
+  #
+  # slsa-verifier itself is bootstrapped with a pinned-version + SHA-256 checksum
+  # (hort_systemd_slsa_verifier_version / hort_systemd_slsa_verifier_sha256_amd64|arm64
+  # in defaults/main.yml).  IMPORTANT: update those SHA-256 values from the
+  # official release page before deploying a new slsa-verifier version.
   block:
-    - name: Download osv-scanner binary (amd64)
+    # ── Step 0: bootstrap slsa-verifier (pinned + checksum-verified) ────────
+    # Sentinel guard: assert checksums are set before downloading.
+    # The `match` test requires exactly 64 lower-hex characters — a valid SHA-256
+    # digest — and returns a boolean (regex_search returns the matched string,
+    # which newer ansible-core rejects as a non-boolean conditional).  Sentinel
+    # strings, truncated hashes, and empty values all fail, giving an actionable
+    # error before any network fetch.
+    - name: Assert slsa-verifier SHA-256 checksums have been configured (not sentinels)
+      ansible.builtin.assert:
+        that:
+          - hort_systemd_slsa_verifier_sha256_amd64 is match('^[0-9a-f]{64}$')
+          - hort_systemd_slsa_verifier_sha256_arm64 is match('^[0-9a-f]{64}$')
+        fail_msg: >-
+          hort_systemd_slsa_verifier_sha256_amd64 and/or
+          hort_systemd_slsa_verifier_sha256_arm64 are not valid SHA-256 hashes
+          (expected 64 lowercase hex characters).
+          Set the real values for slsa-verifier v{{ hort_systemd_slsa_verifier_version }} from:
+            https://github.com/slsa-framework/slsa-verifier/releases/tag/v{{ hort_systemd_slsa_verifier_version }}
+            (files: slsa-verifier-linux-amd64 / slsa-verifier-linux-arm64)
+          Download locally, run sha256sum, cross-check against the release page,
+          then store the verified values in host_vars/ or group_vars/production/
+          (vault-encrypted).  See README "Obtaining binary checksums" for the
+          step-by-step runbook.
+
+    - name: Download slsa-verifier binary (amd64)
       ansible.builtin.get_url:
         url: >-
-          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_linux_amd64
+          https://github.com/slsa-framework/slsa-verifier/releases/download/v{{ hort_systemd_slsa_verifier_version }}/slsa-verifier-linux-amd64
+        dest: /var/tmp/slsa-verifier
+        mode: "0600"
+        force: true
+      when: hort_arch == 'amd64'
+
+    - name: Download slsa-verifier binary (arm64)
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/slsa-framework/slsa-verifier/releases/download/v{{ hort_systemd_slsa_verifier_version }}/slsa-verifier-linux-arm64
+        dest: /var/tmp/slsa-verifier
+        mode: "0600"
+        force: true
+      when: hort_arch == 'arm64'
+
+    - name: Compute checksum of downloaded slsa-verifier
+      ansible.builtin.stat:
+        path: /var/tmp/slsa-verifier
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: hort_systemd_slsa_verifier_stat
+
+    - name: Fail if slsa-verifier checksum does not match (amd64)
+      ansible.builtin.fail:
+        msg: >-
+          slsa-verifier checksum mismatch for v{{ hort_systemd_slsa_verifier_version }} (amd64):
+          expected {{ hort_systemd_slsa_verifier_sha256_amd64 }},
+          got {{ hort_systemd_slsa_verifier_stat.stat.checksum }}.
+          Update hort_systemd_slsa_verifier_sha256_amd64 in defaults/main.yml.
+      when:
+        - hort_arch == 'amd64'
+        - hort_systemd_slsa_verifier_stat.stat.checksum != hort_systemd_slsa_verifier_sha256_amd64
+
+    - name: Fail if slsa-verifier checksum does not match (arm64)
+      ansible.builtin.fail:
+        msg: >-
+          slsa-verifier checksum mismatch for v{{ hort_systemd_slsa_verifier_version }} (arm64):
+          expected {{ hort_systemd_slsa_verifier_sha256_arm64 }},
+          got {{ hort_systemd_slsa_verifier_stat.stat.checksum }}.
+          Update hort_systemd_slsa_verifier_sha256_arm64 in defaults/main.yml.
+      when:
+        - hort_arch == 'arm64'
+        - hort_systemd_slsa_verifier_stat.stat.checksum != hort_systemd_slsa_verifier_sha256_arm64
+
+    - name: Make slsa-verifier executable
+      ansible.builtin.file:
+        path: /var/tmp/slsa-verifier
+        mode: "0700"
+
+    # ── Step 1: download osv-scanner binary + provenance artifacts ───────────
+
+    - name: Compute osv-scanner release base URL
+      ansible.builtin.set_fact:
+        hort_systemd_osv_base_url: >-
+          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}
+
+    - name: Download osv-scanner binary (amd64)
+      ansible.builtin.get_url:
+        url: "{{ hort_systemd_osv_base_url }}/osv-scanner_linux_amd64"
         dest: /var/tmp/osv-scanner
         mode: "0600"
         force: true
@@ -138,20 +281,32 @@
 
     - name: Download osv-scanner binary (arm64)
       ansible.builtin.get_url:
-        url: >-
-          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_linux_arm64
+        url: "{{ hort_systemd_osv_base_url }}/osv-scanner_linux_arm64"
         dest: /var/tmp/osv-scanner
         mode: "0600"
         force: true
       when: hort_arch == 'arm64'
 
+    # osv-scanner publishes one checksums file named `osv-scanner_SHA256SUMS`
+    # (not a versioned `_checksums.txt`); lines are `<sha256>  osv-scanner_linux_<arch>`.
     - name: Download osv-scanner checksums file
       ansible.builtin.get_url:
-        url: >-
-          https://github.com/google/osv-scanner/releases/download/v{{ hort_systemd_osv_version }}/osv-scanner_{{ hort_systemd_osv_version }}_checksums.txt
+        url: "{{ hort_systemd_osv_base_url }}/osv-scanner_SHA256SUMS"
         dest: /var/tmp/osv-scanner_checksums.txt
         mode: "0600"
         force: true
+
+    # osv-scanner ships ONE multi-subject SLSA provenance for all release
+    # artifacts (multiple.intoto.jsonl), not a per-arch file; slsa-verifier
+    # verify-artifact matches the given binary's digest against its subjects.
+    - name: Download osv-scanner SLSA provenance attestation
+      ansible.builtin.get_url:
+        url: "{{ hort_systemd_osv_base_url }}/multiple.intoto.jsonl"
+        dest: /var/tmp/osv-scanner.intoto.jsonl
+        mode: "0600"
+        force: true
+
+    # ── Step 2: integrity check (checksums.txt) ───────────────────────────────
 
     - name: Extract expected checksum for this arch
       ansible.builtin.shell:
@@ -179,6 +334,27 @@
           got {{ hort_systemd_osv_stat.stat.checksum }}
       when: hort_systemd_osv_stat.stat.checksum != hort_systemd_osv_expected_sha256.stdout
 
+    # ── Step 3: SLSA provenance check ────────────────────────────────────────
+    # Verifies that the binary was produced by the google/osv-scanner release
+    # workflow — not just that the bytes are unchanged from the release archive.
+    # --source-uri pins the expected GitHub source repository; a binary signed
+    # by any other builder is rejected.  Fail-closed: no fallback path.
+
+    - name: Verify osv-scanner SLSA provenance
+      ansible.builtin.command:
+        argv:
+          - /var/tmp/slsa-verifier
+          - verify-artifact
+          - /var/tmp/osv-scanner
+          - "--provenance-path=/var/tmp/osv-scanner.intoto.jsonl"
+          - "--source-uri={{ hort_systemd_osv_slsa_source_uri }}"
+          - "--source-tag=v{{ hort_systemd_osv_version }}"
+      changed_when: false
+      register: hort_systemd_osv_slsa_result
+      failed_when: hort_systemd_osv_slsa_result.rc != 0
+
+    # ── Install only after both checks pass ───────────────────────────────────
+
     - name: Install osv-scanner to /usr/local/bin
       ansible.builtin.copy:
         src: /var/tmp/osv-scanner
@@ -189,10 +365,23 @@
         remote_src: true
 
 # ── Enable and start units ────────────────────────────────────────────────────
-# hort-migrate is Type=oneshot; we enable it so the ordering dependency fires
-# automatically when hort-server starts.  We do NOT start it standalone here
-# because it requires the DB passwords (env-file) which are ready now, but
-# the postgres-apt role has already started PostgreSQL earlier in the play.
+# Ordering is explicit to ensure the migration and the post-migrate grant
+# both complete before hort-server and hort-worker are started:
+#
+#   1. Enable hort-migrate.service (so the systemd ordering dep is registered).
+#   2. Start hort-migrate.service explicitly and WAIT for it to finish.
+#      The systemd module with state=started on a Type=oneshot service blocks
+#      until the unit reaches the `dead` (success) state — the play fails here
+#      if the migration exits non-zero, giving a clear error before any server
+#      starts.  sqlx migrations are idempotent, so hort-server re-triggering
+#      hort-migrate.service via its Requires=/After= dependency on subsequent
+#      invocations is a harmless no-op.
+#   3. Grant hort_retention_role TO hort_app_role (post-migrate: the role is
+#      created by migration 004_events.sql and does not exist before that).
+#      This lets the worker (login as hort_app_role) issue
+#      `SET LOCAL ROLE hort_retention_role` for the sanctioned retention sweep
+#      (ADR 0020) without needing a separate login role for the worker.
+#   4. Enable and start hort-server.service and hort-worker.service.
 
 - name: Enable hort-migrate.service
   ansible.builtin.systemd:
@@ -200,16 +389,54 @@
     enabled: true
     scope: system
 
-- name: Enable and start hort-server.service
+- name: Run hort-migrate.service (oneshot — blocks until migration completes)
+  ansible.builtin.systemd:
+    name: hort-migrate.service
+    state: started
+    scope: system
+
+# Post-migrate grant: hort_retention_role is created by migration 004_events.sql
+# and only exists after the migration above completes successfully. Membership
+# lets the worker (logging in as hort_app_role) call `SET LOCAL ROLE
+# hort_retention_role` inside the sanctioned retention sweep transaction (ADR 0020).
+#
+# WITH INHERIT FALSE is REQUIRED (PG16+). A plain GRANT makes hort_app_role
+# *inherit* hort_retention_role's SELECT+DELETE on the events table, and
+# hort-server's event-store boot probe — has_table_privilege(current_user,
+# 'events','DELETE') — counts inherited privileges, so it refuses to boot:
+# "runtime role holds forbidden 'DELETE' privilege on events table". INHERIT
+# FALSE grants membership for SET ROLE only (SET defaults TRUE), with no passive
+# privilege inheritance — the probe passes, and the sweep still assumes the role
+# explicitly. Re-granting updates the inherit flag (self-heals a membership
+# previously granted WITH INHERIT).
+- name: Grant hort_retention_role to hort_app_role (SET ROLE only, no inherit — ADR 0020)
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -d
+      - "{{ postgres_apt_db_name }}"
+      - -c
+      - "GRANT {{ postgres_apt_retention_role }} TO {{ postgres_apt_runtime_role }} WITH INHERIT FALSE;"
+  become: true
+  become_user: postgres
+  changed_when: true
+
+# `restarted` (not `started`) when hort_binaries swapped the binary this run —
+# `started` is a no-op on an already-running unit, which would leave the old
+# binary executing. This runs AFTER hort-migrate above, so a new binary's
+# migrations apply before the new server/worker process starts.
+- name: Enable and start (restart on binary change) hort-server.service
   ansible.builtin.systemd:
     name: hort-server.service
-    state: started
+    state: "{{ 'restarted' if hort_binaries_changed | default(false) | bool else 'started' }}"
     enabled: true
     scope: system
 
-- name: Enable and start hort-worker.service
+- name: Enable and start (restart on binary change) hort-worker.service
   ansible.builtin.systemd:
     name: hort-worker.service
-    state: started
+    state: "{{ 'restarted' if hort_binaries_changed | default(false) | bool else 'started' }}"
     enabled: true
     scope: system

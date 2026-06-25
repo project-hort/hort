@@ -311,6 +311,74 @@ jobs:
         continue-on-error: true
 
   # ════════════════════════════════════════════════════════════════════════════
+  # MIRROR-TO-HORT-OCI: publish the first-party images to registry.hort.rs (dogfood)
+  #
+  # Mirrors the just-merged multi-arch hort-server / hort-worker images — and
+  # their cosign signatures + attestations — from ghcr.io to the hosted, public
+  # `hort-oci` repo on registry.hort.rs. Gated by vars.HORT_PROXY_ENABLED ==
+  # 'true' (default off), so it is a no-op until the instance is live — exactly
+  # like the crates publish in release.yml. `environment: release` makes this
+  # job's OIDC token carry the `environment: release` claim that the gha-release
+  # ServiceAccount matches (developer/write on hort-oci). `cosign copy` (not
+  # crane/skopeo) carries the signatures + attestations along with the image, so
+  # the mirrored copy verifies the same way the ghcr.io copy does. Requires the
+  # protected `release` environment (Settings → Environments → release: tag-only
+  # + reviewer) — the same prerequisite as the crates publish.
+  # ════════════════════════════════════════════════════════════════════════════
+  mirror-to-hort-oci:
+    name: Mirror images to registry.hort.rs/hort-oci
+    runs-on: ubuntu-latest
+    environment: release
+    needs: [merge]
+    permissions:
+      contents: read
+      id-token: write   # mint the OIDC token for the gha-release SA exchange
+      packages: read    # pull the just-published images from ghcr.io
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      vars.HORT_PROXY_ENABLED == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GitHub Container Registry (read source images)
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Authenticate to registry.hort.rs as the gha-release SA (environment:
+      # release ↔ SA claim). The action's docker login writes the registry.hort.rs
+      # credential that `cosign copy` reads from ~/.docker/config.json to push.
+      - uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+
+      - name: Mirror images (with signatures + attestations) to hort-oci
+        env:
+          GHCR: ${{ env.REGISTRY }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Mirror the version tag always; add :latest only for a stable release
+          # (no pre-release suffix), matching the ghcr.io metadata tagging.
+          dest_tags=("${version}")
+          case "${version}" in *-*) ;; *) dest_tags+=("latest") ;; esac
+          for suffix in server worker; do
+            src="${GHCR}/${REPO}-${suffix}:${version}"
+            for tag in "${dest_tags[@]}"; do
+              dest="registry.hort.rs/hort-oci/hort-${suffix}:${tag}"
+              echo "Mirroring ${src} -> ${dest}"
+              cosign copy --force "${src}" "${dest}"
+            done
+          done
+
+  # ════════════════════════════════════════════════════════════════════════════
   # PUBLISH-CHART: package and push the hort-server Helm chart as an OCI
   # artifact to ghcr.io, mirroring the GitLab `helm:lint-and-publish` job. The
   # chart lands at ghcr.io/<owner>/charts/hort-server:<version>. Runs after the

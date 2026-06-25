@@ -1,0 +1,43 @@
+# /etc/sysctl.d/60-hort.conf — managed by Ansible (base role).
+# CIS-aligned network and kernel hardening.  Applied by "sysctl --system"
+# after this file is deployed.  Overrides the distro defaults in
+# /etc/sysctl.d/99-sysctl.conf; does NOT override anything in
+# /etc/sysctl.d/10-*.conf (Debian defaults) unless explicitly duplicated.
+
+# ── Reverse-path filtering (CIS 3.3.7 / 3.3.8) ───────────────────────────────
+# Reject packets whose source address is not reachable via the ingress
+# interface — prevents IP spoofing and asymmetric-routing abuse.
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# ── TCP SYN cookies (CIS 3.3.5) ───────────────────────────────────────────────
+# Protect against SYN flood DoS without discarding half-open connections.
+net.ipv4.tcp_syncookies = 1
+
+# ── ICMP redirect rejection (CIS 3.3.1 / 3.3.2 / 3.3.3) ─────────────────────
+# Do not accept ICMP redirects (routing-table poisoning vector).
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+# Do not send ICMP redirects (this host is not a router).
+net.ipv4.conf.all.send_redirects = 0
+
+# ── Source routing rejection (CIS 3.3.9 / 3.3.10) ────────────────────────────
+# Ignore packets with the IP source-route option set.
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+
+# ── Kernel pointer and dmesg restriction (CIS 1.6.x) ─────────────────────────
+# kernel.kptr_restrict=2: always suppress kernel symbol addresses in /proc
+# (even for processes with CAP_SYSLOG) — prevents KASLR bypass via
+# /proc/kallsyms, /proc/modules, etc.
+kernel.kptr_restrict = 2
+# kernel.dmesg_restrict=1: restrict dmesg to CAP_SYSLOG holders — hides
+# kernel addresses and memory layout from unprivileged processes.
+kernel.dmesg_restrict = 1
+
+# ── Ptrace scope (CIS 1.6.x / Yama LSM) ──────────────────────────────────────
+# scope=1: only a parent process (or processes with PTRACE_TRACEME / CAP_SYS_PTRACE)
+# may ptrace a child.  Prevents lateral process inspection by a compromised
+# hort service process (e.g. a malicious WASM plugin escaping the sandbox).
+# Set to 2 if strict no-ptrace-at-all is desired (breaks gdb for all users).
+kernel.yama.ptrace_scope = 1

@@ -3,10 +3,13 @@
 #
 # Installs nginx, templates the registry.hort.rs vhost with streaming/large-
 # body tuning (client_max_body_size 0, proxy_request_buffering off, etc.),
-# and enables the site.  certbot fills in the SSL directives after issuance.
+# and enables the site.
 #
-# The site template is placed under sites-available/ and symlinked into
-# sites-enabled/ (Debian nginx convention).
+# On a fresh host the LE certificate does not yet exist, so the initial render
+# omits the 443 server block (nginx_cert_exists = false) — nginx starts with
+# port 80 only, which is sufficient for the webroot ACME challenge.  After the
+# certbot role issues the certificate the nginx role is notified to re-render
+# the template and reload, bringing up the 443 block in the same play.
 
 - name: Install nginx
   ansible.builtin.apt:
@@ -20,6 +23,37 @@
     state: started
     enabled: true
 
+- name: Deploy rate-limit zone config (conf.d/hort-ratelimit.conf)
+  ansible.builtin.template:
+    src: hort-ratelimit.conf.j2
+    dest: /etc/nginx/conf.d/hort-ratelimit.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+# The TLS policy lives in the named vhost's SERVER block
+# (registry.hort.rs.conf.j2), which overrides nginx.conf's http defaults without
+# conflict. An http-level conf.d baseline duplicated server_tokens / ssl_protocols
+# / ssl_prefer_server_ciphers that Debian's stock nginx.conf already sets in the
+# http context — a duplicate-directive error (nginx -t fails). The default_server
+# blocks need no TLS policy (the 443 one ssl_reject_handshakes; the 80 one 444s).
+# Remove any previously-deployed copy.
+- name: Remove redundant ssl-hardening conf.d (TLS policy lives in the vhost server block)
+  ansible.builtin.file:
+    path: /etc/nginx/conf.d/ssl-hardening.conf
+    state: absent
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Stat LE certificate (determines whether 443 block is rendered)
+  ansible.builtin.stat:
+    path: /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem
+  register: nginx_cert_stat
+
 - name: Template registry vhost (sites-available)
   ansible.builtin.template:
     src: registry.hort.rs.conf.j2
@@ -27,6 +61,8 @@
     owner: root
     group: root
     mode: "0644"
+  vars:
+    nginx_cert_exists: "{{ nginx_cert_stat.stat.exists }}"
   notify:
     - Validate nginx config
     - Reload nginx

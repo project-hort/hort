@@ -2,39 +2,54 @@
 # Managed by Ansible — do not edit by hand.
 #
 # Matches nginx access_log lines (combined format) where the client received
-# a 401 or 403 on authentication-sensitive hort paths:
-#   /api/v1/auth/       — OIDC callback + token exchange endpoint
-#   /api/v1/admin/      — admin API (requires admin token)
-#   /v2/                — OCI Distribution Spec (registry push/pull with auth)
-#   /crates/            — Cargo sparse index + upload (registry-scoped)
-#   /pypi/              — PyPI upload/download (requires write token)
-#   /npm/               — npm publish/install (requires write token)
+# a 401 or 403 on ANY path.  The previous path-allowlist approach was fragile;
+# a status-based match is more robust: anonymous reads return 200, so 401/403
+# on any path is inherently suspicious (auth failure or forbidden access).
 #
-# The regex matches ONLY 401 and 403 status codes.  Anonymous hort-oci reads
-# return 200 and are therefore never matched — no false positives on public
-# pull-through traffic.
+# This filter intentionally matches ALL paths so that:
+#   - Auth failures on newly-added endpoints are caught without a filter update.
+#   - Probing of non-existent auth endpoints (returning 401/403) is also caught.
 #
 # nginx combined log format (reference):
 #   $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent
 #   "$http_referer" "$http_user_agent"
 #
-# Example line that MATCHES (401 on OCI auth):
+# Field layout (1-indexed):
+#   1: $remote_addr  ← <HOST> placeholder (client IP)
+#   2: -             (identd, always "-")
+#   3: $remote_user  (\S+ — authenticated user or "-")
+#   4: [$time_local] (enclosed in brackets)
+#   5: "$request"    (enclosed in quotes)
+#   6: $status       (HTTP status code)
+#   7: $body_bytes_sent
+#   8: "$http_referer"
+#   9: "$http_user_agent"
+#
+# Matched example (401 on OCI auth endpoint):
 #   1.2.3.4 - - [21/Jun/2026:10:00:00 +0000] "GET /v2/ HTTP/1.1" 401 0 "-" "docker/24.0"
 #
-# Example line that does NOT match (200 on anonymous OCI read):
+# Matched example (403 on arbitrary path — e.g. brute-force probe):
+#   5.6.7.8 - - [21/Jun/2026:11:00:00 +0000] "GET /maven/some/path HTTP/1.1" 403 162 "-" "curl/7.88"
+#
+# NOT matched (200 on anonymous OCI read):
 #   1.2.3.4 - - [21/Jun/2026:10:00:00 +0000] "GET /v2/hort-oci/manifests/latest HTTP/1.1" 200 1234 "-" "crane/0.19"
+#
+# NOT matched (200 on anonymous PyPI read):
+#   9.10.11.12 - - [21/Jun/2026:12:00:00 +0000] "GET /pypi/simple/requests/ HTTP/1.1" 200 4096 "-" "pip/23.0"
 #
 # Deploy-time validation (run on the target host after provisioning):
 #   fail2ban-regex /var/log/nginx/access.log \
 #     /etc/fail2ban/filter.d/hort-nginx-auth.conf
-# Expected: matched lines count > 0 if auth failures have occurred; zero
-# false positives on 200 lines.
+# Or use the regression test script shipped in scripts/test-fail2ban-regex.sh
+# (runs against bundled sample lines; see that file for CI wiring notes).
 
 [Definition]
 
 # <HOST> is the fail2ban placeholder for the client IP; it maps to the first
 # field ($remote_addr) in the nginx combined log line.
+# The regex matches any HTTP method, any path, and any HTTP version — only
+# the 401 or 403 status code determines whether the line is matched.
 
-failregex = ^<HOST> - \S+ \[.*?\] "(?:GET|POST|PUT|DELETE|PATCH|HEAD) /(?:api/v1/auth/|api/v1/admin/|v2/|crates/|pypi/|npm/).*?" (?:401|403) \d+
+failregex = ^<HOST> - \S+ \[.*?\] "[A-Z]+ \S+ HTTP/\d\.\d" (?:401|403) \d+
 
 ignoreregex =

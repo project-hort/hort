@@ -14,9 +14,9 @@
   ansible.builtin.file:
     path: "{{ hort_env_dir }}"
     state: directory
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0700"
+    mode: "0750"
 
 - name: Ensure postgres data directory exists
   ansible.builtin.file:
@@ -26,27 +26,57 @@
     group: "{{ hort_gid }}"
     mode: "0700"
 
+# ── OCI token signing key (Ed25519) ──────────────────────────────────────────
+# HORT_NATIVE_TOKENS_ENABLED=true requires an OCI /v2 bearer-token signing key
+# (hort-server refuses to boot otherwise — the same gap the native flavor hit).
+# Generate an Ed25519 PKCS#8 key on the host ONCE (creates: guard — regenerating
+# invalidates already-issued OCI tokens). Owned by the container uid + mounted
+# :U,ro so the rootless container can read it but not rewrite its own secret.
+- name: Ensure OCI key directory exists
+  ansible.builtin.file:
+    path: "{{ hort_oci_key_dir }}"
+    state: directory
+    owner: "{{ hort_uid }}"
+    group: "{{ hort_gid }}"
+    mode: "0700"
+
+- name: Generate OCI token signing key (Ed25519 PKCS#8 PEM, once)
+  ansible.builtin.command:
+    cmd: openssl genpkey -algorithm ed25519 -out {{ hort_oci_key_dir }}/oci-signing.pem
+    creates: "{{ hort_oci_key_dir }}/oci-signing.pem"
+
+- name: Own the OCI signing key as the container uid
+  ansible.builtin.file:
+    path: "{{ hort_oci_key_dir }}/oci-signing.pem"
+    owner: "{{ hort_uid }}"
+    group: "{{ hort_gid }}"
+    mode: "0600"
+
 # ── env-files (non-secret subset) ────────────────────────────────────────────
 # Secret values injected here from group_vars/production/ (gitignored Vault).
 # Each template has a "SECRET PLACEHOLDER" comment explaining where to source
 # the value.
+#
+# mode 0640 root:hort — root owns the file so the container process (running as
+# hort) cannot rewrite its own secrets; the hort group can read so the rootless
+# systemd session that launches the container picks up the env-file correctly.
 
 - name: Write hort-server env-file
   ansible.builtin.template:
     src: hort-server.env.j2
     dest: "{{ hort_env_dir }}/hort-server.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-server
 
 - name: Write hort-worker env-file
   ansible.builtin.template:
     src: hort-worker.env.j2
     dest: "{{ hort_env_dir }}/hort-worker.env"
-    owner: "{{ hort_user }}"
+    owner: root
     group: "{{ hort_user }}"
-    mode: "0600"
+    mode: "0640"
   notify: Reload hort-worker
 
 # ── Quadlet unit files ────────────────────────────────────────────────────────

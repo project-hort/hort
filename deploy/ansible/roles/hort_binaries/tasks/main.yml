@@ -15,12 +15,114 @@
 # Verification: cosign verify-blob --bundle <name>.tar.gz.bundle ...
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
+# cosign is the trust-bootstrap for the provenance gate.  An unpinned apt cosign
+# risks flag-semantics drift (bundle format requires cosign >= v2) and cannot
+# verify its own provenance.  We therefore install a specific release binary from
+# the sigstore GitHub release page, verified by SHA-256 checksum, then assert
+# cosign version >= 2 before running the verify-blob gate (M5).
+#
+# Pinned version and checksums are in defaults/main.yml
+# (hort_binaries_cosign_version / hort_binaries_cosign_sha256_amd64|arm64).
+# IMPORTANT: update those SHA-256 values from the official release page when
+# upgrading cosign.
 
-- name: Install cosign
-  ansible.builtin.apt:
-    name: cosign
-    state: present
-    update_cache: true
+# ── Sentinel guard: assert checksums are set before downloading ───────────────
+# Fails immediately if the default sentinel values have not been replaced.
+# The `match` test requires exactly 64 lower-hex characters — the format of a
+# real SHA-256 digest — and returns a boolean (regex_search returns the matched
+# string, which newer ansible-core rejects as a non-boolean conditional).  A
+# sentinel string, truncated hash, or empty value all fail this check, producing
+# an actionable error before any network fetch.
+- name: Assert cosign SHA-256 checksums have been configured (not sentinels)
+  ansible.builtin.assert:
+    that:
+      - hort_binaries_cosign_sha256_amd64 is match('^[0-9a-f]{64}$')
+      - hort_binaries_cosign_sha256_arm64 is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      hort_binaries_cosign_sha256_amd64 and/or hort_binaries_cosign_sha256_arm64
+      are not valid SHA-256 hashes (expected 64 lowercase hex characters).
+      Set the real values for cosign v{{ hort_binaries_cosign_version }} from:
+        https://github.com/sigstore/cosign/releases/tag/v{{ hort_binaries_cosign_version }}
+        (files: cosign-linux-amd64 / cosign-linux-arm64)
+      Download locally, run sha256sum, cross-check against the release page,
+      then store the verified values in host_vars/ or group_vars/production/
+      (vault-encrypted).  See README "Obtaining binary checksums" for the
+      step-by-step runbook.
+
+- name: Download pinned cosign binary (amd64)
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/sigstore/cosign/releases/download/v{{ hort_binaries_cosign_version }}/cosign-linux-amd64
+    dest: /var/tmp/cosign-install
+    mode: "0600"
+    force: true
+  when: hort_arch == 'amd64'
+
+- name: Download pinned cosign binary (arm64)
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/sigstore/cosign/releases/download/v{{ hort_binaries_cosign_version }}/cosign-linux-arm64
+    dest: /var/tmp/cosign-install
+    mode: "0600"
+    force: true
+  when: hort_arch == 'arm64'
+
+- name: Compute checksum of downloaded cosign binary
+  ansible.builtin.stat:
+    path: /var/tmp/cosign-install
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: hort_binaries_cosign_stat
+
+- name: Fail if cosign checksum does not match (amd64)
+  ansible.builtin.fail:
+    msg: >-
+      cosign checksum mismatch for v{{ hort_binaries_cosign_version }} (amd64):
+      expected {{ hort_binaries_cosign_sha256_amd64 }},
+      got {{ hort_binaries_cosign_stat.stat.checksum }}.
+      Update hort_binaries_cosign_sha256_amd64 in defaults/main.yml.
+  when:
+    - hort_arch == 'amd64'
+    - hort_binaries_cosign_stat.stat.checksum != hort_binaries_cosign_sha256_amd64
+
+- name: Fail if cosign checksum does not match (arm64)
+  ansible.builtin.fail:
+    msg: >-
+      cosign checksum mismatch for v{{ hort_binaries_cosign_version }} (arm64):
+      expected {{ hort_binaries_cosign_sha256_arm64 }},
+      got {{ hort_binaries_cosign_stat.stat.checksum }}.
+      Update hort_binaries_cosign_sha256_arm64 in defaults/main.yml.
+  when:
+    - hort_arch == 'arm64'
+    - hort_binaries_cosign_stat.stat.checksum != hort_binaries_cosign_sha256_arm64
+
+- name: Install pinned cosign binary to /usr/local/bin
+  ansible.builtin.copy:
+    src: /var/tmp/cosign-install
+    dest: /usr/local/bin/cosign
+    owner: root
+    group: root
+    mode: "0755"
+    remote_src: true
+
+- name: Assert cosign version >= 2 (bundle-format verify-blob requires cosign v2+)
+  # Fail-closed: if cosign is older than v2, verify-blob --bundle semantics
+  # differ and the provenance gate cannot be trusted.  This guard fires before
+  # any verify-blob call so a version regression is caught immediately.
+  #
+  # The lookbehind `(?<=GitVersion:\s{1,16}v)` is valid PCRE2 (GNU grep -P).
+  # Variable-width lookbehinds are supported in PCRE2 / grep -P but not in
+  # POSIX ERE.  If sigstore changes the `cosign version` output format, this
+  # pattern may return empty stdout — which is fail-closed: Jinja2 evaluates
+  # `'' | int` as 0, `0 < 2` is true, and the task fails.  Correct behavior.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      cosign version 2>&1 | grep -oP '(?<=GitVersion:\s{1,16}v)\d+' | head -1
+    executable: /bin/bash
+  register: hort_binaries_cosign_major_version
+  changed_when: false
+  failed_when: hort_binaries_cosign_major_version.stdout | int < 2
 
 - name: Ensure download temp directory exists
   ansible.builtin.file:

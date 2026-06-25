@@ -2,14 +2,16 @@
 # Native flavor — bare-metal hort-server binary + systemd units.
 #
 # Role execution order:
-#   base          — (Task 4) OS hardening, swap, unattended-upgrades
+#   base          — OS hardening: firewall (ufw), sysctl, SSH hardening,
+#                   unattended-upgrades, zram compressed-RAM swap,
+#                   auditd baseline, persistent journald, nginx AppArmor enforce
 #   postgres_apt  — (Task 9) PostgreSQL via apt (Debian 13); two ADR-0009 roles
 #   hort_binaries — (Task 9) download + cosign-verify hort-server/worker release binaries
 #   hort_systemd  — (Task 9) native systemd units (migrate.service → server.service)
-#   nginx         — (Task 4) TLS-terminating reverse proxy
-#   certbot       — (Task 4) Let's Encrypt certificate issuance + renewal
-#   fail2ban      — (Task 4) brute-force protection
-#   gitops        — (Task 4) syncs files/gitops/ tree to hort_config_dir on the host
+#   nginx         — TLS-terminating reverse proxy
+#   certbot       — Let's Encrypt certificate issuance + renewal
+#   fail2ban      — brute-force protection
+#   gitops        — syncs files/gitops/ tree to hort_config_dir on the host
 
 - name: Deploy hort (native flavor)
   hosts: hort
@@ -21,6 +23,13 @@
     # hort-server runs as a system service; admin commands are direct.
     gitops_admin_cmd: "hort-server admin"
     gitops_server_systemd_scope: "system"
+    # The bare `hort-server admin` process has no systemd EnvironmentFile, so it
+    # needs HORT_DATABASE_URL in its environment to reach the DB. issue-svc-token
+    # is a runtime CLI subcommand → the hort_app_role runtime DSN (postgres-roles.md).
+    # Mirrors hort-server.env.j2's HORT_DATABASE_URL (socket form, URL-encoded pw).
+    gitops_admin_env:
+      # yamllint disable-line rule:line-length
+      HORT_DATABASE_URL: "postgres://{{ postgres_apt_runtime_role }}:{{ hort_db_runtime_password | urlencode | regex_replace('/', '%2F') }}@%2Fvar%2Frun%2Fpostgresql/{{ postgres_apt_db_name }}"
 
   roles:
     - role: base

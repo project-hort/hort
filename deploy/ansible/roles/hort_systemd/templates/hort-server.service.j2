@@ -22,6 +22,39 @@ NoNewPrivileges=true
 ReadWritePaths={{ hort_systemd_cas_dir }}
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── M1 additional hardening (security audit 2026-06) ──────────────────────────
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# ProcSubset=pid VERIFIED SAFE for hort-server (M1 review follow-up, 2026-06):
+# /metrics is in-process metrics_exporter_prometheus counters
+# (telemetry.rs install_recorder -> handle.render()), the health check is a DB
+# ping, and there are NO non-pid /proc reads in source nor any
+# procfs/sysinfo/process-collector crate in Cargo.lock. So hiding /proc/net,
+# /proc/meminfo, etc. does not affect metrics/health here.
+ProcSubset=pid
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+LimitNOFILE=65536
+TasksMax=4096
+# NOTE: MemoryDenyWriteExecute is intentionally OMITTED.
+# wasmtime uses a JIT that requires W+X memory mappings at runtime; MDWX
+# would cause an immediate SIGSYS on the first WASM module load.  Do NOT
+# add MemoryDenyWriteExecute to this unit without first replacing wasmtime
+# with an AOT-only runtime that makes no W+X mappings.
+
 Restart=always
 
 [Install]

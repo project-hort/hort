@@ -1,0 +1,53 @@
+---
+# base role defaults — SSH hardening knobs.
+#
+# SAFETY: PasswordAuthentication is disabled by default.  This is correct for
+# an internet-facing host provisioned via Ansible (key auth is verified if the
+# play reaches this task).  If you need to adjust these values, override in
+# group_vars/ or host_vars/ before running the play.
+#
+# base_sshd_allow_groups is intentionally UNSET (commented out) by default —
+# setting it to a specific group would lock out any user not in that group,
+# including the ansible_user.  Only set this if you have verified all required
+# users are members of the named group on the target host.
+#
+# base_sshd_allow_groups: wheel
+
+base_sshd_password_auth: "no"
+base_sshd_kbd_interactive_auth: "no"
+base_sshd_permit_root_login: "prohibit-password"
+base_sshd_max_auth_tries: 3
+base_sshd_client_alive_interval: 300
+base_sshd_client_alive_count_max: 2
+
+# ── Unattended-upgrades reboot window ─────────────────────────────────────────
+# Allow unattended-upgrades to reboot the host automatically after a security
+# update requires it (e.g. kernel, glibc).  The reboot fires at the time below
+# (local system clock).  Override in group_vars/production/ or host_vars/ if
+# the maintenance window differs per environment.
+base_unattended_reboot: "true"
+base_unattended_reboot_time: "03:30"
+
+# ── zram compressed-RAM swap (L6) ─────────────────────────────────────────────
+# Logical swap size for the zram0 device, in MiB.  lz4 compression typically
+# achieves 2:1–3:1 on mixed workloads, so the physical RAM consumption is
+# roughly half to one third of this value.
+# Note: systemd-zram-generator interprets a bare integer as MiB.
+# Default: min(RAM/2, 4096) MiB — evaluated at play time via ansible_memtotal_mb.
+# Override in group_vars/ or host_vars/ with an explicit integer (MiB).
+base_zram_size: "{{ [ansible_memtotal_mb // 2, 4096] | min }}"
+
+# ── auditd (L7) ───────────────────────────────────────────────────────────────
+# base_audit_immutable — append -e 2 (immutable ruleset) to the audit rules.
+# Requires a reboot to change rules; prevents an attacker who gains root from
+# disabling audit without a reboot.  Set to false if frequent rule changes are
+# needed on the host (not recommended for production).
+base_audit_immutable: true
+
+# ── Persistent journald (L7) ──────────────────────────────────────────────────
+# Maximum total disk usage for the persistent journal store (/var/log/journal).
+# Debian default (volatile) retains no post-reboot history; persistent storage
+# is essential for post-incident analysis.
+# 1G is a conservative cap for a single-service VPS; raise to 2G or more if
+# you have disk headroom and need longer incident history.
+base_journald_max_use: "1G"

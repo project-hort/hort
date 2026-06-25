@@ -1,0 +1,24 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: hort-oci-scan
+spec:
+  scope:
+    repository: hort-oci
+  severityThreshold: high
+  # First-party hosted repo — SCANNED (trivy), defence in depth. The release CI
+  # already trivy-scans these images pre-publish; this hosted re-scan catches
+  # CVEs disclosed between build and pull. Small 1h observation window (humantime)
+  # so the world-readable release face stays near-immediate, vs the proxies'
+  # 1-day ramp. quarantineDuration is a gitops field (restart-to-apply), NOT a
+  # deployment env var. Block bar `high`, matching the proxies: a high+ finding
+  # HOLDS the artifact (recorded AND blocked from release). Our images are
+  # distroless (few base-image CVEs) so this rarely fires; and ghcr.io is the
+  # canonical source, so a held image degrades only this showcase face, never the
+  # real distribution. When it fires: rebuild on a patched base, or override
+  # after assessing the finding.
+  quarantineDuration: 1h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["trivy"]
+  licensePolicy: {}

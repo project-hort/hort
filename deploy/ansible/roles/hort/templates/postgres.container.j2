@@ -19,6 +19,12 @@ Volume={{ hort_postgres_data_dir }}:/var/lib/postgresql/data:U
 EnvironmentFile=%h/.config/hort/hort-server.env
 # POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB are pulled from the env-file.
 # The env-file also carries DATABASE_URL which hort-server and hort-migrate use.
+#
+# RAM-scaled performance tuning passed as -c flags.  The official postgres image
+# entrypoint forwards extra arguments to the postgres binary, so -c flags work
+# without a custom conf.d mount.  Values are sourced from group_vars/all.yml
+# (pg_* variables).  Override any value in group_vars/production/ or host_vars/.
+Exec=postgres -c shared_buffers={{ pg_shared_buffers_mb }}MB -c effective_cache_size={{ pg_effective_cache_size_mb }}MB -c work_mem={{ pg_work_mem_mb }}MB -c maintenance_work_mem={{ pg_maintenance_work_mem_mb }}MB -c max_wal_size={{ pg_max_wal_size }} -c random_page_cost={{ pg_random_page_cost }} -c effective_io_concurrency={{ pg_effective_io_concurrency }} -c wal_compression={{ pg_wal_compression }} -c checkpoint_completion_target={{ pg_checkpoint_completion_target }} -c autovacuum_vacuum_scale_factor={{ pg_autovacuum_vacuum_scale_factor }} -c autovacuum_analyze_scale_factor={{ pg_autovacuum_analyze_scale_factor }} -c password_encryption={{ pg_password_encryption }} -c log_connections={{ pg_log_connections }} -c log_disconnections={{ pg_log_disconnections }}
 
 [Service]
 Restart=always

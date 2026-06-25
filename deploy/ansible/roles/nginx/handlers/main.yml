@@ -5,6 +5,21 @@
 # but deduplicates, so a task that notifies both gets validate → reload
 # as long as validate is registered first here.
 
+# Re-renders the vhost with the 443 block after certbot issues a cert on a
+# fresh host.  Notified by the certbot role's cert-issuance task (handler
+# names are play-scoped, so the nginx role's handlers are reachable from
+# any other role in the same play).  Uses the role-local template path —
+# no cross-role {{ playbook_dir }}/roles/nginx/... reference needed here.
+- name: Render nginx vhost (cert present)
+  ansible.builtin.template:
+    src: registry.hort.rs.conf.j2
+    dest: /etc/nginx/sites-available/registry.hort.rs.conf
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    nginx_cert_exists: true
+
 - name: Validate nginx config
   ansible.builtin.command: nginx -t
   changed_when: false

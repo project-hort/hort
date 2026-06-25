@@ -117,7 +117,12 @@ runs:
         # Write .cargo/config.toml using printf to avoid heredoc indentation
         # issues (the YAML `run: |` block indents all lines; a heredoc inside
         # it would carry leading whitespace into the TOML file).
-        printf '[source.crates-io]\nreplace-with = "hort"\n\n' > .cargo/config.toml
+        #
+        # cargo >=1.74 requires a credential provider for auth-required
+        # registries (hort's config.json advertises auth-required:true);
+        # cargo:token is the built-in one that reads CARGO_REGISTRIES_<NAME>_TOKEN.
+        printf '[registry]\nglobal-credential-providers = ["cargo:token"]\n\n' > .cargo/config.toml
+        printf '[source.crates-io]\nreplace-with = "hort"\n\n' >> .cargo/config.toml
         printf '[registries.hort]\nindex = "sparse+%s/cargo/%s/"\n\n' \
           "${HORT_URL}" "${CARGO_SOURCE_REPO}" >> .cargo/config.toml
         printf '# hort-crates: first-party hosted registry (cargo publish target)\n' \
@@ -125,10 +130,17 @@ runs:
         printf '[registries.hort-crates]\nindex = "sparse+%s/cargo/hort-crates/"\n' \
           "${HORT_URL}" >> .cargo/config.toml
 
-        # Export tokens so they survive into subsequent steps. Both get the
-        # same session token (the hort auth model: one token, per-repo RBAC).
-        echo "CARGO_REGISTRIES_HORT_TOKEN=${HORT_TOKEN}" >> "$GITHUB_ENV"
-        echo "CARGO_REGISTRIES_HORT_CRATES_TOKEN=${HORT_TOKEN}" >> "$GITHUB_ENV"
+        # cargo sends the registry token VERBATIM as the Authorization header
+        # (the crates.io / RFC 3231 convention is a raw, scheme-less token), but
+        # hort accepts only Bearer/Basic. Encode the hort token as HTTP Basic
+        # with a dummy username so cargo emits `Authorization: Basic <b64>` — the
+        # same shape the npm (_authToken→Bearer) and docker (Basic) steps rely on.
+        # Mask the base64 (the raw token is masked already, but this is a distinct
+        # string). Both registries share the one session token (per-repo RBAC).
+        cargo_b64="$(printf 'x:%s' "${HORT_TOKEN}" | base64 -w0)"
+        echo "::add-mask::${cargo_b64}"
+        echo "CARGO_REGISTRIES_HORT_TOKEN=Basic ${cargo_b64}" >> "$GITHUB_ENV"
+        echo "CARGO_REGISTRIES_HORT_CRATES_TOKEN=Basic ${cargo_b64}" >> "$GITHUB_ENV"
 
     # ── npm config ─────────────────────────────────────────────────────────────
     # npm-proxy is the pull-through npm registry.

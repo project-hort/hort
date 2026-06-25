@@ -13,3 +13,15 @@
 # This default is intentionally left empty so a missing override causes an
 # explicit error rather than silently running the wrong command.
 gitops_admin_cmd: ""
+
+# Environment applied to the admin token-minting commands. The native flavor
+# sets HORT_DATABASE_URL here (the bare `hort-server admin` process has no
+# systemd EnvironmentFile); the podman flavor leaves it empty because
+# `podman exec` inherits the container's env. Default: empty.
+gitops_admin_env: {}
+
+# Path to the gitops source tree to scan for placeholder tokens (M8 guard) and
+# to synchronise to the managed host.  Defaults to the co-located files/gitops/
+# directory relative to the playbook.  Override if your operator tree lives
+# elsewhere (e.g. a separate inventory overlay).
+gitops_source_dir: "{{ playbook_dir }}/files/gitops"

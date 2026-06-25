@@ -564,6 +564,20 @@ quality:helm-template-test:
   script:
     - bash scripts/test-helm-templates.sh
 
+# Fail2ban regex regression test. Mirrors quality:helm-template-test: plain
+# bash, lightweight image, needs: [], runs on every pipeline (no rules).
+# Installs fail2ban (provides fail2ban-regex) then runs the fixture script
+# that asserts 401/403 lines match and 200 lines do not.
+quality:fail2ban-regex-test:
+  stage: quality
+  image: debian:13-slim
+  needs: []
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends fail2ban
+  script:
+    - bash scripts/test-fail2ban-regex.sh
+
 # ===========================================================================
 # Stage 4: build-images — buildah + cosign sign for hort-server
 # ===========================================================================

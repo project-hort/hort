@@ -35,3 +35,30 @@ hort_binaries_install_dir: /usr/local/bin
 
 # Temporary download directory on the target host.
 hort_binaries_tmp_dir: /var/tmp/hort-binaries
+
+# ── Pinned cosign installation (M5) ──────────────────────────────────────────
+# cosign is the trust-bootstrap tool for the provenance gate: an unpinned apt
+# cosign carries two risks:
+#   1. Flag-semantics drift — a new apt cosign major version may change
+#      verify-blob flag semantics (the bundle format requires cosign >= v2).
+#   2. Trust-bootstrap: apt transport cannot verify cosign's own provenance the
+#      way cosign can verify hort's binaries.
+#
+# Fix: install a specific cosign release binary from the sigstore GitHub release
+# page, verified by its published SHA-256 checksum, then assert the installed
+# version is >= 2 before running the verify-blob gate.
+#
+# Pinned cosign version and per-arch SHA-256 checksums.
+# Verify at https://github.com/sigstore/cosign/releases
+# When upgrading, update the version and both checksums together.
+hort_binaries_cosign_version: "2.4.3"
+hort_binaries_cosign_sha256_amd64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+hort_binaries_cosign_sha256_arm64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+# ACTION REQUIRED: replace the sentinel values above with the real SHA-256
+# checksums before deploying.  See README "Obtaining binary checksums" for
+# the step-by-step runbook.  Obtain the values from:
+#   https://github.com/sigstore/cosign/releases/tag/v2.4.3
+#   (files: cosign-linux-amd64  /  cosign-linux-arm64)
+# Run: sha256sum cosign-linux-amd64  to confirm locally.
+# Store the verified values in host_vars/ or group_vars/production/ (vault),
+# NOT in this committed defaults file.

@@ -14,6 +14,12 @@
 # is appropriate for an auth brute-force — the attacker should be fully blocked.
 banaction     = nftables-multiport
 banaction_allports = nftables-allports
+# ignoreip — IPs / CIDRs that are never banned, regardless of auth failures.
+# Loopback is always safe to add.  Add admin and CI egress IPs here to prevent
+# accidental self-ban during deploys or automated integration tests.
+# Override fail2ban_ignoreip in group_vars/production/ or host_vars/ to add
+# your admin workstation IP and/or CI NAT gateway before going live.
+ignoreip      = {{ fail2ban_ignoreip | default('127.0.0.1/8 ::1') }}
 
 [sshd]
 enabled  = true

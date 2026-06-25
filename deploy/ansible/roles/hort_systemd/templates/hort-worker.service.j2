@@ -24,6 +24,51 @@ CapabilityBoundingSet=
 # Worker needs AF_UNIX for the local postgres socket and AF_INET/AF_INET6
 # for scanner advisory API calls and upstream registry fetches.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── M1 additional hardening (security audit 2026-06) ──────────────────────────
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# STAGING VALIDATION REQUIRED before production rollout:
+# The worker spawns trivy and osv-scanner as subprocesses.  FOUR directives in
+# this block interact with those child processes and have NOT been verified in
+# a live scan run — validate ALL of them together in staging (unlike the server
+# unit, where they were verified safe):
+#   * SystemCallFilter (~@privileged @resources) — may block syscalls used by
+#     trivy/osv-scanner (e.g. setrlimit, getrlimit, clone3 flags).
+#   * ProcSubset=pid — hides /proc/meminfo, /proc/cpuinfo, etc.; trivy may read
+#     them for memory/CPU-aware scanning.
+#   * PrivateDevices=true — synthetic /dev hides /dev/fd/… which scanner FD
+#     redirection can rely on.
+#   * UMask=0077 — inherited by scanner children; tools expecting 0644 outputs
+#     see 0600.
+# Run a full scan cycle in staging with "journalctl -u hort-worker -f"; on a
+# SIGSYS / ENOENT / permission failure, relax the offending directive (expand
+# the SystemCallFilter allow-list, drop ~@privileged @resources, or remove the
+# specific directive) — start by isolating which one via bisection.
+# TODO: remove this comment once staging validation is complete.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+LimitNOFILE=65536
+TasksMax=4096
+# NOTE: MemoryDenyWriteExecute is intentionally OMITTED.
+# wasmtime uses a JIT that requires W+X memory mappings at runtime; MDWX
+# would cause an immediate SIGSYS on the first WASM module load.  Do NOT
+# add MemoryDenyWriteExecute to this unit without first replacing wasmtime
+# with an AOT-only runtime that makes no W+X mappings.
+
 Restart=always
 
 [Install]

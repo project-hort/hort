@@ -1,8 +1,7 @@
 ---
 # certbot role handlers.
-# Reload nginx after certbot patches the vhost with ssl_certificate directives.
-
-- name: Reload nginx
-  ansible.builtin.service:
-    name: nginx
-    state: reloaded
+#
+# The cert-issuance task (tasks/main.yml) notifies the nginx role's handlers
+# directly by play-scoped name: "Render nginx vhost (cert present)", then
+# "Validate nginx config", then "Reload nginx".  No handler is needed here —
+# this file is kept to preserve the expected role structure.

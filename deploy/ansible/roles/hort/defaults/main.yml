@@ -13,3 +13,10 @@ hort_env_dir: /var/lib/hort/.config/hort
 
 # Postgres container data volume host path.
 hort_postgres_data_dir: /var/lib/hort/postgres-data
+
+# OCI token signing key (Ed25519 PKCS#8 PEM). HORT_NATIVE_TOKENS_ENABLED=true
+# requires an OCI /v2 bearer-token signing key — hort-server refuses to boot
+# without one (the same gap the native flavor hit). Generated on the host and
+# bind-mounted read-only into the hort-server container.
+hort_oci_key_dir: /var/lib/hort/keys
+hort_oci_signing_key_container_path: /etc/hort/keys/oci-signing.pem

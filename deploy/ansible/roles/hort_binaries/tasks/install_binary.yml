@@ -72,3 +72,16 @@
     group: root
     mode: "0755"
     remote_src: true
+  register: hort_binaries_install_result
+
+# A swapped binary on disk does NOT restart a running service: systemctl
+# `state: started` is a no-op when the unit is already active, so without this
+# the host keeps executing the OLD (now-deleted) binary inode until something
+# restarts it. Accumulate the change across the loop (hort-server + hort-worker)
+# so the hort_systemd role restarts the units AFTER migrate (correct ordering —
+# a new binary may carry new migrations). Set unconditionally as an OR-fold (not
+# `when: ... is changed`) so it stays a plain fact, not a no-handler task.
+- name: Record binary change for a post-migrate service restart
+  ansible.builtin.set_fact:
+    hort_binaries_changed: >-
+      {{ hort_binaries_changed | default(false) or (hort_binaries_install_result is changed) }}
