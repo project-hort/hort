@@ -33,6 +33,89 @@
       gitops_admin_cmd must be set (e.g. "hort-server admin" for native flavor
       or "podman exec hort-server hort-server admin" for Podman flavor).
 
+# ── Placeholder guard (M8) ────────────────────────────────────────────────────
+# Scan the gitops SOURCE tree (gitops_source_dir, defaults to files/gitops/ in
+# the Ansible repo) for residual placeholder tokens before syncing to the host.
+# If any are found the play aborts with a clear message pointing the operator at
+# the substitution step.
+#
+# What is checked:
+#   REPLACE_ME   — literal marker used in example service-account fixtures
+#                  (e.g. gitlab-ci.yaml.example project_path: "REPLACE_ME/hort")
+#   <...>        — angle-bracket style markers (e.g. <YOUR_VALUE>)
+#
+# Why scan the SOURCE tree, not the destination:
+#   The destination tree is written by this role — if placeholders are in the
+#   source they will be in the destination after sync.  Scanning source before
+#   sync gives an early, actionable failure rather than silently deploying a
+#   broken config that fails only at hort-server boot.
+#
+# *.example files are excluded from the scan — they are committed operator
+# templates that legitimately contain REPLACE_ME markers.  The operator copies
+# the .example to a real YAML file and substitutes the value; the guard then
+# catches any un-substituted copy.  See README "Customising the gitops tree".
+#
+# The scan path is parameterised via gitops_source_dir (set in defaults/main.yml).
+# Override in host_vars/group_vars if your operator tree lives elsewhere.
+
+- name: Scan gitops source tree for residual placeholder tokens
+  ansible.builtin.find:
+    paths: "{{ gitops_source_dir }}"
+    patterns: "*.yaml,*.yml,*.json,*.toml"
+    excludes: "*.example"
+    recurse: true
+    file_type: file
+  register: gitops_tree_files
+  # The gitops SOURCE tree lives in the Ansible repo on the control node, not on
+  # the managed host — scan it there. become:false so we read it as the local
+  # user (no sudo prompt on the control node from the play-level become:true).
+  delegate_to: localhost
+  become: false
+
+- name: Check each gitops file for placeholder tokens
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      grep -nE 'REPLACE_ME|<[A-Z_][A-Z0-9_]*>' "{{ gitops_item.path }}" || true
+    executable: /bin/bash
+  loop: "{{ gitops_tree_files.files }}"
+  loop_control:
+    loop_var: gitops_item
+    label: "{{ gitops_item.path | basename }}"
+  register: gitops_placeholder_hits
+  changed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Collect files that still contain placeholder tokens
+  ansible.builtin.set_fact:
+    gitops_placeholder_files: >-
+      {{
+        gitops_placeholder_hits.results
+        | selectattr('stdout', 'ne', '')
+        | map(attribute='gitops_item')
+        | map(attribute='path')
+        | list
+      }}
+
+- name: Fail if any gitops file contains residual placeholder tokens
+  ansible.builtin.fail:
+    msg: >-
+      Residual placeholder tokens found in the gitops tree — the play is aborted
+      to prevent deploying an incomplete configuration.
+
+      Files with placeholders:
+      {% for gitops_path in gitops_placeholder_files %}
+        - {{ gitops_path }}
+      {% endfor %}
+
+      Action required: substitute all REPLACE_ME / <...> markers with real
+      values before running this play.  See the README "Customising the gitops
+      tree" section for per-file instructions (e.g. copy
+      auth/service-accounts/gitlab-ci.yaml.example →
+      auth/service-accounts/gitlab-ci.yaml and set the project_path value).
+  when: gitops_placeholder_files | length > 0
+
 # ── Config tree ───────────────────────────────────────────────────────────────
 
 - name: Ensure hort config directory exists
@@ -43,17 +126,27 @@
     group: "{{ hort_user }}"
     mode: "0750"
 
+# The synchronize module needs rsync on BOTH ends; a minimal Debian image ships
+# none on the managed host. Install it before the sync.
+- name: Ensure rsync is installed (required by the synchronize module)
+  ansible.builtin.apt:
+    name: rsync
+    state: present
+    update_cache: true
+
 # Synchronise the gitops tree.  The `delete: true` flag removes stale files
 # so the host tree always matches the committed Ansible repo state exactly.
+# *.example files are excluded: they are operator templates, not live config.
 - name: Sync gitops config tree to host
   ansible.posix.synchronize:
-    src: "{{ playbook_dir }}/files/gitops/"
+    src: "{{ gitops_source_dir }}/"
     dest: "{{ hort_config_dir }}/"
     delete: true
     recursive: true
     rsync_opts:
       - "--chown=root:{{ hort_user }}"
       - "--chmod=D750,F640"
+      - "--exclude=*.example"
   notify:
     - Restart hort-server (system scope)
     - Restart hort-server (user scope)
@@ -87,6 +180,7 @@
       --name maintainer-dev
       --permission read
       --output file:/run/secrets/hort-dev.token
+  environment: "{{ gitops_admin_env }}"
   changed_when: true
   # Note: idempotency is enforced by hort-server itself (exit 0, no reissue
   # if the token already exists).  changed_when: true is intentional — we
@@ -101,4 +195,5 @@
       --name maintainer-curator
       --permission curate
       --output file:/run/secrets/hort-curator.token
+  environment: "{{ gitops_admin_env }}"
   changed_when: true

@@ -233,6 +233,15 @@ rsync -a --delete /var/lib/hort/cas/ /backup/hort-cas/
 The Postgres database holds all non-blob state: artifact metadata, quarantine
 status, event streams, service accounts, scan results, and operator tokens.
 
+**Performance tuning.** Both flavors apply RAM-scaled Postgres tuning sourced
+from `deploy/ansible/group_vars/all.yml` (`pg_*` variables).  Values are
+computed from `ansible_memtotal_mb` (a gathered fact) using co-location-
+conservative ratios — Postgres shares the VPS with hort-server, hort-worker,
+and the scanners.  The native flavor deploys a conf.d drop-in
+(`/etc/postgresql/17/main/conf.d/10-hort-tuning.conf`); the Podman flavor
+passes identical values as `-c` flags in the Quadlet `Exec=` line.  Override
+any `pg_*` variable in `group_vars/production/` or `host_vars/` as needed.
+
 **Podman flavor** (Postgres as a container):
 
 ```bash

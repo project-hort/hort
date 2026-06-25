@@ -40,9 +40,9 @@
     state: present
     update_cache: true
 
-- name: Allow SSH through firewall
+- name: Rate-limit SSH through firewall (ufw limit)
   community.general.ufw:
-    rule: allow
+    rule: limit
     name: OpenSSH
 
 - name: Allow HTTP (80) through firewall
@@ -57,10 +57,10 @@
     port: "443"
     proto: tcp
 
-- name: Deny external access to hort API port ({{ hort_api_port }})
+- name: Deny external access to PostgreSQL port (5432) — belt-and-suspenders
   community.general.ufw:
     rule: deny
-    port: "{{ hort_api_port }}"
+    port: "5432"
     proto: tcp
 
 - name: Enable ufw with default deny-incoming policy
@@ -69,6 +69,17 @@
     policy: deny
     direction: incoming
 
+# ── Sysctl hardening ──────────────────────────────────────────────────────────
+
+- name: Deploy sysctl hardening drop-in (CIS network + kernel set)
+  ansible.builtin.template:
+    src: 60-hort.conf.j2
+    dest: /etc/sysctl.d/60-hort.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctl settings
+
 # ── Unattended upgrades ───────────────────────────────────────────────────────
 
 - name: Install unattended-upgrades
@@ -76,8 +87,169 @@
     name: unattended-upgrades
     state: present
 
-- name: Enable unattended-upgrades
+- name: Deploy apt periodic config (20auto-upgrades)
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy unattended-upgrades policy (50unattended-upgrades)
+  ansible.builtin.template:
+    src: 50unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/50unattended-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable unattended-upgrades service
   ansible.builtin.service:
     name: unattended-upgrades
     state: started
     enabled: true
+
+- name: Enable apt-daily timer (package index refresh)
+  ansible.builtin.service:
+    name: apt-daily.timer
+    state: started
+    enabled: true
+
+- name: Enable apt-daily-upgrade timer (unattended upgrade trigger)
+  ansible.builtin.service:
+    name: apt-daily-upgrade.timer
+    state: started
+    enabled: true
+
+# ── SSH hardening ─────────────────────────────────────────────────────────────
+# SAFETY: PasswordAuthentication no is safe here because Ansible connects via
+# key auth — if this play reaches this task, key-based login is confirmed to
+# work.  See roles/base/defaults/main.yml for override variables.
+
+- name: Install openssh-server
+  ansible.builtin.apt:
+    name: openssh-server
+    state: present
+
+- name: Deploy sshd drop-in validate helper
+  ansible.builtin.copy:
+    src: validate-sshd-dropin.sh
+    dest: /usr/local/bin/hort-validate-sshd-dropin
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Template sshd hardening drop-in
+  ansible.builtin.template:
+    src: 10-hort-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/10-hort-hardening.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/local/bin/hort-validate-sshd-dropin %s
+  notify: Reload sshd
+
+# ── zram compressed-RAM swap (L6) ─────────────────────────────────────────────
+# systemd-zram-generator is preferred over disk swap: no secrets/DB pages reach
+# physical storage, no writeback latency, no swap file/partition to size at
+# provision time.  lz4 compressor: lowest CPU overhead, suitable for mixed
+# Rust-service + PostgreSQL workloads.  dm-crypt random-key swap would also keep
+# secrets off disk, but adds a device-mapper dependency and boot-time complexity
+# that systemd-zram-generator avoids entirely.
+
+- name: Install systemd-zram-generator
+  ansible.builtin.apt:
+    name: systemd-zram-generator
+    state: present
+
+- name: Deploy zram-generator config
+  ansible.builtin.template:
+    src: zram-generator.conf.j2
+    dest: /etc/systemd/zram-generator.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Reload systemd unit files (picks up zram-setup@.service)
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start zram swap (zram0)
+  ansible.builtin.systemd:
+    name: systemd-zram-setup@zram0.service
+    state: started
+    enabled: true
+
+# ── auditd baseline (L7) ──────────────────────────────────────────────────────
+
+- name: Install auditd
+  ansible.builtin.apt:
+    name: auditd
+    state: present
+
+- name: Ensure /etc/audit/rules.d directory exists
+  ansible.builtin.file:
+    path: /etc/audit/rules.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Deploy hort audit rules
+  ansible.builtin.template:
+    src: hort-audit.rules.j2
+    dest: /etc/audit/rules.d/hort-audit.rules
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Reload auditd rules
+
+- name: Enable and start auditd
+  ansible.builtin.service:
+    name: auditd
+    state: started
+    enabled: true
+
+# ── Persistent journald (L7) ──────────────────────────────────────────────────
+
+- name: Ensure journald drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy persistent journald drop-in
+  ansible.builtin.template:
+    src: hort-journald.conf.j2
+    dest: /etc/systemd/journald.conf.d/hort-persistent.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart journald
+
+# ── AppArmor — nginx enforce mode (L7) ────────────────────────────────────────
+# Install AppArmor and enforce the distro-provided nginx profile.
+# Custom hort-server/hort-worker AppArmor profiles are a documented follow-on
+# (the systemd isolation block in M1 already confines those services).
+
+- name: Install AppArmor packages
+  ansible.builtin.apt:
+    name:
+      - apparmor
+      - apparmor-utils
+      - apparmor-profiles-extra   # ships /etc/apparmor.d/usr.sbin.nginx on Debian
+    state: present
+
+- name: Enable and start AppArmor service
+  ansible.builtin.service:
+    name: apparmor
+    state: started
+    enabled: true
+
+- name: Enforce distro nginx AppArmor profile
+  ansible.builtin.command: aa-enforce /etc/apparmor.d/usr.sbin.nginx
+  register: base_aa_enforce_nginx
+  changed_when: "'Setting' in base_aa_enforce_nginx.stdout"
+  failed_when: base_aa_enforce_nginx.rc != 0

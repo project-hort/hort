@@ -1,0 +1,18 @@
+---
+# certbot role defaults.
+#
+# le_email — Let's Encrypt account email address.  REQUIRED: must be set in
+#   group_vars/production/ or --extra-vars before running the play.  The role
+#   asserts this variable is defined and non-empty so a missing value fails
+#   early with an actionable message rather than silently producing an
+#   unusable certificate.
+#   There is intentionally no default value: an empty registration email is
+#   rejected by Let's Encrypt and would cause the certbot invocation to fail
+#   with a confusing upstream error.
+
+# certbot_staging — when true, passes --staging to certbot so that issuance
+#   uses the Let's Encrypt staging CA.  Staging certificates are not trusted
+#   by browsers but are issued without consuming production rate-limit quota.
+#   Use this for test runs or CI-driven provisioning against a non-production
+#   host.  Set to false (the default) for all production deployments.
+certbot_staging: false

@@ -2,18 +2,15 @@
 # Podman flavor — rootless Podman + Quadlet units.
 #
 # Role execution order:
-#   base          — (Task 4) OS hardening, swap, unattended-upgrades
-#   podman        — (this task) rootless Podman runtime + service user + linger
-#   hort          — (this task) Quadlet units: migrate, server, worker, postgres
-#   nginx         — (Task 4) TLS-terminating reverse proxy (127.0.0.1:8080 → 443)
-#   certbot       — (Task 4) Let's Encrypt certificate issuance + renewal
-#   fail2ban      — (Task 4) brute-force protection
-#   gitops        — (Task 4) syncs files/gitops/ tree to hort_config_dir on the host
-#
-# Roles marked (Task 4) are scaffolded below but their role directories are
-# created in Task 4.  This play is valid for --syntax-check now because the
-# roles are listed but the play only RUNS them if the role directories exist
-# (Ansible resolves roles at runtime, not parse time).
+#   base          — OS hardening: firewall (ufw), sysctl, SSH hardening,
+#                   unattended-upgrades, zram compressed-RAM swap,
+#                   auditd baseline, persistent journald, nginx AppArmor enforce
+#   podman        — rootless Podman runtime + service user + linger
+#   hort          — Quadlet units: migrate, server, worker, postgres
+#   nginx         — TLS-terminating reverse proxy (127.0.0.1:8080 → 443)
+#   certbot       — Let's Encrypt certificate issuance + renewal
+#   fail2ban      — brute-force protection
+#   gitops        — syncs files/gitops/ tree to hort_config_dir on the host
 
 - name: Deploy hort (Podman flavor)
   hosts: hort

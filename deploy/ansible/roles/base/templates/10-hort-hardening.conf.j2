@@ -1,0 +1,27 @@
+# /etc/ssh/sshd_config.d/10-hort-hardening.conf
+# Managed by Ansible — do not edit by hand.
+#
+# SAFETY NOTE: PasswordAuthentication is disabled.  Ansible connects via
+# key-based authentication; if this play is running, key auth is confirmed
+# to work.  Override base_sshd_* vars in group_vars/ or host_vars/ if
+# adjustments are required.
+#
+# Override variables (defaults/main.yml):
+#   base_sshd_password_auth         — "no"  (disable password login)
+#   base_sshd_kbd_interactive_auth  — "no"  (disable keyboard-interactive)
+#   base_sshd_permit_root_login     — "prohibit-password"
+#   base_sshd_max_auth_tries        — 3
+#   base_sshd_client_alive_interval — 300 (seconds between keepalive probes)
+#   base_sshd_client_alive_count_max — 2  (probes before disconnect)
+#   base_sshd_allow_groups          — UNSET by default; set to a group name to
+#                                     restrict login to that group only.
+
+PasswordAuthentication {{ base_sshd_password_auth }}
+KbdInteractiveAuthentication {{ base_sshd_kbd_interactive_auth }}
+PermitRootLogin {{ base_sshd_permit_root_login }}
+MaxAuthTries {{ base_sshd_max_auth_tries }}
+ClientAliveInterval {{ base_sshd_client_alive_interval }}
+ClientAliveCountMax {{ base_sshd_client_alive_count_max }}
+{% if base_sshd_allow_groups is defined %}
+AllowGroups {{ base_sshd_allow_groups }}
+{% endif %}

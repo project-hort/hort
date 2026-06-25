@@ -14,8 +14,16 @@ hort_systemd_server_bin: /usr/local/bin/hort-server
 hort_systemd_worker_bin: /usr/local/bin/hort-worker
 
 # Scanner binary paths used by the worker.
-hort_systemd_trivy_bin: /usr/local/bin/trivy
+# trivy is installed by apt (the aquasecurity .deb lands in /usr/bin); osv-scanner
+# is installed by this role as a release binary in /usr/local/bin.
+hort_systemd_trivy_bin: /usr/bin/trivy
 hort_systemd_osv_bin: /usr/local/bin/osv-scanner
+
+# OCI token signing key (Ed25519 PKCS#8 PEM). HORT_NATIVE_TOKENS_ENABLED=true
+# requires a signing key for the OCI /v2 bearer-token path; this role generates
+# one on the host (once) and points HORT_OCI_TOKEN_SIGNING_KEY_FILE at it.
+hort_systemd_key_dir: /etc/hort/keys
+hort_systemd_oci_signing_key_file: "{{ hort_systemd_key_dir }}/oci-signing.pem"
 
 # Pinned scanner versions.
 # Override in host_vars or group_vars when a newer version is validated.
@@ -24,7 +32,32 @@ hort_systemd_osv_bin: /usr/local/bin/osv-scanner
 # Verify against https://github.com/google/osv-scanner/releases
 hort_systemd_osv_version: "1.9.1"
 #
-# hort_systemd_trivy_version: pinned to a known-good version string accepted by
-# the aquasecurity apt repository (https://aquasecurity.github.io/trivy-repo/).
-# Use `apt-cache madison trivy` after adding the repo to confirm availability.
-hort_systemd_trivy_version: "0.60.0"
+# trivy is installed UNPINNED from the aquasecurity apt repo: that repo's
+# "generic" suite is rolling-latest-only (it serves a single version), so a
+# version pin cannot hold. Integrity is via the signed-by keyring; latest is
+# the right posture for a vuln scanner. (No hort_systemd_trivy_version var.)
+
+# ── osv-scanner SLSA provenance verification ──────────────────────────────────
+# slsa-verifier is used to verify the SLSA provenance attestation
+# (osv-scanner_<version>_linux_amd64.intoto.jsonl) shipped by google/osv-scanner
+# releases.  This mirrors the fail-closed ethos of the hort_binaries cosign gate:
+# the provenance check runs before install, and the play fails if it does not pass.
+#
+# Pinned slsa-verifier version and per-arch SHA-256 checksums.
+# Verify at https://github.com/slsa-framework/slsa-verifier/releases
+# When upgrading, update the version and both checksums together.
+hort_systemd_slsa_verifier_version: "2.7.0"
+hort_systemd_slsa_verifier_sha256_amd64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+hort_systemd_slsa_verifier_sha256_arm64: "REPLACE_WITH_SHA256_FROM_RELEASE_PAGE"
+# ACTION REQUIRED: replace the sentinel values above with the real SHA-256
+# checksums before deploying.  See README "Obtaining binary checksums" for
+# the step-by-step runbook.  Obtain the values from:
+#   https://github.com/slsa-framework/slsa-verifier/releases/tag/v2.7.0
+#   (file: slsa-verifier-linux-amd64  /  slsa-verifier-linux-arm64)
+# Run: sha256sum slsa-verifier-linux-amd64  to confirm locally.
+# Store the verified values in host_vars/ or group_vars/production/ (vault),
+# NOT in this committed defaults file.
+
+# SLSA source URI for osv-scanner provenance verification.
+# Must match the GitHub repo that built the release.
+hort_systemd_osv_slsa_source_uri: "github.com/google/osv-scanner"

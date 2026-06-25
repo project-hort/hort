@@ -1,0 +1,11 @@
+# /etc/nginx/conf.d/hort-ratelimit.conf — managed by Ansible (nginx role).
+# Defines the rate-limit zone used by the hort auth surface.
+# MUST be in the http context; this file is loaded from conf.d/ which nginx
+# includes inside its http { } block.
+#
+# Zone: {{ nginx_ratelimit_zone }}
+#   Key:  $binary_remote_addr (compact 4- or 16-byte IP key)
+#   Size: {{ nginx_ratelimit_size }} shared memory (≈ 160 000 IP state slots per 10m)
+#   Rate: {{ nginx_ratelimit_rate }} — prevents brute-force while allowing normal interactive use
+
+limit_req_zone $binary_remote_addr zone={{ nginx_ratelimit_zone }}:{{ nginx_ratelimit_size }} rate={{ nginx_ratelimit_rate }};

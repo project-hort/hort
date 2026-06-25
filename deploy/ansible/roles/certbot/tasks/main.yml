@@ -1,36 +1,112 @@
 ---
 # certbot role — Let's Encrypt TLS certificate issuance + renewal.
 #
-# Installs certbot and the nginx plugin, then runs certbot --nginx for the
-# registry FQDN.  The issuance task is guarded by `creates:` so it only
-# fires when the live certificate does not yet exist (idempotent).  The
-# systemd renewal timer is enabled so certificates renew automatically.
+# Uses certbot certonly --webroot so that ALL ssl_certificate / ssl_* directives
+# remain Ansible-managed (the nginx template renders them once the cert exists).
+# This avoids the --nginx plugin's in-place vhost mutation, which conflicts with
+# Ansible's template ownership and caused the H1 bootstrap defect (commented-out
+# ssl_certificate on a live listen 443 ssl block).
+#
+# Bootstrap sequence (fresh host):
+#   1. nginx role starts nginx with port-80-only config (cert absent → 443 block
+#      omitted by Jinja gate).
+#   2. This role runs certbot --webroot; the ACME challenge is served from
+#      /var/www/html via the port-80 location block.
+#   3. On success the live cert now exists.  The cert-issuance task notifies
+#      "Render nginx vhost (cert present)", "Validate nginx config", and
+#      "Reload nginx" — all handlers from the nginx role (play-scoped, so
+#      reachable here).  Ansible runs them in notification order within the
+#      flush: re-render → validate → reload → 443 comes up in the same play.
+#
+# Renewal: the deploy hook (written below) reloads nginx after every successful
+# renewal so the new cert is picked up without manual intervention.
 #
 # Required variables (set in group_vars/production/ or --extra-vars):
 #   registry_fqdn  — the FQDN to certify (default: registry.hort.rs)
 #   le_email       — Let's Encrypt registration email (no default; must be set)
 
-- name: Install certbot and nginx plugin
+# Guard: fail early if le_email is missing or empty rather than letting certbot
+# fail with a cryptic upstream error.  Set le_email in group_vars/production/
+# or pass --extra-vars le_email=admin@example.com before running the play.
+- name: Assert le_email is defined and non-empty
+  ansible.builtin.assert:
+    that:
+      - le_email is defined
+      - le_email | length > 0
+    fail_msg: >-
+      le_email must be set to a valid email address before running the certbot role.
+      Set it in group_vars/production/ or pass --extra-vars le_email=<address>.
+      Let's Encrypt requires a registration email for certificate issuance and
+      expiry notifications.
+
+- name: Install certbot (webroot plugin is built-in; no nginx plugin needed)
   ansible.builtin.apt:
-    name:
-      - certbot
-      - python3-certbot-nginx
+    name: certbot
     state: present
     update_cache: true
+
+# ── Staging → production transition (gap-free, in-place) ─────────────────────
+# The issuance task below skips while ANY cert exists (creates: semantics), so a
+# host bootstrapped on --staging would keep its untrusted TEST cert even after
+# certbot_staging is flipped to false. Delete the staging cert HERE — after the
+# nginx role (which runs before this one) has already rendered the vhost with the
+# still-present cert, so the 443 block stays in place. nginx keeps serving the
+# previous cert from memory (nothing reloads it between this delete and the
+# re-issue); the issuance task then re-issues against production and its
+# post-issue handlers re-render + reload nginx to swap in the new cert. Net: no
+# manual `certbot delete`, and no 443 downtime during the switch.
+- name: Read existing renewal config (to detect a staging-issued certificate)
+  ansible.builtin.slurp:
+    src: "/etc/letsencrypt/renewal/{{ registry_fqdn }}.conf"
+  register: certbot_renewal_conf
+  failed_when: false
+
+- name: Remove the staging certificate when switching to production
+  ansible.builtin.command:
+    cmd: "certbot delete --cert-name {{ registry_fqdn }} --non-interactive"
+  changed_when: true
+  when:
+    - not certbot_staging
+    - certbot_renewal_conf.content is defined
+    - "'acme-staging' in (certbot_renewal_conf.content | b64decode)"
 
 # Idempotency guard: the live chain file only exists after a successful
 # issuance.  If it is absent certbot runs; if it is present the task is
 # a no-op (creates: semantics).
+#
+# --staging flag: when certbot_staging is true the certificate is issued by
+# the Let's Encrypt staging CA (not trusted by browsers) so that test runs do
+# not consume production rate-limit quota.  Set certbot_staging: false (the
+# default in defaults/main.yml) for all production deployments.
 - name: Issue Let's Encrypt certificate for {{ registry_fqdn }}
   ansible.builtin.command:
     cmd: >-
-      certbot --nginx
+      certbot certonly --webroot
+      -w /var/www/html
       -d {{ registry_fqdn }}
       --non-interactive
       --agree-tos
       -m {{ le_email }}
+      {{ '--staging' if certbot_staging else '' }}
     creates: /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem
-  notify: Reload nginx
+  notify:
+    - Render nginx vhost (cert present)
+    - Validate nginx config
+    - Reload nginx
+
+# Deploy hook: reload nginx after every successful certbot renew so the live
+# cert is picked up immediately without manual intervention.
+- name: Install certbot deploy hook to reload nginx on renewal
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+    content: |
+      #!/bin/sh
+      # Managed by Ansible — do not edit by hand.
+      # Reloads nginx after certbot successfully renews a certificate.
+      systemctl reload nginx
+    owner: root
+    group: root
+    mode: "0750"
 
 # Debian ships certbot with a systemd timer (certbot.timer) that invokes
 # certbot renew twice daily.  Ensure it is enabled and running.

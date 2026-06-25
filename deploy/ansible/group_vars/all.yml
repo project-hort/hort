@@ -39,9 +39,78 @@ hort_api_port: 8080
 # Metrics listener port (internal; NOT exposed to the internet).
 hort_metrics_port: 9090
 
-# OIDC — issuer URL. Override in group_vars/production/ or host_vars/.
-# NOTE: the observation window is NOT a group_vars value — it lives in each
-# Class B ScanPolicy's quarantineDuration field in the gitops tree (Task 1 Step 7).
-hort_oidc_issuer_url: "https://{{ registry_fqdn }}/realms/hort"
-hort_oidc_audience: hort-server
-hort_oidc_groups_claim: groups
+# ── PostgreSQL performance tuning ─────────────────────────────────────────────
+# Values are scaled from ansible_memtotal_mb (a gathered fact; both playbooks
+# have gather_facts: true).  They are intentionally CONSERVATIVE because
+# Postgres co-locates with hort-server, hort-worker, and the Trivy/OSV scanners
+# on a single VPS — Postgres does not own the box.
+#
+# Co-location sizing rationale:
+#   shared_buffers     12.5% RAM  (not the 25% solo-server recommendation)
+#   effective_cache    45%  RAM   (OS page-cache estimate for the planner)
+#   work_mem           floor(RAM/512, 8) MB — kept low: per-sort-node × per-conn
+#   maintenance_work_mem  min(5% RAM, 256 MB) — single autovac/index-build cap
+#
+# Workload notes:
+#   - append-heavy event store + JSONB payloads → wal_compression on
+#   - high-churn jwt_replay_seen/jobs tables → autovacuum_*_scale_factor 0.05
+#   - SSD storage → random_page_cost 1.1, effective_io_concurrency 200
+#
+# Target values on a 4 GB box:
+#   shared_buffers 512 MB, effective_cache_size ~1843 MB, work_mem 8 MB,
+#   maintenance_work_mem 204 MB
+# Target values on an 8 GB box:
+#   shared_buffers 1024 MB, effective_cache_size ~3686 MB, work_mem 16 MB,
+#   maintenance_work_mem 256 MB (capped)
+#
+# Override any of these in group_vars/production/ or host_vars/ if needed.
+
+pg_shared_buffers_mb: "{{ (ansible_memtotal_mb * 0.125) | int }}"
+pg_effective_cache_size_mb: "{{ (ansible_memtotal_mb * 0.45) | int }}"
+pg_work_mem_mb: "{{ [(ansible_memtotal_mb // 512), 8] | max }}"
+pg_maintenance_work_mem_mb: "{{ [(ansible_memtotal_mb * 0.05) | int, 256] | min }}"
+pg_max_wal_size: "2GB"
+pg_random_page_cost: "1.1"
+pg_effective_io_concurrency: 200
+pg_wal_compression: "on"
+pg_checkpoint_completion_target: "0.9"
+pg_autovacuum_vacuum_scale_factor: "0.05"
+pg_autovacuum_analyze_scale_factor: "0.05"
+
+# ── nginx edge hardening (M7) ─────────────────────────────────────────────────
+# nginx_client_max_body_size — cap request body size.  Default 10g is large
+#   enough for OCI base images and large Cargo crates while bounding abuse.
+#   Set to 0 to restore the unlimited legacy behaviour.
+nginx_client_max_body_size: "10g"
+
+# Rate-limit zone for the auth surface (/api/v1/auth/).
+# Zone size 10m ≈ 160 000 IP state slots; rate 30r/m prevents brute-force while
+# allowing normal interactive use.  burst absorbs short token bursts; nodelay
+# means excess requests are rejected immediately, not queued.
+# burst=20: absorbs parallel token-exchange requests from a multi-format CI
+# pipeline (Cargo + npm + PyPI + OCI auths from one IP); tune up for busier
+# self-hosted runners.
+nginx_ratelimit_zone: "hort_auth"
+nginx_ratelimit_size: "10m"
+nginx_ratelimit_rate: "30r/m"
+nginx_ratelimit_burst: 20
+
+# TLS policy — Mozilla intermediate profile (TLSv1.2 + TLSv1.3).
+# nginx_ssl_ciphers is the single authoritative definition of the cipher list
+# used by both the http-level baseline (conf.d/ssl-hardening.conf) and the
+# server-level override in the cert-present vhost block.  The yamllint
+# disable comment below is intentional: this value is a security-policy
+# constant that must not be line-wrapped or abbreviated.
+nginx_ssl_protocols: "TLSv1.2 TLSv1.3"
+# yamllint disable-line rule:line-length
+nginx_ssl_ciphers: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305"
+
+# ── PostgreSQL security settings ──────────────────────────────────────────────
+# Shared between both flavors: applied via conf.d drop-in (native) and -c args
+# (podman).  listen_addresses='' (socket-only) is native-ONLY — see the
+# postgres_apt template.  For podman the postgres container must listen on the
+# container network; TCP to the host is still blocked because the container
+# unit does not PublishPort 5432.
+pg_password_encryption: "scram-sha-256"
+pg_log_connections: "on"
+pg_log_disconnections: "on"

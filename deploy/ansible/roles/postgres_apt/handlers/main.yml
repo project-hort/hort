@@ -3,3 +3,10 @@
   ansible.builtin.service:
     name: postgresql
     state: reloaded
+
+# shared_buffers and max_wal_size require a full restart (not just reload).
+# Notified by the 10-hort-tuning.conf.j2 drop-in task only.
+- name: Restart PostgreSQL
+  ansible.builtin.service:
+    name: postgresql
+    state: restarted

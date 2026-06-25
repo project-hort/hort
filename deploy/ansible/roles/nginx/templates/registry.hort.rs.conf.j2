@@ -2,16 +2,49 @@
 # Managed by Ansible — do not edit by hand.
 #
 # Streaming / large-body tuning:
-#   client_max_body_size 0       — allow arbitrarily large OCI blob uploads
+#   client_max_body_size {{ nginx_client_max_body_size }} — cap request body (OCI blobs + crates);
+#                                  set nginx_client_max_body_size: "0" to restore unlimited
 #   proxy_request_buffering off  — stream uploads directly to hort-server
 #   proxy_buffering off          — stream downloads directly to the client
 #   proxy_read_timeout 300s      — scan gate can hold a response open for
 #                                  up to 300 s before the release decision
+#
+# Default-server blocks (M7):
+#   - Port 443: ssl_reject_handshake on — silently drop TLS for unknown SNI/Host.
+#     Requires nginx ≥ 1.19.4 (Debian 13 ships 1.26.x).  No certificate is
+#     needed for this block; ssl_reject_handshake on handles the TLS layer
+#     before any certificate is consulted.
+#   - Port 80: return 444 (close without response) for any unknown Host.
+#
+# H1-invariant (pre-cert bootstrap):
+#   When nginx_cert_exists = false the cert-gated 443 block (guarded by the
+#   "if nginx_cert_exists" conditional) is omitted entirely — written without
+#   Jinja delimiters here so this comment is not itself parsed as a tag — so
+#   there is no "listen 443 ssl" reference to a missing
+#   certificate.  The default 443 block below uses ssl_reject_handshake on and
+#   needs NO ssl_certificate directive, so it is safe to include in both states.
+#   The 80 default-server block has no TLS dependency at all.
 
+# ── Default-server: reject unknown SNI on port 80 ────────────────────────────
+server {
+    listen 80 default_server;
+    return 444;
+}
+
+# ── Default-server: reject unknown SNI on port 443 ───────────────────────────
+# ssl_reject_handshake on drops the TLS handshake for any ServerName that does
+# not match a named server block.  No ssl_certificate is required — this block
+# never completes a handshake.  Safe in both pre-cert and post-cert states.
+server {
+    listen 443 ssl default_server;
+    ssl_reject_handshake on;
+}
+
+# ── Registry vhost — port 80 (ACME + redirect) ───────────────────────────────
 server {
     listen 80;
     server_name {{ registry_fqdn }};
-    # Let certbot's ACME challenge through on port 80;
+    # Let certbot's webroot ACME challenge through on port 80;
     # redirect everything else to HTTPS.
     location /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -21,20 +54,50 @@ server {
     }
 }
 
+{% if nginx_cert_exists %}
+# ── Registry vhost — port 443 (TLS) ─────────────────────────────────────────
 server {
     listen 443 ssl;
     server_name {{ registry_fqdn }};
 
-    # certbot fills these in after first issuance.
-    # ssl_certificate     /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem;
-    # ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
-    # include /etc/letsencrypt/options-ssl-nginx.conf;
-    # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    ssl_certificate     /etc/letsencrypt/live/{{ registry_fqdn }}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{ registry_fqdn }}/privkey.pem;
+    # No ssl_dhparam: the webroot ACME model (certbot certonly) does NOT create
+    # /etc/letsencrypt/ssl-dhparams.pem — only the --nginx plugin does, and we
+    # don't use it. nginx 1.11.0+ uses built-in RFC 7919 ffdhe2048 params when
+    # none is configured, so DHE suites still negotiate safe parameters (and
+    # TLS 1.3 uses none at all). Referencing the missing file fails nginx -t.
 
-    # Large OCI blobs / Cargo crates — no limit.
-    client_max_body_size 0;
+    # TLS policy — Mozilla intermediate profile, set at SERVER level so it
+    # overrides nginx.conf's http defaults for real client connections without
+    # duplicating them (an http-level conf.d clashes with the stock nginx.conf
+    # http directives — duplicate-directive error). The certbot-generated
+    # options-ssl-nginx.conf is intentionally NOT included; this role owns the
+    # TLS policy. Cipher list + protocols sourced from nginx_ssl_ciphers /
+    # nginx_ssl_protocols in group_vars/all.yml — single definition, no duplication.
+    ssl_protocols {{ nginx_ssl_protocols }};
+    ssl_prefer_server_ciphers off;
+    ssl_ciphers {{ nginx_ssl_ciphers }};
+    ssl_session_cache shared:le_nginx_SSL:10m;
+    ssl_session_timeout 1440m;
+    ssl_session_tickets off;
 
+    # HSTS — instruct browsers to use HTTPS for this domain for 2 years.
+    # 'always' ensures the header is sent on all responses, including errors.
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # Security headers (M7)
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    # Suppress the nginx version (Server header / error pages). Set at server
+    # level — NOT an http-level conf.d — so it does not duplicate the directive
+    # Debian's stock nginx.conf already sets in the http context.
+    server_tokens off;
+
+    # Bound the body — large enough for OCI base images and Cargo crates.
     # Stream uploads directly to hort-server; do not spool to disk.
+    client_max_body_size {{ nginx_client_max_body_size }};
     proxy_request_buffering off;
 
     # Stream downloads directly to the client; do not buffer in nginx.
@@ -46,11 +109,22 @@ server {
     access_log /var/log/nginx/access.log combined;
     error_log  /var/log/nginx/error.log;
 
+    # Rate-limit the auth surface — defined in conf.d/hort-ratelimit.conf.
+    location /api/v1/auth/ {
+        limit_req zone={{ nginx_ratelimit_zone }} burst={{ nginx_ratelimit_burst }} nodelay;
+        proxy_pass http://127.0.0.1:{{ hort_api_port }};
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:{{ hort_api_port }};
         proxy_set_header Host              $host;
         proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Real-IP         $remote_addr;
     }
 }
+{% endif %}

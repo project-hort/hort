@@ -1,0 +1,15 @@
+# /etc/systemd/journald.conf.d/hort-persistent.conf
+# Managed by Ansible (base role) — do not edit by hand.
+#
+# Persist journal to /var/log/journal so logs survive reboots and are
+# available for post-incident analysis.  Without this setting Debian boots
+# with Storage=auto, which falls back to volatile if /var/log/journal
+# does not exist — meaning no history survives a reboot.
+#
+# base_journald_max_use controls the total disk cap for the journal store.
+# Default: {{ base_journald_max_use }} (override in group_vars/host_vars).
+# rsyslog/syslog-ng forwarding, if present, is unaffected by this drop-in.
+
+[Journal]
+Storage=persistent
+SystemMaxUse={{ base_journald_max_use }}
