@@ -17,6 +17,10 @@ Beta release. The feature set is described in the documentation under `docs/`.
   transfers are checksum-verified against a SHA-1 floor — a Maven artifact whose
   upstream checksum cannot be verified is not served (ADR 0032 *Maven/Gradle
   multi-file handler*, ADR 0033 *SHA-1 upstream transfer-verification floor*).
+- **Maven / Gradle virtual (aggregated) repositories.** `type: virtual`
+  aggregation now covers Maven/Gradle (joining npm / PyPI / Cargo), so a single
+  virtual repo can front several Maven members under the same
+  dependency-confusion defences (ADR 0031).
 - **Public supply-chain deployment for `registry.hort.rs` (dogfood).** An
   Ansible-based deployment (rootless-podman and native-systemd flavours) plus the
   gitops config — repositories, upstream mappings, policies, service-account
@@ -54,6 +58,13 @@ Beta release. The feature set is described in the documentation under `docs/`.
   repo. The scope now resolves the owning repository by its first path segment,
   matching the `/v2/*` request path; public-repo anonymous pulls were
   unaffected.
+- **OCI `/v2/auth` no longer rejects the credential before the token exchange.**
+  The `/v2/*` bearer-auth middleware (`oci_bearer_auth`) also ran on the
+  `/v2/auth` token endpoint and treated the inbound `Basic <PAT>` as a bearer
+  JWT — which a PAT (or a federated token) is not — so it was rejected with
+  `401` before the PAT→token-exchange handler could run, breaking push/pull and
+  proxy pull-through for every credentialed client. The middleware now
+  path-skips `/v2/auth`, so the handler's PAT validation and bearer mint run.
 - **PyPI virtual (aggregated) repositories are now installable with `pip`.** A
   `pip install` through a `type: virtual` PyPI repo failed on pip's PEP 658
   `.metadata` fetch — the metadata endpoint served against the virtual repo
