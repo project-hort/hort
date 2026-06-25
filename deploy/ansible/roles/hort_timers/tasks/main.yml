@@ -1,0 +1,104 @@
+---
+# Drive the worker's periodic task kinds via systemd timers — the native
+# equivalent of the Helm CronJobs. See defaults/main.yml for the model.
+# Depends on: hort_systemd (server/worker units + hort-cli installed by
+# hort_binaries) and gitops (config applied) having run first.
+
+# The active set = enabled dsn-direct tasks, plus enabled admin-task tasks when
+# the admin-task path is globally on (hort-cli + token are provisioned below).
+# Computed once as a list so the enable/disable steps use literal true/false
+# (no templated-bool coercion).
+- name: Compute the active timer set
+  ansible.builtin.set_fact:
+    hort_timers_active_kinds: >-
+      {{ (hort_timers_tasks | selectattr('enabled') | selectattr('path', 'equalto', 'dsn-direct') | map(attribute='kind') | list)
+         + (hort_timers_tasks | selectattr('enabled') | selectattr('path', 'equalto', 'admin-task') | map(attribute='kind') | list
+            if hort_timers_admin_tasks_enabled | bool else []) }}
+  when: hort_timers_enabled | bool
+
+- name: Default the active set to empty when the role is disabled
+  ansible.builtin.set_fact:
+    hort_timers_active_kinds: []
+  when: not hort_timers_enabled | bool
+
+- name: Note whether any admin-task timer is active (gates the token mint)
+  ansible.builtin.set_fact:
+    hort_timers_any_admin_task: >-
+      {{ hort_timers_tasks | selectattr('kind', 'in', hort_timers_active_kinds)
+         | selectattr('path', 'equalto', 'admin-task') | list | length > 0 }}
+
+# ── admin_task_invoke token for the admin-task path ───────────────────────────
+# NOTE (OCI-auth capability model / Fix B — docs/plans/oci-auth-capability-model.md):
+# once `issue-svc-token` stops fabricating admin-backed users, `cronjob-tasks`
+# must be declared as a non-admin ServiceAccount in gitops (with an
+# admin_task_invoke User-subject grant) and applied BEFORE this mint, else the
+# mint errors on a missing SA user. Until Fix B lands, the system-mint path
+# below is the correct (and only wired) way to provision it.
+- name: Mint the cronjob-tasks service-account token (admin_task_invoke)
+  ansible.builtin.command:
+    cmd: >-
+      {{ gitops_admin_cmd }} issue-svc-token
+      --name cronjob-tasks
+      --permission admin_task_invoke
+      --output file:{{ hort_timers_token_file }}
+    creates: "{{ hort_timers_token_file }}"
+  environment: "{{ gitops_admin_env }}"
+  when: hort_timers_any_admin_task | bool
+
+- name: Secure the cronjob-tasks token file (readable only by the run user)
+  ansible.builtin.file:
+    path: "{{ hort_timers_token_file }}"
+    owner: "{{ hort_timers_run_user }}"
+    group: "{{ hort_timers_run_user }}"
+    mode: "0600"
+  when: hort_timers_any_admin_task | bool
+
+# ── unit files (template ALL tasks; enable/disable decided below) ─────────────
+- name: Install hort-task oneshot service units
+  ansible.builtin.template:
+    src: hort-task.service.j2
+    dest: "/etc/systemd/system/hort-task-{{ hort_timers_task.kind }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ hort_timers_tasks }}"
+  loop_control:
+    loop_var: hort_timers_task
+    label: "{{ hort_timers_task.kind }}"
+  notify: Reload systemd (hort_timers)
+
+- name: Install hort-task timer units
+  ansible.builtin.template:
+    src: hort-task.timer.j2
+    dest: "/etc/systemd/system/hort-task-{{ hort_timers_task.kind }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ hort_timers_tasks }}"
+  loop_control:
+    loop_var: hort_timers_task
+    label: "{{ hort_timers_task.kind }}"
+  notify: Reload systemd (hort_timers)
+
+- name: Apply unit changes before enabling timers
+  ansible.builtin.meta: flush_handlers
+
+# ── enable/disable per the computed active set ────────────────────────────────
+- name: Enable + start active timers
+  ansible.builtin.systemd_service:
+    name: "hort-task-{{ item }}.timer"
+    enabled: true
+    state: started
+  loop: "{{ hort_timers_active_kinds }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Disable + stop inactive timers
+  ansible.builtin.systemd_service:
+    name: "hort-task-{{ hort_timers_task.kind }}.timer"
+    enabled: false
+    state: stopped
+  loop: "{{ hort_timers_tasks | rejectattr('kind', 'in', hort_timers_active_kinds) | list }}"
+  loop_control:
+    loop_var: hort_timers_task
+    label: "{{ hort_timers_task.kind }}"

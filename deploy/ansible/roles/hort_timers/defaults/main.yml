@@ -1,0 +1,94 @@
+---
+# hort_timers — systemd timers that drive the worker's periodic task kinds on
+# the native (non-k8s) deploy.
+#
+# The Helm chart schedules these as CronJobs; the native flavor had no
+# equivalent, so quarantine-release-sweep never ran and quarantined artifacts
+# never released (the scan-policy windows were effectively "quarantine
+# forever"). Two execution paths mirror the Helm `scheduledTasks` model:
+#
+#   - dsn-direct: `hort-server <enqueue-subcommand>` — a DB-only subcommand
+#     (MinimalConfig, ADR 0009) that enqueues a job directly via the DSN. The
+#     running hort-worker then processes it. No token, no API.
+#   - admin-task: `hort-cli admin task invoke <kind>` — enqueues via the API
+#     with an `admin_task_invoke` token. Requires hort-cli on the host.
+
+hort_timers_enabled: true
+
+# Master gate for the admin-task path (needs hort-cli + the cronjob-tasks
+# token). dsn-direct timers run regardless of this flag.
+hort_timers_admin_tasks_enabled: true
+
+hort_timers_server_bin: /usr/local/bin/hort-server
+hort_timers_cli_bin: /usr/local/bin/hort-cli
+hort_timers_server_env_file: /etc/hort/hort-server.env
+hort_timers_token_file: /etc/hort/tasks-token
+hort_timers_server_url: "https://{{ registry_fqdn }}"
+hort_timers_run_user: "{{ hort_user }}"
+
+# Per-task schedule (systemd OnCalendar) + enable. Cadences mirror the Helm
+# scheduledTasks defaults; `path` selects the execution path.
+hort_timers_tasks:
+  # ── dsn-direct (hort-server; no token) ──────────────────────────────────────
+  - kind: quarantine-release-sweep
+    path: dsn-direct
+    exec_subcommand: enqueue-quarantine-release-sweep
+    on_calendar: "*:0/5"             # every 5 min (Helm: */5 * * * *)
+    enabled: true
+    description: "Release artifacts whose quarantine window has elapsed (CRITICAL — without it quarantine never releases)."
+  - kind: config-scrub
+    path: dsn-direct
+    exec_subcommand: scrub
+    on_calendar: "*-*-* 03:00:00"    # daily 03:00 (Helm: 0 3 * * *)
+    enabled: true
+    description: "Scrub the gitops config snapshot."
+  - kind: verify-event-chain
+    path: dsn-direct
+    exec_subcommand: verify-event-chain
+    on_calendar: "*-*-* 02:30:00"    # daily (Helm verifyEventChain)
+    enabled: true
+    description: "Tamper-evidence verification of the per-stream event chain."
+  # ── admin-task (hort-cli; needs the cronjob-tasks token) ────────────────────
+  - kind: scanner-registry-prune
+    path: admin-task
+    idempotency_window: hour
+    on_calendar: "*:00"              # hourly (Helm: 0 * * * *)
+    enabled: true
+    description: "Prune stale scanner-registry rows."
+  - kind: staging-sweep
+    path: admin-task
+    idempotency_window: minute
+    on_calendar: "*:0/15"            # every 15 min (Helm: */15 * * * *)
+    enabled: true
+    description: "Sweep orphaned stateful-upload staging entries (else they grow until ingest fails on a full FS)."
+  - kind: replay-seen-prune
+    path: admin-task
+    idempotency_window: hour
+    on_calendar: "*:00"              # hourly (Helm replaySeenPrune enabled:true)
+    enabled: true
+    description: "Prune the federation JWT-replay seen-set."
+  # ── disabled by default (situational / need extra config) ───────────────────
+  - kind: cron-rescan-tick
+    path: admin-task
+    idempotency_window: minute
+    on_calendar: "*:0/5"
+    enabled: false
+    description: "Re-scan tick — re-evaluate artifacts against updated advisories (Helm default-off)."
+  - kind: retention-evaluate
+    path: admin-task
+    idempotency_window: hour
+    on_calendar: "*-*-* 03:00:00"
+    enabled: false
+    description: "Retention evaluation — needs HORT_RETENTION_DATABASE_URL wired (else fail-safe no-op)."
+  - kind: retention-purge
+    path: admin-task
+    idempotency_window: hour
+    on_calendar: "*-*-* 04:00:00"
+    enabled: false
+    description: "Retention purge — needs HORT_RETENTION_DATABASE_URL wired."
+  - kind: eventstore-archive
+    path: admin-task
+    idempotency_window: day
+    on_calendar: "Sun *-*-* 05:00:00"
+    enabled: false
+    description: "Event-store archive — needs HORT_RETENTION_DATABASE_URL + the seal-pool single-flight backstop (ADR 0020)."

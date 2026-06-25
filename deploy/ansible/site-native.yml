@@ -40,3 +40,9 @@
     - role: certbot
     - role: fail2ban
     - role: gitops
+    # Periodic worker tasks (quarantine-release-sweep, scanner-registry-prune,
+    # staging-sweep, …) as systemd timers — the native equivalent of the Helm
+    # CronJobs. Must run after gitops: the server is up (admin-task path), the
+    # hort-cli binary is installed (hort_binaries), and the admin_task_invoke
+    # token is mintable via the same gitops_admin_cmd/env.
+    - role: hort_timers

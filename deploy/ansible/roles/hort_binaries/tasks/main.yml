@@ -134,10 +134,15 @@
 
 # ── Download + verify each binary ────────────────────────────────────────────
 
-- name: Download, verify, and install hort-server and hort-worker
+- name: Download, verify, and install hort-server, hort-worker, and hort-cli
   ansible.builtin.include_tasks: install_binary.yml
   loop:
     - hort-server
     - hort-worker
+    # hort-cli — needed by the hort_timers role: the admin-task systemd timers
+    # run `hort-cli admin task invoke <kind>`. Released as a cosign-signed
+    # tarball (hort-cli-linux-<arch>.tar.gz), installed identically to the
+    # services. Not a long-running unit, so no service restart depends on it.
+    - hort-cli
   loop_control:
     loop_var: hort_binaries_bin

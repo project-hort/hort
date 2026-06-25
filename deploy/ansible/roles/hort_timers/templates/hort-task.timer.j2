@@ -1,0 +1,14 @@
+# {{ ansible_managed }} — hort_timers role
+[Unit]
+Description=Timer for Hort scheduled task: {{ hort_timers_task.kind }}
+
+[Timer]
+OnCalendar={{ hort_timers_task.on_calendar }}
+# Spread firings so co-scheduled timers don't stampede the worker/DB at once.
+RandomizedDelaySec=30
+# Catch up a single missed run after downtime (the tasks are idempotent).
+Persistent=true
+Unit=hort-task-{{ hort_timers_task.kind }}.service
+
+[Install]
+WantedBy=timers.target
