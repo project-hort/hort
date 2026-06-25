@@ -1,0 +1,27 @@
+# {{ ansible_managed }} — hort_timers role
+[Unit]
+Description=Hort scheduled task: {{ hort_timers_task.kind }} — {{ hort_timers_task.description }}
+After=network-online.target hort-server.service
+Wants=network-online.target
+{% if hort_timers_task.path == 'admin-task' %}
+# admin-task enqueues via the API, so the server must be up.
+Requires=hort-server.service
+{% endif %}
+
+[Service]
+Type=oneshot
+User={{ hort_timers_run_user }}
+Group={{ hort_timers_run_user }}
+TimeoutStartSec=300
+{% if hort_timers_task.path == 'dsn-direct' %}
+# DB-direct enqueue. HORT_DATABASE_URL (+ tunables) come from the server env;
+# the subcommand uses MinimalConfig (ADR 0009), so unrelated vars are ignored.
+EnvironmentFile={{ hort_timers_server_env_file }}
+ExecStart={{ hort_timers_server_bin }} {{ hort_timers_task.exec_subcommand }}
+{% else %}
+# admin-task path. The admin_task_invoke token is read from the token file
+# (mode 0600) at exec time via the wrapper — never written into this
+# (world-readable) unit file.
+Environment=HORT_SERVER={{ hort_timers_server_url }}
+ExecStart=/bin/bash -c 'export HORT_TOKEN="$(cat {{ hort_timers_token_file }})"; exec {{ hort_timers_cli_bin }} admin task invoke {{ hort_timers_task.kind }}{% if hort_timers_task.idempotency_window is defined %} --idempotency-key-window {{ hort_timers_task.idempotency_window }}{% endif %}'
+{% endif %}
