@@ -1911,3 +1911,197 @@ mod proxy_pull_through {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Virtual (aggregating) repository — ADR 0031
+// ---------------------------------------------------------------------------
+mod virtual_repo {
+    use super::*;
+
+    /// Insert a `type: virtual` Maven repo aggregating `members` in priority
+    /// order (index 0 = highest).
+    fn insert_virtual_repo(mocks: &MockPorts, key: &str, members: &[&Repository]) -> Repository {
+        let mut repo = sample_repository();
+        repo.key = key.to_string();
+        repo.format = RepositoryFormat::Maven;
+        repo.repo_type = RepositoryType::Virtual;
+        mocks.repositories.insert(repo.clone());
+        for m in members {
+            mocks.repositories.seed_virtual_member(repo.id, m.id);
+        }
+        repo
+    }
+
+    /// A-level `maven-metadata.xml` through a virtual unions the members'
+    /// version lists (the `aggregate_virtual_index` merge).
+    #[tokio::test]
+    async fn virtual_a_level_metadata_merges_member_versions() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let a = insert_repo(&mocks, "mvn-a", RepositoryFormat::Maven);
+        let b = insert_repo(&mocks, "mvn-b", RepositoryFormat::Maven);
+        insert_file(
+            &mocks,
+            a.id,
+            "com.example:foo",
+            "1.0",
+            "com/example/foo/1.0/foo-1.0.jar",
+            b"A",
+            QuarantineStatus::Released,
+        );
+        insert_file(
+            &mocks,
+            b.id,
+            "com.example:foo",
+            "2.0",
+            "com/example/foo/2.0/foo-2.0.jar",
+            b"B",
+            QuarantineStatus::Released,
+        );
+        let _virt = insert_virtual_repo(&mocks, "mvn-virt", &[&a, &b]);
+        let router = router(ctx);
+
+        let (st, body) = get(
+            &router,
+            "/maven/mvn-virt/com/example/foo/maven-metadata.xml",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let xml = String::from_utf8(body).unwrap();
+        assert!(
+            xml.contains("<version>1.0</version>"),
+            "member a version: {xml}"
+        );
+        assert!(
+            xml.contains("<version>2.0</version>"),
+            "member b version: {xml}"
+        );
+    }
+
+    /// Dependency-confusion pinning (same-version): the higher-priority member
+    /// holds 1.0 Quarantined; a lower-priority member has the SAME version
+    /// Released. The held copy wins the authoritative merge and is then
+    /// filtered out — it is NOT replaced by the secondary's released copy, so
+    /// 1.0 is absent from the served document. Mirrors the pypi/npm regression.
+    #[tokio::test]
+    async fn virtual_a_level_held_primary_not_replaced_by_secondary() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let primary = insert_repo(&mocks, "mvn-primary", RepositoryFormat::Maven);
+        let secondary = insert_repo(&mocks, "mvn-secondary", RepositoryFormat::Maven);
+        insert_file(
+            &mocks,
+            primary.id,
+            "com.example:foo",
+            "1.0",
+            "com/example/foo/1.0/foo-1.0.jar",
+            b"held",
+            QuarantineStatus::Quarantined,
+        );
+        insert_file(
+            &mocks,
+            secondary.id,
+            "com.example:foo",
+            "1.0",
+            "com/example/foo/1.0/foo-1.0.jar",
+            b"released",
+            QuarantineStatus::Released,
+        );
+        let _virt = insert_virtual_repo(&mocks, "mvn-virt", &[&primary, &secondary]);
+        let router = router(ctx);
+
+        let (st, body) = get(
+            &router,
+            "/maven/mvn-virt/com/example/foo/maven-metadata.xml",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let xml = String::from_utf8(body).unwrap();
+        assert!(
+            !xml.contains("<version>1.0</version>"),
+            "held primary copy filtered out, NOT replaced by the secondary's released copy: {xml}"
+        );
+    }
+
+    /// V-level (snapshot) `maven-metadata.xml` through a virtual resolves to
+    /// the authoritative member that owns the `-SNAPSHOT` version and serves
+    /// ITS build list (no cross-member interleaving).
+    #[tokio::test]
+    async fn virtual_v_level_routes_to_authoritative_member() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let a = insert_repo(&mocks, "mvn-a", RepositoryFormat::Maven);
+        let b = insert_repo(&mocks, "mvn-b", RepositoryFormat::Maven);
+        // Only member a owns the snapshot.
+        insert_snapshot_build(
+            &mocks,
+            a.id,
+            "com.example:foo",
+            "1.0-SNAPSHOT",
+            "foo-1.0-20231201.120000-1.jar",
+            b"build1",
+            QuarantineStatus::Released,
+        );
+        let _virt = insert_virtual_repo(&mocks, "mvn-virt", &[&a, &b]);
+        let router = router(ctx);
+
+        let (st, body) = get(
+            &router,
+            "/maven/mvn-virt/com/example/foo/1.0-SNAPSHOT/maven-metadata.xml",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let xml = String::from_utf8(body).unwrap();
+        assert!(
+            xml.contains("20231201.120000"),
+            "authoritative member's snapshot build timestamp must be served: {xml}"
+        );
+    }
+
+    /// A virtual file download routes through the owning member's full
+    /// per-member serve path (CAS bytes returned).
+    #[tokio::test]
+    async fn virtual_file_download_routes_to_member() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let a = insert_repo(&mocks, "mvn-a", RepositoryFormat::Maven);
+        insert_file(
+            &mocks,
+            a.id,
+            "com.example:foo",
+            "1.0",
+            "com/example/foo/1.0/foo-1.0.jar",
+            b"JARBYTES",
+            QuarantineStatus::Released,
+        );
+        let _virt = insert_virtual_repo(&mocks, "mvn-virt", &[&a]);
+        let router = router(ctx);
+
+        let (st, body) = get(&router, "/maven/mvn-virt/com/example/foo/1.0/foo-1.0.jar").await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "virtual file download must route to the member"
+        );
+        assert_eq!(body, b"JARBYTES");
+    }
+
+    /// A virtual file download for a coordinate no member has → 404 (the owner
+    /// of the name lacks this version; no proxy fall-through).
+    #[tokio::test]
+    async fn virtual_file_download_absent_coordinate_returns_404() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let a = insert_repo(&mocks, "mvn-a", RepositoryFormat::Maven);
+        insert_file(
+            &mocks,
+            a.id,
+            "com.example:foo",
+            "1.0",
+            "com/example/foo/1.0/foo-1.0.jar",
+            b"JARBYTES",
+            QuarantineStatus::Released,
+        );
+        let _virt = insert_virtual_repo(&mocks, "mvn-virt", &[&a]);
+        let router = router(ctx);
+
+        // Member a owns `com.example:foo` but has no 3.0 → 404.
+        let (st, _body) = get(&router, "/maven/mvn-virt/com/example/foo/3.0/foo-3.0.jar").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+}

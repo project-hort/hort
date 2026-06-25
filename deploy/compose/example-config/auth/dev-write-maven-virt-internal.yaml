@@ -1,0 +1,14 @@
+# PermissionGrant: [developer, ci-pusher] -> write maven-virt-internal
+# (dev-user `mvn deploy` to the private member,
+# scripts/native-tests/scenarios/clients/maven-virtual.sh). Per-repo + two-claim
+# subject passes the allowlist linter. Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-write-maven-virt-internal
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: maven-virt-internal

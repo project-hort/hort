@@ -1,0 +1,18 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: maven-virt-e2e
+spec:
+  name: "Maven Virtual (private + Central)"
+  description: "Virtual aggregating the private hosted member maven-virt-internal + the Maven Central proxy maven-central-e2e (ADR 0031); scripts/native-tests/scenarios/clients/maven-virtual.sh"
+  format: maven
+  type: virtual
+  # Order is resolution priority (index 0 = highest). The private member is
+  # first so it OWNS its group:artifact names: name-level pinning then excludes
+  # the public proxy for those names (dependency-confusion defence, ADR 0031
+  # rule 2b). Mirrors npm-virt-e2e.yaml.
+  virtualMembers:
+    - maven-virt-internal
+    - maven-central-e2e
+  isPublic: true
+  replicationPriority: local_only

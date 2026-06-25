@@ -389,6 +389,12 @@ pub const VIRTUAL_SERVE_SUPPORTED_FORMATS: &[RepositoryFormat] = &[
     RepositoryFormat::Npm,
     RepositoryFormat::Pypi,
     RepositoryFormat::Cargo,
+    // Maven + Gradle (one handler, `hort-http-maven`) ship virtual serve-time
+    // member resolution: A-level metadata merge via `aggregate_virtual_index`,
+    // V-level snapshot via the authoritative-member walk, and file download via
+    // `resolve_download` (ADR 0031).
+    RepositoryFormat::Maven,
+    RepositoryFormat::Gradle,
 ];
 
 /// Per-spec validation: applies only to one envelope's content.
@@ -1077,18 +1083,18 @@ spec:
     fn type_virtual_unsupported_format_is_validation_error() {
         // ADR 0015 inert-field stopgap (spec §9 part A): a format absent from
         // `VIRTUAL_SERVE_SUPPORTED_FORMATS` is rejected at apply rather than
-        // accepted with an inert `virtualMembers`. npm/pypi/cargo are lifted
-        // (Phases 1-3); `maven` is a known, still-unsupported format — the
-        // correct steady state. The repo below is otherwise valid (members
-        // present, no dup, no self-reference), so the unsupported-format
-        // rejection is the operative error.
+        // accepted with an inert `virtualMembers`. npm/pypi/cargo/maven/gradle
+        // are lifted; `oci` is a known, still-unsupported format — the correct
+        // steady state. The repo below is otherwise valid (members present, no
+        // dup, no self-reference), so the unsupported-format rejection is the
+        // operative error.
         let yaml_doc = "apiVersion: project-hort.de/v1beta1
 kind: ArtifactRepository
 metadata:
   name: vroot
 spec:
   name: vroot
-  format: maven
+  format: oci
   type: virtual
   storage: { backend: filesystem, path: /x }
   virtualMembers: [a, b]
@@ -1100,6 +1106,39 @@ spec:
         assert!(errors
             .iter()
             .any(|e| e.to_string().contains("not yet serve-supported")));
+    }
+
+    #[test]
+    fn type_virtual_maven_is_serve_supported() {
+        // Maven (and Gradle, same handler) ship virtual serve-time member
+        // resolution (ADR 0031), so a valid `type: virtual` maven repo no
+        // longer trips the inert-field stopgap — `virtualMembers` is genuinely
+        // served (A-level merge + V-level authoritative + file download).
+        for format in ["maven", "gradle"] {
+            let yaml_doc = format!(
+                "apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: vroot
+spec:
+  name: vroot
+  format: {format}
+  type: virtual
+  storage: {{ backend: filesystem, path: /x }}
+  virtualMembers: [a, b]
+  isPublic: true
+  replicationPriority: immediate
+"
+            );
+            let env = parse_repository(&p(), yaml_doc.as_bytes()).unwrap();
+            let errors = validate_repository(&env);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.to_string().contains("not yet serve-supported")),
+                "{format} virtual is serve-supported and must not trip the stopgap: {errors:?}"
+            );
+        }
     }
 
     #[test]
