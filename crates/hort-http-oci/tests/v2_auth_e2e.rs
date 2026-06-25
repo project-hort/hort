@@ -487,6 +487,67 @@ fn step2_v2_auth_with_valid_pat_mints_jwt() {
 }
 
 // ===========================================================================
+// Step 2b (MR !29 regression) — the SAME mint as step 2, but under
+// `AuthContext::Disabled`, driven through the REAL `oci_routes_with_config`
+// router (the production `route_layer` over the merged router), NOT a
+// standalone test router. The bug is masked under `Enabled` (step 2): there
+// the middleware's `authenticate_bearer` validates the Basic-PAT and passes it
+// through. Under a non-`Enabled` context (the deploy's disabled / BearerOnly
+// shape) the PAT verifies as `NotOurToken` and, pre-fix, hit the middleware's
+// `auth_disabled_token_rejected` 401 BEFORE the handler. The `/v2/auth`
+// path-skip lets the request reach the handler, which mints independently of
+// the auth provider. Locks the real wiring in fast CI — the `oci_auth` unit
+// test only covers the middleware in isolation, on a standalone router.
+// ===========================================================================
+
+#[test]
+fn step2b_v2_auth_mints_under_disabled_auth_through_real_router() {
+    let (status, body_json) = run(async {
+        let h = build_harness();
+        // Flip the wired ctx to Disabled. `with_auth` rebuilds preserving the
+        // OCI signing-key + token-exchange slots, so the mint path (which never
+        // consults `AuthContext`) stays fully wired while the middleware now
+        // sees a non-`Enabled` context — exactly the deploy shape that 401'd
+        // pre-fix.
+        let ctx = with_auth(&h.ctx, AuthContext::Disabled);
+        let creds =
+            base64::engine::general_purpose::STANDARD.encode(format!("oauth2:{}", h.plaintext_pat));
+        let uri = format!(
+            "/v2/auth?service=hort.example.com&scope=repository:{}:pull",
+            h.repo_key
+        );
+        let router = oci_routes_with_config(&OciHttpConfig::default(), ctx.clone()).with_state(ctx);
+        let resp = router
+            .oneshot(
+                Request::get(&uri)
+                    .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (status, body_json)
+    });
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Basic-PAT GET /v2/auth must mint under Disabled through the REAL router, \
+         not the middleware 401: {body_json}"
+    );
+    let token = body_json["token"]
+        .as_str()
+        .expect("response must carry `token`");
+    assert_eq!(
+        token.split('.').count(),
+        3,
+        "minted token must be a JWT (header.payload.signature)"
+    );
+}
+
+// ===========================================================================
 // Step 3 — `/v2/auth` with no Authorization → 401 + Bearer challenge
 // (the same realm/service shape as step 1).
 // ===========================================================================

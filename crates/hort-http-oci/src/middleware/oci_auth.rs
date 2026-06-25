@@ -1,6 +1,12 @@
 //! OCI bearer-token auth middleware (ADR 0012).
 //!
-//! Attached to the `/v2/*` subtree only. The global
+//! Attached to the `/v2/*` subtree only — EXCEPT `/v2/auth`, which is
+//! path-skipped at the top of [`oci_bearer_auth`]: the Distribution-Spec
+//! token-exchange handler validates the inbound `Basic <PAT>` itself, so a
+//! native PAT (or federated CI token) — which verifies as `NotOurToken`
+//! against the OCI signing key — must not be intercepted here (under
+//! `HORT_AUTH_PROVIDER=disabled` that interception `401`'d every credentialed
+//! mint request before the handler ran). The global
 //! `method_based_auth_dispatch` from `hort-http-core::router`
 //! short-circuits on OCI paths and lets this middleware own auth
 //! for the OCI surface.
@@ -12,27 +18,32 @@
 //!    forward. Read paths on public repos succeed; write paths fail
 //!    at the `WriteRepoAccess` extractor with 401 + Basic challenge.
 //!
-//! 2. **`Authorization: Bearer <jwt>`** → call
-//!    `AuthenticateUseCase::authenticate_bearer(jwt)` (IdP JWKS
-//!    validation). On success, insert the resulting `CallerPrincipal`.
-//!    On failure, 401 with Basic challenge.
+//! 2. **`Authorization: Bearer <jwt>`** → verified FIRST against the OCI
+//!    signing key (`verify_inbound`): a native hort-minted `/v2/auth` token
+//!    is accepted; a structurally-ours-but-invalid one (expired / wrong
+//!    `aud`) is a hard 401. A `NotOurToken` falls through to
+//!    `AuthenticateUseCase::authenticate_bearer` (IdP JWKS), so Keycloak
+//!    bearers keep working alongside native tokens.
 //!
-//! 3. **`Authorization: Basic <b64(user:jwt)>`** — same as Bearer.
-//!    The password field is treated as the bearer token. Legacy
-//!    clients (twine, docker pre-OCI-spec) embed an IdP-issued JWT
-//!    in the password slot; this is the documented Docker Hub
-//!    convention and what `require_principal` accepted.
+//! 3. **`Authorization: Basic <b64(user:secret)>`** — the password is
+//!    treated as the bearer token and runs the same two-stage verify as
+//!    (2); legacy clients embed an IdP-issued JWT in the password slot
+//!    (Docker Hub convention). NB this is the *consume* carrier — the
+//!    native *mint* path is a `Basic <PAT>` to `/v2/auth` (Entry 7/8 of
+//!    `docs/auth-catalog.md`), which this middleware path-skips (see above).
 //!
-//! 4. **`AuthContext::Disabled`** (dev / single-node bootstrap): the
-//!    middleware runs the same code path as `Enabled`, but the
-//!    bearer-validation arm short-circuits to 401 (no IdP is wired
-//!    under Disabled), and an anonymous request flows through with
-//!    `Option<CallerPrincipal>::None` so downstream extractors fail
-//!    closed with 401. The OCI surface is therefore unusable when
-//!    `AUTH=disabled` — operators wanting OCI must wire a real IdP.
+//! 4. **`AuthContext::Disabled`** (no IdP wired): the IdP fall-through in
+//!    (2)/(3) short-circuits to 401, so Keycloak bearers are rejected — but
+//!    the NATIVE path still works. With native tokens enabled, a client
+//!    mints at `/v2/auth` (Basic `<PAT>`, exempt from this middleware) and
+//!    presents the resulting hort-signed JWT, which `verify_inbound` accepts
+//!    independently of the auth provider. OCI is therefore fully usable
+//!    under `disabled` *with native tokens enabled*; anonymous reads on
+//!    public repos also pass through.
 //!
-//! There is **no hort-server-minted token** in this flow. Tokens come
-//! from the configured IdP.
+//! hort DOES mint OCI tokens: `/v2/auth` issues a short-lived Ed25519 JWT
+//! (Entry 7) that this middleware verifies on `/v2/*`. IdP bearers
+//! (Keycloak) remain supported via the (2)/(3) fall-through.
 
 use std::sync::Arc;
 
@@ -50,7 +61,7 @@ use hort_http_core::middleware::auth::{
     mint_authenticated_principal_for_format_middleware, AuthenticatedPrincipal,
 };
 
-use crate::v2_auth::path_to_scope;
+use crate::v2_auth::{path_to_scope, V2_AUTH_PATH};
 
 /// Bearer middleware for `/v2/*`. See module-level docstring.
 ///
@@ -73,6 +84,24 @@ pub async fn oci_bearer_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
+    // `/v2/auth` owns its OWN credential validation: the Distribution-Spec
+    // token-exchange handler validates the inbound `Basic <PAT>` directly via
+    // `OciTokenExchangeUseCase`. This consume-side bearer middleware must NOT
+    // intercept it — a native PAT (and a federated CI token) verifies as
+    // `NotOurToken` here, which under `HORT_AUTH_PROVIDER=disabled` / `BearerOnly`
+    // is rejected at the `AuthContext::Enabled` guard below, BEFORE the handler
+    // runs — which broke the entire `Basic <PAT> → OCI JWT` exchange for every
+    // credentialed request. This is the skip the `/v2/auth` route comment in
+    // `lib.rs` already promises. `path()` is query-stripped, so
+    // `/v2/auth?service=…&scope=…` matches. The `None` principal slot is set to
+    // honour this middleware's "always populate the `Option` slot" contract
+    // (same shape as the anonymous-pass-through below).
+    if req.uri().path() == V2_AUTH_PATH {
+        req.extensions_mut()
+            .insert::<Option<AuthenticatedPrincipal>>(None);
+        return next.run(req).await;
+    }
+
     // Resolve a token from `Authorization`. Bearer or Basic-as-JWT
     // both supply the same string; absent → anonymous pass-through.
     let token = extract_token(&req);
@@ -562,6 +591,54 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let www = www.expect("WWW-Authenticate present");
         assert!(www.starts_with("Basic"), "expected Basic challenge: {www}");
+    }
+
+    /// REGRESSION — the `/v2/auth` middleware-skip bug. The `oci_bearer_auth`
+    /// `route_layer` wraps `/v2/auth` (lib.rs), but that endpoint owns its OWN
+    /// credential validation (`Basic <PAT>` → `OciTokenExchangeUseCase`). A
+    /// `Basic <PAT>` verifies as `NotOurToken` here and — under
+    /// `AuthContext::Disabled` — was rejected at the `auth_disabled_token_rejected`
+    /// guard BEFORE the handler, breaking the entire `Basic <PAT> → OCI JWT`
+    /// exchange (native PAT *and* the federated CI token). The path-skip lets
+    /// the request reach the handler. Contrast `disabled_auth_bearer_header_returns_401`:
+    /// the SAME credential on a non-`/v2/auth` path still 401s at the middleware.
+    #[test]
+    fn v2_auth_basic_credential_skips_middleware_and_reaches_handler() {
+        use base64::Engine as _;
+        let parsed = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, _mocks) = build_mock_ctx(handle); // AuthContext::Disabled
+            let router = Router::new()
+                .route("/v2/auth", get(echo_principal_handler))
+                .layer(from_fn_with_state(ctx.clone(), oci_bearer_auth))
+                .with_state(ctx.clone());
+            // A native PAT carried as the Basic password — exactly what
+            // `docker login` / `mvn deploy` send. Pre-fix this 401'd at the
+            // middleware (NotOurToken under Disabled) before the handler ran.
+            let creds = base64::engine::general_purpose::STANDARD.encode("x:hort_pat_deadbeef");
+            let resp = router
+                .oneshot(
+                    HttpRequest::get("/v2/auth?service=hort.test&scope=repository:foo:pull")
+                        .header(header::AUTHORIZATION, format!("Basic {creds}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "Basic-PAT GET /v2/auth must reach the handler, NOT the middleware's 401"
+            );
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        });
+        // The skip injects the `None` principal slot and does NOT synthesise a
+        // principal from the Basic-PAT — the handler owns that validation.
+        assert_eq!(
+            parsed["authenticated"], false,
+            "the skip must not validate the PAT here (handler owns /v2/auth auth)"
+        );
     }
 
     // -------------------- 2. Bearer with valid token --------------------
