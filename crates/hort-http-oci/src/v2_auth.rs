@@ -64,6 +64,12 @@ use hort_http_core::context::AppContext;
 use crate::error::OciError;
 use crate::middleware::oci_auth::v2_auth_challenge_value;
 
+/// The canonical Distribution-Spec token-mint path. **Single source of truth
+/// for the literal:** the route registration ([`crate::oci_routes_with_config`])
+/// and the `oci_bearer_auth` path-skip both reference this const, so a rename
+/// moves both at once and the skip can never silently stop matching the route.
+pub(crate) const V2_AUTH_PATH: &str = "/v2/auth";
+
 // ---------------------------------------------------------------------------
 // Query DTO
 // ---------------------------------------------------------------------------
@@ -117,15 +123,15 @@ struct V2AuthResponseBody {
 
 /// `GET /v2/auth` — Distribution-Spec token exchange.
 ///
-/// Mounted by [`crate::oci_routes_with_config`]. The middleware
-/// `oci_bearer_auth` runs BEFORE this handler; the handler parses the
-/// `Authorization: Basic` header itself rather than using the
-/// middleware's principal, because:
+/// Mounted by [`crate::oci_routes_with_config`] at [`V2_AUTH_PATH`]. The
+/// `oci_bearer_auth` middleware PATH-SKIPS this route (the consume-side bearer
+/// gate does not own the mint endpoint), so this handler owns credential
+/// validation: it parses the `Authorization: Basic` header itself rather than
+/// using a middleware principal, because:
 /// - The username slot is irrelevant per spec (clients pass `oauth2`,
 ///   `<anything>`, or empty); only the password (PAT) matters.
-/// - The middleware's existing flow validates the credential as an
-///   IdP JWT, NOT as a PAT — the PAT path lives under the
-///   `OciTokenExchangeUseCase`.
+/// - The PAT is validated AS a PAT (via `OciTokenExchangeUseCase`), not as an
+///   IdP JWT — the middleware's bearer flow would mis-handle it.
 pub async fn handle_v2_auth(
     State(ctx): State<Arc<AppContext>>,
     Query(query): Query<V2AuthQuery>,

@@ -401,7 +401,10 @@ pub fn oci_routes_with_config(
         // upstream `oci_bearer_auth` middleware skips this path because
         // it has its own credential validation surface. Mounted on the
         // read-and-admin half because it is GET-only with no body.
-        .route("/v2/auth", axum::routing::get(v2_auth::handle_v2_auth))
+        .route(
+            v2_auth::V2_AUTH_PATH,
+            axum::routing::get(v2_auth::handle_v2_auth),
+        )
         // Per-repo catalog (modern default, always mounted). More
         // specific than `/v2/:repo_key/*tail`, so axum routes
         // `/v2/:repo_key/_catalog` here rather than into the pull

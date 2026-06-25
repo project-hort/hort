@@ -283,7 +283,7 @@ async fn method_based_auth_dispatch(
     // Short-circuit here so we don't run the IdP-bearer/Basic-fallback
     // pipeline on `/v2/*` requests — the OCI bearer middleware
     // attached on the OCI router will fire instead, validating the
-    // hort-server-minted JWT from `/v2/token`.
+    // hort-server-minted JWT from `/v2/auth`.
     if is_oci_path(req.uri().path()) {
         return next.run(req).await;
     }
