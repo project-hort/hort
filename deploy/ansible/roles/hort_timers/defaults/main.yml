@@ -1,17 +1,13 @@
 ---
-# hort_timers — systemd timers that drive the worker's periodic task kinds on
-# the native (non-k8s) deploy.
-#
-# The Helm chart schedules these as CronJobs; the native flavor had no
-# equivalent, so quarantine-release-sweep never ran and quarantined artifacts
-# never released (the scan-policy windows were effectively "quarantine
-# forever"). Two execution paths mirror the Helm `scheduledTasks` model:
-#
-#   - dsn-direct: `hort-server <enqueue-subcommand>` — a DB-only subcommand
-#     (MinimalConfig, ADR 0009) that enqueues a job directly via the DSN. The
-#     running hort-worker then processes it. No token, no API.
+# hort_timers — systemd timer+oneshot pairs that drive the worker's periodic
+# task kinds on the native (non-k8s) deploy, mirroring the Helm scheduledTasks.
+# Two execution paths:
+#   - dsn-direct: `hort-server <subcommand>` — a DB-only subcommand
+#     (MinimalConfig, ADR 0009) that enqueues a job via the DSN; the running
+#     hort-worker processes it. No token, no API.
 #   - admin-task: `hort-cli admin task invoke <kind>` — enqueues via the API
-#     with an `admin_task_invoke` token. Requires hort-cli on the host.
+#     with an `admin_task_invoke` token. Needs hort-cli + the cronjob-tasks
+#     token on the host.
 
 hort_timers_enabled: true
 
@@ -29,7 +25,7 @@ hort_timers_run_user: "{{ hort_user }}"
 # Per-task schedule (systemd OnCalendar) + enable. Cadences mirror the Helm
 # scheduledTasks defaults; `path` selects the execution path.
 hort_timers_tasks:
-  # ── dsn-direct (hort-server; no token) ──────────────────────────────────────
+  # ── enabled — dsn-direct (hort-server subcommand; no token) ──────────────────
   - kind: quarantine-release-sweep
     path: dsn-direct
     exec_subcommand: enqueue-quarantine-release-sweep
@@ -41,14 +37,8 @@ hort_timers_tasks:
     exec_subcommand: scrub
     on_calendar: "*-*-* 03:00:00"    # daily 03:00 (Helm: 0 3 * * *)
     enabled: true
-    description: "Scrub the gitops config snapshot."
-  - kind: verify-event-chain
-    path: dsn-direct
-    exec_subcommand: verify-event-chain
-    on_calendar: "*-*-* 02:30:00"    # daily (Helm verifyEventChain)
-    enabled: true
-    description: "Tamper-evidence verification of the per-stream event chain."
-  # ── admin-task (hort-cli; needs the cronjob-tasks token) ────────────────────
+    description: "Scrub the gitops config snapshot / CAS integrity."
+  # ── enabled — admin-task (hort-cli; needs the cronjob-tasks token) ───────────
   - kind: scanner-registry-prune
     path: admin-task
     idempotency_window: hour
@@ -64,16 +54,62 @@ hort_timers_tasks:
   - kind: replay-seen-prune
     path: admin-task
     idempotency_window: hour
-    on_calendar: "*:00"              # hourly (Helm replaySeenPrune enabled:true)
+    on_calendar: "*:00"              # hourly (Helm: 0 * * * *)
     enabled: true
     description: "Prune the federation JWT-replay seen-set."
-  # ── disabled by default (situational / need extra config) ───────────────────
   - kind: cron-rescan-tick
     path: admin-task
     idempotency_window: minute
-    on_calendar: "*:0/5"
+    on_calendar: "*:0/5"             # every 5 min (Helm: */5 * * * *)
+    enabled: true
+    description: "Re-scan cached artifacts against newly-published advisories (continuous supply-chain re-evaluation)."
+  - kind: advisory-watch-tick
+    path: admin-task
+    idempotency_window: hour
+    on_calendar: "0/6:00"            # every 6h (Helm: 0 */6 * * *)
+    enabled: true
+    description: "Pull the OSV advisory diff and re-scan artifacts hit by newly-published advisories (keeps OSV data current)."
+  # ── disabled — need extra infrastructure (non-destructive) ──────────────────
+  - kind: verify-event-chain
+    path: dsn-direct
+    exec_subcommand: verify-event-chain
+    on_calendar: "*-*-* 02:30:00"    # daily (Helm: 0 2 * * *)
     enabled: false
-    description: "Re-scan tick — re-evaluate artifacts against updated advisories (Helm default-off)."
+    description: "Offline event-chain tamper-evidence + anchoring; needs eventstore-checkpoint + an S3 Object-Lock bucket (off on the filesystem flavor)."
+  - kind: eventstore-checkpoint
+    path: admin-task
+    idempotency_window: hour
+    on_calendar: "*:00"              # hourly (Helm: 0 * * * *)
+    enabled: false
+    description: "Emit the signed event-chain checkpoint anchor verify-event-chain attests; needs an S3 Object-Lock (WORM) bucket."
+  - kind: prefetch-tick
+    path: dsn-direct
+    exec_subcommand: enqueue-prefetch-tick
+    on_calendar: "*:0/15"            # every 15 min (Helm: */15 * * * *)
+    enabled: false
+    description: "Walk prefetch-eligible repos + tracked packages and enqueue upstream-divergence prefetch jobs."
+  - kind: prefetch-row-retention-sweep
+    path: dsn-direct
+    exec_subcommand: enqueue-prefetch-row-retention-sweep
+    on_calendar: "*-*-* 02:00:00"    # daily 02:00 (Helm: 0 2 * * *)
+    enabled: false
+    description: "Delete terminal prefetch job rows older than the retention horizon."
+  - kind: wheel-metadata-backfill
+    path: dsn-direct
+    exec_subcommand: enqueue-wheel-metadata-backfill
+    on_calendar: "Sun *-*-* 04:00:00"  # weekly Sun 04:00 (Helm: 0 4 * * 0)
+    enabled: false
+    description: "One-shot retrofit: extract PEP 658 METADATA for PyPI wheels ingested before metadata extraction existed."
+  - kind: service-account-rotation
+    path: admin-task
+    idempotency_window: minute
+    on_calendar: "*:0/15"            # every 15 min (Helm: */15 * * * *)
+    enabled: false
+    description: "Rotate service-account tokens (needs the k8s svc-token rotation surface; off on the native flavor)."
+  # ── disabled — destructive retention/archive tasks ──────────────────────────
+  # Require the task:destructive claim (ADR 0038), which the non-admin
+  # cronjob-tasks SA cannot hold, plus HORT_RETENTION_DATABASE_URL — so they
+  # cannot run unattended.
   - kind: retention-evaluate
     path: admin-task
     idempotency_window: hour

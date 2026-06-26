@@ -477,6 +477,14 @@ quality:sonar:
     name: sonarsource/sonar-scanner-cli:latest
     entrypoint: [""]
   rules:
+    # Skip Sonar on merge-request pipelines. Its quality gate scores coverage +
+    # duplication on "new code", which has no meaning for the many MRs that
+    # change no Rust (deploy / docs / CI) — those score 0% and block the MR. The
+    # gate runs on the branch pipeline (develop / main / release / tags) instead,
+    # which is the authoritative full-project analysis. MR-level coverage is
+    # still enforced by the test:coverage job.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
     # Runs only when a Sonar token is configured, so installations without a
     # Sonar instance don't hard-fail the quality stage. Set SONAR_TOKEN (and
     # SONAR_HOST_URL) as masked CI/CD variables to enable. See docs/ci/README.md.
@@ -496,21 +504,15 @@ quality:sonar:
       - .sonar/cache
   script:
     - |
-      PR_ARGS=""
-      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
-        PR_ARGS="-Dsonar.pullrequest.key=${CI_MERGE_REQUEST_IID} \
-                 -Dsonar.pullrequest.branch=${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME} \
-                 -Dsonar.pullrequest.base=${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
-      fi
       # Static analysis config (sources, tests, exclusions, coverage report
       # paths, and the test-key issue-ignores) lives in
       # sonar-project.properties at the repo root and is auto-read by
-      # sonar-scanner. Only dynamic / secret args are passed here.
+      # sonar-scanner. Only dynamic / secret args are passed here. This job runs
+      # on branch pipelines only (see rules), so there is no pull-request mode.
       sonar-scanner \
         -Dsonar.host.url=${SONAR_HOST_URL} \
         -Dsonar.token=${SONAR_TOKEN} \
-        ${SONAR_PROJECT_KEY:+-Dsonar.projectKey=$SONAR_PROJECT_KEY} \
-        ${PR_ARGS}
+        ${SONAR_PROJECT_KEY:+-Dsonar.projectKey=$SONAR_PROJECT_KEY}
 
 # Lint pin-sync between Cargo.toml MSRV / the hort-server Dockerfile rust
 # toolchain, and between the Helm chart values.yaml top-level keys / their
