@@ -115,6 +115,12 @@ test-values-worker-metrics.yaml|^kind: NetworkPolicy$|3|the additive `-worker-me
 test-values-worker-metrics.yaml|name: hort-server-worker-metrics$|1|the worker-scoped scrape NetworkPolicy renders with the conventional release-name suffix
 test-values-worker-metrics.yaml|^        - port: 9090$|1|the worker NetworkPolicy's single Ingress rule admits the configured scrapers to the metrics port (the additive scrape allowance)
 test-values-worker-metrics.yaml|app.kubernetes.io/component: worker|7|the `-worker-metrics` NetworkPolicy adds exactly 2 `component: worker` lines (metadata label + podSelector) — selecting ONLY worker pods — on top of the 5 the worker Deployment/ConfigMap/ServiceAccount already carry
+test-values-dex.yaml|hort-server.io/component: dex|6|auth.dex.enabled renders the Dex sidecar trio (ConfigMap + Service + Deployment) — 6 component-label lines: ConfigMap metadata (1) + Service metadata + podSelector (2) + Deployment metadata + selector + pod-template (3)
+test-values-dex.yaml|ghcr.io/dexidp/dex|1|auth.dex.enabled renders the Dex Deployment with the configured Dex image
+test-values-dex.yaml|/etc/dex/config.yaml|1|the Dex Deployment serves the mounted config (dex serve /etc/dex/config.yaml)
+test-values-dex.yaml|value: "https://registry.example.com/dex"|3|auth.dex.enabled overrides HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl on the server Deployment AND the two DSN-direct runtimeEnv CronJobs (scrub + quarantineReleaseSweep)
+test-values-dex.yaml|^ +value: "hort-cli"$|3|auth.dex.enabled overrides HORT_OIDC_AUDIENCE to auth.dex.cliClientId (Dex mints the cli-flow token; its aud is the Dex client id, NOT auth.oidc.audience) — on the server Deployment AND the two DSN-direct runtimeEnv CronJobs; mirrors the issuer override and the Ansible flavor
+test-values-token-exchange-happy.yaml|hort-server.io/component: dex|0|auth.dex.enabled default false ⇒ NO Dex sidecar renders (negative counterpart to test-values-dex.yaml)
 EOF
 }
 
@@ -132,6 +138,7 @@ test-values-rotation-half-on.yaml|scheduledTasks.adminTasksEnabled|the single ro
 test-values-extra-ca-both-sources.yaml|extraCaBundle|configMapName AND secretName both set is mutually exclusive — schema oneOf + validateSources must fail the render
 test-values-strict-schema-typo.yaml|Additional property|the strict schema (additionalProperties:false on the top-level + every nested block) must REJECT mistyped / retired keys (replicaCountt, apiBindAddr, http.ociUploadTimeoutSeconds, worker.scanner.osvScanner, worker.scanner.osvv) at helm template instead of silently ignoring them
 test-values-worker-metrics-no-scrapers.yaml|scrapeFrom|worker.metrics.enabled=true with an empty scrapeFrom must be rejected — an empty NetworkPolicy `from: []` means ALL sources (fail-OPEN) per the k8s spec, so the schema's `if enabled then scrapeFrom minItems 1` rule must fail the render rather than open the metrics port cluster-wide
+test-values-dex-broken.yaml|auth.dex.issuerUrl|auth.dex.enabled=true with an empty auth.dex.issuerUrl must fail schema validation — the chart points HORT_OIDC_ISSUER_URL at Dex so an empty issuer is rejected at render time
 EOF
 }
 

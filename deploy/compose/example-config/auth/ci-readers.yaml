@@ -1,0 +1,18 @@
+# ClaimMapping (e2e fan-out): IdP group `hort-readers` ALSO resolves to the
+# `ci-reader` scope claim, so a `hort-readers` member's resolved claim set is
+# [reader, ci-reader] — the two-claim subject the reader private-pull grant
+# (reader-read-oci-private-e2e.yaml) requires.
+#
+# WHY two claims: the apply-time grant linter rejects single-claim grants by
+# default (single-claim-grant rule). A real deployment would source the two
+# claims from two DIFFERENT IdP groups (defense-in-depth); the e2e LDAP
+# directory defines only one reader group, so both claims are mapped from it —
+# the additive-claims grant shape is identical either way. Mirrors
+# `ci-pushers.yaml` (the developer-side equivalent).
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: ci-readers
+spec:
+  idpGroup: hort-readers
+  claim: ci-reader

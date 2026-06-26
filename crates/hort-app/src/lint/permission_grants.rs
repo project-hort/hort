@@ -309,7 +309,13 @@ impl LintOutcome {
 /// direct-user path — auto-synthesised from `desired.service_accounts`,
 /// not operator-hand-declared escalations). The
 /// `direct-user-grant-without-justification` rule treats SA-owned
-/// `User` grants as **justified by provenance** and exempts them; an
+/// `User` grants as **justified by provenance** and exempts them —
+/// **except `Permission::Admin`**, which is denied the exemption (an
+/// SA-owned `Admin` grant `Reject`s like the hand-rolled form; the
+/// earliest gate is `hort_config::validate_permission_grant`, which
+/// hard-rejects a `serviceAccount` subject with `permission: admin`,
+/// and this linter scoping is defense-in-depth — ADR 0038 "no service
+/// account holds admin, no exception" on the grant axis). An
 /// operator-hand-declared `GrantSubjectSpec::User` envelope grant
 /// whose user-id is NOT in this set is a privilege-escalation shape
 /// and triggers the rule.
@@ -422,7 +428,11 @@ fn evaluate_wildcard_repo_non_admin(
 /// signal (see [`lint_permission_grants`] for the as-built
 /// reconciliation: every gitops grant carries a `managed_by_digest`,
 /// so it cannot be the discriminator). An SA-owned grant is exempt
-/// (justified by provenance → `Pass`). An operator-hand-declared bare
+/// (justified by provenance → `Pass`) **for every permission except
+/// `Admin`** — an SA-owned `Admin` grant is denied the exemption and
+/// falls through to the `high_privilege` `Reject` (ADR 0038: no SA
+/// holds admin, on the grant axis too; `AdminTaskInvoke`/`Curate`/etc.
+/// SA grants stay exempt). An operator-hand-declared bare
 /// `User` grant rejects when high-privilege (`Admin` always, or a
 /// wildcard-repo grant of any [`ADMIN_CLASS_PERMISSIONS`] member —
 /// `AdminTaskInvoke`/`Curate`/`Prefetch` — or wildcard-repo
@@ -438,11 +448,24 @@ fn evaluate_direct_user_grant(
     let GrantSubject::User(uid) = &grant.subject else {
         return; // rule only applies to User subjects
     };
-    if sa_owned_user_ids.contains(uid) {
-        // Justified by provenance: this `User` grant was synthesised
-        // from a declared `ServiceAccount`, not a hand-written
-        // escalation. The SA apply path (+ its apply-time validation,
-        // incl. the no-admin-SA rule) is the audited gate here.
+    if sa_owned_user_ids.contains(uid) && grant.permission != Permission::Admin {
+        // Justified by provenance — but **strictly non-`Admin`**: this
+        // `User` grant was synthesised from a declared `ServiceAccount`,
+        // not a hand-written escalation, AND it is not an admin grant.
+        // The gate that makes an SA-owned grant safe is twofold: (1)
+        // `validate_permission_grant` hard-rejects a `serviceAccount`
+        // subject with `permission: admin` at apply (the earliest,
+        // clearest gate — see `hort-config`), and (2) this scoping, which
+        // declines the provenance exemption for `Admin` so an SA-owned
+        // Admin grant falls through to the `high_privilege` arm below and
+        // `Reject`s exactly like the hand-rolled `User`-subject form. This
+        // upholds ADR 0038 "no service account holds admin — no exception"
+        // on the *grant* axis. The exemption is **deliberately scoped to
+        // `permission != Permission::Admin`, NOT `!is_admin_class(..)`**:
+        // `AdminTaskInvoke` is a legitimate SA permission (the
+        // `cronjob-tasks` SA holds a global `admin_task_invoke` grant), as
+        // are `Curate`/`Read`/`Write`/`Delete` — all stay exempt. Only
+        // `Admin` itself is denied the exemption.
         emit_and_record(RULE_DIRECT_USER, RuleAction::Pass, grant, outcome);
         return;
     }
@@ -868,18 +891,46 @@ mod tests {
     }
 
     #[test]
-    fn direct_user_sa_owned_admin_is_exempt() {
-        // The legitimate SA-owned path: a `User` grant whose uid
-        // is SA-owned is justified by provenance → Pass, even at
-        // Admin permission.
+    fn direct_user_sa_owned_admin_is_rejected() {
+        // ADR 0038 on the grant axis: the provenance exemption is
+        // scoped to non-`Admin` permissions. An SA-owned `User` grant
+        // at `Permission::Admin` is DENIED the exemption and falls
+        // through to the high-privilege `Reject` — exactly like the
+        // hand-rolled `User`-subject form. (The earliest gate is
+        // `hort_config::validate_permission_grant`, which rejects a
+        // `serviceAccount` subject + `permission: admin` at apply;
+        // this linter scoping is defense-in-depth.)
         let sa_uid = Uuid::new_v4();
         let g = user_grant_for(sa_uid, Permission::Admin, None);
         let mut sa_owned = HashSet::new();
         sa_owned.insert(sa_uid);
         let out = lint_sa(&[g], &sa_owned, &LintConfig::default());
         assert!(
+            out.rejected(),
+            "an SA-owned User grant at Admin is NOT exempt — no SA holds admin (ADR 0038)"
+        );
+        assert!(out
+            .violations
+            .iter()
+            .any(|v| v.rule == RULE_DIRECT_USER && v.action == RuleAction::Reject));
+    }
+
+    #[test]
+    fn direct_user_sa_owned_admin_task_invoke_is_exempt() {
+        // Over-rejection guard: the provenance exemption is scoped to
+        // `permission != Permission::Admin`, NOT `!is_admin_class(..)`.
+        // `AdminTaskInvoke` is a LEGITIMATE SA permission (the
+        // `cronjob-tasks` SA holds a global `admin_task_invoke` grant),
+        // so an SA-owned global AdminTaskInvoke `User` grant MUST stay
+        // exempt (`Pass`) — denying it would break the cronjob SA.
+        let sa_uid = Uuid::new_v4();
+        let g = user_grant_for(sa_uid, Permission::AdminTaskInvoke, None);
+        let mut sa_owned = HashSet::new();
+        sa_owned.insert(sa_uid);
+        let out = lint_sa(&[g], &sa_owned, &LintConfig::default());
+        assert!(
             !out.rejected(),
-            "an SA-owned User grant is justified by provenance"
+            "an SA-owned global AdminTaskInvoke grant is justified by provenance — must pass"
         );
         assert!(out.violations.is_empty());
     }
@@ -970,9 +1021,12 @@ mod tests {
 
     #[test]
     fn direct_user_sa_owned_admin_class_is_exempt() {
-        // Provenance exemption holds for admin-class perms too: an SA-owned
-        // wildcard admin-class `User` grant is justified by provenance
-        // → Pass (mirrors `direct_user_sa_owned_admin_is_exempt`).
+        // Provenance exemption holds for admin-CLASS perms (other than
+        // `Admin` itself): an SA-owned wildcard admin-class `User` grant
+        // is justified by provenance → Pass (mirrors
+        // `direct_user_sa_owned_admin_task_invoke_is_exempt`; the `Admin`
+        // permission specifically is denied the exemption — see
+        // `direct_user_sa_owned_admin_is_rejected`).
         let sa_uid = Uuid::new_v4();
         let g = user_grant_for(sa_uid, Permission::AdminTaskInvoke, None);
         let mut sa_owned = HashSet::new();

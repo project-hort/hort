@@ -1751,6 +1751,15 @@ pub struct MinimalConfig {
     pub include_repository_label: bool,
     pub pg_statement_timeout_ms: Option<u64>,
     pub pg_acquire_timeout_secs: u64,
+    /// `HORT_TOKEN_ALLOW_ADMIN`. Carried on `MinimalConfig` because the
+    /// DB-only `admin bootstrap-session` subcommand gates on it: the
+    /// short-lived, full-cap, non-SA admin token it mints is the
+    /// DSN-gated first-admin / break-glass path, and must refuse unless
+    /// the operator has opted in (steady-state admin is IdP-backed,
+    /// OIDC → CliSession). Same env var and `false` default as the
+    /// matching `Config` field; one bool is the cheaper diff than
+    /// reading the var directly in the CLI module.
+    pub allow_admin_tokens: bool,
 }
 
 impl MinimalConfig {
@@ -1773,6 +1782,7 @@ impl MinimalConfig {
             include_repository_label: parse_bool("METRICS_INCLUDE_REPOSITORY_LABEL", true)?,
             pg_statement_timeout_ms: parse_pg_statement_timeout_ms()?,
             pg_acquire_timeout_secs: parse_pg_acquire_timeout_secs()?,
+            allow_admin_tokens: parse_bool("HORT_TOKEN_ALLOW_ADMIN", false)?,
         })
     }
 }
@@ -1787,13 +1797,17 @@ impl Config {
         // The DB-only subset is parsed via
         // `MinimalConfig::from_env` so DB-only subcommands and the
         // full serve config share one source of truth for these
-        // five fields. Behaviour for full-Config callers is unchanged.
+        // fields. Behaviour for full-Config callers is unchanged —
+        // `allow_admin_tokens` is destructured here so the serve config
+        // reuses the same parse as the `bootstrap-session` CLI path
+        // rather than re-reading `HORT_TOKEN_ALLOW_ADMIN`.
         let MinimalConfig {
             database_url,
             log_format,
             include_repository_label,
             pg_statement_timeout_ms,
             pg_acquire_timeout_secs,
+            allow_admin_tokens,
         } = MinimalConfig::from_env()?;
 
         let storage = parse_storage()?;
@@ -2231,9 +2245,12 @@ impl Config {
         let pat_lockout_threshold = parse_pat_lockout_threshold()?;
         let pat_lockout_window_secs = parse_pat_lockout_window_secs()?;
         let pat_lockout_duration_secs = parse_pat_lockout_duration_secs()?;
-        // Issuance feature flags. Both default to `false`
-        // (admin tokens off, unbounded service-account tokens off).
-        let allow_admin_tokens = parse_bool("HORT_TOKEN_ALLOW_ADMIN", false)?;
+        // Issuance feature flags. `allow_admin_tokens`
+        // (`HORT_TOKEN_ALLOW_ADMIN`) is already destructured from
+        // `MinimalConfig` above (shared with the `bootstrap-session`
+        // CLI gate). `allow_unbounded_svc_tokens` is serve-only. Both
+        // default to `false` (admin tokens off, unbounded
+        // service-account tokens off).
         let allow_unbounded_svc_tokens = parse_bool("HORT_TOKEN_ALLOW_UNBOUNDED_SVC", false)?;
 
         // Token-exchange feature flag. When false,
@@ -7720,6 +7737,9 @@ mod tests {
             ("METRICS_INCLUDE_REPOSITORY_LABEL", None),
             ("PG_STATEMENT_TIMEOUT_MS", None),
             ("PG_ACQUIRE_TIMEOUT_SECS", None),
+            // `MinimalConfig` consults this for the `bootstrap-session`
+            // gate; pin to None so it can't leak from the shell.
+            ("HORT_TOKEN_ALLOW_ADMIN", None),
             // Slots `MinimalConfig` deliberately does NOT consult —
             // setting them to None proves the parser doesn't trip on
             // their absence.
@@ -7762,6 +7782,24 @@ mod tests {
             assert_eq!(
                 cfg.pg_acquire_timeout_secs, 30,
                 "PG_ACQUIRE_TIMEOUT_SECS unset → 30 s default"
+            );
+            assert!(
+                !cfg.allow_admin_tokens,
+                "default for HORT_TOKEN_ALLOW_ADMIN is false"
+            );
+        });
+    }
+
+    #[test]
+    fn minimal_config_allow_admin_tokens_round_trips() {
+        let mut env = minimal_env_slots();
+        set_env_slot(&mut env, "DATABASE_URL", Some("postgres://x/y"));
+        set_env_slot(&mut env, "HORT_TOKEN_ALLOW_ADMIN", Some("true"));
+        temp_env::with_vars(env, || {
+            let cfg = MinimalConfig::from_env().expect("MinimalConfig parses");
+            assert!(
+                cfg.allow_admin_tokens,
+                "HORT_TOKEN_ALLOW_ADMIN=true must surface on MinimalConfig"
             );
         });
     }

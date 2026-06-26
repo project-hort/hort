@@ -47,6 +47,7 @@ Start here if you want to know **why** the system looks the way it does.
 - [Helm chart — edge overlays](how-to/deploy/examples-overlays.md)
 - [Provision the two Postgres roles](how-to/deploy/postgres-roles.md)
 - [Trust internal or corporate CAs (`extraCaBundle`)](how-to/deploy/extra-ca-bundle.md)
+- [Admin identity and the Dex bootstrap](how-to/deploy/admin-identity-and-dex.md)
 - [Security hardening checklist](how-to/deploy/security-hardening-checklist.md)
 
 ## Reference — look up exact values

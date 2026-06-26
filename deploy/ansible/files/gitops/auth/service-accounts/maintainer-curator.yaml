@@ -1,0 +1,29 @@
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: maintainer-curator
+spec:
+  # Operator "curator" identity: a maintainer who quarantine-releases /
+  # curates artifacts across the registry. The token is minted by the
+  # gitops role (`issue-svc-token --name maintainer-curator --permission
+  # curate`) and stored in the operator's secret store.
+  #
+  # Non-admin. `role: reader` + the repo set is the authority the SA
+  # envelope expresses; the CURATE authority comes from the standalone
+  # serviceAccount-subject PermissionGrant in
+  # `auth/grants/maintainer-curator-curate.yaml` (`curate` is not
+  # expressible on the SA envelope — the role confers only read/write — so
+  # the standalone grant is the only carrier of it).
+  #
+  # The SA envelope requires >= 1 repo + role in {developer, reader}; that
+  # constraint is intentional. Keep the repo list in sync with
+  # `repositories/`.
+  role: reader
+  repositories:
+    - cargo-virtual
+    - crates-proxy
+    - dockerhub-proxy
+    - quay-proxy
+    - npm-proxy
+    - hort-oci
+    - hort-crates

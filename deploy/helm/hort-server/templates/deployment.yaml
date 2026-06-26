@@ -113,9 +113,34 @@ spec:
               value: {{ .Values.auth.provider | quote }}
             {{- if eq .Values.auth.provider "oidc" }}
             - name: HORT_OIDC_ISSUER_URL
+              {{- /*
+                When auth.dex.enabled, the interactive OIDC provider points
+                at the Dex sidecar (auth.dex.issuerUrl) instead of
+                auth.oidc.issuerUrl. Human admin is then OIDC (Dex) ->
+                CliSession via the hort-admins -> admin ClaimMapping. Disable
+                auth.dex and set auth.oidc.issuerUrl to front your own SSO.
+              */}}
+              {{- if .Values.auth.dex.enabled }}
+              value: {{ .Values.auth.dex.issuerUrl | quote }}
+              {{- else }}
               value: {{ .Values.auth.oidc.issuerUrl | quote }}
+              {{- end }}
             - name: HORT_OIDC_AUDIENCE
+              {{- /*
+                When auth.dex.enabled, tokens are minted by the Dex
+                sidecar via the hort-cli device-code flow, so their `aud`
+                claim is the Dex CLI client id (auth.dex.cliClientId) —
+                NOT auth.oidc.audience. Source the audience from the Dex
+                client id to match the issuer override above (and the
+                Ansible flavor, which sets HORT_OIDC_AUDIENCE from
+                hort_dex_cli_client_id). Disable auth.dex and set
+                auth.oidc.audience to front your own SSO.
+              */}}
+              {{- if .Values.auth.dex.enabled }}
+              value: {{ .Values.auth.dex.cliClientId | quote }}
+              {{- else }}
               value: {{ .Values.auth.oidc.audience | quote }}
+              {{- end }}
             - name: HORT_OIDC_GROUPS_CLAIM
               value: {{ .Values.auth.oidc.groupsClaim | quote }}
             - name: HORT_JWKS_CACHE_TTL_SECS

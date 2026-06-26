@@ -26,7 +26,7 @@ use crate::exclusion::{parse_exclusion, validate_exclusion, ExclusionSpec};
 use crate::lint_config::{parse_lint_config, validate_lint_config, PermissionGrantLintConfigSpec};
 use crate::oidc_issuer::{parse_oidc_issuer, validate_oidc_issuer, OidcIssuerSpec};
 use crate::permission_grant::{
-    parse_permission_grant, validate_permission_grant, PermissionGrantSpec,
+    parse_permission_grant, validate_permission_grant, GrantSubjectSpec, PermissionGrantSpec,
 };
 use crate::repository::{parse_repository, validate_repository, RepositorySpec};
 use crate::retention_policy::{
@@ -618,6 +618,11 @@ fn push_init14_reference_errors(
         .iter()
         .map(|e| e.metadata.name.as_str())
         .collect();
+    let declared_service_accounts: std::collections::HashSet<&str> = state
+        .service_accounts
+        .iter()
+        .map(|e| e.metadata.name.as_str())
+        .collect();
 
     for env in &state.permission_grants {
         if let Some(repo) = env.spec.repository.as_ref() {
@@ -628,6 +633,23 @@ fn push_init14_reference_errors(
                     field: "spec.repository",
                     target_kind: Kind::ArtifactRepository,
                     missing_name: repo.clone(),
+                });
+            }
+        }
+        // A `serviceAccount` subject must name a declared
+        // `ServiceAccount` — same cross-spec resolution shape as the
+        // `spec.repository` reference above (the per-spec validator sees
+        // one envelope at a time and cannot resolve it). The apply
+        // pipeline resolves the name to the SA's backing-user UUID; a
+        // dangling name would mint nothing, so reject at apply.
+        if let GrantSubjectSpec::ServiceAccount { name } = &env.spec.subject {
+            if !name.trim().is_empty() && !declared_service_accounts.contains(name.as_str()) {
+                errors.push(ValidationError::DanglingReference {
+                    referrer_kind: Kind::PermissionGrant,
+                    referrer_name: env.metadata.name.clone(),
+                    field: "spec.subject.name",
+                    target_kind: Kind::ServiceAccount,
+                    missing_name: name.clone(),
                 });
             }
         }
@@ -1444,6 +1466,26 @@ spec:
         .into_bytes()
     }
 
+    /// A `PermissionGrant` envelope with a `serviceAccount` subject
+    /// (ADR 0037 / spec §9).
+    fn pg_sa_yaml(name: &str, sa: &str, permission: &str, repository: Option<&str>) -> Vec<u8> {
+        let repo_line = match repository {
+            Some(r) => format!("  repository: {r}\n"),
+            None => String::new(),
+        };
+        format!(
+            "apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: {name}
+spec:
+  subject: {{ kind: serviceAccount, name: {sa} }}
+  permission: {permission}
+{repo_line}"
+        )
+        .into_bytes()
+    }
+
     fn cr_yaml(name: &str) -> Vec<u8> {
         format!(
             "apiVersion: project-hort.de/v1beta1
@@ -1653,6 +1695,66 @@ spec:
             (
                 p("g.yaml"),
                 pg_yaml("g", "developer", "read", Some("npm-public")),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_catches_dangling_permission_grant_service_account_reference() {
+        // A `serviceAccount` subject must name a declared ServiceAccount;
+        // a missing name dangles, mirroring the repository-reference check.
+        let files = vec![(p("g.yaml"), pg_sa_yaml("g", "ghost-sa", "read", None))];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        assert!(err.0.iter().any(|e| matches!(
+            e,
+            ValidationError::DanglingReference {
+                referrer_kind: Kind::PermissionGrant,
+                target_kind: Kind::ServiceAccount,
+                field,
+                missing_name, ..
+            } if missing_name == "ghost-sa" && *field == "spec.subject.name"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_global_service_account_grant_with_declared_sa() {
+        // The headline operator path: a declared SA + a standalone GLOBAL
+        // (`repository: None`) serviceAccount grant — the way to express
+        // global read / curate / admin_task_invoke for an SA.
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-public", "hosted", None)),
+            (p("sa.yaml"), sa_yaml("maintainer-dev", "npm-public", None)),
+            (
+                p("g.yaml"),
+                pg_sa_yaml("maintainer-dev-global-read", "maintainer-dev", "read", None),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        assert!(
+            state.validate().is_ok(),
+            "a global serviceAccount grant referencing a declared SA must validate"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_repo_scoped_service_account_curate_grant() {
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("oci-prod", "hosted", None)),
+            (
+                p("sa.yaml"),
+                sa_yaml("maintainer-curator", "oci-prod", None),
+            ),
+            (
+                p("g.yaml"),
+                pg_sa_yaml(
+                    "curator-grant",
+                    "maintainer-curator",
+                    "curate",
+                    Some("oci-prod"),
+                ),
             ),
         ];
         let state = DesiredState::parse_files(files).unwrap();

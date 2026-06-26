@@ -1,0 +1,32 @@
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: maintainer-dev
+spec:
+  # Operator "developer" identity: a maintainer's day-to-day read access
+  # across every first-party + proxy repo on registry.hort.rs. The token
+  # is minted by the gitops role (`issue-svc-token --name maintainer-dev
+  # --permission read`) and stored in the operator's secret store.
+  #
+  # This SA is non-admin. `role: reader` + the repo set below is the
+  # authority the SA envelope itself expresses; the READ authority is
+  # supplied by the standalone serviceAccount-subject PermissionGrant in
+  # `auth/grants/maintainer-dev-read.yaml`. The SA holds no `is_admin`
+  # bit (`issue-svc-token` rejects `--permission=admin`); human admin is
+  # OIDC (Dex) -> CliSession, not a static SA token.
+  #
+  # The SA envelope requires >= 1 repo + role in {developer, reader}; that
+  # constraint is intentional. The repo list mirrors the declared
+  # repositories under `repositories/` — keep the two in sync.
+  role: reader
+  repositories:
+    - cargo-virtual
+    - crates-proxy
+    - dockerhub-proxy
+    - quay-proxy
+    - npm-proxy
+    - hort-oci
+    - hort-crates
+  # No federatedIdentities / fallbackRotation: this is a PAT-only SA whose
+  # token the gitops role mints via `issue-svc-token`. CI federation lives
+  # on the gha-ci / gha-release / gitlab-ci SAs instead.

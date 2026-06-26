@@ -1,0 +1,26 @@
+# PermissionGrant: [reader, ci-reader] -> read oci-private-e2e
+#
+# The capability-token private-pull regression
+# (scripts/native-tests/scenarios/clients/oci-private-pull.sh): a NON-ADMIN
+# reader (reader-user, group hort-readers -> [reader, ci-reader]) holds an
+# explicit, repo-scoped Read grant on the PRIVATE oci-private-e2e repo. This is
+# the only authority that lets the OCI /v2/auth mint return a populated access[]
+# for that repo (it is isPublic: false, so an anonymous or unauthorized caller
+# gets an empty access[] and the pull is denied). Proves the capability-token
+# model works for a non-admin claims-subject reader (an OIDC user whose resolved
+# claims match this grant — this is a claims subject, NOT a serviceAccount
+# subject) on a private repo — the gha-ci shape the suite never drove.
+#
+# Per-repo scoped + two-claim subject: clears both the single-claim-grant and
+# wildcard-repo-non-admin linter rules (both reject by secure default).
+# Rationale for the second claim: see ci-readers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: reader-read-oci-private-e2e
+spec:
+  subject:
+    kind: claims
+    required: [reader, ci-reader]
+  permission: read
+  repository: oci-private-e2e

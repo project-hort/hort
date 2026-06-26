@@ -1,0 +1,93 @@
+{{/*
+Dex IdP Deployment — the example/dogfood minimal OIDC IdP sidecar.
+Renders ONLY when `auth.dex.enabled` is true (default false).
+
+Single-replica, memory-storage Dex. The recommended minimal IdP for the
+dogfood / reference deploy; for production front your real SSO (Dex can
+proxy it, or point HORT_OIDC_ISSUER_URL straight at it and disable this
+sidecar). hort-server's HORT_OIDC_ISSUER_URL is wired to this Service when
+auth.dex.enabled (see deployment.yaml).
+
+The bcrypt admin password hash comes from the
+auth.dex.staticAdmin.passwordHashSecret k8s Secret (key
+passwordHashSecretKey) and is exposed to Dex as DEX_ADMIN_PASSWORD_HASH;
+config.yaml references it via hashFromEnv + DEX_EXPAND_ENV.
+*/}}
+{{- if .Values.auth.dex.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hort-server.fullname" . }}-dex
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/component: dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
+      hort-server.io/component: dex
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.selectorLabels" . | nindent 8 }}
+        hort-server.io/component: dex
+      annotations:
+        # Roll the Dex pod when its config changes.
+        checksum/dex-config: {{ include (print $.Template.BasePath "/dex-configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: dex
+          image: {{ .Values.auth.dex.image | quote }}
+          imagePullPolicy: {{ .Values.auth.dex.imagePullPolicy }}
+          args:
+            - dex
+            - serve
+            - /etc/dex/config.yaml
+          env:
+            # Let Dex expand $DEX_ADMIN_PASSWORD_HASH (hashFromEnv) in config.
+            - name: DEX_EXPAND_ENV
+              value: "true"
+            - name: DEX_ADMIN_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.dex.staticAdmin.passwordHashSecret | quote }}
+                  key: {{ .Values.auth.dex.staticAdmin.passwordHashSecretKey | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.auth.dex.containerPort }}
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.auth.dex.resources | nindent 12 }}
+          volumeMounts:
+            - name: dex-config
+              mountPath: /etc/dex
+              readOnly: true
+      volumes:
+        - name: dex-config
+          configMap:
+            name: {{ include "hort-server.fullname" . }}-dex
+            items:
+              - key: config.yaml
+                path: config.yaml
+{{- end }}

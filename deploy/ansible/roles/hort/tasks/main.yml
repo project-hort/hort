@@ -135,6 +135,47 @@
     mode: "0644"
   notify: Reload systemd user daemon
 
+# ── Dex IdP sidecar (optional) ────────────────────────────────────────────────
+# Rendered + started only when hort_dex_enabled. The hort-server env-file
+# switches HORT_AUTH_PROVIDER=oidc + HORT_OIDC_ISSUER_URL=<Dex> in the same
+# condition (see hort-server.env.j2).
+
+- name: Ensure Dex config directory exists
+  ansible.builtin.file:
+    path: "{{ hort_dex_config_dir }}"
+    state: directory
+    owner: "{{ hort_uid }}"
+    group: "{{ hort_gid }}"
+    mode: "0750"
+  when: hort_dex_enabled | bool
+
+- name: Render Dex config
+  ansible.builtin.template:
+    src: dex-config.yaml.j2
+    dest: "{{ hort_dex_config_dir }}/config.yaml"
+    owner: "{{ hort_uid }}"
+    group: "{{ hort_gid }}"
+    mode: "0640"
+  when: hort_dex_enabled | bool
+  notify: Reload systemd user daemon
+
+- name: Install dex.container Quadlet unit
+  ansible.builtin.template:
+    src: dex.container.j2
+    dest: "{{ hort_quadlet_dir }}/dex.container"
+    owner: "{{ hort_user }}"
+    group: "{{ hort_user }}"
+    mode: "0644"
+  when: hort_dex_enabled | bool
+  notify: Reload systemd user daemon
+
+- name: Remove dex.container Quadlet unit when Dex is disabled
+  ansible.builtin.file:
+    path: "{{ hort_quadlet_dir }}/dex.container"
+    state: absent
+  when: not (hort_dex_enabled | bool)
+  notify: Reload systemd user daemon
+
 # ── Flush handlers before enabling units ─────────────────────────────────────
 # daemon-reload must complete before systemctl enable --now so that systemd
 # sees the freshly generated unit files.
@@ -154,6 +195,18 @@
     scope: user
   become: true
   become_user: "{{ hort_user }}"
+
+# Dex must be up before hort-server so the OIDC discovery / JWKS fetch at boot
+# succeeds when HORT_AUTH_PROVIDER=oidc points at Dex.
+- name: Enable and start dex container
+  ansible.builtin.systemd:
+    name: dex
+    state: started
+    enabled: true
+    scope: user
+  become: true
+  become_user: "{{ hort_user }}"
+  when: hort_dex_enabled | bool
 
 - name: Enable and start hort-server container
   ansible.builtin.systemd:

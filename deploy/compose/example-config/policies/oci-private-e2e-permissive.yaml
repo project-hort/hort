@@ -1,0 +1,18 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: oci-private-e2e-permissive
+spec:
+  # Per-repo operator opt-out of quarantine-by-default, mirroring
+  # oci-e2e-permissive.yaml — the private-pull regression
+  # (scripts/native-tests/scenarios/clients/oci-private-pull.sh) pushes an image
+  # and immediately pulls it back, so the quarantine 503 (Retry-After) must not
+  # block the pull.
+  scope:
+    repository: oci-private-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

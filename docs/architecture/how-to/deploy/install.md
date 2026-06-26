@@ -372,9 +372,11 @@ and the producer surface was retired with it. The no-IdP path
 is `auth.provider: disabled` + `auth.nativeTokens.enabled: true`:
 the composition root wires `AuthContext::BearerOnly` and the only
 inbound identity surface is the native-token validator
-(`Bearer hort_<kind>_*`). Operators bootstrap a workstation token via
-the `hort-server admin issue-svc-token` CLI and consume it with
-`hort-cli auth login --paste`.
+(`Bearer hort_<kind>_*`). Operators bootstrap the first admin via the
+DSN-gated `hort-server admin bootstrap-session` CLI (admin is not a
+service-account capability — ADR 0038) and mint the non-admin
+operator / CI / cron svc-tokens with `hort-server admin issue-svc-token`,
+consuming both with `hort-cli auth login --paste`.
 
 This path is operationally functional but locks all admin work to
 paste-token CLI — there is no browser-driven SSO flow. Migrate to
@@ -438,29 +440,36 @@ helm install hort oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server \
   -f values-noidc.yaml
 ```
 
-**Bootstrap the workstation operator token.** The chart's
-`NOTES.txt` reminds you of this; here it is for reference:
+**Bootstrap the first admin (`bootstrap-session`).** Admin is **not** a
+service-account capability — `issue-svc-token` rejects `--permission=admin`
+(ADR 0038). The no-IdP / first-admin / break-glass admin path is the DSN-gated
+`bootstrap-session`, which mints a short-lived (≤ 1 h) non-service-account admin
+token. It is **doubly gated**: it needs operator-level Postgres (DSN) access
+**and** `HORT_TOKEN_ALLOW_ADMIN=true` (an issuance-time gate read by the CLI;
+the running server does not need it set).
 
 ```bash
-kubectl -n hort exec -it deploy/hort-server -- \
-    hort-server admin issue-svc-token \
-        --name=ops \
-        --permission=admin \
-        --output=stdout
-# → hort_svc_<48-chars>
+kubectl -n hort exec -it deploy/hort-server -- env HORT_TOKEN_ALLOW_ADMIN=true \
+    hort-server admin bootstrap-session --ttl 1h
+# → hort_pat_<…>  (a short-lived admin token for the reserved
+#                  non-SA `bootstrap-admin` user)
 
 # On the operator's workstation:
 hort-cli auth login --paste --server https://hort.internal.example
-# Paste the hort_svc_… at the prompt. The token is stored in the
+# Paste the token at the prompt. The token is stored in the
 # workstation's keyring (or ~/.config/hort-cli/config.toml when no
 # keyring is available).
 ```
 
-The `admin issue-svc-token` command is **DSN-authorised** — it needs
-operator-level Postgres access (which the in-pod execution has via
-the admin DSN), not a caller-principal Bearer token. No HTTP, no
-authentication. Idempotent on re-run; pass `--rotate` to force a
-fresh value.
+The command is **DSN-authorised** — it needs operator-level Postgres access
+(which the in-pod execution has via the admin DSN), not a caller-principal
+Bearer token. No HTTP, no authentication. It revokes any prior bootstrap token
+first (single active token). Use it only to bootstrap (and, on the no-IdP path,
+to mint the non-admin operator/CI/cron svc-tokens below); for a team, wire an
+IdP and switch to the steady-state human-admin path. The full recipe — both the
+bootstrap-session and the IdP path, with the Dex `groups`-claim caveat — is in
+[`admin-identity-and-dex.md`](admin-identity-and-dex.md) (standing decision:
+ADR 0038).
 
 **Cron-job and publishing-pipeline tokens** follow the same minting
 pattern but with different caps (`admin_task_invoke` for cron jobs,

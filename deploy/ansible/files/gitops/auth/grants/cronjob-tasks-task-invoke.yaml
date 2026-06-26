@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: cronjob-tasks-task-invoke
+spec:
+  # Standalone serviceAccount-subject grant. Resolves at apply to
+  # GrantSubject::User(<cronjob-tasks backing user>), so the cronjob-tasks
+  # SA can enqueue non-destructive admin tasks without admin.
+  # `admin_task_invoke` is the narrow "may enqueue an admin task" cap, not
+  # the `admin` bit, and is not expressible on the SA envelope — this
+  # standalone grant is the sole carrier.
+  #
+  # This does not confer the `task:destructive` claim, so the cronjob-tasks
+  # token cannot run retention-evaluate / retention-purge / eventstore-archive
+  # (those need admin_task_invoke AND task:destructive). Destructive
+  # housekeeping requires a fresh admin session instead.
+  subject:
+    kind: serviceAccount
+    name: cronjob-tasks
+  permission: admin_task_invoke
+  # No `repository:` -> global admin_task_invoke (task invocation is a
+  # global capability, not per-repo).

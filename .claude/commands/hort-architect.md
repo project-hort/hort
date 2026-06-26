@@ -632,12 +632,15 @@ Read these before making architectural decisions:
 | `docs/adr/0013-cli-session-lifetime.md` | CLI session lifetime: ≤1 h admin cap; short-lived full-authority tokens with refresh |
 | `docs/adr/0015-apply-time-linter-inert-fields-and-naming.md` | Apply-time rejection of inert policy fields and misleading config names |
 | `docs/adr/0016-cross-opt-in-interaction-matrix.md` | Cross-opt-in interaction matrix for release-gate-influencing knobs |
-| `docs/adr/0018-machine-identity-and-jwks.md` | Machine identity / JWKS rules: TLS-verified JWKS fetch, `ServiceAccount` non-empty claims |
+| `docs/adr/0018-auth-catalog-canonical.md` | The authentication catalog (`docs/auth-catalog.md`) is canonical: every inbound auth mechanism + inbound-gating trust anchor has exactly one schema-complete entry; TLS-verified JWKS fetch + `ServiceAccount` non-empty-claims rules live in the catalog entries |
 | `docs/adr/0020-seal-pool-single-flight.md` | Seal-pool single-flight backstop for `seal_and_remove` |
 | `docs/adr/0025-state-precondition-409.md` | `409 Conflict` for state-precondition failures (admin release on rejected/released artifact) |
 | `docs/adr/0026-streaming-metadata-projection.md` | Streaming metadata projection (no whole-body buffering on pull-through) |
 | `docs/adr/0027-artifact-provenance-verification.md` | Artifact provenance verification (Sigstore/cosign, offline, policy-gated) |
 | `docs/adr/0028-destructive-task-idempotency.md` | Durable per-UTC-day idempotency key for destructive task kinds |
+| `docs/adr/0036-oci-auth-capability-token.md` | OCI `/v2/auth` is a per-identity capability token: authority = `User`-subject grants ∩ cap, no ambient admin; the B1 fail-closed Pat/SA cap backstop (OIDC/CliSession `None`-cap untouched); admin off the OCI surface |
+| `docs/adr/0037-gitops-service-account-grant.md` | gitops `PermissionGrant` may target a ServiceAccount by name: `GrantSubjectSpec::ServiceAccount { name }` resolves at apply to `GrantSubject::User(backing_user_id)`; domain `GrantSubject` taxonomy unchanged (ADR 0012 not reopened) |
+| `docs/adr/0038-admin-identity-model.md` | Admin-identity model: human admin is IdP-assumed (OIDC → CliSession via a group→`admin` ClaimMapping); service accounts strictly non-admin (`issue-svc-token` rejects `--permission=admin`); the DSN-gated `bootstrap-session` is the only no-IdP/first-admin admin path; `task:destructive`-as-claim kept; Dex `staticPasswords` emit no `groups` |
 | `docs/architecture/how-to/add-a-format-handler.md` | Step-by-step guide for creating a new `hort-http-<format>` crate + the `hort-formats::<format>` domain handler that pairs with it |
 | `docs/architecture/how-to/declare-gitops-config.md` | Gitops config: `upstream_name_prefix`, curation, upstream mappings, claim-based grants |
 | `docs/metrics-catalog.md` | **Canonical** metrics catalog: every metric name, labels, units, `result` values. No metric emission without a matching entry here. See `## Metrics` section above. |

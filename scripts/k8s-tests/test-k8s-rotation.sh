@@ -393,87 +393,54 @@ kubectl -n "${NAMESPACE}" create secret generic hort-postgres-admin \
     --from-literal=DATABASE_URL='postgres://hort:hort-smoke-test@postgres:5432/hort' \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# -- Admin bootstrap (pre-helm) ----------------------------------------
+# -- Dex IdP admin-password Secret (pre-helm) --------------------------
 #
-# `hort-server` refuses to boot under `HORT_AUTH_PROVIDER=disabled`
-# UNLESS at least one local admin row exists. We provision that row
-# up-front via a one-shot Job calling
-# `hort-server admin bootstrap` against the admin DSN. The same binary's
-# bootstrap subcommand also applies migrations as part of its boot
-# sequence — the chart's own pre-install migrate Job re-runs the same
-# `sqlx::migrate!().run()` idempotently moments later, which is a no-op
-# once everything is current.
+# The IdP is Dex (the chart's optional sidecar), not the retired no-IdP
+# `HORT_AUTH_PROVIDER=disabled` + local-admin-bootstrap path (the
+# `admin bootstrap` CLI is retired; steady-state human admin is OIDC ->
+# CliSession). Dex's staticPasswords admin needs a bcrypt password hash,
+# supplied via this k8s Secret (referenced from the Helm values'
+# auth.dex.staticAdmin.passwordHashSecret). The chart does NOT generate it.
 #
-# `admin bootstrap` is itself idempotent (`UserUseCase::create_or_rotate_admin`
-# upserts on `username`) — re-running the smoke after a partial failure
-# rotates the password rather than blowing up. The pinned password
-# below is smoke-only; the e2e doesn't exercise inbound auth.
+# NOTE (groups caveat — not exercised here): Dex's staticPasswords DB does
+# not attach `groups` to the issued token, so this static admin does NOT
+# resolve the hort-admins -> admin ClaimMapping. That is fine for THIS
+# smoke: the rotation CronJob authenticates with a native `hort_svc_*`
+# token (nativeTokens, below), not an admin OIDC token — Dex's role here is
+# only to satisfy the OIDC boot contract with a real IdP. A
+# group-bearing admin needs a group-capable connector (LDAP / mock); see
+# the compose tier / docs/plans for the worked example.
 #
-# The password is supplied via a mounted Secret file (`--password-file`)
-# rather than piped to stdin. The runtime image is distroless (no
-# `/bin/sh`), so the previous `cat … | hort-server …` shape couldn't
-# start — the kubelet failed the container before the Job's pods
-# produced logs. The file path is in argv (visible to `kubectl
-# describe`); the password itself is not.
-ADMIN_BOOTSTRAP_PASSWORD="${ADMIN_BOOTSTRAP_PASSWORD:-smoke-admin-password}"
-echo "==> Bootstrapping the local admin user (escape hatch for HORT_AUTH_PROVIDER=disabled)..."
-kubectl -n "${NAMESPACE}" create secret generic hort-admin-bootstrap-credentials \
-    --from-literal=password="${ADMIN_BOOTSTRAP_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-
-# Delete any prior Job (Job specs are immutable, and the smoke is
-# expected to be re-runnable).
-kubectl -n "${NAMESPACE}" delete job hort-admin-bootstrap --ignore-not-found=true >/dev/null
-
-kubectl -n "${NAMESPACE}" apply -f - <<EOF >/dev/null
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: hort-admin-bootstrap
-spec:
-  backoffLimit: 1
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: bootstrap
-          image: ${HORT_SERVER_IMAGE_REPO}:${HORT_SERVER_IMAGE_TAG}
-          imagePullPolicy: Never
-          # No command override: the image's ENTRYPOINT is
-          # /usr/local/bin/hort-server. The runtime image is distroless
-          # (no shell), so args go straight to hort-server.
-          args:
-            - admin
-            - bootstrap
-            - --username
-            - admin
-            - --password-file
-            - /etc/hort-admin-bootstrap/password
-          env:
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: hort-postgres-admin
-                  key: DATABASE_URL
-          volumeMounts:
-            - name: credentials
-              mountPath: /etc/hort-admin-bootstrap
-              readOnly: true
-      volumes:
-        - name: credentials
-          secret:
-            secretName: hort-admin-bootstrap-credentials
-EOF
-
-echo "    waiting for hort-admin-bootstrap Job to complete..."
-if ! kubectl -n "${NAMESPACE}" wait --for=condition=complete \
-        --timeout=120s job/hort-admin-bootstrap >/dev/null; then
-    echo "FAIL: hort-admin-bootstrap Job did not complete within 120s."
-    kubectl -n "${NAMESPACE}" describe job hort-admin-bootstrap || true
-    kubectl -n "${NAMESPACE}" logs --tail=200 -l job-name=hort-admin-bootstrap --all-containers || true
-    exit 1
+# bcrypt hash of the smoke admin password (pinned, smoke-only). Computed in
+# the cluster-independent way `htpasswd` would, but without requiring
+# htpasswd on the host: python's bcrypt if present, else a known-good hash
+# for the pinned password.
+DEX_ADMIN_PASSWORD="${DEX_ADMIN_PASSWORD:-smoke-admin-password}"
+echo "==> Creating the Dex admin-password Secret (OIDC IdP)..."
+DEX_ADMIN_HASH="$(python3 - "$DEX_ADMIN_PASSWORD" <<'PY' 2>/dev/null || true
+import sys
+try:
+    import bcrypt
+    print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(rounds=10)).decode())
+except Exception:
+    pass
+PY
+)"
+if [ -z "$DEX_ADMIN_HASH" ]; then
+    # Fallback: a precomputed bcrypt hash of "smoke-admin-password" (cost 10).
+    # Only valid when DEX_ADMIN_PASSWORD is left at its default; a custom
+    # password requires python-bcrypt (or htpasswd) on the host.
+    if [ "$DEX_ADMIN_PASSWORD" != "smoke-admin-password" ]; then
+        echo "MISSING: python3 'bcrypt' needed to hash a custom DEX_ADMIN_PASSWORD." >&2
+        echo "Install it (pip install bcrypt) or leave DEX_ADMIN_PASSWORD unset." >&2
+        exit 2
+    fi
+    DEX_ADMIN_HASH='$2b$10$ZFx4vf73x.yQgM2JA8f/cOZuU3A1NnLywsbaU0Y69kjsmGaYIvlKu'
 fi
-echo "    admin user provisioned (username=admin)."
+kubectl -n "${NAMESPACE}" create secret generic hort-dex-admin \
+    --from-literal=passwordHash="${DEX_ADMIN_HASH}" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+echo "    Dex admin-password Secret hort-dex-admin created/updated."
 
 # -- OCI / native-token signing key ----
 #
@@ -539,16 +506,33 @@ postgres:
     existingSecret: hort-postgres-admin
     secretKey: DATABASE_URL
 
-# Auth: provider=disabled (no OIDC IdP for the smoke) but with the
-# native-token validator wired so the rotation CronJob's
-# \`Bearer hort_svc_*\` token can authenticate. Admin endpoints are
-# reachable via HTTP Basic against the local admin row AND/OR Bearer
-# against the native-token validator. The pre-helm bootstrap Job
-# provisions the local admin row; the native-token validator wires
-# when nativeTokens.enabled=true with a signing key (the operator-side
-# \`hort-oci-signing-key\` Secret generated above).
+# Auth: provider=oidc with the chart's optional Dex IdP sidecar (the
+# recommended shape — OIDC, not the retired no-IdP disabled+local-admin
+# path). The chart wires HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl, which
+# here is the in-cluster Dex Service (the Dex discovery doc advertises the
+# same host for both iss and jwks_uri, satisfying hort-server's same-host
+# JWKS binding). The rotation CronJob still authenticates with a native
+# \`Bearer hort_svc_*\` token (nativeTokens, below) — Dex's role is only to
+# satisfy the OIDC boot contract with a real IdP; this smoke does not need
+# an admin OIDC token (and Dex's staticPasswords admin would not carry the
+# hort-admins group anyway — see the hort-dex-admin Secret note above).
 auth:
-  provider: disabled
+  provider: oidc
+  oidc:
+    # Overridden by auth.dex.issuerUrl when dex.enabled (the chart points
+    # HORT_OIDC_ISSUER_URL at Dex); kept non-empty for schema validity.
+    issuerUrl: "http://hort-server-dex.${NAMESPACE}.svc.cluster.local:5556/dex"
+    audience: "hort-server"
+    groupsClaim: "groups"
+  dex:
+    enabled: true
+    # In-cluster Dex Service URL — reachable from the hort-server pod, and
+    # the iss/JWKS host hort-server validates against.
+    issuerUrl: "http://hort-server-dex.${NAMESPACE}.svc.cluster.local:5556/dex"
+    adminGroup: "hort-admins"
+    staticAdmin:
+      passwordHashSecret: "hort-dex-admin"
+      passwordHashSecretKey: "passwordHash"
   nativeTokens:
     enabled: true
     signingKey:

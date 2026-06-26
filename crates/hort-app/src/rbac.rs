@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use hort_domain::entities::api_token::{cap_allows_optional_repo, TokenCap};
+use hort_domain::entities::api_token::{cap_allows_optional_repo, TokenCap, TokenKind};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::{ClaimMapping, GrantSubject, Permission, PermissionGrant};
 
@@ -208,6 +208,19 @@ impl RbacEvaluator {
         // DB metadata kept in sync with the synthetic `admin` claim by
         // construction.
         if principal.claims.iter().any(|c| c == "admin") {
+            // B1 (ADR 0036): a cap-bound native token (Pat/ServiceAccount) carrying
+            // the admin claim MUST also carry a cap — `authenticate_pat` always
+            // constructs `Some(cap)`. A `None` cap here is an anomalous construction;
+            // fail closed rather than grant unfenced admin. OIDC (token_kind:None) and
+            // CliSession (token_kind:Some(CliSession)) legitimately carry a `None` cap
+            // and are full-authority by design — they are deliberately NOT guarded.
+            if matches!(
+                principal.token_kind,
+                Some(TokenKind::Pat) | Some(TokenKind::ServiceAccount)
+            ) && principal.token_cap.is_none()
+            {
+                return false;
+            }
             return true;
         }
 
@@ -687,6 +700,19 @@ mod tests {
         p
     }
 
+    /// Same as [`principal`] but with explicit `token_kind` / `token_cap`,
+    /// for the B1 cap-backstop tests (ADR 0036).
+    fn principal_kind_cap(
+        claims: &[&str],
+        kind: Option<TokenKind>,
+        token_cap: Option<TokenCap>,
+    ) -> CallerPrincipal {
+        let mut p = principal(claims);
+        p.token_kind = kind;
+        p.token_cap = token_cap;
+        p
+    }
+
     fn cap(perms: Vec<Permission>, repos: Option<Vec<Uuid>>) -> TokenCap {
         TokenCap {
             permissions: perms,
@@ -765,6 +791,87 @@ mod tests {
             assert!(!eval.authorize(&p, perm, None));
             assert!(!eval.authorize(&p, perm, Some(Uuid::new_v4())));
         }
+    }
+
+    // -- authorize: B1 fail-closed cap backstop (ADR 0036) -----------------
+
+    #[test]
+    fn b1_admin_claim_pat_with_none_cap_is_denied() {
+        // A cap-bound native token (Pat) carrying the admin claim but no cap
+        // is an anomalous construction — `authenticate_pat` always builds
+        // `Some(cap)`. The backstop fails closed.
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_kind_cap(&["admin"], Some(TokenKind::Pat), None);
+        assert!(!eval.authorize(&p, Permission::Write, None));
+        assert!(!eval.authorize(&p, Permission::Read, Some(Uuid::new_v4())));
+    }
+
+    #[test]
+    fn b1_admin_claim_service_account_with_none_cap_is_denied() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_kind_cap(&["admin"], Some(TokenKind::ServiceAccount), None);
+        assert!(!eval.authorize(&p, Permission::Write, None));
+        assert!(!eval.authorize(&p, Permission::Read, Some(Uuid::new_v4())));
+    }
+
+    #[test]
+    fn b1_admin_claim_oidc_none_kind_with_none_cap_is_authorized() {
+        // LOAD-BEARING SAFETY: an OIDC bearer admin (token_kind = None)
+        // legitimately carries a `None` cap and is full-authority by design.
+        // The backstop must NOT deny it.
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_kind_cap(&["admin"], None, None);
+        for perm in [
+            Permission::Read,
+            Permission::Write,
+            Permission::Delete,
+            Permission::Admin,
+        ] {
+            assert!(
+                eval.authorize(&p, perm, None),
+                "OIDC admin denied for {perm:?}"
+            );
+            assert!(
+                eval.authorize(&p, perm, Some(Uuid::new_v4())),
+                "OIDC admin denied for {perm:?} with repo"
+            );
+        }
+    }
+
+    #[test]
+    fn b1_admin_claim_cli_session_with_none_cap_is_authorized() {
+        // LOAD-BEARING SAFETY: a CliSession admin (token_kind = Some(CliSession))
+        // legitimately carries a `None` cap (authority = claims + live grants,
+        // no cap leg). The backstop must NOT deny it.
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_kind_cap(&["admin"], Some(TokenKind::CliSession), None);
+        for perm in [
+            Permission::Read,
+            Permission::Write,
+            Permission::Delete,
+            Permission::Admin,
+        ] {
+            assert!(
+                eval.authorize(&p, perm, None),
+                "CliSession admin denied for {perm:?}"
+            );
+            assert!(
+                eval.authorize(&p, perm, Some(Uuid::new_v4())),
+                "CliSession admin denied for {perm:?} with repo"
+            );
+        }
+    }
+
+    #[test]
+    fn b1_admin_claim_pat_with_some_cap_still_authorized() {
+        // The short-circuit still grants when the Pat carries a cap; the cap
+        // then clips at the `authorize` AND. With a permissive cap (the
+        // requested permission present, no repo restriction) the AND passes.
+        let eval = RbacEvaluator::new(Vec::new());
+        let token_cap = cap(vec![Permission::Write, Permission::Read], None);
+        let p = principal_kind_cap(&["admin"], Some(TokenKind::Pat), Some(token_cap));
+        assert!(eval.authorize(&p, Permission::Write, None));
+        assert!(eval.authorize(&p, Permission::Read, Some(Uuid::new_v4())));
     }
 
     // -- authorize: GrantSubject::Claims arm -------------------------------

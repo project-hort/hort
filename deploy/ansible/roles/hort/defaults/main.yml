@@ -20,3 +20,26 @@ hort_postgres_data_dir: /var/lib/hort/postgres-data
 # bind-mounted read-only into the hort-server container.
 hort_oci_key_dir: /var/lib/hort/keys
 hort_oci_signing_key_container_path: /etc/hort/keys/oci-signing.pem
+
+# ── Dex IdP sidecar — podman-container-specific defaults ──────────────────────
+# The shared Dex toggle + issuer/client/group vars live in group_vars/all.yml
+# (both flavors read them). These are the podman-flavor container specifics.
+
+# Dex container image (pin to a digest in production).
+hort_dex_image: ghcr.io/dexidp/dex:v2.41.1
+
+# Dex listener port inside the hort network (not published to the host; nginx
+# proxies the issuer path to it).
+hort_dex_port: 5556
+
+# Static bootstrap admin identity rendered into the Dex config (dogfood
+# convenience). The bcrypt password hash is a SECRET — set
+# hort_dex_admin_password_hash in group_vars/production/vault.yml (generate with:
+# htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n' | sed 's/$2y/$2a/').
+hort_dex_admin_email: "admin@{{ registry_fqdn }}"
+hort_dex_admin_username: admin
+hort_dex_admin_user_id: hort-bootstrap-admin
+
+# Host directory for the rendered Dex config (mounted read-only into the
+# container).
+hort_dex_config_dir: /var/lib/hort/dex

@@ -7,9 +7,25 @@
 # is to restart the server — there is NO `admin bootstrap` subcommand and NO
 # `apply` CLI.  The apply-time linter is the audited validation gate.
 #
+# APPLY-BEFORE-MINT SEQUENCING:
+#   `issue-svc-token` requires a pre-existing gitops ServiceAccount of the
+#   same name (a non-admin svc-token has no standing privilege of its own —
+#   its authority comes from the SA's gitops grants). So the gitops tree (which
+#   declares the maintainer-dev / maintainer-curator SAs + their standalone
+#   serviceAccount-subject PermissionGrants under auth/) must be synced AND
+#   applied (server restart -> boot apply) BEFORE the token-mint tasks run.
+#   The task ordering below enforces this: sync tree -> flush_handlers
+#   (restart -> boot apply) -> issue-svc-token. Do NOT reorder the mint tasks
+#   above the `flush_handlers` step.
+#
+#   These tokens are non-admin: `issue-svc-token` rejects `--permission=admin`.
+#   Human admin is OIDC (Dex) -> CliSession, not a static SA token — see the
+#   Dex sidecar (roles/hort, hort_dex_enabled) + auth/admins.yaml
+#   (hort-admins -> admin ClaimMapping).
+#
 # Token minting:
-#   hort-svc-maintainer-dev     — read permission  → /run/secrets/hort-dev.token
-#   hort-svc-maintainer-curator — curate permission → /run/secrets/hort-curator.token
+#   maintainer-dev     — read permission  → /run/secrets/hort-dev.token
+#   maintainer-curator — curate permission → /run/secrets/hort-curator.token
 #
 #   Both tokens are idempotent (exit 0, no reissue) unless --rotate is passed.
 #   Tokens must be stored in Ansible Vault / the maintainer's secret store after
@@ -156,10 +172,28 @@
 - name: Flush handlers (restart hort-server to trigger boot-time apply)
   ansible.builtin.meta: flush_handlers
 
+# Apply-before-mint gate: the boot apply runs to completion BEFORE hort-server
+# binds its API listener (it reads every *.yaml under HORT_CONFIG_DIR first),
+# so a reachable listener is the signal that the maintainer-dev /
+# maintainer-curator ServiceAccounts exist in the DB. `issue-svc-token`
+# requires that pre-existing SA — minting before the listener is up races the
+# apply and fails with "service account not found". Wait for the local API high
+# port before any mint task runs.
+- name: Wait for hort-server boot apply to complete (API listener reachable)
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ hort_api_port }}"
+    delay: 2
+    timeout: 120
+
 # ── Operator service-account tokens ──────────────────────────────────────────
 # Mint tokens for the two operator service accounts.  Both invocations are
 # idempotent: if the named token already exists the command exits 0 without
 # rotation.  Pass --rotate to replace an existing token.
+#
+# These tokens are non-admin (read / curate). `issue-svc-token` rejects
+# `--permission=admin` and requires the matching gitops SA to already exist
+# (declared under files/gitops/auth/service-accounts/, applied above).
 #
 # Tokens are written to /run/secrets/ (tmpfs, cleared on reboot) and must be
 # retrieved from there and stored in Ansible Vault / the operator's secret

@@ -1,0 +1,16 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: maintainer-dev-read
+spec:
+  # Standalone serviceAccount-subject grant. Resolves at apply to
+  # GrantSubject::User(<maintainer-dev backing user>), so the maintainer-dev
+  # SA — which holds no is_admin bit — gets global READ without relying on
+  # admin.
+  subject:
+    kind: serviceAccount
+    name: maintainer-dev
+  permission: read
+  # No `repository:` -> global read across every repo. The maintainer-dev
+  # SA envelope already enumerates the repos for the role; this global grant
+  # keeps the operator's day-to-day pull working without per-repo upkeep.
