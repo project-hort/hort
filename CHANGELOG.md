@@ -57,6 +57,26 @@ is reworked into a per-identity **capability token**, service accounts are made
 - **`HORT_TRUSTED_PROXY_CIDRS`** is set in the deployment so `hort-server` observes
   the real client IP behind the edge (nginx) proxy.
 
+### Fixed
+
+- **`issue-svc-token` could not find a gitops-declared service account**
+  (`0.9.5-beta.2`). `svc_username` looked up `hort-svc-<name>` while a gitops
+  `ServiceAccount` apply creates its backing user as `sa:<name>`, so the
+  "requires a pre-existing gitops ServiceAccount" mint flow — the Ansible
+  `maintainer-dev`/`maintainer-curator` tokens and the Helm `cronjob-tasks` token
+  — was non-functional in `0.9.5-beta.1`. The convention is now single-sourced as
+  `hort_domain::entities::service_account::backing_username` and every
+  construct/parse site (CLI lookup, gitops apply, auth parse, k8s payload) routes
+  through it, guarded by a cross-convention test.
+- **Server parked (registry served `503`) when the IdP was disabled**
+  (`0.9.5-beta.2`). The Ansible gitops tree shipped the `admins` `ClaimMapping`
+  unconditionally, but the native/podman flavors default
+  `HORT_AUTH_PROVIDER=disabled`; `hort-server`'s gitops preflight then refuses the
+  dormant ClaimMapping and parks (`/readyz=503`, status-only). The deploy now
+  gates the ClaimMapping on the IdP being enabled (`hort_dex_enabled`) and removes
+  it otherwise — which also un-parks a host previously synced with it present.
+  Admin without an IdP remains the DSN-gated `bootstrap-session` (ADR 0038).
+
 ## [0.9.4] - 2026-06-21
 
 Beta release. The feature set is described in the documentation under `docs/`.
