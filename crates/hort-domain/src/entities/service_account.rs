@@ -195,6 +195,25 @@ pub struct ServiceAccount {
 }
 
 // ---------------------------------------------------------------------------
+// Backing-username convention
+// ---------------------------------------------------------------------------
+
+/// Canonical backing-`users` username for a service account: `"sa:" || name`.
+///
+/// THE single source of truth — every construction site must call this so the
+/// CLI lookup, gitops apply, k8s payload, and auth parse cannot drift (the
+/// `hort-svc-` mismatch this replaces shipped in 0.9.5-beta.1).
+pub fn backing_username(name: &str) -> String {
+    format!("sa:{name}")
+}
+
+/// Inverse of [`backing_username`]: the SA name from a backing username, or
+/// `None` if it is not an SA-backed user.
+pub fn parse_backing_username(username: &str) -> Option<&str> {
+    username.strip_prefix("sa:")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -364,6 +383,30 @@ mod tests {
         };
         assert!(sa.federated_identities.is_empty());
         assert!(sa.fallback_rotation.is_none());
+    }
+
+    // -- backing_username / parse_backing_username --------------------------
+
+    #[test]
+    fn backing_username_prefixes_sa() {
+        assert_eq!(backing_username("cronjob-tasks"), "sa:cronjob-tasks");
+        assert_eq!(backing_username("foo"), "sa:foo");
+    }
+
+    #[test]
+    fn parse_backing_username_strips_sa_prefix() {
+        assert_eq!(parse_backing_username("sa:foo"), Some("foo"));
+    }
+
+    #[test]
+    fn parse_backing_username_rejects_non_sa() {
+        assert_eq!(parse_backing_username("hort-svc-foo"), None);
+        assert_eq!(parse_backing_username("alice"), None);
+    }
+
+    #[test]
+    fn backing_username_roundtrips() {
+        assert_eq!(parse_backing_username(&backing_username("x")), Some("x"));
     }
 
     // Compile-time invariants — none of these structs may implement

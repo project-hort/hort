@@ -459,13 +459,14 @@ metadata:
 spec:
   subject:
     kind: User
-    username: hort-svc-cron-rescan      # resolved by the apply use case
+    username: sa:cron-rescan            # backing user the SA apply writes
   permission: admin_task_invoke
   scope: global
 ```
 
-Repeat for each cron-job SA. The `username` field follows the
-`hort-svc-<name>` convention enforced by `admin issue-svc-token`
+Repeat for each cron-job SA. The backing-user username follows the
+`sa:<name>` convention the gitops `ServiceAccount` apply writes, which is
+the same username `admin issue-svc-token` looks up
 ([§5.2](#5-mint-the-operator-and-cron-tokens)).
 
 `hort-server` applies the directory on startup; restart the service
@@ -581,7 +582,7 @@ TOKEN=hort_...   # paste (hort_pat_… for the §5.1 admin token,
 
 curl -sf -H "Authorization: Bearer $TOKEN" \
     http://localhost:8080/api/v1/auth/whoami | jq .
-# → {"user_id":"...","username":"hort-svc-ops","claims":["admin"],...}
+# → {"user_id":"...","username":"sa:ops","claims":["admin"],...}
 ```
 
 If this returns 401 with `WWW-Authenticate: Bearer realm="..."`, the
@@ -649,8 +650,8 @@ hort-server admin issue-svc-token \
 
 Naming + scoping choices:
 
-- **`--name`** identifies the SA in audit events and provisions the
-  backing user `hort-svc-<name>`. Use a descriptive name that names
+- **`--name`** identifies the SA in audit events; the gitops apply
+  provisions the backing user `sa:<name>`. Use a descriptive name that names
   the consumer (`ci-publish-<thing>`, `gh-actions-<repo>`,
   `gitlab-<group>-<project>`). One SA per pipeline gives clean
   audit attribution; avoid sharing one SA across pipelines unless
@@ -690,7 +691,7 @@ metadata:
 spec:
   subject:
     kind: User
-    username: hort-svc-ci-publish-internal-libs
+    username: sa:ci-publish-internal-libs
   permission: write
   scope:
     repository_id: <uuid-of-internal-libs-repo>
@@ -993,7 +994,7 @@ curl -sf -H "Authorization: Bearer ${HORT_PUBLISH_TOKEN}" \
         token_cap
     }'
 # {
-#   "username": "hort-svc-ci-publish-internal-libs",
+#   "username": "sa:ci-publish-internal-libs",
 #   "claims": [],                       ← SA tokens carry no synthetic claims
 #                                         (long-lived static tokens are
 #                                         under-privileged for
