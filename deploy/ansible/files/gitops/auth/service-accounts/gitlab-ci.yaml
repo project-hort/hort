@@ -1,0 +1,21 @@
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: gitlab-ci
+spec:
+  # Pull access for GitLab CI builds (gitlab.kdp.kloni.cloud) — same scope as
+  # the GitHub gha-ci SA: read on the pull-through proxies + the cargo virtual.
+  role: reader
+  repositories:
+    - cargo-virtual
+    - crates-proxy
+    - dockerhub-proxy
+    - quay-proxy
+    - npm-proxy
+  federatedIdentities:
+    - issuer: gitlab                       # OidcIssuer metadata.name (auth/issuers/gitlab.yaml)
+      claims:
+        # GitLab CI id_tokens emit project_path as <namespace>/<project>; this
+        # binds the SA to the one project so no other repo on the instance can
+        # assume it.
+        project_path: "pub-projects/hort"
