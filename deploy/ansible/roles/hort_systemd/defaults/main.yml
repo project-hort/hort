@@ -29,8 +29,12 @@ hort_systemd_oci_signing_key_file: "{{ hort_systemd_key_dir }}/oci-signing.pem"
 # Override in host_vars or group_vars when a newer version is validated.
 #
 # hort_systemd_osv_version: pinned to a known-good release tag (without "v").
-# Verify against https://github.com/google/osv-scanner/releases
-hort_systemd_osv_version: "1.9.1"
+# Must match docker/Dockerfile.worker's OSV_SCANNER_VERSION — the worker's osv
+# adapter invokes the v2 `osv-scanner scan source --format json --sbom` CLI, so a
+# v1.x binary fails every scan (artifacts then quarantine forever). The lockstep
+# is enforced by scripts/check-osv-scanner-version.sh. Verify release tags at
+# https://github.com/google/osv-scanner/releases
+hort_systemd_osv_version: "2.3.8"
 #
 # trivy is installed UNPINNED from the aquasecurity apt repo: that repo's
 # "generic" suite is rolling-latest-only (it serves a single version), so a

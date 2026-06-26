@@ -273,8 +273,10 @@ test:lint:
   <<: *rust-cache
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    - *hort-auth-steps
+    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
+    # exchange (curl) and the proxy config depend on them being present.
     - *rust-apt-deps
+    - *hort-auth-steps
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all -- --check
@@ -290,8 +292,10 @@ test:unit:
       artifacts: false
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    - *hort-auth-steps
+    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
+    # exchange (curl) and the proxy config depend on them being present.
     - *rust-apt-deps
+    - *hort-auth-steps
   script:
     - cargo test --workspace --lib --verbose
 
@@ -311,8 +315,10 @@ test:coverage:
     RUSTC_WRAPPER: ""
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    - *hort-auth-steps
+    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
+    # exchange (curl) and the proxy config depend on them being present.
     - *rust-apt-deps
+    - *hort-auth-steps
     - rustup component add llvm-tools-preview
     - cargo install --locked cargo-llvm-cov || true
   script:
@@ -359,8 +365,10 @@ test:integration:
     DATABASE_URL: "postgresql://registry:registry@postgres:5432/artifact_registry"
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    - *hort-auth-steps
+    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
+    # exchange (curl) and the proxy config depend on them being present.
     - *rust-apt-deps
+    - *hort-auth-steps
     - apt-get install -y -qq --no-install-recommends postgresql-client
     - for i in $(seq 1 30); do pg_isready -h postgres -U "${POSTGRES_USER}" && break; sleep 1; done
   script:
@@ -515,11 +523,12 @@ quality:sonar:
         ${SONAR_PROJECT_KEY:+-Dsonar.projectKey=$SONAR_PROJECT_KEY}
 
 # Lint pin-sync between Cargo.toml MSRV / the hort-server Dockerfile rust
-# toolchain, and between the Helm chart values.yaml top-level keys / their
-# per-section comment blocks. Both scripts are pure bash and finish in well
-# under a second; they run on every pipeline (no rules / no needs:). Alpine
-# has bash, grep, and yq is not required — the scripts use only POSIX
-# awk/sed.
+# toolchain; between the Helm chart values.yaml top-level keys / their
+# per-section comment blocks; and between the worker container's
+# OSV_SCANNER_VERSION / the native hort_systemd osv-scanner pin. The scripts are
+# pure bash and finish in well under a second; they run on every pipeline (no
+# rules / no needs:). Alpine has bash, grep, and yq is not required — the
+# scripts use only POSIX awk/sed.
 quality:chart-and-rust-pin-sync:
   stage: quality
   image: alpine:3.20
@@ -529,6 +538,7 @@ quality:chart-and-rust-pin-sync:
   script:
     - bash scripts/check-rust-version.sh
     - bash scripts/check-values-comments.sh
+    - bash scripts/check-osv-scanner-version.sh
 
 # Machine-readable G1 release-predicate gate. Fails unless the
 # event-chain-verify and advisory-ingest telemetry rows are catalogued in
@@ -930,8 +940,10 @@ release:sbom:
     HORT_OIDC_TOKEN:
       aud: hort-server
   before_script:
-    - *hort-auth-steps
+    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
+    # exchange (curl) and the proxy config depend on them being present.
     - *rust-apt-deps
+    - *hort-auth-steps
     # cosign-setup.sh's `apk add jq` / `dnf install jq` fallback does
     # not cover debian-based images. The rust-apt-deps anchor above
     # already pulls curl + ca-certificates; add jq explicitly so the
