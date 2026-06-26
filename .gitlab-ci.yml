@@ -515,11 +515,12 @@ quality:sonar:
         ${SONAR_PROJECT_KEY:+-Dsonar.projectKey=$SONAR_PROJECT_KEY}
 
 # Lint pin-sync between Cargo.toml MSRV / the hort-server Dockerfile rust
-# toolchain, and between the Helm chart values.yaml top-level keys / their
-# per-section comment blocks. Both scripts are pure bash and finish in well
-# under a second; they run on every pipeline (no rules / no needs:). Alpine
-# has bash, grep, and yq is not required — the scripts use only POSIX
-# awk/sed.
+# toolchain; between the Helm chart values.yaml top-level keys / their
+# per-section comment blocks; and between the worker container's
+# OSV_SCANNER_VERSION / the native hort_systemd osv-scanner pin. The scripts are
+# pure bash and finish in well under a second; they run on every pipeline (no
+# rules / no needs:). Alpine has bash, grep, and yq is not required — the
+# scripts use only POSIX awk/sed.
 quality:chart-and-rust-pin-sync:
   stage: quality
   image: alpine:3.20
@@ -529,6 +530,7 @@ quality:chart-and-rust-pin-sync:
   script:
     - bash scripts/check-rust-version.sh
     - bash scripts/check-values-comments.sh
+    - bash scripts/check-osv-scanner-version.sh
 
 # Machine-readable G1 release-predicate gate. Fails unless the
 # event-chain-verify and advisory-ingest telemetry rows are catalogued in
