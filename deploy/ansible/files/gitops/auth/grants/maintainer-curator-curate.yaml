@@ -1,0 +1,16 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: maintainer-curator-curate
+spec:
+  # Standalone serviceAccount-subject grant. Resolves at apply to
+  # GrantSubject::User(<maintainer-curator backing user>), so the
+  # maintainer-curator SA gets global CURATE without admin. `curate` is not
+  # expressible on the SA envelope (the role confers only read/write), so
+  # this standalone grant is the sole carrier of the curator authority.
+  subject:
+    kind: serviceAccount
+    name: maintainer-curator
+  permission: curate
+  # No `repository:` -> global curate. Narrow to a `repository:` reference
+  # if the curator's remit should be scoped to a single repo.

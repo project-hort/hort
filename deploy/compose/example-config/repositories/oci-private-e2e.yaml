@@ -1,0 +1,21 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: oci-private-e2e
+spec:
+  name: "OCI Private E2E"
+  description: >-
+    PRIVATE hosted OCI repo for the reader-SA private-pull regression
+    (scripts/native-tests/scenarios/clients/oci-private-pull.sh). Unlike the
+    public oci-e2e repo, isPublic is false, so an anonymous /v2/auth mint
+    returns an EMPTY access[] and the pull is denied — the pull only succeeds
+    for an identity holding an explicit Read grant (reader-user via
+    auth/reader-read-oci-private-e2e.yaml). This drives the capability-token
+    gha-ci shape: a non-admin reader resolving a private repo.
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/oci-private-e2e
+  isPublic: false
+  replicationPriority: local_only

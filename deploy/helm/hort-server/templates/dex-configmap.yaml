@@ -1,0 +1,74 @@
+{{/*
+Dex IdP ConfigMap — the example/dogfood minimal OIDC IdP sidecar. Renders
+ONLY when `auth.dex.enabled` is true (default false).
+
+Dex is the recommended minimal IdP for the human-admin path: human admin
+is OIDC (Dex) -> CliSession, not a static service-account token. Hort is
+IdP-agnostic — Dex is replaceable by your org's SSO (which Dex can also
+front as an upstream connector). This ships ONE static-password admin user;
+the gitops `ClaimMapping` (hort-admins -> admin claim) resolves the admin
+group to is_admin at login.
+
+GROUP CLAIM NOTE (read before relying on this): Dex's static-password DB
+(`enablePasswordDB`) does NOT attach `groups` to a user — group membership
+in Dex comes from an upstream connector (LDAP / GitHub / OIDC). For a
+self-contained example with no upstream, this config wires the single admin
+via the bootstrap path:
+
+  1. The first admin is minted out-of-band via the DSN-gated
+     `hort-server admin bootstrap-session` — short-lived, used once to wire
+     Dex + the ClaimMapping (and as break-glass).
+  2. For ongoing group-based admin, replace the staticPasswords block with a
+     group-capable connector (e.g. an LDAP/GitHub connector that emits the
+     `{{ .Values.auth.dex.adminGroup }}` group), so a connector login carries
+     the group -> the hort-admins ClaimMapping resolves it to admin.
+
+This ConfigMap is bootable as-is (the static admin can log in for the OIDC
+-> CliSession exchange), and the group->admin mapping becomes live once a
+group-capable connector is added. The example keeps the connector out so
+the dogfood needs no external IdP.
+
+SECURITY: the static-password block is a bootstrap/dogfood convenience.
+The bcrypt hash is supplied via `auth.dex.staticAdmin.passwordHashSecret`
+(a k8s Secret) and expanded from the pod env, so plaintext never lives in
+values or the ConfigMap.
+*/}}
+{{- if .Values.auth.dex.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hort-server.fullname" . }}-dex
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/component: dex
+data:
+  config.yaml: |
+    # Dex issuer — MUST equal hort-server's HORT_OIDC_ISSUER_URL exactly
+    # (iss claim match + JWKS discovery). The chart wires both from
+    # auth.dex.issuerUrl when auth.dex.enabled.
+    issuer: {{ .Values.auth.dex.issuerUrl | quote }}
+    storage:
+      type: memory
+    web:
+      http: 0.0.0.0:{{ .Values.auth.dex.containerPort }}
+    oauth2:
+      # Skip the approval screen for the device/code flows the CLI uses.
+      skipApprovalScreen: true
+    staticClients:
+      # The public client the hort-cli device-code flow authenticates
+      # against. Must match auth.tokenExchange.cliClientId.
+      - id: {{ .Values.auth.dex.cliClientId | quote }}
+        name: "hort-cli"
+        public: true
+    enablePasswordDB: true
+    staticPasswords:
+      - email: {{ .Values.auth.dex.staticAdmin.email | quote }}
+        # bcrypt hash of the admin password, sourced from a k8s Secret and
+        # rendered into the Dex pod env (DEX_ADMIN_PASSWORD_HASH); Dex
+        # expands the env at load (DEX_EXPAND_ENV=true in the Deployment).
+        hashFromEnv: DEX_ADMIN_PASSWORD_HASH
+        username: {{ .Values.auth.dex.staticAdmin.username | quote }}
+        userID: {{ .Values.auth.dex.staticAdmin.userID | quote }}
+    frontend:
+      issuer: hort (Dex)
+{{- end }}

@@ -1,0 +1,33 @@
+# Test fixture (render MUST fail): auth.dex.enabled=true with an empty
+# auth.dex.issuerUrl. The chart points HORT_OIDC_ISSUER_URL at Dex, so an
+# empty issuer is a misconfiguration the strict schema rejects at
+# `helm template` instead of producing an unbootable manifest.
+#
+# Usage (expected to FAIL):
+#   helm template deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values-dex-broken.yaml
+
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+  dex:
+    enabled: true
+    # issuerUrl deliberately omitted -> schema rule fails the render.
+    staticAdmin:
+      passwordHashSecret: "hort-dex-admin"
+
+publicBaseUrl: "https://registry.example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

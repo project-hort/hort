@@ -178,6 +178,77 @@ auth:
       # not rotating.
       prevExistingSecret: ""
       prevSecretKey: "hort-oci-token-signing-key-prev.pem"
+  # dex — OPTIONAL minimal OIDC IdP sidecar (the recommended dogfood IdP).
+  # Default OFF.
+  #
+  # Human admin is OIDC (Dex) -> CliSession, not a static service-account
+  # token. Dex is the dogfood/reference IdP; hort is IdP-agnostic (Dex is
+  # replaceable by your org's SSO, which Dex can also front). When
+  # `enabled: true` the chart renders a Dex Deployment + Service + ConfigMap
+  # and points hort-server's HORT_OIDC_ISSUER_URL at Dex (overriding
+  # auth.oidc.issuerUrl).
+  #
+  # Seed a gitops ClaimMapping mapping the admin group to the `admin`
+  # claim so a Dex-group member resolves to is_admin on login, e.g. under
+  # `gitopsConfig`:
+  #     "auth/admins.yaml": |
+  #       apiVersion: project-hort.de/v1beta1
+  #       kind: ClaimMapping
+  #       metadata:
+  #         name: admins
+  #       spec:
+  #         idpGroup: hort-admins   # == auth.dex.adminGroup
+  #         claim: admin
+  #
+  # NOTE (Dex static-password DB does not attach groups): the example
+  # ships ONE static admin for bootstrap. The first admin is minted
+  # out-of-band via `hort-server admin bootstrap-session` (DSN-gated) to
+  # wire Dex + the ClaimMapping; for ongoing group-based admin add a
+  # group-capable connector to the Dex config that emits adminGroup. See
+  # templates/dex-configmap.yaml for the full note.
+  dex:
+    # When true: render the Dex sidecar AND point HORT_OIDC_ISSUER_URL at
+    # auth.dex.issuerUrl (requires auth.provider=oidc).
+    enabled: false
+    # Dex container image. Pin to a digest in production.
+    image: "ghcr.io/dexidp/dex:v2.41.1"
+    imagePullPolicy: IfNotPresent
+    # The OIDC issuer URL Dex advertises AND that hort-server validates
+    # against. MUST be reachable from both clients and the hort-server pod
+    # and MUST match exactly (iss claim + JWKS discovery). Typically the
+    # public host with a /dex path served by the same ingress, e.g.
+    # "https://registry.example.com/dex". Required when dex.enabled.
+    issuerUrl: ""
+    # The public OIDC client id the hort-cli device-code flow uses. MUST
+    # equal auth.tokenExchange.cliClientId. When auth.dex.enabled, this
+    # ALSO sources HORT_OIDC_AUDIENCE (the `aud` of a Dex-minted cli-flow
+    # token is the Dex client id, NOT auth.oidc.audience) — mirroring the
+    # Ansible flavor (HORT_OIDC_AUDIENCE = hort_dex_cli_client_id).
+    cliClientId: "hort-cli"
+    # The IdP group whose members map to the `admin` claim (must match the
+    # ClaimMapping idpGroup you seed in gitopsConfig).
+    adminGroup: "hort-admins"
+    # Dex listener port (container) and Service port.
+    containerPort: 5556
+    servicePort: 5556
+    staticAdmin:
+      email: "admin@example.com"
+      username: "admin"
+      userID: "hort-bootstrap-admin"
+      # k8s Secret holding the bcrypt hash of the admin password. Create
+      # out-of-band (the chart does not generate it):
+      #   HASH=$(htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n' | sed 's/$2y/$2a/')
+      #   kubectl create secret generic hort-dex-admin \
+      #     --from-literal=passwordHash="$HASH"
+      passwordHashSecret: ""
+      passwordHashSecretKey: "passwordHash"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
 
 # -------------------- HTTP transport --------------------
 http:

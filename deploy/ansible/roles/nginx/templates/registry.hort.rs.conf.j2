@@ -119,6 +119,19 @@ server {
         proxy_set_header X-Real-IP         $remote_addr;
     }
 
+{% if hort_dex_enabled | bool %}
+    # Dex IdP issuer path. Dex's issuer is https://{{ registry_fqdn }}/dex, so it
+    # serves discovery + JWKS under /dex/.well-known/...; pass the full path
+    # through to the localhost-published Dex container.
+    location /dex {
+        proxy_pass http://127.0.0.1:{{ hort_dex_port }};
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+    }
+{% endif %}
+
     location / {
         proxy_pass http://127.0.0.1:{{ hort_api_port }};
         proxy_set_header Host              $host;

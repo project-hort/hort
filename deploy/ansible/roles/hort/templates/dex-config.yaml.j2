@@ -1,0 +1,44 @@
+# Dex IdP config — minimal OIDC IdP for the human-admin path.
+# Rendered to {{ hort_dex_config_dir }}/config.yaml and mounted read-only into
+# the Dex container. Only rendered when hort_dex_enabled is true.
+#
+# Human admin is OIDC (Dex) -> CliSession. hort is IdP-agnostic — replace the
+# staticPasswords block with a group-capable connector (LDAP / GitHub / OIDC)
+# that emits the {{ hort_dex_admin_group }} group to make group-based admin live.
+#
+# GROUP CLAIM NOTE: Dex's static-password DB does not attach `groups` to a user.
+# The single static admin below logs in for the OIDC -> CliSession exchange;
+# the first admin is minted out-of-band via `hort-server admin bootstrap-session`
+# to wire Dex + the hort-admins -> admin ClaimMapping. Add a group-capable
+# connector for ongoing group-based admin.
+
+issuer: {{ hort_dex_issuer_url }}
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:{{ hort_dex_port }}
+
+oauth2:
+  # Skip the approval screen for the device/code flows the CLI uses.
+  skipApprovalScreen: true
+
+staticClients:
+  # The public client the hort-cli device-code flow authenticates against.
+  - id: {{ hort_dex_cli_client_id }}
+    name: "hort-cli"
+    public: true
+
+enablePasswordDB: true
+staticPasswords:
+  - email: {{ hort_dex_admin_email }}
+    # bcrypt hash of the admin password, expanded from the container env
+    # (DEX_ADMIN_PASSWORD_HASH); set hort_dex_admin_password_hash in
+    # group_vars/production/vault.yml — never commit the plaintext or hash.
+    hashFromEnv: DEX_ADMIN_PASSWORD_HASH
+    username: {{ hort_dex_admin_username }}
+    userID: {{ hort_dex_admin_user_id }}
+
+frontend:
+  issuer: hort (Dex)

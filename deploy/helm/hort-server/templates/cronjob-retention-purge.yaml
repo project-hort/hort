@@ -19,6 +19,18 @@ Gated by `scheduledTasks.retentionPurge.enabled` (default false; this
 is the most destructive retention task, so opt-in is required for
 safety). The parent `scheduledTasks.adminTasksEnabled` must also be
 true.
+
+DESTRUCTIVE TASK: `retention-purge` is in DESTRUCTIVE_TASK_KINDS, so the
+worker requires the caller carry the `task:destructive` claim in addition to
+`AdminTaskInvoke`. The bootstrap `{{ release }}-svc-token` is a non-admin
+`cronjob-tasks` svc-token (AdminTaskInvoke only — svc-tokens are claimless),
+so it cannot satisfy `task:destructive` and this CronJob fails if run with it.
+To run a destructive task, EITHER:
+  - leave this disabled (default) and run it by hand with a Dex-backed admin
+    CliSession: `hort-cli admin task invoke retention-purge`; OR
+  - opt in AND mount a narrow, cataloged, HORT_TOKEN_ALLOW_ADMIN-gated token
+    that carries the `task:destructive` claim (not the default svc-token) —
+    override the HORT_TOKEN secretKeyRef below to that Secret.
 */}}
 {{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.retentionPurge.enabled }}
 apiVersion: batch/v1

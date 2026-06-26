@@ -138,6 +138,28 @@ value must be set to your actual GitLab namespace/project before deploying.
 Do NOT commit `gitlab-ci.yaml` with a real project path — it is gitignored
 alongside `group_vars/production/`.
 
+### Provisioned service accounts
+
+The gitops tree (`files/gitops/auth/`) declares three **non-admin** operator
+service accounts plus their standalone `serviceAccount`-subject
+`PermissionGrant`s (ADR 0037). None is an admin — `issue-svc-token` rejects
+`--permission=admin`, and admin authority lives only on the human-admin path
+(see *First admin* below).
+
+| ServiceAccount | Authority | Token destination |
+|---|---|---|
+| `maintainer-dev` | global `read` | `/run/secrets/hort-dev.token` (minted by the gitops role) |
+| `maintainer-curator` | global `curate` | `/run/secrets/hort-curator.token` (minted by the gitops role) |
+| `cronjob-tasks` | global `admin_task_invoke` | minted out-of-band for scheduled tasks (see *Scheduled tasks & destructive jobs*) |
+
+The gitops role applies the tree (server restart → boot apply) **before** it
+mints tokens, because `issue-svc-token` requires the matching gitops
+`ServiceAccount` to already exist (a non-admin svc-token has no standing
+privilege of its own — its authority comes from the SA's gitops grants).
+Retrieve the minted `maintainer-dev` / `maintainer-curator` tokens from
+`/run/secrets/` (tmpfs) and store them in your secret manager immediately —
+see *Post-provisioning operator token retrieval* below.
+
 ## Obtaining binary checksums
 
 The `hort_binaries` and `hort_systemd` roles pin specific versions of `cosign`
@@ -216,6 +238,62 @@ Dry-run (check mode, no changes applied):
 ansible-playbook -i inventory/production/hosts.ini site-podman.yml \
   --ask-vault-pass --check --diff
 ```
+
+## First admin (bootstrap-session)
+
+The playbook provisions only **non-admin** service accounts (see *Provisioned
+service accounts* above) — it never mints an admin credential. Hort has no
+standing admin token, no admin service account, and no password/host-coupled
+admin. The single no-IdP / first-admin / break-glass admin path is the
+DSN-gated `bootstrap-session` CLI: run it on the host (the operator shell, with
+the database reachable) to mint a short-lived non-service-account admin token.
+
+```bash
+# On the target host, as an operator with the DB DSN configured.
+# HORT_TOKEN_ALLOW_ADMIN gates token *issuance* and is read by this CLI from
+# the operator shell — the running hort-server does NOT need it set.
+#
+# Native flavor:
+HORT_TOKEN_ALLOW_ADMIN=true hort-server admin bootstrap-session --ttl 1h
+#
+# Podman flavor (the binary lives in the container):
+HORT_TOKEN_ALLOW_ADMIN=true \
+  podman exec -e HORT_TOKEN_ALLOW_ADMIN hort-server \
+  hort-server admin bootstrap-session --ttl 1h
+```
+
+It prints a short-lived (≤ 1 h) full-cap admin token for the reserved non-SA
+`bootstrap-admin` user. Paste it into `hort-cli auth login --paste` (or use it
+as the REST `Authorization: Bearer`) and use it only to wire your IdP + the
+`hort-admins → admin` `ClaimMapping`, then switch to the steady-state IdP path.
+Do not treat it as a standing admin credential.
+
+For a **team + an IdP** (the steady-state human-admin path), point Dex (set
+`hort_dex_enabled: true`, or front your org SSO) at a **group-capable**
+connector and map the admin group to the `admin` claim. A Dex
+`staticPasswords`-only admin is **non-admin** (Dex emits no `groups` claim).
+The full recipe — both the bootstrap-session and the IdP path, with the Dex
+caveat — is in
+[`docs/architecture/how-to/deploy/admin-identity-and-dex.md`](../../docs/architecture/how-to/deploy/admin-identity-and-dex.md)
+(standing decision: ADR 0038).
+
+## Scheduled tasks & destructive jobs
+
+The `cronjob-tasks` service account (provisioned by the gitops tree, non-admin,
+`admin_task_invoke`) runs **non-destructive** scheduled admin tasks unattended
+(noop, staging-sweep, cron-rescan-tick, advisory-watch-tick,
+eventstore-checkpoint, …) — its `hort_svc_*` token carries the
+"may enqueue an admin task" capability but no `task:destructive` claim.
+
+**Destructive housekeeping** (`eventstore-archive`, `retention-purge`,
+`retention-evaluate`) is **disabled by default**. These tasks additionally
+require the `task:destructive` claim, which a claimless non-admin svc-token
+cannot hold — so they cannot run unattended on the `cronjob-tasks` token by
+construction. Run a destructive task by hand with the bootstrap-admin token
+(see *First admin* above) — `hort-cli admin task invoke retention-purge` — or
+wait for the destructive-op approval workflow (GitLab issue #2; ADR 0038
+follow-on). This is the intended posture: there is zero standing destructive
+privilege.
 
 ## Role summary
 

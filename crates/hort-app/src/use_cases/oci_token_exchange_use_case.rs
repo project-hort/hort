@@ -49,7 +49,7 @@ use crate::oci_token_signing::{
     AccessEntry, OciAccessClaims, OciTokenSigningKey, SigningError, VerificationError,
     DEFAULT_MINT_TTL,
 };
-use crate::rbac::{add_admin_claim_if_admin, RbacEvaluator};
+use crate::rbac::RbacEvaluator;
 use crate::use_cases::pat_validation_use_case::{PatValidationError, PatValidationUseCase};
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 
@@ -300,16 +300,18 @@ impl OciTokenExchangeUseCase {
             })?;
 
         // Step 3: build a synthetic principal carrying the validated
-        // user_id + token_cap. Roles are seeded from the live `User`
-        // row's `is_admin` bit, mirroring `authenticate_pat` (live
-        // re-resolution per request). PAT-bearing callers carry no
-        // fresh IdP claim, so `groups` stays empty and the only
-        // authority leg through the user-grants path is the admin
-        // short-circuit (when `is_admin = true`) or per-repo
-        // `PermissionGrant` rows attached to roles the user holds.
-        // Without this re-resolution `roles: Vec::new()` would
-        // short-circuit `RbacEvaluator::user_grants_authorize` to
-        // `false` and every minted JWT would carry an empty `access[]`.
+        // user_id + token_cap. Authority on the OCI surface is the set
+        // of the user's `GrantSubject::User` `PermissionGrant`s of `sub`
+        // intersected with the token cap — and nothing else (the
+        // capability-token model, ADR 0036). The principal's claims stay
+        // EMPTY, so the admin short-circuit never fires on this surface:
+        // the OCI `/v2/auth` token carries NO ambient admin. Authority
+        // therefore resolves purely through `user_grants_authorize`
+        // (User-subject grants of the user) ∩ the token cap — the
+        // identical basis the consume side (`synthesize_principal_from_jwt`,
+        // also `claims:[]`) re-evaluates, so mint ≡ consume by construction.
+        // Admin operations authenticate via the API surface (CliSession /
+        // OIDC bearer), never the OCI token.
         //
         // The validator already short-circuited on `is_active = false`
         // upstream, so a successful `validation` implies the user row
@@ -318,13 +320,12 @@ impl OciTokenExchangeUseCase {
         // as `Infrastructure(DomainError::NotFound)` (5xx) — same
         // shape as any other repository miss on a hot path.
         let user = self.users.find_by_id(validation.user_id).await?;
-        // Behaviour-preserving: the
-        // `is_admin → ["admin"]` derivation is reproduced exactly via
-        // the shared synthetic-admin helper — no claim is invented beyond
-        // the synthetic `admin` claim. PAT-bearing callers carry
-        // no fresh IdP claim, so the claim set is at most `["admin"]`.
-        let mut claims = Vec::new();
-        add_admin_claim_if_admin(&mut claims, user.is_admin);
+        // CAPABILITY-TOKEN MODEL (ADR 0036): the OCI /v2/auth token carries NO
+        // ambient admin. The mint principal's claims stay EMPTY so the admin
+        // short-circuit never fires here — authority = User-subject grants ∩ cap,
+        // the identical basis the consume side (`synthesize_principal_from_jwt`,
+        // also claims:[]) re-evaluates. Admin operations use the API surface, not OCI.
+        let claims: Vec<String> = Vec::new();
         let principal = CallerPrincipal {
             user_id: user.id,
             external_id: user
@@ -478,24 +479,12 @@ impl OciTokenExchangeUseCase {
                 })
             }
             ResourceType::Registry => {
-                // Catalog ops: require admin authority. The cap leg
-                // applies via `RbacEvaluator::authorize`'s built-in
-                // intersection; a token without `Permission::Admin`
-                // in its cap fails the cap leg and is denied.
-                let mut granted_actions = Vec::with_capacity(scope.actions.len());
-                for action in &scope.actions {
-                    let perm = action.required_permission();
-                    // The catalog-grant check uses
-                    // `repository_id = None` (system-level op). The
-                    // cap-intersection helper denies a per-repo-
-                    // restricted token on this path automatically.
-                    if rbac.authorize(principal, perm, None) {
-                        granted_actions.push(action.wire_str().to_string());
-                    }
-                }
-                Ok(GrantedActions {
-                    actions: granted_actions,
-                })
+                // Registry/catalog scope is VESTIGIAL under the capability model: the
+                // consume `_catalog` handler is capability-scoped (lists per-repo
+                // Read-visible repos; it never reads a registry:catalog scope from the
+                // token). With no ambient admin, the mint must not echo an unenforced
+                // registry:catalog grant. Return empty.
+                Ok(GrantedActions::empty())
             }
         }
     }
@@ -1076,6 +1065,14 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
 
+    /// Deterministic user id shared by [`seed_pat_row`] (the PAT's backing
+    /// user) and [`make_use_case`] (the `GrantSubject::User` grants). Under
+    /// the capability-token model (ADR 0036) the OCI mint principal carries
+    /// `claims:[]`, so authority flows ONLY through `GrantSubject::User`
+    /// grants keyed on this id — a `Claims`-subject grant (or the old admin
+    /// short-circuit) would never match.
+    const PAT_USER_ID: Uuid = Uuid::from_u128(0x0C17_1234_5678_9ABC_DEF0_1234_5678_9ABC_u128);
+
     // -- Fixed clock so the histogram side-effect is deterministic.
     struct FixedClock(DateTime<Utc>);
     impl Clock for FixedClock {
@@ -1368,9 +1365,12 @@ mod tests {
     );
 
     /// Build a use case wired to in-memory mocks and an evaluator
-    /// pre-loaded with the supplied grants on the role `developer`.
-    /// The caller principal carries `developer` in its roles, so
-    /// the evaluator's `authorize` checks resolve via that role.
+    /// pre-loaded with the supplied grants as `GrantSubject::User`
+    /// grants keyed on [`PAT_USER_ID`] (the PAT's backing user — see
+    /// [`seed_pat_row`]). Under the capability-token model (ADR 0036)
+    /// the OCI mint principal carries `claims:[]`, so this is the ONLY
+    /// authority leg that can match: a `Claims`-subject grant or the old
+    /// admin short-circuit would yield an empty `access[]`.
     ///
     /// `verifier_result` controls the `Argon2Verifier` planted in the
     /// validator: `true` simulates a matching hash (happy path), `false`
@@ -1397,15 +1397,16 @@ mod tests {
             PatLockoutConfig::DEFAULT,
         ));
 
-        // -- RbacEvaluator where the `developer` claim grants the
-        //    requested permissions (claim-based subject model — a
-        //    `Claims(["developer"])` subject, no `(Role, role_id)`
-        //    indirection).
+        // -- RbacEvaluator where the supplied grants are `GrantSubject::User`
+        //    grants keyed on `PAT_USER_ID` (the PAT's backing user). This is
+        //    the only authority leg the capability-token model (ADR 0036)
+        //    honours on the OCI mint surface — the principal carries
+        //    `claims:[]`, so a `Claims`-subject grant could never match.
         let rows: Vec<PermissionGrant> = grants
             .into_iter()
             .map(|(perm, repo)| PermissionGrant {
                 id: Uuid::new_v4(),
-                subject: GrantSubject::Claims(vec!["developer".to_string()]),
+                subject: GrantSubject::User(PAT_USER_ID),
                 repository_id: repo,
                 permission: perm,
                 created_at: now,
@@ -1446,18 +1447,20 @@ mod tests {
     /// planted row deterministically.
     ///
     /// `is_admin` controls the `User.is_admin` bit of the seeded user
-    /// row. `OciTokenExchangeUseCase::exchange` re-resolves the user
-    /// via `UserRepository::find_by_id` and seeds `roles: vec!["admin"]`
-    /// when the row is admin (mirroring `authenticate_pat`). The
-    /// full-grant / pull-push-delete tests
-    /// pass `true`; the partial-grant test combines `is_admin = true`
-    /// with a narrowed `declared_permissions` to exercise the cap
-    /// leg's deny path.
+    /// row. Under the capability-token model (ADR 0036) the OCI mint
+    /// principal carries `claims:[]`, so `is_admin` no longer confers
+    /// ambient authority on this surface — authority flows ONLY through
+    /// `GrantSubject::User(PAT_USER_ID)` grants (see [`make_use_case`]).
+    /// The bit is retained so the F1 regression test can prove an admin
+    /// user with NO User-subject grant still mints an empty `access[]`.
+    ///
+    /// The backing user's id is the deterministic [`PAT_USER_ID`] so the
+    /// `User`-subject grants `make_use_case` seeds match by identity.
     ///
     /// `declared_permissions` controls the `ApiToken.declared_permissions`
     /// (the token cap). Default is `[Read, Write, Delete]` (full cap);
     /// the partial-grant test passes `[Read]` so the cap leg denies
-    /// `Write` (push) while admin's user-leg allows it.
+    /// `Write` (push) while the user-leg grant allows it.
     fn seed_pat_row(
         tokens: &OciInMemoryTokenRepo,
         users: &OciInMemoryUserRepo,
@@ -1466,7 +1469,7 @@ mod tests {
     ) -> (String, Uuid) {
         // Format per `parse_pat_token_format`: `hort_pat_<32-char-base32>`.
         let plaintext = "hort_pat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let user_id = Uuid::new_v4();
+        let user_id = PAT_USER_ID;
         let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("epoch");
         users.insert(User {
             id: user_id,
@@ -1802,12 +1805,14 @@ mod tests {
     #[test]
     fn exchange_resolves_repo_by_first_segment_of_full_scope_name() {
         capture_async(|| async {
-            let (uc, tokens, users, repos) = make_use_case(vec![], true);
-            // admin → user-leg short-circuit; full cap → cap-leg allows.
+            // Global User Read grant → user-leg allows pull; full cap →
+            // cap-leg allows. (ADR 0036: authority is User-subject grants,
+            // not the old admin short-circuit.)
+            let (uc, tokens, users, repos) = make_use_case(vec![(Permission::Read, None)], true);
             let (plaintext, _user_id) = seed_pat_row(
                 &tokens,
                 &users,
-                true,
+                false,
                 vec![Permission::Read, Permission::Write, Permission::Delete],
             );
             // hort repo keyed by the FIRST segment only.
@@ -1843,27 +1848,21 @@ mod tests {
     // -- hort_oci_v2_auth_total — happy + grant-classification paths ---
 
     /// Happy path: every requested action is authorised → full_grant.
-    /// Drives `exchange()` end-to-end with an admin user (so the
-    /// admin short-circuit allows the user-grants leg) and a full cap
-    /// (so the cap leg admits Read/Write/Delete). Single `pull` scope
-    /// → 1 requested, 1 granted → `ResultLabel::FullGrant`.
-    ///
-    /// Previously this test went around `exchange()` because the
-    /// synthetic principal carried `roles: Vec::new()` and could never
-    /// reach the FullGrant arm; the fix wires
-    /// `UserRepository::find_by_id` into the principal-construction
-    /// step and seeds `roles: ["admin"]` from the live `is_admin` bit,
-    /// making the arm reachable.
+    /// Drives `exchange()` end-to-end with a global User Read grant (so
+    /// the user-grants leg allows pull) and a full cap (so the cap leg
+    /// admits it). Single `pull` scope → 1 requested, 1 granted →
+    /// `ResultLabel::FullGrant`. (ADR 0036: authority is User-subject
+    /// grants, not the old `is_admin` short-circuit.)
     #[test]
     fn oci_v2_auth_total_emits_full_grant_on_authorised_request() {
         let snap = capture_async(|| async {
-            let (uc, tokens, users, repos) = make_use_case(vec![], true);
-            // Admin user → user-leg short-circuits to allow.
-            // Full cap → cap leg allows every action.
+            let (uc, tokens, users, repos) = make_use_case(vec![(Permission::Read, None)], true);
+            // Global User Read grant → user-leg allows pull.
+            // Full cap → cap leg allows it.
             let (plaintext, _user_id) = seed_pat_row(
                 &tokens,
                 &users,
-                true,
+                false,
                 vec![Permission::Read, Permission::Write, Permission::Delete],
             );
             repos.insert(build_repo("myrepo"));
@@ -1876,7 +1875,7 @@ mod tests {
                     client_ip: Some(ip()),
                 })
                 .await
-                .expect("admin user with full cap must mint a JWT");
+                .expect("authorised user with full cap must mint a JWT");
             // The single requested action `pull` lands in the granted
             // subset → exchange() classifies as full_grant.
             assert_eq!(resp.granted_subset.len(), 1);
@@ -1891,25 +1890,27 @@ mod tests {
 
     /// Partial path: some actions authorised, some not → partial_grant.
     /// Drives `exchange()` end-to-end. The shape that produces this
-    /// classification through the live evaluator: admin user (so the
-    /// user-leg short-circuits to allow every action) combined with a
+    /// classification through the live evaluator: global User Read+Write
+    /// grants (so the user-leg allows both pull and push) combined with a
     /// narrowed token cap (`Permission::Read` only) so the cap leg
     /// denies `Write`. Requesting `pull,push` then yields `pull`
     /// granted but `push` denied → 2 requested, 1 granted →
-    /// `ResultLabel::PartialGrant`.
-    ///
-    /// Previously this test went around `exchange()` because the
-    /// synthetic principal carried `roles: Vec::new()` and could never
-    /// reach the PartialGrant arm; the fix makes it reachable by
-    /// re-resolving roles from the live user row.
+    /// `ResultLabel::PartialGrant`. (ADR 0036: the user-leg is grants,
+    /// not the old admin short-circuit; the cap leg is what clips push.)
     #[test]
     fn oci_v2_auth_total_emits_partial_grant_when_some_actions_unauthorised() {
         let snap = capture_async(|| async {
-            let (uc, tokens, users, repos) = make_use_case(vec![], true);
-            // Admin user → admin short-circuits the user-leg for every
-            // action. Cap is narrowed to `Read` only so the cap leg
-            // denies `Write` (push).
-            let (plaintext, _user_id) = seed_pat_row(&tokens, &users, true, vec![Permission::Read]);
+            // User-leg grants BOTH Read and Write so the partial outcome is
+            // produced by the cap leg (Read-only) clipping push, not by a
+            // missing user-leg grant.
+            let (uc, tokens, users, repos) = make_use_case(
+                vec![(Permission::Read, None), (Permission::Write, None)],
+                true,
+            );
+            // Cap is narrowed to `Read` only so the cap leg denies `Write`
+            // (push).
+            let (plaintext, _user_id) =
+                seed_pat_row(&tokens, &users, false, vec![Permission::Read]);
             repos.insert(build_repo("myrepo"));
 
             let resp = uc
@@ -1923,7 +1924,7 @@ mod tests {
                     client_ip: Some(ip()),
                 })
                 .await
-                .expect("admin user must always mint a JWT");
+                .expect("authorised user must always mint a JWT");
             // Pull granted, push denied → partial.
             assert_eq!(resp.granted_subset.len(), 1);
             assert_eq!(resp.granted_subset[0].actions, vec!["pull".to_string()]);
@@ -1943,9 +1944,8 @@ mod tests {
     #[test]
     fn oci_v2_auth_total_emits_no_grant_when_zero_actions_authorised() {
         let snap = capture_async(|| async {
-            // No grants at all — every action denied. `is_admin = false`
-            // so the user-leg has no admin short-circuit; with no role
-            // grants either, every requested action falls to no_grant.
+            // No User-subject grants at all (and a non-admin user), so every
+            // requested action falls to no_grant.
             let (uc, tokens, users, repos) = make_use_case(vec![], true);
             let (plaintext, _user_id) = seed_pat_row(
                 &tokens,
@@ -1973,29 +1973,75 @@ mod tests {
         );
     }
 
-    // -- hort_oci_v2_auth_scope_actions_granted_total ------------------
-
-    /// Watchpoint #2: the `action` label MUST cover all three values
-    /// (`pull`, `push`, `delete`). Drives `exchange()` end-to-end with
-    /// an admin user + full cap requesting `pull,push,delete`; with
-    /// admin short-circuiting the user-leg and the cap admitting
-    /// every permission, each of the three actions lands in the
-    /// granted subset and emits one increment on
-    /// `hort_oci_v2_auth_scope_actions_granted_total`.
-    ///
-    /// Previously this test went around `exchange()` because the
-    /// synthetic principal carried `roles: Vec::new()` and could
-    /// never accumulate any granted actions; the fix re-resolves
-    /// the user row and seeds `roles: ["admin"]` from `is_admin`,
-    /// making every action reachable through `evaluate_scope`.
+    /// F1 regression (ADR 0036): the OCI `/v2/auth` mint confers NO ambient
+    /// admin. An `is_admin = true` PAT user with NO `GrantSubject::User`
+    /// grant mints an EMPTY `access[]` (`result=no_grant`) — proving the
+    /// admin short-circuit no longer fires on the mint surface, so mint ≡
+    /// consume by construction (the consume side also evaluates with
+    /// `claims:[]`). Closes F1 at the mint.
     #[test]
-    fn oci_v2_auth_scope_actions_granted_total_emits_pull_push_delete() {
+    fn oci_mint_admin_user_without_user_grant_yields_empty_access() {
         let snap = capture_async(|| async {
+            // No User-subject grants — but the user IS admin. Pre-ADR-0036
+            // the mint principal carried `claims:["admin"]` and the admin
+            // short-circuit granted every scope; now claims:[] → no grant.
             let (uc, tokens, users, repos) = make_use_case(vec![], true);
             let (plaintext, _user_id) = seed_pat_row(
                 &tokens,
                 &users,
+                true, // is_admin = true — must NOT confer ambient authority.
+                vec![Permission::Read, Permission::Write, Permission::Delete],
+            );
+            repos.insert(build_repo("myrepo"));
+
+            let resp = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:myrepo:pull".into()],
+                    client_ip: Some(ip()),
+                })
+                .await
+                .expect("admin-user mint still returns 200 with empty access[]");
+            assert!(
+                resp.granted_subset.is_empty(),
+                "admin user with NO User-subject grant must mint an EMPTY access[]; \
+                 got {:?}",
+                resp.granted_subset
+            );
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_oci_v2_auth_total", &[("result", "no_grant")],),
+            1,
+            "admin user with no grant must emit result=no_grant (no ambient admin)"
+        );
+    }
+
+    // -- hort_oci_v2_auth_scope_actions_granted_total ------------------
+
+    /// Watchpoint #2: the `action` label MUST cover all three values
+    /// (`pull`, `push`, `delete`). Drives `exchange()` end-to-end with
+    /// global User Read+Write+Delete grants + full cap requesting
+    /// `pull,push,delete`; with the user-leg granting every permission
+    /// and the cap admitting it, each of the three actions lands in the
+    /// granted subset and emits one increment on
+    /// `hort_oci_v2_auth_scope_actions_granted_total`. (ADR 0036: the
+    /// user-leg is grants, not the old admin short-circuit.)
+    #[test]
+    fn oci_v2_auth_scope_actions_granted_total_emits_pull_push_delete() {
+        let snap = capture_async(|| async {
+            let (uc, tokens, users, repos) = make_use_case(
+                vec![
+                    (Permission::Read, None),
+                    (Permission::Write, None),
+                    (Permission::Delete, None),
+                ],
                 true,
+            );
+            let (plaintext, _user_id) = seed_pat_row(
+                &tokens,
+                &users,
+                false,
                 vec![Permission::Read, Permission::Write, Permission::Delete],
             );
             repos.insert(build_repo("myrepo"));
@@ -2008,8 +2054,8 @@ mod tests {
                     client_ip: Some(ip()),
                 })
                 .await
-                .expect("admin user must mint a JWT");
-            // All three actions granted (admin user-leg + full cap).
+                .expect("authorised user must mint a JWT");
+            // All three actions granted (user-leg grants + full cap).
             assert_eq!(resp.granted_subset.len(), 1);
             assert_eq!(
                 resp.granted_subset[0].actions,
@@ -2042,12 +2088,12 @@ mod tests {
             let repo_id = repo.id;
             let (uc, tokens, users, repos) =
                 make_use_case(vec![(Permission::Read, Some(repo_id))], true);
-            // Admin user → admin short-circuits user-leg, exercising
+            // Repo-scoped User Read grant → user-leg allows pull, exercising
             // the same exchange() path the cardinality test pins.
             let (plaintext, _user_id) = seed_pat_row(
                 &tokens,
                 &users,
-                true,
+                false,
                 vec![Permission::Read, Permission::Write, Permission::Delete],
             );
             repos.insert(repo);
@@ -2083,16 +2129,17 @@ mod tests {
 
     /// `hort_oci_v2_auth_scope_actions_granted_total` MUST carry
     /// EXACTLY the `action` label. Drives `exchange()` end-to-end
-    /// with an admin user so the action metric actually fires through
-    /// the live evaluator path.
+    /// with a global User Read grant so the action metric actually fires
+    /// through the live evaluator path. (ADR 0036: authority is grants,
+    /// not the old admin short-circuit.)
     #[test]
     fn oci_v2_auth_scope_actions_granted_label_set_is_exactly_action() {
         let snap = capture_async(|| async {
-            let (uc, tokens, users, repos) = make_use_case(vec![], true);
+            let (uc, tokens, users, repos) = make_use_case(vec![(Permission::Read, None)], true);
             let (plaintext, _user_id) = seed_pat_row(
                 &tokens,
                 &users,
-                true,
+                false,
                 vec![Permission::Read, Permission::Write, Permission::Delete],
             );
             repos.insert(build_repo("myrepo"));

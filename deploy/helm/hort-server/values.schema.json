@@ -67,9 +67,68 @@
               }
             }
           }
+        },
+        "dex": {
+          "description": "Optional minimal OIDC IdP sidecar (de-admin reset, spec §3). Default off. When enabled, renders a Dex Deployment+Service+ConfigMap and points HORT_OIDC_ISSUER_URL at dex.issuerUrl.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "image": {"type": "string"},
+            "imagePullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]},
+            "issuerUrl": {"type": "string"},
+            "cliClientId": {"type": "string"},
+            "adminGroup": {"type": "string"},
+            "containerPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "servicePort": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "staticAdmin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "email": {"type": "string"},
+                "username": {"type": "string"},
+                "userID": {"type": "string"},
+                "passwordHashSecret": {"type": "string"},
+                "passwordHashSecretKey": {"type": "string"}
+              }
+            },
+            "resources": {"type": "object"}
+          }
         }
       },
       "allOf": [
+        {
+          "description": "If auth.dex.enabled, provider must be oidc, dex.issuerUrl must be non-empty, and the static-admin password-hash Secret must be set. The chart points HORT_OIDC_ISSUER_URL at Dex and Dex needs its admin hash; surface the misconfig at install time.",
+          "if": {
+            "properties": {
+              "dex": {
+                "type": "object",
+                "properties": {"enabled": {"const": true}},
+                "required": ["enabled"]
+              }
+            },
+            "required": ["dex"]
+          },
+          "then": {
+            "properties": {
+              "provider": {"const": "oidc"},
+              "dex": {
+                "type": "object",
+                "required": ["issuerUrl", "staticAdmin"],
+                "properties": {
+                  "issuerUrl": {"type": "string", "minLength": 1},
+                  "staticAdmin": {
+                    "type": "object",
+                    "required": ["passwordHashSecret"],
+                    "properties": {
+                      "passwordHashSecret": {"type": "string", "minLength": 1}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         {
           "description": "Rule 2 cont'd: if provider == oidc, oidc.issuerUrl + oidc.audience must be non-empty.",
           "if": {

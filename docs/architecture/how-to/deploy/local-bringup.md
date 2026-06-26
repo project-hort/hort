@@ -156,22 +156,31 @@ your roles per [`postgres-roles.md`](postgres-roles.md), set
 ## 5. Mint the operator and cron tokens
 
 `hort-server admin issue-svc-token` is the only path to mint long-lived
-service-account tokens. It is **DSN-authorised**: the command needs
-operator-level Postgres access (which you have, since you're running
+**non-admin** service-account tokens. It is **DSN-authorised**: the command
+needs operator-level Postgres access (which you have, since you're running
 it locally), not a caller-principal Bearer token. No HTTP, no
-authentication.
+authentication. Admin is **not** a service-account capability —
+`issue-svc-token` rejects `--permission=admin` (ADR 0038).
 
 ```bash
-# 5.1 — workstation operator token. Used by hort-cli on your workstation
-#       for `admin task invoke <kind>` and any future HTTP admin work.
-hort-server admin issue-svc-token \
-    --name=ops \
-    --permission=admin \
-    --output=stdout
-# → hort_svc_<48-chars>  (paste into `hort-cli auth login --paste`)
+# 5.1 — first admin (bootstrap-session). Admin work is gated behind a
+#       short-lived (≤1 h) non-service-account token, not a long-lived
+#       svc-token. The command is doubly gated: operator-level DSN access
+#       AND HORT_TOKEN_ALLOW_ADMIN=true (an issuance-time gate read here
+#       from your shell — the running hort-server does NOT need it set).
+HORT_TOKEN_ALLOW_ADMIN=true hort-server admin bootstrap-session --ttl 1h
+# → hort_pat_<…>  (paste into `hort-cli auth login --paste`)
 ```
 
-If you do not yet need an operator workstation token, skip 5.1 — the
+Use the bootstrap-session token for `admin task invoke <kind>` and HTTP admin
+work (token-mint, user management). For a team, wire an IdP and switch to the
+steady-state human-admin path (IdP → admin CliSession); a Dex
+`staticPasswords`-only admin is non-admin (no `groups` claim). The full recipe,
+including the Dex caveat, is in
+[`admin-identity-and-dex.md`](admin-identity-and-dex.md) (standing decision:
+ADR 0038).
+
+If you do not yet need an admin token, skip 5.1 — the
 cron-job tokens below are independent.
 
 ```bash
@@ -195,11 +204,6 @@ hort-server admin issue-svc-token \
     --name=cron-advisory-watch \
     --permission=admin_task_invoke \
     --output=file:/var/run/hort/advisory-watch-token
-
-hort-server admin issue-svc-token \
-    --name=cron-eventstore-archive \
-    --permission=admin_task_invoke \
-    --output=file:/var/run/hort/eventstore-archive-token
 ```
 
 The command is **idempotent**: re-running with the same `--name`
@@ -210,10 +214,14 @@ token and writes a fresh value.
 Token-cap permission notes:
 
 - `admin_task_invoke` is the right cap for cron-job tokens. It gates
-  `POST /api/v1/admin/tasks/:kind` and nothing else.
-- `admin` would over-grant. Only use it on the workstation operator
-  token in 5.1 if you need HTTP admin endpoints (token-mint, user
-  management, gitops apply).
+  `POST /api/v1/admin/tasks/:kind` and nothing else. It does **not** confer
+  the `task:destructive` claim, so it cannot run the destructive tasks
+  (`retention-purge`, `eventstore-archive`, `retention-evaluate`) — those
+  need a fresh admin session (§5.1).
+- `admin` is **not** mintable as a svc-token cap (`issue-svc-token` rejects
+  `--permission=admin`, ADR 0038). HTTP admin endpoints (token-mint, user
+  management, gitops apply) need the bootstrap-session token from §5.1 or an
+  IdP-backed admin CliSession.
 - For cron-job tokens to actually authorise the task they invoke,
   the matching `PermissionGrant` row must also exist for the SA's
   user. See §7.3.
@@ -379,7 +387,7 @@ Convert the bare token file written in §5.2 into an `EnvironmentFile`
 shape (`TOKEN=hort_svc_...`):
 
 ```bash
-for name in staging-sweep rescan advisory-watch eventstore-archive; do
+for name in staging-sweep rescan advisory-watch; do
     echo "TOKEN=$(cat /var/run/hort/${name}-token)" \
         | sudo tee /var/run/hort/${name}-token.env > /dev/null
     sudo chmod 0640 /var/run/hort/${name}-token.env
@@ -397,7 +405,8 @@ canonical cadence (matches the Helm chart's CronJob defaults — see
 | `staging-sweep` | `*:0/15` (every 15 minutes) | Cleans abandoned stateful-upload sessions |
 | `cron-rescan` | `*-*-* 02:00:00` (nightly) | Re-scans artifacts against current advisory DB |
 | `advisory-watch` | `*-*-* 03:00:00` (nightly) | Pulls fresh advisory feed |
-| `eventstore-archive` | `Sun *-*-* 04:00:00` (weekly) | Eventstore retention sweep — runs `seal_and_remove` under the per-day idempotency key |
+
+> **Destructive tasks** (`eventstore-archive`, `retention-purge`, `retention-evaluate`) are **not** set up as unattended timers — an `admin_task_invoke` svc-token cannot run them (they need the `task:destructive` claim — see §5.2). Run them by hand with the bootstrap-session admin token (§5.1), or track the approval-workflow follow-on (GitLab issue #2).
 
 Enable:
 
@@ -406,8 +415,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now \
     hort-task-staging-sweep.timer \
     hort-task-rescan.timer \
-    hort-task-advisory-watch.timer \
-    hort-task-eventstore-archive.timer
+    hort-task-advisory-watch.timer
 sudo systemctl list-timers --all
 ```
 
@@ -564,11 +572,12 @@ hort-worker healthcheck
 
 ### 9.4 Token-protected endpoint round-trip
 
-Use the workstation operator token from §5.1 (or one of the cron
+Use the admin (bootstrap-session) token from §5.1 (or one of the cron
 tokens if you skipped 5.1):
 
 ```bash
-TOKEN=hort_svc_...   # paste
+TOKEN=hort_...   # paste (hort_pat_… for the §5.1 admin token,
+                 #         hort_svc_… for a cron token)
 
 curl -sf -H "Authorization: Bearer $TOKEN" \
     http://localhost:8080/api/v1/auth/whoami | jq .
@@ -941,8 +950,14 @@ smoke pipeline to confirm the new token works, **then** revoke the
 old via `--rotate`. (The `--rotate` flag does the revoke atomically,
 so a fully zero-downtime rotation needs you to mint without
 `--rotate` first, smoke, then revoke the old explicitly via
-`DELETE /api/v1/admin/tokens/:id` — which needs an admin token; the
-single-step `--rotate` is acceptable for most CI cadences.)
+`DELETE /api/v1/admin/tokens/:id` — which needs an admin token. Admin is
+not a service-account capability (ADR 0038); obtain a short-lived admin
+token via the DSN-gated `HORT_TOKEN_ALLOW_ADMIN=true hort-server admin
+bootstrap-session --ttl 1h` (the no-IdP / break-glass path) or via an
+IdP-backed admin CliSession — see
+[`admin-identity-and-dex.md`](admin-identity-and-dex.md). The single-step
+`--rotate` avoids needing the admin token at all and is acceptable for most
+CI cadences.)
 
 ### 10.6 Audit and verification
 
@@ -1008,9 +1023,10 @@ A short list, all corresponding to either anti-pattern bullets in
 [`docs/auth-catalog.md`](../../../auth-catalog.md) or to the
 architect-skill review-only rules:
 
-- **Don't reuse the workstation operator token (§5.1) for CI.** That
-  token has `admin` cap — a CI compromise gives admin authority on
-  the whole instance. Mint per-pipeline `write`-capped tokens.
+- **Don't reuse the §5.1 admin (bootstrap-session) token for CI.** It is a
+  short-lived full-authority admin token — a CI compromise gives admin
+  authority on the whole instance, and it expires fast anyway. Mint
+  per-pipeline `write`-capped non-admin svc-tokens instead.
 - **Don't share one token across multiple pipelines.** Cheap to mint
   one per pipeline; audit attribution is then per-consumer.
 - **Don't put the token in `Authorization: Bearer` headers logged
@@ -1059,8 +1075,8 @@ echo "TOKEN=$(cat /var/run/hort/rescan-token)" \
 sudo systemctl daemon-reload
 ```
 
-Workstation operator tokens are paste-tokens, so rotation is:
-re-mint, paste into `hort-cli auth login --paste` on the workstation,
+Bootstrap-session admin tokens (§5.1) are paste-tokens, so rotation is:
+re-mint via `bootstrap-session`, paste into `hort-cli auth login --paste` on the workstation,
 discard the old value. The old token is invalidated server-side as
 soon as `--rotate` runs.
 

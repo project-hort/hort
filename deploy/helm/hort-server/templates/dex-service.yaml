@@ -1,0 +1,29 @@
+{{/*
+Dex IdP Service — the example/dogfood minimal OIDC IdP sidecar.
+Renders ONLY when `auth.dex.enabled` is true (default false).
+
+ClusterIP so hort-server fetches Dex's JWKS / discovery in-cluster. The
+issuer URL operators advertise to clients (auth.dex.issuerUrl) must route
+to this Service (typically via the same ingress as hort-server, e.g.
+https://<host>/dex). For the in-cluster iss/JWKS match keep
+auth.dex.issuerUrl reachable from the hort-server pod.
+*/}}
+{{- if .Values.auth.dex.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hort-server.fullname" . }}-dex
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/component: dex
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "hort-server.selectorLabels" . | nindent 4 }}
+    hort-server.io/component: dex
+  ports:
+    - name: http
+      port: {{ .Values.auth.dex.servicePort }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

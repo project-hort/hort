@@ -1,0 +1,39 @@
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: cronjob-tasks
+spec:
+  # Scheduled-housekeeping identity: the SA whose token the in-cluster /
+  # on-host CronJobs mount to invoke non-destructive admin tasks
+  # (`hort-cli admin task invoke <kind>` for noop, staging-sweep,
+  # cron-rescan-tick, advisory-watch-tick, eventstore-checkpoint, …).
+  #
+  # Non-admin. The task-invoke authority is the standalone
+  # serviceAccount-subject PermissionGrant in
+  # `auth/grants/cronjob-tasks-task-invoke.yaml`
+  # (`permission: admin_task_invoke`, global). `admin_task_invoke` is the
+  # narrow "may enqueue an admin task" cap, not the `admin` bit, and is not
+  # expressible on the SA envelope, so the standalone grant is the only
+  # carrier.
+  #
+  # Destructive tasks (retention-evaluate, retention-purge,
+  # eventstore-archive) need `admin_task_invoke` AND the `task:destructive`
+  # claim. A `hort_svc_*` SA token is claimless, so it cannot run them.
+  # The destructive CronJobs are disabled-by-default; run them by hand with
+  # a Dex-backed admin CliSession or a narrow HORT_TOKEN_ALLOW_ADMIN-gated
+  # token. See the destructive CronJob templates for the operator note.
+  #
+  # The SA envelope requires >= 1 repo + role in {developer, reader}; that
+  # constraint is intentional. The repo set is unused by the task-invoke
+  # path (task invocation is gated on the global admin_task_invoke grant,
+  # not per-repo) but must be present and reference declared repos. Keep in
+  # sync with `repositories/`.
+  role: reader
+  repositories:
+    - cargo-virtual
+    - crates-proxy
+    - dockerhub-proxy
+    - quay-proxy
+    - npm-proxy
+    - hort-oci
+    - hort-crates

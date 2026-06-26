@@ -8,16 +8,24 @@
 //! `INSERT INTO api_tokens` either — the SQL work happens in
 //! `PgApiTokenRepository`.
 //!
-//! Shape: a nested subcommand enum — today only `IssueSvcToken`; future
-//! operations (list-tokens, rotate-signing-key, …) each get a discrete
-//! variant without re-shaping [`Command::Admin`].
+//! Shape: a nested subcommand enum — `IssueSvcToken` and
+//! `BootstrapSession`; future operations (list-tokens,
+//! rotate-signing-key, …) each get a discrete variant without
+//! re-shaping [`Command::Admin`].
 //!
-//! There is no `bootstrap` subcommand: the
-//! HTTP-Basic-against-local-admin-row identity path it once seeded
-//! was removed (commit b7fd6d65).
-//! The minimal-setup bring-up path is this
-//! command — operator runs `admin issue-svc-token` and pastes the
-//! resulting `hort_svc_*` into `hort-cli auth login --paste`.
+//! `issue-svc-token` mints a strictly **non-admin** service-account
+//! token for a *pre-existing* gitops `ServiceAccount` (Entry 4 /
+//! ADR 0012). It rejects `--permission=admin` and never fabricates an
+//! admin identity; grants flow through the audited gitops apply path.
+//!
+//! `bootstrap-session` is the narrow DSN-gated first-admin /
+//! break-glass path: it mints a short-lived (≤ 1 h) full-cap admin
+//! `Pat` for the reserved non-service-account `bootstrap-admin` user,
+//! gated by `HORT_TOKEN_ALLOW_ADMIN`. Steady-state human admin is
+//! IdP-backed (OIDC → CliSession); this command is only for the
+//! one-time wire-up (or break-glass when the IdP is down). The old
+//! HTTP-Basic-against-local-admin-row identity path remains removed
+//! (commit b7fd6d65).
 //!
 //! [`Command::Admin`]: super::Command::Admin
 
@@ -45,7 +53,7 @@ use hort_app::use_cases::api_token_use_case::{
 use hort_app::use_cases::user_use_case::{CreateUser, UserPrivileges, UserUseCase};
 use hort_domain::entities::api_token::ApiToken;
 use hort_domain::entities::rbac::Permission;
-use hort_domain::entities::user::AuthProvider;
+use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::events::ApiActor;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::ports::event_store::EventStore;
@@ -91,6 +99,22 @@ pub enum AdminSubcommand {
     /// direct kube-secret writing once the cluster RBAC surface is
     /// finalised. No pre-v1 action expected.
     IssueSvcToken(IssueSvcTokenArgs),
+
+    /// Mint a short-lived first-admin / break-glass admin token.
+    ///
+    /// DSN-gated (operator-level Postgres access) and additionally
+    /// gated on `HORT_TOKEN_ALLOW_ADMIN=true` — it refuses otherwise.
+    /// Creates (or reuses) the reserved **non-service-account** admin
+    /// user `bootstrap-admin` and mints it a short-lived (≤ 1 h) `Pat`
+    /// carrying an explicit FULL admin cap. Any prior `bootstrap-admin`
+    /// token is revoked first (single active bootstrap token).
+    ///
+    /// This is the narrow no-IdP bootstrap: use it once to wire the
+    /// IdP (Dex / SSO) + the group→`admin` `ClaimMapping`, then switch
+    /// to OIDC → CliSession for steady-state admin. Keep it for
+    /// break-glass when the IdP is down. Not a first-class admin model
+    /// (ADR 0012 / ADR 0013).
+    BootstrapSession(BootstrapSessionArgs),
 }
 
 /// Arguments to `admin issue-svc-token`.
@@ -140,11 +164,35 @@ pub struct IssueSvcTokenArgs {
     pub expires_in_days: u32,
 }
 
+/// Arguments to `admin bootstrap-session`.
+#[derive(Debug, Args)]
+pub struct BootstrapSessionArgs {
+    /// Output mode for the issued token.
+    ///
+    /// - `stdout` (default): print to stdout.
+    /// - `file:<path>`: write to `<path>` with mode 0600.
+    ///
+    /// Same shape as `issue-svc-token`; `kube-secret` is not supported
+    /// here (the bootstrap token is a one-off break-glass credential,
+    /// not a mounted secret).
+    #[arg(long, default_value = "stdout")]
+    pub output: String,
+
+    /// Token lifetime. Accepts a bare seconds count or a single-unit
+    /// suffix `s`/`m`/`h` (e.g. `1h`, `30m`, `900s`, `3600`). Default
+    /// `1h`. Clamped to ≤ 1 h — the ADR-0013 admin cap. A longer value
+    /// is silently clamped down (the use case enforces the ceiling);
+    /// `0` is rejected.
+    #[arg(long, default_value = "1h")]
+    pub ttl: String,
+}
+
 /// Entry point. Dispatches to the subcommand handler. Process exit code
 /// translation happens here (0 on success, non-zero on any failure).
 pub fn run(cmd: AdminCommand) -> ExitCode {
     match cmd.command {
         AdminSubcommand::IssueSvcToken(args) => run_issue_svc_token(args),
+        AdminSubcommand::BootstrapSession(args) => run_bootstrap_session(args),
     }
 }
 
@@ -163,6 +211,50 @@ fn run_issue_svc_token(args: IssueSvcTokenArgs) -> ExitCode {
 /// `GET /admin/users` as a clearly-namespaced service principal.
 fn svc_username(name: &str) -> String {
     format!("hort-svc-{name}")
+}
+
+/// Validate the user `issue-svc-token` is about to mint for.
+///
+/// `issue-svc-token` requires a PRE-EXISTING gitops `ServiceAccount`
+/// and never fabricates a user (ADR 0012). `found` is the
+/// `find_by_username` result for `username` (= `svc:<svc_name>`); the
+/// resolution rules are:
+///
+/// - `None` (no such user) → error: define the SA in gitops + apply
+///   first. The caller must NOT create the user.
+/// - exists but `!is_service_account` → error (the existing guard).
+/// - exists, is a service account, but `is_admin` → error: service
+///   accounts are strictly non-admin (Entry 4 / ADR 0012); refuse
+///   rather than mint an admin-capable token.
+/// - exists, service account, non-admin → return it for the mint.
+///
+/// Pure (operates on the already-fetched `Option<User>`) so every
+/// branch is unit-testable without a database.
+fn resolve_svc_user(found: Option<User>, username: &str, svc_name: &str) -> anyhow::Result<User> {
+    match found {
+        Some(u) => {
+            if !u.is_service_account {
+                anyhow::bail!(
+                    "user {username:?} exists but is not a service account; \
+                     refusing to issue a service-account token for it"
+                );
+            }
+            if u.is_admin {
+                anyhow::bail!(
+                    "refusing to issue a token for an admin user via issue-svc-token; \
+                     service accounts must be non-admin (Entry 4 / ADR 0012)"
+                );
+            }
+            Ok(u)
+        }
+        None => {
+            anyhow::bail!(
+                "service account {svc_name:?} not found — define it as a ServiceAccount in \
+                 gitops and apply before issuing its token (grants flow through the \
+                 audited apply path, ADR 0012)."
+            );
+        }
+    }
 }
 
 async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
@@ -187,17 +279,14 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<_>>()?;
 
+    // Service accounts are strictly non-admin (Entry 4 / ADR 0012):
+    // `issue-svc-token` must never mint an admin-cap token. Reject
+    // `--permission=admin` here, before any DB work — there is no
+    // operator opt-in for it.
+    reject_admin_permission(&permissions)?;
+
     // Parse output mode.
-    let output_path: Option<String> = if args.output == "stdout" {
-        None
-    } else if let Some(path) = args.output.strip_prefix("file:") {
-        Some(path.to_owned())
-    } else {
-        anyhow::bail!(
-            "unknown output mode {:?}; valid values: stdout, file:<path>",
-            args.output
-        );
-    };
+    let output_path = parse_output_mode(&args.output)?;
 
     let cfg = MinimalConfig::from_env().context("parsing environment")?;
     telemetry::init_tracing(cfg.log_format)?;
@@ -231,60 +320,15 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     // the event store in a no-broadcast publisher.
     let event_publisher = Arc::new(EventStorePublisher::without_broadcast(event_store));
 
-    // Find or create the service-account user.
+    // Require a PRE-EXISTING gitops ServiceAccount. The command no
+    // longer creates a user when absent: an SA's authority must flow
+    // through the audited gitops apply path (ADR 0012), not be
+    // fabricated here. It also no longer creates an `is_admin` user —
+    // service accounts are strictly non-admin (Entry 4).
     let username = svc_username(&args.name);
     let user_uc = UserUseCase::new(user_repo.clone());
-    let svc_user = match user_uc.find_by_username(&username).await? {
-        Some(u) => {
-            if !u.is_service_account {
-                anyhow::bail!(
-                    "user {username:?} exists but is not a service account; \
-                     refusing to issue a service-account token for it"
-                );
-            }
-            u
-        }
-        None => {
-            info!(%username, "creating service-account user");
-            user_uc
-                .create(
-                    CreateUser {
-                        username: username.clone(),
-                        email: format!("{username}@hort-internal.local"),
-                        auth_provider: AuthProvider::Local,
-                        external_id: None,
-                        display_name: Some(format!("Service account: {}", args.name)),
-                    },
-                    UserPrivileges {
-                        is_active: true,
-                        // `is_admin: true` looks broad but is intentional —
-                        // `RbacEvaluator::authorize` AND-s `user_leg` and
-                        // `cap_leg` (ADR 0012). The TOKEN's
-                        // `declared_permissions` cap (passed as
-                        // `args.permissions`, default `[admin_task_invoke]`)
-                        // narrows the effective surface to exactly the
-                        // declared set. Setting `is_admin: false` here
-                        // makes `user_leg` fail for any non-trivial
-                        // permission because the bootstrap user has no
-                        // real role/grant rows, which would have meant
-                        // the svc-account token authenticates but every
-                        // authorize check 403s — defeating the whole
-                        // `admin issue-svc-token` story.
-                        //
-                        // Stolen-token blast radius is bounded by the
-                        // cap, not by `is_admin`: a thief gets exactly
-                        // the declared permissions (typically only
-                        // `admin_task_invoke`), regardless of the
-                        // underlying user privilege. This mirrors the
-                        // machine-identity reasoning for federated
-                        // SAs (ADR 0018).
-                        is_admin: true,
-                        is_service_account: true,
-                    },
-                )
-                .await?
-        }
-    };
+    let found = user_uc.find_by_username(&username).await?;
+    let svc_user = resolve_svc_user(found, &username, &args.name)?;
 
     // Check for an existing token with the same name on this user.
     let existing: Option<ApiToken> =
@@ -364,13 +408,59 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     );
 
     // Write the plaintext token to the requested output.
+    write_plaintext(&output_path, &issued.plaintext)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared output helpers
+// ---------------------------------------------------------------------------
+
+/// Reject `Permission::Admin` in an `issue-svc-token` permission set.
+///
+/// Service accounts are strictly non-admin (Entry 4 / ADR 0012) and
+/// there is no operator opt-in for an admin-cap svc token — the only
+/// admin mint path is `bootstrap-session`. Pure so the rejection is
+/// unit-testable without a database.
+fn reject_admin_permission(permissions: &[Permission]) -> anyhow::Result<()> {
+    if permissions.contains(&Permission::Admin) {
+        anyhow::bail!(
+            "--permission=admin is not permitted for service-account tokens — \
+             service accounts are strictly non-admin (Entry 4 / ADR 0012). \
+             Human admin uses OIDC → CliSession; first-admin bootstrap uses \
+             `hort-server admin bootstrap-session`."
+        );
+    }
+    Ok(())
+}
+
+/// Parse an `--output` value into an optional file path.
+///
+/// `stdout` → `None` (print to stdout). `file:<path>` → `Some(path)`.
+/// Any other value is an error. `kube-secret` is intentionally NOT
+/// handled here — `issue-svc-token` rejects it earlier with a tailored
+/// message, and `bootstrap-session` never advertises it.
+fn parse_output_mode(output: &str) -> anyhow::Result<Option<String>> {
+    if output == "stdout" {
+        Ok(None)
+    } else if let Some(path) = output.strip_prefix("file:") {
+        Ok(Some(path.to_owned()))
+    } else {
+        anyhow::bail!("unknown output mode {output:?}; valid values: stdout, file:<path>")
+    }
+}
+
+/// Write the plaintext token to the resolved output sink.
+///
+/// `None` → stdout (the Helm / provisioning caller reads it). `Some(path)`
+/// → write to `<path>` with mode 0600 so only the owning process can read.
+fn write_plaintext(output_path: &Option<String>, plaintext: &str) -> anyhow::Result<()> {
     match output_path {
         None => {
-            // stdout — Helm bootstrap Job reads this.
-            println!("{}", issued.plaintext);
+            println!("{plaintext}");
         }
-        Some(ref path) => {
-            // file:<path> — mode 0600 so only the owning process can read.
+        Some(path) => {
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -378,12 +468,11 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
                 .mode(0o600)
                 .open(path)
                 .with_context(|| format!("opening output file {path:?}"))?;
-            file.write_all(issued.plaintext.as_bytes())
+            file.write_all(plaintext.as_bytes())
                 .with_context(|| format!("writing token to {path:?}"))?;
             eprintln!("info: token written to {path}");
         }
     }
-
     Ok(())
 }
 
@@ -436,6 +525,218 @@ fn build_token_use_case(
     )
 }
 
+// ---------------------------------------------------------------------------
+// bootstrap-session
+// ---------------------------------------------------------------------------
+
+/// Reserved username for the first-admin / break-glass admin identity.
+///
+/// This is the ONE deliberate admin-identity creation in the CLI. It is
+/// a NON-service-account user (`is_admin = true`,
+/// `is_service_account = false`) — service accounts are strictly
+/// non-admin (Entry 4 / ADR 0012), so the bootstrap admin is
+/// intentionally not one.
+const BOOTSTRAP_ADMIN_USERNAME: &str = "bootstrap-admin";
+
+/// Token row name (and audit label) for the bootstrap-admin token.
+const BOOTSTRAP_ADMIN_TOKEN_NAME: &str = "bootstrap-session";
+
+/// The full admin cap minted onto the bootstrap token: every
+/// [`Permission`] variant, with no per-repo restriction
+/// (`repository_ids = None`). The explicit `Admin` permission is
+/// REQUIRED — the B1 fail-closed backstop denies an admin-claim `Pat`
+/// carrying a `None`/admin-less cap, so the cap must be present and
+/// full. Listed exhaustively (the enum has no iterator); a new variant
+/// is a deliberate review point for whether the break-glass admin
+/// should hold it (it should — full cap is the contract).
+fn full_admin_cap() -> Vec<Permission> {
+    vec![
+        Permission::Read,
+        Permission::Write,
+        Permission::Delete,
+        Permission::Admin,
+        Permission::AdminTaskInvoke,
+        Permission::Curate,
+        Permission::Prefetch,
+    ]
+}
+
+/// Gate `bootstrap-session` on the `HORT_TOKEN_ALLOW_ADMIN` opt-in.
+///
+/// Pure so the gate is unit-testable without a database. Refuses unless
+/// the operator opted in — the command is the DSN-gated first-admin /
+/// break-glass path; steady-state admin is IdP-backed.
+fn require_allow_admin_tokens(allow_admin_tokens: bool) -> anyhow::Result<()> {
+    if !allow_admin_tokens {
+        anyhow::bail!(
+            "bootstrap-session requires HORT_TOKEN_ALLOW_ADMIN=true; it is the \
+             DSN-gated first-admin / break-glass path. Steady-state admin is \
+             IdP-backed (OIDC → CliSession)."
+        );
+    }
+    Ok(())
+}
+
+/// Parse a `--ttl` value into seconds. Accepts a bare integer (seconds)
+/// or a single-unit suffix `s` / `m` / `h`. Rejects `0`, empty, and
+/// anything else. Kept dependency-free (no `humantime`) since the
+/// accepted surface is intentionally tiny.
+fn parse_ttl_secs(ttl: &str) -> anyhow::Result<u64> {
+    let ttl = ttl.trim();
+    if ttl.is_empty() {
+        anyhow::bail!("--ttl must not be empty");
+    }
+    let (num, mult): (&str, u64) = match ttl.as_bytes().last() {
+        Some(b's') => (&ttl[..ttl.len() - 1], 1),
+        Some(b'm') => (&ttl[..ttl.len() - 1], 60),
+        Some(b'h') => (&ttl[..ttl.len() - 1], 3600),
+        Some(b'0'..=b'9') => (ttl, 1),
+        _ => anyhow::bail!("invalid --ttl {ttl:?}; use a bare seconds count or a s/m/h suffix"),
+    };
+    let n: u64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid --ttl {ttl:?}; not a number"))?;
+    let secs = n
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("--ttl {ttl:?} overflows"))?;
+    if secs == 0 {
+        anyhow::bail!("--ttl must be at least 1 second");
+    }
+    Ok(secs)
+}
+
+/// Synchronous entry point for `admin bootstrap-session`.
+fn run_bootstrap_session(args: BootstrapSessionArgs) -> ExitCode {
+    super::run_with_runtime(move || bootstrap_session_async(args), |_| ExitCode::SUCCESS)
+}
+
+async fn bootstrap_session_async(args: BootstrapSessionArgs) -> anyhow::Result<()> {
+    // Parse output + TTL up-front, before any DB work.
+    let output_path = parse_output_mode(&args.output)?;
+    let ttl_secs = parse_ttl_secs(&args.ttl)?;
+
+    let cfg = MinimalConfig::from_env().context("parsing environment")?;
+    telemetry::init_tracing(cfg.log_format)?;
+
+    // Gate: bootstrap-session is the DSN-gated first-admin / break-glass
+    // path and additionally requires the operator's explicit opt-in.
+    // Steady-state admin is IdP-backed (OIDC → CliSession).
+    require_allow_admin_tokens(cfg.allow_admin_tokens)?;
+
+    let pool = PgPoolOptions::new()
+        .connect(&cfg.database_url)
+        .await
+        .context("connecting to postgres")?;
+    // Runtime-DML only (INSERT into `users` + `api_tokens`); no DDL.
+    // Mirrors `issue_svc_token_async`.
+    migrate::assert_current(&pool)
+        .await
+        .context("verifying schema version")?;
+
+    let user_repo: Arc<dyn UserRepository> = Arc::new(PgUserRepository::new(pool.clone()));
+    let token_repo: Arc<dyn ApiTokenRepository> = Arc::new(PgApiTokenRepository::new(pool.clone()));
+    let event_store: Arc<dyn EventStore> = Arc::new(
+        PgEventStore::new(pool.clone())
+            .await
+            .context("constructing event store")?,
+    );
+    let event_publisher = Arc::new(EventStorePublisher::without_broadcast(event_store));
+
+    // Find or create the reserved bootstrap-admin user. This is the ONE
+    // deliberate admin-identity creation: a NON-service-account user
+    // with `is_admin = true`.
+    let user_uc = UserUseCase::new(user_repo.clone());
+    let admin_user = match user_uc.find_by_username(BOOTSTRAP_ADMIN_USERNAME).await? {
+        Some(u) => {
+            // Defence-in-depth: the row must be the expected shape. A
+            // pre-existing `bootstrap-admin` that is somehow a service
+            // account is a misconfiguration — refuse rather than mint.
+            if u.is_service_account {
+                anyhow::bail!(
+                    "user {BOOTSTRAP_ADMIN_USERNAME:?} exists but is a service account; \
+                     the bootstrap admin must be a non-service-account user"
+                );
+            }
+            u
+        }
+        None => {
+            info!(
+                username = BOOTSTRAP_ADMIN_USERNAME,
+                "creating bootstrap-admin user"
+            );
+            user_uc
+                .create(
+                    CreateUser {
+                        username: BOOTSTRAP_ADMIN_USERNAME.to_owned(),
+                        email: format!("{BOOTSTRAP_ADMIN_USERNAME}@hort-internal.local"),
+                        auth_provider: AuthProvider::Local,
+                        external_id: None,
+                        display_name: Some("Bootstrap admin (break-glass)".to_owned()),
+                    },
+                    UserPrivileges {
+                        is_active: true,
+                        // The deliberate admin-identity creation.
+                        is_admin: true,
+                        // Strictly NOT a service account (Entry 4).
+                        is_service_account: false,
+                    },
+                )
+                .await?
+        }
+    };
+
+    // Single active bootstrap token: revoke any prior one before minting.
+    if let Some(prev) = find_token_by_name(
+        token_repo.as_ref(),
+        admin_user.id,
+        BOOTSTRAP_ADMIN_TOKEN_NAME,
+    )
+    .await?
+    {
+        info!(token_id = %prev.id, "revoking prior bootstrap-admin token");
+        let token_uc = build_token_use_case(
+            token_repo.clone(),
+            user_repo.clone(),
+            event_publisher.clone(),
+        );
+        token_uc
+            .revoke(
+                ApiActor {
+                    user_id: admin_user.id,
+                },
+                prev.id,
+                true,
+            )
+            .await
+            .context("revoking prior bootstrap-admin token")?;
+    }
+
+    // System-mint a short-lived (≤ 1 h) full-cap admin Pat. The use case
+    // requires the explicit admin cap (B1) and bounds the lifetime to
+    // the ADR-0013 admin ceiling.
+    let token_uc = build_token_use_case(token_repo, user_repo, event_publisher);
+    let issued = token_uc
+        .issue_for_bootstrap_admin_system(
+            admin_user.id,
+            BOOTSTRAP_ADMIN_TOKEN_NAME.to_owned(),
+            full_admin_cap(),
+            ttl_secs,
+        )
+        .await
+        .context("minting bootstrap-admin token")?;
+
+    info!(
+        token_id = %issued.id,
+        user_id = %admin_user.id,
+        expires_at = ?issued.expires_at,
+        "bootstrap-admin token issued"
+    );
+
+    write_plaintext(&output_path, &issued.plaintext)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,7 +770,9 @@ mod tests {
         let super::super::Command::Admin(admin_cmd) = cli.command else {
             panic!("expected Admin");
         };
-        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command;
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
         assert_eq!(args.name, "cronjob-tasks");
         // Default permission.
         assert_eq!(args.permissions, vec!["admin_task_invoke"]);
@@ -497,7 +800,9 @@ mod tests {
         let super::super::Command::Admin(admin_cmd) = cli.command else {
             panic!("expected Admin");
         };
-        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command;
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
         assert_eq!(args.expires_in_days, 30);
     }
 
@@ -518,7 +823,9 @@ mod tests {
         let super::super::Command::Admin(admin_cmd) = cli.command else {
             panic!("expected Admin");
         };
-        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command;
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
         assert_eq!(args.permissions, vec!["read", "write"]);
     }
 
@@ -537,7 +844,9 @@ mod tests {
         let super::super::Command::Admin(admin_cmd) = cli.command else {
             panic!("expected Admin");
         };
-        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command;
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
         assert_eq!(args.output, "file:/tmp/token.txt");
     }
 
@@ -555,7 +864,9 @@ mod tests {
         let super::super::Command::Admin(admin_cmd) = cli.command else {
             panic!("expected Admin");
         };
-        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command;
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
         assert!(args.rotate);
     }
 
@@ -601,5 +912,211 @@ mod tests {
         let output = "stdout";
         assert!(output.strip_prefix("file:").is_none());
         assert_ne!(output, "kube-secret");
+    }
+
+    // -- issue-svc-token: --permission=admin rejection ----------------------
+
+    #[test]
+    fn issue_svc_token_rejects_admin_permission() {
+        // `--permission=admin` must be rejected before any DB work —
+        // service accounts are strictly non-admin (Entry 4 / ADR 0012).
+        let err = reject_admin_permission(&[Permission::Read, Permission::Admin]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not permitted for service-account tokens"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains("bootstrap-session"),
+            "should point at the bootstrap path: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_svc_token_accepts_non_admin_permissions() {
+        // The common non-admin caps pass the gate.
+        reject_admin_permission(&[Permission::AdminTaskInvoke]).expect("admin_task_invoke ok");
+        reject_admin_permission(&[Permission::Read, Permission::Write]).expect("read+write ok");
+        reject_admin_permission(&[Permission::Curate, Permission::Prefetch]).expect("curate ok");
+    }
+
+    // -- issue-svc-token: SA resolution (no user fabrication) ----------------
+
+    fn svc_user_row(is_service_account: bool, is_admin: bool) -> User {
+        User {
+            id: Uuid::from_u128(0x5A),
+            username: "hort-svc-cronjob-tasks".into(),
+            email: "x@hort-internal.local".into(),
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin,
+            is_service_account,
+            last_login_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn resolve_svc_user_errors_when_missing() {
+        // Missing SA → error pointing at gitops; the caller does NOT
+        // create a user (this helper returning Err is what prevents it).
+        let err = resolve_svc_user(None, "hort-svc-cronjob-tasks", "cronjob-tasks").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "unexpected: {msg}");
+        assert!(
+            msg.contains("gitops"),
+            "should point at gitops apply: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_svc_user_errors_when_not_a_service_account() {
+        let row = svc_user_row(false, false);
+        let err =
+            resolve_svc_user(Some(row), "hort-svc-cronjob-tasks", "cronjob-tasks").unwrap_err();
+        assert!(err.to_string().contains("is not a service account"));
+    }
+
+    #[test]
+    fn resolve_svc_user_errors_when_admin() {
+        // A service-account row that is somehow is_admin is refused —
+        // service accounts must be non-admin.
+        let row = svc_user_row(true, true);
+        let err =
+            resolve_svc_user(Some(row), "hort-svc-cronjob-tasks", "cronjob-tasks").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("admin user"), "unexpected: {msg}");
+        assert!(msg.contains("non-admin"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn resolve_svc_user_returns_non_admin_service_account() {
+        let row = svc_user_row(true, false);
+        let resolved =
+            resolve_svc_user(Some(row.clone()), "hort-svc-cronjob-tasks", "cronjob-tasks")
+                .expect("non-admin SA must resolve");
+        assert_eq!(resolved.id, row.id);
+        assert!(resolved.is_service_account);
+        assert!(!resolved.is_admin);
+    }
+
+    // -- output-mode parsing (shared helper) --------------------------------
+
+    #[test]
+    fn parse_output_mode_handles_stdout_and_file() {
+        assert_eq!(parse_output_mode("stdout").unwrap(), None);
+        assert_eq!(
+            parse_output_mode("file:/tmp/t.txt").unwrap(),
+            Some("/tmp/t.txt".to_string())
+        );
+        let err = parse_output_mode("kube-secret").unwrap_err();
+        assert!(err.to_string().contains("unknown output mode"));
+    }
+
+    // -- bootstrap-session: HORT_TOKEN_ALLOW_ADMIN gate ----------------------
+
+    #[test]
+    fn bootstrap_session_requires_allow_admin_tokens() {
+        // Without the opt-in: refused with a message pointing at the env
+        // var and the IdP-backed steady-state path.
+        let err = require_allow_admin_tokens(false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HORT_TOKEN_ALLOW_ADMIN=true"),
+            "unexpected: {msg}"
+        );
+        assert!(msg.contains("break-glass"), "unexpected: {msg}");
+        // With it: passes.
+        require_allow_admin_tokens(true).expect("opt-in must allow bootstrap-session");
+    }
+
+    // -- bootstrap-session: --ttl parsing + clamp ----------------------------
+
+    #[test]
+    fn parse_ttl_secs_accepts_units_and_bare_seconds() {
+        assert_eq!(parse_ttl_secs("1h").unwrap(), 3600);
+        assert_eq!(parse_ttl_secs("30m").unwrap(), 1800);
+        assert_eq!(parse_ttl_secs("900s").unwrap(), 900);
+        assert_eq!(parse_ttl_secs("3600").unwrap(), 3600);
+        assert_eq!(parse_ttl_secs("  1h ").unwrap(), 3600);
+    }
+
+    #[test]
+    fn parse_ttl_secs_rejects_zero_and_garbage() {
+        assert!(parse_ttl_secs("0").is_err());
+        assert!(parse_ttl_secs("0s").is_err());
+        assert!(parse_ttl_secs("").is_err());
+        assert!(parse_ttl_secs("   ").is_err());
+        assert!(parse_ttl_secs("abc").is_err());
+        assert!(parse_ttl_secs("1d").is_err()); // unsupported unit
+        assert!(parse_ttl_secs("h").is_err()); // no number
+    }
+
+    #[test]
+    fn full_admin_cap_is_every_permission_including_admin() {
+        let cap = full_admin_cap();
+        // Admin MUST be present — the B1 backstop fail-closes an
+        // admin-claim Pat with a None/admin-less cap.
+        assert!(cap.contains(&Permission::Admin));
+        // Every variant present (full cap).
+        for p in [
+            Permission::Read,
+            Permission::Write,
+            Permission::Delete,
+            Permission::Admin,
+            Permission::AdminTaskInvoke,
+            Permission::Curate,
+            Permission::Prefetch,
+        ] {
+            assert!(cap.contains(&p), "full cap missing {p:?}");
+        }
+    }
+
+    // -- bootstrap-session CLI parsing --------------------------------------
+
+    #[test]
+    fn bootstrap_session_parses_with_defaults() {
+        let cli = TestCli::try_parse_from(["hort-server", "admin", "bootstrap-session"]).unwrap();
+        let super::super::Command::Admin(admin_cmd) = cli.command else {
+            panic!("expected Admin");
+        };
+        let AdminSubcommand::BootstrapSession(args) = admin_cmd.command else {
+            panic!("expected BootstrapSession");
+        };
+        assert_eq!(args.output, "stdout");
+        assert_eq!(args.ttl, "1h");
+    }
+
+    #[test]
+    fn bootstrap_session_parses_custom_ttl_and_output() {
+        let cli = TestCli::try_parse_from([
+            "hort-server",
+            "admin",
+            "bootstrap-session",
+            "--ttl",
+            "30m",
+            "--output",
+            "file:/tmp/admin.txt",
+        ])
+        .unwrap();
+        let super::super::Command::Admin(admin_cmd) = cli.command else {
+            panic!("expected Admin");
+        };
+        let AdminSubcommand::BootstrapSession(args) = admin_cmd.command else {
+            panic!("expected BootstrapSession");
+        };
+        assert_eq!(args.ttl, "30m");
+        assert_eq!(args.output, "file:/tmp/admin.txt");
+    }
+
+    #[test]
+    fn bootstrap_admin_username_is_non_sa_reserved_name() {
+        // Pin the reserved identity name so a rename is a deliberate
+        // review point (catalog + ADR reference it).
+        assert_eq!(BOOTSTRAP_ADMIN_USERNAME, "bootstrap-admin");
+        assert_eq!(BOOTSTRAP_ADMIN_TOKEN_NAME, "bootstrap-session");
     }
 }

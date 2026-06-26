@@ -10,6 +10,19 @@
 //! - `subject: { kind: user, userId: "<uuid>" }` — direct user-id
 //!   binding (service accounts, one-off escalations); bypasses the
 //!   claim mechanism entirely.
+//! - `subject: { kind: serviceAccount, name: "maintainer-dev" }` — a
+//!   gitops-spec sugar that names a declared `ServiceAccount`. The apply
+//!   pipeline resolves it to the domain
+//!   `GrantSubject::User(<sa.backing_user_id>)` (SA aggregate lookup by
+//!   name), so the **domain `GrantSubject` taxonomy is unchanged** (still
+//!   `Claims | User`; ADR 0012's two-variant closure is preserved — this
+//!   is an authoring convenience that compiles down to `User`). An SA's
+//!   backing-user UUID is minted at apply (`Uuid::new_v4()` in
+//!   `ensure_backing_user`) and therefore unknowable when authoring, so
+//!   naming the SA is the only way to express global / curate /
+//!   admin_task_invoke authority for a service account in gitops (the
+//!   `ServiceAccount` envelope itself is repo-scoped only — see ADR 0037,
+//!   spec §9).
 //!
 //! One CRD declares exactly one grant: one `subject`, one
 //! `permission`, and an optional single `repository`. The domain
@@ -21,9 +34,12 @@
 //!
 //! Identity is subject-dependent (see [`PermissionGrantSpec::diff_identity`]):
 //! `(sorted required_claims, repository, permission)` for a `Claims`
-//! subject; `(user_id, repository, permission)` for a `User` subject.
-//! `metadata.name` is operator-cosmetic and does NOT participate in
-//! identity. The apply/diff layers (`crate::diff`) consume
+//! subject; `(user_id, repository, permission)` for a `User` subject;
+//! `(sa_name, repository, permission)` for an as-yet-unresolved
+//! `ServiceAccount` subject (the apply pipeline rewrites it to the
+//! `User` identity once the SA's backing user exists). `metadata.name`
+//! is operator-cosmetic and does NOT participate in identity. The
+//! apply/diff layers (`crate::diff`) consume
 //! [`PermissionGrantSpec::diff_identity`].
 
 use std::str::FromStr;
@@ -39,8 +55,9 @@ use crate::error::{ParseError, ValidationError};
 ///
 /// Internally tagged on `kind` so the YAML reads
 /// `subject: { kind: claims, required: [...] }` /
-/// `subject: { kind: user, userId: "<uuid>" }`. `userId` is carried as
-/// a string here (the spec layer is reference-resolving only — the
+/// `subject: { kind: user, userId: "<uuid>" }` /
+/// `subject: { kind: serviceAccount, name: "..." }`. `userId` is carried
+/// as a string here (the spec layer is reference-resolving only — the
 /// apply pipeline parses it to a `Uuid`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
@@ -54,6 +71,17 @@ pub enum GrantSubjectSpec {
     /// the apply pipeline parses it to a `Uuid`.
     #[serde(rename_all = "camelCase")]
     User { user_id: String },
+    /// Gitops-spec sugar naming a declared `ServiceAccount`. The apply
+    /// pipeline resolves `name` to the SA's backing-user UUID and
+    /// materialises the grant as the domain
+    /// `GrantSubject::User(<sa.backing_user_id>)` — the **domain
+    /// taxonomy stays two-variant** (`Claims | User`; ADR 0012). Cross-spec
+    /// validation (`crate::desired`) enforces that a `ServiceAccount` of
+    /// this `name` is declared, mirroring the `repository`-reference
+    /// check. Resolves to the same row shape an equivalent `User`-subject
+    /// grant would, so it diffs identically (no SA name leaks into the
+    /// diff identity). See ADR 0037 / spec §9.
+    ServiceAccount { name: String },
 }
 
 /// Shape of a `kind: PermissionGrant` YAML body.
@@ -66,8 +94,10 @@ pub enum GrantSubjectSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PermissionGrantSpec {
-    /// Claims-or-user subject. Mirrors
-    /// `hort_domain::entities::rbac::GrantSubject`.
+    /// Claims / user / serviceAccount subject. `Claims` and `User`
+    /// mirror `hort_domain::entities::rbac::GrantSubject` directly;
+    /// `ServiceAccount { name }` is a gitops-spec sugar the apply
+    /// pipeline resolves to `GrantSubject::User(backing_user_id)`.
     pub subject: GrantSubjectSpec,
     /// One of `read | write | delete | admin`. Validated via
     /// `Permission::FromStr`.
@@ -83,9 +113,21 @@ pub struct PermissionGrantSpec {
 ///
 /// `Claims` grants key off `(sorted required_claims, repository,
 /// permission)`; `User` grants key off `(user_id, repository,
-/// permission)`. The two arms are disjoint by construction (one
+/// permission)`. The arms are disjoint by construction (one
 /// envelope yields exactly one identity), so a single enum captures
-/// both without ambiguity.
+/// them without ambiguity.
+///
+/// A `ServiceAccount`-subject grant *resolves* to a [`GrantIdentity::User`]
+/// (keyed on the resolved `backing_user_id`) the moment the SA exists —
+/// the apply pipeline rewrites the subject to `User` before the cosmetic
+/// diff plan compares against the current rows, so a re-apply is a no-op.
+/// The [`GrantIdentity::ServiceAccount`] arm below exists only for the
+/// transient first-apply window when the SA's backing user has not yet
+/// been minted (so `name → uuid` cannot resolve): it keys on the SA name
+/// so the fresh grant classifies as `create` exactly once. It never
+/// matches a current `User`-subject row (no SA name leaks into a
+/// persisted grant — the row is always `User(backing_user_id)`), which is
+/// the intended behaviour for a not-yet-created SA grant. See ADR 0037.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GrantIdentity {
     /// `(sorted required_claims, repository, permission)`.
@@ -97,6 +139,15 @@ pub enum GrantIdentity {
     /// `(user_id, repository, permission)`.
     User {
         user_id: String,
+        repository: Option<String>,
+        permission: Permission,
+    },
+    /// `(sa_name, repository, permission)` — the transient
+    /// first-apply identity of an unresolved `ServiceAccount`-subject
+    /// grant (see the type doc). Disjoint from `User` by construction
+    /// (a persisted row is never `ServiceAccount`-keyed).
+    ServiceAccount {
+        sa_name: String,
         repository: Option<String>,
         permission: Permission,
     },
@@ -128,6 +179,11 @@ impl PermissionGrantSpec {
             }
             GrantSubjectSpec::User { user_id } => GrantIdentity::User {
                 user_id: user_id.clone(),
+                repository,
+                permission,
+            },
+            GrantSubjectSpec::ServiceAccount { name } => GrantIdentity::ServiceAccount {
+                sa_name: name.clone(),
                 repository,
                 permission,
             },
@@ -199,6 +255,42 @@ pub fn validate_permission_grant(env: &Envelope<PermissionGrantSpec>) -> Vec<Val
                     kind: Kind::PermissionGrant,
                     name: env.metadata.name.clone(),
                     detail: "subject.userId must not be blank".into(),
+                });
+            }
+        }
+        GrantSubjectSpec::ServiceAccount { name } => {
+            // Per-spec: a non-blank reference. Existence of the named
+            // ServiceAccount is checked cross-spec in `crate::desired`
+            // (it surfaces as a `DanglingReference`), mirroring the
+            // `spec.repository` reference check — a per-spec validator
+            // sees one envelope at a time and cannot resolve it.
+            if name.trim().is_empty() {
+                errors.push(ValidationError::Invalid {
+                    kind: Kind::PermissionGrant,
+                    name: env.metadata.name.clone(),
+                    detail: "subject.name (serviceAccount) must not be blank".into(),
+                });
+            }
+            // ADR 0038: service accounts are strictly non-admin — no
+            // exception, including on the standalone-grant axis. The
+            // §9 `serviceAccount`-subject grant resolves to a
+            // `GrantSubject::User(backing_user_id)`, so without this
+            // gate an operator could author a `serviceAccount` subject
+            // with `permission: admin` and have it apply as a real
+            // global Admin grant (while the identical hand-rolled
+            // `User`-subject row is rejected by the linter). This is
+            // the earliest + clearest gate; the `hort-app` apply-config
+            // linter's scoped provenance exemption is defense-in-depth.
+            if matches!(
+                Permission::from_str(&env.spec.permission),
+                Ok(Permission::Admin)
+            ) {
+                errors.push(ValidationError::Invalid {
+                    kind: Kind::PermissionGrant,
+                    name: env.metadata.name.clone(),
+                    detail: "spec.permission: a serviceAccount subject may not hold 'admin' \
+                             — service accounts are strictly non-admin (ADR 0038)"
+                        .into(),
                 });
             }
         }
@@ -356,6 +448,167 @@ mod tests {
             }
             other => panic!("expected User identity, got {other:?}"),
         }
+    }
+
+    // ---- ServiceAccount subject (ADR 0037 / spec §9) ----------------------
+
+    #[test]
+    fn parse_service_account_subject_round_trip() {
+        let body = "
+  subject: { kind: serviceAccount, name: maintainer-dev }
+  permission: read
+";
+        let env = parse_permission_grant(&p(), yaml("sa-global-read", body).as_bytes()).unwrap();
+        assert_eq!(
+            env.spec.subject,
+            GrantSubjectSpec::ServiceAccount {
+                name: "maintainer-dev".into()
+            }
+        );
+        assert_eq!(env.spec.permission, "read");
+        // Global grant (no repository) — the audited operator path.
+        assert!(env.spec.repository.is_none());
+        // Per-spec validation passes (cross-spec SA-existence is
+        // checked in `crate::desired`, not here).
+        assert!(validate_permission_grant(&env).is_empty());
+
+        match env.spec.diff_identity() {
+            GrantIdentity::ServiceAccount {
+                sa_name,
+                repository,
+                permission,
+            } => {
+                assert_eq!(sa_name, "maintainer-dev");
+                assert!(repository.is_none());
+                assert_eq!(permission, Permission::Read);
+            }
+            other => panic!("expected ServiceAccount identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_account_subject_repo_scoped_curate_round_trip() {
+        // The non-read/write authority a `ServiceAccount` envelope cannot
+        // express: curate, here repo-scoped.
+        let body = "
+  subject: { kind: serviceAccount, name: maintainer-curator }
+  permission: curate
+  repository: oci-prod
+";
+        let env = parse_permission_grant(&p(), yaml("curator-grant", body).as_bytes()).unwrap();
+        assert_eq!(
+            env.spec.subject,
+            GrantSubjectSpec::ServiceAccount {
+                name: "maintainer-curator".into()
+            }
+        );
+        assert!(validate_permission_grant(&env).is_empty());
+        match env.spec.diff_identity() {
+            GrantIdentity::ServiceAccount {
+                sa_name,
+                repository,
+                permission,
+            } => {
+                assert_eq!(sa_name, "maintainer-curator");
+                assert_eq!(repository.as_deref(), Some("oci-prod"));
+                assert_eq!(permission, Permission::Curate);
+            }
+            other => panic!("expected ServiceAccount identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_account_subject_admin_task_invoke_validates() {
+        // `admin_task_invoke` is a non-admin authority an SA envelope
+        // cannot grant — only a standalone serviceAccount grant can.
+        let body = "
+  subject: { kind: serviceAccount, name: cronjob-sa }
+  permission: admin_task_invoke
+";
+        let env = parse_permission_grant(&p(), yaml("cron-task", body).as_bytes()).unwrap();
+        assert!(validate_permission_grant(&env).is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_service_account_subject_admin_permission() {
+        // ADR 0038: a serviceAccount subject may not hold `admin`. The
+        // §9 SA-subject grant resolves to a `GrantSubject::User`, so
+        // without this gate a `serviceAccount` + `permission: admin`
+        // would apply as a real global Admin grant. Hard-rejected at
+        // the per-spec validator (the earliest, clearest gate).
+        let body = "
+  subject: { kind: serviceAccount, name: cronjob-sa }
+  permission: admin
+";
+        let env = parse_permission_grant(&p(), yaml("sa-admin", body).as_bytes()).unwrap();
+        let errors = validate_permission_grant(&env);
+        assert!(
+            errors.iter().any(|e| e
+                .to_string()
+                .contains("serviceAccount subject may not hold 'admin'")),
+            "serviceAccount + permission: admin must be a validation error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_service_account_subject_non_admin_permissions() {
+        // The reject is scoped to `admin` ONLY — every other permission
+        // a serviceAccount subject may legitimately hold (notably
+        // `admin_task_invoke` for the cronjob SA, plus `curate`/`read`/
+        // `write`/`delete`) must still validate cleanly. Guards against
+        // over-rejecting legitimate SA grants.
+        for perm in ["admin_task_invoke", "curate", "read", "write", "delete"] {
+            let body = format!(
+                "
+  subject: {{ kind: serviceAccount, name: cronjob-sa }}
+  permission: {perm}
+"
+            );
+            let env = parse_permission_grant(&p(), yaml("sa-grant", &body).as_bytes()).unwrap();
+            let errors = validate_permission_grant(&env);
+            assert!(
+                errors.is_empty(),
+                "serviceAccount + permission: {perm} must validate cleanly: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_service_account_subject_rejects_unknown_field() {
+        let body = "
+  subject: { kind: serviceAccount, name: x, bogus: 1 }
+  permission: read
+";
+        let err = parse_permission_grant(&p(), yaml("g", body).as_bytes()).unwrap_err();
+        assert!(matches!(err, ParseError::Yaml(_)));
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn validate_rejects_blank_service_account_name() {
+        let body = "
+  subject: { kind: serviceAccount, name: '   ' }
+  permission: read
+";
+        let env = parse_permission_grant(&p(), yaml("g", body).as_bytes()).unwrap();
+        let errors = validate_permission_grant(&env);
+        assert!(errors
+            .iter()
+            .any(|e| e.to_string().contains("subject.name (serviceAccount)")));
+    }
+
+    #[test]
+    fn service_account_subject_diff_identity_is_name_repo_perm_idempotent() {
+        // Same SA name / repo / permission ⇒ same transient identity
+        // (replay = no-op before the SA's backing user resolves).
+        let body = "
+  subject: { kind: serviceAccount, name: maintainer-dev }
+  permission: read
+";
+        let a = parse_permission_grant(&p(), yaml("a", body).as_bytes()).unwrap();
+        let b = parse_permission_grant(&p(), yaml("b", body).as_bytes()).unwrap();
+        // metadata.name differs (a vs b) but does not participate in identity.
+        assert_eq!(a.spec.diff_identity(), b.spec.diff_identity());
     }
 
     // ---- Parse rejects ----------------------------------------------------

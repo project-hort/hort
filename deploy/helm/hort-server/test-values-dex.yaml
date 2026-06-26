@@ -1,0 +1,40 @@
+# Test fixture: enable the optional Dex IdP sidecar
+# (auth.dex.enabled) for helm-template verification.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values-dex.yaml
+#
+# Asserts the Dex Deployment + Service + ConfigMap render and that
+# hort-server's HORT_OIDC_ISSUER_URL is wired to auth.dex.issuerUrl
+# (overriding auth.oidc.issuerUrl). Strictly a local helm lint/template
+# smoke fixture — not a production values file.
+
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+  dex:
+    enabled: true
+    issuerUrl: "https://registry.example.com/dex"
+    cliClientId: "hort-cli"
+    adminGroup: "hort-admins"
+    staticAdmin:
+      passwordHashSecret: "hort-dex-admin"
+      passwordHashSecretKey: "passwordHash"
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://registry.example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

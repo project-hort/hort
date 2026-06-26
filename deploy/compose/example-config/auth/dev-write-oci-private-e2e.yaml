@@ -1,0 +1,17 @@
+# PermissionGrant: [developer, ci-pusher] -> write oci-private-e2e
+#
+# Lets dev-user seed the PRIVATE repo in the private-pull regression
+# (scripts/native-tests/scenarios/clients/oci-private-pull.sh) by pushing an
+# image, so the reader has something to pull back. Mirror of dev-write-oci-e2e
+# — per-repo + two-claim subject passes the allowlist linter. Rationale for the
+# second claim: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-write-oci-private-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: oci-private-e2e

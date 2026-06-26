@@ -98,6 +98,17 @@ pub const MAX_EXPIRY_DAYS: u32 = 365;
 /// tokens have severe blast radius on leak; 30 days bounds it).
 pub const MAX_ADMIN_EXPIRY_DAYS: u32 = 30;
 
+/// Hard ceiling on the lifetime (seconds) of a `bootstrap-admin`
+/// break-glass PAT minted by [`ApiTokenUseCase::issue_for_bootstrap_admin_system`].
+///
+/// 3600 s (1 h) is the ADR-0013 admin cap. The
+/// `bootstrap-session` CLI path is the DSN-gated first-admin /
+/// break-glass mechanism (only reached when `HORT_TOKEN_ALLOW_ADMIN`
+/// is set); the token carries a full admin cap, so its lifetime is
+/// bounded to the admin ceiling to keep the leak blast-radius tight.
+/// A requested lifetime above this is clamped down to it.
+pub const MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS: u64 = 3600;
+
 // -- CLI-session lifetime caps (seconds; ADR 0013) --
 //
 // RFC 8693 §2.1 seconds-based `requested_token_lifetime`. Below-min is
@@ -1100,6 +1111,205 @@ impl ApiTokenUseCase {
             id: token.id,
             name: token.name.clone(),
             kind: TokenKind::ServiceAccount,
+            plaintext,
+            expires_at: token.expires_at,
+        })
+    }
+
+    // -- issue_for_bootstrap_admin_system ----------------------------------
+    //
+    // System-mint path for the DSN-gated `hort-server admin
+    // bootstrap-session` command (the first-admin / break-glass path,
+    // spec §3 / ADR 0013). Like `issue_for_service_account_system` it
+    // has no human `CallerPrincipal` — DSN access is the credential —
+    // and short-circuits the cap-vs-authority gate.
+    //
+    // It differs from the service-account system-mint in three
+    // load-bearing ways, which is why it is a SEPARATE method rather
+    // than a flag on the existing one:
+    //
+    //   1. The target is the reserved NON-service-account admin user
+    //      (`is_admin = true`, `is_service_account = false`). The SA
+    //      system-mint *requires* `is_service_account = true` and would
+    //      reject this target — service accounts are strictly non-admin
+    //      (Entry 4 / ADR 0012), so the bootstrap admin is deliberately
+    //      not a service account.
+    //   2. The cap is REQUIRED to be the full admin cap. The SA
+    //      system-mint rejects `Permission::Admin` unconditionally; here
+    //      `Permission::Admin` is mandatory because the B1 fail-closed
+    //      backstop (`hort-domain` rbac) denies an admin-claim `Pat`
+    //      carrying a `None`/admin-less cap. The token must therefore
+    //      carry an explicit admin-bearing cap.
+    //   3. The kind is `Pat` (a break-glass personal access token),
+    //      lifetime-bounded to the ADR-0013 admin ceiling
+    //      ([`MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS`], 1 h).
+
+    /// System-mint a short-lived full-cap admin `Pat` for the reserved
+    /// `bootstrap-admin` user.
+    ///
+    /// Trust contract: no `CallerPrincipal` — the caller is the
+    /// DSN-gated `bootstrap-session` CLI. The cap-vs-authority gate is
+    /// skipped (there is no caller to authorise against); the blast
+    /// radius is bounded instead by the ≤ 1 h lifetime
+    /// ([`MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS`]) and by the operator's
+    /// `HORT_TOKEN_ALLOW_ADMIN` opt-in at the CLI.
+    ///
+    /// `target_user_id` MUST resolve to a user with
+    /// `is_admin = true` and `is_service_account = false`; any other
+    /// shape is rejected (a service account is strictly non-admin —
+    /// Entry 4 / ADR 0012 — and minting an admin `Pat` for a non-admin
+    /// row would be a privilege fabrication).
+    ///
+    /// `declared_permissions` MUST contain [`Permission::Admin`]; the
+    /// minted cap is the full declared set with `repository_ids = None`.
+    /// A `None`/admin-less cap on an admin-claim `Pat` fail-closes at
+    /// the domain backstop, so the explicit full cap is required.
+    ///
+    /// `lifetime_secs` is clamped to `[1, MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS]`;
+    /// `0` is rejected. Audit attribution is
+    /// `Actor::Internal(InternalActor::System)`;
+    /// `ApiTokenIssued.minted_by_admin_id` is `None`.
+    #[tracing::instrument(skip(self, declared_permissions))]
+    pub async fn issue_for_bootstrap_admin_system(
+        &self,
+        target_user_id: Uuid,
+        name: String,
+        declared_permissions: Vec<Permission>,
+        lifetime_secs: u64,
+    ) -> Result<IssuedToken, ApiTokenError> {
+        let result = self
+            .issue_for_bootstrap_admin_system_inner(
+                target_user_id,
+                name,
+                declared_permissions,
+                lifetime_secs,
+            )
+            .await;
+        emit_issued_metric(TokenKind::Pat, issuance_result_label(&result));
+        result
+    }
+
+    async fn issue_for_bootstrap_admin_system_inner(
+        &self,
+        target_user_id: Uuid,
+        name: String,
+        declared_permissions: Vec<Permission>,
+        lifetime_secs: u64,
+    ) -> Result<IssuedToken, ApiTokenError> {
+        // 1. Static request validation.
+        if name.trim().is_empty() {
+            return Err(ApiTokenError::NameEmpty);
+        }
+        if name.len() > MAX_NAME_LEN {
+            return Err(ApiTokenError::NameTooLong);
+        }
+
+        // 2. The full admin cap is REQUIRED. A `Pat` carrying an
+        //    admin claim with no `Permission::Admin` in its cap
+        //    fail-closes at the domain backstop (B1), so the bootstrap
+        //    token MUST declare admin explicitly.
+        if !declared_permissions.contains(&Permission::Admin) {
+            return Err(ApiTokenError::AdminAuthorityRequired);
+        }
+
+        // 3. Resolve target + verify the reserved bootstrap-admin shape:
+        //    is_admin AND NOT is_service_account. Service accounts are
+        //    strictly non-admin (Entry 4 / ADR 0012); minting an admin
+        //    Pat for any other shape would be a privilege fabrication.
+        let target = self.users.find_by_id(target_user_id).await?;
+        if !target.is_admin || target.is_service_account {
+            return Err(ApiTokenError::NotAuthorized);
+        }
+
+        // 4. Lifetime clamp: `[1, MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS]`.
+        if lifetime_secs == 0 {
+            return Err(ApiTokenError::ExpiryZero);
+        }
+        let clamped_secs = lifetime_secs.min(MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS);
+        let now = Utc::now();
+        let expires_at = Some(now + Duration::seconds(clamped_secs as i64));
+
+        // 5. Generate the token plaintext + hash + prefix.
+        let (plaintext, body_prefix) = generate_token_plaintext(TokenKind::Pat);
+        let token_hash = hash_token(&plaintext)
+            .map_err(|e| DomainError::Invariant(format!("argon2 hash failed: {e}")))?;
+
+        // 6. Build the row. `created_by_user_id` carries the target's
+        //    own id — there is no human actor; attribution is the
+        //    `Actor::Internal(System)` on the appended event.
+        let token = ApiToken {
+            id: Uuid::new_v4(),
+            user_id: target.id,
+            name: name.clone(),
+            description: Some(
+                "Issued by hort-server admin bootstrap-session (break-glass)".to_owned(),
+            ),
+            kind: TokenKind::Pat,
+            token_hash,
+            token_prefix: body_prefix,
+            declared_permissions: declared_permissions.clone(),
+            // Full cap — no per-repo restriction.
+            repository_ids: None,
+            expires_at,
+            revoked_at: None,
+            last_used_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+            created_by_user_id: target.id,
+            created_at: now,
+        };
+
+        // 7. Persist.
+        self.tokens.insert(&token).await?;
+
+        // 8. Emit ApiTokenIssued on the token-owner's user stream,
+        //    attributed to System.
+        let stream_id = StreamId::user(target.id);
+        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
+            .await
+            .map_err(|e| match e {
+                crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
+                other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
+            })?;
+        let event = DomainEvent::ApiTokenIssued(ApiTokenIssued {
+            token_id: token.id,
+            user_id: target.id,
+            kind: TokenKind::Pat,
+            declared_permissions: token.declared_permissions.clone(),
+            repository_ids: token.repository_ids.clone(),
+            expires_at: token.expires_at,
+            // No admin actor — system mint.
+            minted_by_admin_id: None,
+            at: now,
+            // Not a federation mint.
+            source_issuer: None,
+            source_jti: None,
+            source_sub: None,
+        });
+        self.events
+            .append(AppendEvents {
+                stream_id,
+                expected_version: expected,
+                events: vec![EventToAppend::new(event)],
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+            })
+            .await?;
+
+        tracing::info!(
+            token_id = %token.id,
+            kind = ?TokenKind::Pat,
+            user_id = %target.id,
+            actor = "system",
+            declared_permission_count = token.declared_permissions.len(),
+            "bootstrap-admin token issued (system mint)"
+        );
+
+        Ok(IssuedToken {
+            id: token.id,
+            name: token.name.clone(),
+            kind: TokenKind::Pat,
             plaintext,
             expires_at: token.expires_at,
         })
@@ -3260,6 +3470,198 @@ mod tests {
             issued.expires_at.is_some(),
             "system mint must never produce an unbounded token"
         );
+    }
+
+    // ---------- issue_for_bootstrap_admin_system ----------
+
+    /// The reserved `bootstrap-admin` user: `is_admin = true`,
+    /// `is_service_account = false`. Id pinned to `0xACE` so it aligns
+    /// with `make_use_case` lookups.
+    fn bootstrap_admin_user() -> User {
+        User {
+            is_admin: true,
+            is_service_account: false,
+            ..user(false)
+        }
+    }
+
+    /// Full admin cap — every `Permission` variant. Mirrors what the
+    /// `bootstrap-session` CLI passes.
+    fn full_admin_cap() -> Vec<Permission> {
+        vec![
+            Permission::Read,
+            Permission::Write,
+            Permission::Delete,
+            Permission::Admin,
+            Permission::AdminTaskInvoke,
+            Permission::Curate,
+            Permission::Prefetch,
+        ]
+    }
+
+    #[tokio::test]
+    async fn issue_for_bootstrap_admin_system_happy_path_full_cap_short_lived() {
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+
+        let issued = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                full_admin_cap(),
+                3600,
+            )
+            .await
+            .expect("bootstrap-admin mint must succeed for the reserved admin user");
+
+        // Pat kind, short-lived.
+        assert_eq!(issued.kind, TokenKind::Pat);
+        assert!(issued.plaintext.starts_with("hort_pat_"));
+        let ttl = issued.expires_at.expect("bootstrap token must expire") - Utc::now();
+        assert!(
+            ttl <= Duration::seconds(MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS as i64),
+            "bootstrap token TTL must be <= 1h, got {ttl}"
+        );
+
+        // The persisted row carries the FULL admin cap and no per-repo
+        // restriction (B1 fail-closes a None/admin-less cap admin Pat).
+        let inserts = tokens.inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].kind, TokenKind::Pat);
+        assert!(inserts[0].declared_permissions.contains(&Permission::Admin));
+        assert_eq!(inserts[0].declared_permissions, full_admin_cap());
+        assert!(
+            inserts[0].repository_ids.is_none(),
+            "bootstrap-admin cap must be global (repository_ids = None)"
+        );
+
+        // System-attributed event, no admin actor.
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 1);
+        assert!(matches!(
+            batches[0].actor,
+            Actor::Internal(hort_domain::events::InternalActor::System)
+        ));
+        let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
+        assert!(event.minted_by_admin_id.is_none());
+        assert_eq!(event.kind, TokenKind::Pat);
+    }
+
+    #[tokio::test]
+    async fn issue_for_bootstrap_admin_system_clamps_lifetime_to_one_hour() {
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+
+        // Request 24h; expect a clamp to the 1h admin ceiling.
+        let issued = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                full_admin_cap(),
+                24 * 3600,
+            )
+            .await
+            .expect("mint must succeed; lifetime is clamped, not rejected");
+        let ttl = issued.expires_at.expect("must expire") - Utc::now();
+        assert!(
+            ttl <= Duration::seconds(MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS as i64),
+            "requested 24h must clamp down to <= 1h, got {ttl}"
+        );
+        assert_eq!(tokens.inserts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn issue_for_bootstrap_admin_system_requires_admin_in_cap() {
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+
+        // Cap without Permission::Admin → rejected (the B1 backstop
+        // would otherwise fail-close at runtime; reject at mint).
+        let err = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                vec![Permission::Read, Permission::Write],
+                3600,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiTokenError::AdminAuthorityRequired));
+        assert!(tokens.inserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_for_bootstrap_admin_system_rejects_service_account_target() {
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        // A service-account user (even an is_admin one) is the wrong
+        // shape — service accounts are strictly non-admin.
+        users.insert(User {
+            is_admin: true,
+            is_service_account: true,
+            ..user(true)
+        });
+        let err = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                full_admin_cap(),
+                3600,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiTokenError::NotAuthorized));
+        assert!(tokens.inserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_for_bootstrap_admin_system_rejects_non_admin_target() {
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(false)); // is_admin = false, not a service account
+        let err = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                full_admin_cap(),
+                3600,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiTokenError::NotAuthorized));
+        assert!(tokens.inserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_for_bootstrap_admin_system_rejects_zero_lifetime() {
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+        let err = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                full_admin_cap(),
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiTokenError::ExpiryZero));
+        assert!(tokens.inserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_for_bootstrap_admin_system_rejects_empty_name() {
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+        let err = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "   ".into(),
+                full_admin_cap(),
+                3600,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiTokenError::NameEmpty));
+        assert!(tokens.inserts().is_empty());
     }
 
     // ====================================================================

@@ -1496,6 +1496,19 @@ impl ApplyConfigUseCase {
                 Some(sha256_of(&canonical))
             })
             .collect();
+        // `ServiceAccount.name → backing-user UUID (stringified)` for
+        // every SA whose aggregate (and therefore backing `users` row)
+        // already exists. The diff layer uses it to resolve a
+        // `serviceAccount`-subject grant's identity to the persisted
+        // `User(backing_user_id)` row, so a re-apply is `unchanged`
+        // rather than churning create+delete. A brand-new SA is absent
+        // from this map (it is created later in the same apply), so its
+        // grant falls back to the name-keyed transient identity →
+        // `create` on the first apply. See ADR 0037.
+        let sa_backing_user_ids_by_name: HashMap<String, String> = sa_entities
+            .iter()
+            .map(|s| (s.name.clone(), s.backing_user_id.to_string()))
+            .collect();
         let service_accounts_snapshot: Vec<CurrentServiceAccount> = sa_entities
             .into_iter()
             .map(|s| CurrentServiceAccount {
@@ -1514,6 +1527,7 @@ impl ApplyConfigUseCase {
             oidc_issuers: oidc_issuers_snapshot,
             service_accounts: service_accounts_snapshot,
             sa_owned_grant_digests,
+            sa_backing_user_ids_by_name,
         })
     }
 
@@ -2682,6 +2696,39 @@ impl ApplyConfigUseCase {
                         ))
                     })?;
                     GrantSubject::User(uid)
+                }
+                GrantSubjectSpec::ServiceAccount { name } => {
+                    // Gitops-spec sugar: resolve the named ServiceAccount
+                    // to its backing-user UUID and materialise the grant
+                    // as `GrantSubject::User(backing_user_id)` — the
+                    // domain taxonomy stays two-variant (ADR 0012/0037).
+                    // `apply_service_accounts` ran earlier in this apply
+                    // (Stage above), so the SA aggregate + backing user
+                    // exist and resolve here. A dangling name is rejected
+                    // cross-spec at validate-time (`DanglingReference`).
+                    let sa = self
+                        .service_accounts
+                        .get_by_name(name)
+                        .await?
+                        .ok_or_else(|| {
+                            DomainError::Validation(format!(
+                                "PermissionGrant `{}` subject.serviceAccount `{name}` names no \
+                                 declared ServiceAccount — define the ServiceAccount in gitops \
+                                 and apply first",
+                                env.metadata.name
+                            ))
+                        })?;
+                    let backing_user_id = sa.backing_user_id;
+                    // This backing user-id is an SA-owned
+                    // (provenance-justified) direct-user subject — exempt
+                    // it from the `direct-user-grant-without-justification`
+                    // linter rule, exactly like the SA-role-derived grants
+                    // in step (b). Without this a global serviceAccount
+                    // grant (the audited operator path for global / curate
+                    // / admin_task_invoke authority) would trip the
+                    // high-privilege reject arm.
+                    sa_owned_user_ids.insert(backing_user_id);
+                    GrantSubject::User(backing_user_id)
                 }
             };
             self.push_desired_grant(
@@ -5031,6 +5078,30 @@ mod tests {
             spec: PermissionGrantSpec {
                 subject: GrantSubjectSpec::User {
                     user_id: user_id.to_string(),
+                },
+                permission: permission.into(),
+                repository: repo.map(Into::into),
+            },
+        }
+    }
+
+    /// `PermissionGrant` envelope with a **serviceAccount** subject
+    /// (`GrantSubjectSpec::ServiceAccount`) — the gitops-spec sugar the
+    /// apply pipeline resolves to `GrantSubject::User(backing_user_id)`
+    /// (ADR 0037 / spec §9).
+    fn sa_grant_env(
+        name: &str,
+        sa_name: &str,
+        permission: &str,
+        repo: Option<&str>,
+    ) -> Envelope<PermissionGrantSpec> {
+        Envelope {
+            api_version: ApiVersion::V1Beta1,
+            kind: Kind::PermissionGrant,
+            metadata: Metadata { name: name.into() },
+            spec: PermissionGrantSpec {
+                subject: GrantSubjectSpec::ServiceAccount {
+                    name: sa_name.into(),
                 },
                 permission: permission.into(),
                 repository: repo.map(Into::into),
@@ -11801,6 +11872,215 @@ mod tests {
             sa_grant.repository_id.is_some(),
             "SA-derived grant must be repo-scoped, not global"
         );
+    }
+
+    // -- ServiceAccount-subject standalone grants (ADR 0037 / spec §9) -----
+
+    #[tokio::test]
+    async fn apply_global_service_account_grant_resolves_to_backing_user() {
+        // A declared SA + a standalone GLOBAL serviceAccount Read grant.
+        // The grant must materialise as `GrantSubject::User(backing_user_id)`
+        // with `repository_id: None` — the global authority an SA envelope
+        // (always repo-scoped) cannot express.
+        let h = build_harness();
+        seed_developer_role(&h);
+        h.repos.insert(Repository {
+            key: "npm-public".into(),
+            ..sample_repository_for_test("npm-public")
+        });
+        let mut desired = DesiredState::default();
+        desired.service_accounts.push(service_account_env_for_apply(
+            "maintainer-dev",
+            &["npm-public"],
+            None,
+        ));
+        desired.permission_grants.push(sa_grant_env(
+            "maintainer-dev-global-read",
+            "maintainer-dev",
+            "read",
+            None, // global
+        ));
+
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect("global serviceAccount grant must apply");
+
+        let sa_user = h
+            .users
+            .find_by_username("sa:maintainer-dev")
+            .await
+            .unwrap()
+            .expect("SA backing user must exist");
+        let managed = h.grant_repo.managed_snapshot();
+        // The standalone GLOBAL grant resolves to User(backing) / None.
+        let global = managed
+            .iter()
+            .find(|g| {
+                matches!(&g.subject, GrantSubject::User(uid) if *uid == sa_user.id)
+                    && g.repository_id.is_none()
+                    && g.permission == Permission::Read
+            })
+            .expect("global User(backing_user_id) Read grant must be present");
+        assert!(global.repository_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_service_account_grant_reapply_is_idempotent_no_churn() {
+        // THE diff-idempotence assertion. Apply the SAME config (SA +
+        // standalone global serviceAccount Read grant) twice; the second
+        // apply must produce ZERO add/remove churn in the managed grant
+        // partition — the SA-name resolves to the same backing_user_id and
+        // the resolved User(uuid) row diffs identically across applies.
+        let h = build_harness();
+        seed_developer_role(&h);
+        h.repos.insert(Repository {
+            key: "npm-public".into(),
+            ..sample_repository_for_test("npm-public")
+        });
+        let build = || {
+            let mut d = DesiredState::default();
+            d.service_accounts.push(service_account_env_for_apply(
+                "maintainer-dev",
+                &["npm-public"],
+                None,
+            ));
+            d.permission_grants.push(sa_grant_env(
+                "maintainer-dev-global-read",
+                "maintainer-dev",
+                "read",
+                None,
+            ));
+            d
+        };
+
+        h.uc.apply(build(), env_oidc()).await.unwrap();
+        // Managed set after first apply: the SA-role-derived repo-scoped
+        // grant + the standalone global grant = 2.
+        let first = h.grant_repo.managed_snapshot();
+        let first_count = first.len();
+        assert_eq!(
+            first_count, 2,
+            "SA role-derived repo grant + standalone global grant = 2"
+        );
+        // Capture surrogate ids so we can prove they carry through.
+        let mut first_ids: Vec<Uuid> = first.iter().map(|g| g.id).collect();
+        first_ids.sort();
+
+        h.uc.apply(build(), env_oidc()).await.unwrap();
+        let second = h.grant_repo.managed_snapshot();
+        assert_eq!(
+            second.len(),
+            first_count,
+            "re-applying the identical config must not change the managed grant count"
+        );
+        let mut second_ids: Vec<Uuid> = second.iter().map(|g| g.id).collect();
+        second_ids.sort();
+        assert_eq!(
+            first_ids, second_ids,
+            "surrogate grant ids must carry through a no-op re-apply (no delete+recreate churn)"
+        );
+        // Exactly one save_managed call per apply (two total).
+        assert_eq!(h.grant_repo.save_managed_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn apply_repo_scoped_service_account_curate_grant_resolves() {
+        // Repo-scoped `curate` — non-read/write authority an SA role
+        // bundle cannot grant. Resolves to User(backing) scoped to the repo.
+        let h = build_harness();
+        seed_developer_role(&h);
+        // Declare the repo in the bundle (let the apply create it) so the
+        // grant's `spec.repository` cross-spec reference resolves; a
+        // pre-seeded harness row would collide with the managed upsert.
+        let mut desired = DesiredState::default();
+        desired.repositories.push(repo_env("oci-prod", "hosted"));
+        desired.service_accounts.push(service_account_env_for_apply(
+            "maintainer-curator",
+            &["oci-prod"],
+            None,
+        ));
+        desired.permission_grants.push(sa_grant_env(
+            "curator-grant",
+            "maintainer-curator",
+            "curate",
+            Some("oci-prod"),
+        ));
+
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect("repo-scoped serviceAccount curate grant must apply");
+
+        let sa_user = h
+            .users
+            .find_by_username("sa:maintainer-curator")
+            .await
+            .unwrap()
+            .expect("SA backing user must exist");
+        let managed = h.grant_repo.managed_snapshot();
+        let curate = managed
+            .iter()
+            .find(|g| {
+                matches!(&g.subject, GrantSubject::User(uid) if *uid == sa_user.id)
+                    && g.permission == Permission::Curate
+            })
+            .expect("User(backing_user_id) Curate grant must be present");
+        assert!(
+            curate.repository_id.is_some(),
+            "curate grant is repo-scoped"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_global_service_account_grant_passes_secure_default_linter() {
+        // The audited operator path: a GLOBAL serviceAccount grant under
+        // the SECURE-BY-DEFAULT linter (no downgrade). It must NOT trip
+        // the `direct-user-grant-without-justification` reject arm — the
+        // resolved backing user is SA-owned (provenance-justified), so the
+        // linter exempts it exactly like an SA role-derived grant.
+        let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
+        h.repos.insert(Repository {
+            key: "npm-public".into(),
+            ..sample_repository_for_test("npm-public")
+        });
+        let mut desired = DesiredState::default();
+        desired.service_accounts.push(service_account_env_for_apply(
+            "maintainer-dev",
+            &["npm-public"],
+            None,
+        ));
+        desired.permission_grants.push(sa_grant_env(
+            "maintainer-dev-global-read",
+            "maintainer-dev",
+            "read",
+            None,
+        ));
+
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect("a global serviceAccount grant must clear the SECURE-DEFAULT linter");
+    }
+
+    #[tokio::test]
+    async fn apply_service_account_grant_naming_missing_sa_fails_validation() {
+        // A serviceAccount-subject grant naming an undeclared SA is a
+        // cross-spec DanglingReference — apply must fail before any write.
+        let h = build_harness();
+        h.repos.insert(Repository {
+            key: "npm-public".into(),
+            ..sample_repository_for_test("npm-public")
+        });
+        let mut desired = DesiredState::default();
+        desired
+            .permission_grants
+            .push(sa_grant_env("dangling", "ghost-sa", "read", None));
+        let err = h.uc.apply(desired, env_oidc()).await.unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("ghost-sa"),
+            "validation error must name the missing ServiceAccount: {rendered}"
+        );
+        // No grant was written.
+        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
     }
 
     #[tokio::test]

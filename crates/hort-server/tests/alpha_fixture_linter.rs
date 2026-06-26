@@ -83,8 +83,17 @@ fn alpha_auth_fixtures_clear_the_real_section_8_1_linter() {
 
     // Convert every PermissionGrant envelope to the domain shape the
     // linter consumes — the SAME mapping `ApplyConfigUseCase` applies
-    // (sorted `Claims`, `User(uuid)`, repo-name → id).
+    // (sorted `Claims`, `User(uuid)`, `ServiceAccount` → SA backing user,
+    // repo-name → id).
     let mut grants: Vec<PermissionGrant> = Vec::new();
+    // SA-owned (provenance-justified) backing-user ids. A
+    // `serviceAccount`-subject grant resolves (apply-side) to the SA's
+    // backing user and is exempt from the direct-user-grant rule; we
+    // thread the resolved id in here exactly as apply does. The alpha
+    // fixtures currently declare no `serviceAccount` grants, so this set
+    // stays empty in practice — but the wiring keeps the mapping a
+    // faithful mirror of apply if a fixture ever adds one.
+    let mut sa_owned_user_ids: HashSet<Uuid> = HashSet::new();
     for env in &state.permission_grants {
         let permission = Permission::from_str(&env.spec.permission)
             .unwrap_or_else(|_| panic!("permission `{}` should parse", env.spec.permission));
@@ -101,6 +110,15 @@ fn alpha_auth_fixtures_clear_the_real_section_8_1_linter() {
             }
             GrantSubjectSpec::User { user_id } => {
                 GrantSubject::User(Uuid::parse_str(user_id.trim()).expect("valid uuid"))
+            }
+            GrantSubjectSpec::ServiceAccount { name } => {
+                // Deterministic per-SA backing-user id (offline analogue
+                // of the apply-side `get_by_name(...).backing_user_id`),
+                // threaded into the exemption set so it lints as an
+                // SA-owned (justified) direct-user grant.
+                let backing = Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes());
+                sa_owned_user_ids.insert(backing);
+                GrantSubject::User(backing)
             }
         };
         grants.push(PermissionGrant {
@@ -127,10 +145,9 @@ fn alpha_auth_fixtures_clear_the_real_section_8_1_linter() {
         })
         .collect();
 
-    // The alpha fixtures declare no ServiceAccounts, so there
-    // are no SA-owned (provenance-justified) direct-user grants — empty
-    // exemption set.
-    let sa_owned_user_ids: HashSet<Uuid> = HashSet::new();
+    // `sa_owned_user_ids` was populated in the grant-conversion loop
+    // above (one entry per `serviceAccount`-subject grant; the alpha
+    // fixtures declare none, so it is empty in practice).
 
     // The whole point: DEFAULT (secure-by-default reject posture)
     // LintConfig — NOT a downgraded one. A downgrade would mask a

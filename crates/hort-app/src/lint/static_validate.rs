@@ -447,6 +447,20 @@ impl StaticConfigValidator {
                 GrantSubjectSpec::User { user_id } => GrantSubject::User(
                     Uuid::parse_str(user_id.trim()).unwrap_or_else(|_| Uuid::new_v4()),
                 ),
+                // A `serviceAccount` subject resolves (apply-side) to the
+                // SA's backing-user UUID and is exempt from the
+                // direct-user-grant rule (SA-provenance). Offline we
+                // synthesise the SAME deterministic per-SA id branch (b)
+                // uses and thread it into `sa_owned_user_ids`, so a
+                // global / curate serviceAccount grant lints exactly as
+                // it applies (Pass, justified by provenance) rather than
+                // tripping the high-privilege reject arm. A dangling SA
+                // name is row 0's cross-validate concern.
+                GrantSubjectSpec::ServiceAccount { name } => {
+                    let backing_user_id = synthetic_sa_backing_user_id(name);
+                    sa_owned_user_ids.insert(backing_user_id);
+                    GrantSubject::User(backing_user_id)
+                }
             };
             grants.push(synthetic_grant(subject, repository_id, permission));
         }
@@ -1581,6 +1595,26 @@ mod tests {
         }
     }
 
+    fn sa_grant_env(
+        name: &str,
+        sa_name: &str,
+        permission: &str,
+        repository: Option<&str>,
+    ) -> Envelope<PermissionGrantSpec> {
+        Envelope {
+            api_version: ApiVersion::V1Beta1,
+            kind: Kind::PermissionGrant,
+            metadata: Metadata { name: name.into() },
+            spec: PermissionGrantSpec {
+                subject: GrantSubjectSpec::ServiceAccount {
+                    name: sa_name.into(),
+                },
+                permission: permission.into(),
+                repository: repository.map(Into::into),
+            },
+        }
+    }
+
     fn claim_mapping_env(name: &str, idp_group: &str, claim: &str) -> Envelope<ClaimMappingSpec> {
         Envelope {
             api_version: ApiVersion::V1Beta1,
@@ -1713,6 +1747,37 @@ mod tests {
             grant_findings(&report),
             0,
             "SA-owned grant must be exempt (provenance): {:?}",
+            report.errors
+        );
+    }
+
+    /// (e2) A standalone GLOBAL `serviceAccount`-subject grant naming a
+    /// declared SA is exempt offline (ADR 0037 / spec §9) — it resolves
+    /// to the SA's (deterministic, synthetic) backing user, which is
+    /// threaded into the sa_owned set, so the provenance exemption fires
+    /// exactly as on the apply path. Without the threading this global
+    /// Read grant would trip the high-privilege direct-user reject arm.
+    #[test]
+    fn row8_global_service_account_subject_grant_is_exempt() {
+        let desired = DesiredState {
+            service_accounts: vec![sa_env_with_repos(
+                "maintainer-dev",
+                "developer",
+                &["repo-x"],
+            )],
+            permission_grants: vec![sa_grant_env(
+                "maintainer-dev-global-read",
+                "maintainer-dev",
+                "read",
+                None, // global
+            )],
+            ..Default::default()
+        };
+        let report = grant_lint_validator().validate(&desired);
+        assert_eq!(
+            grant_findings(&report),
+            0,
+            "a global serviceAccount-subject grant must be exempt (provenance): {:?}",
             report.errors
         );
     }

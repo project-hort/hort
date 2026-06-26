@@ -39,6 +39,32 @@ hort_api_port: 8080
 # Metrics listener port (internal; NOT exposed to the internet).
 hort_metrics_port: 9090
 
+# ── Dex IdP sidecar (optional, shared by both flavors) ────────────────────────
+# Minimal OIDC IdP for the human-admin path: human admin is OIDC (Dex) ->
+# CliSession, not a static service-account token. Default OFF — the base deploy
+# runs HORT_AUTH_PROVIDER=disabled (PAT + CI-federation only). When
+# hort_dex_enabled is true, the podman flavor runs a Dex container on the hort
+# network and the hort-server env switches HORT_AUTH_PROVIDER=oidc with
+# HORT_OIDC_ISSUER_URL pointed at hort_dex_issuer_url. The native flavor wires
+# the same env but expects an EXTERNAL IdP at that URL (no container runtime to
+# host Dex). hort is IdP-agnostic — replace Dex with your org's SSO (or front it
+# via a Dex connector) by overriding hort_dex_issuer_url + the connector config.
+hort_dex_enabled: false
+
+# The OIDC issuer URL the IdP advertises AND hort-server validates against. MUST
+# match exactly (iss claim + JWKS discovery) and be reachable from both clients
+# and the hort-server process. Served by nginx at the /dex path of the public
+# FQDN (podman flavor proxies to the Dex container).
+hort_dex_issuer_url: "https://{{ registry_fqdn }}/dex"
+
+# The public OIDC client id the hort-cli device-code flow uses. Must equal the
+# staticClient id in the Dex config and HORT_OIDC_CLI_CLIENT_ID.
+hort_dex_cli_client_id: hort-cli
+
+# The IdP group whose members map to the `admin` claim. Must match the
+# ClaimMapping idpGroup in files/gitops/auth/admins.yaml (hort-admins -> admin).
+hort_dex_admin_group: hort-admins
+
 # ── PostgreSQL performance tuning ─────────────────────────────────────────────
 # Values are scaled from ansible_memtotal_mb (a gathered fact; both playbooks
 # have gather_facts: true).  They are intentionally CONSERVATIVE because

@@ -104,12 +104,13 @@ Part II(3) effectiveness into the catalog's done-criteria.
 
 - **Credential form:** `hort_svc_*` bearer; Argon2id-hashed at rest.
 - **Purpose / allowed use:** admin-minted machine identity for non-human consumers.
-- **Restrictions & caps:** admin forbidden at apply time (`crates/hort-config/src/service_account.rs` — `validate_rejects_admin_role` pins it); authority exclusively via `GrantSubject::User(backing_user_id)` grants (ADR 0012); self-mint forbidden.
+- **Restrictions & caps:** admin forbidden at apply time (`crates/hort-config/src/service_account.rs` — `validate_rejects_admin_role` pins it); authority exclusively via `GrantSubject::User(backing_user_id)` grants (ADR 0012) — including scoped `Read`/`Curate`/global `AdminTaskInvoke` expressed as gitops `serviceAccount`-subject grants that resolve to `GrantSubject::User(backing_user_id)` at apply (ADR 0037); self-mint forbidden.
 - **Protection:** at rest — Argon2id; in transit — TLS; blast-radius — User-subject grants only, never claim-mapped.
 - **Allowed call paths / surfaces:** all API surfaces; admin-mint path only.
 - **Enforcement owner:** `Hort-enforced`.
 - **Status:** `Active`.
 - **Mandatory guardrails:** [OWASP A07/A01 · NIS2 21(2)(i) · CRA I(2)(a) · BSI ORP.4] no `claims:[…]` ever; SA self-mint is a hard reject.
+- **`issue-svc-token` conformance note:** the `hort-server admin issue-svc-token` CLI now conforms to this entry — it rejects `--permission=admin` and requires a **pre-existing** gitops `ServiceAccount` (it no longer fabricates an `is_admin` user when the SA is absent). Service accounts are strictly non-admin (ADR 0038); scoped authority flows through the audited gitops apply path as `serviceAccount`-subject grants (ADR 0037 / ADR 0012). The one admin-identity creation moved to the `bootstrap-session` note below.
 
 ### Entry 5 — Native token — Refresh
 
@@ -139,13 +140,13 @@ Part II(3) effectiveness into the catalog's done-criteria.
 ### Entry 7 — OCI `/v2/auth` token
 
 - **Credential form:** OCI registry bearer; server-config `aud`; `sub` = validated PAT's user.
-- **Purpose / allowed use:** Docker/OCI client auth against the registry endpoints.
-- **Restrictions & caps:** roles re-resolved from current DB grants on consume; `aud` is server-config (not attacker-controlled).
-- **Protection:** at rest — none (bearer); in transit — TLS; blast-radius — forged token requires signing-key compromise.
+- **Purpose / allowed use:** Docker/OCI client auth against the registry endpoints. **Per-identity capability token** (ADR 0036): it authorises exactly the repository actions the caller's authority permits — admin is **not** an OCI scope and the token never carries it.
+- **Restrictions & caps:** authority = the caller's **`User`-subject grants ∩ token cap** — the same basis the consume side re-evaluates, with **no admin/registry/catalog ambient authority** on either the mint or consume side. The mint principal carries `claims: []` (the admin short-circuit cannot fire on this surface — ADR 0036); `aud` is server-config (not attacker-controlled). **B1 fail-closed cap backstop:** a cap-bound native token (`TokenKind::Pat` / `TokenKind::ServiceAccount`) carrying the `admin` claim but a `None` cap is **denied** (`RbacEvaluator::user_grants_authorize`, `crates/hort-app/src/rbac.rs`) — OIDC (`token_kind:None`) and CliSession (`token_kind:Some(CliSession)`) are deliberately untouched, since they legitimately carry a `None` cap (ADR 0012/0013).
+- **Protection:** at rest — none (bearer); in transit — TLS; blast-radius — bounded by `User`-subject grants ∩ cap (no admin short-circuit); forged token requires signing-key compromise.
 - **Allowed call paths / surfaces:** OCI `/v2/*` + `/v2/auth` — **public-by-requirement** (push clients / CI).
 - **Enforcement owner:** `Hort-enforced`.
-- **Status:** `Active`. Consume-side validation is **unified** behind the single `hort-app` entrypoint `OciTokenExchangeUseCase::verify_inbound → OciVerifyOutcome` (`crates/hort-app/src/use_cases/oci_token_exchange_use_case.rs`) — no bespoke verification logic lives in the inbound crate; the mint half delegates PAT validation to the shared `PatValidationUseCase`. The Ed25519 sign/verify primitive *is* the OCI Distribution-Spec issuer mechanism, not bespoke-by-choice. The **`service=`-vs-configured-`aud` 400-on-mismatch gate** is enforced as an unbypassable Step-0 inside `OciTokenExchangeUseCase::exchange` (before scope parse + PAT validate; HTTP 400 `UNSUPPORTED` envelope, message constant `"service mismatch"`, requested value goes to the structured audit log only). Consume-side `aud` is centralised on `config.jwt_audience` (no mint/consume aud-derivation drift). The **mint endpoint `/v2/auth` is exempt from the consume-side `oci_bearer_auth` `route_layer`** (path-skip at the top of `crates/hort-http-oci/src/middleware/oci_auth.rs`): it validates the inbound `Basic <PAT>` itself, so a native PAT (or federated CI token) — which verifies as `NotOurToken` against the OCI signing key — must NOT be intercepted by the bearer middleware (under `HORT_AUTH_PROVIDER=disabled` that interception `401`'d every credentialed mint request before the handler ran, breaking the `Basic <PAT> → OCI JWT` exchange; regression-pinned by `v2_auth_basic_credential_skips_middleware_and_reaches_handler`). The `/v2/*` consume paths stay behind the middleware.
-- **Mandatory guardrails:** [OWASP A07 · NIS2 21(2)(i) · CRA I(2)(a)] `service=` validated-or-rejected — **met** by the unbypassable Step-0 gate in `exchange`; the verifier stays unified onto the single `hort-app` `verify_inbound` entrypoint.
+- **Status:** `Active`. **Capability model (ADR 0036):** the mint principal carries `claims: []` and authority is computed as `User`-subject grants ∩ cap on **both** mint and consume — there is no admin short-circuit on the OCI surface and mint/consume no longer diverge. Consume-side validation is **unified** behind the single `hort-app` entrypoint `OciTokenExchangeUseCase::verify_inbound → OciVerifyOutcome` (`crates/hort-app/src/use_cases/oci_token_exchange_use_case.rs`) — no bespoke verification logic lives in the inbound crate; the mint half delegates PAT validation to the shared `PatValidationUseCase`. The Ed25519 sign/verify primitive *is* the OCI Distribution-Spec issuer mechanism, not bespoke-by-choice (one key shared with the CliSession family, verify-time `aud`+`token_kind` separation — open-items register CRYP-1). The **`service=`-vs-configured-`aud` 400-on-mismatch gate** is enforced as an unbypassable Step-0 inside `OciTokenExchangeUseCase::exchange` (before scope parse + PAT validate; HTTP 400 `UNSUPPORTED` envelope, message constant `"service mismatch"`, requested value goes to the structured audit log only). Consume-side `aud` is centralised on `config.jwt_audience` (no mint/consume aud-derivation drift). The **mint endpoint `/v2/auth` is exempt from the consume-side `oci_bearer_auth` `route_layer`** (path-skip at the top of `crates/hort-http-oci/src/middleware/oci_auth.rs`): it validates the inbound `Basic <PAT>` itself, so a native PAT (or federated CI token) — which verifies as `NotOurToken` against the OCI signing key — must NOT be intercepted by the bearer middleware (under `HORT_AUTH_PROVIDER=disabled` that interception `401`'d every credentialed mint request before the handler ran, breaking the `Basic <PAT> → OCI JWT` exchange; regression-pinned by `v2_auth_basic_credential_skips_middleware_and_reaches_handler`). The `/v2/*` consume paths stay behind the middleware.
+- **Mandatory guardrails:** [OWASP A07/A01 · NIS2 21(2)(i) · CRA I(2)(a)] `service=` validated-or-rejected — **met** by the unbypassable Step-0 gate in `exchange`; the verifier stays unified onto the single `hort-app` `verify_inbound` entrypoint; **no admin/ambient authority on the OCI surface** — the mint carries `claims: []` and the B1 fail-closed Pat/SA cap backstop denies an admin-claim native token with a `None` cap (ADR 0036). A future change reintroducing an admin claim onto the OCI mint, or relaxing B1 to admit a `None`-cap Pat/SA admin, is a hard block.
 
 ### Entry 8 — HTTP Basic
 
@@ -176,6 +177,28 @@ entry numbers are **not** renumbered (external references in
 `docs/metrics-catalog.md` and
 `docs/architecture/how-to/deploy/security-hardening-checklist.md`
 stay stable).
+
+**Bootstrap-session note (not the removed Entry-9 mechanism).** A
+narrow `hort-server admin bootstrap-session` CLI exists as the
+DSN-gated **first-admin / break-glass** path
+(`crates/hort-server/src/cli/admin.rs`). It is **doubly gated**: it
+requires operator-level Postgres (DSN) access **and**
+`HORT_TOKEN_ALLOW_ADMIN=true` (refuses otherwise). It mints a
+**short-lived (≤ 1 h)**, **full-cap** admin `Pat` for the reserved
+**non-service-account** user `bootstrap-admin` (`is_admin=true`,
+`is_service_account=false`), revoking any prior bootstrap token first
+(single active token). The explicit full cap is required because the B1
+fail-closed backstop denies an admin-claim `Pat` carrying a
+`None`/admin-less cap (Entry 7 / ADR 0036). It is **bootstrap /
+break-glass only** — used once to wire the IdP (Dex / SSO) + the
+group→`admin` `ClaimMapping`, or when the IdP is down; steady-state
+human admin is IdP-backed (OIDC → CliSession, Entries 1/3). It is the
+**only** no-IdP / first-admin admin path; service accounts are strictly
+non-admin (Entry 4). Canonical decision: **ADR 0038** (admin-identity
+model). This is the only admin-identity *creation* in the CLI; it is
+deliberately not a full Entry of its own (it is not a steady-state
+inbound mechanism but a DSN-gated provisioning/break-glass primitive),
+catalogued here so an audit sweep finds it.
 
 ### Entry 10 — Test-clock bypass
 
@@ -229,6 +252,37 @@ token after a 404/401. The leak is limited to repo existence + `dl`/`api` URLs
 download) remain fully gated through `resolve(.., AccessLevel::Read)` and are
 unaffected.** npm and PyPI do not have this conditional-token bootstrap gap and
 are not affected. See ADR 0035.
+
+### Cross-cutting note — deployment / IdP model (admin identity, Dex) (ADR 0038)
+
+Not a mechanism — a deployment-modeling note that constrains how the Entry 1
+(OIDC) / Entry 3 (CliSession) / Entry 4 (ServiceAccount) mechanisms compose in
+practice.
+
+- **Human admin is IdP-assumed: OIDC → CliSession.** Hort derives `is_admin` and
+  all claim-mapped grants from the IdP **`groups`** claim via a group→`admin`
+  `ClaimMapping`. The IdP must therefore be **group-capable** — the org's real
+  SSO, or **Dex fronting a group-capable connector** (LDAP / GitHub / upstream
+  OIDC).
+- **Accuracy correction — Dex `staticPasswords` emit NO `groups` claim**
+  (verified across Dex v2.41–2.44; only LDAP / a real group-capable connector
+  emits `groups`). A Dex `staticPasswords`-only deployment therefore yields
+  **non-admin** OIDC humans — the static admin completes the OIDC → CliSession
+  exchange but resolves to no `admin` claim. **Do not read this catalog as "a
+  static Dex admin is a Hort admin" — it is not.**
+- **No-IdP / first-admin / break-glass admin = the DSN-gated `bootstrap-session`**
+  (see the "Bootstrap-session note" above — explicitly NOT the removed Entry-9
+  mechanism): short-lived (≤1 h), non-SA, full-cap,
+  `HORT_TOKEN_ALLOW_ADMIN`-gated. Used once to wire the IdP + the `admin`
+  `ClaimMapping`, or when the IdP is down.
+- **Tested-path note:** the compose E2E uses **Keycloak** (which emits `groups`);
+  the k8s no-IdP tier moves to the chart's **Dex** sidecar for the OIDC →
+  CliSession path. Dex is the recommended *minimal* IdP **for deployments with a
+  group-capable connector**; the dogfood Dex sidecar ships `staticPasswords`
+  only, so its static admin is documented as non-admin (admin via the
+  bootstrap-session or a real connector — ADR 0038 follow-on 3).
+
+See ADR 0038.
 
 ## §4 — How this catalog is enforced
 

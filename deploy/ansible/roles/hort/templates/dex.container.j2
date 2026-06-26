@@ -1,0 +1,36 @@
+# Quadlet container unit — Dex IdP sidecar (optional, hort_dex_enabled).
+#
+# Minimal OIDC IdP for the human-admin path. Attaches to the hort network so
+# hort-server reaches its JWKS / discovery by container name (dex:{{ hort_dex_port }}),
+# and publishes on 127.0.0.1 so the host nginx proxies the public /dex issuer
+# path to it (nginx runs on the host, outside the container network).
+#
+# The bcrypt admin password hash is a secret read from the unit env
+# (DEX_ADMIN_PASSWORD_HASH); Dex expands it at load (DEX_EXPAND_ENV=true).
+
+[Unit]
+Description=hort dex IdP
+PartOf=hort-server.service
+Before=hort-server.service
+
+[Container]
+Image={{ hort_dex_image }}
+ContainerName=dex
+# Publish on localhost only — nginx proxies the /dex path to it.
+PublishPort=127.0.0.1:{{ hort_dex_port }}:{{ hort_dex_port }}
+# Config (read-only; rendered by the hort role).
+Volume={{ hort_dex_config_dir }}:/etc/dex:ro
+Exec=dex serve /etc/dex/config.yaml
+Environment=DEX_EXPAND_ENV=true
+# SECRET: bcrypt hash of the static admin password. Set
+# hort_dex_admin_password_hash in group_vars/production/vault.yml.
+Environment=DEX_ADMIN_PASSWORD_HASH={{ hort_dex_admin_password_hash }}
+Network=hort.network
+# Drop all Linux capabilities — Dex binds a high port and needs none.
+DropCapability=all
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

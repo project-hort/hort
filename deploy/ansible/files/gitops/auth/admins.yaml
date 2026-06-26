@@ -1,0 +1,18 @@
+# ClaimMapping: the Dex (or any OIDC IdP) group `hort-admins` resolves to
+# the synthetic `admin` claim. A caller whose JWT `groups` claim contains
+# `hort-admins` resolves to is_admin at authentication time (the RBAC
+# evaluator short-circuits on the `admin` claim).
+#
+# This is the human-admin path: human admin is OIDC (Dex) -> CliSession,
+# not a static service-account token. Wire your IdP so the maintainer's
+# account is a member of the `hort-admins` group and point hort-server's
+# HORT_OIDC_ISSUER_URL at it (the hort role's Dex sidecar is the
+# dogfood/recommended minimal IdP; replace `hort-admins` with your real SSO
+# group claim if you front your org IdP instead).
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: admins
+spec:
+  idpGroup: hort-admins
+  claim: admin

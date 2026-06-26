@@ -11,6 +11,7 @@
 //! produces an empty plan instead of a redundant UPDATE.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::Permission;
@@ -77,6 +78,20 @@ pub struct CurrentSnapshot {
     /// grants must continue to be excluded from the PG sweep until
     /// `apply_service_accounts` cleans them up).
     pub sa_owned_grant_digests: HashSet<[u8; 32]>,
+    /// `ServiceAccount.metadata.name` → backing-user UUID (stringified),
+    /// for every SA whose backing `users` row already exists. The diff
+    /// layer uses it to resolve a `GrantSubjectSpec::ServiceAccount`
+    /// grant's identity to the same `GrantIdentity::User` a persisted
+    /// `User(backing_user_id)` row produces, so a re-apply of a
+    /// `serviceAccount`-subject grant classifies as `unchanged` rather
+    /// than churning `create` + `delete`. Computed by the snapshot
+    /// builder (the diff layer is pure: no lookups). An SA absent from
+    /// this map (its backing user not yet minted — the first-apply
+    /// window) falls back to the transient
+    /// [`crate::permission_grant::GrantIdentity::ServiceAccount`]
+    /// name-keyed identity, which correctly classifies the fresh grant
+    /// as `create`. See ADR 0037.
+    pub sa_backing_user_ids_by_name: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,6 +398,38 @@ fn current_grant_identity(g: &CurrentPermissionGrant) -> Option<GrantIdentity> {
     }
 }
 
+/// Desired-side diff identity of one `PermissionGrant` envelope,
+/// resolving a `serviceAccount` subject against the snapshot's
+/// `sa_backing_user_ids_by_name` map so it matches the persisted
+/// `User(backing_user_id)` row's identity.
+///
+/// `Claims` / `User` subjects pass through
+/// [`PermissionGrantSpec::diff_identity`] unchanged. A `ServiceAccount`
+/// subject resolves to [`GrantIdentity::User`] keyed on the SA's
+/// backing-user UUID when that user already exists (the steady-state
+/// re-apply case → `unchanged`); when the backing user has not yet been
+/// minted (the first apply that *creates* the SA) it falls back to
+/// `diff_identity`'s transient
+/// [`GrantIdentity::ServiceAccount`] name-keyed identity, which has no
+/// current match → `create` (correct: the SA-derived row is new). The
+/// digest is unaffected — it is always
+/// [`spec_digest_permission_grant`] over the *original* envelope spec,
+/// so the resolved-identity match still compares the stable spec
+/// digest and a replay is `unchanged`.
+fn desired_grant_identity(spec: &PermissionGrantSpec, current: &CurrentSnapshot) -> GrantIdentity {
+    use crate::permission_grant::GrantSubjectSpec;
+    if let GrantSubjectSpec::ServiceAccount { name } = &spec.subject {
+        if let Some(user_id) = current.sa_backing_user_ids_by_name.get(name) {
+            return GrantIdentity::User {
+                user_id: user_id.clone(),
+                repository: spec.repository.clone(),
+                permission: Permission::from_str(&spec.permission).unwrap_or(Permission::Read),
+            };
+        }
+    }
+    spec.diff_identity()
+}
+
 /// PermissionGrant diff. One envelope = one grant = one
 /// subject-dependent identity. The envelope is classified as:
 ///
@@ -407,12 +454,12 @@ fn diff_permission_grants(
     let desired_identities: HashSet<GrantIdentity> = desired
         .permission_grants
         .iter()
-        .map(|e| e.spec.diff_identity())
+        .map(|e| desired_grant_identity(&e.spec, current))
         .collect();
 
     for env in &desired.permission_grants {
         let digest = spec_digest_permission_grant(&env.spec);
-        let identity = env.spec.diff_identity();
+        let identity = desired_grant_identity(&env.spec, current);
         match current_managed.get(&identity) {
             None => plan.create.push(env.clone()),
             Some(existing) => {
@@ -1115,6 +1162,28 @@ mod tests {
         }
     }
 
+    /// `PermissionGrant` envelope with a `serviceAccount` subject
+    /// (ADR 0037 / spec §9).
+    fn pg_sa_env(
+        name: &str,
+        sa_name: &str,
+        permission: &str,
+        repository: Option<&str>,
+    ) -> Envelope<PermissionGrantSpec> {
+        Envelope {
+            api_version: ApiVersion::V1Beta1,
+            kind: Kind::PermissionGrant,
+            metadata: Metadata { name: name.into() },
+            spec: PermissionGrantSpec {
+                subject: GrantSubjectSpec::ServiceAccount {
+                    name: sa_name.into(),
+                },
+                permission: permission.into(),
+                repository: repository.map(Into::into),
+            },
+        }
+    }
+
     /// Current snapshot row for a `Claims` grant. `required` is stored
     /// already-sorted (the snapshot builder sorts before handing to the
     /// diff), so callers pass it sorted.
@@ -1391,6 +1460,66 @@ mod tests {
         let plan = diff(&snapshot, &desired);
         assert_eq!(plan.permission_grants.create.len(), 1);
         assert_eq!(plan.permission_grants.delete, vec![stale_id]);
+    }
+
+    #[test]
+    fn permission_grant_service_account_subject_first_apply_is_create_then_reapply_unchanged() {
+        // Spec §9 / ADR 0037 — the diff-idempotence crux.
+        //
+        // A `serviceAccount`-subject grant resolves (apply-side) to a
+        // `GrantSubject::User(backing_user_id)` row. The cosmetic diff
+        // plan must mirror that:
+        //   - FIRST apply (SA's backing user not yet minted — absent from
+        //     `sa_backing_user_ids_by_name`): the grant has no current
+        //     match → `create` (correct, the row is new).
+        //   - RE-APPLY (backing user now exists, mapped name→uuid): the
+        //     grant resolves to `User(uuid)` and matches the persisted
+        //     `User(uuid)` row at the SAME stable spec digest → `unchanged`
+        //     (no spurious create/delete churn).
+        let sa_name = "maintainer-dev";
+        let backing_uuid = "22222222-2222-2222-2222-222222222222";
+        let env = pg_sa_env("maintainer-dev-global-read", sa_name, "read", None);
+        let digest = spec_digest_permission_grant(&env.spec);
+        let mut desired = DesiredState::default();
+        desired.permission_grants.push(env);
+
+        // FIRST apply: SA backing user not yet known + no current rows.
+        let plan = diff(&CurrentSnapshot::default(), &desired);
+        assert_eq!(
+            plan.permission_grants.create.len(),
+            1,
+            "first apply of an SA-subject grant is a create"
+        );
+        assert!(plan.permission_grants.delete.is_empty());
+
+        // RE-APPLY: the SA backing user exists (name→uuid resolves) and a
+        // matching `User(uuid)` row carries the SAME spec digest.
+        let mut sa_map = HashMap::new();
+        sa_map.insert(sa_name.to_string(), backing_uuid.to_string());
+        let snapshot = CurrentSnapshot {
+            permission_grants: vec![current_pg_user(
+                backing_uuid,
+                Permission::Read,
+                None,
+                ManagedBy::GitOps,
+                Some(digest),
+            )],
+            sa_backing_user_ids_by_name: sa_map,
+            ..CurrentSnapshot::default()
+        };
+        let plan = diff(&snapshot, &desired);
+        assert_eq!(
+            plan.permission_grants.unchanged, 1,
+            "re-apply of an SA-subject grant against the resolved User row is a no-op"
+        );
+        assert!(
+            plan.permission_grants.create.is_empty(),
+            "no spurious create on re-apply"
+        );
+        assert!(
+            plan.permission_grants.delete.is_empty(),
+            "no spurious delete of the resolved User row on re-apply"
+        );
     }
 
     #[test]

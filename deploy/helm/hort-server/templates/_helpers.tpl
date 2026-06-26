@@ -147,9 +147,19 @@ other helper.
   value: {{ .Values.auth.provider | quote }}
 {{- if eq .Values.auth.provider "oidc" }}
 - name: HORT_OIDC_ISSUER_URL
+  {{- if .Values.auth.dex.enabled }}
+  value: {{ .Values.auth.dex.issuerUrl | quote }}
+  {{- else }}
   value: {{ .Values.auth.oidc.issuerUrl | quote }}
+  {{- end }}
 - name: HORT_OIDC_AUDIENCE
+  {{- /* auth.dex.enabled ⇒ aud is the Dex CLI client id (mirrors the
+         issuer override above and the Ansible flavor). */}}
+  {{- if .Values.auth.dex.enabled }}
+  value: {{ .Values.auth.dex.cliClientId | quote }}
+  {{- else }}
   value: {{ .Values.auth.oidc.audience | quote }}
+  {{- end }}
 - name: HORT_OIDC_GROUPS_CLAIM
   value: {{ .Values.auth.oidc.groupsClaim | quote }}
 - name: HORT_JWKS_CACHE_TTL_SECS
