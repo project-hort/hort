@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-06-26
+
+Beta release (`0.9.5-beta.1`). Headline: the OCI `/v2/auth` authorization model
+is reworked into a per-identity **capability token**, service accounts are made
+**strictly non-admin**, and a first-class **no-IdP admin-bootstrap** path is added.
+
+### Security
+
+- **OCI `/v2/auth` is a per-identity capability token.** The token-exchange mint
+  no longer confers ambient admin (the mint principal carries `claims: []`);
+  authority is the caller's `User`-subject `PermissionGrant`s intersected with the
+  token cap — the same basis the consume side re-evaluates — closing the over-grant
+  where the mint granted `pull`/`push` scopes that the `/v2/*` resource gate then
+  denied. Admin is not an OCI scope and the token never carries it. (ADR 0036)
+- **Service accounts are strictly non-admin — no exception.** `issue-svc-token`
+  rejects `--permission=admin` and requires a pre-existing gitops `ServiceAccount`;
+  a gitops `serviceAccount`-subject `PermissionGrant` may not carry `admin`; and the
+  apply-time RBAC linter no longer exempts SA-owned `Admin` grants from the
+  high-privilege reject. (ADR 0037, ADR 0038)
+- **Fail-closed cap backstop.** A cap-bound native token (`Pat` / `ServiceAccount`)
+  presenting the `admin` claim with a `None` cap is denied; OIDC and CliSession
+  principals, which legitimately carry no cap, are unaffected. (ADR 0036)
+
+### Added
+
+- **gitops `PermissionGrant` may target a ServiceAccount by name** —
+  `subject: { kind: serviceAccount, name: … }` resolves at apply to a `User`-subject
+  grant on the SA's backing user, so a non-admin service account can hold scoped
+  `read` / `curate` / `admin_task_invoke` / global authority without an `is_admin`
+  bit (the domain `GrantSubject` taxonomy is unchanged). (ADR 0037)
+- **`hort-server admin bootstrap-session`** — a DSN-gated, short-lived (≤1 h),
+  non-service-account admin token for the no-IdP / first-admin / break-glass path,
+  gated by `HORT_TOKEN_ALLOW_ADMIN`. (ADR 0038)
+- **Optional Dex IdP sidecar** (Helm + Ansible) wiring the human-admin
+  OIDC → CliSession path; **off by default**. (ADR 0038)
+- **Native systemd timers** for the periodic worker tasks (`hort_timers` Ansible
+  role) — the native-flavour equivalent of the Helm CronJobs.
+
+### Changed
+
+- **Admin-identity model — IdP-assumed, zero standing privilege.** Human admin is
+  OIDC (Dex / the organisation's SSO) → CliSession, or the DSN-gated
+  `bootstrap-session`; the deployment de-admins the operator/cron service accounts
+  (`maintainer-dev` → `read`, `maintainer-curator` → `curate`, `cronjob-tasks` →
+  `admin_task_invoke`, all non-admin via standalone `serviceAccount` grants).
+  Destructive scheduled tasks (`eventstore-archive` / `retention-purge` /
+  `retention-evaluate`) are **off by default** — they require a fresh admin session
+  and are run on demand (a propose→confirm→execute approval workflow is the tracked
+  follow-on). (ADR 0038)
+- **`HORT_TRUSTED_PROXY_CIDRS`** is set in the deployment so `hort-server` observes
+  the real client IP behind the edge (nginx) proxy.
+
 ## [0.9.4] - 2026-06-21
 
 Beta release. The feature set is described in the documentation under `docs/`.
