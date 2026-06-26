@@ -118,7 +118,7 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 // offline validator), not duplicated here.
 use crate::provenance::{provenance_identities_from_spec, provenance_mode_from_spec};
 use hort_domain::entities::service_account::{
-    FallbackRotation, FederatedIdentity, SecretFormat, ServiceAccount,
+    backing_username, FallbackRotation, FederatedIdentity, SecretFormat, ServiceAccount,
 };
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::error::DomainError;
@@ -3788,7 +3788,7 @@ impl ApplyConfigUseCase {
     /// token issuance, audit attribution) may grant or revoke tokens
     /// scoped to this user independent of the SA aggregate lifecycle.
     async fn ensure_backing_user(&self, sa_name: &str) -> AppResult<Uuid> {
-        let username = format!("sa:{sa_name}");
+        let username = backing_username(sa_name);
         if let Some(user) = self.users.find_by_username(&username).await? {
             return Ok(user.id);
         }

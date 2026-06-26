@@ -30,6 +30,7 @@ use uuid::Uuid;
 use hort_domain::entities::api_token::TokenKind;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::ClaimMapping;
+use hort_domain::entities::service_account::parse_backing_username;
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::events::{
     system_actor, AdminStatusChanged, AuthenticationAttempted, DomainEvent, StreamId,
@@ -881,10 +882,8 @@ impl AuthenticateUseCase {
                 // the only writer), but guards against historical
                 // rows produced by `hort-cli admin token issue --kind
                 // svc` before the gitops surface existed.
-                let sa_label = user
-                    .username
-                    .strip_prefix("sa:")
-                    .unwrap_or(user.username.as_str());
+                let sa_label =
+                    parse_backing_username(&user.username).unwrap_or(user.username.as_str());
                 crate::metrics::emit_service_account_authenticated(
                     sa_label,
                     crate::metrics::SA_AUTH_SOURCE_PAT,

@@ -153,6 +153,10 @@
 # Synchronise the gitops tree.  The `delete: true` flag removes stale files
 # so the host tree always matches the committed Ansible repo state exactly.
 # *.example files are excluded: they are operator templates, not live config.
+# auth/admins.yaml (a ClaimMapping) is excluded here and managed by the gated
+# tasks below: hort-server's gitops preflight PARKS (serves /readyz=503) if a
+# ClaimMapping is declared while HORT_AUTH_PROVIDER=disabled, so the ClaimMapping
+# may only reach HORT_CONFIG_DIR when the IdP (Dex/OIDC) is enabled.
 - name: Sync gitops config tree to host
   ansible.posix.synchronize:
     src: "{{ gitops_source_dir }}/"
@@ -163,6 +167,36 @@
       - "--chown=root:{{ hort_user }}"
       - "--chmod=D750,F640"
       - "--exclude=*.example"
+      - "--exclude=auth/admins.yaml"
+  notify:
+    - Restart hort-server (system scope)
+    - Restart hort-server (user scope)
+
+# Gate the admins ClaimMapping on the IdP being enabled. hort-server refuses to
+# boot (parks, /readyz=503) when a ClaimMapping/GroupMapping is declared but
+# HORT_AUTH_PROVIDER=disabled — "silent dormant state is not supported". With
+# Dex/OIDC off (the default), human admin is the DSN-gated bootstrap-session
+# (ADR 0038), which needs no ClaimMapping. The bulk sync above excludes
+# auth/admins.yaml (rsync --delete protects an excluded file from removal), so
+# these two tasks own its lifecycle: ship it only when the IdP is on, else
+# ensure absent (which also un-parks a host previously synced with it present).
+- name: Ship the admins ClaimMapping (IdP/Dex enabled)
+  ansible.builtin.copy:
+    src: "{{ gitops_source_dir }}/auth/admins.yaml"
+    dest: "{{ hort_config_dir }}/auth/admins.yaml"
+    owner: root
+    group: "{{ hort_user }}"
+    mode: "0640"
+  when: hort_dex_enabled | bool
+  notify:
+    - Restart hort-server (system scope)
+    - Restart hort-server (user scope)
+
+- name: Remove the admins ClaimMapping (IdP/Dex disabled — avoid dormant-ClaimMapping park)
+  ansible.builtin.file:
+    path: "{{ hort_config_dir }}/auth/admins.yaml"
+    state: absent
+  when: not (hort_dex_enabled | bool)
   notify:
     - Restart hort-server (system scope)
     - Restart hort-server (user scope)

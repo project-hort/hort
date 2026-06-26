@@ -82,8 +82,8 @@ pub enum AdminSubcommand {
     /// named token already exists in `users.api_tokens` it is NOT
     /// rotated (operator forces rotation by passing `--rotate`).
     ///
-    /// The command finds (or creates) a service-account user named
-    /// `hort-svc-<name>` (e.g. `hort-svc-cronjob-tasks`), then calls
+    /// The command finds the gitops-created service-account user named
+    /// `sa:<name>` (e.g. `sa:cronjob-tasks`), then calls
     /// `ApiTokenUseCase::issue_for_service_account_system`
     /// with the requested permissions. The system-mint path is correct
     /// here because the CLI runs at deploy time with operator-level DSN
@@ -123,7 +123,7 @@ pub struct IssueSvcTokenArgs {
     /// Logical name for the token row.
     ///
     /// Stored in `api_tokens.name`; surfaced in audit events. Also used to
-    /// derive the service-account username (`hort-svc-<name>`). Must be
+    /// derive the service-account username (`sa:<name>`). Must be
     /// non-empty and ≤ 255 characters.
     #[arg(long)]
     pub name: String,
@@ -207,17 +207,21 @@ fn run_issue_svc_token(args: IssueSvcTokenArgs) -> ExitCode {
 
 /// Service-account username derived from the token logical name.
 ///
-/// Convention: `hort-svc-<name>`. Keeps the provisioned user visible in
-/// `GET /admin/users` as a clearly-namespaced service principal.
+/// Convention: `sa:<name>` — the SAME backing-`users` username a gitops
+/// `ServiceAccount` apply writes (`ensure_backing_user`). The CLI lookup
+/// MUST match the apply convention or `issue-svc-token` can never find a
+/// gitops-declared SA; routing through
+/// [`hort_domain::entities::service_account::backing_username`] is the
+/// single source of truth that prevents the two from drifting again.
 fn svc_username(name: &str) -> String {
-    format!("hort-svc-{name}")
+    hort_domain::entities::service_account::backing_username(name)
 }
 
 /// Validate the user `issue-svc-token` is about to mint for.
 ///
 /// `issue-svc-token` requires a PRE-EXISTING gitops `ServiceAccount`
 /// and never fabricates a user (ADR 0012). `found` is the
-/// `find_by_username` result for `username` (= `svc:<svc_name>`); the
+/// `find_by_username` result for `username` (= `sa:<svc_name>`); the
 /// resolution rules are:
 ///
 /// - `None` (no such user) → error: define the SA in gitops + apply
@@ -874,8 +878,24 @@ mod tests {
 
     #[test]
     fn svc_username_derives_correct_name() {
-        assert_eq!(svc_username("cronjob-tasks"), "hort-svc-cronjob-tasks");
-        assert_eq!(svc_username("foo"), "hort-svc-foo");
+        assert_eq!(svc_username("cronjob-tasks"), "sa:cronjob-tasks");
+        assert_eq!(svc_username("foo"), "sa:foo");
+    }
+
+    #[test]
+    fn svc_username_matches_gitops_backing_user_convention() {
+        // The CLI lookup IS the gitops backing-user convention: both must
+        // derive the SAME `sa:<name>` username, or `issue-svc-token` can
+        // never find a gitops-declared SA (the `hort-svc-` mismatch that
+        // shipped in 0.9.5-beta.1). Pinning them to the single
+        // `hort_domain::entities::service_account::backing_username` source
+        // of truth keeps the two from drifting again.
+        for name in ["cronjob-tasks", "foo", "bar-baz"] {
+            assert_eq!(
+                svc_username(name),
+                hort_domain::entities::service_account::backing_username(name),
+            );
+        }
     }
 
     // -- output-mode parsing (unit tests on the pure logic) -----------------
@@ -945,7 +965,7 @@ mod tests {
     fn svc_user_row(is_service_account: bool, is_admin: bool) -> User {
         User {
             id: Uuid::from_u128(0x5A),
-            username: "hort-svc-cronjob-tasks".into(),
+            username: "sa:cronjob-tasks".into(),
             email: "x@hort-internal.local".into(),
             auth_provider: AuthProvider::Local,
             external_id: None,
@@ -963,7 +983,7 @@ mod tests {
     fn resolve_svc_user_errors_when_missing() {
         // Missing SA → error pointing at gitops; the caller does NOT
         // create a user (this helper returning Err is what prevents it).
-        let err = resolve_svc_user(None, "hort-svc-cronjob-tasks", "cronjob-tasks").unwrap_err();
+        let err = resolve_svc_user(None, "sa:cronjob-tasks", "cronjob-tasks").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found"), "unexpected: {msg}");
         assert!(
@@ -975,8 +995,7 @@ mod tests {
     #[test]
     fn resolve_svc_user_errors_when_not_a_service_account() {
         let row = svc_user_row(false, false);
-        let err =
-            resolve_svc_user(Some(row), "hort-svc-cronjob-tasks", "cronjob-tasks").unwrap_err();
+        let err = resolve_svc_user(Some(row), "sa:cronjob-tasks", "cronjob-tasks").unwrap_err();
         assert!(err.to_string().contains("is not a service account"));
     }
 
@@ -985,8 +1004,7 @@ mod tests {
         // A service-account row that is somehow is_admin is refused —
         // service accounts must be non-admin.
         let row = svc_user_row(true, true);
-        let err =
-            resolve_svc_user(Some(row), "hort-svc-cronjob-tasks", "cronjob-tasks").unwrap_err();
+        let err = resolve_svc_user(Some(row), "sa:cronjob-tasks", "cronjob-tasks").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("admin user"), "unexpected: {msg}");
         assert!(msg.contains("non-admin"), "unexpected: {msg}");
@@ -995,9 +1013,8 @@ mod tests {
     #[test]
     fn resolve_svc_user_returns_non_admin_service_account() {
         let row = svc_user_row(true, false);
-        let resolved =
-            resolve_svc_user(Some(row.clone()), "hort-svc-cronjob-tasks", "cronjob-tasks")
-                .expect("non-admin SA must resolve");
+        let resolved = resolve_svc_user(Some(row.clone()), "sa:cronjob-tasks", "cronjob-tasks")
+            .expect("non-admin SA must resolve");
         assert_eq!(resolved.id, row.id);
         assert!(resolved.is_service_account);
         assert!(!resolved.is_admin);

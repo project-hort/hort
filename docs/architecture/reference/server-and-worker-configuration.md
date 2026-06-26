@@ -95,7 +95,7 @@ plus `hort-cli auth login --paste`; see `crates/hort-server/README.md`.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--name` | String | _(required)_ | Logical token name; derives SA username `hort-svc-<name>`. |
+| `--name` | String | _(required)_ | Logical token name; derives the gitops SA backing-user username `sa:<name>`. |
 | `--permission` | String (repeatable) | `["admin_task_invoke"]` | Permissions to grant. |
 | `--output` | String | `"stdout"` | `stdout` \| `file:<path>` (mode `0600`); `kube-secret` is rejected in v1. |
 | `--rotate` | flag | off | Force revoke + re-mint; default is idempotent (exit 0, no rotation if it already exists). |

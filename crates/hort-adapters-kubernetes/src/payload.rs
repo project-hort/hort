@@ -16,7 +16,7 @@ use k8s_openapi::ByteString;
 use serde_json::json;
 use uuid::Uuid;
 
-use hort_domain::entities::service_account::SecretFormat;
+use hort_domain::entities::service_account::{backing_username, SecretFormat};
 use hort_domain::ports::kubernetes_secret_writer::{ManagedSecret, ManagedSecretSpec};
 
 use crate::metrics::{
@@ -118,7 +118,7 @@ pub(crate) fn build_secret(name: &str, spec: &ManagedSecretSpec) -> Secret {
 fn build_payload(spec: &ManagedSecretSpec) -> (&'static str, BTreeMap<String, ByteString>) {
     match spec.format {
         SecretFormat::Dockerconfigjson => {
-            let username = format!("sa:{}", spec.service_account_name);
+            let username = backing_username(&spec.service_account_name);
             // `auth` is the base64 of `username:password` per the
             // dockerconfigjson convention. Some clients ignore it
             // (they re-compute from username/password) but operators
