@@ -198,9 +198,10 @@ variables:
 #                 subject_token_type=urn:ietf:params:oauth:token-type:jwt
 #   response: { "access_token": "..." }
 #
-# Cargo source: sparse+https://registry.hort.rs/cargo/cargo-virtual/ (the
-# virtual aggregation repo). Fallback until cargo-virtual lands: crates-proxy
-# (change HORT_CARGO_SOURCE_REPO to "crates-proxy").
+# Cargo source (HORT_CARGO_SOURCE_REPO, default cargo-virtual): the virtual
+# aggregation repo — own crates + crates.io mirror. For a hort deployment whose
+# build predates the aggregation, set HORT_CARGO_SOURCE_REPO=crates-proxy to
+# resolve against the crates.io pull-through directly.
 .hort-auth:
   id_tokens:
     HORT_OIDC_TOKEN:
@@ -230,16 +231,24 @@ variables:
 
         # Cargo: sparse index via cargo-virtual (or crates-proxy fallback)
         mkdir -p .cargo
-        printf '[source.crates-io]\nreplace-with = "hort"\n\n' \
+        # cargo >=1.74 requires a credential provider for auth-required
+        # registries (hort's config.json advertises auth-required:true);
+        # cargo:token reads CARGO_REGISTRIES_<NAME>_TOKEN.
+        printf '[registry]\nglobal-credential-providers = ["cargo:token"]\n\n' \
           > .cargo/config.toml
+        printf '[source.crates-io]\nreplace-with = "hort"\n\n' \
+          >> .cargo/config.toml
         printf '[registries.hort]\nindex = "sparse+%s/cargo/%s/"\n\n' \
           "${_hort_url}" "${_hort_cargo_repo}" >> .cargo/config.toml
         # hort-crates: first-party hosted registry (cargo publish target)
         _hort_crates_idx="sparse+${_hort_url}/cargo/hort-crates/"
         printf '[registries.hort-crates]\nindex = "%s"\n' \
           "${_hort_crates_idx}" >> .cargo/config.toml
-        export CARGO_REGISTRIES_HORT_TOKEN="${HORT_TOKEN}"
-        export CARGO_REGISTRIES_HORT_CRATES_TOKEN="${HORT_TOKEN}"
+        # cargo sends the registry token verbatim as the Authorization header;
+        # hort accepts only Bearer/Basic, so encode as HTTP Basic (dummy user).
+        _cargo_b64="$(printf 'x:%s' "${HORT_TOKEN}" | base64 -w0)"
+        export CARGO_REGISTRIES_HORT_TOKEN="Basic ${_cargo_b64}"
+        export CARGO_REGISTRIES_HORT_CRATES_TOKEN="Basic ${_cargo_b64}"
 
         # npm: npm-proxy pull-through
         _hort_host="${_hort_url#https://}"
@@ -273,9 +282,11 @@ test:lint:
   <<: *rust-cache
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
-    # exchange (curl) and the proxy config depend on them being present.
+    # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
+    # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
+    # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
     - *rust-apt-deps
+    - *platform-ca-deb
     - *hort-auth-steps
     - rustup component add rustfmt clippy
   script:
@@ -292,9 +303,11 @@ test:unit:
       artifacts: false
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
-    # exchange (curl) and the proxy config depend on them being present.
+    # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
+    # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
+    # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
     - *rust-apt-deps
+    - *platform-ca-deb
     - *hort-auth-steps
   script:
     - cargo test --workspace --lib --verbose
@@ -315,9 +328,11 @@ test:coverage:
     RUSTC_WRAPPER: ""
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
-    # exchange (curl) and the proxy config depend on them being present.
+    # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
+    # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
+    # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
     - *rust-apt-deps
+    - *platform-ca-deb
     - *hort-auth-steps
     - rustup component add llvm-tools-preview
     - cargo install --locked cargo-llvm-cov || true
@@ -365,9 +380,11 @@ test:integration:
     DATABASE_URL: "postgresql://registry:registry@postgres:5432/artifact_registry"
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
-    # exchange (curl) and the proxy config depend on them being present.
+    # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
+    # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
+    # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
     - *rust-apt-deps
+    - *platform-ca-deb
     - *hort-auth-steps
     - apt-get install -y -qq --no-install-recommends postgresql-client
     - for i in $(seq 1 30); do pg_isready -h postgres -U "${POSTGRES_USER}" && break; sleep 1; done
@@ -940,9 +957,11 @@ release:sbom:
     HORT_OIDC_TOKEN:
       aud: hort-server
   before_script:
-    # rust-apt-deps installs curl/ca-certificates first; hort-auth's OIDC
-    # exchange (curl) and the proxy config depend on them being present.
+    # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
+    # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
+    # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
     - *rust-apt-deps
+    - *platform-ca-deb
     - *hort-auth-steps
     # cosign-setup.sh's `apk add jq` / `dnf install jq` fallback does
     # not cover debian-based images. The rust-apt-deps anchor above
