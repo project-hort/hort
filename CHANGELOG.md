@@ -5,20 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-- **Re-scanning an already-rejected artifact no longer loops the worker.** A
-  re-scan (e.g. `admin rescan`) that re-derives a `Reject` outcome on an
-  artifact already in the terminal `Rejected` state previously hit the
-  `cannot reject artifact in state rejected` invariant; `record_scan_result`
-  propagated it, failing the job, which the worker then retried indefinitely —
-  re-running the scanner on every attempt. The reject path now treats an
-  already-terminal artifact as a recoverable, idempotent skip (mirroring the
-  `ScanIndeterminate` path): the job completes, no duplicate `ArtifactRejected`
-  event, no scan churn.
-
 ## [0.9.6] - 2026-06-27
 
 Beta release (`0.9.6-beta.1`). Headline: OSV **informational** advisories
@@ -46,6 +32,11 @@ cosign-key provenance backend and native-deploy / CI hardening.
 
 - **`cron-rescan-tick` is enabled by default** in the native `hort_timers`
   Ansible role, so proxied artifacts are rescanned on a cadence out of the box.
+- **CI publishes first-party images + chart to Zot on `-beta` tags**
+  (`0.9.6-beta.2`). The `build-images:*` and `helm:lint-and-publish` jobs gated
+  on a tag regex that allowed `-rc` but excluded `-beta`, so a `-beta` release
+  never produced images or a chart for the operator's local cluster. The regex
+  now admits `-beta`; pre-release tags push `:<version>` only, never `:latest`.
 
 ### Fixed
 
@@ -57,6 +48,19 @@ cosign-key provenance backend and native-deploy / CI hardening.
   trust the internal-PKI CA before it, and configure the cargo
   credential-provider + HTTP-Basic token, so federated CI works against a hort
   instance behind an internal CA.
+- **Re-scanning an already-rejected artifact no longer loops the worker**
+  (`0.9.6-beta.2`). A re-scan (e.g. `admin rescan`) that re-derived a `Reject`
+  outcome on an artifact already in the terminal `Rejected` state hit the
+  `cannot reject artifact in state rejected` invariant; `record_scan_result`
+  propagated it, failing the job, which the worker then retried indefinitely.
+  The reject path now treats an already-terminal artifact as a recoverable,
+  idempotent skip (mirroring the `ScanIndeterminate` path).
+- **hort-migrate re-runs on every deploy** (`0.9.6-beta.2`). The native and
+  podman Ansible flavors `started` the `Type=oneshot` migrate unit, which
+  no-ops once it is `active (exited)` — migrations ran on the first deploy and
+  never again, so a schema-advancing release booted a newer binary against a
+  trailing schema and the boot `assert_current` refused to serve. Both flavors
+  now `restart` the oneshot so every deploy applies pending migrations.
 
 ## [0.9.5] - 2026-06-26
 
