@@ -2309,6 +2309,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hort-adapters-provenance-cosign-key"
+version = "0.9.4-beta.5"
+dependencies = [
+ "hort-domain",
+ "p256",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hort-adapters-provenance-sigstore"
 version = "0.9.5-beta.2"
 dependencies = [
@@ -3020,6 +3033,7 @@ dependencies = [
  "hort-adapters-ephemeral-redis",
  "hort-adapters-kubernetes",
  "hort-adapters-postgres",
+ "hort-adapters-provenance-cosign-key",
  "hort-adapters-provenance-sigstore",
  "hort-adapters-scanner-osv",
  "hort-adapters-scanner-trivy",

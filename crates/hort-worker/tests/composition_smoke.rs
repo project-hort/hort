@@ -179,6 +179,7 @@ async fn build_app_context_registers_seed_import_handler() {
         // path, not provenance).
         provenance_cosign_enabled: false,
         provenance_trusted_root_file: None,
+        provenance_cosign_public_keys_file: None,
         advisory_osv_url: String::new(),
         advisory_osv_bulk_url: String::new(),
         advisory_watch_ecosystems: None,
@@ -282,6 +283,7 @@ fn build_app_context_signature_compiles() {
             // is exercised by the hort-app orchestration unit tests).
             provenance_cosign_enabled: false,
             provenance_trusted_root_file: None,
+            provenance_cosign_public_keys_file: None,
             advisory_osv_url: String::new(),
             advisory_osv_bulk_url: String::new(),
             advisory_watch_ecosystems: None,

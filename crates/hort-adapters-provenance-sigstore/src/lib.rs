@@ -311,6 +311,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyed_bundle_is_skipped_not_rejected() {
+        // ADR 0039 §8: a keyed (cosign-key `simplesigning`) bundle is NOT this
+        // verifier's — `signature.is_some()` is skipped, so a keyed-only artifact
+        // yields NoAttestation here (the keyed verifier decides), NOT a reject
+        // that would dominate the fold and false-block a valid keyed image on a
+        // worker running both backends.
+        let a = adapter();
+        let hash: ContentHash = VALID_SHA256.parse().unwrap();
+        let subj = subject(&hash);
+        let reqs = ProvenanceRequirements {
+            allowed_identities: &[],
+        };
+        let bundles = [AttestationBundle::new_signed(
+            br#"{"critical":{"image":{"docker-manifest-digest":"sha256:abc"}}}"#.to_vec(),
+            vec![0x30, 0x44, 0x01],
+        )];
+        let verdict = a.verify(&subj, &bundles, &reqs).await.expect("ok");
+        assert_eq!(verdict.outcome, ProvenanceOutcome::NoAttestation);
+    }
+
+    #[tokio::test]
+    async fn mixed_keyed_and_malformed_keyless_skips_keyed_keeps_keyless_reject() {
+        // A mixed set: the keyed bundle is skipped, but the malformed KEYLESS
+        // bundle still drives the verdict — the keyed one does not mask it.
+        let a = adapter();
+        let hash: ContentHash = VALID_SHA256.parse().unwrap();
+        let subj = subject(&hash);
+        let reqs = ProvenanceRequirements {
+            allowed_identities: &[],
+        };
+        let bundles = [
+            AttestationBundle::new_signed(b"keyed payload".to_vec(), vec![1, 2]),
+            AttestationBundle::new(b"not a bundle".to_vec()),
+        ];
+        let verdict = a.verify(&subj, &bundles, &reqs).await.expect("ok");
+        assert_eq!(
+            verdict.outcome,
+            ProvenanceOutcome::Rejected(
+                hort_domain::ports::provenance::ProvenanceRejectReason::BundleMalformed
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn payload_not_hashing_to_content_hash_is_an_invariant_error() {
         // The `ProvenanceSubject` invariant is `sha256(payload) ==
         // content_hash`. If a caller loads the wrong preimage from

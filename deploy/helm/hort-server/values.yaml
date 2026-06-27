@@ -959,6 +959,18 @@ worker:
       # `worker.extraVolumeMounts` (e.g. from a ConfigMap or Secret) at
       # this path.
       trustedRootFile: /etc/hort/provenance/trusted_root.json
+      # HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE — the KEYED backend (ADR 0039,
+      # `cosign-key`). Path (inside the worker container) to a mounted file of
+      # one or more PEM `-----BEGIN PUBLIC KEY-----` ECDSA P-256 blocks (cosign
+      # `cosign.pub`; multiple keys = a rotation-overlap window). Its PRESENCE
+      # is the keyed backend's enabling gate — INDEPENDENT of `enabled` above
+      # (which gates the keyless Sigstore backend). Empty/unset = keyed backend
+      # off. When set, the worker loads the key set + registers `cosign-key`,
+      # and REFUSES to boot if the file is unreadable or has no parseable key.
+      # NEVER public-grade provenance (no transparency log / identity / timestamp)
+      # — for internal-audience first-party signing only. Mount via
+      # `worker.extraVolumes` / `worker.extraVolumeMounts` (e.g. from a Secret).
+      publicKeysFile: ""
   # -------------------- Worker metrics scrape ----------
   metrics:
     # Worker /metrics scrape endpoint (hort_provenance_*, scan, queue depth).

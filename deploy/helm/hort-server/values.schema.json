@@ -1096,7 +1096,7 @@
           }
         },
         "provenance": {
-          "description": "Sigstore/cosign provenance verification. `cosign.enabled` is LOAD-BEARING (gates ProvenancePort + provenance-verify handler registration, NOT cosmetic). When true the verifier loads a PINNED trusted_root.json from `cosign.trustedRootFile` at boot (the verify path is offline — no live TUF/Rekor/Fulcio fetch) and the worker refuses to boot if that file is missing.",
+          "description": "Sigstore/cosign provenance verification. `cosign.enabled` is LOAD-BEARING (gates the keyless Sigstore ProvenancePort + provenance-verify handler registration, NOT cosmetic). When true the verifier loads a PINNED trusted_root.json from `cosign.trustedRootFile` at boot (the verify path is offline — no live TUF/Rekor/Fulcio fetch) and the worker refuses to boot if that file is missing. `cosign.publicKeysFile` independently enables the KEYED cosign-key backend (ADR 0039): a mounted PEM public-key file for first-party internal-audience signing — never public-grade provenance.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -1105,7 +1105,8 @@
               "additionalProperties": false,
               "properties": {
                 "enabled": {"type": "boolean"},
-                "trustedRootFile": {"type": "string", "minLength": 1}
+                "trustedRootFile": {"type": "string", "minLength": 1},
+                "publicKeysFile": {"type": "string"}
               }
             }
           }

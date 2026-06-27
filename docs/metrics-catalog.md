@@ -2916,12 +2916,14 @@ change (catalog-and-code-atomic; the `ProvenanceRejectReason` match is
 non-wildcard so a new domain variant is a compile error until the label
 mapping + this catalog row are extended).
 
-**`backend` label.** The provenance verifier id — `cosign` in Tier 1
-(the only registered `ProvenancePort`). Bounded by the registered
-verifier set (cosign → OCI today; Tier-2 PGP / PEP-740 / cargo verifiers
-add their own ids as they ship). Shares the `backend` label name with the
-storage-backend metrics but a disjoint, closed value set — the per-metric
-row is authoritative.
+**`backend` label.** The provenance verifier id — in Tier 1: `cosign`
+(keyless Sigstore v0.3 bundle) and `cosign-key` (keyed pinned-public-key,
+ADR 0039). A scope running both verifiers labels the series with the verifier
+that **decided** the folded verdict (ADR 0039 §6), not the first-registered one.
+Bounded by the registered verifier set (`cosign`, `cosign-key` → OCI today;
+Tier-2 PGP / PEP-740 / cargo verifiers add their own ids as they ship). Shares
+the `backend` label name with the storage-backend metrics but a disjoint, closed
+value set — the per-metric row is authoritative.
 
 **`mode` label** (`hort_provenance_verify_total` only). The resolved
 `provenance_mode` for the artifact's scope — the lowercase wire-form of

@@ -7,8 +7,9 @@ artifacts and, optionally, **gate release** on a verified attestation.
 Provenance verification extends hort's "Origin" pillar from checksum to
 signature: at ingest, hort verifies a cryptographic claim about *where an
 artifact came from* against a set of allowed signer identities. In Tier 1
-the only verifier is **cosign → OCI**; other formats (npm/PyPI/cargo
-Sigstore, Maven PGP) are Tier 2.
+the verifiers are **cosign → OCI** (keyless Sigstore bundle) and **cosign-key →
+OCI** (keyed pinned-public-key, ADR 0039 — see the keyed section in §1); other
+formats (npm/PyPI/cargo Sigstore, Maven PGP) are Tier 2.
 
 Verification works on **both hosted and proxy/pull-through OCI repos**.
 For a proxy repo, the worker fetches the image's Sigstore signature from
@@ -16,8 +17,9 @@ upstream (the OCI v1.1 Referrers API, with a cosign `.sig` tag-scheme
 fallback), ingests it into local CAS, and verifies it offline against the
 pinned trust root — so `verify_if_present` and `required` are both
 meaningful on a proxy, not just on hosted content. See §2's mode
-descriptions for the per-mode behavior and the **one named limitation**
-(legacy `simplesigning` signatures).
+descriptions for the per-mode behavior. The keyless verifier's one named
+limitation — legacy `simplesigning` signatures — is now covered, **only for
+scopes that select the keyed `cosign-key` backend** (ADR 0039).
 
 For the design rationale see
 [ADR 0027 — artifact provenance verification](../../adr/0027-artifact-provenance-verification.md)
@@ -74,6 +76,66 @@ fails if it is unset, and the worker **refuses to boot** if the file is
 missing, unreadable, or stale (outside its refresh window). A boot-time
 `health_check` verifies the trust root is loaded and fresh; it does
 **not** probe live Rekor/Fulcio (verification is offline).
+
+### Keyed cosign (`cosign-key`) — a pinned public key, for sovereign first-party signing (ADR 0039)
+
+A second, **independent** verifier backend (`cosign-key`) verifies a keyed cosign
+signature (`cosign sign --key`, the legacy `simplesigning` shape) against an
+**operator-pinned public key** — no Fulcio, no Rekor, no trust root, fully
+offline. It is for the sovereign operator who signs **first-party OCI images**
+with a long-lived key (e.g. a self-hosted CI that no public Fulcio will issue
+for), where Hort is the verifier. See
+[ADR 0039](../../adr/0039-keyed-provenance-verification.md).
+
+Its enabling gate is the **presence of a pinned-key file** (independent of
+`cosign.enabled`, which gates the keyless backend) — mount a file of one or more
+PEM public keys and point the worker at it:
+
+```yaml
+worker:
+  provenance:
+    cosign:
+      # Keyed backend (ADR 0039): a mounted file of one or more
+      # `-----BEGIN PUBLIC KEY-----` ECDSA P-256 blocks (cosign `cosign.pub`).
+      # Multiple keys = a rotation-overlap window.
+      publicKeysFile: /etc/hort/provenance/cosign-keys.pem
+```
+
+> The chart key above lands with the keyed-backend Helm wiring; until then set
+> the env var directly on the worker:
+> `HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE=/etc/hort/provenance/cosign-keys.pem`.
+
+The worker **refuses to boot** if the file is set but unreadable or contains no
+parseable P-256 public key. A `ScanPolicy` then selects the backend with
+`provenanceBackends: [cosign-key]` (no `provenanceIdentities` — they are **inert**
+for the keyed backend, and a `cosign-key`-only scope that sets them is rejected
+at apply).
+
+> **A keyed signature is a WEAKER assertion than a keyless bundle — never
+> public-grade provenance.** It carries **no transparency-log inclusion, no
+> OIDC-identity binding, no public verifiability, and no trusted timestamp**. It
+> attests only "signed by the holder of key K", trusted solely because *you*
+> pinned K. It is the correct control for an **internal-audience** deployment
+> where Hort is the verifier — never present it as equivalent to a Sigstore
+> bundle.
+>
+> **Key compromise = re-sign everything.** With no trusted timestamp there is no
+> way to distinguish pre- from post-compromise signatures, so revoking a
+> compromised key means removing it from the pinned set **and re-signing every
+> legitimate artifact** — not a rotation overlap.
+
+> **A worker runs every verifier it has configured.** Dispatch is worker-level,
+> not per-scope: a `ScanPolicy`'s `provenanceBackends` is validated at apply but
+> does **not** select which verifier runs at ingest. So if a worker has BOTH the
+> keyless trust root and the keyed key file, every OCI artifact is checked by
+> both — the fold is OR (either a valid keyless bundle **or** a valid keyed
+> signature clears the gate). This is safe: the two verifiers partition by
+> signature shape (each ignores the other's), and a keyed signature **requires
+> your pinned key** — an attacker cannot forge one to bypass keyless checks. **To
+> enforce a single backend** (e.g. keyless-only on a public proxy), configure only
+> that verifier on the worker — set the trust root XOR the keyed `publicKeysFile`,
+> not both. Mixing both on one worker is fine for first-party-keyed +
+> third-party-keyless content (each image carries one shape).
 
 ### Mounting the pinned trust root
 

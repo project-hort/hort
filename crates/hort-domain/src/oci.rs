@@ -18,6 +18,20 @@ use crate::types::ContentHash;
 /// for "this OCI referrer is a cosign signature/attestation."
 pub const SIGSTORE_BUNDLE_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
 
+/// The OCI layer `mediaType` of a legacy cosign `simplesigning` signature —
+/// the `cosign sign --key` shape (ADR 0039). The layer blob is the
+/// `simplesigning` JSON payload (carrying `critical.image.docker-manifest-digest`);
+/// the detached signature rides the layer annotation
+/// [`COSIGN_SIGNATURE_ANNOTATION`]. Distinct from [`SIGSTORE_BUNDLE_MEDIA_TYPE`]
+/// (the keyless v0.3 bundle) — the keyed verifier reads this shape, the Sigstore
+/// verifier reads that one.
+pub const COSIGN_SIMPLESIGNING_MEDIA_TYPE: &str =
+    "application/vnd.dev.cosign.simplesigning.v1+json";
+
+/// The OCI layer annotation key carrying the base64 detached cosign signature
+/// over a [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`] payload layer.
+pub const COSIGN_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
+
 /// Minimal OCI image-manifest projection — only the fields bundle-layer
 /// extraction needs. `serde` ignores every other manifest field.
 #[derive(Deserialize)]
@@ -36,6 +50,11 @@ struct OciLayer {
     media_type: Option<String>,
     #[serde(default)]
     digest: Option<String>,
+    /// Layer annotations — the keyed `simplesigning` signature rides
+    /// `dev.cosignproject.cosign/signature` here. `serde` defaults to empty for
+    /// the bundle/SBOM layers that carry none.
+    #[serde(default)]
+    annotations: std::collections::HashMap<String, String>,
 }
 
 /// Returns the CAS content hash of every layer carrying a Sigstore bundle.
@@ -126,6 +145,85 @@ pub fn is_pure_sigstore_bundle(manifest_json: &[u8]) -> DomainResult<bool> {
             .all(|l| l.media_type.as_deref() == Some(SIGSTORE_BUNDLE_MEDIA_TYPE)))
 }
 
+/// Returns `true` iff the manifest is a **pure** cosign `simplesigning`
+/// referrer: it parses, carries **at least one** layer, and **every** layer's
+/// `mediaType` is [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`]. The keyed counterpart of
+/// [`is_pure_sigstore_bundle`] — the push-path scan exemption (ADR 0039 §8): a
+/// keyed `.sig` is signature material, not runnable content, so it is landed via
+/// the narrow signature-ingest path (status `None`, no scan, the `oci_subject`
+/// link) like a keyless `.sig`. The "every layer" requirement is the same
+/// anti-scan-evasion guard: a mixed manifest (a simplesigning layer plus a
+/// `tar+gzip` malware layer) is **not** pure → it stays scanned.
+///
+/// Recognition is keyed solely on the per-layer `mediaType` (not the signature
+/// annotation): the exemption is about "no runnable content", which the media
+/// type alone establishes. Malformed / non-manifest JSON is
+/// [`crate::error::DomainError::Validation`].
+pub fn is_pure_simplesigning(manifest_json: &[u8]) -> DomainResult<bool> {
+    let manifest: OciManifest = serde_json::from_slice(manifest_json)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
+
+    Ok(!manifest.layers.is_empty()
+        && manifest
+            .layers
+            .iter()
+            .all(|l| l.media_type.as_deref() == Some(COSIGN_SIMPLESIGNING_MEDIA_TYPE)))
+}
+
+/// One legacy cosign `simplesigning` signature carried on a `.sig` referrer:
+/// the CAS hash of the payload-layer blob (the `simplesigning` JSON) plus the
+/// base64 detached signature read from the layer's
+/// [`COSIGN_SIGNATURE_ANNOTATION`]. The keyed verifier
+/// (`hort-adapters-provenance-sigstore`) reads the payload blob by
+/// `payload_layer` and verifies `signature` over it against the pinned key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimplesigningSignature {
+    /// CAS content hash of the `simplesigning` payload-layer blob.
+    pub payload_layer: ContentHash,
+    /// The base64-encoded detached signature (the layer annotation value).
+    pub signature: String,
+}
+
+/// Extract every legacy cosign `simplesigning` signature a `.sig` referrer
+/// manifest carries — the keyed-provenance counterpart of
+/// [`sigstore_bundle_layers`] (ADR 0039 §8). For each layer whose `mediaType`
+/// is [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`] that ALSO carries a non-empty
+/// [`COSIGN_SIGNATURE_ANNOTATION`] and a `sha256:` digest, returns the payload
+/// layer hash + the signature. A layer missing either the annotation or a usable
+/// `sha256:` digest is **skipped** (not an error) — it cannot be verified. A
+/// non-simplesigning referrer (a v0.3 bundle, an SBOM, an ordinary manifest)
+/// yields `Ok(vec![])`. Malformed / non-manifest JSON is
+/// [`crate::error::DomainError::Validation`] — the same error shape
+/// [`sigstore_bundle_layers`] produces.
+///
+/// Unlike [`sigstore_bundle_layers`] there is no manifest-level `artifactType`
+/// fallback: the keyed signature is intrinsically per-layer (payload digest +
+/// annotation live on the layer), so an `artifactType`-only signal carries
+/// neither and is meaningless here.
+pub fn simplesigning_signature_layers(
+    manifest_json: &[u8],
+) -> DomainResult<Vec<SimplesigningSignature>> {
+    let manifest: OciManifest = serde_json::from_slice(manifest_json)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
+
+    Ok(manifest
+        .layers
+        .iter()
+        .filter(|l| l.media_type.as_deref() == Some(COSIGN_SIMPLESIGNING_MEDIA_TYPE))
+        .filter_map(|l| {
+            let payload_layer = l.digest.as_deref().and_then(parse_sha256_digest)?;
+            let signature = l.annotations.get(COSIGN_SIGNATURE_ANNOTATION)?;
+            if signature.is_empty() {
+                return None;
+            }
+            Some(SimplesigningSignature {
+                payload_layer,
+                signature: signature.clone(),
+            })
+        })
+        .collect())
+}
+
 /// Parse an OCI `<algorithm>:<hex>` digest into a CAS [`ContentHash`]. Only
 /// `sha256` maps to the CAS keyspace; any other algorithm, or malformed hex,
 /// yields `None` (the caller skips that layer).
@@ -173,6 +271,161 @@ mod tests {
         let got = sigstore_bundle_layers(&m).expect("valid");
         let hashes: Vec<&str> = got.iter().map(AsRef::as_ref).collect();
         assert_eq!(hashes, vec![ha.as_str(), hb.as_str()]);
+    }
+
+    // -- simplesigning_signature_layers (ADR 0039 §8 keyed carriage) --------
+
+    const SIG_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
+
+    #[test]
+    fn simplesigning_layer_returns_payload_and_signature() {
+        let hex = hex64('c');
+        let sig = "MEUCIQDexampleSignatureBytesBase64==";
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": [
+                {
+                    "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+                    "digest": format!("sha256:{hex}"),
+                    "size": 250,
+                    "annotations": { SIG_ANNOTATION: sig }
+                }
+            ]
+        }));
+        let got = simplesigning_signature_layers(&m).expect("valid manifest");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload_layer.as_ref(), hex.as_str());
+        assert_eq!(got[0].signature, sig);
+    }
+
+    #[test]
+    fn multiple_simplesigning_layers_all_extracted_in_order() {
+        let (ha, hb) = (hex64('a'), hex64('b'));
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": format!("sha256:{ha}"),
+                  "annotations": { SIG_ANNOTATION: "sigA" } },
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": format!("sha256:{hb}"),
+                  "annotations": { SIG_ANNOTATION: "sigB" } }
+            ]
+        }));
+        let got = simplesigning_signature_layers(&m).expect("valid");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].signature, "sigA");
+        assert_eq!(got[1].payload_layer.as_ref(), hb.as_str());
+        assert_eq!(got[1].signature, "sigB");
+    }
+
+    #[test]
+    fn sigstore_bundle_manifest_yields_no_simplesigning() {
+        // A keyless v0.3 bundle referrer carries no simplesigning layer.
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) }
+            ]
+        }));
+        assert!(simplesigning_signature_layers(&m)
+            .expect("valid")
+            .is_empty());
+    }
+
+    #[test]
+    fn simplesigning_layer_without_annotation_is_skipped() {
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) }
+            ]
+        }));
+        assert!(simplesigning_signature_layers(&m)
+            .expect("valid")
+            .is_empty());
+    }
+
+    #[test]
+    fn simplesigning_layer_empty_signature_is_skipped() {
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')),
+                  "annotations": { SIG_ANNOTATION: "" } }
+            ]
+        }));
+        assert!(simplesigning_signature_layers(&m)
+            .expect("valid")
+            .is_empty());
+    }
+
+    #[test]
+    fn simplesigning_layer_non_sha256_digest_is_skipped() {
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": "sha512:abc",
+                  "annotations": { SIG_ANNOTATION: "sig" } }
+            ]
+        }));
+        assert!(simplesigning_signature_layers(&m)
+            .expect("valid")
+            .is_empty());
+    }
+
+    #[test]
+    fn simplesigning_malformed_json_is_validation_error() {
+        let err = simplesigning_signature_layers(b"not json").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn simplesigning_signature_struct_constructs_and_debugs() {
+        let s = SimplesigningSignature {
+            payload_layer: hex64('a').parse().unwrap(),
+            signature: "sig".into(),
+        };
+        assert_eq!(s.clone(), s);
+        assert!(!format!("{s:?}").is_empty());
+    }
+
+    #[test]
+    fn pure_simplesigning_single_layer_is_true() {
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) }
+            ]
+        }));
+        assert!(is_pure_simplesigning(&m).expect("valid"));
+    }
+
+    #[test]
+    fn mixed_simplesigning_and_runnable_layer_is_false() {
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) },
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": format!("sha256:{}", hex64('b')) }
+            ]
+        }));
+        assert!(!is_pure_simplesigning(&m).expect("valid"));
+    }
+
+    #[test]
+    fn pure_simplesigning_zero_layers_is_false() {
+        let m = manifest(&serde_json::json!({ "layers": [] }));
+        assert!(!is_pure_simplesigning(&m).expect("valid"));
+    }
+
+    #[test]
+    fn pure_simplesigning_bundle_layer_is_false() {
+        // A keyless v0.3 bundle is not a simplesigning manifest.
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) }
+            ]
+        }));
+        assert!(!is_pure_simplesigning(&m).expect("valid"));
+    }
+
+    #[test]
+    fn pure_simplesigning_malformed_json_is_validation_error() {
+        let err = is_pure_simplesigning(b"nope").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
     }
 
     #[test]

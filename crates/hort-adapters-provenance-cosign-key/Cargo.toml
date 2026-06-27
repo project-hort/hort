@@ -1,0 +1,30 @@
+[package]
+name = "hort-adapters-provenance-cosign-key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort outbound adapter — keyed (pinned-public-key) cosign provenance verifier (ProvenancePort impl), ADR 0039"
+
+[lints]
+workspace = true
+
+[dependencies]
+hort-domain = { path = "../hort-domain" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# Adapter-layer observability (which fail-closed branch a keyed rejection took;
+# NEVER key bytes / signatures / payloads).
+tracing    = { workspace = true }
+# ECDSA P-256 verification (the cosign default key type) + PEM SPKI public-key
+# parsing. The minimal keyed primitive — NOT the sigstore bundle/PKI crate
+# (ADR 0039 Consequences: a smaller advisory surface on the keyed path). p256
+# and its ecdsa/pkcs8/spki/sec1 deps are already in the locked graph (the
+# sigstore adapter's transitive tree), so this adds no new crate.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Test-only: generate an ECDSA P-256 keypair + sign a synthetic simplesigning
+# payload, proving the verify path runs the real ECDSA verification (no
+# committed key). Same `p256` already in the build graph + an OS RNG.
+rand_core = { version = "0.6", features = ["getrandom"] }

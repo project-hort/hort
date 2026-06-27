@@ -1480,92 +1480,134 @@ async fn register_provenance_verify(
     upstream_proxy: Arc<dyn UpstreamProxy>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
 ) -> anyhow::Result<()> {
-    if !cfg.provenance_cosign_enabled {
+    let keyed_keys_file = cfg.provenance_cosign_public_keys_file.clone();
+    if !cfg.provenance_cosign_enabled && keyed_keys_file.is_none() {
         tracing::info!(
-            "ProvenanceVerifyHandler not registered: HORT_PROVENANCE_COSIGN_ENABLED is false \
-             (worker.provenance.cosign.enabled). Provenance verification is inert — \
-             provenance-verify jobs dispatch to no handler. A repository policy with \
-             provenance_mode: required on a verifiable format then leaves artifacts \
-             Pending (fail-closed); enable cosign + provision a pinned trust root to \
-             activate enforcement."
+            "ProvenanceVerifyHandler not registered: neither HORT_PROVENANCE_COSIGN_ENABLED \
+             (keyless cosign) nor HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE (keyed cosign-key) is \
+             set (worker.provenance.cosign.{{enabled,publicKeysFile}}). Provenance verification is \
+             inert — provenance-verify jobs dispatch to no handler. A repository policy with \
+             provenance_mode: required on a verifiable format then leaves artifacts Pending \
+             (fail-closed); enable a backend to activate enforcement."
         );
         return Ok(());
     }
 
-    // Flag is ON — the pinned trust-root path is REQUIRED. A missing /
-    // unset / unreadable path is a hard boot failure.
-    let trusted_root_path = cfg.provenance_trusted_root_file.as_ref().ok_or_else(|| {
-        anyhow!(
-            "HORT_PROVENANCE_COSIGN_ENABLED is true but HORT_PROVENANCE_TRUSTED_ROOT_FILE is \
-             unset (worker.provenance.cosign.trustedRootFile). The cosign verifier loads a \
-             PINNED Sigstore trusted_root.json (no live fetch); set the path to the mounted \
-             trust-root file and rotate it through the image/release pipeline."
-        )
-    })?;
-    let trusted_root_bytes = std::fs::read(trusted_root_path).map_err(|e| {
-        anyhow!(
-            "failed to read the pinned Sigstore trust root at {}: {e}. \
-             Provision worker.provenance.cosign.trustedRootFile (a mounted trusted_root.json) \
-             before enabling the cosign verifier.",
-            trusted_root_path.display()
-        )
-    })?;
-    let cached_trust_root =
-        hort_adapters_provenance_sigstore::CachedTrustRoot::from_trusted_root_json(
-            &trusted_root_bytes,
-        )
-        .map_err(|e| {
+    let mut provenance_ports: Vec<Arc<dyn ProvenancePort>> = Vec::new();
+
+    // ---- Keyless cosign (Sigstore v0.3 bundle) — ADR 0027 ----
+    if cfg.provenance_cosign_enabled {
+        // The pinned trust-root path is REQUIRED. A missing / unset /
+        // unreadable path is a hard boot failure.
+        let trusted_root_path = cfg.provenance_trusted_root_file.as_ref().ok_or_else(|| {
             anyhow!(
-                "the pinned Sigstore trust root at {} did not parse as a trusted_root.json: {e}",
+                "HORT_PROVENANCE_COSIGN_ENABLED is true but HORT_PROVENANCE_TRUSTED_ROOT_FILE is \
+                 unset (worker.provenance.cosign.trustedRootFile). The cosign verifier loads a \
+                 PINNED Sigstore trusted_root.json (no live fetch); set the path to the mounted \
+                 trust-root file and rotate it through the image/release pipeline."
+            )
+        })?;
+        let trusted_root_bytes = std::fs::read(trusted_root_path).map_err(|e| {
+            anyhow!(
+                "failed to read the pinned Sigstore trust root at {}: {e}. \
+                 Provision worker.provenance.cosign.trustedRootFile (a mounted trusted_root.json) \
+                 before enabling the cosign verifier.",
                 trusted_root_path.display()
             )
         })?;
+        let cached_trust_root =
+            hort_adapters_provenance_sigstore::CachedTrustRoot::from_trusted_root_json(
+                &trusted_root_bytes,
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "the pinned Sigstore trust root at {} did not parse as a trusted_root.json: {e}",
+                    trusted_root_path.display()
+                )
+            })?;
 
-    // Fail-closed boot assertion (ADR 0027): the verify path now
-    // cryptographically verifies the Rekor Merkle inclusion proof +
-    // checkpoint signature against the trust root's Rekor public key
-    // (selected per-entry by `logID`). A trust root with no (time-valid)
-    // Rekor key would therefore reject EVERY bundle `RekorNotFound` — a
-    // fail-closed-but-useless state. Catch the misprovisioned root here, at
-    // boot, rather than per artifact at verify time.
-    let rekor_keys = cached_trust_root.rekor_keys().map_err(|e| {
-        anyhow!(
-            "the pinned Sigstore trust root at {} could not be read for its Rekor keys: {e}",
-            trusted_root_path.display()
-        )
-    })?;
-    if rekor_keys.is_empty() {
-        return Err(anyhow!(
-            "the pinned Sigstore trust root at {} carries no Rekor public key (empty/expired \
-             `tlogs`). Provenance verification now requires a Rekor key to verify the Merkle \
-             inclusion proof + checkpoint signature (ADR 0027); without one every bundle would \
-             be rejected `RekorNotFound`. Provision a current trusted_root.json with a valid \
-             Rekor key (rotated via the Hort image/release pipeline).",
-            trusted_root_path.display()
-        ));
+        // Fail-closed boot assertion (ADR 0027): the verify path
+        // cryptographically verifies the Rekor Merkle inclusion proof +
+        // checkpoint signature against the trust root's Rekor public key. A
+        // trust root with no (time-valid) Rekor key would reject EVERY bundle
+        // `RekorNotFound` — catch the misprovisioned root here at boot.
+        let rekor_keys = cached_trust_root.rekor_keys().map_err(|e| {
+            anyhow!(
+                "the pinned Sigstore trust root at {} could not be read for its Rekor keys: {e}",
+                trusted_root_path.display()
+            )
+        })?;
+        if rekor_keys.is_empty() {
+            return Err(anyhow!(
+                "the pinned Sigstore trust root at {} carries no Rekor public key (empty/expired \
+                 `tlogs`). Provenance verification now requires a Rekor key to verify the Merkle \
+                 inclusion proof + checkpoint signature (ADR 0027); without one every bundle would \
+                 be rejected `RekorNotFound`. Provision a current trusted_root.json with a valid \
+                 Rekor key (rotated via the Hort image/release pipeline).",
+                trusted_root_path.display()
+            ));
+        }
+
+        let port: Arc<dyn ProvenancePort> = Arc::new(
+            hort_adapters_provenance_sigstore::SigstoreProvenanceAdapter::new(cached_trust_root),
+        );
+        port.health_check().await.map_err(|e| {
+            anyhow!(
+                "cosign provenance verifier {:?} failed its startup health check: {e}. \
+                 The pinned trust root is missing or stale (outside its refresh window). \
+                 Refusing to start — provision a current trusted_root.json (rotated via the \
+                 Hort image/release pipeline).",
+                port.name()
+            )
+        })?;
+        tracing::info!(
+            backend = %port.name(),
+            trusted_root_path = %trusted_root_path.display(),
+            "cosign provenance verifier health check OK (pinned trust root loaded + fresh)"
+        );
+        provenance_ports.push(port);
     }
 
-    let provenance_port: Arc<dyn ProvenancePort> = Arc::new(
-        hort_adapters_provenance_sigstore::SigstoreProvenanceAdapter::new(cached_trust_root),
-    );
-
-    // Startup health check (mirrors the scanner `health_check_all_or_fail`
-    // posture): the trust root must be loaded + fresh, else refuse to
-    // start. Offline only — never probes live Rekor/Fulcio.
-    provenance_port.health_check().await.map_err(|e| {
-        anyhow!(
-            "cosign provenance verifier {:?} failed its startup health check: {e}. \
-             The pinned trust root is missing or stale (outside its refresh window). \
-             Refusing to start — provision a current trusted_root.json (rotated via the \
-             Hort image/release pipeline).",
-            provenance_port.name()
-        )
-    })?;
-    tracing::info!(
-        backend = %provenance_port.name(),
-        trusted_root_path = %trusted_root_path.display(),
-        "cosign provenance verifier health check OK (pinned trust root loaded + fresh)"
-    );
+    // ---- Keyed cosign (pinned public key, simplesigning) — ADR 0039 ----
+    if let Some(keys_path) = keyed_keys_file.as_ref() {
+        let pem_blob = std::fs::read_to_string(keys_path).map_err(|e| {
+            anyhow!(
+                "failed to read the pinned cosign public-key file at {}: {e}. Provision \
+                 worker.provenance.cosign.publicKeysFile (a mounted file of one or more PEM \
+                 `-----BEGIN PUBLIC KEY-----` blocks) before enabling the keyed backend.",
+                keys_path.display()
+            )
+        })?;
+        let pems = split_pem_public_keys(&pem_blob);
+        if pems.is_empty() {
+            return Err(anyhow!(
+                "the cosign public-key file at {} contains no PEM `-----BEGIN PUBLIC KEY-----` \
+                 block. Provision at least one ECDSA P-256 public key (cosign `cosign.pub`).",
+                keys_path.display()
+            ));
+        }
+        let verifier = hort_adapters_provenance_cosign_key::CosignKeyVerifier::from_pem_keys(&pems)
+            .map_err(|e| {
+                anyhow!(
+                    "a pinned cosign public key in {} failed to parse: {e}",
+                    keys_path.display()
+                )
+            })?;
+        let key_count = verifier.key_count();
+        let port: Arc<dyn ProvenancePort> = Arc::new(verifier);
+        port.health_check().await.map_err(|e| {
+            anyhow!(
+                "keyed cosign verifier {:?} failed its startup health check: {e}",
+                port.name()
+            )
+        })?;
+        tracing::info!(
+            backend = %port.name(),
+            keys = key_count,
+            "keyed cosign-key provenance verifier health check OK (pinned public-key set loaded)"
+        );
+        provenance_ports.push(port);
+    }
 
     let orchestration = Arc::new(ProvenanceOrchestrationUseCase::new(
         artifacts,
@@ -1575,7 +1617,7 @@ async fn register_provenance_verify(
         storage,
         lifecycle,
         event_publisher,
-        vec![provenance_port],
+        provenance_ports,
         upstream_proxy,
         upstream_resolver,
     ));
@@ -1585,9 +1627,22 @@ async fn register_provenance_verify(
     );
     tracing::info!(
         "ProvenanceVerifyHandler registered (single-active per worker replica) \
-         — cosign/OCI provenance verification is now wired"
+         — cosign / cosign-key OCI provenance verification is now wired"
     );
     Ok(())
+}
+
+/// Split a file of one-or-more concatenated PEM `-----BEGIN PUBLIC KEY-----`
+/// blocks into individual PEM strings (ADR 0039 §3 — the keyed-cosign pinned
+/// key *set*, for rotation overlap). Whitespace/comment content between blocks
+/// is ignored; each returned string is a single trimmed PEM block.
+fn split_pem_public_keys(blob: &str) -> Vec<String> {
+    const END: &str = "-----END PUBLIC KEY-----";
+    blob.split_inclusive(END)
+        .map(str::trim)
+        .filter(|chunk| chunk.contains("-----BEGIN PUBLIC KEY-----") && chunk.ends_with(END))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The worker's upstream-resolver refresh interval.
@@ -2032,6 +2087,33 @@ mod tests {
     use hort_domain::error::{DomainError, DomainResult};
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::{ContentHash, Finding, Sbom};
+
+    #[test]
+    fn split_pem_public_keys_splits_multiple_blocks_for_rotation_overlap() {
+        let blob = "\
+-----BEGIN PUBLIC KEY-----
+AAAA
+-----END PUBLIC KEY-----
+# a rotation-overlap second key, with a comment in between
+-----BEGIN PUBLIC KEY-----
+BBBB
+-----END PUBLIC KEY-----
+";
+        let keys = split_pem_public_keys(blob);
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].starts_with("-----BEGIN PUBLIC KEY-----"));
+        assert!(keys[0].ends_with("-----END PUBLIC KEY-----"));
+        assert!(keys[0].contains("AAAA"));
+        assert!(keys[1].contains("BBBB"));
+    }
+
+    #[test]
+    fn split_pem_public_keys_ignores_non_key_content() {
+        assert!(split_pem_public_keys("no keys here").is_empty());
+        assert!(split_pem_public_keys("").is_empty());
+        // A dangling BEGIN without END is not a usable block.
+        assert!(split_pem_public_keys("-----BEGIN PUBLIC KEY-----\nincomplete").is_empty());
+    }
     use std::path::PathBuf;
 
     #[test]

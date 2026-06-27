@@ -43,6 +43,7 @@ accepted?*
 | [0015](0015-apply-time-linter-inert-fields-and-naming.md) | Apply-time rejection of inert policy fields and misleading config names |
 | [0016](0016-cross-opt-in-interaction-matrix.md) | Cross-opt-in interaction matrix for release-gate-influencing knobs |
 | [0027](0027-artifact-provenance-verification.md) | Artifact provenance verification (Sigstore/cosign, offline, policy-gated) |
+| [0038](0038-keyed-provenance-verification.md) | Keyed (pinned-public-key) provenance verification backend (extends 0027) |
 
 ### Formats, index serving, and the API surface
 

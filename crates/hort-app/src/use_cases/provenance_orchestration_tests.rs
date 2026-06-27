@@ -259,6 +259,22 @@ fn seed_bundle(f: &Fixture, bundle_bytes: &[u8]) {
     let _ = seed_manifest_and_bundle(f, bundle_bytes);
 }
 
+/// `decode_simplesigning_signature` (ADR 0039 §8): standard base64 → raw bytes;
+/// whitespace trimmed; non-base64 → `None` (the carriage skips it).
+#[test]
+fn decode_simplesigning_signature_decodes_b64_and_rejects_garbage() {
+    use base64::Engine as _;
+    let raw: &[u8] = b"\x30\x45\x02\x21\x00sigbytes";
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+    assert_eq!(decode_simplesigning_signature(&b64).as_deref(), Some(raw));
+    assert_eq!(
+        decode_simplesigning_signature(&format!("  {b64}\n")).as_deref(),
+        Some(raw),
+        "annotation whitespace is trimmed"
+    );
+    assert_eq!(decode_simplesigning_signature("!!!not base64!!!"), None);
+}
+
 // ===========================================================================
 // (Off) — provenance inert; no verifier runs.
 // ===========================================================================
@@ -756,6 +772,32 @@ fn fold_two_no_attestation_both() {
     ));
 }
 
+#[test]
+fn fold_two_backend_attributes_the_deciding_verifier() {
+    let verified = || ProvenanceVerdict::verified(sample_identity(), None);
+    let none = ProvenanceVerdict::no_attestation;
+    let rejected = || ProvenanceVerdict::rejected(ProvenanceRejectReason::CertChainInvalid);
+
+    // Verified ⊳ NoAttestation — the keyed verifier that Verified is attributed
+    // (so the metric labels `cosign-key`, not the first-listed `cosign`).
+    let (v, b) = fold_two_backend((none(), "cosign".into()), (verified(), "cosign-key".into()));
+    assert!(matches!(v.outcome, ProvenanceOutcome::Verified { .. }));
+    assert_eq!(b, "cosign-key");
+
+    // Rejected ⊳ Verified — the rejecting backend is attributed.
+    let (v, b) = fold_two_backend(
+        (rejected(), "cosign".into()),
+        (verified(), "cosign-key".into()),
+    );
+    assert!(matches!(v.outcome, ProvenanceOutcome::Rejected(_)));
+    assert_eq!(b, "cosign");
+
+    // Order-independence: Verified on the left still wins over NoAttestation.
+    let (v, b) = fold_two_backend((verified(), "cosign-key".into()), (none(), "cosign".into()));
+    assert!(matches!(v.outcome, ProvenanceOutcome::Verified { .. }));
+    assert_eq!(b, "cosign-key");
+}
+
 // ===========================================================================
 // Multiple applicable verifiers — both run, verdicts fold.
 // ===========================================================================
@@ -1199,6 +1241,156 @@ fn seed_manifest_and_bundle(f: &Fixture, bundle_bytes: &[u8]) -> ContentHash {
     blob_hash
 }
 
+// ---------------------------------------------------------------------------
+// Keyed simplesigning carriage (ADR 0039 §8) — fetch_bundles collects the
+// legacy `.sig` as a SIGNED AttestationBundle (payload blob + decoded sig).
+// ---------------------------------------------------------------------------
+
+/// A referrer manifest carrying ONE cosign `simplesigning` layer — the payload
+/// blob digest + the base64 signature on the `dev.cosignproject.cosign/signature`
+/// annotation (ADR 0039 §8).
+fn referrer_manifest_for_simplesigning(
+    payload_blob_hash: &ContentHash,
+    signature_b64: &str,
+    payload_len: usize,
+) -> Vec<u8> {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "size": 2
+        },
+        "layers": [
+            {
+                "mediaType": hort_domain::oci::COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+                "digest": format!("sha256:{payload_blob_hash}"),
+                "size": payload_len,
+                "annotations": { "dev.cosignproject.cosign/signature": signature_b64 }
+            }
+        ]
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Seed a keyed simplesigning `.sig` referrer: the payload-layer blob in CAS,
+/// the referrer manifest (the `oci_subject` source) pointing at it with the
+/// signature annotation, and the `oci_subject` row pointing at the signed
+/// artifact's content hash.
+fn seed_simplesigning(f: &Fixture, payload_bytes: &[u8], signature_b64: &str) {
+    let payload_hash_hex = format!("{:x}", sha2::Sha256::digest(payload_bytes));
+    let payload_hash: ContentHash = payload_hash_hex.parse().expect("valid sha256");
+    f.storage
+        .insert_content(payload_hash.clone(), payload_bytes.to_vec());
+
+    let manifest_bytes =
+        referrer_manifest_for_simplesigning(&payload_hash, signature_b64, payload_bytes.len());
+    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash: ContentHash = manifest_hash_hex.parse().expect("valid sha256");
+
+    let mut sig_artifact: Artifact = sample_artifact(QuarantineStatus::Released);
+    sig_artifact.repository_id = f.repository_id;
+    sig_artifact.sha256_checksum = manifest_hash.clone();
+    let sig_id = sig_artifact.id;
+    f.artifacts.insert(sig_artifact);
+    f.storage.insert_content(manifest_hash, manifest_bytes);
+
+    futures::executor::block_on(async {
+        f.content_references
+            .insert(ContentReference {
+                source_artifact_id: sig_id,
+                target_content_hash: f.content_hash.clone(),
+                kind: "oci_subject".to_string(),
+                metadata: serde_json::Value::Null,
+                repository_id: f.repository_id,
+                recorded_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("seed content-reference");
+    });
+}
+
+/// Captures the `(bytes, signature)` of each bundle handed to `verify` so a
+/// test can assert the keyed carriage produced a SIGNED bundle. Returns
+/// `NoAttestation` (the carriage, not the verdict, is under test).
+/// `(payload bytes, optional detached signature)` of a captured bundle.
+type CapturedBundle = (Vec<u8>, Option<Vec<u8>>);
+
+struct CapturingSignaturePort {
+    captured: Mutex<Vec<CapturedBundle>>,
+}
+impl CapturingSignaturePort {
+    fn new() -> Self {
+        Self {
+            captured: Mutex::new(Vec::new()),
+        }
+    }
+    fn captured(&self) -> Vec<CapturedBundle> {
+        self.captured.lock().unwrap().clone()
+    }
+}
+impl ProvenancePort for CapturingSignaturePort {
+    fn name(&self) -> &str {
+        "cosign-key"
+    }
+    fn applies_to(&self, format: &str) -> bool {
+        format == "oci"
+    }
+    fn verify<'a>(
+        &'a self,
+        _artifact: &'a ProvenanceSubject<'a>,
+        bundles: &'a [AttestationBundle],
+        _policy: &'a ProvenanceRequirements<'a>,
+    ) -> BoxFuture<'a, DomainResult<ProvenanceVerdict>> {
+        *self.captured.lock().unwrap() = bundles
+            .iter()
+            .map(|b| (b.bytes.clone(), b.signature.clone()))
+            .collect();
+        Box::pin(async { Ok(ProvenanceVerdict::no_attestation()) })
+    }
+    fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn fetch_bundles_collects_simplesigning_as_signed_bundle() {
+    use base64::Engine as _;
+    let port = Arc::new(CapturingSignaturePort::new());
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::VerifyIfPresent),
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    let payload: &[u8] = br#"{"critical":{"image":{"docker-manifest-digest":"sha256:abc"}}}"#;
+    let raw_sig: &[u8] = b"\x30\x44the-detached-signature-bytes";
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(raw_sig);
+    seed_simplesigning(&f, payload, &sig_b64);
+
+    f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+
+    let captured = port.captured();
+    assert_eq!(
+        captured.len(),
+        1,
+        "the legacy simplesigning .sig is collected (not dropped) as one bundle"
+    );
+    let (bytes, signature) = &captured[0];
+    assert_eq!(
+        bytes.as_slice(),
+        payload,
+        "bundle.bytes is the simplesigning PAYLOAD blob, not the referrer manifest"
+    );
+    assert_eq!(
+        signature.as_deref(),
+        Some(raw_sig),
+        "the base64 annotation is decoded into bundle.signature (ADR 0039 §8)"
+    );
+}
+
 #[tokio::test]
 async fn fetch_resolves_bundle_blob_not_manifest_real_fixture() {
     // Seed the real cosign v0.3 bundle as the BLOB, with a referrer manifest
@@ -1512,6 +1704,92 @@ fn seed_upstream_referrer(f: &Fixture, bundle_bytes: &[u8]) -> (String, ContentH
     );
 
     (manifest_digest, blob_hash)
+}
+
+/// Mirror of [`seed_upstream_referrer`] for a keyed simplesigning `.sig`
+/// (ADR 0039 §8): a well-typed simplesigning referrer descriptor + its manifest
+/// (carrying the signature annotation) + the payload-layer blob, on a PROXY scope.
+fn seed_upstream_simplesigning_referrer(f: &Fixture, payload_bytes: &[u8], signature_b64: &str) {
+    f.upstream_resolver.insert(proxy_mapping(f.repository_id));
+
+    let payload_hash_hex = format!("{:x}", sha2::Sha256::digest(payload_bytes));
+    let payload_hash: ContentHash = payload_hash_hex.parse().expect("valid sha256");
+    let blob_digest = format!("sha256:{payload_hash}");
+
+    let manifest_bytes =
+        referrer_manifest_for_simplesigning(&payload_hash, signature_b64, payload_bytes.len());
+    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_digest = format!("sha256:{manifest_hash_hex}");
+
+    let image_digest = image_digest_str(&f.content_hash);
+    let upstream_name = f.artifacts.get(f.artifact_id).unwrap().name;
+
+    f.upstream_proxy.insert_referrers(
+        PROXY_PATH_PREFIX,
+        &upstream_name,
+        &image_digest,
+        vec![ReferrerDescriptor {
+            digest: manifest_digest.clone(),
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            artifact_type: Some(hort_domain::oci::COSIGN_SIMPLESIGNING_MEDIA_TYPE.into()),
+        }],
+    );
+    f.upstream_proxy.insert_manifest(
+        PROXY_PATH_PREFIX,
+        &upstream_name,
+        &manifest_digest,
+        ManifestFetch {
+            bytes: manifest_bytes,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            declared_digest: Some(manifest_digest.clone()),
+            last_modified: None,
+        },
+    );
+    f.upstream_proxy.insert_blob(
+        PROXY_PATH_PREFIX,
+        &upstream_name,
+        &blob_digest,
+        payload_bytes.to_vec(),
+        Some(blob_digest.clone()),
+    );
+}
+
+#[tokio::test]
+async fn proxy_lands_upstream_simplesigning_referrer_as_signed_bundle() {
+    use base64::Engine as _;
+    let port = Arc::new(CapturingSignaturePort::new());
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::VerifyIfPresent),
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    // No LOCAL bundle — the orchestrator fetches the simplesigning referrer from
+    // upstream, lands the payload blob + manifest, then re-reads it (ADR 0039 §8).
+    let payload: &[u8] = br#"{"critical":{"image":{"docker-manifest-digest":"sha256:abc"}}}"#;
+    let raw_sig: &[u8] = b"\x30\x44proxied-detached-signature";
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(raw_sig);
+    seed_upstream_simplesigning_referrer(&f, payload, &sig_b64);
+
+    f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+
+    let captured = port.captured();
+    assert_eq!(
+        captured.len(),
+        1,
+        "the proxied simplesigning .sig is landed from upstream + read as one bundle"
+    );
+    let (bytes, signature) = &captured[0];
+    assert_eq!(
+        bytes.as_slice(),
+        payload,
+        "the landed simplesigning payload blob reaches the verifier"
+    );
+    assert_eq!(
+        signature.as_deref(),
+        Some(raw_sig),
+        "the annotation signature is carried through the proxy landing"
+    );
 }
 
 // ---------------------------------------------------------------------------
