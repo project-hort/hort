@@ -99,6 +99,7 @@ fn build_scan_findings_rows(
             source_scanner: f.source_scanner.clone(),
             title: f.title.clone(),
             detected_at,
+            informational_class: f.informational_class.clone(),
         })
         .collect()
 }
@@ -1478,7 +1479,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::scan_policy::{
-        ExclusionProjection, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection,
+        SeverityThreshold,
     };
     use hort_domain::events::{
         system_actor, Actor, DomainEvent, PersistedEvent, PolicyResult, PolicyScope, ReleaseReason,
@@ -1656,6 +1658,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             });
         }
         for i in 0..severity.high {
@@ -1669,6 +1672,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             });
         }
         for i in 0..severity.medium {
@@ -1682,6 +1686,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             });
         }
         for i in 0..severity.low {
@@ -1695,6 +1700,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             });
         }
         out
@@ -1790,6 +1796,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -2389,6 +2396,7 @@ mod tests {
             source_scanner: "trivy".into(),
             references: vec![],
             aliases: vec![],
+            informational_class: None,
         }];
         uc.record_scan_result(artifact_id, "trivy".into(), findings, None)
             .await
@@ -4598,6 +4606,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: refs.clone(),
                 aliases: vec![],
+                informational_class: None,
             });
         }
         // Sanity: confirm we cleared the cap before invoking the use case.

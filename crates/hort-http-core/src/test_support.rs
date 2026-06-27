@@ -846,7 +846,7 @@ pub struct MockPorts {
 pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectionRepository) {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::{
-        ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::PolicyScope;
     let now = Utc::now();
@@ -865,6 +865,7 @@ pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectio
         archived: false,
         scan_backends: vec!["trivy".to_string()],
         rescan_interval_hours: 24,
+        negligible_action: NegligibleAction::Ignore,
         stream_version: 0,
         created_at: now,
         updated_at: now,

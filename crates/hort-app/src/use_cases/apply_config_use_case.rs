@@ -116,7 +116,9 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 // The ScanPolicy wire->domain provenance mappers live in
 // the shared `hort_app::provenance` module (single source for apply + the
 // offline validator), not duplicated here.
-use crate::provenance::{provenance_identities_from_spec, provenance_mode_from_spec};
+use crate::provenance::{
+    negligible_action_from_spec, provenance_identities_from_spec, provenance_mode_from_spec,
+};
 use hort_domain::entities::service_account::{
     backing_username, FallbackRotation, FederatedIdentity, SecretFormat, ServiceAccount,
 };
@@ -4291,6 +4293,10 @@ fn create_command_from_spec(
         // the create command. `validate_scan_policy` (hort-config) has
         // already enforced `>= 0` upstream of this helper.
         rescan_interval_hours: env.spec.rescan_interval_hours,
+        // `negligible_action` flows from YAML to the create command.
+        // hort-config validated the wire value (parses to one of
+        // ignore/warn/block) before this site.
+        negligible_action: negligible_action_from_spec(&env.spec.negligible_action),
     }
 }
 
@@ -4333,6 +4339,11 @@ fn update_command_from_diff(
         // Flow rescan_interval_hours through. Same
         // argument: per-field same-value skip in `update_policy`.
         rescan_interval_hours: FieldChange::Set(env.spec.rescan_interval_hours),
+        // Flow negligible_action through. Same argument: per-field
+        // same-value skip in `update_policy`.
+        negligible_action: FieldChange::Set(negligible_action_from_spec(
+            &env.spec.negligible_action,
+        )),
     }
 }
 
@@ -4418,7 +4429,7 @@ mod tests {
     // Test-only — the provenance mappers live in `crate::provenance`;
     // these types are referenced only by the fixtures.
     use hort_config::scan_policy::SignerIdentitySpec;
-    use hort_domain::entities::scan_policy::ProvenanceMode;
+    use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode};
 
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{MockCall, MockRepositoryRepository};
@@ -5145,6 +5156,7 @@ mod tests {
                 license_policy: serde_json::json!({"allowed": ["MIT"]}),
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
+                negligible_action: "ignore".into(),
             },
         }
     }
@@ -7296,6 +7308,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -7351,6 +7364,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -10021,6 +10035,7 @@ mod tests {
                 license_policy: serde_json::json!({"allowed": ["MIT"]}),
                 scan_backends: backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
+                negligible_action: "ignore".into(),
             },
         }
     }
@@ -10053,6 +10068,7 @@ mod tests {
             archived: true,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 3,
             created_at: now,
             updated_at: now,
@@ -10952,6 +10968,7 @@ mod tests {
                 license_policy: serde_json::json!({"allowed": ["MIT"]}),
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
+                negligible_action: "ignore".into(),
             },
         }
     }
@@ -10983,6 +11000,7 @@ mod tests {
                 license_policy: serde_json::json!({"allowed": ["MIT"]}),
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
+                negligible_action: "ignore".into(),
             },
         }
     }
@@ -11433,6 +11451,7 @@ mod tests {
                 license_policy: serde_json::json!({"allowed": ["MIT"]}),
                 scan_backends: backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
+                negligible_action: "ignore".into(),
             },
         }
     }

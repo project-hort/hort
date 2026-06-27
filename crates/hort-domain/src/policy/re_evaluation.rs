@@ -48,7 +48,7 @@ use crate::types::{ArtifactCoords, Finding};
 use super::cve::evaluate_cve_thresholds;
 use super::exclusion::{filter_excluded_findings, filter_excluded_summary};
 use super::primitives::{PolicyAction, ViolationsAccumulator};
-use super::scan::DefaultPolicy;
+use super::scan::{collect_negligible_action, DefaultPolicy};
 
 /// Outcome of [`re_evaluate_after_exclusion`].
 ///
@@ -158,6 +158,18 @@ pub fn re_evaluate_after_exclusion(
         &post_exclusion_summary,
         threshold,
     ));
+    // Mirror the initial scan's Step 4b: a `negligible_action: Block`
+    // rejection must survive an exclusion-triggered re-evaluation. The
+    // shared helper is the single source of this decision, so this path
+    // cannot silently drop a Block that `evaluate_scan_result` enforces.
+    let negligible_action = policy
+        .map(|p| p.negligible_action)
+        .unwrap_or_else(DefaultPolicy::negligible_action);
+    collect_negligible_action(
+        &mut accumulator,
+        negligible_action,
+        post_exclusion_summary.negligible,
+    );
     let (action, _violations) = accumulator.into_outcome();
     match action {
         PolicyAction::Block => ReEvaluationOutcome::StillRejected,
@@ -174,7 +186,7 @@ mod tests {
     use super::*;
     use crate::entities::artifact::QuarantineStatus;
     use crate::entities::repository::RepositoryFormat;
-    use crate::entities::scan_policy::{ProvenanceMode, SeverityThreshold};
+    use crate::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
     use crate::events::PolicyScope;
     use crate::types::{ContentHash, Finding};
     use chrono::TimeZone;
@@ -238,6 +250,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -473,6 +486,7 @@ mod tests {
             source_scanner: "osv".into(),
             references: vec![],
             aliases: vec![],
+            informational_class: None,
         }
     }
 
@@ -545,6 +559,93 @@ mod tests {
             ts(1_000_000),
         );
         assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
+    }
+
+    /// An informational/negligible finding: no CVSS score, classified
+    /// informational by the advisory DB so it routes onto the negligible
+    /// lane (`post_exclusion_summary.negligible == 1`) and never trips a
+    /// CVE threshold. The cosmetic `severity` is irrelevant to the
+    /// routing — `is_informational()` keys on the class, not severity.
+    fn informational_finding(vuln: &str) -> Finding {
+        Finding {
+            informational_class: Some("unmaintained".to_string()),
+            ..finding(vuln, SeverityThreshold::Low)
+        }
+    }
+
+    fn projection_with_negligible(
+        threshold: SeverityThreshold,
+        action: NegligibleAction,
+    ) -> ScanPolicyProjection {
+        ScanPolicyProjection {
+            negligible_action: action,
+            ..projection(threshold)
+        }
+    }
+
+    #[test]
+    fn informational_finding_under_block_stays_rejected_after_exclusion() {
+        // ADR 0040 §3: a `negligible_action: Block` rejection must survive
+        // an exclusion-triggered re-evaluation. The finding is CVE-clean
+        // (no scored tier) but routes onto the negligible lane; under
+        // Block the re-evaluation must keep the artifact Rejected even
+        // though an unrelated exclusion was added. This is the regression
+        // guard for the helper-shared negligible step in re_evaluation.
+        let artifact = rejected_artifact("proc-macro-error2");
+        let summary = SeveritySummary {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 1,
+        };
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let policy = projection_with_negligible(SeverityThreshold::High, NegligibleAction::Block);
+        // An unrelated exclusion — does not match the informational
+        // finding, so the post-exclusion negligible count stays 1.
+        let exclusions = vec![exclusion("CVE-UNRELATED")];
+        let outcome = re_evaluate_after_exclusion(
+            &artifact,
+            &summary,
+            Some(&findings),
+            Some(&policy),
+            &exclusions,
+            // Deadline in the future — irrelevant under Block, the
+            // outcome must be StillRejected regardless.
+            Some(ts(2_000_000)),
+            ts(1_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
+    }
+
+    #[test]
+    fn informational_finding_under_ignore_resets_to_released() {
+        // Same CVE-clean informational finding under `negligible_action:
+        // Ignore` — the negligible lane is non-enforcing, so the
+        // re-evaluation is Clean and the elapsed-deadline boundary lands
+        // the artifact on Released.
+        let artifact = rejected_artifact("proc-macro-error2");
+        let summary = SeveritySummary {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 1,
+        };
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let policy = projection_with_negligible(SeverityThreshold::High, NegligibleAction::Ignore);
+        let exclusions = vec![exclusion("CVE-UNRELATED")];
+        let outcome = re_evaluate_after_exclusion(
+            &artifact,
+            &summary,
+            Some(&findings),
+            Some(&policy),
+            &exclusions,
+            // Deadline elapsed → ResetToReleased.
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::ResetToReleased);
     }
 
     #[test]

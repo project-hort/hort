@@ -21,7 +21,7 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::entities::scan_policy::{
-    ProvenanceMode, ScanPolicyProjection, SignerIdentityPattern,
+    NegligibleAction, ProvenanceMode, ScanPolicyProjection, SignerIdentityPattern,
 };
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{DomainEvent, PolicyScope};
@@ -243,6 +243,7 @@ fn projection(
         archived: false,
         scan_backends: vec!["trivy".to_string()],
         rescan_interval_hours: 24,
+        negligible_action: NegligibleAction::Ignore,
         stream_version: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),

@@ -222,6 +222,11 @@ fn vuln_to_finding(trivy_type: &str, vuln: &TrivyVulnerability) -> Finding {
         source_scanner: "trivy".to_string(),
         references,
         aliases,
+        // Trivy has no informational-advisory concept; every Trivy
+        // finding is a scored vulnerability. The negligible lane is
+        // populated only by the OSV adapters' `database_specific.informational`
+        // discriminator.
+        informational_class: None,
     }
 }
 

@@ -111,10 +111,14 @@ pub fn filter_excluded_findings(
 }
 
 /// Per-tier count over `findings`. Single source of truth for the
-/// post-exclusion summary returned in [`FilteredFindings::remaining`].
-/// `negligible` is always zero — `Finding.severity` is a
-/// [`SeverityThreshold`] which has no `Negligible` variant; the v1
-/// scanner mapping never emits findings in that tier.
+/// post-exclusion summary returned in [`FilteredFindings::remaining`] —
+/// the summary that feeds the release-gate decision
+/// ([`crate::policy::cve::evaluate_cve_thresholds`]). A finding for which
+/// [`Finding::is_informational`] holds is counted in `negligible` (the
+/// non-enforcing lane) regardless of its cosmetic `severity`, so it
+/// never trips a severity threshold. `Finding.severity` is a
+/// [`SeverityThreshold`] which has no `Negligible` variant —
+/// informational is a property of the finding, not a severity tier.
 fn summary_of(findings: &[Finding]) -> SeveritySummary {
     let mut s = SeveritySummary {
         critical: 0,
@@ -124,6 +128,10 @@ fn summary_of(findings: &[Finding]) -> SeveritySummary {
         negligible: 0,
     };
     for f in findings {
+        if f.is_informational() {
+            s.negligible += 1;
+            continue;
+        }
         match f.severity {
             SeverityThreshold::Critical => s.critical += 1,
             SeverityThreshold::High => s.high += 1,
@@ -338,6 +346,7 @@ mod tests {
             source_scanner: "trivy".into(),
             references: vec![],
             aliases: vec![],
+            informational_class: None,
         }
     }
 
@@ -356,6 +365,7 @@ mod tests {
             source_scanner: "osv".into(),
             references: vec![],
             aliases: vec![alias.into()],
+            informational_class: None,
         }
     }
 
@@ -453,6 +463,39 @@ mod tests {
         );
         assert_eq!(r.excluded_count, 0);
         assert!(r.matched_exclusion_ids.is_empty());
+    }
+
+    #[test]
+    fn summary_of_routes_informational_finding_to_negligible() {
+        // The post-exclusion summary feeds the release-gate decision. An
+        // informational finding (cosmetic Critical severity) must be counted
+        // in `negligible` — the non-enforcing lane — not `critical`, or it
+        // would block under the default threshold. Routed via the public
+        // `filter_excluded_findings` (no exclusions) so the private
+        // `summary_of` is exercised end-to-end.
+        let mut informational = finding("RUSTSEC-2026-0173", SeverityThreshold::Critical);
+        informational.informational_class = Some("unmaintained".to_string());
+        let scored = finding("CVE-A", SeverityThreshold::High);
+
+        let r = filter_excluded_findings(
+            &[informational, scored],
+            &[],
+            &coords("proc-macro-error2"),
+            ts(0),
+        );
+        assert_eq!(
+            r.remaining,
+            SeveritySummary {
+                critical: 0,
+                high: 1,
+                medium: 0,
+                low: 0,
+                negligible: 1,
+            }
+        );
+        // Both survive (no exclusions) — only the bucketing differs.
+        assert_eq!(r.remaining_findings.len(), 2);
+        assert_eq!(r.excluded_count, 0);
     }
 
     // ---- one matching exclusion -------------------------------------------

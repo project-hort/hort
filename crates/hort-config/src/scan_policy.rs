@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use hort_domain::entities::scan_policy::{
-    ProvenanceMode, SeverityThreshold, SignerIdentityPattern,
+    NegligibleAction, ProvenanceMode, SeverityThreshold, SignerIdentityPattern,
 };
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,13 @@ pub struct ScanPolicySpec {
     /// `validate_scan_policy`.
     #[serde(default = "default_rescan_interval_hours")]
     pub rescan_interval_hours: i32,
+    /// How negligible / informational findings steer the release
+    /// decision (`ignore | warn | block`). Validated via
+    /// [`NegligibleAction::FromStr`] in [`validate_scan_policy`].
+    /// Defaults to `ignore` when omitted — informational advisories
+    /// (OSV `unmaintained` / `unsound` / `notice`) never block.
+    #[serde(default = "default_negligible_action")]
+    pub negligible_action: String,
 }
 
 /// Out-of-the-box `scanBackends` default when the YAML omits the
@@ -144,6 +151,13 @@ fn default_provenance_backends() -> Vec<String> {
 /// — 24 hours.
 fn default_rescan_interval_hours() -> i32 {
     hort_domain::policy::scan::DefaultPolicy::rescan_interval_hours()
+}
+
+/// Out-of-the-box `negligibleAction` default when the YAML omits the
+/// field: `ignore`, the non-blocking default that lets informational
+/// advisories through. Mirrors [`NegligibleAction::default`].
+fn default_negligible_action() -> String {
+    NegligibleAction::default().to_string()
 }
 
 /// Parse one `ScanPolicy` envelope.
@@ -240,6 +254,19 @@ pub fn validate_scan_policy(env: &Envelope<ScanPolicySpec>) -> Vec<ValidationErr
             field: "spec.provenanceMode",
             got: env.spec.provenance_mode.clone(),
             expected: vec!["off", "verify_if_present", "required"],
+        });
+    }
+
+    // `negligibleAction` parses via the domain enum. An unknown value
+    // is a typed reject naming the field — mirrors `provenanceMode`.
+    // The knob is enforced at runtime by
+    // `hort_domain::policy::scan::evaluate_scan_result`, so accepting an
+    // unparseable value here would be an accepted-but-inert footgun.
+    if NegligibleAction::from_str(&env.spec.negligible_action).is_err() {
+        errors.push(ValidationError::UnknownEnumValue {
+            field: "spec.negligibleAction",
+            got: env.spec.negligible_action.clone(),
+            expected: vec!["ignore", "warn", "block"],
         });
     }
 
@@ -568,6 +595,56 @@ mod tests {
 ";
         let err = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::Yaml(_)));
+    }
+
+    // `negligibleAction` round-trip + default + validation.
+    #[test]
+    fn parse_round_trips_explicit_negligible_action_block() {
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  negligibleAction: block
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("with-negligible", body).as_bytes()).unwrap();
+        assert_eq!(env.spec.negligible_action, "block");
+        assert!(validate_scan_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn parse_omitted_negligible_action_defaults_to_ignore() {
+        // The non-blocking default: informational advisories never block.
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("default-negligible", body).as_bytes()).unwrap();
+        assert_eq!(env.spec.negligible_action, "ignore");
+        assert!(validate_scan_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_negligible_action() {
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  negligibleAction: nuke
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap();
+        let errors = validate_scan_policy(&env);
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::UnknownEnumValue { field, got, .. }
+                if *field == "spec.negligibleAction" && got == "nuke"
+        )));
     }
 
     // `rescanIntervalHours` round-trip + default + validation.

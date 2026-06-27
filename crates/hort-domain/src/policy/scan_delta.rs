@@ -76,6 +76,7 @@ mod tests {
             source_scanner: "trivy".into(),
             references: vec![],
             aliases: vec![],
+            informational_class: None,
         }
     }
 

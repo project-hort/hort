@@ -58,7 +58,7 @@ pub(crate) async fn insert_findings_in_tx(
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "INSERT INTO scan_findings (\
             artifact_id, scan_id, purl, vulnerability_id, severity, \
-            cvss_score, source_scanner, title, detected_at\
+            cvss_score, source_scanner, title, detected_at, informational_class\
         ) ",
     );
     qb.push_values(rows, |mut b, row| {
@@ -70,7 +70,8 @@ pub(crate) async fn insert_findings_in_tx(
             .push_bind(row.cvss_score)
             .push_bind(&row.source_scanner)
             .push_bind(&row.title)
-            .push_bind(row.detected_at);
+            .push_bind(row.detected_at)
+            .push_bind(row.informational_class.as_deref());
     });
     let query = qb.build();
     query
@@ -223,7 +224,12 @@ mod tests {
         let repo_id = seed_repo(&pool).await;
         let artifact_id = seed_artifact(&pool, repo_id).await;
         let scan_id = Uuid::new_v4();
-        let row = ScanFindingsRow {
+        // Two rows through the same write path: a scored finding
+        // (`informational_class = None`) and an informational one
+        // (`informational_class = Some("unmaintained")`). Both must persist
+        // their class to the projection so a later reconstruction reads it
+        // back rather than defaulting to NULL.
+        let scored = ScanFindingsRow {
             artifact_id,
             scan_id,
             purl: format!("pkg:npm/it-{}@1", artifact_id.simple()),
@@ -233,10 +239,23 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "test".into(),
             detected_at: Utc::now(),
+            informational_class: None,
+        };
+        let info = ScanFindingsRow {
+            artifact_id,
+            scan_id,
+            purl: format!("pkg:cargo/it-info-{}@1", artifact_id.simple()),
+            vulnerability_id: "RUSTSEC-IT-1".into(),
+            severity: SeverityThreshold::Low,
+            cvss_score: None,
+            source_scanner: "osv".into(),
+            title: "unmaintained".into(),
+            detected_at: Utc::now(),
+            informational_class: Some("unmaintained".to_string()),
         };
 
         let repo = PgScanFindingsRepository::new(pool.clone());
-        repo.insert_batch(std::slice::from_ref(&row))
+        repo.insert_batch(&[scored.clone(), info.clone()])
             .await
             .expect("insert_batch");
 
@@ -249,7 +268,34 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count query");
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
+
+        // The `informational_class` value round-trips per row: the scored
+        // finding reads back NULL, the informational one reads back the
+        // raw OSV class string verbatim.
+        let scored_class: Option<String> = sqlx::query_scalar(
+            "SELECT informational_class FROM scan_findings \
+             WHERE artifact_id = $1 AND scan_id = $2 AND vulnerability_id = $3",
+        )
+        .bind(artifact_id)
+        .bind(scan_id)
+        .bind(&scored.vulnerability_id)
+        .fetch_one(&pool)
+        .await
+        .expect("scored informational_class query");
+        assert_eq!(scored_class, None);
+
+        let info_class: Option<String> = sqlx::query_scalar(
+            "SELECT informational_class FROM scan_findings \
+             WHERE artifact_id = $1 AND scan_id = $2 AND vulnerability_id = $3",
+        )
+        .bind(artifact_id)
+        .bind(scan_id)
+        .bind(&info.vulnerability_id)
+        .fetch_one(&pool)
+        .await
+        .expect("info informational_class query");
+        assert_eq!(info_class.as_deref(), Some("unmaintained"));
 
         // Cleanup so reruns stay deterministic. Deleting the repository
         // cascades through artifacts and scan_findings (M3 + M4).
@@ -288,6 +334,7 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "dup".into(),
             detected_at: Utc::now(),
+            informational_class: None,
         };
 
         let repo = PgScanFindingsRepository::new(pool.clone());

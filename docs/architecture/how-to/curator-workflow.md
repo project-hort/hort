@@ -424,6 +424,7 @@ spec:
   quarantineDuration: 0s          # permissive mode — no time gate
   requireApproval: false          # required
   provenanceMode: off             # optional: off | verify_if_present | required
+  negligibleAction: ignore        # optional: ignore | warn | block — informational (unmaintained/unsound) advisory handling; default ignore
   scanBackends:                   # scan still runs; finding-rejection still applies
     - trivy
 ```

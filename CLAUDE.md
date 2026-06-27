@@ -162,7 +162,7 @@ What "objectively better" is *not*:
 
 What "objectively better" *is*:
 
-- A concrete advantage the design did not have (e.g., the design pays N permanent files forever for a property that one in-place file plus a 3-second merge resolve also provides — the migration ALTER chain pre-1.0).
+- A concrete advantage the design did not have (e.g., an alternative that removes a per-request allocation or a network round-trip the design's structure otherwise forces).
 - A measurable cost reduction (latency, memory, cardinality, blast radius, surface area) on a cost the design acknowledged.
 - A correctness fix where the design was wrong — flag it, get the design amended, then implement.
 

@@ -3856,7 +3856,7 @@ mod tests {
         archived: bool,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
@@ -3874,6 +3874,7 @@ mod tests {
             archived,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

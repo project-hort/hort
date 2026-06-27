@@ -4200,7 +4200,9 @@ mod tests {
     /// construct their own use case
     /// without this seed.
     fn permissive_global_policy_projection() -> ScanPolicyProjection {
-        use hort_domain::entities::scan_policy::{ProvenanceMode, SeverityThreshold};
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, SeverityThreshold,
+        };
         use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
             policy_id: Uuid::from_u128(0x0046_0002_0000_0000_0000_0000_0000_0001),
@@ -4217,6 +4219,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -11162,7 +11165,9 @@ mod tests {
     /// inline because importing across the test-module boundary is
     /// awkward and the body is small.
     fn global_scan_policy() -> ScanPolicyProjection {
-        use hort_domain::entities::scan_policy::{ProvenanceMode, SeverityThreshold};
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, SeverityThreshold,
+        };
         ScanPolicyProjection {
             policy_id: Uuid::new_v4(),
             name: format!("scan-gated-ingest-test-{}", Uuid::new_v4()),
@@ -11178,6 +11183,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["osv".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -11817,7 +11823,7 @@ mod tests {
 
     /// A provenance policy projection (global scope) at the requested mode.
     fn provenance_policy(mode: ProvenanceMode) -> ScanPolicyProjection {
-        use hort_domain::entities::scan_policy::SeverityThreshold;
+        use hort_domain::entities::scan_policy::{NegligibleAction, SeverityThreshold};
         ScanPolicyProjection {
             policy_id: Uuid::new_v4(),
             name: format!("prov-test-{}", Uuid::new_v4()),
@@ -11842,6 +11848,7 @@ mod tests {
             // assertion focused on the provenance-verify enqueue.
             scan_backends: vec![],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

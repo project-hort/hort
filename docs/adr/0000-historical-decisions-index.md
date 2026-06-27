@@ -69,6 +69,7 @@ accepted?*
 | [0036](0036-oci-auth-capability-token.md) | OCI `/v2/auth` is a per-identity capability token (authority = `User`-subject grants ∩ cap; no ambient admin; B1 fail-closed Pat/SA cap backstop; admin off the OCI surface) |
 | [0037](0037-gitops-service-account-grant.md) | gitops `PermissionGrant` may target a ServiceAccount by name (apply-boundary sugar → `GrantSubject::User(backing_user_id)`; domain taxonomy unchanged) |
 | [0038](0038-admin-identity-model.md) | Admin-identity model: IdP-assumed (OIDC → CliSession), service accounts strictly non-admin, DSN-gated `bootstrap-session` for first-admin / break-glass; `task:destructive`-as-claim kept |
+| [0040](0040-osv-informational-negligible-lane.md) | OSV informational advisories (unmaintained/unsound/notice) ride the non-enforcing negligible lane, operator-steered via `ScanPolicy.negligible_action` (Ignore default / Warn / Block); persist the raw class fact and derive the routing so config changes are respected; fail-closed Critical preserved for genuinely-unscored vulns (ADR 0007) |
 
 ### TLS and trust
 

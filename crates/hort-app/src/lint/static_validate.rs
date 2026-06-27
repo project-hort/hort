@@ -47,8 +47,8 @@ use hort_config::DesiredState;
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{ClaimMapping, GrantSubject, Permission, PermissionGrant};
 use hort_domain::entities::scan_policy::{
-    ProvenanceConfigError, ProvenanceConfigWarning, ProvenanceMode, ScanPolicyProjection,
-    SeverityThreshold,
+    NegligibleAction, ProvenanceConfigError, ProvenanceConfigWarning, ProvenanceMode,
+    ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
 use uuid::Uuid;
@@ -835,6 +835,7 @@ fn provenance_projection_for_lint(
         archived: false,
         scan_backends: Vec::new(),
         rescan_interval_hours: 0,
+        negligible_action: NegligibleAction::Ignore,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1014,6 +1015,7 @@ mod tests {
                 license_policy: serde_json::json!({"allowed": ["MIT"]}),
                 scan_backends: scan_backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
+                negligible_action: "ignore".into(),
             },
         }
     }
@@ -1377,6 +1379,7 @@ mod tests {
                     license_policy: serde_json::json!({"allowed": ["MIT"]}),
                     scan_backends: vec!["trivy".into()],
                     rescan_interval_hours: 24,
+                    negligible_action: "ignore".into(),
                 },
             }],
             ..Default::default()

@@ -139,6 +139,80 @@ impl FromStr for ProvenanceMode {
 }
 
 // ---------------------------------------------------------------------------
+// NegligibleAction
+// ---------------------------------------------------------------------------
+
+/// Per-policy steering of how **negligible / informational** findings
+/// affect the release decision.
+///
+/// A finding lands on the non-enforcing `negligible` tier of
+/// [`SeveritySummary`](crate::events::SeveritySummary) when it carries no
+/// scored severity but an explicit informational classification from the
+/// advisory DB (OSV `unmaintained` / `unsound` / `notice`). The CVE
+/// tier-walk never enforces the negligible tier, so by default these
+/// findings are non-blocking. `NegligibleAction` is the operator knob
+/// that re-introduces enforcement when wanted.
+///
+/// - [`Ignore`](Self::Ignore) — **the default**. Negligible findings
+///   never block and produce no violation. This is exactly the behaviour
+///   of routing informational advisories onto the negligible tier:
+///   `unmaintained != vulnerable` (matches cargo-audit's stance).
+/// - [`Warn`](Self::Warn) — emit a `negligible-advisory` violation
+///   collected as [`PolicyAction::Warn`](crate::policy::PolicyAction);
+///   recorded for the audit trail but non-blocking in the v1 binary scan
+///   path (same shape as the license-policy `Warn`).
+/// - [`Block`](Self::Block) — emit a `negligible-advisory` violation
+///   collected as [`PolicyAction::Block`](crate::policy::PolicyAction):
+///   the artifact is rejected. Strict mode for operators who refuse
+///   unmaintained / unsound dependencies.
+///
+/// Orthogonal to [`SeverityThreshold`]: a scored finding above the
+/// threshold blocks regardless of `negligible_action`, and an excluded
+/// finding is dropped before this knob is consulted.
+///
+/// Lowercase wire-form on parse and display (mirrors [`SeverityThreshold`]
+/// and [`ProvenanceMode`]) so the YAML, JSON, and SQL surfaces share one
+/// spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum NegligibleAction {
+    /// Default — negligible / informational findings never block and
+    /// produce no violation.
+    #[default]
+    Ignore,
+    /// Emit a non-blocking `negligible-advisory` violation for the audit
+    /// trail; the scan outcome stays clean.
+    Warn,
+    /// Emit a blocking `negligible-advisory` violation → the artifact is
+    /// rejected.
+    Block,
+}
+
+impl fmt::Display for NegligibleAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ignore => f.write_str("ignore"),
+            Self::Warn => f.write_str("warn"),
+            Self::Block => f.write_str("block"),
+        }
+    }
+}
+
+impl FromStr for NegligibleAction {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "ignore" => Ok(Self::Ignore),
+            "warn" => Ok(Self::Warn),
+            "block" => Ok(Self::Block),
+            _ => Err(DomainError::Validation(format!(
+                "unknown negligible action: {s}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SignerIdentityPattern (ADR 0027)
 // ---------------------------------------------------------------------------
 
@@ -370,6 +444,13 @@ pub struct ScanPolicyProjection {
     /// zero policy never produces re-enqueues regardless of how stale
     /// `last_scan_at` is.
     pub rescan_interval_hours: i32,
+    /// How negligible / informational findings affect the release
+    /// decision. Default [`NegligibleAction::Ignore`] — informational
+    /// advisories (OSV `unmaintained` / `unsound` / `notice`) never
+    /// block. `Warn` records a non-blocking `negligible-advisory`
+    /// violation; `Block` rejects the artifact. Consumed by
+    /// [`crate::policy::scan::evaluate_scan_result`] (NOT inert).
+    pub negligible_action: NegligibleAction,
     /// Last appended position on the per-policy event stream. Drives
     /// optimistic-concurrency on the next event append.
     pub stream_version: u64,
@@ -618,6 +699,73 @@ mod tests {
         }
     }
 
+    // ---- NegligibleAction ----
+
+    #[test]
+    fn negligible_action_default_is_ignore() {
+        // The load-bearing default: informational advisories stay
+        // non-blocking unless an operator opts into Warn/Block.
+        assert_eq!(NegligibleAction::default(), NegligibleAction::Ignore);
+    }
+
+    #[test]
+    fn negligible_action_round_trips_every_variant() {
+        for (variant, wire) in [
+            (NegligibleAction::Ignore, "ignore"),
+            (NegligibleAction::Warn, "warn"),
+            (NegligibleAction::Block, "block"),
+        ] {
+            assert_eq!(variant.to_string(), wire);
+            assert_eq!(NegligibleAction::from_str(wire).expect("parse"), variant);
+        }
+    }
+
+    #[test]
+    fn negligible_action_parse_is_case_insensitive() {
+        assert_eq!(
+            NegligibleAction::from_str("IGNORE").expect("parse"),
+            NegligibleAction::Ignore
+        );
+        assert_eq!(
+            NegligibleAction::from_str("Warn").expect("parse"),
+            NegligibleAction::Warn
+        );
+        assert_eq!(
+            NegligibleAction::from_str("BLOCK").expect("parse"),
+            NegligibleAction::Block
+        );
+    }
+
+    #[test]
+    fn negligible_action_parse_unknown_is_validation_error() {
+        let err = NegligibleAction::from_str("nuke").expect_err("unknown action must reject");
+        match err {
+            DomainError::Validation(msg) => {
+                assert!(msg.contains("nuke"), "msg should echo input: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negligible_action_parse_empty_is_validation_error() {
+        let err = NegligibleAction::from_str("").expect_err("empty must reject");
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn negligible_action_serde_round_trips() {
+        for a in [
+            NegligibleAction::Ignore,
+            NegligibleAction::Warn,
+            NegligibleAction::Block,
+        ] {
+            let json = serde_json::to_string(&a).expect("serialize");
+            let back: NegligibleAction = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(a, back);
+        }
+    }
+
     // ---- ScanPolicyProjection clone/eq/Serialize ----
 
     fn sample_projection() -> ScanPolicyProjection {
@@ -640,6 +788,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -736,6 +885,27 @@ mod tests {
         p.rescan_interval_hours = 0;
         let json = serde_json::to_string(&p).expect("serialize");
         assert!(json.contains("\"rescan_interval_hours\":0"));
+    }
+
+    // `negligible_action` field round-trips through serde and
+    // participates in equality. Default Ignore.
+    #[test]
+    fn scan_policy_projection_negligible_action_serialises_under_snake_case_key() {
+        let mut p = sample_projection();
+        p.negligible_action = NegligibleAction::Block;
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            json.contains("\"negligible_action\":\"Block\""),
+            "negligible_action must surface under snake_case key: {json}"
+        );
+    }
+
+    #[test]
+    fn scan_policy_projection_negligible_action_change_breaks_equality() {
+        let a = sample_projection();
+        let mut b = a.clone();
+        b.negligible_action = NegligibleAction::Warn;
+        assert_ne!(a, b);
     }
 
     #[test]

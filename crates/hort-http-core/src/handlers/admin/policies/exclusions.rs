@@ -329,7 +329,8 @@ mod tests {
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
     use hort_domain::entities::scan_policy::{
-        ExclusionProjection, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection,
+        SeverityThreshold,
     };
     use hort_domain::ports::identity_provider::IdentityProvider;
     use hort_domain::ports::user_repository::UserRepository;
@@ -413,6 +414,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".into()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: now,
             updated_at: now,

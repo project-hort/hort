@@ -1855,7 +1855,7 @@ mod proxy_pull_through {
     #[tokio::test]
     async fn proxy_cache_miss_pulled_artifact_quarantined_returns_503() {
         use hort_domain::entities::scan_policy::{
-            ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -1881,6 +1881,7 @@ mod proxy_pull_through {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: now,
             updated_at: now,

@@ -63,7 +63,7 @@ use hort_config::exclusion::ExclusionSpec;
 use hort_config::scan_policy::{ScanPolicySpec, SignerIdentitySpec};
 use hort_config::scope::ScopeSpec;
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
     SignerIdentityPattern,
 };
 use hort_domain::events::{
@@ -197,6 +197,7 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
         let desired_provenance_mode = parse_provenance_mode(&desired.spec.provenance_mode);
         let desired_provenance_identities =
             parse_provenance_identities(&desired.spec.provenance_identities);
+        let desired_negligible_action = parse_negligible_action(&desired.spec.negligible_action);
 
         match projection {
             None => {
@@ -218,6 +219,7 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                     &desired.spec.license_policy,
                     &desired.spec.scan_backends,
                     desired.spec.rescan_interval_hours,
+                    &desired_negligible_action,
                 );
                 vec![DomainEvent::PolicyCreated(PolicyCreated {
                     policy_id,
@@ -367,6 +369,21 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                         field: PolicyField::RescanIntervalHours,
                         previous_value: serde_json::Value::from(proj.rescan_interval_hours),
                         new_value: serde_json::Value::from(desired.spec.rescan_interval_hours),
+                    }));
+                }
+
+                // -- NegligibleAction --
+                // Lowercase wire strings on the payload (mirrors
+                // ProvenanceMode). A change from `ignore` → `block`
+                // re-introduces enforcement of informational advisories.
+                if proj.negligible_action != desired_negligible_action {
+                    events.push(DomainEvent::PolicyUpdated(PolicyUpdated {
+                        policy_id: pid,
+                        field: PolicyField::NegligibleAction,
+                        previous_value: serde_json::Value::String(
+                            proj.negligible_action.to_string(),
+                        ),
+                        new_value: serde_json::Value::String(desired_negligible_action.to_string()),
                     }));
                 }
 
@@ -548,6 +565,7 @@ fn build_config_snapshot(
     license_policy: &serde_json::Value,
     scan_backends: &[String],
     rescan_interval_hours: i32,
+    negligible_action: &NegligibleAction,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": name,
@@ -563,6 +581,7 @@ fn build_config_snapshot(
         "license_policy": license_policy,
         "scan_backends": scan_backends,
         "rescan_interval_hours": rescan_interval_hours,
+        "negligible_action": negligible_action.to_string(),
     })
 }
 
@@ -573,6 +592,19 @@ fn parse_provenance_mode(s: &str) -> ProvenanceMode {
     ProvenanceMode::from_str(s).unwrap_or_else(|err| {
         panic!(
             "INVARIANT: provenance mode '{s}' must have been validated by \
+             hort_config::scan_policy::validate_scan_policy before reaching the \
+             applier (parse error: {err})"
+        )
+    })
+}
+
+/// Parse the validated `negligibleAction` wire string into the domain
+/// enum. `hort_config::scan_policy::validate_scan_policy` ran first, so a
+/// parse failure is a bypassed-validator programming error.
+fn parse_negligible_action(s: &str) -> NegligibleAction {
+    NegligibleAction::from_str(s).unwrap_or_else(|err| {
+        panic!(
+            "INVARIANT: negligible action '{s}' must have been validated by \
              hort_config::scan_policy::validate_scan_policy before reaching the \
              applier (parse error: {err})"
         )
@@ -685,6 +717,7 @@ mod tests {
             }),
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: "ignore".into(),
         }
     }
 
@@ -708,6 +741,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -793,6 +827,8 @@ mod tests {
         assert_eq!(snap["scan_backends"], serde_json::json!(["trivy"]));
         // rescan_interval_hours in the create-snapshot.
         assert_eq!(snap["rescan_interval_hours"], 24);
+        // negligible_action defaults to ignore in the create-snapshot.
+        assert_eq!(snap["negligible_action"], "ignore");
     }
 
     #[test]
@@ -1765,6 +1801,7 @@ mod tests {
             &serde_json::json!({"x": 1}),
             &["trivy".to_string(), "osv".to_string()],
             48,
+            &NegligibleAction::Block,
         );
         for key in [
             "name",
@@ -1779,6 +1816,7 @@ mod tests {
             "license_policy",
             "scan_backends",
             "rescan_interval_hours",
+            "negligible_action",
         ] {
             assert!(snap.get(key).is_some(), "missing key {key}");
         }
@@ -1794,5 +1832,31 @@ mod tests {
             snap["provenance_identities"],
             serde_json::json!([{"issuer": "iss", "san": "san"}])
         );
+        // negligible_action surfaces as the lowercase wire string.
+        assert_eq!(snap["negligible_action"], "block");
+    }
+
+    #[test]
+    fn scan_policy_negligible_action_change_emits_one_event() {
+        let policy_id = Uuid::new_v4();
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let mut spec = baseline_spec();
+        spec.negligible_action = "block".into();
+        let events = applier.diff(
+            &policy_envelope(spec),
+            Some(&baseline_projection(policy_id)),
+        );
+        let updated: Vec<&PolicyUpdated> = events
+            .iter()
+            .filter_map(|e| match e {
+                DomainEvent::PolicyUpdated(p) if p.field == PolicyField::NegligibleAction => {
+                    Some(p)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updated.len(), 1, "exactly one NegligibleAction event");
+        assert_eq!(updated[0].previous_value, serde_json::json!("ignore"));
+        assert_eq!(updated[0].new_value, serde_json::json!("block"));
     }
 }

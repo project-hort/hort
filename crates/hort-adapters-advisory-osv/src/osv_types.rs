@@ -125,12 +125,33 @@ pub(crate) struct OsvDatabaseSpecific {
     /// `"7.5"`, or absent. Parsed by `severity::label_to_severity`.
     #[serde(default)]
     pub severity: Option<String>,
+
+    /// RustSec informational class — `"unmaintained"`, `"unsound"`, or
+    /// `"notice"`. Present only on informational advisories, which carry
+    /// no CVSS score by design. A recognised class routes the finding
+    /// onto the non-enforcing negligible lane rather than the SUP-4
+    /// Critical fail-closed fallback. Parity with the scanner-osv
+    /// adapter's `OsvDatabaseSpecific`.
+    #[serde(default)]
+    pub informational: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub(crate) struct OsvAffected {
     #[serde(default)]
     pub ranges: Vec<OsvRange>,
+
+    /// Per-`affected[]` `database_specific` block. Real RustSec OSV
+    /// records place the `informational` discriminator
+    /// (`unmaintained` / `unsound` / `notice`) here, NOT on the
+    /// vulnerability-level `database_specific`. Present only on full
+    /// records (the bulk-archive path); `/v1/querybatch` returns
+    /// abbreviated records without `affected[].database_specific`, so
+    /// this field is `None` on querybatch responses by design — that is
+    /// an inherent querybatch limitation, not a bug. See
+    /// `crates/hort-adapters-scanner-osv/tests/fixtures/informational_unmaintained.json`.
+    #[serde(default)]
+    pub database_specific: Option<OsvDatabaseSpecific>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

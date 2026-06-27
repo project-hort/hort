@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
     SignerIdentityPattern,
 };
 use hort_domain::error::DomainError;
@@ -95,6 +95,11 @@ pub struct CreatePolicyCommand {
     /// operator opt-out; negative values are rejected upstream by
     /// `hort_config::scan_policy::validate_scan_policy`.
     pub rescan_interval_hours: i32,
+    /// How negligible / informational findings steer the release
+    /// decision. Default [`NegligibleAction::Ignore`]; enforced by
+    /// `evaluate_scan_result`. The gitops apply pipeline validates the
+    /// wire value via `hort_config::scan_policy::validate_scan_policy`.
+    pub negligible_action: NegligibleAction,
 }
 
 /// A field-level update directive for [`PolicyUseCase::update_policy`].
@@ -145,6 +150,10 @@ pub struct UpdatePolicyCommand {
     /// interval. `FieldChange::Set(0)` is meaningful (it disables
     /// rescanning) and distinct from `FieldChange::Unchanged`.
     pub rescan_interval_hours: FieldChange<i32>,
+    /// Operator-driven update of the negligible-action knob. Every
+    /// variant (Ignore / Warn / Block) is a meaningful value distinct
+    /// from `FieldChange::Unchanged`.
+    pub negligible_action: FieldChange<NegligibleAction>,
 }
 
 impl UpdatePolicyCommand {
@@ -166,6 +175,7 @@ impl UpdatePolicyCommand {
             license_policy: FieldChange::Unchanged,
             scan_backends: FieldChange::Unchanged,
             rescan_interval_hours: FieldChange::Unchanged,
+            negligible_action: FieldChange::Unchanged,
         }
     }
 }
@@ -327,6 +337,7 @@ impl PolicyUseCase {
             archived: false,
             scan_backends: cmd.scan_backends,
             rescan_interval_hours: cmd.rescan_interval_hours,
+            negligible_action: cmd.negligible_action,
             stream_version: result.stream_position,
             created_at: now,
             updated_at: now,
@@ -550,6 +561,21 @@ impl PolicyUseCase {
                     serde_json::Value::from(*new_interval),
                 ));
                 projection.rescan_interval_hours = *new_interval;
+            }
+        }
+
+        // Same-value skip; the `previous_value` / `new_value` payloads
+        // are the lowercase `NegligibleAction` wire strings (mirrors
+        // `ProvenanceMode`).
+        if let FieldChange::Set(new_action) = &cmd.negligible_action {
+            if *new_action != projection.negligible_action {
+                events.push(field_event(
+                    policy_id,
+                    PolicyField::NegligibleAction,
+                    serde_json::Value::String(projection.negligible_action.to_string()),
+                    serde_json::Value::String(new_action.to_string()),
+                ));
+                projection.negligible_action = *new_action;
             }
         }
 
@@ -1617,6 +1643,7 @@ fn build_config_snapshot(cmd: &CreatePolicyCommand) -> serde_json::Value {
         "license_policy": cmd.license_policy,
         "scan_backends": cmd.scan_backends,
         "rescan_interval_hours": cmd.rescan_interval_hours,
+        "negligible_action": cmd.negligible_action.to_string(),
     })
 }
 
@@ -1682,6 +1709,7 @@ mod tests {
             }),
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
         }
     }
 
@@ -1704,6 +1732,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version,
             created_at: now,
             updated_at: now,
@@ -2480,6 +2509,69 @@ mod tests {
             }
             other => panic!("expected PolicyUpdated, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn update_policy_set_negligible_action_emits_one_event_and_mutates_projection() {
+        // The `FieldChange::Set(new_action)` branch must emit exactly one
+        // `PolicyField::NegligibleAction` event (carrying the lowercase
+        // wire strings) and mutate the upserted projection. Exercises the
+        // `update_policy` code path directly — the gitops applier path is
+        // a different call site and is not interchangeable.
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        // sample_projection defaults negligible_action = Ignore.
+        let p = sample_projection(id, 0);
+        assert_eq!(p.negligible_action, NegligibleAction::Ignore);
+        projections.insert(p);
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.negligible_action = FieldChange::Set(NegligibleAction::Block);
+
+        uc.update_policy(cmd, api_actor()).await.unwrap();
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 1, "single atomic batch");
+        assert_eq!(batches[0].events.len(), 1, "exactly one event");
+        match &batches[0].events[0].event {
+            DomainEvent::PolicyUpdated(u) => {
+                assert_eq!(u.field, PolicyField::NegligibleAction);
+                assert_eq!(u.previous_value, serde_json::Value::String("ignore".into()));
+                assert_eq!(u.new_value, serde_json::Value::String("block".into()));
+            }
+            other => panic!("expected PolicyUpdated, got {other:?}"),
+        }
+
+        let upserts = projections.upserts();
+        assert_eq!(
+            upserts.last().unwrap().negligible_action,
+            NegligibleAction::Block,
+            "projection reflects the new action"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_policy_set_negligible_action_to_same_value_yields_zero_events() {
+        // Same-value skip: `Set(Ignore)` over an `Ignore` projection is a
+        // no-op — no event, no new upsert.
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let p = sample_projection(id, 0);
+        assert_eq!(p.negligible_action, NegligibleAction::Ignore);
+        projections.insert(p);
+        let baseline_upserts = projections.upserts().len();
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.negligible_action = FieldChange::Set(NegligibleAction::Ignore);
+
+        uc.update_policy(cmd, api_actor()).await.unwrap();
+
+        assert!(events.appended_batches().is_empty(), "no event on no-op");
+        assert_eq!(
+            projections.upserts().len(),
+            baseline_upserts,
+            "no new upsert on no-op"
+        );
     }
 
     #[tokio::test]
@@ -3855,6 +3947,7 @@ mod tests {
         assert_eq!(cmd.provenance_identities, FieldChange::Unchanged);
         assert_eq!(cmd.max_artifact_age_secs, FieldChange::Unchanged);
         assert_eq!(cmd.license_policy, FieldChange::Unchanged);
+        assert_eq!(cmd.negligible_action, FieldChange::Unchanged);
     }
 
     #[test]
