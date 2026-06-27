@@ -369,13 +369,16 @@
 # both complete before hort-server and hort-worker are started:
 #
 #   1. Enable hort-migrate.service (so the systemd ordering dep is registered).
-#   2. Start hort-migrate.service explicitly and WAIT for it to finish.
-#      The systemd module with state=started on a Type=oneshot service blocks
-#      until the unit reaches the `dead` (success) state — the play fails here
-#      if the migration exits non-zero, giving a clear error before any server
-#      starts.  sqlx migrations are idempotent, so hort-server re-triggering
-#      hort-migrate.service via its Requires=/After= dependency on subsequent
-#      invocations is a harmless no-op.
+#   2. Restart hort-migrate.service explicitly and WAIT for it to finish.
+#      state=restarted, NOT started: the unit has RemainAfterExit and stays
+#      `active (exited)` after its first run, so a plain `start` is a no-op and
+#      would silently skip newly-added migrations on every later deploy (the
+#      schema would then trail the new binary, and hort-server's boot
+#      assert_current refuses to serve). A oneshot `restart` re-execs ExecStart,
+#      blocks until it finishes, and fails the play if the migration exits
+#      non-zero — before any server starts. sqlx migrations are idempotent, so
+#      re-running with nothing new to apply is a harmless no-op (it just
+#      re-asserts the events-role hardening).
 #   3. Grant hort_retention_role TO hort_app_role (post-migrate: the role is
 #      created by migration 004_events.sql and does not exist before that).
 #      This lets the worker (login as hort_app_role) issue
@@ -389,10 +392,10 @@
     enabled: true
     scope: system
 
-- name: Run hort-migrate.service (oneshot — blocks until migration completes)
+- name: Run hort-migrate.service (oneshot restart — re-applies migrations each deploy, blocks until complete)
   ansible.builtin.systemd:
     name: hort-migrate.service
-    state: started
+    state: restarted
     scope: system
 
 # Post-migrate grant: hort_retention_role is created by migration 004_events.sql
