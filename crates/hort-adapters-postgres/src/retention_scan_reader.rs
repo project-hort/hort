@@ -54,15 +54,19 @@ struct FindingRow {
     cvss_score: Option<f32>,
     source_scanner: String,
     title: String,
+    informational_class: Option<String>,
 }
 
 impl FindingRow {
     /// Map a projection row to the shipped [`Finding`] value type.
     /// `fixed_versions` / `references` / `aliases` are empty — the
-    /// projection has no columns to populate them from (see module
-    /// docs). An unrecognised `severity` literal
-    /// is a corruption signal (the migration 009 CHECK constrains it
-    /// to the four-value set); surface it loudly rather than guessing.
+    /// projection has no columns to populate them from (see module docs).
+    /// `informational_class` is read from the persisted column (migration
+    /// 015) so an exclusion-triggered re-evaluation reconstructs the same
+    /// negligible-lane routing the original scan produced. An
+    /// unrecognised `severity` literal is a corruption signal (the
+    /// migration 009 CHECK constrains it to the four-value set); surface
+    /// it loudly rather than guessing.
     fn into_domain(self) -> DomainResult<Finding> {
         let severity = SeverityThreshold::from_str(&self.severity).map_err(|_| {
             DomainError::Invariant(format!(
@@ -81,6 +85,7 @@ impl FindingRow {
             source_scanner: self.source_scanner,
             references: Vec::new(),
             aliases: Vec::new(),
+            informational_class: self.informational_class,
         })
     }
 }
@@ -133,7 +138,7 @@ impl RetentionScanReader for PgRetentionScanReader {
             let rows = sqlx::query_as::<_, FindingRow>(
                 r#"
                 SELECT purl, vulnerability_id, severity, cvss_score,
-                       source_scanner, title
+                       source_scanner, title, informational_class
                 FROM scan_findings
                 WHERE artifact_id = $1
                 ORDER BY detected_at ASC
@@ -177,6 +182,7 @@ impl RetentionScanReader for PgRetentionScanReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::env;
 
     /// Compile-time assertion that the adapter implements the port.
@@ -202,6 +208,7 @@ mod tests {
             cvss_score: Some(7.0),
             source_scanner: "trivy".into(),
             title: "t".into(),
+            informational_class: None,
         };
         let f = r.into_domain().unwrap();
         assert_eq!(f.severity, SeverityThreshold::High);
@@ -209,6 +216,27 @@ mod tests {
         assert!(f.fixed_versions.is_empty());
         assert!(f.references.is_empty());
         assert!(f.aliases.is_empty());
+        assert_eq!(f.informational_class, None);
+        assert!(!f.is_informational());
+    }
+
+    #[test]
+    fn finding_row_preserves_informational_class() {
+        // The persisted `informational_class` column (migration 015) must
+        // reach the reconstructed Finding verbatim so the negligible-lane
+        // routing stays stable under re-evaluation — not hardcoded to NULL.
+        let r = FindingRow {
+            purl: "pkg:cargo/proc-macro-error@1.0.4".into(),
+            vulnerability_id: "RUSTSEC-2024-0370".into(),
+            severity: "low".into(),
+            cvss_score: None,
+            source_scanner: "osv".into(),
+            title: "unmaintained".into(),
+            informational_class: Some("unmaintained".to_string()),
+        };
+        let f = r.into_domain().unwrap();
+        assert_eq!(f.informational_class.as_deref(), Some("unmaintained"));
+        assert!(f.is_informational());
     }
 
     #[test]
@@ -220,6 +248,7 @@ mod tests {
             cvss_score: None,
             source_scanner: "trivy".into(),
             title: "t".into(),
+            informational_class: None,
         };
         let err = r.into_domain().unwrap_err();
         assert!(matches!(err, DomainError::Invariant(_)));
@@ -252,6 +281,7 @@ mod tests {
     /// on `DATABASE_URL` so unit-only runs skip cleanly (mirrors
     /// `scan_findings_repository`'s integration-test gating).
     #[tokio::test]
+    #[serial(hort_pg_db)]
     async fn list_findings_round_trip_db() {
         let Ok(url) = env::var("DATABASE_URL") else {
             return;
@@ -315,7 +345,9 @@ mod tests {
         // No score row yet.
         assert!(reader.repo_security_score(repo_id).await.unwrap().is_none());
 
-        // Insert one finding + a score row.
+        // Insert one scored finding (no `informational_class` column →
+        // relies on the migration-015 nullable column reading back NULL) +
+        // a score row.
         sqlx::query(
             r#"INSERT INTO scan_findings
                (artifact_id, scan_id, purl, vulnerability_id, severity,
@@ -328,6 +360,22 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert finding");
+        // Insert an informational finding (explicit
+        // `informational_class = 'unmaintained'`) — the persisted class
+        // must read back verbatim, not NULL.
+        sqlx::query(
+            r#"INSERT INTO scan_findings
+               (artifact_id, scan_id, purl, vulnerability_id, severity,
+                cvss_score, source_scanner, title, detected_at, informational_class)
+               VALUES ($1,$2,$3,'RUSTSEC-RR-2','low',NULL,'osv','unmaintained',
+                       now() + interval '1 second', 'unmaintained')"#,
+        )
+        .bind(artifact_id)
+        .bind(Uuid::new_v4())
+        .bind(format!("pkg:cargo/rr-info-{}@1", artifact_id.simple()))
+        .execute(&pool)
+        .await
+        .expect("insert informational finding");
         sqlx::query(
             r#"INSERT INTO repo_security_scores
                (repository_id, released_count, critical_count, last_scan_at)
@@ -342,10 +390,28 @@ mod tests {
             .list_findings_for_artifact(artifact_id)
             .await
             .unwrap();
-        assert_eq!(fs.len(), 1);
-        assert_eq!(fs[0].severity, SeverityThreshold::Critical);
-        assert_eq!(fs[0].cvss_score, Some(9.8));
-        assert!(fs[0].fixed_versions.is_empty());
+        assert_eq!(fs.len(), 2);
+
+        // The scored finding read back: severity preserved,
+        // informational_class NULL (no marker) by migration 015.
+        let scored = fs
+            .iter()
+            .find(|f| f.vulnerability_id == "CVE-RR-1")
+            .expect("scored finding present");
+        assert_eq!(scored.severity, SeverityThreshold::Critical);
+        assert_eq!(scored.cvss_score, Some(9.8));
+        assert!(scored.fixed_versions.is_empty());
+        assert_eq!(scored.informational_class, None);
+        assert!(!scored.is_informational());
+
+        // The informational finding read back: the persisted class survives
+        // the projection round-trip verbatim rather than reverting to NULL.
+        let info = fs
+            .iter()
+            .find(|f| f.vulnerability_id == "RUSTSEC-RR-2")
+            .expect("informational finding present");
+        assert_eq!(info.informational_class.as_deref(), Some("unmaintained"));
+        assert!(info.is_informational());
 
         let sc = reader.repo_security_score(repo_id).await.unwrap();
         let sc = sc.expect("score row now present");

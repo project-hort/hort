@@ -231,6 +231,7 @@ mod tests {
             source_scanner: "osv".into(),
             references: vec![],
             aliases: vec![],
+            informational_class: None,
         }
     }
 

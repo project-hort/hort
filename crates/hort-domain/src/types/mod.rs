@@ -13,7 +13,10 @@ pub mod idempotency_key;
 pub mod sbom;
 
 pub use checksum::{HashAlgorithm, UpstreamPublishedChecksum};
-pub use finding::{highest_severity, severity_label, severity_summary_from_findings, Finding};
+pub use finding::{
+    highest_severity, is_informational_class, severity_label, severity_summary_from_findings,
+    Finding,
+};
 pub use idempotency_key::IdempotencyKey;
 pub use sbom::{Ecosystem, PayloadAccess, Sbom, SbomComponent};
 

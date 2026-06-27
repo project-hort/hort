@@ -548,6 +548,7 @@ spec:
   quarantineDuration: 24h       # humantime duration
   requireApproval: true
   provenanceMode: verify_if_present   # optional; off | verify_if_present | required
+  negligibleAction: ignore      # optional; ignore | warn | block — informational (unmaintained/unsound) advisory handling; default ignore
   maxArtifactAge: 90d           # optional humantime
   licensePolicy:                # optional JSON; defaults to no license policy when omitted
     allowed: [Apache-2.0, MIT]

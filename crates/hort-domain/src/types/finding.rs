@@ -101,16 +101,63 @@ pub struct Finding {
     /// this struct.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// The raw OSV `database_specific.informational` class verbatim — the
+    /// fact the advisory database published, not a derived interpretation.
+    /// RustSec/OSV informational advisories carry `"unmaintained"`,
+    /// `"unsound"`, or `"notice"` here (under `affected[].database_specific`
+    /// for full records); these are maintenance signals published without a
+    /// CVSS score by design, not exploitable defects. `None` means a scored
+    /// vulnerability — no informational marker.
+    ///
+    /// Persisting the class string (the fact) rather than a derived boolean
+    /// keeps the interpretation re-derivable: a future per-class policy
+    /// (e.g. block `unsound`, ignore `unmaintained`) can re-evaluate from
+    /// stored findings, which a baked-in boolean would have lost. The
+    /// boolean is derived on demand via [`Finding::is_informational`].
+    ///
+    /// Informational findings are routed onto the non-enforcing
+    /// **negligible** lane by [`severity_summary_from_findings`] and the
+    /// post-exclusion block-decision summary, so they never trip a
+    /// severity threshold. `severity` is cosmetic for these (the OSV
+    /// adapters map it to `Low`); the negligible routing — keyed on
+    /// [`Finding::is_informational`], not on `severity` — is what makes them
+    /// non-blocking.
+    ///
+    /// `#[serde(default)]` for round-trip compatibility with events /
+    /// cached blobs written before this field landed: a payload missing
+    /// it deserialises as `None` (a scored vulnerability), the same
+    /// no-re-validation posture as every other shape-evolution on this
+    /// struct.
+    #[serde(default)]
+    pub informational_class: Option<String>,
+}
+
+/// Recognises the OSV `database_specific.informational` classes that mark a
+/// finding as informational rather than a scored vulnerability:
+/// `unmaintained` / `unsound` / `notice` (ASCII case-insensitive). This is
+/// the canonical recognizer shared by the OSV adapters (which decide the
+/// finding's severity from it) and the negligible-lane routing
+/// ([`Finding::is_informational`]); a finding's raw informational class is
+/// persisted, and this function re-derives the boolean interpretation from
+/// it at decision time. Any other (or absent) value is not informational,
+/// preserving the SUP-4 fail-closed Critical fallback for genuinely-unscored
+/// vulnerabilities.
+pub fn is_informational_class(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "unmaintained" | "unsound" | "notice"
+    )
 }
 
 /// Per-tier count over `findings` — single source of truth
 /// for the `ScanCompleted.severity_summary` aggregate. Lifted from
 /// previously-duplicated copies in `hort-app::scan_orchestration` and
 /// `hort-app::quarantine_use_case` so both
-/// callers reuse one helper. `SeveritySummary.negligible` is always
-/// emitted as `0` because the `SeverityThreshold` enum has no
-/// Negligible variant today; the field stays in the wire shape for
-/// forward compatibility.
+/// callers reuse one helper. A finding for which
+/// [`Finding::is_informational`] holds is counted in `negligible` (the
+/// non-enforcing lane) regardless of its cosmetic `severity`; the
+/// `SeverityThreshold` enum has no Negligible variant — informational
+/// is a property of the finding, not a severity tier.
 pub fn severity_summary_from_findings(findings: &[Finding]) -> SeveritySummary {
     let mut s = SeveritySummary {
         critical: 0,
@@ -120,6 +167,10 @@ pub fn severity_summary_from_findings(findings: &[Finding]) -> SeveritySummary {
         negligible: 0,
     };
     for f in findings {
+        if f.is_informational() {
+            s.negligible += 1;
+            continue;
+        }
         match f.severity {
             SeverityThreshold::Critical => s.critical += 1,
             SeverityThreshold::High => s.high += 1,
@@ -176,6 +227,27 @@ fn severity_tier(s: SeverityThreshold) -> u8 {
 }
 
 impl Finding {
+    /// Whether this finding is informational — derived at decision time
+    /// from the persisted [`Finding::informational_class`] fact via the
+    /// canonical [`is_informational_class`] recognizer. `None` (a scored
+    /// vulnerability) or an unrecognised class is not informational.
+    /// Routing onto the non-enforcing negligible lane keys on this, not on
+    /// `severity`.
+    ///
+    /// A finding carrying any `cvss_score` is never informational, even
+    /// with a recognised class: informational advisories carry no CVSS
+    /// by design, so a scored finding stays on the enforced lane
+    /// regardless of any class string. Gating on the absence of a CVSS
+    /// score preserves the fail-closed posture — a genuinely-scored
+    /// vulnerability cannot be demoted off the threshold gate.
+    pub fn is_informational(&self) -> bool {
+        self.cvss_score.is_none()
+            && self
+                .informational_class
+                .as_deref()
+                .is_some_and(is_informational_class)
+    }
+
     /// Validate the per-finding length caps.
     /// Returns `DomainError::Validation` naming the offending field
     /// and its observed size on failure. Lengths are byte-counted via
@@ -251,6 +323,7 @@ mod tests {
             source_scanner: "trivy".into(),
             references: vec!["https://nvd.nist.gov/vuln/detail/CVE-2021-23337".into()],
             aliases: vec!["GHSA-35jh-r3h4-6jhm".into()],
+            informational_class: None,
         }
     }
 
@@ -276,6 +349,7 @@ mod tests {
             source_scanner: "osv".into(),
             references: vec![],
             aliases: vec![],
+            informational_class: None,
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: Finding = serde_json::from_str(&json).unwrap();
@@ -472,6 +546,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -483,6 +558,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -494,6 +570,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
             Finding {
                 purl: "pkg:npm/d@1".into(),
@@ -505,6 +582,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
             Finding {
                 purl: "pkg:npm/e@1".into(),
@@ -516,6 +594,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
         ];
         let s = severity_summary_from_findings(&findings);
@@ -547,6 +626,130 @@ mod tests {
     }
 
     #[test]
+    fn severity_summary_routes_informational_to_negligible_regardless_of_severity() {
+        // An informational finding is counted in `negligible` (the
+        // non-enforcing lane) even though its cosmetic `severity` is a real
+        // tier — the routing is keyed on `is_informational()` (derived from
+        // the class), not on `severity`. A Critical-tier informational
+        // finding must NOT land in the critical bucket, or it would block
+        // under the default threshold. Informational advisories carry no
+        // CVSS score by design, so the fixture has `cvss_score = None`.
+        let mut critical_but_informational = valid_finding();
+        critical_but_informational.severity = SeverityThreshold::Critical;
+        critical_but_informational.cvss_score = None;
+        critical_but_informational.informational_class = Some("unmaintained".to_string());
+
+        let mut real_critical = valid_finding();
+        real_critical.severity = SeverityThreshold::Critical;
+        real_critical.informational_class = None;
+
+        let s = severity_summary_from_findings(&[critical_but_informational, real_critical]);
+        assert_eq!(
+            s,
+            SeveritySummary {
+                critical: 1,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn scored_finding_with_informational_class_stays_enforced() {
+        // A finding carrying BOTH a real `cvss_score` AND a recognised
+        // informational class must NOT route onto the negligible lane —
+        // informational advisories carry no CVSS by design, so a scored
+        // finding stays on the enforced lane (ADR 0040 §4). Demoting it
+        // would let a scored Critical escape the threshold gate.
+        let scored_but_classed = Finding {
+            cvss_score: Some(9.0),
+            informational_class: Some("unmaintained".to_string()),
+            severity: SeverityThreshold::Critical,
+            ..valid_finding()
+        };
+        assert!(
+            !scored_but_classed.is_informational(),
+            "a scored finding is never informational, regardless of class"
+        );
+
+        let s = severity_summary_from_findings(&[scored_but_classed]);
+        assert_eq!(
+            s,
+            SeveritySummary {
+                critical: 1,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            "a scored Critical with a class counts as critical, not negligible"
+        );
+    }
+
+    #[test]
+    fn finding_deserialises_with_default_informational_class_none_when_field_absent() {
+        // `informational_class` is `#[serde(default)]`: a legacy event /
+        // cached blob written before the field landed must round-trip as
+        // `None` (a scored vulnerability), preserving fail-closed behaviour
+        // for old findings.
+        let legacy_json = r#"{
+            "purl": "pkg:cargo/proc-macro-error2@2.0.1",
+            "vulnerability_id": "RUSTSEC-2026-0173",
+            "severity": "Critical",
+            "cvss_score": null,
+            "title": "unmaintained",
+            "fixed_versions": [],
+            "source_scanner": "osv",
+            "references": [],
+            "aliases": []
+        }"#;
+        let back: Finding = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(back.informational_class, None);
+        assert!(!back.is_informational());
+    }
+
+    #[test]
+    fn is_informational_class_recognises_the_three_classes_and_rejects_others() {
+        // The canonical recognizer: case-insensitive `unmaintained` /
+        // `unsound` / `notice`; everything else (including a made-up class)
+        // is not informational.
+        assert!(is_informational_class("unmaintained"));
+        assert!(is_informational_class("unsound"));
+        assert!(is_informational_class("notice"));
+        assert!(is_informational_class("UNMAINTAINED"));
+        assert!(is_informational_class("  Unsound  "));
+        assert!(!is_informational_class("some-future-class"));
+        assert!(!is_informational_class(""));
+        assert!(!is_informational_class("critical"));
+    }
+
+    #[test]
+    fn is_informational_derives_the_boolean_from_the_persisted_class() {
+        // A recognised class → informational; `None` or a made-up class → not.
+        // The made-up string is stored verbatim (the fact) but does not flip
+        // the derived boolean — the interpretation lives in the recognizer,
+        // not in the stored value. Informational advisories carry no CVSS
+        // score by design, so the fixture clears `cvss_score`.
+        let mut f = valid_finding();
+        f.cvss_score = None;
+        f.informational_class = Some("unsound".to_string());
+        assert!(f.is_informational());
+
+        f.informational_class = Some("some-future-class".to_string());
+        assert_eq!(
+            f.informational_class.as_deref(),
+            Some("some-future-class"),
+            "the raw class is stored verbatim"
+        );
+        assert!(!f.is_informational());
+
+        f.informational_class = None;
+        assert!(!f.is_informational());
+    }
+
+    #[test]
     fn severity_label_maps_each_tier_to_its_lowercase_wire_string() {
         // Mirrors the metric-catalog label values exactly so the
         // catalog stays the single source of truth (the registry's
@@ -570,6 +773,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -581,6 +785,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -592,6 +797,7 @@ mod tests {
                 source_scanner: "trivy".into(),
                 references: vec![],
                 aliases: vec![],
+                informational_class: None,
             },
         ];
         assert_eq!(highest_severity(&findings), Some(SeverityThreshold::High));

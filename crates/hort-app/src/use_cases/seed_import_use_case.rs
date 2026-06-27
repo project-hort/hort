@@ -416,7 +416,7 @@ mod tests {
     use chrono::Duration;
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::Repository;
-    use hort_domain::entities::scan_policy::{ProvenanceMode, SeverityThreshold};
+    use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
     use hort_domain::events::DomainEvent;
 
     use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
@@ -449,6 +449,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".into()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: now,
             updated_at: now,

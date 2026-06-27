@@ -33,6 +33,16 @@ pub struct ScanFindingsRow {
     pub source_scanner: String,
     pub title: String,
     pub detected_at: DateTime<Utc>,
+    /// Mirrors [`crate::types::Finding::informational_class`] — the raw OSV
+    /// `database_specific.informational` class verbatim (RustSec
+    /// `unmaintained` / `unsound` / `notice`), or `None` for a scored
+    /// vulnerability. Persisting the class (the fact) rather than a derived
+    /// boolean keeps the negligible-lane routing stable under
+    /// exclusion-triggered re-evaluation — including `negligible_action =
+    /// block` — and lets a future per-class policy re-derive from stored
+    /// findings. A Finding reconstructed from `scan_findings` reads the class
+    /// back rather than defaulting to `None`.
+    pub informational_class: Option<String>,
 }
 
 /// Outbound port for the `scan_findings` projection.
@@ -87,6 +97,7 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "t".into(),
             detected_at: DateTime::<Utc>::from_timestamp(0, 0).expect("ts"),
+            informational_class: None,
         };
         let cloned = r.clone();
         assert_eq!(r, cloned);
@@ -126,6 +137,7 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "t".into(),
             detected_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            informational_class: None,
         };
         repo.insert_batch(std::slice::from_ref(&row)).await.unwrap();
     }

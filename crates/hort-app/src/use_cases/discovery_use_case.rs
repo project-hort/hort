@@ -922,6 +922,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: hort_domain::entities::scan_policy::NegligibleAction::Ignore,
             stream_version: 1,
             created_at: now,
             updated_at: now,

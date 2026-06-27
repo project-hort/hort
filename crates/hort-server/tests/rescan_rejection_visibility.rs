@@ -210,6 +210,7 @@ fn single_critical_finding() -> Vec<Finding> {
         source_scanner: "rescan-test".into(),
         references: Vec::new(),
         aliases: Vec::new(),
+        informational_class: None,
     };
     // Sanity-check the validator against our hand-built fixture so a
     // future field-cap change surfaces against this test, not a

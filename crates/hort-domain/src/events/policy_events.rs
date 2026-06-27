@@ -80,6 +80,10 @@ pub enum PolicyField {
     /// `rescan_interval_hours` changed. The
     /// `previous_value` / `new_value` payloads are JSON integers.
     RescanIntervalHours,
+    /// `negligible_action` changed. The `previous_value` / `new_value`
+    /// payloads are the lowercase `NegligibleAction` wire strings
+    /// (`ignore` / `warn` / `block`).
+    NegligibleAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

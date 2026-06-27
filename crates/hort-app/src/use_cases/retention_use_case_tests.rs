@@ -123,6 +123,7 @@ fn finding(sev: SeverityThreshold, cvss: Option<f32>, fixed: Vec<&str>) -> Findi
         source_scanner: "trivy".into(),
         references: vec![],
         aliases: vec![],
+        informational_class: None,
     }
 }
 

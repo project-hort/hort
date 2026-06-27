@@ -25,7 +25,9 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
-use hort_domain::entities::scan_policy::{ProvenanceMode, ScanPolicyProjection, SeverityThreshold};
+use hort_domain::entities::scan_policy::{
+    NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
     Actor, DomainEvent, PersistedEvent, PolicyScope, ScanCompleted, SeveritySummary, StreamId,
@@ -244,6 +246,7 @@ fn finding(purl: &str, vuln: &str, sev: SeverityThreshold) -> Finding {
         source_scanner: "test".into(),
         references: vec![],
         aliases: vec![],
+        informational_class: None,
     }
 }
 
@@ -449,6 +452,7 @@ fn seed_global_policy(scan_backends: Vec<String>) -> ScanPolicyProjection {
         archived: false,
         scan_backends,
         rescan_interval_hours: 24,
+        negligible_action: NegligibleAction::Ignore,
         stream_version: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),

@@ -23,7 +23,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
     SignerIdentityPattern,
 };
 use hort_domain::error::{DomainError, DomainResult};
@@ -115,6 +115,19 @@ fn row_to_projection(row: &sqlx::postgres::PgRow) -> DomainResult<ScanPolicyProj
     let rescan_interval_hours: i32 = row
         .try_get("rescan_interval_hours")
         .map_err(|e| map_row_err(&e))?;
+    // `negligible_action` is a CHECK-constrained text column decoded via
+    // the domain `FromStr`. The column is `text NOT NULL DEFAULT
+    // 'ignore'`, so any row written before this column existed surfaces
+    // as Ignore (the non-blocking pre-knob behaviour). A value outside
+    // the three variants is a corrupt-row invariant violation.
+    let negligible_action_str: String = row
+        .try_get("negligible_action")
+        .map_err(|e| map_row_err(&e))?;
+    let negligible_action = NegligibleAction::from_str(&negligible_action_str).map_err(|e| {
+        DomainError::Invariant(format!(
+            "policy_projections.negligible_action does not decode to NegligibleAction: {e}"
+        ))
+    })?;
     let stream_version_i64: i64 = row.try_get("stream_version").map_err(|e| map_row_err(&e))?;
     let stream_version = u64::try_from(stream_version_i64).map_err(|_| {
         DomainError::Invariant(format!(
@@ -138,6 +151,7 @@ fn row_to_projection(row: &sqlx::postgres::PgRow) -> DomainResult<ScanPolicyProj
         archived,
         scan_backends,
         rescan_interval_hours,
+        negligible_action,
         stream_version,
         created_at,
         updated_at,
@@ -206,8 +220,8 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, stream_version,
-                          created_at, updated_at
+                          rescan_interval_hours, negligible_action,
+                          stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE policy_id = $1"#,
             )
@@ -232,8 +246,8 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, stream_version,
-                          created_at, updated_at
+                          rescan_interval_hours, negligible_action,
+                          stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE name = $1 AND archived = false"#,
             )
@@ -262,8 +276,8 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, stream_version,
-                          created_at, updated_at
+                          rescan_interval_hours, negligible_action,
+                          stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE name = $1"#,
             )
@@ -284,8 +298,8 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, stream_version,
-                          created_at, updated_at
+                          rescan_interval_hours, negligible_action,
+                          stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE archived = false
                    ORDER BY name"#,
@@ -349,6 +363,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
         let archived = projection.archived;
         let scan_backends = projection.scan_backends.clone();
         let rescan_interval_hours = projection.rescan_interval_hours;
+        let negligible_action = projection.negligible_action.to_string();
         let raw_version = projection.stream_version;
         let Ok(stream_version) = i64::try_from(raw_version) else {
             return Box::pin(async move {
@@ -374,10 +389,10 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                        provenance_identities, max_artifact_age_secs,
                        license_policy, archived, scan_backends,
                        rescan_interval_hours, stream_version,
-                       created_at, updated_at
+                       created_at, updated_at, negligible_action
                    ) VALUES (
                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                       $16, $17
+                       $16, $17, $18
                    )
                    ON CONFLICT (policy_id) DO UPDATE SET
                        name                     = EXCLUDED.name,
@@ -393,6 +408,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                        archived                 = EXCLUDED.archived,
                        scan_backends            = EXCLUDED.scan_backends,
                        rescan_interval_hours    = EXCLUDED.rescan_interval_hours,
+                       negligible_action        = EXCLUDED.negligible_action,
                        stream_version           = EXCLUDED.stream_version,
                        updated_at               = EXCLUDED.updated_at"#,
             )
@@ -413,6 +429,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
             .bind(stream_version)
             .bind(created_at)
             .bind(updated_at)
+            .bind(&negligible_action)
             .execute(&self.pool)
             .await
             .map_err(|e| map_query_err(&e, "upsert"))?;
@@ -572,6 +589,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: version,
             created_at: now,
             updated_at: now,
@@ -859,6 +877,40 @@ mod tests {
         assert_eq!(fetched.provenance_mode, ProvenanceMode::Off);
         assert!(fetched.provenance_backends.is_empty());
         assert!(fetched.provenance_identities.is_empty());
+    }
+
+    // Round-trip `negligible_action` (text column, CHECK-constrained)
+    // through the DB. A non-default value exercises the read + write
+    // paths; the default makes a pre-knob row read back as Ignore.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn upsert_and_find_by_id_round_trip_negligible_action() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+
+        let id = Uuid::new_v4();
+        let mut p = sample_projection(id, &format!("negl-{}", id.simple()), 1);
+        // sample_projection defaults to Ignore — confirm that reads back.
+        assert_eq!(p.negligible_action, NegligibleAction::Ignore);
+        repo.upsert(&p).await.expect("upsert ignore");
+        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
+        assert_eq!(fetched.negligible_action, NegligibleAction::Ignore);
+
+        // Flip to Block and confirm the non-default round-trips.
+        p.negligible_action = NegligibleAction::Block;
+        p.stream_version = 2;
+        repo.upsert(&p).await.expect("upsert block");
+        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
+        assert_eq!(fetched.negligible_action, NegligibleAction::Block);
+
+        // And Warn.
+        p.negligible_action = NegligibleAction::Warn;
+        p.stream_version = 3;
+        repo.upsert(&p).await.expect("upsert warn");
+        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
+        assert_eq!(fetched.negligible_action, NegligibleAction::Warn);
     }
 
     #[tokio::test]

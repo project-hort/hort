@@ -55,7 +55,9 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection, SeverityThreshold};
+use crate::entities::scan_policy::{
+    ExclusionProjection, NegligibleAction, ScanPolicyProjection, SeverityThreshold,
+};
 use crate::events::PolicyViolation;
 use crate::types::{ArtifactCoords, Finding};
 
@@ -63,6 +65,12 @@ use super::cve::evaluate_cve_thresholds;
 use super::exclusion::filter_excluded_findings;
 use super::license::evaluate_license_policy;
 use super::primitives::{PolicyAction, ViolationsAccumulator};
+
+/// Rule id stamped on the [`PolicyViolation`] emitted by the
+/// `negligible_action` enforcement step (Warn / Block). Distinct from
+/// [`crate::policy::cve::RULE`] so audit consumers can tell an
+/// informational-advisory block apart from a scored-CVE block.
+pub const NEGLIGIBLE_RULE: &str = "negligible-advisory";
 
 /// Outcome of evaluating a scan result against the active policy.
 ///
@@ -159,6 +167,18 @@ impl DefaultPolicy {
     pub const fn quarantine_duration_secs() -> i64 {
         86_400
     }
+
+    /// Default `negligible_action` when no operator `ScanPolicy` is
+    /// configured for a repo.
+    ///
+    /// Returns [`NegligibleAction::Ignore`] — the no-policy path treats
+    /// negligible / informational findings as non-blocking, matching the
+    /// negligible tier's never-enforced contract. Operators who want
+    /// these advisories to warn or block declare a `ScanPolicy` with an
+    /// explicit `negligibleAction:`.
+    pub const fn negligible_action() -> NegligibleAction {
+        NegligibleAction::Ignore
+    }
 }
 
 /// Compute the quarantine observation-window **deadline** from the stored
@@ -243,6 +263,21 @@ pub fn evaluate_scan_result(
         }
     }
 
+    // Step 4b — negligible / informational findings. The CVE tier-walk
+    // never enforces the post-exclusion `negligible` count; this knob is
+    // the only path that lets it influence the outcome. Exclusions ran
+    // in Step 1, so an excluded informational finding is already gone
+    // from `filtered.remaining` before this point. The same shared
+    // helper drives the re-evaluation path so the two cannot diverge.
+    let negligible_action = policy
+        .map(|p| p.negligible_action)
+        .unwrap_or_else(DefaultPolicy::negligible_action);
+    collect_negligible_action(
+        &mut accumulator,
+        negligible_action,
+        filtered.remaining.negligible,
+    );
+
     // Step 5 — translate accumulator outcome into ScanOutcome.
     let (action, violations) = accumulator.into_outcome();
     match action {
@@ -253,6 +288,53 @@ pub fn evaluate_scan_result(
         // future enhancement; today the scan-result path is binary.
         PolicyAction::Warn | PolicyAction::Allow => ScanOutcome::Clean,
     }
+}
+
+/// Feeds the `negligible_action` enforcement step into a shared
+/// [`ViolationsAccumulator`]. Single source of the negligible-lane
+/// decision for both [`evaluate_scan_result`] (initial scan) and
+/// [`crate::policy::re_evaluate_after_exclusion`] (exclusion-triggered
+/// re-evaluation) so the two paths cannot diverge.
+///
+/// Keyed on the resolved `negligible_action`:
+///   - `Ignore` → no-op (informational stays non-blocking);
+///   - `Warn`   → one `negligible-advisory` violation, collected as
+///     [`PolicyAction::Warn`] (recorded, non-blocking in the v1 scan
+///     path);
+///   - `Block`  → one `negligible-advisory` violation, collected as
+///     [`PolicyAction::Block`] → the accumulator escalates to Block.
+///
+/// `negligible_count` is the post-exclusion negligible finding count;
+/// a count of `0` returns immediately and adds nothing regardless of
+/// the action.
+pub(crate) fn collect_negligible_action(
+    accumulator: &mut ViolationsAccumulator,
+    negligible_action: NegligibleAction,
+    negligible_count: u32,
+) {
+    if negligible_count == 0 {
+        return;
+    }
+    let action = match negligible_action {
+        NegligibleAction::Ignore => return,
+        NegligibleAction::Warn => PolicyAction::Warn,
+        NegligibleAction::Block => PolicyAction::Block,
+    };
+    let violation = PolicyViolation {
+        rule: NEGLIGIBLE_RULE.to_string(),
+        // Negligible is below the lowest enforceable tier; the
+        // violation carries `Low` so it serialises cleanly and the
+        // escalation comes from the policy action, not the severity.
+        // (`SeverityThreshold` has no Negligible variant by design —
+        // see `threshold.rs`.)
+        severity: SeverityThreshold::Low,
+        message: format!(
+            "{negligible_count} informational/negligible advisory finding(s) under \
+             negligibleAction = {negligible_action}"
+        ),
+        details: serde_json::json!({ "negligible_count": negligible_count }),
+    };
+    accumulator.collect_with_policy_action(vec![violation], action);
 }
 
 /// Returns true when `value` is a non-empty JSON object — i.e. there
@@ -278,7 +360,7 @@ fn has_license_policy(value: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
-    use crate::entities::scan_policy::{ExclusionProjection, ProvenanceMode};
+    use crate::entities::scan_policy::{ExclusionProjection, NegligibleAction, ProvenanceMode};
     use crate::events::PolicyScope;
     use chrono::TimeZone;
     use uuid::Uuid;
@@ -311,6 +393,18 @@ mod tests {
             source_scanner: "trivy".into(),
             references: vec![],
             aliases: vec![],
+            informational_class: None,
+        }
+    }
+
+    /// An informational/negligible finding: no scored tier, classified
+    /// informational by the advisory DB (the negligible-lane routing keys
+    /// on `is_informational()`, derived from `informational_class`,
+    /// regardless of the cosmetic `severity`).
+    fn informational_finding(vuln: &str) -> Finding {
+        Finding {
+            informational_class: Some("unmaintained".to_string()),
+            ..finding(vuln, SeverityThreshold::Low)
         }
     }
 
@@ -358,6 +452,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -439,6 +534,15 @@ mod tests {
         // pinned — the pin doubles as a regression guard against an
         // accidental flip back to "permissive by default".
         assert_eq!(DefaultPolicy::quarantine_duration_secs(), 86_400);
+    }
+
+    // Out-of-the-box default negligible action.
+    #[test]
+    fn default_policy_negligible_action_is_ignore() {
+        // The no-policy path treats informational/negligible findings as
+        // non-blocking — matching the negligible tier's never-enforced
+        // contract. A flip here would silently block on unmaintained deps.
+        assert_eq!(DefaultPolicy::negligible_action(), NegligibleAction::Ignore);
     }
 
     // ---- effective_quarantine_deadline ----
@@ -716,6 +820,131 @@ mod tests {
             }
             ScanOutcome::Clean => panic!("expected Reject"),
         }
+    }
+
+    // ---- evaluate_scan_result: negligible_action knob ----
+
+    fn projection_with_negligible(action: NegligibleAction) -> ScanPolicyProjection {
+        let mut p = projection(SeverityThreshold::High, serde_json::Value::Null);
+        p.negligible_action = action;
+        p
+    }
+
+    #[test]
+    fn negligible_only_no_policy_is_clean_via_default_ignore() {
+        // No policy → DefaultPolicy::negligible_action() == Ignore →
+        // informational findings never block. This is exactly the
+        // post-Part-A behaviour.
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let r = evaluate_scan_result(&coords("proc-macro-error2"), &findings, None, &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    #[test]
+    fn negligible_only_ignore_policy_is_clean() {
+        let policy = projection_with_negligible(NegligibleAction::Ignore);
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    #[test]
+    fn negligible_only_warn_policy_is_clean_but_records_violation() {
+        // Warn is recorded but non-blocking in the v1 binary scan path —
+        // same shape as the license-shape Warn. The scan outcome is Clean
+        // (a future enhancement surfaces it via PolicyEvaluated(Pass)).
+        let policy = projection_with_negligible(NegligibleAction::Warn);
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    #[test]
+    fn negligible_only_block_policy_rejects() {
+        let policy = projection_with_negligible(NegligibleAction::Block);
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        match r {
+            ScanOutcome::Reject(violations) => {
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].rule, NEGLIGIBLE_RULE);
+                // The violation carries the negligible count in details.
+                assert_eq!(violations[0].details["negligible_count"], 1);
+            }
+            ScanOutcome::Clean => panic!("expected Reject under Block"),
+        }
+    }
+
+    #[test]
+    fn negligible_block_with_no_negligible_findings_is_clean() {
+        // Block only fires when the post-exclusion negligible count > 0.
+        // A scored-but-non-negligible finding under the threshold passes.
+        let policy = projection_with_negligible(NegligibleAction::Block);
+        let r = evaluate_scan_result(
+            &coords("any"),
+            &findings(0, 0, 0, 1),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    #[test]
+    fn scored_critical_rejects_regardless_of_negligible_ignore() {
+        // Orthogonality: a scored Critical finding blocks under the
+        // High threshold even when negligible_action = Ignore. The knob
+        // does not relax the CVE gate.
+        let policy = projection_with_negligible(NegligibleAction::Ignore);
+        let findings = vec![
+            finding("CVE-CRIT", SeverityThreshold::Critical),
+            informational_finding("RUSTSEC-2026-0173"),
+        ];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        match r {
+            ScanOutcome::Reject(violations) => {
+                // The CVE violation fires; the Ignore'd negligible adds none.
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].rule, super::super::cve::RULE);
+            }
+            ScanOutcome::Clean => panic!("expected Reject from the scored Critical"),
+        }
+    }
+
+    #[test]
+    fn scored_critical_and_negligible_block_yields_two_violations() {
+        // A scored Critical AND a negligible finding under Block produce
+        // both violations; the outcome is Reject either way.
+        let policy = projection_with_negligible(NegligibleAction::Block);
+        let findings = vec![
+            finding("CVE-CRIT", SeverityThreshold::Critical),
+            informational_finding("RUSTSEC-2026-0173"),
+        ];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        match r {
+            ScanOutcome::Reject(violations) => {
+                assert_eq!(violations.len(), 2);
+                let rules: Vec<&str> = violations.iter().map(|v| v.rule.as_str()).collect();
+                assert!(rules.contains(&super::super::cve::RULE));
+                assert!(rules.contains(&NEGLIGIBLE_RULE));
+            }
+            ScanOutcome::Clean => panic!("expected Reject"),
+        }
+    }
+
+    #[test]
+    fn excluded_negligible_finding_is_dropped_before_negligible_action() {
+        // An exclusion drops the informational finding in Step 1, so the
+        // post-exclusion negligible count is 0 and Block never fires.
+        let policy = projection_with_negligible(NegligibleAction::Block);
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let exs = vec![exclusion(1, "RUSTSEC-2026-0173", None, None)];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &exs, ts(0));
+        assert_eq!(
+            r,
+            ScanOutcome::Clean,
+            "excluded informational finding must be gone before negligible_action is consulted"
+        );
     }
 
     // ---- ScanOutcome derives ----

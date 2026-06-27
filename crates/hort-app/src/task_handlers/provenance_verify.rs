@@ -145,7 +145,7 @@ mod tests {
     use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
     use hort_domain::entities::scan_policy::{
-        ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::{system_actor, PolicyScope};
     use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
@@ -255,6 +255,7 @@ mod tests {
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
             stream_version: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

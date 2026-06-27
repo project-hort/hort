@@ -35,7 +35,7 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::advisory::{AdvisoryDiffResult, AdvisoryPort};
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_domain::types::{Ecosystem, Finding, SbomComponent};
+use hort_domain::types::{is_informational_class, Ecosystem, Finding, SbomComponent};
 
 use crate::bulk::{osv_label_to_ecosystem, pull_one_ecosystem, BulkFetchErrorKind};
 use crate::ingest_metrics::emit_advisory_ingest_count;
@@ -309,6 +309,41 @@ impl OsvAdvisoryAdapter {
     // -----------------------------------------------------------------------
 
     fn vuln_to_finding(component: &PreparedComponent<'_>, vuln: OsvVuln) -> Finding {
+        // Informational discriminator: store the raw OSV
+        // `database_specific.informational` value verbatim (the fact),
+        // taking the vuln-level marker if present else the first
+        // `affected[].database_specific.informational`. The boolean
+        // interpretation and the severity routing derive from it via the
+        // domain recognizer `is_informational_class` — a recognised RustSec
+        // class (`unmaintained` / `unsound` / `notice`) marks an
+        // informational advisory: a maintenance signal published without a
+        // CVSS score by design, not a scored vulnerability.
+        //
+        // Real RustSec OSV records carry this marker under
+        // `affected[].database_specific.informational`, so the
+        // affected-level read is the load-bearing one for full-record
+        // sources (the bulk-archive path). The vuln-level read is
+        // retained as belt-and-suspenders for any feed that places the
+        // marker there. `/v1/querybatch` returns abbreviated records
+        // without `affected[].database_specific`, so the affected-level
+        // marker is simply absent there — an inherent querybatch
+        // limitation, not a bug; such records fall through to the SUP-4
+        // fail-closed fallback below if also unscored.
+        let informational_class: Option<String> = vuln
+            .database_specific
+            .as_ref()
+            .and_then(|ds| ds.informational.clone())
+            .or_else(|| {
+                vuln.affected.iter().find_map(|aff| {
+                    aff.database_specific
+                        .as_ref()
+                        .and_then(|ds| ds.informational.clone())
+                })
+            });
+        let informational = informational_class
+            .as_deref()
+            .is_some_and(is_informational_class);
+
         // Severity precedence: numeric `database_specific.severity`
         // (highest signal); else string label there; else fail-closed
         // fallback to the HIGHEST tier `Critical` (SUP-4). The
@@ -318,11 +353,22 @@ impl OsvAdvisoryAdapter {
         // determine must still block under the default Critical threshold
         // rather than slip under it — unified with the scanner-osv and
         // trivy adapters.
+        //
+        // An informational advisory carries no score by design and rides
+        // the non-enforcing negligible lane (keyed on
+        // `Finding::is_informational`, not on `severity`). Its `severity` is
+        // cosmetic, so map it to the lowest tier rather than the SUP-4
+        // Critical fail-closed fallback.
         let severity = vuln
             .database_specific
             .as_ref()
             .and_then(|ds| ds.severity.as_deref())
             .and_then(severity::label_to_severity)
+            .or(if informational {
+                Some(SeverityThreshold::Low)
+            } else {
+                None
+            })
             .unwrap_or(SeverityThreshold::Critical);
 
         // Title: prefer the one-line summary; else the long-form
@@ -425,6 +471,7 @@ impl OsvAdvisoryAdapter {
             source_scanner: "osv".to_string(),
             references,
             aliases,
+            informational_class,
         }
     }
 }
@@ -719,6 +766,7 @@ mod tests {
             summary: Some("RCE in lodash".to_string()),
             database_specific: Some(osv_types::OsvDatabaseSpecific {
                 severity: Some("HIGH".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -757,6 +805,98 @@ mod tests {
     }
 
     #[test]
+    fn vuln_to_finding_informational_marker_stores_class_and_skips_critical_fallback() {
+        // A vuln-level `database_specific.informational` naming a recognised
+        // RustSec class is stored verbatim as `informational_class`;
+        // `is_informational()` derives true and its cosmetic severity maps to
+        // Low rather than the SUP-4 Critical fail-closed fallback — the
+        // finding rides the non-enforcing negligible lane.
+        let prepared = PreparedComponent {
+            name: "proc-macro-error2",
+            version: Some("2.0.1"),
+            osv_eco: "crates.io",
+            purl: "pkg:cargo/proc-macro-error2@2.0.1",
+        };
+        let vuln = OsvVuln {
+            id: "RUSTSEC-2026-0173".to_string(),
+            database_specific: Some(osv_types::OsvDatabaseSpecific {
+                informational: Some("unmaintained".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
+        assert_eq!(finding.informational_class.as_deref(), Some("unmaintained"));
+        assert!(finding.is_informational());
+        assert_eq!(finding.severity, SeverityThreshold::Low);
+    }
+
+    #[test]
+    fn vuln_to_finding_affected_level_informational_marker_stores_class_and_skips_critical_fallback(
+    ) {
+        // Real RustSec OSV records place `informational` under
+        // `affected[].database_specific.informational`, NOT at the
+        // vulnerability level. Such a record (no CVSS) must lower to a
+        // finding whose `informational_class` is the raw value, with a
+        // non-Critical (Low) severity, riding the non-enforcing negligible
+        // lane rather than the SUP-4 Critical fail-closed fallback. See
+        // `crates/hort-adapters-scanner-osv/tests/fixtures/informational_unmaintained.json`.
+        let prepared = PreparedComponent {
+            name: "proc-macro-error2",
+            version: Some("2.0.1"),
+            osv_eco: "crates.io",
+            purl: "pkg:cargo/proc-macro-error2@2.0.1",
+        };
+        let vuln = OsvVuln {
+            id: "RUSTSEC-2026-0173".to_string(),
+            affected: vec![osv_types::OsvAffected {
+                database_specific: Some(osv_types::OsvDatabaseSpecific {
+                    informational: Some("unmaintained".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
+        assert_eq!(finding.informational_class.as_deref(), Some("unmaintained"));
+        assert!(finding.is_informational());
+        assert_ne!(finding.severity, SeverityThreshold::Critical);
+        assert_eq!(finding.severity, SeverityThreshold::Low);
+    }
+
+    #[test]
+    fn vuln_to_finding_unscored_non_informational_still_critical_fail_closed() {
+        // ADR 0007 regression guard: an unscored finding whose
+        // `database_specific.informational` is absent (or not a recognised
+        // class) must still hit the SUP-4 Critical fail-closed fallback. Here
+        // `database_specific` is present but carries only an unrecognised
+        // informational value and no severity label — the raw value is stored
+        // as a fact, but `is_informational()` is false.
+        let prepared = PreparedComponent {
+            name: "x",
+            version: Some("1"),
+            osv_eco: "npm",
+            purl: "pkg:npm/x@1",
+        };
+        let vuln = OsvVuln {
+            id: "OSV-1".to_string(),
+            database_specific: Some(osv_types::OsvDatabaseSpecific {
+                informational: Some("some-future-class".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
+        assert_eq!(
+            finding.informational_class.as_deref(),
+            Some("some-future-class")
+        );
+        assert!(!finding.is_informational());
+        assert_eq!(finding.severity, SeverityThreshold::Critical);
+    }
+
+    #[test]
     fn vuln_to_finding_extracts_fixed_versions_from_affected_ranges() {
         let prepared = PreparedComponent {
             name: "x",
@@ -772,6 +912,7 @@ mod tests {
                         fixed: Some("2.0.0".into()),
                     }],
                 }],
+                ..Default::default()
             }],
             ..Default::default()
         };

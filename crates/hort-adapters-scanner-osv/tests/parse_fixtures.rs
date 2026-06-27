@@ -8,11 +8,13 @@
 
 use hort_adapters_scanner_osv::parse_findings_from_json;
 use hort_domain::entities::scan_policy::SeverityThreshold;
+use hort_domain::types::finding::severity_summary_from_findings;
 
 const CLEAN: &[u8] = include_bytes!("fixtures/clean_scan.json");
 const MIXED: &[u8] = include_bytes!("fixtures/mixed_severities.json");
 const NO_MAX_SEVERITY: &[u8] = include_bytes!("fixtures/no_max_severity_with_inline_score.json");
 const MANY_FIXED: &[u8] = include_bytes!("fixtures/many_fixed_versions.json");
+const INFORMATIONAL: &[u8] = include_bytes!("fixtures/informational_unmaintained.json");
 
 #[test]
 fn clean_scan_returns_empty_findings() {
@@ -145,4 +147,40 @@ fn malformed_json_propagates_validation_error() {
         }
         Ok(v) => panic!("expected error, got {v:?}"),
     }
+}
+
+#[test]
+fn informational_unmaintained_advisory_rides_the_negligible_lane() {
+    // Real osv-scanner 2.3.8 capture for proc-macro-error2 (RUSTSEC-2026-0173,
+    // `affected[].database_specific.informational == "unmaintained"`). The
+    // advisory has no CVSS score; without the informational carve-out it would
+    // hit the SUP-4 Critical fail-closed fallback and over-block. Routed onto
+    // the non-enforcing negligible lane instead.
+    let findings = parse_findings_from_json(INFORMATIONAL).expect("parse");
+    assert_eq!(findings.len(), 1, "got {findings:#?}");
+    let f = &findings[0];
+
+    assert_eq!(f.vulnerability_id, "RUSTSEC-2026-0173");
+    assert_eq!(f.purl, "pkg:cargo/proc-macro-error2@2.0.1");
+    // The raw OSV informational class is stored verbatim (the fact); the
+    // boolean derives from it via the domain recognizer.
+    assert_eq!(
+        f.informational_class.as_deref(),
+        Some("unmaintained"),
+        "raw informational class must be stored: {f:?}"
+    );
+    assert!(f.is_informational(), "must be marked informational: {f:?}");
+    // Severity is cosmetic for informational findings — it must NOT be the
+    // Critical fail-closed fallback (that is the over-block this fix removes).
+    assert_ne!(f.severity, SeverityThreshold::Critical);
+    assert_eq!(f.severity, SeverityThreshold::Low);
+
+    // The summary that feeds the release-gate decision counts it as negligible
+    // (never enforced), not critical.
+    let summary = severity_summary_from_findings(&findings);
+    assert_eq!(summary.negligible, 1, "{summary:?}");
+    assert_eq!(summary.critical, 0, "{summary:?}");
+    assert_eq!(summary.high, 0, "{summary:?}");
+    assert_eq!(summary.medium, 0, "{summary:?}");
+    assert_eq!(summary.low, 0, "{summary:?}");
 }

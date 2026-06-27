@@ -10,7 +10,7 @@
 use std::str::FromStr;
 
 use hort_config::scan_policy::SignerIdentitySpec;
-use hort_domain::entities::scan_policy::{ProvenanceMode, SignerIdentityPattern};
+use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, SignerIdentityPattern};
 
 /// The Tier-1 set of formats with a registered `ProvenancePort` verifier.
 ///
@@ -31,6 +31,13 @@ pub const TIER1_PROVENANCE_CAPABLE_FORMATS: &[&str] = &["oci"];
 /// a parse failure is a bypassed-validator programming error.
 pub(crate) fn provenance_mode_from_spec(s: &str) -> ProvenanceMode {
     ProvenanceMode::from_str(s).expect("INVARIANT: provenanceMode validated by hort-config")
+}
+
+/// Map the validated `negligibleAction` wire string to the domain
+/// enum. `hort_config::scan_policy::validate_scan_policy` ran first, so
+/// a parse failure is a bypassed-validator programming error.
+pub(crate) fn negligible_action_from_spec(s: &str) -> NegligibleAction {
+    NegligibleAction::from_str(s).expect("INVARIANT: negligibleAction validated by hort-config")
 }
 
 /// Map the validated `provenanceIdentities` wire specs to the
@@ -70,6 +77,19 @@ mod tests {
         assert_eq!(
             provenance_mode_from_spec("required"),
             ProvenanceMode::Required
+        );
+    }
+
+    #[test]
+    fn negligible_action_maps_each_validated_string() {
+        assert_eq!(
+            negligible_action_from_spec("ignore"),
+            NegligibleAction::Ignore
+        );
+        assert_eq!(negligible_action_from_spec("warn"), NegligibleAction::Warn);
+        assert_eq!(
+            negligible_action_from_spec("block"),
+            NegligibleAction::Block
         );
     }
 

@@ -2125,6 +2125,7 @@ fn policy_field_clone_eq_serde() {
         PolicyField::LicensePolicy,
         PolicyField::ScanBackends,
         PolicyField::RescanIntervalHours,
+        PolicyField::NegligibleAction,
     ];
     for field in fields {
         let cloned = field.clone();
@@ -2373,6 +2374,7 @@ fn sample_finding() -> crate::types::Finding {
         source_scanner: "trivy".into(),
         references: vec!["https://nvd.nist.gov/vuln/detail/CVE-2021-23337".into()],
         aliases: vec!["GHSA-35jh-r3h4-6jhm".into()],
+        informational_class: None,
     }
 }
 
