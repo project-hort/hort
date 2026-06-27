@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-06-27
+
+Beta release (`0.9.6-beta.1`). Headline: OSV **informational** advisories
+(`unmaintained` / `unsound` / `notice`) no longer over-block — they ride a
+non-enforcing **negligible** lane, operator-steered per policy. Plus a keyed
+cosign-key provenance backend and native-deploy / CI hardening.
+
+### Added
+
+- **OSV informational advisories ride the negligible lane, operator-steered.**
+  RustSec `unmaintained` / `unsound` / `notice` advisories — which carry no
+  CVSS — no longer map to Critical and reject an artifact; they route to the
+  non-enforcing negligible tier. The new `ScanPolicy.negligibleAction`
+  (`ignore`, the default — never block; `warn` — record only; `block` — reject)
+  steers them per policy. The raw OSV class is persisted, so an
+  exclusion-triggered re-evaluation respects the current policy; a finding with
+  no CVSS **and** no recognised informational class still fails closed to
+  Critical. (ADR 0040)
+- **Keyed (cosign-key) provenance backend** — verify artifact provenance against
+  a pinned cosign public key, alongside the existing keyless path.
+- **gitlab-ci federation `ServiceAccount`** — a gitops `ServiceAccount` for
+  GitLab CI OIDC federation against a hort instance.
+
+### Changed
+
+- **`cron-rescan-tick` is enabled by default** in the native `hort_timers`
+  Ansible role, so proxied artifacts are rescanned on a cadence out of the box.
+
+### Fixed
+
+- **Native osv-scanner pinned to v2.3.8** (with a pin-sync guard against the
+  worker container's `OSV_SCANNER_VERSION`). The native deploy had drifted to
+  v1.9.1, which lacks the v2 `scan source` CLI the scanner adapter invokes — so
+  every scan failed and proxied artifacts stranded in quarantine.
+- **GitLab CI hort-auth federation** — install `curl` before the OIDC exchange,
+  trust the internal-PKI CA before it, and configure the cargo
+  credential-provider + HTTP-Basic token, so federated CI works against a hort
+  instance behind an internal CA.
+
 ## [0.9.5] - 2026-06-26
 
 Beta release (`0.9.5-beta.1`). Headline: the OCI `/v2/auth` authorization model
