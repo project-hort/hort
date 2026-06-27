@@ -99,8 +99,20 @@ where
     F: Fn() -> DomainResult<Verifier>,
 {
     let mut best: Option<ProvenanceRejectReason> = None;
+    let mut saw_keyless = false;
 
     for bundle in bundles {
+        // Skip keyed (cosign-key `simplesigning`) bundles — `signature.is_some()`
+        // means the keyed verifier owns this one (ADR 0039 §8). This verifier
+        // reads ONLY keyless v0.3 bundles; a keyed bundle is not a v0.3 bundle
+        // and must NOT be rejected here. A worker running BOTH backends hands the
+        // same bundle set to both verifiers; the keyed verifier symmetrically
+        // skips `signature.is_none()`, so the two cleanly partition the set and
+        // the OR-fold never false-rejects a validly keyed-signed artifact.
+        if bundle.signature.is_some() {
+            continue;
+        }
+        saw_keyless = true;
         match verify_one(&make_verifier, payload, &bundle.bytes, allowed, rekor_keys).await {
             BundleVerify::Verified {
                 signer,
@@ -114,7 +126,12 @@ where
         }
     }
 
-    // Non-empty input always produces at least one reject reason here.
+    // No keyless v0.3 bundle was present (the set was empty or all keyed) → this
+    // verifier has nothing to attest: NoAttestation, NOT a reject. The keyed
+    // verifier (if registered) decides.
+    if !saw_keyless {
+        return ProvenanceVerdict::no_attestation();
+    }
     ProvenanceVerdict::rejected(best.unwrap_or(ProvenanceRejectReason::BundleMalformed))
 }
 

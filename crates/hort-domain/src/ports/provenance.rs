@@ -64,14 +64,38 @@ pub struct ProvenanceSubject<'a> {
 /// wrapper here keeps the port dyn-compatible and the domain crypto-free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationBundle {
-    /// The raw bundle bytes (e.g. a cosign `*.sigstore`/`*.bundle` JSON).
+    /// The raw bundle bytes. For a keyless v0.3 bundle (`signature == None`)
+    /// this is the cosign `*.sigstore`/`*.bundle` JSON; for a keyed cosign
+    /// `simplesigning` `.sig` (`signature == Some`) this is the `simplesigning`
+    /// payload-layer blob the signature is computed over (ADR 0039 §8).
     pub bytes: Vec<u8>,
+    /// The detached raw signature bytes, present **only** for the keyed cosign
+    /// `simplesigning` shape (the base64 `dev.cosignproject.cosign/signature`
+    /// annotation, decoded). `None` for a keyless v0.3 bundle (whose signature
+    /// material lives inside `bytes`). The keyed verifier requires `Some`; the
+    /// Sigstore verifier ignores it.
+    pub signature: Option<Vec<u8>>,
 }
 
 impl AttestationBundle {
-    /// Wrap raw bundle bytes.
+    /// Wrap raw bundle bytes with no detached signature — the keyless v0.3
+    /// bundle shape (`signature == None`).
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            signature: None,
+        }
+    }
+
+    /// Wrap a keyed cosign `simplesigning` payload (`bytes`) + its detached raw
+    /// signature (ADR 0039 §8). The keyed verifier checks `signature` over
+    /// `bytes` against the pinned key and binds the payload's claimed manifest
+    /// digest.
+    pub fn new_signed(bytes: Vec<u8>, signature: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            signature: Some(signature),
+        }
     }
 }
 
@@ -377,12 +401,20 @@ mod tests {
         assert_eq!(copied.version, Some("1.0.0"));
     }
 
-    /// `AttestationBundle::new` wraps bytes and `bytes` reads them back.
+    /// `AttestationBundle::new` wraps bytes (unsigned), and `new_signed`
+    /// carries the detached signature (ADR 0039 §8).
     #[test]
     fn attestation_bundle_wraps_bytes() {
         let b = AttestationBundle::new(vec![1, 2, 3]);
         assert_eq!(b.bytes, vec![1, 2, 3]);
+        assert_eq!(b.signature, None);
         assert_eq!(b.clone(), b);
+
+        let signed = AttestationBundle::new_signed(vec![4, 5], vec![9, 9]);
+        assert_eq!(signed.bytes, vec![4, 5]);
+        assert_eq!(signed.signature, Some(vec![9, 9]));
+        assert_ne!(signed, b);
+        assert_eq!(signed.clone(), signed);
     }
 
     /// `ProvenanceRequirements` is a `Copy` borrow over the identity

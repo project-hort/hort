@@ -611,6 +611,17 @@ impl StaticConfigValidator {
                         ),
                     ));
                 }
+                Err(ProvenanceConfigError::KeyedBackendWithInertIdentities) => {
+                    report.errors.push(LintFinding::error(
+                        LinterRule::ProvenanceConfig,
+                        format!(
+                            "ScanPolicy `{policy_name}`: a `cosign-key`-only scope sets \
+                             `provenanceIdentities`, but identity patterns are INERT for the keyed \
+                             backend — the pinned public key is the trust anchor (ADR 0039). Remove \
+                             `provenanceIdentities`, or add the keyless `cosign` backend that uses them."
+                        ),
+                    ));
+                }
                 Ok(warnings) => {
                     for w in warnings {
                         match w {
@@ -1283,6 +1294,35 @@ mod tests {
             .collect();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].message.contains("p-req-no-ids"));
+        assert!(hits[0].message.contains("provenanceIdentities"));
+    }
+
+    #[test]
+    fn provenance_keyed_only_with_inert_identities_is_reported() {
+        // ADR 0039 §4: a `cosign-key`-only scope that sets `provenanceIdentities`
+        // is rejected — the patterns are inert for the keyed backend (the pinned
+        // key is the anchor). Exercises the `KeyedBackendWithInertIdentities` arm.
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-first-party", "oci")],
+            scan_policies: vec![scan_policy_repo_scope(
+                "p-keyed-inert-ids",
+                "oci-first-party",
+                "required",
+                vec!["cosign-key"],
+                vec![sample_identity_spec()],
+                vec!["trivy"],
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits: Vec<_> = report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::ProvenanceConfig)
+            .collect();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].message.contains("p-keyed-inert-ids"));
+        assert!(hits[0].message.contains("cosign-key"));
         assert!(hits[0].message.contains("provenanceIdentities"));
     }
 

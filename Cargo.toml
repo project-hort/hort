@@ -21,6 +21,7 @@ members = [
     # trust-root refresh, built via the vendored
     # `extra_ca::apply_to_reqwest_builder` (ADR 0010).
     "crates/hort-adapters-provenance-sigstore",
+    "crates/hort-adapters-provenance-cosign-key",
     "crates/hort-adapters-scanner-osv",
     "crates/hort-adapters-scanner-trivy",
     "crates/hort-adapters-secrets",

@@ -335,11 +335,21 @@ impl ProvenanceOrchestrationUseCase {
         let requirements = ProvenanceRequirements { allowed_identities };
 
         // Dispatch each applicable verifier and fold to one verdict.
-        let verdict = self
+        let (verdict, verdict_backend) = self
             .dispatch_and_fold(&applicable, &subject, &bundles, &requirements, mode)
             .await;
 
-        self.apply_verdict(artifact, &backend, verdict, mode).await
+        // Label the metric with the backend that DECIDED the folded verdict
+        // (ADR 0039 §6), not `applicable[0]`. The dead-defensive empty case (no
+        // verifier ran — impossible since `applicable` is non-empty) falls back
+        // to the representative `backend`.
+        let metric_backend = if verdict_backend.is_empty() {
+            backend
+        } else {
+            verdict_backend
+        };
+        self.apply_verdict(artifact, &metric_backend, verdict, mode)
+            .await
     }
 
     // -----------------------------------------------------------------
@@ -409,6 +419,21 @@ impl ProvenanceOrchestrationUseCase {
                 let bundle_bytes = self.read_bounded(&blob_hash).await?;
                 bundles.push(AttestationBundle::new(bundle_bytes));
             }
+
+            // Keyed (ADR 0039 §8): collect any legacy cosign `simplesigning`
+            // signatures on the same referrer. Each yields a SIGNED bundle —
+            // `bytes` = the simplesigning payload-layer blob, `signature` = the
+            // base64 `dev.cosignproject.cosign/signature` annotation decoded. An
+            // undecodable annotation can never be a valid signature → skipped
+            // (under `Required`, no valid bundle folds to `Rejected{Unsigned}`).
+            let sig_layers = hort_domain::oci::simplesigning_signature_layers(&manifest_bytes)?;
+            for sig in sig_layers {
+                let payload_bytes = self.read_bounded(&sig.payload_layer).await?;
+                let Some(sig_bytes) = decode_simplesigning_signature(&sig.signature) else {
+                    continue;
+                };
+                bundles.push(AttestationBundle::new_signed(payload_bytes, sig_bytes));
+            }
         }
         Ok(bundles)
     }
@@ -461,10 +486,18 @@ impl ProvenanceOrchestrationUseCase {
         //    (or fails the declared-digest integrity check) is skipped.
         let mut landed_bundles = 0usize;
         for descriptor in descriptors {
-            let is_sigstore = descriptor.artifact_type.as_deref()
+            // Keyless Sigstore-bundle OR keyed simplesigning referrers (ADR 0039
+            // §8). A well-typed referrer (Referrers API `artifactType`) is caught
+            // here; the legacy `sha256-<hex>.sig` tag-scheme `.sig` carries the
+            // simplesigning type on the LAYER not the descriptor, so proxying that
+            // shape is not auto-discovered (keyed images are first-party/hosted;
+            // proxied third-party content uses keyless cosign).
+            let is_signature_referrer = descriptor.artifact_type.as_deref()
                 == Some(hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE)
-                || descriptor.media_type == hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE;
-            if !is_sigstore {
+                || descriptor.media_type == hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE
+                || descriptor.artifact_type.as_deref()
+                    == Some(hort_domain::oci::COSIGN_SIMPLESIGNING_MEDIA_TYPE);
+            if !is_signature_referrer {
                 continue;
             }
             if self
@@ -523,9 +556,18 @@ impl ProvenanceOrchestrationUseCase {
         let manifest_bytes = crate::project::project_cached(&handle, IdentityProjector).await?;
         crate::project::remove_cached_body(&handle).await;
 
-        // b. Parse the manifest → bundle-layer digest(s). A non-Sigstore
-        //    referrer manifest yields nothing → skip (no bundle to land).
-        let blob_hashes = hort_domain::oci::sigstore_bundle_layers(&manifest_bytes)?;
+        // b. Parse the manifest → the signature-material blob digest(s) to land:
+        //    keyless Sigstore-bundle layers AND keyed simplesigning payload
+        //    layers (ADR 0039 §8 — proxying a keyed image). A referrer with
+        //    neither yields nothing → skip. The signature itself (for the keyed
+        //    shape) rides the manifest annotation, which is stored verbatim in
+        //    step d, so only the payload-layer blob needs landing here.
+        let mut blob_hashes = hort_domain::oci::sigstore_bundle_layers(&manifest_bytes)?;
+        blob_hashes.extend(
+            hort_domain::oci::simplesigning_signature_layers(&manifest_bytes)?
+                .into_iter()
+                .map(|s| s.payload_layer),
+        );
         if blob_hashes.is_empty() {
             return Ok(false);
         }
@@ -736,10 +778,10 @@ impl ProvenanceOrchestrationUseCase {
         bundles: &[AttestationBundle],
         requirements: &ProvenanceRequirements<'_>,
         mode: ProvenanceMode,
-    ) -> ProvenanceVerdict {
+    ) -> (ProvenanceVerdict, String) {
         use hort_domain::ports::provenance::ProvenanceOutcome;
 
-        let mut folded: Option<ProvenanceVerdict> = None;
+        let mut folded: Option<(ProvenanceVerdict, String)> = None;
         for port in applicable {
             let verdict = match port.verify(subject, bundles, requirements).await {
                 Ok(v) => v,
@@ -761,15 +803,24 @@ impl ProvenanceOrchestrationUseCase {
                     }
                 }
             };
+            // Carry the deciding backend alongside the verdict so the metric
+            // labels the verifier that produced the folded result, not
+            // `applicable[0]` (ADR 0039 §6).
+            let candidate = (verdict, port.name().to_string());
             folded = Some(match folded {
-                None => verdict,
-                Some(prev) => fold_two(prev, verdict),
+                None => candidate,
+                Some(prev) => fold_two_backend(prev, candidate),
             });
         }
         // `applicable` is non-empty (checked by the caller), so `folded`
         // is always `Some`. Defensive default keeps the fn total.
-        folded.unwrap_or(ProvenanceVerdict {
-            outcome: ProvenanceOutcome::NoAttestation,
+        folded.unwrap_or_else(|| {
+            (
+                ProvenanceVerdict {
+                    outcome: ProvenanceOutcome::NoAttestation,
+                },
+                String::new(),
+            )
         })
     }
 
@@ -890,6 +941,11 @@ impl ProvenanceOrchestrationUseCase {
                     error = %err,
                     "provenance: fetch exhausted under Required — fail-closed (RekorNotFound)",
                 );
+                // `RekorNotFound` is the backend-AGNOSTIC fail-closed-fetch reason
+                // here ("no verifiable attestation material was obtained"). The keyed
+                // `cosign-key` backend has no Rekor, but reuses this marker rather than
+                // growing the enum — the audit event's `backend` label disambiguates
+                // which backend's fetch failed.
                 let verdict = ProvenanceVerdict::rejected(ProvenanceRejectReason::RekorNotFound);
                 self.apply_verdict(artifact, backend, verdict, mode).await
             }
@@ -941,6 +997,18 @@ fn parse_sha256_digest(digest: &str) -> Option<ContentHash> {
     digest.strip_prefix("sha256:")?.parse().ok()
 }
 
+/// Decode a base64 `dev.cosignproject.cosign/signature` annotation into raw
+/// signature bytes (ADR 0039 §8). cosign emits standard-alphabet base64. A
+/// malformed annotation yields `None` — the carriage skips it; it can never be
+/// a valid signature, and under `Required` the absence of any valid bundle
+/// folds to `Rejected{Unsigned}`.
+fn decode_simplesigning_signature(annotation: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(annotation.trim())
+        .ok()
+}
+
 /// Fold two verdicts to one (the multi-verifier fold rule). `Rejected`
 /// dominates `Verified` dominates `NoAttestation`. Pure helper — testable
 /// without the use case.
@@ -952,6 +1020,21 @@ fn fold_two(a: ProvenanceVerdict, b: ProvenanceVerdict) -> ProvenanceVerdict {
         (Verified { .. }, _) => a,
         (_, Verified { .. }) => b,
         (NoAttestation, NoAttestation) => a,
+    }
+}
+
+/// Fold two `(verdict, backend)` candidates — [`fold_two`] plus backend
+/// attribution. The returned backend names the verifier whose verdict won, so
+/// the metric labels the deciding backend rather than `applicable[0]`
+/// (ADR 0039 §6). Pure helper — testable without the use case.
+fn fold_two_backend(
+    a: (ProvenanceVerdict, String),
+    b: (ProvenanceVerdict, String),
+) -> (ProvenanceVerdict, String) {
+    if fold_two(a.0.clone(), b.0.clone()) == a.0 {
+        a
+    } else {
+        b
     }
 }
 

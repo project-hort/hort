@@ -40,6 +40,13 @@ data:
   {{- if .Values.worker.provenance.cosign.enabled }}
   HORT_PROVENANCE_TRUSTED_ROOT_FILE: {{ required "worker.provenance.cosign.trustedRootFile is required when worker.provenance.cosign.enabled=true (a pinned trusted_root.json the worker loads at boot — the verify path does no live fetch)" .Values.worker.provenance.cosign.trustedRootFile | quote }}
   {{- end }}
+  {{- /* Keyed cosign-key verifier (ADR 0039): the pinned public-key file.   */}}
+  {{- /* Its PRESENCE is the keyed backend's enabling gate (independent of   */}}
+  {{- /* cosign.enabled, which gates the keyless Sigstore backend). When     */}}
+  {{- /* set, the worker loads the PEM key set + registers cosign-key.       */}}
+  {{- if .Values.worker.provenance.cosign.publicKeysFile }}
+  HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE: {{ .Values.worker.provenance.cosign.publicKeysFile | quote }}
+  {{- end }}
   HORT_ADVISORY_OSV_API_URL: {{ .Values.worker.advisory.osvUrl | quote }}
   HORT_SCANNER_POLL_INTERVAL_SECS: {{ .Values.worker.scanner.pollIntervalSecs | quote }}
   HORT_SCANNER_BATCH_SIZE: {{ .Values.worker.scanner.batchSize | quote }}

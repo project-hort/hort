@@ -460,18 +460,20 @@ pub(crate) async fn put_manifest_dispatch(
     // The exemption is gated on the manifest's declared media types, which a
     // write-authed pusher fully controls — so it is deliberately AIRTIGHT:
     // it fires **only** when the manifest carries a `subject.digest` AND
-    // EVERY layer is a Sigstore bundle (`is_pure_sigstore_bundle`). A mixed
-    // manifest (a bundle layer plus a runnable `tar+gzip` layer) does NOT
-    // match → it stays on `ingest_verified` and IS scanned. "Exempted" ⟺
-    // "carries no runnable content" — the anti-scan-evasion guard.
+    // EVERY layer is signature material — either a Sigstore v0.3 bundle
+    // (`is_pure_sigstore_bundle`, keyless) OR a cosign `simplesigning` layer
+    // (`is_pure_simplesigning`, the keyed `cosign sign --key` shape, ADR 0039
+    // §8). A mixed manifest (a signature layer plus a runnable `tar+gzip` layer)
+    // does NOT match → it stays on `ingest_verified` and IS scanned. "Exempted"
+    // ⟺ "carries no runnable content" — the anti-scan-evasion guard.
     //
-    // `is_pure_sigstore_bundle` parses the manifest JSON; the body already
-    // parsed cleanly above (`parsed_manifest`), so a parse error here is not
-    // expected. On the off chance it errors, fail safe → generic path
-    // (`unwrap_or(false)`), which scans/quarantines as before — never a
-    // wrongful exemption.
+    // Both predicates parse the manifest JSON; the body already parsed cleanly
+    // above (`parsed_manifest`), so a parse error here is not expected. On the
+    // off chance one errors, fail safe → generic path (`unwrap_or(false)`),
+    // so the generic path scans/quarantines it — never a wrongful exemption.
     let is_pure_signature = subject_digest_parsed.is_some()
-        && hort_domain::oci::is_pure_sigstore_bundle(&body_bytes).unwrap_or(false);
+        && (hort_domain::oci::is_pure_sigstore_bundle(&body_bytes).unwrap_or(false)
+            || hort_domain::oci::is_pure_simplesigning(&body_bytes).unwrap_or(false));
 
     // Ingest the manifest bytes. A `Conflict` here is the
     // declared-hash mismatch. The wire mapping

@@ -206,6 +206,14 @@ spec:
                   name: {{ include "hort-server.fullname" . }}-worker-config
                   key: HORT_PROVENANCE_TRUSTED_ROOT_FILE
             {{- end }}
+            {{- /* Keyed cosign-key verifier (ADR 0039) — gated on the file's presence. */}}
+            {{- if .Values.worker.provenance.cosign.publicKeysFile }}
+            - name: HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE
+            {{- end }}
             - name: HORT_ADVISORY_OSV_API_URL
               valueFrom:
                 configMapKeyRef:

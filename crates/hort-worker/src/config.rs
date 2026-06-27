@@ -153,6 +153,15 @@ pub struct WorkerConfig {
     /// image/release pipeline, NOT a live TUF fetch (no live client on the
     /// verify path; avoids unchecked-TUF-fetch; ADR 0010).
     pub provenance_trusted_root_file: Option<PathBuf>,
+    /// Path to a file of one-or-more PEM ECDSA P-256 public keys for the
+    /// **keyed** cosign verifier (`cosign-key`, ADR 0039 §3). Parsed from
+    /// `HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE`. Its presence is the keyed
+    /// backend's enabling gate — independent of [`Self::provenance_cosign_enabled`],
+    /// which gates the keyless Sigstore backend: when set, the composition root
+    /// loads the pinned public-key set and registers the `cosign-key`
+    /// `ProvenancePort`. No live fetch; the set rotates via the mounted secret
+    /// (rotation overlap = multiple keys in the file).
+    pub provenance_cosign_public_keys_file: Option<PathBuf>,
     pub advisory_osv_url: String,
     /// Base URL for the per-ecosystem `osv-vulnerabilities` bulk archive
     /// host consumed by [`AdvisoryWatchTickHandler`]. Distinct from
@@ -289,6 +298,7 @@ impl std::fmt::Debug for WorkerConfig {
             osv_scanner_bin,
             provenance_cosign_enabled,
             provenance_trusted_root_file,
+            provenance_cosign_public_keys_file,
             advisory_osv_url,
             advisory_osv_bulk_url,
             advisory_watch_ecosystems,
@@ -324,6 +334,10 @@ impl std::fmt::Debug for WorkerConfig {
             .field("osv_scanner_bin", osv_scanner_bin)
             .field("provenance_cosign_enabled", provenance_cosign_enabled)
             .field("provenance_trusted_root_file", provenance_trusted_root_file)
+            .field(
+                "provenance_cosign_public_keys_file",
+                provenance_cosign_public_keys_file,
+            )
             .field("advisory_osv_url", advisory_osv_url)
             .field("advisory_osv_bulk_url", advisory_osv_bulk_url)
             .field("advisory_watch_ecosystems", advisory_watch_ecosystems)
@@ -448,6 +462,8 @@ impl WorkerConfig {
             parse_bool_default("HORT_PROVENANCE_COSIGN_ENABLED", false)?;
         let provenance_trusted_root_file =
             optional("HORT_PROVENANCE_TRUSTED_ROOT_FILE").map(PathBuf::from);
+        let provenance_cosign_public_keys_file =
+            optional("HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE").map(PathBuf::from);
         let advisory_osv_url = env_or(
             "HORT_ADVISORY_OSV_API_URL",
             "https://api.osv.dev/v1/querybatch",
@@ -566,6 +582,7 @@ impl WorkerConfig {
             osv_scanner_bin,
             provenance_cosign_enabled,
             provenance_trusted_root_file,
+            provenance_cosign_public_keys_file,
             advisory_osv_url,
             advisory_osv_bulk_url,
             advisory_watch_ecosystems,
@@ -945,6 +962,7 @@ mod tests {
         // Load-bearing cosign provenance flag + pinned trust-root path.
         "HORT_PROVENANCE_COSIGN_ENABLED",
         "HORT_PROVENANCE_TRUSTED_ROOT_FILE",
+        "HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE",
         "HORT_ADVISORY_OSV_API_URL",
         "HORT_ADVISORY_OSV_BULK_URL",
         "HORT_ADVISORY_WATCH_ECOSYSTEMS",
@@ -1010,6 +1028,10 @@ mod tests {
         assert!(
             cfg.provenance_trusted_root_file.is_none(),
             "HORT_PROVENANCE_TRUSTED_ROOT_FILE default must be None"
+        );
+        assert!(
+            cfg.provenance_cosign_public_keys_file.is_none(),
+            "HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE default must be None"
         );
         assert_eq!(cfg.advisory_osv_url, "https://api.osv.dev/v1/querybatch");
         assert_eq!(

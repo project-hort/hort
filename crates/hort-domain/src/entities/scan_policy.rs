@@ -273,6 +273,13 @@ pub enum ProvenanceConfigWarning {
 /// [`ScanPolicyProjection::validate_provenance_config`] — the
 /// apply-time linter renders these as apply rejections (ADR 0015:
 /// a field accepted at apply must never be inert at runtime).
+/// The keyed-cosign provenance backend name (ADR 0039) — the value in
+/// [`ScanPolicyProjection::provenance_backends`] that selects the
+/// pinned-public-key verifier. Single-sourced here (a policy-config concept)
+/// and re-used by the `cosign-key` adapter's `ProvenancePort::name()`. The
+/// keyed model anchors on a pinned public key, NOT `provenance_identities`.
+pub const COSIGN_KEY_BACKEND: &str = "cosign-key";
+
 /// Pure-domain hooks the linter consumes; one variant (`Required` on a
 /// no-verifier scope) is deliberately *not* here because it needs the
 /// registered-port set, which is an application-layer concern.
@@ -281,9 +288,17 @@ pub enum ProvenanceConfigError {
     /// `provenance_mode != Off` with an empty `provenance_backends`: there
     /// is no verifier to run, so the mode is inert. Reject.
     NonOffWithoutBackends,
-    /// `Required` with an empty `provenance_identities`: every signature
-    /// would match (the any-signer footgun). Reject.
+    /// `Required` with an empty `provenance_identities` **on a scope that runs
+    /// an identity-model backend** (e.g. keyless `cosign`): every signature
+    /// would match (the any-signer footgun). A `cosign-key`-only scope does NOT
+    /// trip this — its pinned key is the anchor (enforced at worker boot). Reject.
     RequiredWithoutIdentities,
+    /// A keyed-ONLY scope (`provenance_backends` selects `cosign-key` and no
+    /// identity-model backend) that sets a non-empty `provenance_identities`:
+    /// the identity patterns are **inert** for the keyed backend (the pinned
+    /// public key is the anchor, ADR 0039 §3/§4), so accepting-but-ignoring them
+    /// is the accepted-at-apply/inert-at-runtime footgun (ADR 0015). Reject.
+    KeyedBackendWithInertIdentities,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,11 +390,21 @@ impl ScanPolicyProjection {
     /// **Encoded here (pure domain):**
     /// - `mode != Off` + empty `provenance_backends` ⇒
     ///   [`ProvenanceConfigError::NonOffWithoutBackends`] (reject).
-    /// - `Required` + empty `provenance_identities` ⇒
+    /// - `Required` + empty `provenance_identities` **on a scope with an
+    ///   identity-model backend** (keyless `cosign`) ⇒
     ///   [`ProvenanceConfigError::RequiredWithoutIdentities`] (reject).
-    /// - `VerifyIfPresent` + empty `provenance_identities` ⇒
-    ///   [`ProvenanceConfigWarning::VerifyIfPresentWithoutIdentities`]
-    ///   (warn).
+    /// - keyed-ONLY scope (`cosign-key`, no identity-model backend) + non-empty
+    ///   `provenance_identities` ⇒
+    ///   [`ProvenanceConfigError::KeyedBackendWithInertIdentities`] (reject —
+    ///   ADR 0015 inert-field).
+    /// - `VerifyIfPresent` + empty `provenance_identities` (identity-model
+    ///   backend) ⇒
+    ///   [`ProvenanceConfigWarning::VerifyIfPresentWithoutIdentities`] (warn).
+    ///
+    /// The keyed backend's positive "a pinned key is configured" requirement is
+    /// enforced at **worker boot** (the verifier's `health_check` + the
+    /// composition gate), NOT here — the key is a worker env, not a policy
+    /// field, so it is invisible to this pure-domain hook.
     ///
     /// **Deliberately NOT here:** `Required` on a scope whose format has
     /// no registered verifier — that needs the live registered-`ProvenancePort`
@@ -392,12 +417,38 @@ impl ScanPolicyProjection {
             return Err(ProvenanceConfigError::NonOffWithoutBackends);
         }
 
+        // Per-backend identity model (ADR 0039 §4). The keyed `cosign-key`
+        // backend anchors on a pinned public key, NOT `provenance_identities`;
+        // every other backend (keyless `cosign`) uses the identity-pattern
+        // model. So the identity rules below fire only when an identity-model
+        // backend is present.
+        let has_identity_backend = self
+            .provenance_backends
+            .iter()
+            .any(|b| b != COSIGN_KEY_BACKEND);
+        let has_keyed_backend = self
+            .provenance_backends
+            .iter()
+            .any(|b| b == COSIGN_KEY_BACKEND);
+        let identities_empty = self.provenance_identities.is_empty();
+
+        // Inert-field reject (ADR 0015): a keyed-ONLY scope must not set
+        // `provenance_identities` — they are silently ignored for `cosign-key`
+        // (the pinned key is the anchor). A mixed cosign + cosign-key scope is
+        // fine (identities are load-bearing for the cosign leg).
+        if has_keyed_backend && !has_identity_backend && !identities_empty {
+            return Err(ProvenanceConfigError::KeyedBackendWithInertIdentities);
+        }
+
         let mut warnings = Vec::new();
         match self.provenance_mode {
-            ProvenanceMode::Required if self.provenance_identities.is_empty() => {
+            // The any-signer footgun is an identity-model concern: a
+            // `cosign-key`-only Required scope is gated by its pinned key at
+            // worker boot (no identities to require), so it does NOT trip this.
+            ProvenanceMode::Required if has_identity_backend && identities_empty => {
                 return Err(ProvenanceConfigError::RequiredWithoutIdentities);
             }
-            ProvenanceMode::VerifyIfPresent if self.provenance_identities.is_empty() => {
+            ProvenanceMode::VerifyIfPresent if has_identity_backend && identities_empty => {
                 warnings.push(ProvenanceConfigWarning::VerifyIfPresentWithoutIdentities);
             }
             _ => {}
@@ -962,6 +1013,65 @@ mod tests {
         p.provenance_mode = ProvenanceMode::Required;
         p.provenance_backends = vec!["cosign".into()];
         p.provenance_identities = vec![sample_pattern()];
+        assert_eq!(p.validate_provenance_config(), Ok(Vec::new()));
+    }
+
+    // ---- ADR 0039 §4: per-backend identity model (cosign-key) ----
+
+    #[test]
+    fn validate_provenance_keyed_only_required_without_identities_is_ok() {
+        // A cosign-key-ONLY scope under Required does NOT require identities —
+        // the pinned key is the anchor (enforced at worker boot, not here).
+        let mut p = sample_projection();
+        p.provenance_mode = ProvenanceMode::Required;
+        p.provenance_backends = vec![COSIGN_KEY_BACKEND.into()];
+        p.provenance_identities = Vec::new();
+        assert_eq!(p.validate_provenance_config(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn validate_provenance_keyed_only_with_identities_rejects_inert() {
+        // ADR 0015 inert-field: identities are inert for a keyed-only scope.
+        let mut p = sample_projection();
+        p.provenance_mode = ProvenanceMode::Required;
+        p.provenance_backends = vec![COSIGN_KEY_BACKEND.into()];
+        p.provenance_identities = vec![sample_pattern()];
+        assert_eq!(
+            p.validate_provenance_config(),
+            Err(ProvenanceConfigError::KeyedBackendWithInertIdentities)
+        );
+    }
+
+    #[test]
+    fn validate_provenance_mixed_cosign_and_keyed_with_identities_is_ok() {
+        // Identities are load-bearing for the cosign leg → non-empty is fine.
+        let mut p = sample_projection();
+        p.provenance_mode = ProvenanceMode::Required;
+        p.provenance_backends = vec!["cosign".into(), COSIGN_KEY_BACKEND.into()];
+        p.provenance_identities = vec![sample_pattern()];
+        assert_eq!(p.validate_provenance_config(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn validate_provenance_mixed_required_without_identities_rejects() {
+        // The cosign leg still needs identities under Required.
+        let mut p = sample_projection();
+        p.provenance_mode = ProvenanceMode::Required;
+        p.provenance_backends = vec!["cosign".into(), COSIGN_KEY_BACKEND.into()];
+        p.provenance_identities = Vec::new();
+        assert_eq!(
+            p.validate_provenance_config(),
+            Err(ProvenanceConfigError::RequiredWithoutIdentities)
+        );
+    }
+
+    #[test]
+    fn validate_provenance_keyed_only_verify_if_present_empty_identities_no_warn() {
+        // No identity-model backend → no any-signer warn for a keyed-only scope.
+        let mut p = sample_projection();
+        p.provenance_mode = ProvenanceMode::VerifyIfPresent;
+        p.provenance_backends = vec![COSIGN_KEY_BACKEND.into()];
+        p.provenance_identities = Vec::new();
         assert_eq!(p.validate_provenance_config(), Ok(Vec::new()));
     }
 

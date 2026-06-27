@@ -38,6 +38,9 @@ hort-adapters-advisory-osv     = { path = "../hort-adapters-advisory-osv" }
 # sigstore's transitive reqwest 0.13 stays out of the server binary
 # (verified via `cargo tree`).
 hort-adapters-provenance-sigstore = { path = "../hort-adapters-provenance-sigstore" }
+# Keyed (pinned-public-key) cosign verifier — the `cosign-key` ProvenancePort
+# (ADR 0039). Minimal p256 surface, not the sigstore PKI crate.
+hort-adapters-provenance-cosign-key = { path = "../hort-adapters-provenance-cosign-key" }
 # `KubernetesSecretWriterImpl` for the ServiceAccountRotationHandler.
 # Optional at runtime — the worker logs and skips registration when
 # `kube::Client::try_default()` fails (no kubeconfig, not in-cluster),
