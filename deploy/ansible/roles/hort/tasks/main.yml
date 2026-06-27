@@ -184,8 +184,12 @@
   ansible.builtin.meta: flush_handlers
 
 # ── Enable and start units ────────────────────────────────────────────────────
-# postgres and hort-server are long-running services; hort-migrate is
-# Type=oneshot and is triggered as a dependency of hort-server on each start.
+# postgres and hort-server are long-running services. hort-migrate is
+# Type=oneshot + RemainAfterExit: once it has run it stays active(exited), so the
+# Requires=/After= dep on hort-server will NOT re-trigger it. It is restarted
+# explicitly below (after postgres, before hort-server) so every deploy re-applies
+# newly-added migrations — otherwise the schema would trail a new binary and
+# hort-server's boot assert_current would refuse to serve.
 
 - name: Enable and start postgres container
   ansible.builtin.systemd:
@@ -207,6 +211,14 @@
   become: true
   become_user: "{{ hort_user }}"
   when: hort_dex_enabled | bool
+
+- name: Run hort-migrate container (oneshot restart — re-applies migrations each deploy, blocks until complete)
+  ansible.builtin.systemd:
+    name: hort-migrate.service
+    state: restarted
+    scope: user
+  become: true
+  become_user: "{{ hort_user }}"
 
 - name: Enable and start hort-server container
   ansible.builtin.systemd:
