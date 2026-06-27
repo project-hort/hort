@@ -628,7 +628,26 @@ impl QuarantineUseCase {
                     .map(|v| v.message.clone())
                     .unwrap_or_else(|| "policy evaluation rejected scan result".to_string());
 
-                let reject_event = artifact.reject_from_scan(reason)?;
+                let reject_event = match artifact.reject_from_scan(reason) {
+                    Ok(ev) => ev,
+                    // Idempotent, recoverable skip: a re-scan that re-derives a
+                    // `Reject` outcome on an artifact already in the terminal
+                    // `Rejected` state hits `reject_from_scan`'s "cannot reject
+                    // artifact in state rejected" invariant. Propagating it fails
+                    // the job, which then retries forever and re-scans on every
+                    // attempt. Mirror `record_scan_indeterminate`'s
+                    // already-terminal branch: append nothing, return Ok.
+                    Err(DomainError::Invariant(msg)) => {
+                        tracing::debug!(
+                            artifact_id = %artifact_id,
+                            status = %artifact.quarantine_status,
+                            reason = %msg,
+                            "skipping scan-reject: artifact already terminal"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => return Err(AppError::Domain(e)),
+                };
 
                 let policy_event = PolicyEvaluated {
                     artifact_id,
@@ -4515,6 +4534,43 @@ mod tests {
         assert_eq!(delta.released_delta, 0);
         assert_eq!(delta.critical_delta, 1);
         assert!(delta.last_scan_at.is_some());
+    }
+
+    /// Idempotent skip: a re-scan that re-derives a `Reject` outcome on an
+    /// artifact already in the terminal `Rejected` state returns Ok (a
+    /// recoverable "already terminal" skip) and commits NO transition —
+    /// mirrors `record_scan_indeterminate`'s already-terminal branch. Without
+    /// it, `reject_from_scan`'s "cannot reject artifact in state rejected"
+    /// invariant fails the job, which then retries forever and re-scans on
+    /// every attempt.
+    #[tokio::test]
+    async fn record_scan_result_reject_on_already_rejected_is_idempotent_skip() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Rejected);
+        let severity = SeveritySummary {
+            critical: 1,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+
+        // Returns Ok — a recoverable "already terminal" skip, not the hard
+        // `cannot reject artifact in state rejected` error that looped the job.
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no duplicate reject event/transition for an already-rejected artifact"
+        );
     }
 
     /// Fail-closed: when no authority is constructible

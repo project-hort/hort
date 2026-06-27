@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Re-scanning an already-rejected artifact no longer loops the worker.** A
+  re-scan (e.g. `admin rescan`) that re-derives a `Reject` outcome on an
+  artifact already in the terminal `Rejected` state previously hit the
+  `cannot reject artifact in state rejected` invariant; `record_scan_result`
+  propagated it, failing the job, which the worker then retried indefinitely —
+  re-running the scanner on every attempt. The reject path now treats an
+  already-terminal artifact as a recoverable, idempotent skip (mirroring the
+  `ScanIndeterminate` path): the job completes, no duplicate `ArtifactRejected`
+  event, no scan churn.
+
 ## [0.9.6] - 2026-06-27
 
 Beta release (`0.9.6-beta.1`). Headline: OSV **informational** advisories
