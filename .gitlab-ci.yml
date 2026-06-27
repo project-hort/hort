@@ -653,8 +653,9 @@ quality:fail2ban-regex-test:
     - rm -f /tmp/cosign.key
 
 # Single hort-server image. Tag policy:
-#   - SemVer tag (vX.Y.Z or vX.Y.Z-rc.N): push :${CI_COMMIT_TAG#v} only;
-#     stable releases additionally push :latest, RC tags do NOT.
+#   - SemVer tag (vX.Y.Z, vX.Y.Z-rc.N, or vX.Y.Z-beta.N): push
+#     :${CI_COMMIT_TAG#v} only; stable releases additionally push :latest,
+#     pre-release (rc / beta) tags do NOT.
 #   - main branch:                        push :${CI_COMMIT_SHORT_SHA} AND :latest.
 #   - release/* branch:                   push :${CI_COMMIT_SHORT_SHA} only;
 #     no :latest so a maintenance build can't clobber main's :latest.
@@ -678,7 +679,7 @@ build-images:hort-server:
     KUBERNETES_CPU_REQUEST: "2"
     KUBERNETES_CPU_LIMIT: "4"
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release\//
   script:
@@ -691,7 +692,7 @@ build-images:hort-server:
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         VERSION_TAG="${CI_COMMIT_TAG#v}"
         case "${VERSION_TAG}" in
-          *-rc.*) PUSH_LATEST="false" ;;
+          *-rc.*|*-beta.*) PUSH_LATEST="false" ;;
           *)      PUSH_LATEST="true"  ;;
         esac
       elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
@@ -774,7 +775,7 @@ build-images:hort-worker:
     KUBERNETES_CPU_REQUEST: "2"
     KUBERNETES_CPU_LIMIT: "4"
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release\//
   script:
@@ -787,7 +788,7 @@ build-images:hort-worker:
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         VERSION_TAG="${CI_COMMIT_TAG#v}"
         case "${VERSION_TAG}" in
-          *-rc.*) PUSH_LATEST="false" ;;
+          *-rc.*|*-beta.*) PUSH_LATEST="false" ;;
           *)      PUSH_LATEST="true"  ;;
         esac
       elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
@@ -869,7 +870,7 @@ helm:lint-and-publish:
     - job: build-images:hort-worker
       artifacts: true
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release\//
   before_script:
