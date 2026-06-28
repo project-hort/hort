@@ -31,6 +31,36 @@ impl From<DomainError> for ApiError {
 /// logs.
 const UPSTREAM_UNAVAILABLE_BODY: &str = r#"{"error":"upstream unavailable"}"#;
 
+/// The internal cause that must be logged before an [`ApiError`] is
+/// sanitised to an opaque `5xx` wire body.
+///
+/// Several arms of [`ApiError::into_response`] deliberately collapse to a
+/// generic `{"error":"internal error"}` body so no infrastructure detail
+/// (sqlx paths, pool state, crate names) reaches the client. Without a log
+/// at that boundary the *real* error is discarded entirely — e.g. the
+/// `DomainError::Invariant("jobs row decode failed: …")` the jobs row
+/// mapper raises on a column/type mismatch becomes a 500 with **no log
+/// line at any level**, which is exactly how the admin-task read path's
+/// 500 became undebuggable in production. This function names precisely
+/// the sanitised-away arms; `into_response` logs the returned detail at
+/// `error!` so the cause survives in the logs while the wire body stays
+/// opaque.
+///
+/// Returns `None` for:
+/// - client-facing errors whose wire message already carries the cause; and
+/// - `External` / `Scanner`, which the dedicated sanitiser branch at the
+///   top of `into_response` already logs (returning `Some` here would
+///   double-log them).
+fn opaque_5xx_log_detail(err: &AppError) -> Option<String> {
+    match err {
+        AppError::Domain(DomainError::Invariant(_))
+        | AppError::Repository(_)
+        | AppError::Storage(_)
+        | AppError::EventStore(_) => Some(err.to_string()),
+        _ => None,
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // `ManagedByConfiguration` produces an
@@ -222,6 +252,15 @@ impl IntoResponse for ApiError {
                 "invalid or expired token".to_string(),
             ),
         };
+
+        // Preserve the cause of any sanitised 5xx in the logs. The wire
+        // body for these arms is the opaque `internal error` (no infra
+        // leak), so without this line the real error vanishes — a 500
+        // with nothing to debug. The body is unchanged; only the log
+        // gains the detail.
+        if let Some(detail) = opaque_5xx_log_detail(&self.0) {
+            tracing::error!(error = %detail, status = status.as_u16(), "request sanitised to opaque 5xx");
+        }
 
         let body = serde_json::json!({ "error": message });
         (status, axum::Json(body)).into_response()
@@ -433,6 +472,47 @@ mod tests {
         let (_, body) = response_of(AppError::Repository("pg down".into()));
         let body_str = String::from_utf8(body).unwrap();
         assert!(body_str.contains(r#""error":"internal error""#));
+    }
+
+    #[test]
+    fn opaque_5xx_arms_preserve_cause_for_logging() {
+        // Regression: the jobs-read 500 root cause. A
+        // `DomainError::Invariant("jobs row decode failed: …")` raised by
+        // the jobs row mapper is sanitised to an opaque `internal error`
+        // wire body — correct for the client, but the cause was ALSO
+        // discarded from the logs (no log line at any level), leaving an
+        // undebuggable 500. The detail must survive for the `error!` line.
+        let detail = opaque_5xx_log_detail(&AppError::Domain(DomainError::Invariant(
+            "jobs row decode failed: column \"actor_id\": mismatched types".into(),
+        )))
+        .expect("Invariant must be logged before sanitisation");
+        assert!(detail.contains("jobs row decode failed"));
+        assert!(detail.contains("actor_id"));
+
+        // Repository / Storage / EventStore opaque-500s are likewise rescued.
+        assert!(opaque_5xx_log_detail(&AppError::Repository("pg down".into())).is_some());
+        assert!(opaque_5xx_log_detail(&AppError::Storage("bucket gone".into())).is_some());
+        assert!(opaque_5xx_log_detail(&AppError::EventStore("append failed".into())).is_some());
+
+        // External / Scanner are already logged by the dedicated wire
+        // sanitiser branch at the top of `into_response` — `None` here so
+        // they are not double-logged.
+        assert!(opaque_5xx_log_detail(&AppError::External("upstream down".into())).is_none());
+        assert!(opaque_5xx_log_detail(&AppError::Scanner("timeout".into())).is_none());
+
+        // Client-facing errors carry their real message on the wire, so
+        // there is nothing to rescue and no log entry is warranted.
+        assert!(
+            opaque_5xx_log_detail(&AppError::Domain(DomainError::NotFound {
+                entity: "Artifact",
+                id: "x".into(),
+            }))
+            .is_none()
+        );
+        assert!(
+            opaque_5xx_log_detail(&AppError::Domain(DomainError::Validation("bad".into())))
+                .is_none()
+        );
     }
 
     // -- assert_no_internal_leakage helper ------------------------------

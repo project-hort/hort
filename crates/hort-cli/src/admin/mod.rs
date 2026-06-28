@@ -338,8 +338,12 @@ pub struct TaskRow {
     pub completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    // `result_summary` is a structured JSONB value on the wire (the
+    // server's `JobRowDto` emits the `jobs.result_summary` jsonb column as
+    // a JSON object), so it deserialises as `serde_json::Value`, not
+    // `String`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_summary: Option<String>,
+    pub result_summary: Option<serde_json::Value>,
 }
 
 /// Paginated list of task rows.

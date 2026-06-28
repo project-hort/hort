@@ -32,8 +32,11 @@ pub struct JobRowDto {
     pub completed_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// The completed handler's `result_summary` JSONB, surfaced as a
+    /// structured value (the `jobs.result_summary` column is `jsonb`, not
+    /// text). Omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_summary: Option<String>,
+    pub result_summary: Option<serde_json::Value>,
 }
 
 impl From<JobRow> for JobRowDto {

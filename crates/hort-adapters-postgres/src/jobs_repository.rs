@@ -241,7 +241,13 @@ fn row_to_job_row(row: &sqlx::postgres::PgRow) -> DomainResult<JobRow> {
     let completed_at: Option<DateTime<Utc>> =
         row.try_get("completed_at").map_err(|e| invariant(&e))?;
     let last_error: Option<String> = row.try_get("last_error").map_err(|e| invariant(&e))?;
-    let result_summary: Option<String> =
+    // `result_summary` is a `jsonb` column (migration 009), written by
+    // `mark_completed` as a `serde_json::Value` — decode it as the same
+    // type. Decoding it as `String` is a sqlx type mismatch (TEXT vs
+    // JSONB) that errors on every non-NULL value, which 500'd the
+    // admin-task read path for every completed job. Mirrors the `params`
+    // jsonb decode above.
+    let result_summary: Option<JsonValue> =
         row.try_get("result_summary").map_err(|e| invariant(&e))?;
 
     // Scan-typed columns. For `kind='scan'` rows these are populated by
@@ -1758,5 +1764,75 @@ mod tests {
             .expect("last_completed_at_by_kind (newest)")
             .expect("a completion was recorded");
         assert_eq!(newest, later, "MAX(completed_at) tracks the newest run");
+    }
+
+    /// Regression (admin-task read 500): a completed job's
+    /// `result_summary` is a `jsonb` column, so the row mapper MUST decode
+    /// it as `serde_json::Value` — decoding it as `String` is a sqlx type
+    /// mismatch that errors on every non-NULL value, 500-ing
+    /// `GET /api/v1/admin/tasks` and `…/tasks/:id` for any completed job.
+    /// Inserts/pending rows have a NULL summary (NULL short-circuits the
+    /// decode), which is why writes and `task invoke` stayed green while
+    /// reads of finished jobs blew up.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn get_and_list_decode_completed_job_jsonb_result_summary() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        // Enqueue a task, then complete it with a NON-NULL jsonb summary.
+        let params = serde_json::json!({ "dry_run": true });
+        let job_id = match repo
+            .enqueue_task("noop", &params, None, 0, "manual", None)
+            .await
+            .expect("enqueue_task")
+        {
+            EnqueueOutcome::Enqueued { job_id } => job_id,
+            other => panic!("expected Enqueued, got {other:?}"),
+        };
+        let summary = serde_json::json!({ "scanned": 3, "ok": true });
+        repo.mark_completed(job_id, summary.clone())
+            .await
+            .expect("mark_completed");
+
+        // get_job must DECODE the jsonb result_summary. The bug surfaces
+        // here as a `DomainError::Invariant("jobs row decode failed: …
+        // String is not compatible with JSONB")`.
+        let row = repo
+            .get_job(job_id)
+            .await
+            .expect("get_job must decode a completed job's jsonb result_summary")
+            .expect("row present");
+        assert_eq!(
+            row.result_summary.as_ref(),
+            Some(&summary),
+            "the jsonb summary round-trips as a structured value",
+        );
+
+        // list_jobs decodes the same row inside its page-mapping loop.
+        let page = repo
+            .list_jobs(
+                ListJobsFilter {
+                    kind: Some("noop".to_string()),
+                    status: None,
+                },
+                200,
+                None,
+            )
+            .await
+            .expect("list_jobs must decode the page including the completed row");
+        assert!(
+            page.items.iter().any(|r| r.id == job_id),
+            "the completed job appears in the list page",
+        );
+
+        // Cleanup — this DB is shared across serial DB tests.
+        sqlx::query("DELETE FROM public.jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
     }
 }

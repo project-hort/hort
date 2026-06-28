@@ -89,7 +89,9 @@ fn render_row_table(row: &TaskRow) -> String {
         data.push(vec!["last_error".to_string(), error.clone()]);
     }
     if let Some(ref summary) = row.result_summary {
-        data.push(vec!["result_summary".to_string(), summary.clone()]);
+        // `result_summary` is a structured JSON value; render its compact
+        // JSON form in the single table cell.
+        data.push(vec!["result_summary".to_string(), summary.to_string()]);
     }
 
     format_table_rows(&["FIELD", "VALUE"], &data)
@@ -117,7 +119,7 @@ mod tests {
             updated_at: "2026-01-01T00:01:00Z".to_string(),
             completed_at: Some("2026-01-01T00:01:00Z".to_string()),
             last_error: None,
-            result_summary: Some("ok".to_string()),
+            result_summary: Some(serde_json::json!({ "ok": true })),
         }
     }
 
