@@ -1,11 +1,14 @@
-//! Migration 016 — `policy-reevaluation` job-kind CHECK widen (ADR 0041
-//! Item 3).
+//! `policy-reevaluation` job-kind CHECK — real-adapter enqueue proof
+//! (ADR 0041 Item 3).
 //!
-//! DB-gated proof that the new `policy-reevaluation` task kind survives
-//! the `jobs.kind` SQL CHECK after migration 016's drop+re-add ALTER.
-//! This is the "easy miss" surface: a kind added to `VALID_TASK_KINDS` and
-//! the worker dispatch but NOT to the SQL CHECK enqueues fine in every
-//! mock-based unit test and fails only here — against a real Postgres.
+//! DB-gated proof that the `policy-reevaluation` task kind survives the
+//! `jobs.kind` SQL CHECK when enqueued through the **real adapter path**
+//! (`JobsRepository::enqueue_task`), complementing the raw-SQL coverage in
+//! `migration_009_jobs_and_findings.rs`. This is the "easy miss" surface:
+//! a kind added to `VALID_TASK_KINDS` and the worker dispatch but NOT to
+//! the `jobs.kind` CHECK (defined inline in `009_scan_jobs_and_findings.sql`)
+//! enqueues fine in every mock-based unit test and fails only here —
+//! against a real Postgres.
 //!
 //! ## Isolation contract
 //!
@@ -38,7 +41,7 @@ async fn maybe_pool() -> Option<PgPool> {
 
 /// The `policy-reevaluation` kind enqueues through the **real adapter
 /// path** the production trigger uses (`JobsRepository::enqueue_task`) and
-/// lands — proving the migration-016 CHECK admits it. The persisted row
+/// lands — proving the `jobs.kind` CHECK admits it. The persisted row
 /// round-trips the kind and carries the `'manual'` trigger_source the
 /// enqueue path binds.
 #[tokio::test]
@@ -59,7 +62,7 @@ async fn policy_reevaluation_kind_survives_jobs_kind_check() {
         .await
         .expect(
             "enqueue_task('policy-reevaluation') must succeed — if this fails with a 23514 \
-             check_violation, migration 016 did not add the kind to the jobs.kind CHECK",
+             check_violation, the jobs.kind CHECK in 009 is missing the kind",
         );
     let job_id = match outcome {
         EnqueueOutcome::Enqueued { job_id } => job_id,
@@ -81,11 +84,11 @@ async fn policy_reevaluation_kind_survives_jobs_kind_check() {
 }
 
 /// Control: a kind NOT in the CHECK is still rejected with SQLSTATE 23514
-/// — proving the widen did not accidentally drop the constraint entirely
-/// (a drop-without-re-add would let every kind through).
+/// — proving the `jobs.kind` CHECK is present and constrains the column
+/// (a missing constraint would let every kind through).
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn unknown_kind_still_rejected_after_migration_016() {
+async fn unknown_kind_still_rejected_by_jobs_kind_check() {
     let Some(pool) = maybe_pool().await else {
         return;
     };

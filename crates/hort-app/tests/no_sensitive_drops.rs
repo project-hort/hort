@@ -44,9 +44,12 @@
 //! protected (identity / integrity gone). The one legitimate
 //! drop-and-re-add-under-the-same-name is widening an enum `CHECK`:
 //! PostgreSQL has no in-place `CHECK` alter, so the only way to extend an
-//! allowed-value set (e.g. adding a task kind to `jobs.kind`, migration 016)
-//! is to drop and re-add the same named constraint over a superset of
-//! values, and PostgreSQL auto-names such a constraint `<table>_<col>_check`.
+//! allowed-value set (e.g. adding a task kind to `jobs.kind`) is to drop and
+//! re-add the same named constraint over a superset of values, and
+//! PostgreSQL auto-names such a constraint `<table>_<col>_check`. Pre-1.0
+//! this widening is done in place in the defining CREATE (ADR 0022), so no
+//! migration currently exercises the exemption; it is retained for when
+//! ALTER-as-new-numbered-migration resumes post-1.0.
 //!
 //! The exemption is therefore an **allow-list restricted to constraint
 //! names ending in `_check`** (case-insensitive — see
@@ -852,8 +855,10 @@ fn self_check_check_widen_drop_and_readd_same_name_does_not_trip() {
     // ADR 0030 redefinition exception: dropping and re-adding the SAME
     // named CHECK constraint (the only way to widen an enum CHECK in
     // PostgreSQL — e.g. adding a `jobs.kind` value) leaves the table still
-    // constrained, so it is NOT a de-constrain and must NOT trip. This is
-    // exactly the shape of migration 016 (policy-reevaluation job kind).
+    // constrained, so it is NOT a de-constrain and must NOT trip. This
+    // DROP+re-ADD shape is the post-1.0 ALTER-migration form of a
+    // `jobs.kind` widening (pre-1.0 the widening is done in place in the
+    // 009 CREATE; the exemption stays validated for when ALTERs resume).
     assert!(!trips(
         "ALTER TABLE public.jobs DROP CONSTRAINT jobs_kind_check;\n\
          ALTER TABLE public.jobs ADD CONSTRAINT jobs_kind_check \

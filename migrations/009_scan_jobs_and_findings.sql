@@ -59,11 +59,10 @@ CREATE TABLE public.jobs (
     -- `TaskHandler::kind()` returns. The constraint is the SQL mirror of
     -- the `VALID_TASK_KINDS` allow-list in
     -- `crates/hort-domain/src/events/authorization_events.rs` — keep in
-    -- lock-step. Pre-1.0, kinds are added here in place (ADR 0022); the
-    -- prior 012/014/015/016 forward-ALTER chain was collapsed back into
-    -- this file once the chain stopped earning its keep (DB-wipe-per-alpha
-    -- makes the in-place edit free, and a single defining migration is
-    -- easier to read than a chain).
+    -- lock-step. The full kind set is defined inline in this CREATE (a
+    -- single defining migration, not a forward-ALTER chain): pre-1.0 a new
+    -- kind is added to this IN-list in place (ADR 0022), since the
+    -- DB-wipe-per-alpha contract makes the in-place edit free.
     kind            text NOT NULL CHECK (kind IN (
         'scan',
         'cron-rescan-tick',
@@ -96,7 +95,15 @@ CREATE TABLE public.jobs (
         -- Added in place per the pre-1.0 migration discipline (ADR 0022);
         -- persistent DBs MUST re-migrate when this migration's checksum
         -- changes.
-        'verify-event-chain'            -- event-chain verify-run liveness breadcrumb
+        'verify-event-chain',           -- event-chain verify-run liveness breadcrumb
+        -- ADR 0041 Item 3: async scan-policy re-evaluation pass. Runs
+        -- `PolicyUseCase::run_policy_re_evaluation_pass` off the request
+        -- path — a gate-affecting scan-policy mutation enqueues one row,
+        -- the worker re-derives every in-scope artifact's verdict from its
+        -- stored findings under the bumped policy. Carries no release
+        -- authority of its own (re-runs the same fail-closed gate over
+        -- stored evidence; ADR 0007 preserved).
+        'policy-reevaluation'           -- async scan-policy re-evaluation pass
     )),
     params          jsonb NOT NULL DEFAULT '{}'::jsonb,
     actor_id        uuid REFERENCES public.users(id),
@@ -389,6 +396,18 @@ CREATE TABLE public.scan_findings (
     title              text NOT NULL
         CONSTRAINT scan_findings_title_length CHECK (octet_length(title) <= 1024),
     detected_at        timestamptz NOT NULL,
+    -- The raw OSV `database_specific.informational` class string verbatim
+    -- (RustSec unmaintained / unsound / notice), or NULL for a scored
+    -- vulnerability. This persists the FACT the advisory database
+    -- published, not a derived boolean interpretation: a finding
+    -- reconstructed from this projection (e.g. exclusion-triggered
+    -- re-evaluation) re-derives the informational boolean and the
+    -- non-enforcing negligible-lane routing (steered by
+    -- policy_projections.negligible_action) under the current — or any
+    -- future per-class — policy. A baked-in boolean would have lost the
+    -- class and frozen the interpretation; a NULL here reads back as a
+    -- scored vulnerability.
+    informational_class text,
     PRIMARY KEY (artifact_id, scan_id, purl, vulnerability_id, source_scanner)
 );
 

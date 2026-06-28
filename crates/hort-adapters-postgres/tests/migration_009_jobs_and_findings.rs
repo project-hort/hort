@@ -139,20 +139,14 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
     );
 
     // Insert one row per v1 kind. Every kind must succeed under
-    // `status='pending'`. Hyphen-separated literals are the spec. The
-    // post-009 set is the full allow-list 009 ships directly — the
-    // prior `service-account-rotation` (012) / `eventstore-checkpoint`
-    // (014) / `replay-seen-prune` (015) / `quarantine-release-sweep` (016)
-    // forward-ALTER chain was collapsed back into 009 pre-1.0 per
-    // `feedback_pre_release_migrations`; subsequent kind additions edited
-    // 009 in place under the same policy. This test is the SQL-CHECK side
-    // of the `VALID_TASK_KINDS` lock-step; the use-case side is
-    // `crates/hort-server/tests/task_use_case_enqueue_real_db.rs` (which
-    // walks `VALID_TASK_KINDS` directly through the real use case →
-    // adapter → DB path). The pre-1.0 in-place-edit migration policy
-    // means this fixture is no longer a freeze-time snapshot of what
-    // 009 enumerated when it shipped — the in-place-edited 009 file IS
-    // the source of truth and the test follows.
+    // `status='pending'`. Hyphen-separated literals are the spec. The full
+    // allow-list is defined inline in 009's `jobs.kind` CHECK; pre-1.0 a
+    // new kind is added to that IN-list in place (ADR 0022). This test is
+    // the SQL-CHECK side of the `VALID_TASK_KINDS` lock-step; the use-case
+    // side is `crates/hort-server/tests/task_use_case_enqueue_real_db.rs`
+    // (which walks `VALID_TASK_KINDS` directly through the real use case →
+    // adapter → DB path). The in-place-edited 009 file IS the source of
+    // truth and this fixture follows it.
     let all_kinds = [
         "scan",
         "cron-rescan-tick",
@@ -186,9 +180,9 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
         // (this is a DB-CHECK-only kind, not part of the admin-task-invoke
         // lock-step).
         "verify-event-chain",
-        // Async scan-policy re-evaluation pass — added to the jobs.kind
-        // CHECK by migration 016 (ADR 0041 Item 3). The dedicated DB-gated
-        // proof is `migration_016_policy_reevaluation_kind.rs`.
+        // Async scan-policy re-evaluation pass (ADR 0041 Item 3); part of
+        // the jobs.kind CHECK in 009. The dedicated real-adapter-path
+        // DB-gated proof is `jobs_kind_check_policy_reevaluation.rs`.
         "policy-reevaluation",
     ];
     for kind in all_kinds {

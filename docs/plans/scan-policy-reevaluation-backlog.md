@@ -194,8 +194,9 @@ sites (jobs.kind SQL CHECK in `migrations/`, the enqueue/dispatch registry),
   (`policy_use_case.rs:368`), so a multi-field gate change must coalesce to a single
   task, not N.
 - The task kind is registered at **every** site (incl. the `jobs.kind` SQL CHECK — the
-  easy miss caught only by the DB-gated enqueue test, added as a **new numbered ALTER
-  migration**, never an in-place edit; mind the 012 gap) and, if Helm/timers run it,
+  easy miss caught only by the DB-gated enqueue test; pre-1.0 the kind is added to the
+  inline CHECK in the `009_scan_jobs_and_findings.sql` CREATE in place per ADR 0022,
+  post-1.0 it becomes a new numbered ALTER migration) and, if Helm/timers run it,
   mirrored in the scheduledTasks/`hort_timers` parity surface.
 - **Idempotency/concurrency model (state it explicitly):** the pass is naturally
   verdict-idempotent and `commit_transition` carries event-version optimistic
@@ -228,8 +229,8 @@ run_policy_re_evaluation_pass off the request path; make update_policy/remove_ex
 reactivate_policy enqueue it and return; migrate add_exclusion onto it. Enqueue ONCE per
 policy mutation, not per event (update_policy emits one PolicyUpdated per changed field —
 coalesce). REGISTER the task kind at every site incl. the jobs.kind SQL CHECK (the easy
-miss — caught only by the DB-gated enqueue test) as a NEW numbered ALTER migration (not
-in-place; mind the 012 gap), and mirror it in the hort_timers/scheduledTasks parity surface
+miss — caught only by the DB-gated enqueue test): pre-1.0 add it to the inline jobs.kind
+CHECK in the 009 CREATE in place (ADR 0022), and mirror it in the hort_timers/scheduledTasks parity surface
 if scheduled. State the idempotency model: naturally verdict-idempotent + commit_transition
 event-version optimistic concurrency makes concurrent passes safe; NOT an ADR 0028
 destructive task (no per-UTC-day key / seal-pool). Observability: info! on transitions +
