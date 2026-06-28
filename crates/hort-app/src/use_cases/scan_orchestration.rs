@@ -701,14 +701,16 @@ pub fn compute_backoff(attempts: u32) -> Duration {
     }
 }
 
-/// Deduplicate a finding set by `(purl, vulnerability_id)`. Severity is
-/// preserved in tier-priority order: when two findings collide on the
-/// dedup key, the entry whose severity is higher
-/// (`Critical > High > Medium > Low`) wins. Ties on severity prefer the
-/// entry with `Some(cvss_score)` over `None`; remaining ties keep the
-/// first-seen entry. Vulnerability id matching is case-insensitive.
-/// PURL matching is case-sensitive (matches
-/// `compute_added_findings`'s convention).
+/// Deduplicate a finding set by `(purl, vulnerability_id)`. Collision
+/// preference (see [`prefer_replacement`]): a recognised-informational
+/// reading (no CVSS) wins over an UNSCORED non-informational finding for the
+/// same advisory — so a backend that cannot read the RustSec class and fails
+/// the unscored advisory closed to Critical does not discard the
+/// classification. Otherwise severity tier wins (`Critical > … > Low`); ties
+/// prefer `Some(cvss_score)` over `None`; remaining ties keep the first-seen
+/// entry. A SCORED finding is never informational, so it is never downgraded
+/// by this preference. Vulnerability id matching is case-insensitive; PURL
+/// matching is case-sensitive (matches `compute_added_findings`'s convention).
 fn merge_findings(input: Vec<Finding>) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::with_capacity(input.len());
     let mut seen: Vec<(String, String, usize)> = Vec::with_capacity(input.len());
@@ -737,6 +739,24 @@ fn merge_findings(input: Vec<Finding>) -> Vec<Finding> {
 /// Decide whether `incoming` should replace `existing` in the
 /// dedup-merge step.
 fn prefer_replacement(existing: &Finding, incoming: &Finding) -> bool {
+    // Informational classification preference (ADR 0040). For the same
+    // advisory, a finding carrying a recognised RustSec informational class
+    // (`is_informational()` — unmaintained / unsound / notice, and no CVSS)
+    // is the authoritative reading. It beats an UNSCORED non-informational
+    // finding for the same id — e.g. a backend (Trivy) that cannot read the
+    // class and fails the unscored advisory closed to Critical (SUP-4).
+    // Without this, that cosmetic Critical wins the severity-tier rule below
+    // and silently discards the classification, defeating the negligible
+    // lane (the cross-backend fail-open). A SCORED finding (real CVSS) is
+    // never `is_informational()`, so these arms never fire against it — it
+    // falls through to the severity / score rules and is never downgraded
+    // (ADR 0007 fail-closed preserved).
+    match (existing.is_informational(), incoming.is_informational()) {
+        (true, false) if incoming.cvss_score.is_none() => return false,
+        (false, true) if existing.cvss_score.is_none() => return true,
+        _ => {}
+    }
+
     let existing_tier = severity_tier(existing.severity);
     let incoming_tier = severity_tier(incoming.severity);
     if incoming_tier < existing_tier {
