@@ -733,46 +733,82 @@ impl FormatHandler for NpmFormatHandler {
         Ok(resolve_semver_range_max(range, available))
     }
 
-    /// Compose the upstream tarball URL for an npm `(package, version)`
-    /// coordinate.
+    /// Resolve the authoritative tarball URL for `coords.version` from the
+    /// already-fetched packument — `versions[version].dist.tarball`, the
+    /// publisher-asserted origin (NOT a conventional `{base}/{pkg}/-/...`
+    /// path the registry happens to serve). This is the same `dist.tarball`
+    /// the client-driven pull-through resolves, so prefetch and serve-site
+    /// cannot diverge.
     ///
-    /// Conventional npm tarball path:
+    /// **Streaming.** `body` is a reader over the same packument the
+    /// orchestrator fetched for
+    /// [`parse_upstream_checksum`](Self::parse_upstream_checksum), so one
+    /// fetch yields both the checksum and the URL. The walk captures only
+    /// the target version's `dist.tarball` (memory bounded the same way the
+    /// checksum walk is — the 50 MiB packument never lands in a
+    /// `serde_json::Value` tree), under the streaming plausibility cap.
     ///
-    /// - **Unscoped** (`express` → `4.18.0`):
-    ///   `{upstream_url}/express/-/express-4.18.0.tgz`
-    /// - **Scoped** (`@types/node` → `20.0.0`):
-    ///   `{upstream_url}/@types/node/-/node-20.0.0.tgz`
-    ///
-    /// Note the scoped form uses the *unscoped basename* (`node`) in
-    /// the filename — this is the npm convention and matches
-    /// [`parse_download_path`](Self::parse_download_path)'s scoped
-    /// branch + the canonical logical path on
-    /// [`crate::npm::extract_upstream_tarball_url`]'s output (the
-    /// `https://registry.npmjs.org/{pkg}/-/{pkg}-{version}.tgz` shape).
-    ///
-    /// The implementation strips a trailing `/` from `upstream_url`
-    /// before composition so callers can pass either form. Returns a
-    /// single-element vec — npm publishes one tarball per version.
-    ///
-    /// Pure: no I/O. The leaf [`PrefetchIngestHandler`](
-    /// crate::npm) fetches the URL via `UpstreamProxy::fetch_artifact`
-    /// and ingests via `IngestUseCase::ingest_verified`.
-    fn build_pull_url(
+    /// The URL must be `https://` — `http://`, a missing scheme, or any
+    /// other scheme is rejected as `Validation` so no downgrade target is
+    /// ever promoted to a fetch URL. Error taxonomy mirrors the checksum
+    /// walk: missing-version-in-coords, no-versions-object,
+    /// version-not-found, missing-`dist.tarball`, non-https, input-size cap.
+    fn resolve_download_url_from_metadata(
         &self,
-        upstream_url: &str,
-        package: &str,
-        version: &str,
-    ) -> DomainResult<Vec<String>> {
-        if package.is_empty() || version.is_empty() {
-            return Err(DomainError::Validation(
-                "npm build_pull_url requires non-empty package and version".to_string(),
-            ));
+        body: &mut dyn std::io::Read,
+        coords: &ArtifactCoords,
+    ) -> DomainResult<String> {
+        let version = coords.version.as_deref().ok_or_else(|| {
+            DomainError::Validation(
+                "upstream npm packument parser requires a version in coords".to_string(),
+            )
+        })?;
+
+        // Same streaming plausibility cap + dedicated walk shape as
+        // `parse_upstream_checksum` (see that method for the cap-taxonomy
+        // note): capture ONLY the target version's `dist.tarball`.
+        let max = crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES;
+        let outcome = crate::stream_helpers::project_with_byte_cap(
+            body,
+            max,
+            NpmTarballUrlProjector {
+                version: version.to_string(),
+            },
+            |len, max| {
+                format!(
+                    "upstream metadata body is {len} bytes; streaming plausibility max is {max}"
+                )
+            },
+        )?;
+
+        let tarball = match outcome {
+            NpmTarballOutcome::Tarball(t) => t,
+            NpmTarballOutcome::VersionMissingTarball => {
+                return Err(DomainError::Validation(format!(
+                    "upstream npm version {}@{version} is missing dist.tarball",
+                    coords.name
+                )))
+            }
+            NpmTarballOutcome::VersionNotFound => {
+                return Err(DomainError::Validation(format!(
+                    "upstream npm packument has no version {version} for {}",
+                    coords.name
+                )))
+            }
+            NpmTarballOutcome::NoVersionsObject => {
+                return Err(DomainError::Validation(
+                    "upstream npm packument has no versions object".to_string(),
+                ))
+            }
+        };
+
+        if !tarball.starts_with("https://") {
+            return Err(DomainError::Validation(format!(
+                "upstream npm returned non-https tarball URL: {tarball}"
+            )));
         }
-        let base = upstream_url.trim_end_matches('/');
-        // Scoped basename: `@scope/pkg` → `pkg`. Unscoped: `pkg` → `pkg`.
-        let basename = package.rsplit('/').next().unwrap_or(package);
-        let url = format!("{base}/{package}/-/{basename}-{version}.tgz");
-        Ok(vec![url])
+
+        Ok(tarball)
     }
 }
 
@@ -1148,6 +1184,163 @@ struct NpmChecksumVersionEntry {
 #[derive(serde::Deserialize)]
 struct NpmChecksumDist {
     integrity: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Streaming tarball-URL walk for `resolve_download_url_from_metadata`
+// (see ADR 0026). Same serde-streaming technique as the checksum walk
+// (`deserialize_map` + `IgnoredAny`), capturing ONLY the target version's
+// `dist.tarball`. Memory is bounded by that single string.
+// ---------------------------------------------------------------------------
+
+/// What the streaming tarball walk found for the requested version.
+enum NpmTarballOutcome {
+    /// `versions[version].dist.tarball` string (validated downstream).
+    Tarball(String),
+    /// The version entry exists but has no `dist.tarball`.
+    VersionMissingTarball,
+    /// A `versions{}` object was present but lacked the requested version.
+    VersionNotFound,
+    /// No `versions{}` object at all (missing key OR non-object value).
+    NoVersionsObject,
+}
+
+struct NpmTarballUrlProjector {
+    version: String,
+}
+
+impl MetadataProjector for NpmTarballUrlProjector {
+    type Projection = NpmTarballOutcome;
+    fn project<R: std::io::Read>(self, reader: R) -> DomainResult<NpmTarballOutcome> {
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        serde::de::Deserializer::deserialize_map(
+            &mut de,
+            NpmTarballTopVisitor {
+                version: self.version,
+            },
+        )
+        .map_err(|e| {
+            DomainError::Validation(format!("upstream npm packument is not valid JSON: {e}"))
+        })
+    }
+}
+
+struct NpmTarballTopVisitor {
+    version: String,
+}
+
+impl<'de> serde::de::Visitor<'de> for NpmTarballTopVisitor {
+    type Value = NpmTarballOutcome;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an npm packument object")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<NpmTarballOutcome, A::Error> {
+        let mut outcome = NpmTarballOutcome::NoVersionsObject;
+        let mut seen_versions = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "versions" && !seen_versions {
+                seen_versions = true;
+                outcome = map.next_value_seed(NpmTarballVersionsSeed {
+                    version: &self.version,
+                })?;
+            } else {
+                let _: serde::de::IgnoredAny = map.next_value()?;
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+struct NpmTarballVersionsSeed<'a> {
+    version: &'a str,
+}
+
+impl<'de, 'a> serde::de::DeserializeSeed<'de> for NpmTarballVersionsSeed<'a> {
+    type Value = NpmTarballOutcome;
+    fn deserialize<D: serde::de::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<NpmTarballOutcome, D::Error> {
+        // `deserialize_any` so a non-object `versions` value maps to
+        // `NoVersionsObject` rather than a serde type error.
+        deserializer.deserialize_any(NpmTarballVersionsVisitor {
+            version: self.version,
+        })
+    }
+}
+
+struct NpmTarballVersionsVisitor<'a> {
+    version: &'a str,
+}
+
+impl<'de, 'a> serde::de::Visitor<'de> for NpmTarballVersionsVisitor<'a> {
+    type Value = NpmTarballOutcome;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the npm packument versions{} map")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<NpmTarballOutcome, A::Error> {
+        let mut result = NpmTarballOutcome::VersionNotFound;
+        while let Some(ver) = map.next_key::<String>()? {
+            if ver == self.version {
+                let entry: NpmTarballVersionEntry = map.next_value()?;
+                result = match entry.dist.and_then(|d| d.tarball) {
+                    Some(t) => NpmTarballOutcome::Tarball(t),
+                    None => NpmTarballOutcome::VersionMissingTarball,
+                };
+            } else {
+                let _: serde::de::IgnoredAny = map.next_value()?;
+            }
+        }
+        Ok(result)
+    }
+    // Any non-map `versions` value → no usable versions object.
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> Result<NpmTarballOutcome, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+    fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<NpmTarballOutcome, E> {
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<NpmTarballOutcome, E> {
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<NpmTarballOutcome, E> {
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+    fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<NpmTarballOutcome, E> {
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _v: i64) -> Result<NpmTarballOutcome, E> {
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _v: u64) -> Result<NpmTarballOutcome, E> {
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<NpmTarballOutcome, E> {
+        Ok(NpmTarballOutcome::NoVersionsObject)
+    }
+}
+
+/// Sparse per-version DTO for the tarball walk — only `dist.tarball`
+/// is captured; every other field passes through `deserialize_ignored_any`.
+#[derive(serde::Deserialize)]
+struct NpmTarballVersionEntry {
+    #[serde(default)]
+    dist: Option<NpmTarballDist>,
+}
+
+#[derive(serde::Deserialize)]
+struct NpmTarballDist {
+    tarball: Option<String>,
 }
 
 fn extract_version(filename: &str, basename: &str) -> Option<String> {
@@ -3086,57 +3279,135 @@ mod tests {
         assert_eq!(handler().resolve_range_max("^1.0", &[]).expect("Ok"), None);
     }
 
-    // -- build_pull_url ---------------------------------------------------
+    // -- resolve_download_url_from_metadata -------------------------------
 
     #[test]
-    fn build_pull_url_npm_unscoped_uses_canonical_tarball_path() {
-        // Mirrors the real registry URL shape:
-        // `https://registry.npmjs.org/express/-/express-4.18.2.tgz`.
-        let urls = handler()
-            .build_pull_url("https://registry.npmjs.org", "express", "4.18.2")
+    fn resolve_download_url_from_metadata_returns_authoritative_dist_tarball() {
+        // The authoritative URL is the packument's `dist.tarball`, NOT a
+        // composed `{base}/{pkg}/-/...` heuristic.
+        let body = br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://cdn.example.com/odd/pkg-1.0.0.tgz","integrity":"sha512-x"}}}}"#;
+        let coords = coords_for("pkg", Some("1.0.0"), "pkg/-/pkg-1.0.0.tgz");
+        let url = handler()
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
             .expect("Ok");
-        assert_eq!(
-            urls,
-            vec!["https://registry.npmjs.org/express/-/express-4.18.2.tgz".to_string()]
+        // Note: NOT registry-host-relative — it is the publisher-asserted CDN.
+        assert_eq!(url, "https://cdn.example.com/odd/pkg-1.0.0.tgz");
+    }
+
+    #[test]
+    fn resolve_download_url_from_metadata_real_express_fixture() {
+        let body = include_bytes!("../tests/fixtures/npm/express_4.18.2.packument.json");
+        let coords = coords_for("express", Some("4.18.2"), "express/-/express-4.18.2.tgz");
+        let url = handler()
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
+            .expect("Ok");
+        assert!(url.starts_with("https://"), "must be https: {url}");
+        assert!(
+            url.ends_with("express-4.18.2.tgz"),
+            "must point at the version-stamped tgz: {url}"
         );
     }
 
     #[test]
-    fn build_pull_url_npm_scoped_uses_unscoped_basename_in_filename() {
-        // Scoped tarball convention: `@types/node@20.0.0` lives at
-        // `/@types/node/-/node-20.0.0.tgz` (note the basename is the
-        // *unscoped* package name `node`, not `@types/node`).
-        let urls = handler()
-            .build_pull_url("https://registry.npmjs.org", "@types/node", "20.0.0")
-            .expect("Ok");
-        assert_eq!(
-            urls,
-            vec!["https://registry.npmjs.org/@types/node/-/node-20.0.0.tgz".to_string()]
-        );
-    }
-
-    #[test]
-    fn build_pull_url_npm_trims_trailing_slash_on_upstream_url() {
-        // Operators frequently set `upstream_url` with a trailing /.
-        // Composition strips it so the URL is well-formed (no double /).
-        let urls = handler()
-            .build_pull_url("https://registry.npmjs.org/", "lodash", "4.17.21")
-            .expect("Ok");
-        assert_eq!(
-            urls,
-            vec!["https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()]
-        );
-    }
-
-    #[test]
-    fn build_pull_url_npm_empty_package_or_version_is_validation_error() {
+    fn resolve_download_url_from_metadata_version_not_found_is_validation_error() {
+        let body = br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://x/y.tgz"}}}}"#;
+        let coords = coords_for("pkg", Some("99.99.99"), "pkg/-/pkg-99.99.99.tgz");
         let err = handler()
-            .build_pull_url("https://r.example.com", "", "1.0.0")
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("no version 99.99.99"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_from_metadata_missing_dist_tarball_is_validation_error() {
+        // Version present, `dist` present, but no `tarball`.
+        let body = br#"{"versions":{"1.0.0":{"dist":{"integrity":"sha512-x"}}}}"#;
+        let coords = coords_for("pkg", Some("1.0.0"), "pkg/-/pkg-1.0.0.tgz");
         let err = handler()
-            .build_pull_url("https://r.example.com", "lodash", "")
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("missing dist.tarball"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_from_metadata_non_https_is_validation_error() {
+        // A http:// (downgrade) target must be rejected, never promoted to
+        // a fetch URL.
+        let body =
+            br#"{"versions":{"1.0.0":{"dist":{"tarball":"http://insecure.example/p.tgz"}}}}"#;
+        let coords = coords_for("pkg", Some("1.0.0"), "pkg/-/pkg-1.0.0.tgz");
+        let err = handler()
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("non-https"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_from_metadata_no_versions_object_is_validation_error() {
+        let body = br#"{"name":"pkg","dist-tags":{}}"#;
+        let coords = coords_for("pkg", Some("1.0.0"), "pkg/-/pkg-1.0.0.tgz");
+        let err = handler()
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("no versions object"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_from_metadata_versions_not_object_is_validation_error() {
+        // A non-object `versions` value collapses to "no versions object".
+        let body = br#"{"versions":["not","an","object"]}"#;
+        let coords = coords_for("pkg", Some("1.0.0"), "pkg/-/pkg-1.0.0.tgz");
+        let err = handler()
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("no versions object"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_from_metadata_malformed_json_is_validation_error() {
+        let body = b"not json at all";
+        let coords = coords_for("pkg", Some("1.0.0"), "pkg/-/pkg-1.0.0.tgz");
+        let err = handler()
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("not valid JSON"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_from_metadata_requires_version_in_coords() {
+        let body = br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://x/y.tgz"}}}}"#;
+        let coords = coords_for("pkg", None, "pkg/-/pkg-1.0.0.tgz");
+        let err = handler()
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(&body[..]), &coords)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("requires a version in coords"),
+            "unexpected message: {err}"
+        );
     }
 }

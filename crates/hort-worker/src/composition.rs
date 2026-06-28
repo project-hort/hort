@@ -727,13 +727,13 @@ pub async fn build_app_context(
     //          keyed on the concrete version.
     //
     //          `PrefetchIngestHandler` — leaf-ingest. Per claimed
-    //          `prefetch` row: composes the upstream pull URL via
-    //          `FormatHandler::build_pull_url`, fetches via
-    //          `UpstreamProxy::fetch_artifact`, and ingests via
-    //          `IngestUseCase::ingest_verified`. PyPI fans out
-    //          per-distribution from the per-version JSON manifest.
-    //          `PullDedup` single-flights the prefetch-vs-client-pull
-    //          race.
+    //          `prefetch` row: resolves the AUTHORITATIVE upstream
+    //          download URL (cargo from the index `config.json` `dl`
+    //          field; npm from the packument `dist.tarball`; PyPI fans
+    //          out per-distribution from the per-version JSON manifest),
+    //          fetches via `UpstreamProxy::fetch_artifact`, and ingests
+    //          via `IngestUseCase::ingest_verified`. `PullDedup`
+    //          single-flights the prefetch-vs-client-pull race.
     //
     //          `PrefetchRowRetentionSweepHandler` — periodically
     //          deletes terminal `prefetch%` rows older than a

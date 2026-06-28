@@ -626,7 +626,9 @@ npm/cargo/pypi implement them.
 | `upstream_metadata_accept(&self) -> Vec<String>` | `vec![]` | the metadata fetch needs an `Accept` header (PyPI PEP 691 JSON negotiation). |
 | `extract_dependency_specs(&self, content: &mut dyn Read) -> DomainResult<Vec<DependencySpec>>` | `Ok(vec![])` | the format declares runtime deps inside its archive (npm `package.json`, cargo `Cargo.toml`, PyPI `METADATA`). **Runtime classes only** — never dev/test/peer. **Streaming** (ADR 0026, archive-aware). |
 | `resolve_range_max(&self, range, available) -> DomainResult<Option<String>>` | `Ok(None)` | the format has a version-range grammar (`^1.2`, `>=2,<3`, `[1.0,2.0)`). Range-max only, not a SAT solver. |
-| `build_pull_url(&self, upstream_url, package, version) -> DomainResult<Vec<String>>` | `Ok(vec![])` | the leaf prefetch needs composed pull URL(s) (npm tarball path, cargo `…/download`). PyPI returns `vec![]` (re-fetches the per-version JSON instead). |
+| `download_config_path(&self) -> Option<String>` | `None` | the leaf prefetch must fetch a registry config doc to learn its download URL (cargo `/config.json`, whose `dl` field is authoritative). Pairs with `compose_download_url_from_config`. |
+| `compose_download_url_from_config(&self, config_body, package, version, cksum_hex) -> DomainResult<String>` | `Err(Validation)` | the format composes its download URL from the config doc (cargo: parse `dl` + substitute the spec placeholders). Reached only when `download_config_path` returns `Some`. |
+| `resolve_download_url_from_metadata(&self, body: &mut dyn Read, coords) -> DomainResult<String>` | `Err(Validation)` | the AUTHORITATIVE download URL lives in the already-fetched upstream metadata (npm `versions[ver].dist.tarball`). **Streaming** (ADR 0026); rejects non-`https`. PyPI fans out per-distribution from the per-version JSON instead; cargo uses the config-doc pair above. |
 
 ### SBOM / content extraction
 
