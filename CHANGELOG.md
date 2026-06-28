@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.6] - 2026-06-27
 
-Beta release (`0.9.6-beta.3`). Headlines: scan-policy is now **continuously
+Beta release (`0.9.6-beta.4`). Headlines: scan-policy is now **continuously
 enforced** — a gate-affecting policy change re-derives every in-scope artifact's
 verdict from its stored findings in **both directions**, closing a fail-open
 where a tightened policy left already-decided artifacts un-re-evaluated (ADR 0041);
