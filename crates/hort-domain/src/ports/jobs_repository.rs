@@ -204,7 +204,11 @@ pub struct JobRow {
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
-    pub result_summary: Option<String>,
+    /// Deserialized `result_summary` JSONB — the handler's
+    /// `TaskOutcome::Completed { result_summary }`. `None` when the column
+    /// is SQL NULL (no summary). A structured value, NOT a string: the
+    /// column is `jsonb`, so this mirrors [`Self::params`].
+    pub result_summary: Option<serde_json::Value>,
     /// Kind-specific typed projection. See [`KindFields`].
     pub kind_fields: KindFields,
 }
