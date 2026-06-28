@@ -557,54 +557,89 @@ pub trait FormatHandler: Send + Sync {
     /// [`crate::ports::task_handler::TaskHandler`] `kind = "prefetch"`)
     /// should `fetch_artifact` against. The trait method stays
     /// **I/O-free** — the caller has already resolved a concrete
-    /// version, so URL composition
-    /// is a pure string operation per format:
+    /// The path, relative to the upstream index host, of the registry
+    /// configuration document this format must fetch to learn its download
+    /// URL. `Some(path)` tells the prefetch orchestrator to fetch that
+    /// document and hand its body to
+    /// [`compose_download_url_from_config`](Self::compose_download_url_from_config);
+    /// `None` (the default) means the format's download URL comes from the
+    /// already-fetched upstream metadata via
+    /// [`resolve_download_url_from_metadata`](Self::resolve_download_url_from_metadata)
+    /// instead (npm) or from a per-distribution fan-out the orchestrator
+    /// special-cases (pypi).
     ///
-    /// - **npm** — single URL: the conventional npm tarball path
-    ///   `{upstream_url}/{name}/-/{name}-{version}.tgz` (scoped packages
-    ///   use the *unscoped* basename in the filename per the npm
-    ///   convention: `@scope/pkg → /@scope/pkg/-/pkg-{version}.tgz`).
-    ///   `vec![url]`.
-    /// - **cargo** — single URL: the spec-default sparse-index download
-    ///   suffix `{upstream_url}/{name}/{version}/download` (the
-    ///   crates.io shape; private registries with custom `dl` templates
-    ///   that diverge from this need to expose the conventional path
-    ///   too — the leaf handler does not fetch `config.json`). `vec![url]`.
-    /// - **pypi** — returns `Ok(Vec::new())`. PyPI's per-version
-    ///   manifest enumerates a variable number of distributions
-    ///   (sdist + N wheels) with per-file checksums; the leaf handler
-    ///   resolves them by re-fetching the per-version JSON manifest
-    ///   (which the upstream-checksum-parse path already fetches via
-    ///   [`upstream_checksum_metadata_path`](Self::upstream_checksum_metadata_path)),
-    ///   not via this trait method. Keeping the trait method pure
-    ///   forbids encoding the fan-out here.
-    /// - **oci / maven / helm / rpm / debian / generic** — default
-    ///   `Ok(Vec::new())`. The leaf prefetch handler reads an empty
-    ///   vec as "format has no compose-style URL" and skips.
+    /// cargo returns `Some("/config.json")` — the sparse-registry index
+    /// config (<https://doc.rust-lang.org/cargo/reference/registry-index.html#index-configuration>),
+    /// whose `dl` field is the authoritative download-URL template. Every
+    /// other format inherits the `None` default.
+    fn download_config_path(&self) -> Option<String> {
+        None
+    }
+
+    /// Compose the absolute download URL for `(package, version)` from a
+    /// separately-fetched registry configuration document — cargo's
+    /// `config.json` (`dl` field), as identified by
+    /// [`download_config_path`](Self::download_config_path).
     ///
-    /// `upstream_url` is the mapping's `upstream_url` field (a non-
-    /// `/`-terminated absolute URL like `https://registry.npmjs.org`);
-    /// composition trims a trailing `/` on `upstream_url` if present.
+    /// `body` is a streaming reader over the config document, mirroring the
+    /// other `FormatHandler` body methods (ADR 0026 — the body never lands
+    /// in a buffer at the port boundary). The config document is tiny and
+    /// fixed (`{"dl":…,"api":…}`), so the impl reads it under a small
+    /// bounded cap (defence-in-depth above the fetch-time storage backstop);
+    /// a body over the cap is rejected as `Validation`.
     ///
-    /// Returning `Err` is reserved for genuinely structural errors
-    /// (e.g. an empty package name) — an unsupported format must
-    /// return `Ok(vec![])`, not `Err`, so the cascade silently moves
-    /// on instead of failing the whole walk.
+    /// `cksum_hex` is the verified upstream checksum hex (consumed by the
+    /// `{sha256-checksum}` `dl` placeholder for registries that template on
+    /// it; `None` leaves the placeholder unsubstituted so the upstream
+    /// request 404s naturally rather than routing to a wrong URL).
     ///
-    /// Same shape contract as
-    /// [`extract_dependency_specs`](Self::extract_dependency_specs) +
-    /// [`resolve_range_max`](Self::resolve_range_max)
-    /// and [`extract_upstream_versions`](Self::extract_upstream_versions):
-    /// the same pattern (opaque default + per-format override) so new
-    /// formats opt in without touching the cascade.
-    fn build_pull_url(
+    /// cargo parses the body and substitutes the spec's five `dl`
+    /// placeholders (or appends the spec-default `/{crate}/{version}/download`
+    /// suffix when the template has none).
+    ///
+    /// Default returns `Err(DomainError::Validation(...))`: a format that
+    /// returns `None` from `download_config_path` has no config-driven
+    /// download URL and must never reach this method.
+    fn compose_download_url_from_config(
         &self,
-        upstream_url: &str,
+        body: &mut dyn std::io::Read,
         package: &str,
         version: &str,
-    ) -> DomainResult<Vec<String>> {
-        let _ = (upstream_url, package, version);
-        Ok(Vec::new())
+        cksum_hex: Option<&str>,
+    ) -> DomainResult<String> {
+        let _ = (body, package, version, cksum_hex);
+        Err(DomainError::Validation(
+            "compose_download_url_from_config not supported for this format".into(),
+        ))
+    }
+
+    /// Resolve the authoritative absolute download URL for `coords.version`
+    /// from the already-fetched upstream metadata body — npm's packument
+    /// `versions[version].dist.tarball`, the publisher-asserted tarball
+    /// origin (NOT a conventional path the registry happens to serve).
+    ///
+    /// `body` is a streaming reader over the same metadata document the
+    /// orchestrator fetched for
+    /// [`parse_upstream_checksum`](Self::parse_upstream_checksum), so the
+    /// npm arm resolves the URL and the checksum from one fetch. The parse
+    /// is memory-bounded the same way `parse_upstream_checksum` is (it
+    /// captures only the target version's `dist.tarball`, never the whole
+    /// packument). The resolved URL must be `https://` — a non-`https`
+    /// origin is rejected as `Validation` so no downgrade target is ever
+    /// promoted to a fetch URL.
+    ///
+    /// Default returns `Err(DomainError::Validation(...))`: a format that
+    /// resolves its download URL another way (cargo via config, pypi via
+    /// per-distribution fan-out) must never reach this method.
+    fn resolve_download_url_from_metadata(
+        &self,
+        body: &mut dyn std::io::Read,
+        coords: &ArtifactCoords,
+    ) -> DomainResult<String> {
+        let _ = (body, coords);
+        Err(DomainError::Validation(
+            "resolve_download_url_from_metadata not supported for this format".into(),
+        ))
     }
 
     /// Resolve a mutable (re-deployable) version request to the concrete,
@@ -1136,35 +1171,91 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // `build_pull_url` default impl
+    // download-URL resolution default impls
     // -------------------------------------------------------------------
 
     #[test]
-    fn default_build_pull_url_returns_empty_vec() {
-        // Opaque-format default: a handler that does not override
-        // returns `Ok(Vec::new())` regardless of inputs. The
-        // PrefetchIngestHandler reads this as "format has no pull-URL
-        // concept" and skips. Regression guard: changing the default
-        // to a non-empty Vec would silently start enqueuing pull URLs
-        // for every handler that inherits it, including OCI / generic
-        // / raw uploads.
-        let result =
-            DefaultsOnlyHandler.build_pull_url("https://registry.example.com", "lodash", "4.17.21");
-        assert_eq!(result.expect("Ok"), Vec::<String>::new());
+    fn default_download_config_path_is_none() {
+        // Opaque-format default: a handler that does not override resolves
+        // its download URL without a separate config document. The prefetch
+        // orchestrator reads `None` as "no config.json leg".
+        assert_eq!(DefaultsOnlyHandler.download_config_path(), None);
     }
 
     #[test]
-    fn default_build_pull_url_does_not_inspect_inputs() {
-        // The default does not parse — well-formed inputs, empty
-        // inputs, and garbage all yield the same empty Vec. Pins the
-        // no-inspection contract for reviewers.
-        for (url, pkg, ver) in [
-            ("https://r.example.com", "name", "1.0.0"),
-            ("", "", ""),
-            ("not-a-url", "<<weird>>", "neither-this"),
+    fn default_compose_download_url_from_config_returns_validation_error() {
+        // A format that returns `None` from `download_config_path` must
+        // never reach this method; the fail-safe default is a Validation
+        // error (NOT a fabricated URL).
+        let err = DefaultsOnlyHandler
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(b"{}"),
+                "lodash",
+                "4.17.21",
+                None,
+            )
+            .expect_err("default must error");
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn default_compose_download_url_from_config_ignores_inputs() {
+        // The default does not parse — well-formed body, empty inputs, and
+        // garbage all yield the same Validation error.
+        for (body, pkg, ver, cksum) in [
+            (&br#"{"dl":"x"}"#[..], "name", "1.0.0", Some("abc")),
+            (&b""[..], "", "", None),
+            (&b"<<weird>>"[..], "<<x>>", "neither", Some("")),
         ] {
-            let r = DefaultsOnlyHandler.build_pull_url(url, pkg, ver);
-            assert_eq!(r.expect("Ok"), Vec::<String>::new());
+            let r = DefaultsOnlyHandler.compose_download_url_from_config(
+                &mut std::io::Cursor::new(body),
+                pkg,
+                ver,
+                cksum,
+            );
+            assert!(matches!(r, Err(DomainError::Validation(_))), "got {r:?}");
+        }
+    }
+
+    #[test]
+    fn default_resolve_download_url_from_metadata_returns_validation_error() {
+        // A format that resolves its URL another way (cargo via config,
+        // pypi via fan-out) must never reach this method; the fail-safe
+        // default is a Validation error.
+        let coords = ArtifactCoords {
+            name: "lodash".into(),
+            name_as_published: "lodash".into(),
+            version: Some("4.17.21".into()),
+            path: String::new(),
+            format: RepositoryFormat::Npm,
+            metadata: serde_json::Value::Null,
+        };
+        let err = DefaultsOnlyHandler
+            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(b"{}"), &coords)
+            .expect_err("default must error");
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn default_resolve_download_url_from_metadata_does_not_inspect_body() {
+        // The default does not parse — well-formed JSON, malformed bytes,
+        // and empty input all yield the same Validation error.
+        let coords = ArtifactCoords {
+            name: "x".into(),
+            name_as_published: "x".into(),
+            version: Some("1.0.0".into()),
+            path: String::new(),
+            format: RepositoryFormat::Npm,
+            metadata: serde_json::Value::Null,
+        };
+        for body in [
+            &b""[..],
+            &br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://x/y.tgz"}}}}"#[..],
+            &b"<<not even close>>"[..],
+        ] {
+            let r = DefaultsOnlyHandler
+                .resolve_download_url_from_metadata(&mut std::io::Cursor::new(body), &coords);
+            assert!(matches!(r, Err(DomainError::Validation(_))), "got {r:?}");
         }
     }
 

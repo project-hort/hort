@@ -120,17 +120,44 @@ roles:
 leaf kind. Per claimed row it loads the repository and format handler,
 resolves the catch-all upstream mapping (`path_prefix = ""`), fetches
 the upstream metadata body so `FormatHandler::parse_upstream_checksum`
-can recover the upstream-published checksum, composes the artifact
-URL(s) via `FormatHandler::build_pull_url`, and per URL runs
-`UpstreamProxy::fetch_artifact` →
-`IngestUseCase::ingest_verified` with the upstream-published checksum
-as the integrity target. PyPI is the multi-distribution special case:
-one version maps to many files (sdist + wheels) with per-file
-checksums, so the leaf fans out over the per-version JSON manifest's
-`urls[]` array, one verified ingest per distribution. Individual URL
-failures are non-fatal — the leaf completes with
+can recover the upstream-published checksum, resolves the
+**authoritative** download URL from that upstream metadata, and per URL
+runs `UpstreamProxy::fetch_artifact` → `IngestUseCase::ingest_verified`
+with the upstream-published checksum as the integrity target.
+
+The download URL is never a heuristic — each format resolves the URL
+its protocol spec defines, the same resolution the client-driven
+pull-through uses, so prefetch and serve-site cannot diverge:
+
+- **cargo** — the URL comes from the sparse-index `config.json` `dl`
+  field, not the index host. The leaf fetches `config.json`
+  (`FormatHandler::download_config_path`, honouring
+  `repository.index_upstream_url` for the metadata legs) and composes
+  via `FormatHandler::compose_download_url_from_config` — which parses
+  the `dl` template and substitutes the spec's five placeholders, or
+  appends the spec-default `/{crate}/{version}/download` suffix when the
+  template has none (crates.io's shape →
+  `https://static.crates.io/crates/{crate}/{version}/download`). The
+  download leg follows the resolved (absolute) `dl` URL, so the
+  index-host override never affects it.
+- **npm** — the URL is the packument's
+  `versions[version].dist.tarball`, the publisher-asserted origin
+  (`FormatHandler::resolve_download_url_from_metadata`), recovered from
+  the same packument body already fetched for the checksum (one fetch,
+  two memory-bounded streaming walks). A non-`https` tarball is
+  rejected.
+- **PyPI** — the multi-distribution special case: one version maps to
+  many files (sdist + wheels) with per-file checksums, so the leaf fans
+  out over the per-version JSON manifest's `urls[]` array, one verified
+  ingest per distribution.
+- **Other formats** (OCI, Maven, generic) inherit no resolution method
+  and short-circuit — they have no compose-style prefetch URL.
+
+Individual URL failures are non-fatal — the leaf completes with
 `urls_attempted / urls_succeeded / urls_failed` counts in its
-`result_summary`, and the next pull re-derives anything missed.
+`result_summary`, and the next pull re-derives anything missed. A
+config.json / metadata fetch or compose failure short-circuits the
+leaf (it never falls back to a guessed URL).
 
 All prefetch rows carry `priority = 0`, so manual, cron, and advisory
 work drains first. Warming is a background concern; starving it under
@@ -348,9 +375,10 @@ best-effort, and starvable.
 ## Related pages
 
 - [Format handlers](format-handlers.md) — the `FormatHandler` port the
-  pipeline leans on (`normalize_name`, `build_pull_url`,
-  `parse_upstream_checksum`, `extract_dependency_specs`,
-  `resolve_range_max`).
+  pipeline leans on (`normalize_name`, `download_config_path` /
+  `compose_download_url_from_config` /
+  `resolve_download_url_from_metadata`, `parse_upstream_checksum`,
+  `extract_dependency_specs`, `resolve_range_max`).
 - [Content-addressable storage](cas-storage.md) — where the warmed
   bytes land.
 - [Event sourcing](event-sourcing.md) — the lifecycle events a

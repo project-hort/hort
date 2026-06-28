@@ -62,6 +62,15 @@ const CARGO_CRATE_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// cap.
 const CARGO_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 
+/// Parser-input sanity cap for the sparse-registry index `config.json`
+/// ([`CargoFormatHandler::compose_download_url_from_config`] reads it). The
+/// document is a tiny fixed object (`{"dl":…,"api":…}`, typically < 256 B);
+/// 64 KiB is generous defence-in-depth above the fetch-time storage
+/// backstop while tight enough to reject a pathological body without an
+/// unbounded read. Far below `CARGO_MANIFEST_MAX_BYTES` — `config.json` is
+/// structurally smaller than a manifest.
+const CARGO_CONFIG_MAX_BYTES: usize = 64 * 1024;
+
 /// Validate that `name` is a legal cargo crate name per the upstream
 /// grammar (`[a-zA-Z0-9_-]{1,64}`).
 ///
@@ -714,51 +723,63 @@ impl FormatHandler for CargoFormatHandler {
         Ok(resolve_semver_range_max(range, available))
     }
 
-    /// Compose the upstream `.crate` URL for a `(crate, version)` coordinate.
-    /// See explanation/prefetch-pipeline.md.
+    /// cargo's download URL is authoritatively defined by the sparse
+    /// registry index `config.json` `dl` field, so the prefetch
+    /// orchestrator must fetch `/config.json` from the index host before it
+    /// can compose a download URL. See `explanation/prefetch-pipeline.md`
+    /// and <https://doc.rust-lang.org/cargo/reference/registry-index.html#index-configuration>.
+    fn download_config_path(&self) -> Option<String> {
+        Some("/config.json".to_string())
+    }
+
+    /// Compose the absolute `.crate` download URL for `(package, version)`
+    /// from the registry's `config.json` document — the authoritative
+    /// resolution the cargo spec prescribes (the `dl` field), identical to
+    /// the client-driven pull-through's
+    /// [`compose_download_url`](crate::cargo::config::compose_download_url)
+    /// path so prefetch and serve-site cannot diverge.
     ///
-    /// Uses the **spec-default sparse-index download suffix**:
-    /// `{upstream_url}/{name}/{version}/download`. This is the shape
-    /// `crates.io` serves (the `dl` field on its `config.json` has no
-    /// placeholders, so the spec mandates appending the suffix); it
-    /// also matches every public-mirror Cargo registry observed in practice.
+    /// **Streaming** (ADR 0026): `body` is a `&mut dyn Read` so the document
+    /// never lands in a buffer at the port boundary. It is read under a
+    /// small bounded cap ([`CARGO_CONFIG_MAX_BYTES`] = 64 KiB — `config.json`
+    /// is a tiny fixed object) via
+    /// [`read_to_capped_vec`](crate::stream_helpers::read_to_capped_vec); a
+    /// body over the cap is rejected as `Validation` before parsing.
     ///
-    /// **Private registries with custom `dl` templates** (e.g.
-    /// `{prefix}/{lowerprefix}/{crate}-{version}.crate`) are NOT
-    /// resolved here — the trait method is pure, so it cannot fetch
-    /// the registry's `config.json` to discover the template. An
-    /// operator running such a registry must ensure the conventional
-    /// `/{name}/{version}/download` path also resolves (most do, via
-    /// a 302 redirect to the templated URL); otherwise the leaf
-    /// prefetch ingest fails its `fetch_artifact` and the cohort
-    /// degrades to the existing hot-path serve-site pull-through when
-    /// a client requests the crate. This is a deliberate scope cap —
-    /// adding `config.json` resolution would either bind `build_pull_url`
-    /// to the `UpstreamProxy` port (breaking trait purity) or duplicate
-    /// the `resolve_registry_config` logic that already lives in
-    /// `hort-http-cargo` (a layering violation). The right fix when
-    /// private registries with non-conventional `dl` templates become a
-    /// real operator pain point is to move the per-crate URL composition
-    /// into a richer cascade-driver crate that owns both layers.
-    ///
-    /// Returns `Err(Validation)` for empty package or version (a
-    /// genuinely structural error). Strips trailing `/` on
-    /// `upstream_url`. Single-element vec — cargo publishes one
-    /// `.crate` per version.
-    fn build_pull_url(
+    /// Parses the bytes via
+    /// [`parse_registry_config`](crate::cargo::config::parse_registry_config)
+    /// (a malformed body / missing `dl` is `Validation`), then substitutes
+    /// the spec's five `dl` placeholders — or appends the spec-default
+    /// `/{crate}/{version}/download` suffix when the template has none
+    /// (crates.io's shape). `cksum_hex` feeds the `{sha256-checksum}`
+    /// placeholder for registries that template on it.
+    fn compose_download_url_from_config(
         &self,
-        upstream_url: &str,
+        body: &mut dyn std::io::Read,
         package: &str,
         version: &str,
-    ) -> DomainResult<Vec<String>> {
-        if package.is_empty() || version.is_empty() {
-            return Err(DomainError::Validation(
-                "cargo build_pull_url requires non-empty package and version".to_string(),
-            ));
+        cksum_hex: Option<&str>,
+    ) -> DomainResult<String> {
+        let buf =
+            crate::stream_helpers::read_to_capped_vec(body, CARGO_CONFIG_MAX_BYTES, |len, max| {
+                format!("cargo config.json body is {len} bytes; cargo config max is {max}")
+            })?;
+        let config = config::parse_registry_config(&buf)?;
+        let url = config::compose_download_url(&config, package, version, cksum_hex);
+        // Defense-in-depth, symmetric with npm's
+        // `resolve_download_url_from_metadata` scheme reject: the `dl` value is
+        // asserted by the upstream registry's `config.json`, so a hostile or
+        // compromised registry could point it at a non-http(s) target
+        // (`file://`, `ftp://`, a schemeless string, …). Reject a non-http(s)
+        // scheme at resolution so it never reaches the fetch layer. `http` is
+        // permitted — cargo plaintext is the operator-tracked
+        // `insecure_upstream_url` opt-in (unlike npm's stricter https-only).
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(DomainError::Validation(format!(
+                "cargo registry config `dl` composed a non-http(s) download URL: {url}"
+            )));
         }
-        let base = upstream_url.trim_end_matches('/');
-        let url = format!("{base}/{package}/{version}/download");
-        Ok(vec![url])
+        Ok(url)
     }
 }
 
@@ -2149,42 +2170,155 @@ version = "1.0.0"
         assert_eq!(handler().resolve_range_max("^1.0", &[]).expect("Ok"), None);
     }
 
-    // -- build_pull_url ------------------------------------------------------
+    // -- download_config_path / compose_download_url_from_config -------------
 
     #[test]
-    fn build_pull_url_cargo_uses_spec_default_download_suffix() {
-        // Spec default (no `dl` placeholders → append `/{crate}/{version}/download`):
-        // crates.io's actual `dl` template is `https://static.crates.io/crates`
-        // and downloads resolve via the appended suffix.
-        let urls = handler()
-            .build_pull_url("https://static.crates.io/crates", "serde", "1.0.214")
-            .expect("Ok");
+    fn download_config_path_is_config_json() {
+        // cargo's download URL is config.json-driven: the prefetch
+        // orchestrator must fetch `/config.json` from the index host.
         assert_eq!(
-            urls,
-            vec!["https://static.crates.io/crates/serde/1.0.214/download".to_string()]
+            handler().download_config_path(),
+            Some("/config.json".to_string())
         );
     }
 
     #[test]
-    fn build_pull_url_cargo_trims_trailing_slash_on_upstream_url() {
-        let urls = handler()
-            .build_pull_url("https://static.crates.io/crates/", "tokio", "1.36.0")
+    fn compose_download_url_from_config_crates_io_uses_dl_field_not_index_host() {
+        // crates.io-shaped config.json (placeholder-free `dl`) → the spec
+        // default suffix is appended to the `dl` host, NOT the index host.
+        // This is the bug fix: the URL must point at static.crates.io
+        // (the `dl` value), never index.crates.io.
+        let body = include_bytes!("../tests/fixtures/cargo/crates_io_config.json");
+        let url = handler()
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(&body[..]),
+                "serde",
+                "1.0.214",
+                None,
+            )
             .expect("Ok");
         assert_eq!(
-            urls,
-            vec!["https://static.crates.io/crates/tokio/1.36.0/download".to_string()]
+            url,
+            "https://static.crates.io/crates/serde/1.0.214/download"
         );
     }
 
     #[test]
-    fn build_pull_url_cargo_empty_package_or_version_is_validation_error() {
+    fn compose_download_url_from_config_private_registry_templated_dl() {
+        // A private registry with a templated `dl`
+        // (`{prefix}/{lowerprefix}/{crate}-{version}.crate`) composes via
+        // the spec placeholders — the case the old heuristic could never
+        // resolve.
+        let body = include_bytes!("../tests/fixtures/cargo/private_registry_config.json");
+        let url = handler()
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(&body[..]),
+                "serde",
+                "1.0.214",
+                None,
+            )
+            .expect("Ok");
+        assert_eq!(
+            url,
+            "https://artifacts.example.com/se/rd/se/rd/serde-1.0.214.crate"
+        );
+    }
+
+    #[test]
+    fn compose_download_url_from_config_checksum_template_substitutes_cksum() {
+        let body = include_bytes!("../tests/fixtures/cargo/template_with_checksum.json");
+        let cksum = "f55c3193aca71c12ad7890f1785d2b73e1b9f63a0bbc353c08ef26fe03fc56b5";
+        let url = handler()
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(&body[..]),
+                "serde",
+                "1.0.214",
+                Some(cksum),
+            )
+            .expect("Ok");
+        assert_eq!(
+            url,
+            format!("https://artifacts.example.com/crates/serde/1.0.214/{cksum}.crate")
+        );
+    }
+
+    #[test]
+    fn compose_download_url_from_config_malformed_body_is_validation_error() {
+        // A garbage / missing-`dl` config.json fails closed (Validation),
+        // never a fabricated URL.
+        for body in [&b"not-json"[..], &br#"{"api":"https://x"}"#[..]] {
+            let err = handler()
+                .compose_download_url_from_config(
+                    &mut std::io::Cursor::new(body),
+                    "serde",
+                    "1.0.0",
+                    None,
+                )
+                .unwrap_err();
+            assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn compose_download_url_from_config_body_over_cap_is_validation_error() {
+        // A pathological config.json over CARGO_CONFIG_MAX_BYTES is rejected
+        // by the bounded read BEFORE parsing — defence-in-depth above the
+        // fetch-time storage backstop (never an unbounded read).
+        let body = vec![b' '; CARGO_CONFIG_MAX_BYTES + 1];
         let err = handler()
-            .build_pull_url("https://r.example.com", "", "1.0.0")
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(&body[..]),
+                "serde",
+                "1.0.0",
+                None,
+            )
             .unwrap_err();
-        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("cargo config max is"),
+            "over-cap error must name the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn compose_download_url_from_config_non_http_scheme_is_validation_error() {
+        // A hostile / compromised registry `config.json` could assert a
+        // non-http(s) `dl` (a downgrade / exfil target). It is rejected at
+        // resolution — symmetric with npm's tarball scheme reject — before it
+        // can reach the fetch layer.
+        let body = br#"{"dl":"ftp://evil.example.com/crates","api":"https://crates.io"}"#;
         let err = handler()
-            .build_pull_url("https://r.example.com", "serde", "")
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(&body[..]),
+                "serde",
+                "1.0.0",
+                None,
+            )
             .unwrap_err();
-        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("non-http(s)"),
+            "scheme-reject error must name the cause: {err}"
+        );
+    }
+
+    #[test]
+    fn compose_download_url_from_config_allows_http_scheme() {
+        // `http` IS permitted (unlike npm's https-only): cargo plaintext is the
+        // operator-tracked `insecure_upstream_url` opt-in, so the resolution
+        // layer allows it and leaves the plaintext decision to that gate.
+        let body = br#"{"dl":"http://internal-mirror.example.com/crates"}"#;
+        let url = handler()
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(&body[..]),
+                "serde",
+                "1.0.0",
+                None,
+            )
+            .expect("http dl is allowed");
+        assert_eq!(
+            url,
+            "http://internal-mirror.example.com/crates/serde/1.0.0/download"
+        );
     }
 }

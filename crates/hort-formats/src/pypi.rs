@@ -1072,40 +1072,6 @@ impl FormatHandler for PyPiFormatHandler {
     fn resolve_range_max(&self, range: &str, available: &[&str]) -> DomainResult<Option<String>> {
         Ok(resolve_pep440_range_max(range, available))
     }
-
-    /// PyPI returns the empty vec from `build_pull_url`.
-    ///
-    /// PyPI publishes a variable number of distributions per version
-    /// (sdist + N wheels, each with its own checksum); a single
-    /// `(package, version)` coordinate corresponds to MULTIPLE
-    /// downloadable files. Composing those URLs requires fetching the
-    /// per-version JSON manifest at
-    /// `{upstream_url}/pypi/{normalized_name}/{version}/json` and
-    /// walking its `urls[]` array — an I/O step that breaks the
-    /// trait's purity contract.
-    ///
-    /// The leaf [`PrefetchIngestHandler`](
-    /// crate::pypi) therefore special-cases PyPI: it uses
-    /// [`upstream_checksum_metadata_path`](Self::upstream_checksum_metadata_path)
-    /// to discover the per-version JSON URL, fetches it via
-    /// `UpstreamProxy::fetch_metadata`, parses `urls[]` to enumerate
-    /// the per-distribution files, and ingests each via
-    /// `IngestUseCase::ingest_verified`. Mirrors the hot-path
-    /// `fire_prefetch_trigger_pypi` fan-out in
-    /// `crates/hort-http-pypi/src/simple_index.rs`.
-    ///
-    /// Returns `Ok(Vec::new())` unconditionally — the leaf handler
-    /// detects PyPI by `format_key() == "pypi"` and dispatches to
-    /// the JSON-manifest-fan-out path instead of iterating the empty
-    /// vec.
-    fn build_pull_url(
-        &self,
-        _upstream_url: &str,
-        _package: &str,
-        _version: &str,
-    ) -> DomainResult<Vec<String>> {
-        Ok(Vec::new())
-    }
 }
 
 /// Locate the first `*.dist-info/METADATA` member in a wheel ZIP byte buffer
@@ -3686,23 +3652,6 @@ Requires-Dist: requests[socks] (>=2.31)\n\
         let avail = ["1.0.0", "2.0.0a1", "1.5.0"];
         let out = handler().resolve_range_max(">=1.0", &avail).expect("Ok");
         assert_eq!(out.as_deref(), Some("1.5.0"));
-    }
-
-    // -- build_pull_url ------------------------------------------------------
-
-    #[test]
-    fn build_pull_url_pypi_returns_empty_vec_for_multi_distribution_format() {
-        // PyPI publishes multiple distributions per version (sdist +
-        // wheels); a single (package, version) coordinate cannot be
-        // resolved to a single URL by a pure string operation. The
-        // PrefetchIngestHandler special-cases PyPI and fans out via
-        // the per-version JSON manifest. `build_pull_url` returns the
-        // empty vec to signal "no compose-style URL" — same shape the
-        // default impl produces for oci/maven.
-        let urls = handler()
-            .build_pull_url("https://pypi.org", "requests", "2.31.0")
-            .expect("Ok");
-        assert_eq!(urls, Vec::<String>::new());
     }
 
     // -- is_extras_gated_requirement -----------------------------------------
