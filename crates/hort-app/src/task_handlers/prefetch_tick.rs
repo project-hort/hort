@@ -1123,6 +1123,13 @@ mod tests {
         > {
             panic!("list_rejected_for_policy should not be called by the prefetch-tick handler")
         }
+        fn list_active_for_policy(
+            &self,
+            _p: Uuid,
+            _page: PageRequest,
+        ) -> BoxFuture<'_, DomainResult<Page<hort_domain::entities::artifact::Artifact>>> {
+            panic!("list_active_for_policy should not be called by the prefetch-tick handler")
+        }
         fn package_version_status(
             &self,
             repository_id: Uuid,

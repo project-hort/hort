@@ -202,6 +202,41 @@ pub trait ArtifactRepository: Send + Sync {
         policy_id: Uuid,
     ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>>;
 
+    /// List **active scanned** artifacts whose active scan-policy resolves
+    /// to `policy_id`, **paginated** — the `Released` / `Quarantined` set a
+    /// policy *tighten* may have to re-hold (ADR 0041, the tighten
+    /// direction of continuous enforcement). The complement of
+    /// [`Self::list_rejected_for_policy`]: that lists the `Rejected`
+    /// population a *loosen* may re-release; this lists the active
+    /// population a tighten may re-reject.
+    ///
+    /// "Active scan-policy" is the same runtime resolution
+    /// [`Self::list_rejected_for_policy`] encodes — repo-scoped policies win
+    /// over global, mirroring
+    /// `QuarantineUseCase::resolve_active_policy_for_repo`. `is_deleted =
+    /// false` for symmetry with the rest of the read path; only
+    /// `Quarantined` / `Released` rows are returned (`Rejected` /
+    /// `ScanIndeterminate` / `None` are excluded — a tighten never re-holds
+    /// a never-held, already-blocked, or terminal-failure artifact).
+    ///
+    /// **Returns a [`Page`], NOT a [`LimitedList`] — and the caller pages
+    /// through the *whole* population with no fixed cap.** Unlike the
+    /// loosen direction (where a `LimitedList` truncation merely defers a
+    /// few would-be releases — fail-safe, the artifact stays `Rejected`), a
+    /// `LimitedList` cap on the tighten direction is **fail-open**: a
+    /// now-failing artifact past the cap would silently keep serving. The
+    /// re-evaluation pass therefore iterates pages until exhaustion (ADR
+    /// 0041 invariant: a tighten covers the entire in-scope population).
+    ///
+    /// `page.total` reflects the full in-scope row count so the pass can
+    /// surface a completeness signal; callers detect the last page by
+    /// `items.len() < page.limit`.
+    fn list_active_for_policy(
+        &self,
+        policy_id: Uuid,
+        page: PageRequest,
+    ) -> BoxFuture<'_, DomainResult<Page<Artifact>>>;
+
     /// Per-`(package, version)` servability query — the hot serve-path
     /// read used by the quarantine-aware index-serve filter (the
     /// highest-QPS new query).
@@ -406,6 +441,13 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
                 Box::pin(async { Ok(LimitedList::empty()) })
             }
+            fn list_active_for_policy(
+                &self,
+                _policy_id: Uuid,
+                _page: PageRequest,
+            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+                Box::pin(async { Ok(Page::empty()) })
+            }
             fn package_version_status(
                 &self,
                 _repository_id: Uuid,
@@ -520,6 +562,13 @@ mod tests {
                 _p: Uuid,
             ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
                 Box::pin(async { Ok(LimitedList::empty()) })
+            }
+            fn list_active_for_policy(
+                &self,
+                _p: Uuid,
+                _page: PageRequest,
+            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+                Box::pin(async { Ok(Page::empty()) })
             }
             fn package_version_status(
                 &self,

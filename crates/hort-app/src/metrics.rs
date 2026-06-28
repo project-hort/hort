@@ -2967,6 +2967,101 @@ pub fn set_cron_rescan_eligible_artifacts(count: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Continuous scan-policy re-evaluation (ADR 0041 Item 3)
+// ---------------------------------------------------------------------------
+
+/// Per-artifact terminal outcome of an async scan-policy re-evaluation
+/// pass (`PolicyUseCase::run_policy_re_evaluation_pass`, the
+/// `policy-reevaluation` worker task — ADR 0041).
+///
+/// Drives the `result` label on `hort_policy_reevaluation_artifacts_total`.
+/// Closed taxonomy of three — `result` is a low-cardinality enum label;
+/// no high-cardinality labels (`policy_id`, `artifact_id`, …) are emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyReEvaluationResult {
+    /// A `Rejected` artifact's stored findings now pass the bumped policy
+    /// AND the cross-axis release conjunction (curation ∧ provenance)
+    /// currently clears — released (loosen direction).
+    Released,
+    /// A `Released` / `Quarantined` artifact's stored findings now fail
+    /// the bumped policy — re-held to `Rejected` (tighten direction).
+    ReHeld,
+    /// The artifact's verdict was unchanged by the pass — no transition.
+    /// Covers both directions: a still-rejected loosen candidate, a
+    /// still-clean tighten candidate, a loosen candidate held by the
+    /// cross-axis conjunction, and the re-quarantine arm are all folded
+    /// here only when they leave the artifact's *download status* as it
+    /// was; the dedicated `released` / `re_held` labels carry the
+    /// download-status-changing transitions.
+    Unchanged,
+}
+
+impl PolicyReEvaluationResult {
+    /// Wire string — must match `docs/metrics-catalog.md` exactly.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::ReHeld => "re_held",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// Emit `hort_policy_reevaluation_artifacts_total{result}` — one
+/// increment per in-scope artifact the pass reached a terminal verdict
+/// for, labelled by the [`PolicyReEvaluationResult`] outcome.
+///
+/// `count` lets a caller fold a whole tally bucket into one call
+/// (e.g. `released = reset_released`); pass `1` for a per-artifact
+/// emission. Skipped when `count == 0` so a pass that produced no
+/// outcome of a given label adds no zero-valued series churn.
+pub fn emit_policy_reevaluation_result(result: PolicyReEvaluationResult, count: u64) {
+    if count == 0 {
+        return;
+    }
+    metrics::counter!(
+        "hort_policy_reevaluation_artifacts_total",
+        labels::RESULT => result.as_str(),
+    )
+    .increment(count);
+}
+
+/// Set `hort_policy_reevaluation_population` — the **completeness**
+/// signal: the total number of in-scope artifacts a single
+/// `policy-reevaluation` pass observed (loosen population + tighten
+/// population), set once at pass completion.
+///
+/// A pass that aborts a direction early (loosen-list truncation, a
+/// tighten-page read failure) reports the population it *actually*
+/// walked, so a partial pass is observable on the gauge rather than
+/// silently under-counted: operators correlate this against the sum of
+/// the per-`result` counter increments for the same window — a gap means
+/// some artifacts were skipped (best-effort per-artifact failures) and a
+/// follow-up pass is warranted. No labels (population is policy-pass-
+/// scoped, not per-policy — `policy_id` would be high-cardinality).
+pub fn set_policy_reevaluation_population(count: u64) {
+    metrics::gauge!("hort_policy_reevaluation_population").set(count as f64);
+}
+
+/// Increment `hort_policy_reevaluation_enqueue_failed_total` — the
+/// **alertable signal** that a gate-affecting policy mutation committed but
+/// its async `policy-reevaluation` pass failed to enqueue (the best-effort
+/// enqueue swallowed the error so the mutation still succeeds).
+///
+/// This is the only signal that fires when a pass *never runs*: the
+/// `hort_policy_reevaluation_artifacts_total` / `_population` metrics emit
+/// only at pass completion, so a swallowed enqueue is otherwise invisible.
+/// For a TIGHTEN that fails to enqueue, the now-non-compliant population
+/// stays downloadable until the next gate-affecting mutation re-enqueues or
+/// the operator re-applies the policy — operators alert on a non-zero rate
+/// of this counter. A bare counter: no labels (the `policy_id` / `trigger`
+/// that failed is high-cardinality and already on the warn-level log line at
+/// the swallow site).
+pub fn increment_policy_reevaluation_enqueue_failed() {
+    metrics::counter!("hort_policy_reevaluation_enqueue_failed_total").increment(1);
+}
+
+// ---------------------------------------------------------------------------
 // Subscription create-time SSRF block
 // ---------------------------------------------------------------------------
 

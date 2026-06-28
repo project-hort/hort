@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A rescan of a rejected artifact now refreshes its findings.** The
+  `0.9.6-beta.2` idempotency fix made a re-scan of an already-`Rejected`
+  artifact a pure no-op (it recorded nothing), so a manual `admin rescan`
+  silently updated nothing — the current scan result was only observable by
+  deploying. The reject path now records the fresh `ScanCompleted` + findings on
+  a re-scan of an already-terminal artifact (skipping only the duplicate
+  `ArtifactRejected` event and the score re-count), so a rescan refreshes the
+  stored findings. Adds an end-to-end test proving real osv informational output
+  routes to the negligible lane (not rejected), so the detection no longer needs
+  a release to verify.
+
 ## [0.9.6] - 2026-06-27
 
 Beta release (`0.9.6-beta.1`). Headline: OSV **informational** advisories

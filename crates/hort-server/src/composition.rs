@@ -2602,6 +2602,17 @@ pub async fn build_app_context(
         // `remove_exclusion` resolve `PolicyScope::Repository(id) →
         // key` for the `hort_curation_decisions_total{repository}` label.
         repository_access_use_case.clone(),
+        // The post-exclusion re-evaluation pass's active-curation
+        // precondition (ADR 0041 invariant #6 (c)) reads live curation
+        // rules per artifact's repo via `list_for_repo`.
+        curation_rules.clone(),
+        // ADR 0041 Item 3: gate-affecting scan-policy mutations
+        // (`update_policy` gate fields, `add_exclusion`,
+        // `remove_exclusion`, `reactivate_policy`) enqueue ONE async
+        // `policy-reevaluation` task; the worker runs the population pass
+        // off the request path. Same jobs adapter the ingest scan-enqueue
+        // path uses.
+        jobs_repo.clone(),
     ));
 
     // `WheelMetadataUseCase`. Composed over the

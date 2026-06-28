@@ -461,6 +461,30 @@ pub const VALID_TASK_KINDS: &[&str] = &[
     // re-registers. Mirrors `prefetch-row-retention-sweep` (the other
     // table-growth sweep). Run summary: `{ "deleted_rows": <n> }`.
     "scanner-registry-prune",
+    // Async scan-policy re-evaluation pass (ADR 0041 Item 3) — consumed
+    // by `PolicyReEvaluationHandler` in the worker. Enqueued by
+    // `PolicyUseCase` whenever a gate-affecting scan-policy mutation
+    // occurs (`update_policy` gate fields, `add_exclusion`,
+    // `remove_exclusion`, `reactivate_policy`); a multi-field
+    // `update_policy` coalesces to ONE enqueue, not one per
+    // `PolicyUpdated` event. Params carry the `policy_id` + the driving
+    // `ReEvaluationTrigger`. The handler delegates to
+    // `PolicyUseCase::run_policy_re_evaluation_pass`, which re-derives
+    // every in-scope artifact's verdict from its **stored findings**
+    // under the bumped policy and transitions in both directions
+    // (loosen → release / re-quarantine; tighten → re-hold). **Non-
+    // destructive** — it re-runs the same fail-closed release gate over
+    // the artifact's own stored evidence (ADR 0007 preserved); it
+    // carries no release authority of its own, mints no new authority,
+    // and is NOT in `DESTRUCTIVE_TASK_KINDS` (ADR 0028): the pass is
+    // verdict-idempotent and `commit_transition` carries event-version
+    // optimistic concurrency, so concurrent passes are safe (a stale
+    // transition fails its version check and is skipped) — no per-UTC-day
+    // idempotency key / seal-pool single-flight is required. Run summary:
+    // `{ loosen_population, reset_released, reset_quarantined,
+    // still_rejected, held_cross_axis, tighten_population, re_held,
+    // tighten_unchanged }`.
+    "policy-reevaluation",
 ];
 
 // ---------------------------------------------------------------------------

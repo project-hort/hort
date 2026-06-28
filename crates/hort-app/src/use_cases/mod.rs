@@ -135,6 +135,7 @@ pub mod retention_use_case;
 // `ProvenancePort`, fold to one verdict, apply `complete_provenance`.
 // See ADR 0027.
 pub mod provenance_orchestration;
+pub(crate) mod release_clearance;
 pub(crate) mod scan_history;
 pub mod scan_orchestration;
 // Admin-only read of the scanner_registry worker table, backing

@@ -442,7 +442,86 @@ encode the decision once in policy, not N times in the audit log.
 
 ---
 
-## 6. `hort-cli curation` command reference
+## 6. Changing a `ScanPolicy` re-judges the existing population — in both directions
+
+> **Read this before you tighten or loosen a live `ScanPolicy`.** A gate
+> change is no longer point-in-time at ingest: it re-judges every
+> artifact already decided under that policy.
+
+Editing the gate-affecting fields of a `ScanPolicy` —
+`severityThreshold`, the blocked-class set, `negligibleAction`, or
+removing/adding a CVE finding-exclusion — does **not** only change how
+*future* ingests are judged. Hort re-derives each in-scope artifact's
+verdict under the new policy and transitions the artifact to match, in
+**both** directions:
+
+- **Loosening** (lower the bar, drop a blocked class,
+  `negligibleAction: block → warn/ignore`, add an exclusion) releases
+  the artifacts the relaxed gate now passes — the same cascade as a
+  finding-exclusion (§3), generalised to every gate field. A loosen is
+  fail-closed: an artifact is released only when *every* gate that could
+  hold it currently clears (scan **and** provenance **and** curation),
+  never on the scan re-judgement alone. An artifact rejected for a
+  non-scan reason (provenance, curation, corruption, admin) is **not**
+  released by a scan loosen.
+- **Tightening** (raise the bar, add a blocked class,
+  `negligibleAction: → block`, remove an exclusion) **re-holds the
+  now-non-compliant population**: artifacts that were `Released` or
+  `Quarantined` and whose stored findings now cross the tightened gate
+  are re-`Quarantined` / re-`Rejected`. This is the direction that used
+  to silently fail-open — an artifact you had just declared
+  unacceptable stayed downloadable. It no longer does.
+
+### 6.1 What a tightening actually pulls — and what it cannot
+
+A re-hold **blocks future downloads** through the status gate. It does
+**not** recall already-served bytes — anything a client pulled before
+the re-hold is already on disk somewhere. What the re-hold buys you is
+the audit record of the moment of non-compliance and the closed door
+going forward; closing the door forward is strictly better than leaving
+it open, but it is not a recall. If bytes already in the wild are the
+concern, the re-hold is necessary but not sufficient — treat it as a
+containment step, not a clean-up.
+
+The timer window is **not** re-opened on a tighten. A re-held artifact
+is held on the *verdict*, independent of its original quarantine
+deadline.
+
+### 6.2 The evidence model — re-evaluation reads stored findings, never rescans
+
+Re-evaluation does **not** run a scanner. The per-finding scan results
+recorded at ingest (`scan_findings`) are the durable **evidence**; the
+policy is the **interpretation**. A gate change re-runs the *same* pure
+evaluator over the *same* stored findings under the new policy — so:
+
+- the verdict is reproducible and the two directions cannot diverge
+  (both derive from one evaluation over one evidence set);
+- it works on a waived scope (`scanBackends: []`) — a waiver-released
+  artifact has no stored findings, so it evaluates clean and a
+  tightening **never** manufactures a violation against it (no
+  evidence ⇒ no re-rejection);
+- a buggy or stale scanner is *not* corrected by a policy change — that
+  needs the findings refreshed (a separate corrective-rescan concern),
+  after which re-evaluation re-derives the verdict.
+
+### 6.3 It runs asynchronously, off the request path
+
+A gate-affecting policy mutation **enqueues** a re-evaluation pass and
+returns; the pass runs as a worker task over the whole in-scope
+population, fully paginated (no fixed cap), and is idempotent
+(re-running yields the same verdict). Expect the population to settle
+shortly after the change, not synchronously with the apply. Each
+transition appends its own audit event naming the policy change that
+drove it, and the pass surfaces an outcome breakdown
+(`released` / `re_held` / `unchanged`) plus a completeness signal —
+see `hort_policy_reevaluation_artifacts_total` /
+`hort_policy_reevaluation_population` in the
+[metrics catalog](../../metrics-catalog.md) — so a partial pass is
+observable, never silent.
+
+---
+
+## 7. `hort-cli curation` command reference
 
 All decision subcommands require `--justification` (non-empty, ≤ 512
 bytes); the CLI rejects malformed input before the HTTP round trip.
@@ -499,12 +578,12 @@ hort-cli curation exclusions \
 
 ---
 
-## 7. `block versions` — the continue-on-error contract
+## 8. `block versions` — the continue-on-error contract
 
 This is the **most operationally subtle** curation surface and the
 one operators most often misread.
 
-### 7.1 What the contract says
+### 8.1 What the contract says
 
 Event-sourcing rules out "all-or-nothing" — events are immutable, there
 is no rollback once appended. The use case picks **continue-on-error**:
@@ -524,7 +603,7 @@ The HTTP layer mirrors this: a `block-versions` call with a non-empty
 `5xx`. Partial success is a successful outcome at the HTTP semantics
 level.
 
-### 7.2 What operators MUST do
+### 8.2 What operators MUST do
 
 After every `block versions` call, **inspect the response**:
 
@@ -549,7 +628,7 @@ jq '{
 The CLI's table output highlights the `failed` column in red when it
 is non-empty; do not dismiss the highlight.
 
-### 7.3 Retrying the failed subset
+### 8.3 Retrying the failed subset
 
 If `failed` is non-empty, the contract is:
 
@@ -595,7 +674,7 @@ hort-cli curation block versions \
 > reasons for what is conceptually one decision. Re-issuing with the
 > same text preserves the one-decision framing.
 
-### 7.4 Why not stop-on-first-error
+### 8.4 Why not stop-on-first-error
 
 With a `VersionList` carrying tens of resolved artifact_ids, a
 stop-on-first-error contract forces the operator to recompute "what
@@ -603,7 +682,7 @@ landed vs what was skipped" on every retry. Continue-on-error gives
 the operator a single complete result envelope they can act on (retry
 the failed subset only). The choice was made deliberately.
 
-### 7.5 The `not_found_versions` caveat
+### 8.5 The `not_found_versions` caveat
 
 Versions in the `not_found_versions` list **are not auto-blocked on
 future ingest**. If the version arrives in the proxy later, it goes
@@ -625,7 +704,7 @@ If you need to block versions that haven't been ingested yet:
 
 ---
 
-## 8. What the system does NOT do automatically (and why)
+## 9. What the system does NOT do automatically (and why)
 
 These deliberate non-features are the same shape as the patch-release
 playbook (`docs/architecture/how-to/quarantine-patch-release.md` §6),
@@ -638,7 +717,7 @@ extended for the curator surface:
   more restrictive, never less); waive has no symmetric primitive.
 - **No auto-block on future ingest.** Curator block is per-artifact
   retroactive. Stored block-rules (range/pattern-scoped auto-block at
-  ingest) are out of scope — see §7.5 above.
+  ingest) are out of scope — see §8.5 above.
 - **No notification when items enter the queue.** Operators poll the
   queue listing or wire up external integration via the event-notifier
   (see [event-notifications.md](../explanation/event-notifications.md)).

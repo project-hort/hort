@@ -104,8 +104,8 @@ use hort_app::use_cases::policy_use_case::{
 };
 use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
 use hort_app::use_cases::test_support::{
-    sample_artifact, MockArtifactRepository, MockPolicyProjectionRepository,
-    MockRepositoryRepository, MockStoragePort,
+    sample_artifact, MockArtifactRepository, MockCurationRuleRepository, MockJobsRepository,
+    MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
 };
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
@@ -316,6 +316,8 @@ fn build_policy_use_case(
     let lifecycle: Arc<dyn ArtifactLifecyclePort> =
         Arc::new(ChainingLifecycle::new(publisher.clone()));
     let storage = Arc::new(MockStoragePort::new());
+    let curation_rules = Arc::new(MockCurationRuleRepository::new());
+    let jobs = Arc::new(MockJobsRepository::default());
     PolicyUseCase::new(
         publisher,
         projections,
@@ -323,6 +325,8 @@ fn build_policy_use_case(
         lifecycle,
         storage,
         default_repository_access(),
+        curation_rules,
+        jobs,
     )
 }
 

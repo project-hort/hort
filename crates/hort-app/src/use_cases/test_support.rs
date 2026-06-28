@@ -27,7 +27,8 @@ use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjecti
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
-    Actor, ApiActor, ArtifactQuarantined, DomainEvent, PersistedEvent, StreamCategory, StreamId,
+    Actor, ApiActor, ArtifactQuarantined, DomainEvent, PersistedEvent, RejectionReason,
+    StreamCategory, StreamId,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -102,6 +103,15 @@ pub struct MockArtifactRepository {
     /// when no entry exists for a queried `policy_id`, the mock returns
     /// every rejected artifact.
     rejected_policy_filter: Mutex<HashMap<Uuid, Vec<Uuid>>>,
+    /// Per-policy filter set used by `list_active_for_policy` to
+    /// approximate the SQL shadowing rule (repo-scoped wins over
+    /// global) for the **tighten** direction (ADR 0041). Keyed by
+    /// `policy_id`, value is the set of `repository_id`s the policy
+    /// resolves to. Tests seed via
+    /// [`seed_active_for_policy`](Self::seed_active_for_policy); when no
+    /// entry exists for a queried `policy_id`, the mock returns every
+    /// active (`Quarantined` / `Released`) artifact.
+    active_policy_filter: Mutex<HashMap<Uuid, Vec<Uuid>>>,
     /// Allowlist for
     /// [`find_pypi_wheels_without_kind`](ArtifactRepository::find_pypi_wheels_without_kind).
     /// `None` means "every wheel artifact in the mock is a candidate"
@@ -116,6 +126,7 @@ impl MockArtifactRepository {
         Self {
             artifacts: Mutex::new(HashMap::new()),
             rejected_policy_filter: Mutex::new(HashMap::new()),
+            active_policy_filter: Mutex::new(HashMap::new()),
             pypi_wheels_without_kind_filter: Mutex::new(None),
         }
     }
@@ -198,6 +209,7 @@ impl MockArtifactRepository {
                 md5_checksum: None,
                 content_type: "application/octet-stream".to_string(),
                 quarantine_status: status,
+                rejection_reason: None,
                 quarantine_window_start: None,
                 quarantine_deadline: None,
                 upstream_published_at: None,
@@ -229,6 +241,19 @@ impl MockArtifactRepository {
     /// real `PolicyProjectionRepository` into the mock.
     pub fn seed_rejected_for_policy(&self, policy_id: Uuid, repo_ids: Vec<Uuid>) {
         self.rejected_policy_filter
+            .lock()
+            .unwrap()
+            .insert(policy_id, repo_ids);
+    }
+
+    /// Seed which `repository_id`s a `policy_id` resolves to for the
+    /// **tighten** direction. Used by
+    /// [`list_active_for_policy`](ArtifactRepository::list_active_for_policy)
+    /// tests to approximate the SQL shadowing rule without wiring a real
+    /// `PolicyProjectionRepository` into the mock. Mirrors
+    /// [`Self::seed_rejected_for_policy`].
+    pub fn seed_active_for_policy(&self, policy_id: Uuid, repo_ids: Vec<Uuid>) {
+        self.active_policy_filter
             .lock()
             .unwrap()
             .insert(policy_id, repo_ids);
@@ -497,6 +522,60 @@ impl ArtifactRepository for MockArtifactRepository {
             .collect();
         let cap = hort_domain::types::LIMIT_LIST_MAX_ITEMS as usize;
         Box::pin(async move { Ok(LimitedList::from_overfetch(items, cap)) })
+    }
+
+    fn list_active_for_policy(
+        &self,
+        policy_id: Uuid,
+        page: PageRequest,
+    ) -> BoxFut<'_, DomainResult<Page<Artifact>>> {
+        // Drives the ADR 0041 tighten direction. Mirror the SQL adapter's
+        // semantics: `Quarantined` / `Released`, not soft-deleted, whose
+        // active scan-policy resolves to `policy_id`. The shadowing rule is
+        // approximated by the per-policy `repository_id` filter seeded via
+        // [`Self::seed_active_for_policy`]; with no filter, every active
+        // artifact matches.
+        //
+        // Returns a real [`Page`] (NOT a capped `LimitedList`) so the pass's
+        // uncapped page walk is exercised end-to-end — the >10k pagination
+        // test seeds more than `LIMIT_LIST_MAX_ITEMS` rows and asserts every
+        // one is visited. `page.offset` / `page.limit` paginate; `total`
+        // reflects the full in-scope row count.
+        use hort_domain::entities::artifact::QuarantineStatus;
+        let filter = self
+            .active_policy_filter
+            .lock()
+            .unwrap()
+            .get(&policy_id)
+            .cloned();
+        let mut items: Vec<Artifact> = self
+            .artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| {
+                matches!(
+                    a.quarantine_status,
+                    QuarantineStatus::Quarantined | QuarantineStatus::Released
+                ) && !a.is_deleted
+                    && match &filter {
+                        Some(repo_ids) => repo_ids.contains(&a.repository_id),
+                        None => true,
+                    }
+            })
+            .cloned()
+            .collect();
+        // Stable order so the offset/limit window is deterministic across
+        // pages — the adapter does not guarantee order, but a stable order
+        // keeps the mock-backed pagination walk free of skips/dupes.
+        items.sort_by_key(|a| a.id);
+        let total = items.len() as u64;
+        let items: Vec<Artifact> = items
+            .into_iter()
+            .skip(page.offset as usize)
+            .take(page.limit as usize)
+            .collect();
+        Box::pin(async move { Ok(Page { items, total }) })
     }
 
     fn package_version_status(
@@ -2844,6 +2923,13 @@ pub fn sample_artifact(status: QuarantineStatus) -> Artifact {
         QuarantineStatus::Quarantined | QuarantineStatus::Rejected => Some(Utc::now()),
         _ => None,
     };
+    // A `Rejected` sample artifact defaults to the scan-clearable reason
+    // so re-evaluation fixtures (ADR 0041 eligibility guard) admit it;
+    // every other status carries no rejection reason.
+    let rejection_reason = match status {
+        QuarantineStatus::Rejected => Some(RejectionReason::Scanner),
+        _ => None,
+    };
     Artifact {
         id: Uuid::new_v4(),
         repository_id: Uuid::new_v4(),
@@ -2857,6 +2943,7 @@ pub fn sample_artifact(status: QuarantineStatus) -> Artifact {
         md5_checksum: None,
         content_type: "application/gzip".into(),
         quarantine_status: status,
+        rejection_reason,
         quarantine_window_start,
         // Transient computed deadline — hydrated by the use-case layer
         // on read paths; fixtures that exercise `Retry-After` set it

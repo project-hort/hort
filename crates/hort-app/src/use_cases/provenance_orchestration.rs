@@ -676,6 +676,7 @@ impl ProvenanceOrchestrationUseCase {
             md5_checksum: None,
             content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,

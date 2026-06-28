@@ -894,6 +894,7 @@ mod tests {
             md5_checksum: None,
             content_type: "application/octet-stream".to_string(),
             quarantine_status: QuarantineStatus::Quarantined,
+            rejection_reason: None,
             quarantine_window_start: Some(anchor),
             quarantine_deadline: None,
             upstream_published_at: None,
@@ -1856,6 +1857,18 @@ mod tests {
             >,
         > {
             Box::pin(async { Ok(hort_domain::types::LimitedList::empty()) })
+        }
+        fn list_active_for_policy(
+            &self,
+            _p: Uuid,
+            _page: hort_domain::types::PageRequest,
+        ) -> hort_domain::ports::BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<
+                hort_domain::types::Page<hort_domain::entities::artifact::Artifact>,
+            >,
+        > {
+            Box::pin(async { Ok(hort_domain::types::Page::empty()) })
         }
         fn package_version_status(
             &self,

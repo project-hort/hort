@@ -393,6 +393,7 @@ fn normalise_rejection_reason_kind(raw: &str) -> String {
         "Admin" => "admin".to_string(),
         "Curator" => "curator".to_string(),
         "CurationRetroactive" => "curation_retroactive".to_string(),
+        "ScanPolicyRetroactive" => "scan_policy_retroactive".to_string(),
         other => other.to_lowercase(),
     }
 }
@@ -431,6 +432,18 @@ mod tests {
         assert_eq!(
             normalise_rejection_reason_kind("CurationRetroactive"),
             "curation_retroactive"
+        );
+    }
+
+    /// `ScanPolicyRetroactive` (ADR 0041 tighten direction) gets a proper
+    /// explicit snake_case arm rather than the degraded wildcard
+    /// `to_lowercase` fallthrough (which would yield the run-together
+    /// `scanpolicyretroactive`).
+    #[test]
+    fn normalise_scan_policy_retroactive_to_snake_case() {
+        assert_eq!(
+            normalise_rejection_reason_kind("ScanPolicyRetroactive"),
+            "scan_policy_retroactive"
         );
     }
 

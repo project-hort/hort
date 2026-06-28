@@ -256,6 +256,13 @@ async fn apply_inner(
             true,
         ),
     );
+    // Jobs queue for the ADR 0041 Item 3 async re-evaluation enqueue:
+    // a gitops apply that changes a scan-policy gate field, adds /
+    // removes an exclusion, or reactivates a policy enqueues ONE
+    // `policy-reevaluation` row; the worker runs the population pass off
+    // the apply path. Same adapter the runtime composition uses.
+    let policy_jobs: Arc<dyn hort_domain::ports::jobs_repository::JobsRepository> =
+        Arc::new(hort_adapters_postgres::jobs_repository::PgJobsRepository::new(pool.clone()));
     let policies = Arc::new(PolicyUseCase::new(
         event_publisher.clone(),
         policy_projections.clone(),
@@ -263,6 +270,10 @@ async fn apply_inner(
         artifact_lifecycle.clone(),
         storage,
         repository_access_for_policy,
+        // ADR 0041 invariant #6 (c): the post-exclusion re-evaluation
+        // pass's active-curation precondition reads live curation rules.
+        curation_rule_repo.clone(),
+        policy_jobs,
     ));
     // Gitops writer for the
     // `repository_upstream_mappings` table (there is no admin

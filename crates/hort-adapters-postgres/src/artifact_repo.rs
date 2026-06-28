@@ -721,6 +721,94 @@ impl ArtifactRepository for PgArtifactRepository {
             Ok(LimitedList::from_overfetch(items, cap as usize))
         })
     }
+
+    fn list_active_for_policy(
+        &self,
+        policy_id: Uuid,
+        page: PageRequest,
+    ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+        let offset = page.offset as i64;
+        let limit = page.limit as i64;
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %policy_id,
+                "list_active_for_policy"
+            );
+            // The complement of `list_rejected_for_policy` — the ADR 0041
+            // tighten direction. The WHERE clause that resolves an
+            // artifact's repo to `policy_id` (repo-scoped wins over global,
+            // mirroring `QuarantineUseCase::resolve_active_policy_for_repo`)
+            // is identical; only the leading status predicate differs
+            // (`quarantine_status IN ('quarantined','released')` instead of
+            // `= 'rejected'`).
+            //
+            // PAGINATED, not capped. Unlike the loosen direction (a capped
+            // `LimitedList` whose truncation merely defers a few would-be
+            // releases — fail-safe), a cap here would be fail-OPEN: a
+            // now-failing artifact past the cap would keep serving. The
+            // application pass walks pages until exhaustion. A stable
+            // `ORDER BY id` makes the OFFSET/LIMIT window skip- and
+            // duplicate-free across pages.
+            const SCOPE_PREDICATE: &str = r#"
+                a.quarantine_status IN ('quarantined', 'released')
+                AND a.is_deleted = false
+                AND (
+                  EXISTS (
+                    SELECT 1 FROM policy_projections p
+                    WHERE p.policy_id = $1
+                      AND p.archived = false
+                      AND p.scope ? 'Repository'
+                      AND (p.scope->>'Repository')::uuid = a.repository_id
+                  )
+                  OR
+                  (
+                    EXISTS (
+                      SELECT 1 FROM policy_projections p
+                      WHERE p.policy_id = $1
+                        AND p.archived = false
+                        AND p.scope ? 'Global'
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1 FROM policy_projections p2
+                      WHERE p2.archived = false
+                        AND p2.scope ? 'Repository'
+                        AND (p2.scope->>'Repository')::uuid = a.repository_id
+                    )
+                  )
+                )
+            "#;
+            let sql = format!(
+                "SELECT {SELECT_COLS} FROM artifacts a \
+                 WHERE {SCOPE_PREDICATE} \
+                 ORDER BY a.id \
+                 OFFSET $2 LIMIT $3"
+            );
+            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+                .bind(policy_id)
+                .bind(offset)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Artifact", "list_active_for_policy"))?;
+
+            let count_sql = format!("SELECT COUNT(*) FROM artifacts a WHERE {SCOPE_PREDICATE}");
+            let total: Option<i64> = sqlx::query_scalar(&count_sql)
+                .bind(policy_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Artifact", "list_active_for_policy_count"))?;
+
+            let items: Vec<Artifact> = rows
+                .into_iter()
+                .map(Artifact::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Page {
+                items,
+                total: total.unwrap_or(0) as u64,
+            })
+        })
+    }
 }
 
 impl PgArtifactRepository {
@@ -1304,6 +1392,7 @@ mod tests {
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: Some(upstream_ts),
@@ -1344,6 +1433,7 @@ mod tests {
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,
@@ -1627,5 +1717,211 @@ mod tests {
             "soft-deleted rows do not reserve the collision key"
         );
         cleanup_repo(&pool, repo2).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // list_active_for_policy — ADR 0041 Item 2 (tighten-direction population)
+    // ---------------------------------------------------------------------
+
+    /// Seed a non-archived **global** scan policy projection so
+    /// `list_active_for_policy`'s shadowing rule resolves every
+    /// repo not shadowed by a repo-scoped policy. Returns the policy id.
+    async fn seed_global_policy(pool: &PgPool) -> Uuid {
+        let policy_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO policy_projections (
+                   policy_id, name, scope, severity_threshold,
+                   quarantine_duration_secs, require_approval, stream_version
+               ) VALUES (
+                   $1, $2, '"Global"'::jsonb, 'high',
+                   86400, true, 0
+               )"#,
+        )
+        .bind(policy_id)
+        .bind(format!("it-active-policy-{}", policy_id.simple()))
+        .execute(pool)
+        .await
+        .expect("seed global policy projection");
+        policy_id
+    }
+
+    async fn cleanup_policy(pool: &PgPool, policy_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM policy_projections WHERE policy_id = $1")
+            .bind(policy_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Bulk-insert N active artifacts under one repo with the given
+    /// `quarantine_status`. Distinct version/path/checksum per row.
+    async fn seed_status_artifacts(
+        pool: &PgPool,
+        repo: Uuid,
+        status: &str,
+        n: usize,
+        seed_base: usize,
+    ) {
+        for i in 0..n {
+            let id = Uuid::new_v4();
+            let path = format!("simple/{status}/{status}-{i:08}.tar.gz");
+            let sha256 = deterministic_hex64(seed_base + i);
+            sqlx::query(
+                r#"INSERT INTO artifacts (
+                       id, repository_id, name, name_as_published, version, path,
+                       size_bytes, checksum_sha256, content_type, storage_key,
+                       quarantine_status
+                   ) VALUES (
+                       $1, $2, $3, $3, $4, $5,
+                       0, $6, 'application/octet-stream', $6,
+                       $7
+                   )"#,
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(format!("active-{status}"))
+            .bind(format!("{i:08}"))
+            .bind(&path)
+            .bind(&sha256)
+            .bind(status)
+            .execute(pool)
+            .await
+            .expect("seed status artifact");
+        }
+    }
+
+    /// `list_active_for_policy` returns ONLY the `Quarantined` / `Released`
+    /// rows of a repo whose active policy resolves to `policy_id`,
+    /// excludes `Rejected` / `ScanIndeterminate` / soft-deleted, paginates
+    /// via `PageRequest`, and reports the full in-scope `total`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn list_active_for_policy_filters_status_and_paginates() {
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let repo_id = seed_repo(&pool).await;
+        let policy_id = seed_global_policy(&pool).await;
+
+        // In-scope active rows: 30 released + 20 quarantined = 50.
+        seed_status_artifacts(&pool, repo_id, "released", 30, 0).await;
+        seed_status_artifacts(&pool, repo_id, "quarantined", 20, 1_000).await;
+        // Excluded rows: rejected + scan_indeterminate (not active).
+        seed_status_artifacts(&pool, repo_id, "rejected", 5, 2_000).await;
+        seed_status_artifacts(&pool, repo_id, "scan_indeterminate", 5, 3_000).await;
+        // Excluded: soft-deleted released row.
+        seed_artifact_status(
+            &pool,
+            repo_id,
+            "active-released",
+            Some("99.0.0"),
+            Some("released"),
+            true,
+            4_000,
+        )
+        .await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+
+        // First page of 20 — total reflects the full in-scope set (50).
+        let page0 = r
+            .list_active_for_policy(policy_id, PageRequest::new(0, 20))
+            .await
+            .expect("list_active_for_policy page0");
+        assert_eq!(page0.items.len(), 20, "page size honoured");
+        assert_eq!(page0.total, 50, "total reflects every in-scope active row");
+        for a in &page0.items {
+            assert!(
+                matches!(
+                    a.quarantine_status,
+                    QuarantineStatus::Quarantined | QuarantineStatus::Released
+                ),
+                "only active statuses returned, got {:?}",
+                a.quarantine_status
+            );
+        }
+
+        // Walk every page (offset += page size); cumulative count == 50,
+        // no duplicates — proves the uncapped page walk covers the whole
+        // population with a stable `ORDER BY id`.
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut offset: u64 = 0;
+        let limit: u64 = 20;
+        loop {
+            let page = r
+                .list_active_for_policy(policy_id, PageRequest::new(offset, limit))
+                .await
+                .expect("page");
+            if page.items.is_empty() {
+                break;
+            }
+            for a in &page.items {
+                assert!(seen.insert(a.id), "no duplicate across pages: {}", a.id);
+            }
+            if (page.items.len() as u64) < limit {
+                break;
+            }
+            offset += page.items.len() as u64;
+        }
+        assert_eq!(seen.len(), 50, "every in-scope active row visited once");
+
+        cleanup_repo(&pool, repo_id).await;
+        cleanup_policy(&pool, policy_id).await;
+    }
+
+    /// A repo-scoped policy SHADOWS the global one: `list_active_for_policy`
+    /// for the global policy must NOT return active artifacts in a repo
+    /// owned by a non-archived repo-scoped policy (mirrors
+    /// `list_rejected_for_policy`'s precedence rule).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn list_active_for_policy_global_excludes_repo_shadowed_by_scoped_policy() {
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let global_policy = seed_global_policy(&pool).await;
+        let shadowed_repo = seed_repo(&pool).await;
+        let plain_repo = seed_repo(&pool).await;
+
+        // A repo-scoped policy over `shadowed_repo` shadows the global one.
+        let scoped_policy = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO policy_projections (
+                   policy_id, name, scope, severity_threshold,
+                   quarantine_duration_secs, require_approval, stream_version
+               ) VALUES (
+                   $1, $2, jsonb_build_object('Repository', $3::text), 'high',
+                   86400, true, 0
+               )"#,
+        )
+        .bind(scoped_policy)
+        .bind(format!("it-scoped-{}", scoped_policy.simple()))
+        .bind(shadowed_repo.to_string())
+        .execute(&pool)
+        .await
+        .expect("seed repo-scoped policy");
+
+        seed_status_artifacts(&pool, shadowed_repo, "released", 3, 5_000).await;
+        seed_status_artifacts(&pool, plain_repo, "released", 4, 6_000).await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let page = r
+            .list_active_for_policy(global_policy, PageRequest::new(0, 100))
+            .await
+            .expect("list");
+        // Only the un-shadowed repo's 4 active rows resolve to the global.
+        assert_eq!(page.total, 4, "shadowed repo's rows excluded from global");
+        for a in &page.items {
+            assert_eq!(
+                a.repository_id, plain_repo,
+                "only un-shadowed repo rows returned"
+            );
+        }
+
+        cleanup_repo(&pool, shadowed_repo).await;
+        cleanup_repo(&pool, plain_repo).await;
+        cleanup_policy(&pool, global_policy).await;
+        cleanup_policy(&pool, scoped_policy).await;
     }
 }
