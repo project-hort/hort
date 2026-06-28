@@ -1410,6 +1410,7 @@ impl IngestUseCase {
             md5_checksum: None,
             content_type,
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,
@@ -2506,6 +2507,7 @@ impl IngestUseCase {
             md5_checksum: legacy_md5,
             content_type,
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             // Record the upstream-asserted publish
@@ -3815,6 +3817,7 @@ impl IngestUseCase {
             md5_checksum: legacy_md5,
             content_type,
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,

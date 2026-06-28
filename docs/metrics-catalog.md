@@ -2673,15 +2673,59 @@ the OSV bulk diff).
 | `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout}` |
 | `hort_advisory_diff_duration_seconds` | histogram | `ecosystem` | seconds | per OSV bulk-archive ecosystem label |
 | `hort_cron_rescan_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation; operator alarms on sustained `> batch_size` (cron loop can't keep up) |
+| `hort_policy_reevaluation_artifacts_total` | counter | `result` | — | `result ∈ {released, re_held, unchanged}` — per-artifact terminal outcome of an async scan-policy re-evaluation pass (ADR 0041 Item 3). One increment per in-scope artifact the pass reached a verdict for. NO high-cardinality labels (`policy_id` / `artifact_id` forbidden). |
+| `hort_policy_reevaluation_population` | gauge | (none) | artifacts | set once at the completion of a `policy-reevaluation` pass to the in-scope population it walked (loosen + tighten); the **completeness** signal — a partial pass (loosen-list truncation, a tighten-page read failure) reports the population it actually walked, so a population/counter gap is observable rather than silent |
+| `hort_policy_reevaluation_enqueue_failed_total` | counter | (none) | — | incremented when a gate-affecting policy mutation committed but its async `policy-reevaluation` pass failed to enqueue (the best-effort enqueue swallowed the error so the mutation still succeeds). The **alertable signal that a pass never ran** — the `_artifacts_total` / `_population` metrics emit only at pass completion, so a swallowed enqueue is otherwise invisible. For a TIGHTEN, the now-non-compliant population stays downloadable until a later gate-affecting mutation re-enqueues or the operator re-applies the policy; alert on a non-zero rate. Bare counter (no labels — the failed `policy_id` / `trigger` is on the warn-level log line). |
 | `hort_patch_candidates_listed_total` | counter | `repository`, `result` | — | `repository ∈ {"_all", <key>}` for v1: `_all` for admin-wide scope (no `?repository` filter), the resolved repository key when the handler successfully resolved `?repository=<key>` to a row. `"unknown"` is reserved for future non-HTTP / dispatcher paths — the HTTP handler short-circuits to 404 on lookup failure before reaching the use case. `result ∈ {ok, denied, invalid, error}` |
 
 Source of truth for the result enums:
 - `hort_app::metrics::TriggerSourceLabel` for `hort_scan_jobs_enqueued_total.trigger_source`. Mirrors `hort_domain::ports::jobs_repository::TriggerSource` (the SQL wire form). The two MUST agree — a drift is enforced as a compile-equality test.
 - `hort_app::metrics::AdvisoryDiffResult` for `hort_advisory_diff_processed_total.result`.
 - `hort_app::metrics::PatchCandidateListResult` for `hort_patch_candidates_listed_total.result` (operator-action signal for `GET /admin/quarantine/patch-candidates`).
+- `hort_app::metrics::PolicyReEvaluationResult` for `hort_policy_reevaluation_artifacts_total.result` (the async scan-policy re-evaluation outcome — ADR 0041).
 
 Adding a variant to either enum requires updating this catalog in the
 same change.
+
+**`hort_policy_reevaluation_artifacts_total` result semantics** (closed
+taxonomy of 3; emitted at the completion of a `policy-reevaluation` worker
+pass — [`PolicyUseCase::run_policy_re_evaluation_pass`](../crates/hort-app/src/use_cases/policy_use_case.rs),
+ADR 0041 Item 3 — by folding the per-direction tally buckets, one
+increment per in-scope artifact that reached a terminal verdict):
+
+- `released` — a `Rejected` artifact's stored findings now pass the bumped
+  policy AND the cross-axis release conjunction (curation ∧ provenance)
+  currently clears → released (the loosen direction).
+- `re_held` — a `Released` / `Quarantined` artifact's stored findings now
+  fail the bumped policy → re-held to `Rejected` (the tighten direction,
+  the fail-open gap ADR 0041 closes). Blocks **future** downloads; the
+  audit records the moment of non-compliance.
+- `unchanged` — the artifact's download status was unchanged by the pass:
+  a still-rejected loosen candidate, a loosen candidate held by the
+  cross-axis conjunction, the loosen re-quarantine arm (stays held), and a
+  still-clean tighten candidate all fold here. The dedicated `released` /
+  `re_held` labels carry only the status-changing transitions.
+
+A per-artifact infrastructure failure is logged (`warn!`) and skipped — it
+contributes to **no** `result` bucket, so the sum of the three counters
+can be less than `hort_policy_reevaluation_population` after a pass with
+skips; that gap is the "some artifacts were not re-evaluated, a follow-up
+pass is warranted" signal.
+
+**`hort_policy_reevaluation_population` semantics** — the completeness
+signal. Set once at pass completion to `loosen_population +
+tighten_population` (the in-scope set the pass actually walked). A pass
+that aborts a direction early (the loosen `list_rejected_for_policy`
+truncation, a tighten `list_active_for_policy` page read failure) reports
+the population it walked, never silently under-counting; operators
+correlate it against the sum of the per-`result` counter increments for
+the same window. The pass is enqueue-triggered (not a cron), so the gauge
+updates only when a gate-affecting policy mutation fires a pass — it is a
+last-pass snapshot, not a steady-state level. The complementary
+`hort_policy_reevaluation_enqueue_failed_total` covers the opposite gap:
+the population/counter correlation only signals a pass that *ran* but
+skipped artifacts; the enqueue-failed counter is the only signal that a
+pass *never ran* (the enqueue itself failed and was swallowed).
 
 **`hort_scan_jobs_enqueued_total` trigger_source semantics** (closed
 taxonomy of 4; one increment per landed row, NOT per attempted enqueue
@@ -2794,6 +2838,9 @@ Cardinality:
 - `hort_advisory_diff_duration_seconds`: ≤ 11 histograms (one per
   configured ecosystem). Default deployment 8 histograms.
 - `hort_cron_rescan_eligible_artifacts`: 1 gauge (no labels).
+- `hort_policy_reevaluation_artifacts_total`: 3 result values → 3 series.
+- `hort_policy_reevaluation_population`: 1 gauge (no labels).
+- `hort_policy_reevaluation_enqueue_failed_total`: 1 counter (no labels).
 - `hort_patch_candidates_listed_total`: 1 + N repository values
   (`_all` sentinel plus one per repository the admin has ever
   scoped a listing call to) × 4 results. Deployments with few

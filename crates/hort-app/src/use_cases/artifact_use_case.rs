@@ -965,6 +965,7 @@ mod tests {
             md5_checksum: None,
             content_type: "application/gzip".into(),
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,
@@ -1597,6 +1598,13 @@ mod tests {
             _policy_id: Uuid,
         ) -> hort_domain::ports::BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
             Box::pin(async { Ok(LimitedList::empty()) })
+        }
+        fn list_active_for_policy(
+            &self,
+            _policy_id: Uuid,
+            _page: PageRequest,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Page<Artifact>>> {
+            Box::pin(async { Ok(Page::empty()) })
         }
         fn package_version_status(
             &self,
@@ -2282,6 +2290,7 @@ mod visibility_extension_tests {
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,
@@ -2586,6 +2595,14 @@ mod visibility_extension_tests {
                 hort_domain::error::DomainResult<LimitedList<Artifact>>,
             > {
                 Box::pin(async { Ok(LimitedList::empty()) })
+            }
+            fn list_active_for_policy(
+                &self,
+                _policy_id: Uuid,
+                _page: PageRequest,
+            ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<Page<Artifact>>>
+            {
+                Box::pin(async { Ok(Page::empty()) })
             }
             fn package_version_status(
                 &self,

@@ -1248,6 +1248,13 @@ pub fn build_mock_ctx_with_label_flag(
         // exclusion metric resolves `PolicyScope::Repository(id)` to
         // the repo key.
         repository_access_use_case.clone(),
+        // ADR 0041 invariant #6 (c): the re-evaluation pass's
+        // active-curation precondition reads live curation rules.
+        curation_rules.clone(),
+        // ADR 0041 Item 3: the exclusion-write handlers enqueue the
+        // async `policy-reevaluation` task; share the mock jobs repo so
+        // tests can assert the enqueue.
+        jobs.clone(),
     ));
 
     // `WheelMetadataUseCase` composed over the

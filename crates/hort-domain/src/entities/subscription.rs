@@ -959,12 +959,12 @@ mod tests {
         DenialReason as TokenDenialReason, DownloadActor, ExclusionAdded, ExclusionRemoved,
         FilterSummary, GrantSubjectRecord, IngestSource, OidcKeyRotated, PermissionGrantApplied,
         PermissionGrantRevoked, PolicyArchived, PolicyCreated, PolicyEvaluated, PolicyField,
-        PolicyResult, PolicyScope, PolicyUpdated, PromotionRejected, PromotionRequested, RefMoved,
-        RefRetired, RejectionReason, ReleaseReason, RepositoryScopeKind,
-        RepositoryUpstreamMappingChanged, RevokeReason, ScanCompleted, ScanRequested,
-        SeveritySummary, SubscriptionCreated, SubscriptionCreationDenied, SubscriptionDeleted,
-        SubscriptionDisabled, SubscriptionPaused, SubscriptionResumed, SubscriptionUpdated,
-        TargetKindWire, TaskFailed, TaskInvoked, UpstreamMappingChange,
+        PolicyResult, PolicyScope, PolicyUpdated, PromotionRejected, PromotionRequested,
+        ReEvaluationTrigger, RefMoved, RefRetired, RejectionReason, ReleaseReason,
+        RepositoryScopeKind, RepositoryUpstreamMappingChanged, RevokeReason, ScanCompleted,
+        ScanRequested, SeveritySummary, SubscriptionCreated, SubscriptionCreationDenied,
+        SubscriptionDeleted, SubscriptionDisabled, SubscriptionPaused, SubscriptionResumed,
+        SubscriptionUpdated, TargetKindWire, TaskFailed, TaskInvoked, UpstreamMappingChange,
     };
     use crate::retention::ExpirationReason;
     use crate::types::{ArtifactCoords, ContentHash, Finding};
@@ -1339,7 +1339,9 @@ mod tests {
                 DomainEvent::ArtifactReEvaluated(ArtifactReEvaluated {
                     artifact_id: Uuid::nil(),
                     policy_id: Uuid::nil(),
-                    trigger_exclusion_id: Uuid::nil(),
+                    trigger: ReEvaluationTrigger::ExclusionAdded {
+                        exclusion_id: Uuid::nil(),
+                    },
                     previous_status: QuarantineStatus::Rejected,
                     new_status: QuarantineStatus::Released,
                 }),

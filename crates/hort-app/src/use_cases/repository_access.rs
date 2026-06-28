@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
-use hort_domain::entities::repository::Repository;
+use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::error::DomainError;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::types::{Page, PageRequest};
@@ -267,6 +267,26 @@ impl RepositoryAccessUseCase {
         match self.repositories.find_by_id(repo_id).await {
             Ok(r) => r.key,
             Err(_) => values::REPOSITORY_UNKNOWN.to_string(),
+        }
+    }
+
+    /// No-authz repository-format lookup by id.
+    ///
+    /// Returns the repository's declared [`RepositoryFormat`], or `None`
+    /// when the row is absent; propagates a genuine infrastructure error.
+    /// **NO authz** — the caller is a system pass (the ADR 0041 scan
+    /// re-evaluation), not a user request. The format is needed to build
+    /// the [`hort_domain::types::ArtifactCoords`] the curation evaluator's
+    /// format gate consumes; every artifact in a repository shares its
+    /// repository's format. Mirrors [`Self::metric_label`]'s no-authz
+    /// id-lookup precedent but returns the typed format rather than a
+    /// metric label.
+    #[tracing::instrument(skip(self))]
+    pub async fn repository_format(&self, repo_id: Uuid) -> AppResult<Option<RepositoryFormat>> {
+        match self.repositories.find_by_id(repo_id).await {
+            Ok(r) => Ok(Some(r.format)),
+            Err(DomainError::NotFound { .. }) => Ok(None),
+            Err(other) => Err(AppError::Domain(other)),
         }
     }
 
@@ -1080,6 +1100,37 @@ mod tests {
             .resolve_by_id(Uuid::new_v4(), None, AccessLevel::Read)
             .await
             .unwrap_err();
+        assert!(err.to_string().contains("db down"));
+    }
+
+    // -- repository_format (no-authz id lookup, ADR 0041) ------------------
+
+    #[tokio::test]
+    async fn repository_format_returns_format_for_existing_repo() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let mut repo = sample_repository();
+        repo.format = RepositoryFormat::Pypi;
+        let repo_id = repo.id;
+        repos.insert(repo);
+        let uc = RepositoryAccessUseCase::new(repos, RbacAccess::Disabled, true);
+        let out = uc.repository_format(repo_id).await.unwrap();
+        assert_eq!(out, Some(RepositoryFormat::Pypi));
+    }
+
+    #[tokio::test]
+    async fn repository_format_missing_repo_is_none() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let uc = RepositoryAccessUseCase::new(repos, RbacAccess::Disabled, true);
+        let out = uc.repository_format(Uuid::new_v4()).await.unwrap();
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test]
+    async fn repository_format_propagates_infrastructure_error() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.fail_next_find_by_id(DomainError::Invariant("db down".into()));
+        let uc = RepositoryAccessUseCase::new(repos, RbacAccess::Disabled, true);
+        let err = uc.repository_format(Uuid::new_v4()).await.unwrap_err();
         assert!(err.to_string().contains("db down"));
     }
 

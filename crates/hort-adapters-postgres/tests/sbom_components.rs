@@ -393,6 +393,7 @@ async fn commit_scan_result_constraint_violation_rolls_back_event_append() {
         md5_checksum: None,
         content_type: row.get::<String, _>("content_type"),
         quarantine_status: QuarantineStatus::None,
+        rejection_reason: None,
         quarantine_window_start: None,
         quarantine_deadline: None,
         upstream_published_at: None,

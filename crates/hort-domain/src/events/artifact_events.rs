@@ -471,33 +471,79 @@ pub enum ReleaseReason {
 // ArtifactReEvaluated
 // ---------------------------------------------------------------------------
 
-/// Audit record for a post-exclusion-add re-evaluation pass decision.
+/// Which policy-change event drove a re-evaluation pass (ADR 0041).
 ///
-/// Emitted on the artifact's stream when
-/// [`PolicyUseCase::add_exclusion`](crate) re-evaluates a previously
-/// `Rejected` artifact and decides to transition it back to
-/// `Quarantined` or directly to `Released`. The `previous_status` /
-/// `new_status` pair lets audit consumers project "every reset that
+/// The re-evaluation pass generalises beyond the original
+/// exclusion-add trigger to every gate-affecting `ScanPolicy` mutation.
+/// This discriminator names *which* policy-change event drove the pass
+/// so the audit trail answers "what loosened/tightened this artifact?"
+/// without re-running the evaluator — invariant #3 (the audit names the
+/// driving change).
+///
+/// Externally-tagged (the default serde representation) so each variant
+/// serialises as `{ "ExclusionAdded": { "exclusion_id": "…" } }` etc.
+/// **Back-compat (ADR 0002, append-only).** Events written before the
+/// generalisation carried a bare `trigger_exclusion_id: Uuid` on
+/// [`ArtifactReEvaluated`] (no `trigger` key). [`ArtifactReEvaluated`]'s
+/// hand-written deserialisation maps that legacy field onto
+/// [`Self::ExclusionAdded`]; no past event is rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReEvaluationTrigger {
+    /// An exclusion was added to the policy (a loosen). `exclusion_id`
+    /// is the just-added exclusion — the same value the pre-ADR-0041
+    /// `trigger_exclusion_id` field carried, so a legacy event maps here
+    /// (see [`ArtifactReEvaluated`]'s back-compat note).
+    ExclusionAdded { exclusion_id: Uuid },
+    /// An exclusion was removed from the policy (a tighten).
+    ExclusionRemoved { exclusion_id: Uuid },
+    /// The policy's gate fields changed (severity threshold, blocked
+    /// classes, `negligible_action`, …) — either direction. Carries the
+    /// `PolicyUpdated` event's `policy_id` for audit attribution; a
+    /// single multi-field policy update coalesces to one re-evaluation
+    /// pass, so this is policy-scoped, not per-field.
+    PolicyUpdated { policy_id: Uuid },
+}
+
+/// Audit record for a re-evaluation pass decision (ADR 0041).
+///
+/// Emitted on the artifact's stream when a gate-affecting `ScanPolicy`
+/// change re-evaluates an in-scope artifact and transitions it — a
+/// previously `Rejected` artifact back to `Quarantined` / `Released`
+/// (loosen), or a previously `Released` / `Quarantined` artifact to
+/// re-`Quarantined` / re-`Rejected` (tighten). The `previous_status` /
+/// `new_status` pair lets audit consumers project "every transition that
 /// happened" without having to correlate against
-/// [`ArtifactQuarantined`] / [`ArtifactReleased`] events on the same
-/// stream.
+/// [`ArtifactQuarantined`] / [`ArtifactReleased`] / [`ArtifactRejected`]
+/// events on the same stream.
 ///
-/// `trigger_exclusion_id` is the just-added exclusion that drove the
-/// re-evaluation pass — answers "which exclusion freed this artifact?"
-/// without re-running the evaluator. `policy_id` is the exclusion's
-/// parent policy for symmetry with [`PolicyEvaluated`].
+/// `trigger` is the [`ReEvaluationTrigger`] discriminator naming which
+/// policy-change event drove the pass (invariant #3) — answers "what
+/// loosened/tightened this artifact?" without re-running the evaluator.
+/// `policy_id` is the policy the pass evaluated against, for symmetry
+/// with [`PolicyEvaluated`].
 ///
-/// Pure metadata — `validate()` always returns `Ok(())`. The event
-/// lives on the artifact stream alongside the companion transition
-/// event ([`ArtifactQuarantined`] for `ResetToQuarantined`,
-/// [`ArtifactReleased { released_by: PolicyReEvaluation, .. }`] for
-/// `ResetToReleased`); the pair is appended atomically via
+/// # Schema evolution (ADR 0002, append-only)
+///
+/// The pre-ADR-0041 event was exclusion-shaped: a non-optional
+/// `trigger_exclusion_id: Uuid` field, no `trigger`. The field is
+/// **widened** to the `trigger` discriminator; no past event is
+/// rewritten. [`Deserialize`] is hand-written so a legacy event (carrying
+/// `trigger_exclusion_id`, no `trigger`) maps onto
+/// [`ReEvaluationTrigger::ExclusionAdded`] — every shape that was once
+/// written still parses, matching the
+/// `UpstreamPublishedChecksum::deserialize_without_re_validating`
+/// forward-compat precedent. New events serialise the `trigger` key only.
+///
+/// Pure metadata — `validate()` always returns `Ok(())`. The event lives
+/// on the artifact stream alongside the companion transition event
+/// ([`ArtifactQuarantined`] / [`ArtifactReleased`] / [`ArtifactRejected`]);
+/// the pair is appended atomically via
 /// [`crate::ports::artifact_lifecycle::ArtifactLifecyclePort::commit_transition`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArtifactReEvaluated {
     pub artifact_id: Uuid,
     pub policy_id: Uuid,
-    pub trigger_exclusion_id: Uuid,
+    pub trigger: ReEvaluationTrigger,
     pub previous_status: QuarantineStatus,
     pub new_status: QuarantineStatus,
 }
@@ -505,6 +551,60 @@ pub struct ArtifactReEvaluated {
 impl ArtifactReEvaluated {
     pub fn validate(&self) -> DomainResult<()> {
         Ok(())
+    }
+}
+
+/// Deserialisation wire-shape for [`ArtifactReEvaluated`] that accepts
+/// **both** the current (`trigger`) and legacy (`trigger_exclusion_id`)
+/// shapes (ADR 0002, append-only). Both fields are `#[serde(default)]`
+/// so either may be absent; the `From` conversion resolves which one was
+/// present.
+#[derive(Deserialize)]
+struct ArtifactReEvaluatedRepr {
+    artifact_id: Uuid,
+    policy_id: Uuid,
+    /// Current shape: the policy-change discriminator. `None` on a
+    /// legacy event.
+    #[serde(default)]
+    trigger: Option<ReEvaluationTrigger>,
+    /// Legacy shape: the bare just-added exclusion id. `None` on a
+    /// current event. Mapped onto
+    /// [`ReEvaluationTrigger::ExclusionAdded`] when present.
+    #[serde(default)]
+    trigger_exclusion_id: Option<Uuid>,
+    previous_status: QuarantineStatus,
+    new_status: QuarantineStatus,
+}
+
+impl From<ArtifactReEvaluatedRepr> for ArtifactReEvaluated {
+    fn from(repr: ArtifactReEvaluatedRepr) -> Self {
+        // Prefer the current `trigger`; fall back to the legacy
+        // `trigger_exclusion_id` (mapped to ExclusionAdded). If a
+        // (malformed) event carries neither, default to a nil-id
+        // ExclusionAdded — an audit record must still materialise rather
+        // than fail the whole stream replay; the nil id is the same
+        // "no value" sentinel `PolicyEvaluated::NO_POLICY` uses.
+        let trigger = repr
+            .trigger
+            .unwrap_or_else(|| ReEvaluationTrigger::ExclusionAdded {
+                exclusion_id: repr.trigger_exclusion_id.unwrap_or_else(Uuid::nil),
+            });
+        ArtifactReEvaluated {
+            artifact_id: repr.artifact_id,
+            policy_id: repr.policy_id,
+            trigger,
+            previous_status: repr.previous_status,
+            new_status: repr.new_status,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactReEvaluated {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ArtifactReEvaluatedRepr::deserialize(deserializer).map(ArtifactReEvaluated::from)
     }
 }
 
@@ -742,6 +842,31 @@ pub enum RejectionReason {
     CurationRetroactive {
         rule_id: Uuid,
     },
+    /// A retroactive **scan-policy** tighten re-held the artifact (ADR 0041).
+    /// Set by the continuous-enforcement re-evaluation transition
+    /// ([`crate::entities::artifact::Artifact::reject_from_scan_policy_retroactive`])
+    /// when a gate-affecting `ScanPolicy` change re-derives a now-failing
+    /// verdict from the artifact's *stored* findings and re-holds a
+    /// previously `Released` / `Quarantined` artifact.
+    ///
+    /// A **unit variant** — symmetric to [`Scanner`](Self::Scanner): the
+    /// policy that drove the tighten is attributed by the
+    /// [`ArtifactReEvaluated`] audit event appended in the same
+    /// `commit_transition` batch (its
+    /// [`ReEvaluationTrigger::PolicyUpdated`] discriminator carries the
+    /// policy-change event id), so a payload here would only duplicate
+    /// that. Named distinctly from `Scanner` (a fresh-scan rejection) so
+    /// an audit query can tell "a scanner found this bad at scan time"
+    /// apart from "a *policy tighten* re-judged this artifact's stored
+    /// evidence as now-failing" without parsing the free-text reason.
+    ///
+    /// **Scan-clearable (ADR 0041 invariant #6 (a)).** Like `Scanner`,
+    /// this rejection is on the scan axis and a *later* policy loosen can
+    /// re-release it — so
+    /// [`re_evaluate`](crate::entities::artifact::Artifact::re_evaluate)'s
+    /// eligibility guard admits it alongside `Scanner`. Distinct from
+    /// `CurationRetroactive` (curation axis, NOT scan-clearable).
+    ScanPolicyRetroactive,
     /// A curator (`Permission::Curate` or
     /// `Permission::Admin`) manually blocked the artifact via the
     /// `CurationUseCase::block` path. Carries the curator's user id so
@@ -1389,5 +1514,217 @@ mod retention_event_tests {
     #[test]
     fn replay_empty_stream_is_live() {
         assert_eq!(project(&[]), RetentionState::Live);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArtifactReEvaluated widening + serde back-compat tests (ADR 0041 Item 1)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod re_evaluated_event_tests {
+    use super::*;
+    use crate::events::DomainEvent;
+
+    fn nil() -> Uuid {
+        Uuid::nil()
+    }
+
+    fn sample(trigger: ReEvaluationTrigger) -> ArtifactReEvaluated {
+        ArtifactReEvaluated {
+            artifact_id: Uuid::from_u128(1),
+            policy_id: Uuid::from_u128(2),
+            trigger,
+            previous_status: QuarantineStatus::Rejected,
+            new_status: QuarantineStatus::Released,
+        }
+    }
+
+    // ---- new shape round-trips for every trigger variant ----
+
+    #[test]
+    fn new_shape_round_trips_every_trigger_variant() {
+        let triggers = [
+            ReEvaluationTrigger::ExclusionAdded {
+                exclusion_id: Uuid::from_u128(10),
+            },
+            ReEvaluationTrigger::ExclusionRemoved {
+                exclusion_id: Uuid::from_u128(11),
+            },
+            ReEvaluationTrigger::PolicyUpdated {
+                policy_id: Uuid::from_u128(12),
+            },
+        ];
+        for trigger in triggers {
+            let ev = sample(trigger);
+            let json = serde_json::to_value(&ev).unwrap();
+            // Serialisation emits the new `trigger` key, never the legacy
+            // `trigger_exclusion_id`.
+            assert!(json.get("trigger").is_some(), "new shape carries `trigger`");
+            assert!(
+                json.get("trigger_exclusion_id").is_none(),
+                "new shape must NOT carry the legacy `trigger_exclusion_id`"
+            );
+            let back: ArtifactReEvaluated = serde_json::from_value(json).unwrap();
+            assert_eq!(ev, back);
+            assert_eq!(back.trigger, trigger);
+        }
+    }
+
+    // ---- legacy shape (bare trigger_exclusion_id) still deserialises ----
+
+    #[test]
+    fn legacy_shape_deserialises_to_exclusion_added() {
+        // The exact wire form a pre-ADR-0041 event was persisted with: a
+        // bare `trigger_exclusion_id`, NO `trigger` key (append-only,
+        // ADR 0002 — past events are never rewritten).
+        let legacy = serde_json::json!({
+            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "policy_id": "00000000-0000-0000-0000-000000000002",
+            "trigger_exclusion_id": "00000000-0000-0000-0000-00000000000a",
+            "previous_status": "Rejected",
+            "new_status": "Released",
+        });
+        let back: ArtifactReEvaluated = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            back.trigger,
+            ReEvaluationTrigger::ExclusionAdded {
+                exclusion_id: Uuid::from_u128(10),
+            },
+            "a legacy trigger_exclusion_id maps onto ExclusionAdded"
+        );
+        assert_eq!(back.artifact_id, Uuid::from_u128(1));
+        assert_eq!(back.policy_id, Uuid::from_u128(2));
+        assert_eq!(back.previous_status, QuarantineStatus::Rejected);
+        assert_eq!(back.new_status, QuarantineStatus::Released);
+    }
+
+    #[test]
+    fn legacy_shape_round_trips_through_re_serialisation_to_new_shape() {
+        // A legacy event read back and re-serialised emits the NEW shape
+        // (forward migration on read; the stored event itself is untouched).
+        let legacy = serde_json::json!({
+            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "policy_id": "00000000-0000-0000-0000-000000000002",
+            "trigger_exclusion_id": "00000000-0000-0000-0000-00000000000a",
+            "previous_status": "Rejected",
+            "new_status": "Quarantined",
+        });
+        let parsed: ArtifactReEvaluated = serde_json::from_value(legacy).unwrap();
+        let reserialised = serde_json::to_value(&parsed).unwrap();
+        assert!(reserialised.get("trigger").is_some());
+        assert!(reserialised.get("trigger_exclusion_id").is_none());
+        // And it parses back to the same value (idempotent on the new shape).
+        let back: ArtifactReEvaluated = serde_json::from_value(reserialised).unwrap();
+        assert_eq!(parsed, back);
+    }
+
+    #[test]
+    fn missing_both_trigger_fields_falls_back_to_nil_exclusion_added() {
+        // Defence-in-depth: a malformed event carrying neither key still
+        // materialises (a nil-id ExclusionAdded) rather than failing the
+        // whole stream replay — an audit record must not vanish.
+        let neither = serde_json::json!({
+            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "policy_id": "00000000-0000-0000-0000-000000000002",
+            "previous_status": "Rejected",
+            "new_status": "Released",
+        });
+        let back: ArtifactReEvaluated = serde_json::from_value(neither).unwrap();
+        assert_eq!(
+            back.trigger,
+            ReEvaluationTrigger::ExclusionAdded {
+                exclusion_id: nil()
+            }
+        );
+    }
+
+    #[test]
+    fn new_trigger_takes_precedence_over_a_stray_legacy_field() {
+        // If both keys are present (should never happen in practice), the
+        // current `trigger` wins — the `From` resolves it first.
+        let both = serde_json::json!({
+            "artifact_id": "00000000-0000-0000-0000-000000000001",
+            "policy_id": "00000000-0000-0000-0000-000000000002",
+            "trigger": { "PolicyUpdated": { "policy_id": "00000000-0000-0000-0000-00000000000c" } },
+            "trigger_exclusion_id": "00000000-0000-0000-0000-00000000000a",
+            "previous_status": "Released",
+            "new_status": "Rejected",
+        });
+        let back: ArtifactReEvaluated = serde_json::from_value(both).unwrap();
+        assert_eq!(
+            back.trigger,
+            ReEvaluationTrigger::PolicyUpdated {
+                policy_id: Uuid::from_u128(12),
+            },
+        );
+    }
+
+    #[test]
+    fn round_trips_through_domain_event_envelope() {
+        // Mirrors the adapter's `{type,data}` reshape for the widened event.
+        let ev = DomainEvent::ArtifactReEvaluated(sample(ReEvaluationTrigger::ExclusionRemoved {
+            exclusion_id: Uuid::from_u128(11),
+        }));
+        let event_type = ev.event_type();
+        let v = serde_json::to_value(&ev).unwrap();
+        let payload = match v {
+            serde_json::Value::Object(mut m) => {
+                m.remove(event_type).unwrap_or(serde_json::Value::Null)
+            }
+            other => other,
+        };
+        let reshaped = serde_json::json!({ event_type: payload });
+        let back: DomainEvent = serde_json::from_value(reshaped).unwrap();
+        assert_eq!(ev, back);
+        back.validate().expect("widened event validates");
+    }
+
+    #[test]
+    fn validate_is_ok_and_derives_cover() {
+        let ev = sample(ReEvaluationTrigger::PolicyUpdated { policy_id: nil() });
+        ev.validate().expect("pure metadata always validates");
+        let cloned = ev.clone();
+        assert_eq!(ev, cloned);
+        assert!(format!("{ev:?}").contains("ArtifactReEvaluated"));
+        // ReEvaluationTrigger derives (Debug/Clone/Copy/PartialEq/Eq).
+        let t = ReEvaluationTrigger::ExclusionAdded {
+            exclusion_id: nil(),
+        };
+        let t2 = t;
+        assert_eq!(t, t2);
+        assert_ne!(
+            t,
+            ReEvaluationTrigger::ExclusionRemoved {
+                exclusion_id: nil()
+            }
+        );
+        assert!(!format!("{t:?}").is_empty());
+    }
+
+    // ---- the new RejectionReason variant round-trips ----
+
+    #[test]
+    fn scan_policy_retroactive_rejection_reason_round_trips() {
+        let reason = RejectionReason::ScanPolicyRetroactive;
+        let json = serde_json::to_value(&reason).unwrap();
+        // A unit variant serialises as the bare string discriminator.
+        assert_eq!(json, serde_json::json!("ScanPolicyRetroactive"));
+        let back: RejectionReason = serde_json::from_value(json).unwrap();
+        assert_eq!(back, reason);
+    }
+
+    #[test]
+    fn scan_policy_retroactive_round_trips_inside_artifact_rejected() {
+        let ev = ArtifactRejected {
+            artifact_id: Uuid::from_u128(1),
+            rejected_by: RejectionReason::ScanPolicyRetroactive,
+            reason: "tighten re-hold".into(),
+        };
+        ev.validate().expect("valid");
+        let json = serde_json::to_value(&ev).unwrap();
+        let back: ArtifactRejected = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        assert_eq!(back.rejected_by, RejectionReason::ScanPolicyRetroactive);
     }
 }

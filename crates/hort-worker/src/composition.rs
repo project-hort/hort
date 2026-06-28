@@ -918,7 +918,10 @@ pub async fn build_app_context(
         artifacts.clone(),
         repositories.clone(),
         event_publisher.clone(),
-        curation_rules,
+        // Cloned so the `PolicyUseCase` (PolicyReEvaluationHandler,
+        // ADR 0041) below shares the same curation-rule projection for
+        // its active-curation release precondition (invariant #6 (c)).
+        curation_rules.clone(),
         artifact_group_use_case,
         // See the cardinality-default rationale block above.
         true,
@@ -963,6 +966,64 @@ pub async fn build_app_context(
          — seed-import jobs now claim → dispatch → \
          register-by-hash → ArtifactIngested/ArtifactQuarantined events"
     );
+
+    // -----------------------------------------------------------------
+    // Register the PolicyReEvaluationHandler (kind `policy-reevaluation`,
+    // ADR 0041 Item 3).
+    //
+    //       Unconditional: the handler only needs Postgres ports already
+    //       wired (policy projections, artifacts, lifecycle, storage,
+    //       curation rules, repositories). Enqueued by `PolicyUseCase` on
+    //       every gate-affecting scan-policy mutation (gitops apply +
+    //       the HTTP curator exclusion edits) — one row per mutation —
+    //       and the worker re-derives the in-scope population's verdicts
+    //       from stored findings under the bumped policy, transitioning
+    //       in both directions.
+    //
+    //       Concurrency = 1 — single-active per worker replica. The pass
+    //       is verdict-idempotent and `commit_transition` carries
+    //       event-version optimistic concurrency, so a second concurrent
+    //       pass is safe; pinning at 1 simply avoids two replicas walking
+    //       the same population for no benefit (mirrors the other sweep
+    //       postures). NOT a destructive task (ADR 0028) — no idempotency
+    //       key, no seal-pool.
+    //
+    //       The `PolicyUseCase` here reuses the worker's existing ports;
+    //       RBAC is `Disabled` for the `RepositoryAccessUseCase` (the
+    //       pass only calls `metric_label` / `repository_format`, never
+    //       an authz gate — the gitops apply boundary owns authorization).
+    // -----------------------------------------------------------------
+    {
+        use hort_app::use_cases::policy_use_case::PolicyUseCase;
+        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
+
+        let repository_access_for_policy = Arc::new(RepositoryAccessUseCase::new(
+            repositories.clone(),
+            RbacAccess::Disabled,
+            true,
+        ));
+        let policy_use_case = Arc::new(PolicyUseCase::new(
+            event_publisher.clone(),
+            policy_projections.clone(),
+            artifacts.clone(),
+            lifecycle.clone(),
+            storage.clone(),
+            repository_access_for_policy,
+            curation_rules.clone(),
+            jobs.clone(),
+        ));
+        dispatcher.register(
+            Arc::new(hort_app::task_handlers::PolicyReEvaluationHandler::new(
+                policy_use_case,
+            )),
+            1, // single-active — see the call-site rationale.
+        );
+        tracing::info!(
+            "PolicyReEvaluationHandler registered (single-active per worker replica) \
+             — policy-reevaluation jobs now claim → dispatch → \
+             run_policy_re_evaluation_pass (ADR 0041)"
+        );
+    }
 
     // -----------------------------------------------------------------
     // Register the ServiceAccountRotationHandler when the optional

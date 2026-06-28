@@ -1548,7 +1548,7 @@ fn event_type_artifact_re_evaluated() {
     let e = DomainEvent::ArtifactReEvaluated(ArtifactReEvaluated {
         artifact_id: id(),
         policy_id: id(),
-        trigger_exclusion_id: id(),
+        trigger: ReEvaluationTrigger::ExclusionAdded { exclusion_id: id() },
         previous_status: QuarantineStatus::Rejected,
         new_status: QuarantineStatus::Released,
     });
@@ -1563,7 +1563,7 @@ fn serde_roundtrip_artifact_re_evaluated() {
     let event = DomainEvent::ArtifactReEvaluated(ArtifactReEvaluated {
         artifact_id: id(),
         policy_id: id(),
-        trigger_exclusion_id: id(),
+        trigger: ReEvaluationTrigger::PolicyUpdated { policy_id: id() },
         previous_status: QuarantineStatus::Rejected,
         new_status: QuarantineStatus::Quarantined,
     });
@@ -2134,6 +2134,33 @@ fn policy_field_clone_eq_serde() {
         let back: PolicyField = serde_json::from_str(&json).unwrap();
         assert_eq!(field, back);
     }
+}
+
+/// ADR 0041 Item 3: exactly the three scan-release-gate fields are
+/// gate-affecting; every other `PolicyField` is not. Pins both arms of
+/// the closed match in `PolicyField::is_gate_affecting` so a future
+/// variant (which fails to compile against the closed match) forces a
+/// deliberate gate-affecting decision, and a reclassification of an
+/// existing field is a red test.
+#[test]
+fn policy_field_is_gate_affecting_is_exactly_the_scan_gate_fields() {
+    // Gate-affecting: the three fields `evaluate_scan_result` reads.
+    assert!(PolicyField::SeverityThreshold.is_gate_affecting());
+    assert!(PolicyField::LicensePolicy.is_gate_affecting());
+    assert!(PolicyField::NegligibleAction.is_gate_affecting());
+
+    // Not gate-affecting: identity / timer / promotion / provenance /
+    // age / scanner-selection / rescan-cadence fields.
+    assert!(!PolicyField::Name.is_gate_affecting());
+    assert!(!PolicyField::Scope.is_gate_affecting());
+    assert!(!PolicyField::QuarantineDuration.is_gate_affecting());
+    assert!(!PolicyField::RequireApproval.is_gate_affecting());
+    assert!(!PolicyField::ProvenanceMode.is_gate_affecting());
+    assert!(!PolicyField::ProvenanceBackends.is_gate_affecting());
+    assert!(!PolicyField::ProvenanceIdentities.is_gate_affecting());
+    assert!(!PolicyField::MaxArtifactAge.is_gate_affecting());
+    assert!(!PolicyField::ScanBackends.is_gate_affecting());
+    assert!(!PolicyField::RescanIntervalHours.is_gate_affecting());
 }
 
 // ---------------------------------------------------------------------------

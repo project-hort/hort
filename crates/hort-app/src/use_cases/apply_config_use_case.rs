@@ -5250,6 +5250,8 @@ mod tests {
             lifecycle.clone(),
             Arc::new(crate::use_cases::test_support::MockStoragePort::new()),
             default_repository_access_for_policy(),
+            Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
+            Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
         ));
         // OidcIssuer / ServiceAccount gitops surface mocks.
         let oidc_issuers =
@@ -5330,6 +5332,8 @@ mod tests {
             lifecycle.clone(),
             Arc::new(crate::use_cases::test_support::MockStoragePort::new()),
             default_repository_access_for_policy(),
+            Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
+            Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
         ));
         let oidc_issuers =
             Arc::new(crate::use_cases::test_support::MockOidcIssuerRepository::new());
@@ -7953,6 +7957,7 @@ mod tests {
             quarantine_status: status,
             // Store the observation-window anchor;
             // the deadline is computed live.
+            rejection_reason: None,
             quarantine_window_start: Some(now),
             quarantine_deadline: None,
             upstream_published_at: None,
@@ -9974,6 +9979,8 @@ mod tests {
                 h.lifecycle.clone(),
                 Arc::new(crate::use_cases::test_support::MockStoragePort::new()),
                 default_repository_access_for_policy(),
+                Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
+                Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
             )),
             h.artifacts.clone(),
             h.lifecycle.clone(),
@@ -11591,6 +11598,8 @@ mod tests {
             h.lifecycle.clone(),
             Arc::new(crate::use_cases::test_support::MockStoragePort::new()),
             default_repository_access_for_policy(),
+            Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
+            Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
         ));
         let uc = ApplyConfigUseCase::new(
             h.repos.clone(),

@@ -6,6 +6,11 @@
 
 pub mod advisory_watch_tick;
 pub mod cron_rescan_tick;
+// Async scan-policy re-evaluation pass (kind `policy-reevaluation`,
+// ADR 0041 Item 3). Wraps `PolicyUseCase::run_policy_re_evaluation_pass`;
+// enqueued by `PolicyUseCase` on every gate-affecting scan-policy
+// mutation (one row per mutation, coalesced).
+pub mod policy_reevaluation;
 // Periodic quarantine release sweep (kind `quarantine-release-sweep`).
 // Triggered by a Helm CronJob that runs the `hort-server enqueue-
 // quarantine-release-sweep` subcommand via the runtime DSN —
@@ -85,6 +90,7 @@ pub use eventstore_checkpoint::{
     CheckpointEmissionHook, CheckpointEmitterHookAdapter, EventstoreCheckpointHandler,
 };
 pub use noop::NoopTaskHandler;
+pub use policy_reevaluation::PolicyReEvaluationHandler;
 pub use prefetch_dependencies::{target_key as prefetch_target_key, PrefetchDependenciesHandler};
 pub use prefetch_ingest::PrefetchIngestHandler;
 pub use prefetch_row_retention_sweep::PrefetchRowRetentionSweepHandler;

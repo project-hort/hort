@@ -86,6 +86,70 @@ pub enum PolicyField {
     NegligibleAction,
 }
 
+impl PolicyField {
+    /// Whether a change to this field alters the **scan release gate**
+    /// and therefore warrants an async re-evaluation pass over the
+    /// policy's in-scope population (ADR 0041 §Triggers-and-scope).
+    ///
+    /// The continuous-enforcement pass re-derives each artifact's verdict
+    /// by re-running the pure scan evaluator (`evaluate_scan_result`)
+    /// over the artifact's **stored findings** under the bumped policy.
+    /// That evaluator reads exactly three policy fields:
+    /// `severity_threshold` (the blocked-severity bar), `license_policy`
+    /// (the blocked-license classes), and `negligible_action` (how
+    /// informational / negligible findings steer the decision). A change
+    /// to any of those three can flip a stored-findings verdict and so is
+    /// gate-affecting; the ADR's enumeration ("severity thresholds,
+    /// blocked classes, `negligible_action`") is exactly this set.
+    ///
+    /// Every other field is **not** scan-gate-affecting:
+    /// - `Name` / `Scope` — identity / matching, not the verdict
+    ///   (`Scope` changes *which* policy matches an artifact, handled by
+    ///   the matcher, not by re-deriving a verdict under one policy);
+    /// - `QuarantineDuration` — anchors the timer window, not the verdict
+    ///   (ADR 0041: re-evaluation re-derives the verdict, never the
+    ///   timer);
+    /// - `RequireApproval` — a promotion-gate knob, not the scan release
+    ///   predicate;
+    /// - `ProvenanceMode` / `ProvenanceBackends` / `ProvenanceIdentities`
+    ///   — the provenance axis runs its own verification path
+    ///   (`provenance-verify`); the cross-axis release conjunction
+    ///   (invariant #6) re-checks live provenance state at release time,
+    ///   so a provenance-config change does not require re-deriving the
+    ///   *scan* verdict here;
+    /// - `MaxArtifactAge` — an age gate enforced at ingest, not part of
+    ///   the stored-findings scan verdict;
+    /// - `ScanBackends` — selects *which scanners run*, i.e. which
+    ///   findings get *produced* on the next scan; it does not
+    ///   re-interpret already-stored findings (the evaluator never reads
+    ///   it). Changing it changes future evidence, not the current
+    ///   verdict over existing evidence — out of scope for this pass (the
+    ///   `scan_backends: []` waiver row has no findings → untouched,
+    ///   ADR 0041 cross-opt-in matrix);
+    /// - `RescanIntervalHours` — schedules the cron rescan cadence, not
+    ///   the verdict.
+    ///
+    /// Closed match (no `_` arm) so a future `PolicyField` variant fails
+    /// to compile here, forcing a deliberate gate-affecting decision
+    /// rather than silently defaulting either way.
+    #[must_use]
+    pub const fn is_gate_affecting(&self) -> bool {
+        match self {
+            Self::SeverityThreshold | Self::LicensePolicy | Self::NegligibleAction => true,
+            Self::Name
+            | Self::Scope
+            | Self::QuarantineDuration
+            | Self::RequireApproval
+            | Self::ProvenanceMode
+            | Self::ProvenanceBackends
+            | Self::ProvenanceIdentities
+            | Self::MaxArtifactAge
+            | Self::ScanBackends
+            | Self::RescanIntervalHours => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyUpdated {
     pub policy_id: Uuid,

@@ -186,6 +186,10 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
         // (this is a DB-CHECK-only kind, not part of the admin-task-invoke
         // lock-step).
         "verify-event-chain",
+        // Async scan-policy re-evaluation pass — added to the jobs.kind
+        // CHECK by migration 016 (ADR 0041 Item 3). The dedicated DB-gated
+        // proof is `migration_016_policy_reevaluation_kind.rs`.
+        "policy-reevaluation",
     ];
     for kind in all_kinds {
         // Use a unique fresh artifact_id only for `kind='scan'`; the

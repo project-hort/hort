@@ -12,6 +12,7 @@ use crate::events::{
     ArtifactCorrupted, ArtifactQuarantined, ArtifactRejected, ArtifactReleased, DomainEvent,
     ProvenanceRejected, ProvenanceVerified, RejectionReason, ReleaseReason, ScanIndeterminate,
 };
+use crate::policy::ScanOutcome;
 use crate::ports::provenance::{ProvenanceOutcome, ProvenanceRejectReason, ProvenanceVerdict};
 use crate::types::ContentHash;
 
@@ -106,6 +107,33 @@ pub struct Artifact {
     pub md5_checksum: Option<String>,
     pub content_type: String,
     pub quarantine_status: QuarantineStatus,
+    /// Why this artifact is in [`QuarantineStatus::Rejected`] — the
+    /// structured rejection reason last applied by an `ArtifactRejected`
+    /// event (`Scanner`, `CurationRetroactive`, `Curator`, `Admin`).
+    /// `None` when the artifact is not rejected (or when the rejection
+    /// reason is unknown — e.g. a legacy row, or a rejection from a code
+    /// path that predates reason carriage).
+    ///
+    /// **Cross-axis release eligibility (ADR 0041, invariant #6).** The
+    /// scan re-evaluation release path ([`Self::re_evaluate`]) is
+    /// scan-clearable only for `Some(RejectionReason::Scanner)`: a
+    /// provenance- / curation- / admin-rejected artifact is **ineligible**
+    /// for a scan re-judgement and stays held. A reject reason added later
+    /// is ineligible by default (`None` is not `Scanner`). The field is set
+    /// on the entity reject methods (`reject_from_scan`,
+    /// `reject_from_retroactive_curation`, `block_by_curator`) and is
+    /// re-hydrated by the application layer from the artifact's stored
+    /// `ArtifactRejected` event before [`Self::re_evaluate`] is called
+    /// (the projection row does not persist it — same transient-hydration
+    /// contract as [`Self::quarantine_deadline`]).
+    ///
+    /// `#[serde(default)]` so any persisted/replayed `Artifact`
+    /// representation that predates the field deserialises as `None`
+    /// (defence-in-depth — `Artifact` is materialised from a projection
+    /// row, not the event stream, but the field participates in the
+    /// derived `Serialize`/`Deserialize`).
+    #[serde(default)]
+    pub rejection_reason: Option<RejectionReason>,
     /// Immutable observation-window **anchor** (ADR 0007). The
     /// resolved window start — `ingested_at` by default, or
     /// `min(upstream_published_at, ingested_at)` under the per-upstream
@@ -256,6 +284,38 @@ pub enum ProvenanceClearance {
 }
 
 // ---------------------------------------------------------------------------
+// CurationClearance (ADR 0041, invariant #6 conjunct (c))
+// ---------------------------------------------------------------------------
+
+/// The curation side of the cross-axis re-evaluation release gate
+/// (ADR 0041, invariant #6). Computed by the application layer per
+/// re-evaluation candidate from the live curation rule set
+/// (`CurationRuleRepository::list_for_repo` → `evaluate_curation`) and
+/// threaded into [`Artifact::re_evaluate`] as an **AND-precondition** on
+/// the `Rejected → Released` arm — mirroring the
+/// [`ProvenanceClearance`] param on [`Artifact::release`].
+///
+/// This conjunct is **not** subsumed by the rejection-reason eligibility
+/// guard: a *scan*-rejected artifact (eligible) that a curation rule
+/// added *after* the scan rejection would now block is **not** re-marked
+/// by the retroactive curation pass (`reject_from_retroactive_curation`
+/// transitions only `Quarantined` / `Released`, never an already-
+/// `Rejected` artifact). Without this active re-check, a scan loosen
+/// would release it past the live curation block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurationClearance {
+    /// No currently-active curation rule blocks the artifact — the
+    /// curation conjunct of the release gate is satisfied.
+    Cleared,
+    /// A currently-active curation rule (`evaluate_curation` →
+    /// `CurationOutcome::Block`) matches the artifact — the
+    /// `Rejected → Released` arm is denied (fail-closed). A `Warn` /
+    /// `Allow` curation outcome resolves to [`Self::Cleared`]; only a
+    /// `Block` resolves to `Blocked`.
+    Blocked,
+}
+
+// ---------------------------------------------------------------------------
 // Artifact state machine
 // ---------------------------------------------------------------------------
 
@@ -329,6 +389,7 @@ impl Artifact {
             }
         }
         self.quarantine_status = QuarantineStatus::Rejected;
+        self.rejection_reason = Some(RejectionReason::Scanner);
         Ok(ArtifactRejected {
             artifact_id: self.id,
             rejected_by: RejectionReason::Scanner,
@@ -357,11 +418,91 @@ impl Artifact {
             }
         }
         self.quarantine_status = QuarantineStatus::Rejected;
+        self.rejection_reason = Some(RejectionReason::CurationRetroactive { rule_id });
         Ok(ArtifactRejected {
             artifact_id: self.id,
             rejected_by: RejectionReason::CurationRetroactive { rule_id },
             reason,
         })
+    }
+
+    /// Retroactive **scan-policy** re-hold (ADR 0041, the tighten
+    /// direction of continuous enforcement). A gate-affecting `ScanPolicy`
+    /// change re-derived this artifact's verdict from its **stored**
+    /// findings under the new policy; this method applies that verdict.
+    ///
+    /// The verdict is the single source of truth — the caller (the
+    /// re-evaluation pass) computes it via
+    /// [`crate::policy::evaluate_scan_result`] over the artifact's stored
+    /// findings and threads the [`ScanOutcome`] in; the domain stays pure
+    /// (no I/O, no re-scan). Both the loosen direction
+    /// ([`Self::re_evaluate`]) and this tighten direction read the same
+    /// `evaluate_scan_result` outcome, so the two cannot diverge
+    /// (invariant #2).
+    ///
+    /// - [`ScanOutcome::Reject`] (now-failing) → transition to
+    ///   [`QuarantineStatus::Rejected`], emit [`ArtifactRejected`] with
+    ///   [`RejectionReason::ScanPolicyRetroactive`]. Mirrors
+    ///   [`Self::reject_from_retroactive_curation`]: valid only from the
+    ///   "active" states [`QuarantineStatus::Quarantined`] /
+    ///   [`QuarantineStatus::Released`] (the set
+    ///   `ArtifactRepository::list_active_for_policy` returns).
+    /// - [`ScanOutcome::Clean`] (still-passing) → `Ok(None)`, no
+    ///   transition, no event (invariant #2's "unchanged verdict → no-op").
+    ///
+    /// **No evidence ⇒ no re-rejection (invariant #4).** This method does
+    /// not manufacture a verdict — it applies the one the caller computed.
+    /// An artifact with no stored findings evaluates
+    /// [`ScanOutcome::Clean`], so the caller threads `Clean` and this is a
+    /// no-op: a scan tighten can never re-reject an artifact that has no
+    /// evidence it violates.
+    ///
+    /// **The timer window is NOT re-opened.** A re-rejection does not reset
+    /// [`Self::quarantine_window_start`] (or the transient
+    /// [`Self::quarantine_deadline`]) — the artifact's original observation
+    /// anchor is preserved, exactly as
+    /// [`Self::reject_from_retroactive_curation`] leaves it. Re-rejecting a
+    /// `Released` artifact blocks **future** downloads (the status gate);
+    /// already-served bytes cannot be recalled.
+    ///
+    /// **Terminal source states reject as `Invariant` *without* mutating**
+    /// (mirroring the sibling reject primitives), so the caller skips the
+    /// event append:
+    /// - [`QuarantineStatus::None`] — a never-held artifact is not in the
+    ///   active scanned population this pass walks.
+    /// - [`QuarantineStatus::Rejected`] — already blocked (idempotent skip;
+    ///   a re-evaluation that finds it still-failing is a no-op).
+    /// - [`QuarantineStatus::ScanIndeterminate`] — terminal scan-failure
+    ///   state (ADR 0007); admin-only exit, never re-held by a policy pass.
+    pub fn reject_from_scan_policy_retroactive(
+        &mut self,
+        outcome: &ScanOutcome,
+        reason: String,
+    ) -> DomainResult<Option<ArtifactRejected>> {
+        match self.quarantine_status {
+            QuarantineStatus::Quarantined | QuarantineStatus::Released => {}
+            other => {
+                return Err(DomainError::Invariant(format!(
+                    "cannot retroactively scan-re-hold artifact in state {other}"
+                )));
+            }
+        }
+        match outcome {
+            // Still-passing under the new policy — unchanged verdict, no-op
+            // (invariant #2). The window is untouched; no event appended.
+            ScanOutcome::Clean => Ok(None),
+            // Now-failing — re-hold. The window anchor is preserved (not
+            // re-opened); only the status + reason move.
+            ScanOutcome::Reject(_) => {
+                self.quarantine_status = QuarantineStatus::Rejected;
+                self.rejection_reason = Some(RejectionReason::ScanPolicyRetroactive);
+                Ok(Some(ArtifactRejected {
+                    artifact_id: self.id,
+                    rejected_by: RejectionReason::ScanPolicyRetroactive,
+                    reason,
+                }))
+            }
+        }
     }
 
     /// Block an artifact via a manual curator decision (see
@@ -417,6 +558,7 @@ impl Artifact {
             }
         }
         self.quarantine_status = QuarantineStatus::Rejected;
+        self.rejection_reason = Some(RejectionReason::Curator { curator_id });
         Ok(ArtifactRejected {
             artifact_id: self.id,
             rejected_by: RejectionReason::Curator { curator_id },
@@ -462,6 +604,12 @@ impl Artifact {
         }
         let expected_hash = self.sha256_checksum.clone();
         self.quarantine_status = QuarantineStatus::Rejected;
+        // Corruption is not scan-clearable: there is no `RejectionReason`
+        // variant for it (it emits `ArtifactCorrupted`, not
+        // `ArtifactRejected`). Leaving the reason `None` keeps a
+        // corruption-tombstoned artifact ineligible for a scan
+        // re-judgement (ADR 0041 invariant #6 — `None` is not `Scanner`).
+        self.rejection_reason = None;
         Ok(ArtifactCorrupted {
             artifact_id: self.id,
             computed_hash,
@@ -637,6 +785,12 @@ impl Artifact {
             }
             ProvenanceOutcome::Rejected(reason) => {
                 self.quarantine_status = QuarantineStatus::Rejected;
+                // A provenance rejection is not scan-clearable. There is
+                // no `RejectionReason` variant for provenance (it emits
+                // `ProvenanceRejected`); leaving the reason `None` keeps
+                // the artifact ineligible for a scan re-judgement
+                // (ADR 0041 invariant #6 — `None` is not `Scanner`).
+                self.rejection_reason = None;
                 Ok(Some(DomainEvent::ProvenanceRejected(ProvenanceRejected {
                     artifact_id: self.id,
                     content_hash: self.sha256_checksum.clone(),
@@ -648,6 +802,8 @@ impl Artifact {
                 ProvenanceMode::Required => {
                     // Unsigned IS a rejection under Required (ADR 0027).
                     self.quarantine_status = QuarantineStatus::Rejected;
+                    // Not scan-clearable — see the `Rejected` arm above.
+                    self.rejection_reason = None;
                     Ok(Some(DomainEvent::ProvenanceRejected(ProvenanceRejected {
                         artifact_id: self.id,
                         content_hash: self.sha256_checksum.clone(),
@@ -700,12 +856,47 @@ impl Artifact {
         })
     }
 
-    /// Re-evaluate after a policy exclusion removes the scan block.
+    /// Re-evaluate after a scan-policy change cleared the scan block.
     /// Only valid from `Rejected`.
     ///
     /// If the quarantine observation window is still in the future,
     /// transitions back to `Quarantined` — the remaining window still
     /// applies. Otherwise transitions directly to `Released`.
+    ///
+    /// # Cross-axis release conjunction (ADR 0041, invariant #6)
+    ///
+    /// A `Rejected → Released` transition fires only on the full
+    /// conjunction `scan ∧ curation ∧ provenance` — each conjunct
+    /// *mechanized*, none merely proxied:
+    ///
+    /// - **(a) Rejection-reason eligibility.** Only a scan-clearable
+    ///   rejection (`rejection_reason == Some(RejectionReason::Scanner)`)
+    ///   is a candidate for a scan re-judgement. A provenance- /
+    ///   curation- / admin- / corruption-rejected artifact (any other
+    ///   reason, including `None`) is **ineligible** and returns
+    ///   `Err(Invariant)` without mutating, so the application pass skips
+    ///   it (the artifact stays `Rejected`). The caller has already
+    ///   re-hydrated `rejection_reason` from the stored `ArtifactRejected`
+    ///   event (the projection row does not persist it).
+    /// - **(b) Active provenance precondition.** The `Released` arm fires
+    ///   only when `provenance ∈ {NotRequired, Cleared}` — a scan-cleared
+    ///   artifact with `Pending` (Required mode, not yet a
+    ///   `ProvenanceVerified`) provenance stays `Rejected` (fail-closed).
+    /// - **(c) Active curation precondition.** The `Released` arm fires
+    ///   only when `curation == Cleared` — a `Blocked` (a currently-active
+    ///   curation rule matches) artifact stays `Rejected`. Symmetric to
+    ///   (b); not covered by (a) (see [`CurationClearance`]).
+    ///
+    /// `provenance` and `curation` are verified facts the application
+    /// layer computes from the live provenance state / curation rules and
+    /// passes in (mirroring the [`ProvenanceClearance`] param on
+    /// [`Self::release`]); the domain stays pure (no I/O).
+    ///
+    /// The **re-quarantine** arm (`Rejected → Quarantined`, window still
+    /// active) is **not** gated by (b)/(c): the artifact remains held
+    /// (downloads blocked), so deferring the curation/provenance gate to
+    /// the eventual timer release is fail-closed-safe. The reason guard
+    /// (a) gates the whole method.
     ///
     /// **The window check reads the transient
     /// [`Self::quarantine_deadline`]** — the computed deadline, NOT the
@@ -717,19 +908,43 @@ impl Artifact {
     /// [`crate::policy::effective_quarantine_deadline`] before calling
     /// this method; an un-hydrated `None` is treated as "elapsed",
     /// matching the historic no-quarantine-hold semantics.
-    pub fn re_evaluate(&mut self, now: DateTime<Utc>) -> DomainResult<DomainEvent> {
+    pub fn re_evaluate(
+        &mut self,
+        now: DateTime<Utc>,
+        provenance: ProvenanceClearance,
+        curation: CurationClearance,
+    ) -> DomainResult<DomainEvent> {
         if self.quarantine_status != QuarantineStatus::Rejected {
             return Err(DomainError::Invariant(format!(
                 "cannot re-evaluate artifact in state {}",
                 self.quarantine_status
             )));
         }
+
+        // (a) Eligibility guard: only a scan-clearable rejection is a
+        // candidate for a scan re-judgement. Every other reason (and an
+        // unknown `None`) is ineligible — return without mutating so the
+        // application pass leaves the artifact `Rejected`.
+        if !is_scan_clearable(self.rejection_reason.as_ref()) {
+            return Err(DomainError::Invariant(format!(
+                "cannot scan-re-evaluate artifact rejected by {:?}: only a \
+                 scan-axis rejection (Scanner or ScanPolicyRetroactive) is \
+                 scan-clearable (ADR 0041 invariant #6)",
+                self.rejection_reason
+            )));
+        }
+
         let still_in_window = self
             .quarantine_deadline
             .is_some_and(|deadline| deadline > now);
 
         if still_in_window {
             self.quarantine_status = QuarantineStatus::Quarantined;
+            // The artifact stays held; clearing the scan reason here keeps
+            // a subsequent re-evaluation from treating a now-re-quarantined
+            // artifact as a stale scan rejection. The eventual timer
+            // release applies the provenance gate via `release()`.
+            self.rejection_reason = None;
             Ok(DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
                 artifact_id: self.id,
                 // The re-quarantine preserves the original anchor — the
@@ -737,7 +952,25 @@ impl Artifact {
                 quarantine_window_start: self.quarantine_window_start.unwrap_or(now),
             }))
         } else {
+            // (b)+(c) the release arm requires both cross-axis conjuncts
+            // to currently clear. A pending/failed provenance or an active
+            // curation block keeps the artifact `Rejected` (fail-closed) —
+            // return without mutating so the pass skips it.
+            let provenance_clears = matches!(
+                provenance,
+                ProvenanceClearance::NotRequired | ProvenanceClearance::Cleared
+            );
+            let curation_clears = matches!(curation, CurationClearance::Cleared);
+            if !provenance_clears || !curation_clears {
+                return Err(DomainError::Invariant(format!(
+                    "cannot release re-evaluated artifact: cross-axis release \
+                     conjunction not satisfied (provenance={provenance:?}, \
+                     curation={curation:?}) — ADR 0041 invariant #6"
+                )));
+            }
+
             self.quarantine_status = QuarantineStatus::Released;
+            self.rejection_reason = None;
             // PolicyReEvaluation is system-driven
             // (no operator attribution); the variant invariant requires
             // both fields `None`.
@@ -764,6 +997,35 @@ impl Artifact {
             self.quarantine_status,
             QuarantineStatus::None | QuarantineStatus::Released
         )
+    }
+}
+
+/// Is a rejection **scan-clearable** — i.e. on the scan axis, so a later
+/// scan-policy loosen can re-release it (ADR 0041 invariant #6 (a))?
+///
+/// The scan-axis reasons are [`RejectionReason::Scanner`] (a fresh-scan
+/// rejection) and [`RejectionReason::ScanPolicyRetroactive`] (a retroactive
+/// scan-policy tighten re-hold — see
+/// [`Artifact::reject_from_scan_policy_retroactive`]). Both are cleared by
+/// re-deriving the verdict over the artifact's stored findings, so a
+/// subsequent loosen must be able to re-release an artifact re-held by an
+/// earlier tighten — otherwise a tighten→loosen sequence would strand it
+/// `Rejected` forever.
+///
+/// Every other reason is **not** scan-clearable and stays held:
+/// `Admin`, `Curator` (manual decisions), `CurationRetroactive` (curation
+/// axis), and an unknown `None` (a legacy / reason-less rejection, or a
+/// provenance / corruption rejection that deliberately leaves the reason
+/// `None`). Exhaustive `match` (no wildcard) so a future `RejectionReason`
+/// variant forces a deliberate scan-clearable / not decision here rather
+/// than silently defaulting to eligible.
+pub fn is_scan_clearable(reason: Option<&RejectionReason>) -> bool {
+    match reason {
+        Some(RejectionReason::Scanner) | Some(RejectionReason::ScanPolicyRetroactive) => true,
+        Some(RejectionReason::Admin)
+        | Some(RejectionReason::Curator { .. })
+        | Some(RejectionReason::CurationRetroactive { .. })
+        | None => false,
     }
 }
 
@@ -847,6 +1109,7 @@ mod tests {
             md5_checksum: None,
             content_type: "application/gzip".into(),
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,
@@ -946,6 +1209,11 @@ mod tests {
     fn rejected_artifact() -> Artifact {
         let mut a = quarantined_artifact();
         a.quarantine_status = QuarantineStatus::Rejected;
+        // The default rejected fixture is a *scanner*-rejected artifact —
+        // the scan-clearable reason, so `re_evaluate`'s eligibility guard
+        // (ADR 0041 invariant #6 (a)) admits it. Non-scanner reasons are
+        // exercised by dedicated tests.
+        a.rejection_reason = Some(RejectionReason::Scanner);
         a
     }
 
@@ -1054,6 +1322,8 @@ mod tests {
         assert_eq!(event.artifact_id, a.id);
         assert_eq!(event.rejected_by, RejectionReason::Scanner);
         assert_eq!(event.reason, "CVE-2024-0001");
+        // ADR 0041: the scan-clearable reason is carried on the aggregate.
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Scanner));
     }
 
     /// State-machine extension for `quarantineDuration = 0` (permissive
@@ -1111,6 +1381,13 @@ mod tests {
             RejectionReason::CurationRetroactive { rule_id }
         );
         assert_eq!(event.reason, "policy block");
+        // ADR 0041: a curation rejection is NOT scan-clearable; the
+        // aggregate carries the curation reason (ineligible for
+        // `re_evaluate`'s scan re-judgement).
+        assert_eq!(
+            a.rejection_reason,
+            Some(RejectionReason::CurationRetroactive { rule_id })
+        );
     }
 
     #[test]
@@ -1166,6 +1443,11 @@ mod tests {
         assert_eq!(event.artifact_id, a.id);
         assert_eq!(event.rejected_by, RejectionReason::Curator { curator_id });
         assert_eq!(event.reason, "shadow IT block");
+        // ADR 0041: a curator block is NOT scan-clearable.
+        assert_eq!(
+            a.rejection_reason,
+            Some(RejectionReason::Curator { curator_id })
+        );
     }
 
     #[test]
@@ -1263,6 +1545,9 @@ mod tests {
         assert_eq!(event.computed_hash, computed_hash());
         assert_eq!(event.expected_hash, a.sha256_checksum);
         assert_eq!(event.detected_at, now);
+        // ADR 0041: corruption is not scan-clearable — reason stays None
+        // (ineligible for `re_evaluate`'s scan re-judgement).
+        assert_eq!(a.rejection_reason, None);
     }
 
     #[test]
@@ -1846,6 +2131,8 @@ mod tests {
                     .expect("Ok")
                     .expect("Rejected emits an event");
                 assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+                // ADR 0041: a provenance rejection is not scan-clearable.
+                assert_eq!(a.rejection_reason, None);
                 match ev {
                     DomainEvent::ProvenanceRejected(e) => {
                         assert_eq!(e.artifact_id, a.id);
@@ -2386,7 +2673,11 @@ mod tests {
     fn invariant_3_re_evaluate_not_widened_to_scan_indeterminate() {
         let mut a = scan_indeterminate_artifact();
         assert!(matches!(
-            a.re_evaluate(Utc::now()),
+            a.re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::NotRequired,
+                CurationClearance::Cleared
+            ),
             Err(DomainError::Invariant(_))
         ));
         assert_eq!(a.quarantine_status, QuarantineStatus::ScanIndeterminate);
@@ -2400,6 +2691,19 @@ mod tests {
     }
 
     // -- State machine: re_evaluate -----------------------------------------
+    //
+    // ADR 0041 invariant #6 — the `Rejected → Released` arm fires only on
+    // the cross-axis conjunction `scan ∧ curation ∧ provenance`. The
+    // happy-path tests pass `(NotRequired, Cleared)` (both conjuncts
+    // satisfied); dedicated tests below exercise each non-satisfied
+    // conjunct and the reason-eligibility guard.
+
+    /// Convenience: the "both cross-axis conjuncts clear" inputs — the
+    /// default that mirrors the pre-ADR-0041 `re_evaluate(now)` happy
+    /// path.
+    fn clears() -> (ProvenanceClearance, CurationClearance) {
+        (ProvenanceClearance::NotRequired, CurationClearance::Cleared)
+    }
 
     #[test]
     fn re_evaluate_rejected_future_quarantine_goes_quarantined() {
@@ -2408,9 +2712,13 @@ mod tests {
         // stored anchor.
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
         let now = Utc::now();
-        let event = a.re_evaluate(now).unwrap();
+        let (prov, cur) = clears();
+        let event = a.re_evaluate(now, prov, cur).unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
         assert!(matches!(event, DomainEvent::ArtifactQuarantined(_)));
+        // The re-quarantine clears the scan reason — the artifact is now
+        // held under the window, no longer a scan rejection.
+        assert_eq!(a.rejection_reason, None);
     }
 
     #[test]
@@ -2418,8 +2726,10 @@ mod tests {
         let mut a = rejected_artifact();
         a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
         let now = Utc::now();
-        let event = a.re_evaluate(now).unwrap();
+        let (prov, cur) = clears();
+        let event = a.re_evaluate(now, prov, cur).unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+        assert_eq!(a.rejection_reason, None);
         match event {
             DomainEvent::ArtifactReleased(e) => {
                 assert_eq!(e.released_by, ReleaseReason::PolicyReEvaluation);
@@ -2433,7 +2743,8 @@ mod tests {
         let mut a = rejected_artifact();
         let now = Utc::now();
         a.quarantine_deadline = Some(now);
-        let event = a.re_evaluate(now).unwrap();
+        let (prov, cur) = clears();
+        let event = a.re_evaluate(now, prov, cur).unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         assert!(matches!(event, DomainEvent::ArtifactReleased(_)));
     }
@@ -2442,7 +2753,8 @@ mod tests {
     fn re_evaluate_rejected_no_quarantine_deadline_goes_released() {
         let mut a = rejected_artifact();
         a.quarantine_deadline = None;
-        let event = a.re_evaluate(Utc::now()).unwrap();
+        let (prov, cur) = clears();
+        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         assert!(matches!(event, DomainEvent::ArtifactReleased(_)));
     }
@@ -2462,7 +2774,8 @@ mod tests {
         a.quarantine_window_start = Some(Utc::now() - chrono::Duration::hours(6));
         // ...but the computed deadline is still in the future.
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(18));
-        let event = a.re_evaluate(Utc::now()).unwrap();
+        let (prov, cur) = clears();
+        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
         assert_eq!(
             a.quarantine_status,
             QuarantineStatus::Quarantined,
@@ -2480,8 +2793,9 @@ mod tests {
     #[test]
     fn re_evaluate_from_none_fails() {
         let mut a = sample_artifact();
+        let (prov, cur) = clears();
         assert!(matches!(
-            a.re_evaluate(Utc::now()),
+            a.re_evaluate(Utc::now(), prov, cur),
             Err(DomainError::Invariant(_))
         ));
     }
@@ -2489,8 +2803,9 @@ mod tests {
     #[test]
     fn re_evaluate_from_quarantined_fails() {
         let mut a = quarantined_artifact();
+        let (prov, cur) = clears();
         assert!(matches!(
-            a.re_evaluate(Utc::now()),
+            a.re_evaluate(Utc::now(), prov, cur),
             Err(DomainError::Invariant(_))
         ));
     }
@@ -2498,10 +2813,358 @@ mod tests {
     #[test]
     fn re_evaluate_from_released_fails() {
         let mut a = released_artifact();
+        let (prov, cur) = clears();
         assert!(matches!(
-            a.re_evaluate(Utc::now()),
+            a.re_evaluate(Utc::now(), prov, cur),
             Err(DomainError::Invariant(_))
         ));
+    }
+
+    // -- ADR 0041 invariant #6 — cross-axis release conjunction -------------
+
+    /// (a) Eligibility guard: a non-`Scanner` rejection reason is
+    /// ineligible for a scan re-judgement. Each non-scan reason (and the
+    /// unknown `None` case) must keep the artifact `Rejected` and return
+    /// `Err(Invariant)` *without mutating* — the application pass skips it.
+    #[test]
+    fn re_evaluate_non_scanner_reason_is_ineligible_stays_rejected() {
+        let non_scanner = [
+            None,
+            Some(RejectionReason::Admin),
+            Some(RejectionReason::CurationRetroactive {
+                rule_id: Uuid::new_v4(),
+            }),
+            Some(RejectionReason::Curator {
+                curator_id: Uuid::new_v4(),
+            }),
+        ];
+        for reason in non_scanner {
+            let mut a = rejected_artifact();
+            a.rejection_reason = reason.clone();
+            // Elapsed window — would release under the old reason-blind path.
+            a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+            let (prov, cur) = clears();
+            let err = a.re_evaluate(Utc::now(), prov, cur).unwrap_err();
+            assert!(
+                matches!(err, DomainError::Invariant(_)),
+                "reason {reason:?} must be ineligible"
+            );
+            assert_eq!(
+                a.quarantine_status,
+                QuarantineStatus::Rejected,
+                "reason {reason:?} must stay Rejected (no mutation)"
+            );
+            // Reason is left untouched (not cleared) on the ineligible path.
+            assert_eq!(a.rejection_reason, reason);
+        }
+    }
+
+    /// (b) Active provenance precondition: a scan-cleared artifact with
+    /// `Pending` provenance (Required mode, not yet verified) must NOT be
+    /// released — stays `Rejected` (fail-closed).
+    #[test]
+    fn re_evaluate_provenance_pending_blocks_release() {
+        let mut a = rejected_artifact();
+        a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+        let err = a
+            .re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::Pending,
+                CurationClearance::Cleared,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        // The scan reason is preserved — a later verify can clear it.
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Scanner));
+    }
+
+    /// (c) Active curation precondition: a scan-rejected artifact that a
+    /// curation rule now blocks (`Blocked`) must NOT be released — the
+    /// case the reason guard alone misses (a scan-rejected artifact is
+    /// *eligible* under (a), so only the active curation re-check stops
+    /// it). Stays `Rejected`.
+    #[test]
+    fn re_evaluate_curation_blocked_blocks_release() {
+        let mut a = rejected_artifact();
+        a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+        let err = a
+            .re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::NotRequired,
+                CurationClearance::Blocked,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Scanner));
+    }
+
+    /// The conjunction is an AND: `Cleared` provenance still cannot
+    /// release past a curation `Blocked`, and vice versa. Exhaustive over
+    /// the "exactly one conjunct fails" cross product.
+    #[test]
+    fn re_evaluate_release_requires_both_conjuncts() {
+        let blocking = [
+            (ProvenanceClearance::Pending, CurationClearance::Cleared),
+            (ProvenanceClearance::Pending, CurationClearance::Blocked),
+            (ProvenanceClearance::NotRequired, CurationClearance::Blocked),
+            (ProvenanceClearance::Cleared, CurationClearance::Blocked),
+        ];
+        for (prov, cur) in blocking {
+            let mut a = rejected_artifact();
+            a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+            let err = a.re_evaluate(Utc::now(), prov, cur).unwrap_err();
+            assert!(
+                matches!(err, DomainError::Invariant(_)),
+                "({prov:?}, {cur:?}) must block release"
+            );
+            assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        }
+        // Both clear → released (the only allow combination on the elapsed
+        // window). `Cleared` provenance is also an allow.
+        for prov in [
+            ProvenanceClearance::NotRequired,
+            ProvenanceClearance::Cleared,
+        ] {
+            let mut a = rejected_artifact();
+            a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+            assert!(a
+                .re_evaluate(Utc::now(), prov, CurationClearance::Cleared)
+                .is_ok());
+            assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+        }
+    }
+
+    /// The re-quarantine arm (future window) is NOT gated by the
+    /// provenance / curation conjuncts — the artifact stays held
+    /// (downloads blocked), so deferring those gates to the eventual timer
+    /// release is fail-closed-safe. Even a `Blocked` curation + `Pending`
+    /// provenance re-quarantines rather than erroring.
+    #[test]
+    fn re_evaluate_future_window_requarantines_regardless_of_conjuncts() {
+        let mut a = rejected_artifact();
+        a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
+        let event = a
+            .re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::Pending,
+                CurationClearance::Blocked,
+            )
+            .unwrap();
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        assert!(matches!(event, DomainEvent::ArtifactQuarantined(_)));
+    }
+
+    /// `CurationClearance` derives (Debug/Clone/Copy/Eq) coverage.
+    #[test]
+    fn curation_clearance_derives() {
+        let a = CurationClearance::Cleared;
+        let b = a;
+        #[allow(clippy::clone_on_copy)]
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(a, CurationClearance::Blocked);
+        assert!(!format!("{:?}", CurationClearance::Blocked).is_empty());
+    }
+
+    // -- is_scan_clearable (ADR 0041 invariant #6 (a)) ----------------------
+    //
+    // The eligibility predicate that `re_evaluate` consults. The scan-axis
+    // reasons (Scanner + ScanPolicyRetroactive) are clearable; every other
+    // reason (and None) is not.
+
+    #[test]
+    fn is_scan_clearable_scan_axis_reasons_are_clearable() {
+        assert!(is_scan_clearable(Some(&RejectionReason::Scanner)));
+        assert!(is_scan_clearable(Some(
+            &RejectionReason::ScanPolicyRetroactive
+        )));
+    }
+
+    #[test]
+    fn is_scan_clearable_non_scan_reasons_and_none_are_not_clearable() {
+        assert!(!is_scan_clearable(None));
+        assert!(!is_scan_clearable(Some(&RejectionReason::Admin)));
+        assert!(!is_scan_clearable(Some(&RejectionReason::Curator {
+            curator_id: Uuid::new_v4(),
+        })));
+        assert!(!is_scan_clearable(Some(
+            &RejectionReason::CurationRetroactive {
+                rule_id: Uuid::new_v4(),
+            }
+        )));
+    }
+
+    // -- State machine: reject_from_scan_policy_retroactive (ADR 0041) ------
+    //
+    // The tighten direction of continuous enforcement. The caller computes
+    // the verdict via `evaluate_scan_result` over the artifact's STORED
+    // findings and threads the `ScanOutcome` in; this method applies it.
+    //   Reject  → Rejected (ScanPolicyRetroactive), window NOT re-opened.
+    //   Clean   → no-op (Ok(None)), no mutation, no event.
+    // Valid only from the "active" states Quarantined / Released; terminal
+    // source states return Err(Invariant) WITHOUT mutating.
+
+    fn reject_outcome() -> ScanOutcome {
+        // The violation list is immaterial to the transition — the verdict
+        // (Reject vs Clean) is the only thing the method reads.
+        ScanOutcome::Reject(vec![])
+    }
+
+    #[test]
+    fn reject_from_scan_policy_retroactive_released_now_failing_re_holds() {
+        // The headline tighten case: a long-released artifact whose stored
+        // findings now cross the tightened gate is re-held to Rejected.
+        let mut a = released_artifact();
+        // A released artifact has no live quarantine window; set an anchor
+        // to prove it is NOT re-opened by the re-hold.
+        a.quarantine_window_start = Some(Utc::now() - chrono::Duration::hours(6));
+        let anchor = a.quarantine_window_start;
+        let event = a
+            .reject_from_scan_policy_retroactive(&reject_outcome(), "now exceeds threshold".into())
+            .expect("Ok")
+            .expect("a now-failing verdict re-holds (emits ArtifactRejected)");
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(event.artifact_id, a.id);
+        assert_eq!(event.rejected_by, RejectionReason::ScanPolicyRetroactive);
+        assert_eq!(event.reason, "now exceeds threshold");
+        // The scan-axis reason is carried on the aggregate so a later
+        // loosen can re-release it (invariant #6 (a)).
+        assert_eq!(
+            a.rejection_reason,
+            Some(RejectionReason::ScanPolicyRetroactive)
+        );
+        // The timer window is NOT re-opened — the original anchor is intact.
+        assert_eq!(a.quarantine_window_start, anchor);
+    }
+
+    #[test]
+    fn reject_from_scan_policy_retroactive_quarantined_now_failing_re_holds() {
+        // A still-held artifact whose stored findings now fail is re-held
+        // to Rejected (the other accepted active source state).
+        let mut a = quarantined_artifact();
+        let anchor = a.quarantine_window_start;
+        let event = a
+            .reject_from_scan_policy_retroactive(&reject_outcome(), "tighten".into())
+            .expect("Ok")
+            .expect("now-failing re-holds");
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(event.rejected_by, RejectionReason::ScanPolicyRetroactive);
+        // Window anchor preserved, not re-opened.
+        assert_eq!(a.quarantine_window_start, anchor);
+    }
+
+    #[test]
+    fn reject_from_scan_policy_retroactive_clean_verdict_is_noop() {
+        // Unchanged verdict (still-passing under the new policy) → no-op:
+        // no transition, no event, no mutation (invariant #2).
+        for mut a in [released_artifact(), quarantined_artifact()] {
+            let before = a.clone();
+            let out = a
+                .reject_from_scan_policy_retroactive(&ScanOutcome::Clean, "irrelevant".into())
+                .expect("Clean is Ok(None), never an error");
+            assert!(out.is_none(), "Clean must emit no event");
+            // Status, reason, and window all unchanged.
+            assert_eq!(a, before);
+        }
+    }
+
+    /// Invariant #4 — no evidence ⇒ no re-rejection. An artifact with no
+    /// stored findings evaluates `ScanOutcome::Clean`, so threading `Clean`
+    /// here is a no-op: a scan tighten can NEVER re-reject an artifact that
+    /// has no evidence it violates. This pins the contract that the method
+    /// applies the caller's verdict and never manufactures one.
+    #[test]
+    fn reject_from_scan_policy_retroactive_no_evidence_clean_never_re_rejects() {
+        let mut a = released_artifact();
+        let out = a
+            .reject_from_scan_policy_retroactive(
+                // The verdict a findings-less artifact produces.
+                &ScanOutcome::Clean,
+                "no findings".into(),
+            )
+            .expect("Ok");
+        assert!(out.is_none());
+        assert_eq!(
+            a.quarantine_status,
+            QuarantineStatus::Released,
+            "an artifact with no evidence is never re-rejected on a tighten"
+        );
+    }
+
+    #[test]
+    fn reject_from_scan_policy_retroactive_from_none_fails_without_mutating() {
+        // A never-held artifact is not in the active scanned population the
+        // pass walks; Err(Invariant) without mutating.
+        let mut a = sample_artifact();
+        let result = a.reject_from_scan_policy_retroactive(&reject_outcome(), "x".into());
+        assert!(matches!(result, Err(DomainError::Invariant(_))));
+        assert_eq!(a.quarantine_status, QuarantineStatus::None);
+        assert_eq!(a.rejection_reason, None);
+    }
+
+    #[test]
+    fn reject_from_scan_policy_retroactive_from_rejected_fails_without_mutating() {
+        // Already blocked — idempotent skip. The fixture is Scanner-rejected;
+        // the source-state guard rejects before reading the reason.
+        let mut a = rejected_artifact();
+        let result = a.reject_from_scan_policy_retroactive(&reject_outcome(), "x".into());
+        assert!(matches!(result, Err(DomainError::Invariant(_))));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        // Reason untouched.
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Scanner));
+    }
+
+    #[test]
+    fn reject_from_scan_policy_retroactive_from_scan_indeterminate_fails_without_mutating() {
+        // Terminal scan-failure state (ADR 0007); admin-only exit, never
+        // re-held by a policy pass.
+        let mut a = scan_indeterminate_artifact();
+        let result = a.reject_from_scan_policy_retroactive(&reject_outcome(), "x".into());
+        assert!(matches!(result, Err(DomainError::Invariant(_))));
+        assert_eq!(a.quarantine_status, QuarantineStatus::ScanIndeterminate);
+    }
+
+    /// The guard-widening case (ADR 0041 Item 1): an artifact re-held by a
+    /// tighten (`ScanPolicyRetroactive`) whose stored findings a LATER
+    /// loosen passes must be re-releasable by `re_evaluate` — otherwise a
+    /// tighten→loosen sequence would strand it `Rejected` forever. The
+    /// eligibility guard admits `ScanPolicyRetroactive` alongside `Scanner`.
+    #[test]
+    fn re_evaluate_scan_policy_retroactive_reason_is_re_releasable() {
+        let mut a = rejected_artifact();
+        a.rejection_reason = Some(RejectionReason::ScanPolicyRetroactive);
+        // Elapsed window → the release arm (not re-quarantine).
+        a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+        let (prov, cur) = clears();
+        let event = a
+            .re_evaluate(Utc::now(), prov, cur)
+            .expect("a ScanPolicyRetroactive rejection is scan-clearable");
+        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+        assert_eq!(a.rejection_reason, None);
+        match event {
+            DomainEvent::ArtifactReleased(e) => {
+                assert_eq!(e.released_by, ReleaseReason::PolicyReEvaluation);
+            }
+            other => panic!("expected ArtifactReleased, got {other:?}"),
+        }
+    }
+
+    /// Companion to the guard-widening test: a `ScanPolicyRetroactive`
+    /// rejection with a still-active window re-quarantines (not releases),
+    /// proving the widened eligibility admits it on the re-quarantine arm too.
+    #[test]
+    fn re_evaluate_scan_policy_retroactive_future_window_requarantines() {
+        let mut a = rejected_artifact();
+        a.rejection_reason = Some(RejectionReason::ScanPolicyRetroactive);
+        a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
+        let (prov, cur) = clears();
+        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        assert!(matches!(event, DomainEvent::ArtifactQuarantined(_)));
+        assert_eq!(a.rejection_reason, None);
     }
 
     // -- is_downloadable / is_promotable ------------------------------------

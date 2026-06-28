@@ -29,9 +29,44 @@
 //!
 //!   1. `DROP TABLE <name>`
 //!   2. `DROP TABLE IF EXISTS <name>`
-//!   3. `ALTER TABLE <name> DROP CONSTRAINT <pkey>` (primary-key drop)
+//!   3. `ALTER TABLE <name> DROP CONSTRAINT <cname>` (de-constrain) —
+//!      **unless** the same migration re-adds a constraint of the same
+//!      `_check` name (a DROP + re-ADD of a `_check` constraint is an
+//!      enum-CHECK *widening*, not a de-constrain).
 //!
 //! A match in any migration is a hard failure naming the file:line.
+//!
+//! ## The DROP+re-ADD redefinition exception — `_check`-only (ADR 0030 intent)
+//!
+//! ADR 0030's stated boundary is "no migration may **drop or
+//! de-constrain** a sensitive table" — the canonical breach is
+//! `DROP CONSTRAINT api_tokens_pkey`, which leaves the table *less*
+//! protected (identity / integrity gone). The one legitimate
+//! drop-and-re-add-under-the-same-name is widening an enum `CHECK`:
+//! PostgreSQL has no in-place `CHECK` alter, so the only way to extend an
+//! allowed-value set (e.g. adding a task kind to `jobs.kind`, migration 016)
+//! is to drop and re-add the same named constraint over a superset of
+//! values, and PostgreSQL auto-names such a constraint `<table>_<col>_check`.
+//!
+//! The exemption is therefore an **allow-list restricted to constraint
+//! names ending in `_check`** (case-insensitive — see
+//! [`is_widenable_check_name`]): a `DROP CONSTRAINT <name>_..._check`
+//! immediately paired with an `ADD CONSTRAINT` of the **same `_check`
+//! name** on the **same table** is an enum-CHECK widening and is exempt.
+//! Any other dropped name — `_pkey` / `_fkey` / `_key` / `_unique`, or any
+//! non-`_check` name — does **not** earn the exemption *even if* the same
+//! migration re-adds a same-named constraint, because integrity constraints
+//! are never legitimately drop+re-added to widen: a same-name re-add can be
+//! a no-op or weaker constraint (`DROP CONSTRAINT api_tokens_pkey;
+//! ADD CONSTRAINT api_tokens_pkey CHECK (true);` drops a primary key and
+//! re-adds a no-op same-named CHECK — the table emerges LESS protected while
+//! the shape looks like a redefinition). The allow-list is **fail-closed**:
+//! an unconventionally-named integrity constraint cannot slip through under
+//! the redefinition cover (a deny-list would be fail-open). The exemption is
+//! also **table-scoped**: a same-name `ADD CONSTRAINT` on a *different* table
+//! does NOT exempt the de-constrain (that would be a false negative). A bare
+//! `DROP CONSTRAINT` with no matching same-table same-`_check`-name re-add
+//! is still a hard failure.
 //!
 //! ## Matcher discipline (mirror of `streaming_metadata_port.rs`)
 //!
@@ -380,6 +415,97 @@ struct Finding {
 /// For shape 2 we flag any `DROP CONSTRAINT` on a sensitive table — the
 /// ADR 0030 intent is the primary-key drop, but dropping any constraint on
 /// a sensitive table is at least as alarming and warrants the same red test.
+/// Does the migration re-add constraint `cname` **on the same table**
+/// `table` that a `DROP CONSTRAINT` removed it from? Used to distinguish an
+/// enum-CHECK *widening* (DROP + re-ADD the same name on the same table —
+/// exempt only when `cname` is a `_check` name, see
+/// [`is_widenable_check_name`] at the call site) from a bare de-constraining
+/// DROP. This helper answers only the same-name/same-table re-add question;
+/// the `_check`-only gate is applied by the caller, so a `_pkey` / `_fkey` /
+/// `_key` / `_unique` drop is never exempted regardless of a same-name
+/// re-add. The re-add is conventionally a separate `ALTER TABLE <table> …
+/// ADD CONSTRAINT <cname> …` statement, so this walks the whole migration
+/// for `ALTER TABLE` statements whose target table equals `table` and scans
+/// each such statement (up to its terminating `;`) for `ADD CONSTRAINT
+/// <cname>`.
+///
+/// The table scoping is load-bearing: a same-name `ADD CONSTRAINT` on a
+/// *different* table must NOT exempt a sensitive de-constrain — that would
+/// be a false negative (a genuine de-constrain of the sensitive table
+/// passing because some unrelated table happens to add a constraint of the
+/// same name). Both the table and the constraint name are compared
+/// case-insensitively (SQL identifiers are case-insensitive when unquoted).
+/// `true` when a dropped-constraint name is eligible for the DROP+re-ADD
+/// redefinition exemption: an **allow-list** of names ending in `_check`
+/// (case-insensitive).
+///
+/// This is the load-bearing tightening of the exemption (ADR 0030
+/// amendment): the *only* legitimate drop-and-re-add-under-the-same-name on
+/// a sensitive table is widening an enum `CHECK`, which PostgreSQL
+/// auto-names `<table>_<col>_check`. Restricting the exemption to `_check`
+/// names is **fail-closed** — an integrity constraint (`_pkey` / `_fkey` /
+/// `_key` / `_unique`, or any unconventionally-named constraint) can never
+/// slip through under the redefinition cover. The danger the allow-list
+/// closes: `DROP CONSTRAINT api_tokens_pkey; ADD CONSTRAINT api_tokens_pkey
+/// CHECK (true);` — a primary key dropped, re-added as a no-op same-named
+/// CHECK — leaves the table LESS protected while the same-name shape looks
+/// like a benign redefinition. A deny-list (flag known-bad suffixes) would
+/// be fail-open: a future unconventionally-named integrity constraint would
+/// not match any deny entry and would wrongly earn the exemption. The
+/// allow-list cannot be slipped past.
+fn is_widenable_check_name(cname: &str) -> bool {
+    cname.to_ascii_lowercase().ends_with("_check")
+}
+
+fn readds_constraint(tokens: &[Token], table: &str, cname: &str) -> bool {
+    let target_table = table.to_ascii_lowercase();
+    let target_cname = cname.to_ascii_lowercase();
+    let n = tokens.len();
+    let mut i = 0;
+    while i < n {
+        // Find the start of an `ALTER TABLE [IF EXISTS] [ONLY] <name>`.
+        if tokens[i].text == "alter" && !tokens[i].quoted {
+            if let Some(next) = tokens.get(i + 1) {
+                if next.text == "table" && !next.quoted {
+                    let mut name_idx = i + 2;
+                    // Optional `IF EXISTS`.
+                    if let (Some(a), Some(b)) = (tokens.get(name_idx), tokens.get(name_idx + 1)) {
+                        if a.text == "if" && b.text == "exists" && !a.quoted && !b.quoted {
+                            name_idx += 2;
+                        }
+                    }
+                    // Optional `ONLY`.
+                    if let Some(a) = tokens.get(name_idx) {
+                        if a.text == "only" && !a.quoted {
+                            name_idx += 1;
+                        }
+                    }
+                    if let Some((name, after_name)) = parse_table_name(tokens, name_idx) {
+                        if name == target_table {
+                            // Scan this ALTER statement (to the terminating
+                            // `;`) for `ADD CONSTRAINT <cname>`.
+                            let mut k = after_name;
+                            while k + 2 < n && tokens[k].text != ";" {
+                                if tokens[k].text == "add"
+                                    && !tokens[k].quoted
+                                    && tokens[k + 1].text == "constraint"
+                                    && !tokens[k + 1].quoted
+                                    && tokens[k + 2].text.eq_ignore_ascii_case(&target_cname)
+                                {
+                                    return true;
+                                }
+                                k += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn find_sensitive_drops(tokens: &[Token]) -> Vec<Finding> {
     let mut findings = Vec::new();
     let n = tokens.len();
@@ -438,7 +564,8 @@ fn find_sensitive_drops(tokens: &[Token]) -> Vec<Finding> {
                     if let Some((name, after_name)) = parse_table_name(tokens, name_idx) {
                         if is_sensitive_table(&name) {
                             // Look ahead within this ALTER statement (up to
-                            // the terminating `;`) for `DROP CONSTRAINT`.
+                            // the terminating `;`) for `DROP CONSTRAINT
+                            // <cname>`.
                             let mut k = after_name;
                             while k + 1 < n && tokens[k].text != ";" {
                                 if tokens[k].text == "drop"
@@ -446,11 +573,68 @@ fn find_sensitive_drops(tokens: &[Token]) -> Vec<Finding> {
                                     && tokens[k + 1].text == "constraint"
                                     && !tokens[k + 1].quoted
                                 {
-                                    findings.push(Finding {
-                                        shape: "ALTER TABLE ... DROP CONSTRAINT".to_string(),
-                                        table: name.clone(),
-                                        offset: tokens[i].offset,
-                                    });
+                                    // The constraint name token (skip an
+                                    // optional `IF EXISTS`).
+                                    let mut cn = k + 2;
+                                    if let (Some(a), Some(b)) = (tokens.get(cn), tokens.get(cn + 1))
+                                    {
+                                        if a.text == "if" && b.text == "exists" {
+                                            cn += 2;
+                                        }
+                                    }
+                                    let cname = tokens.get(cn).map(|t| t.text.clone());
+
+                                    // A DROP+re-ADD of the SAME constraint
+                                    // name in this migration is a constraint
+                                    // *redefinition*, not a de-constrain — the
+                                    // table emerges still constrained, so it
+                                    // does not breach ADR 0030's "no migration
+                                    // may drop or de-constrain a sensitive
+                                    // table" boundary (the stated intent is the
+                                    // primary-key / integrity drop that leaves
+                                    // the table *less* protected). The canonical
+                                    // case is widening an enum `CHECK` (e.g.
+                                    // `jobs.kind`) to add a value: PostgreSQL
+                                    // has no in-place CHECK alter, so the only
+                                    // way to extend it is drop + re-add the same
+                                    // named constraint over a superset of
+                                    // allowed values. A bare DROP CONSTRAINT
+                                    // with no matching re-add IS still flagged
+                                    // (genuine de-constrain).
+                                    //
+                                    // The exemption is **`_check`-only** (fail-
+                                    // closed allow-list, see
+                                    // [`is_widenable_check_name`]): only a
+                                    // PostgreSQL auto-named enum `CHECK`
+                                    // (`<table>_<col>_check`) is ever
+                                    // legitimately dropped + re-added under the
+                                    // same name to *widen* an allowed-value set.
+                                    // Integrity constraints — `_pkey` / `_fkey`
+                                    // / `_key` / `_unique`, or any non-`_check`
+                                    // name — are never legitimately drop+re-added
+                                    // to widen: a same-name re-add can silently
+                                    // be a no-op or weaker constraint (e.g. DROP
+                                    // a PRIMARY KEY, re-ADD a same-named
+                                    // `CHECK (true)`), leaving the table LESS
+                                    // protected while the shape looks like a
+                                    // redefinition. So a non-`_check` dropped
+                                    // name does NOT earn the exemption and is
+                                    // always flagged, regardless of any
+                                    // same-name re-add.
+                                    let redefined = cname
+                                        .as_deref()
+                                        .map(|c| {
+                                            is_widenable_check_name(c)
+                                                && readds_constraint(tokens, &name, c)
+                                        })
+                                        .unwrap_or(false);
+                                    if !redefined {
+                                        findings.push(Finding {
+                                            shape: "ALTER TABLE ... DROP CONSTRAINT".to_string(),
+                                            table: name.clone(),
+                                            offset: tokens[i].offset,
+                                        });
+                                    }
                                     break;
                                 }
                                 k += 1;
@@ -609,7 +793,83 @@ fn self_check_whitespace_reformat_survives() {
     ));
 }
 
+#[test]
+fn self_check_drop_constraint_with_unrelated_readd_still_trips() {
+    // A DROP CONSTRAINT whose name is NOT re-added (a different name is
+    // added) is a genuine de-constrain → still flagged. The exception is
+    // scoped to a same-NAME redefinition, not "any ADD CONSTRAINT exists".
+    assert!(trips(
+        "ALTER TABLE jobs DROP CONSTRAINT jobs_pkey;\n\
+         ALTER TABLE jobs ADD CONSTRAINT jobs_kind_check CHECK (kind IN ('scan'));"
+    ));
+}
+
+#[test]
+fn self_check_drop_constraint_with_same_name_readd_on_other_table_still_trips() {
+    // The redefinition exemption is TABLE-SCOPED: a same-NAME
+    // `ADD CONSTRAINT` on a DIFFERENT table must NOT exempt a sensitive
+    // de-constrain. Here the sensitive `api_tokens` is genuinely
+    // de-constrained (its constraint is dropped and never re-added on
+    // `api_tokens`); the matching name is re-added only on the unrelated
+    // `other_table`. Without table scoping this would be a false negative;
+    // it MUST still trip.
+    assert!(trips(
+        "ALTER TABLE api_tokens DROP CONSTRAINT shared_name;\n\
+         ALTER TABLE other_table ADD CONSTRAINT shared_name CHECK (x IN ('a'));"
+    ));
+}
+
+#[test]
+fn self_check_drop_pkey_readd_same_name_noop_check_still_trips() {
+    // The reviewer's exact attack (ADR 0030 amendment): drop a PRIMARY KEY
+    // and re-add a NO-OP same-named CHECK. The shape (same-name DROP +
+    // re-ADD on the same table) is exactly the redefinition shape, but the
+    // dropped name `api_tokens_pkey` is NOT a `_check` name, so it does NOT
+    // earn the `_check`-only exemption. The table emerges LESS protected
+    // (its primary key gone, replaced by a no-op CHECK) — this MUST trip.
+    assert!(trips(
+        "ALTER TABLE api_tokens DROP CONSTRAINT api_tokens_pkey;\n\
+         ALTER TABLE api_tokens ADD CONSTRAINT api_tokens_pkey CHECK (true);"
+    ));
+}
+
+#[test]
+fn self_check_drop_unique_readd_same_name_non_check_still_trips() {
+    // Same fail-closed property for a `_key` / `_unique` integrity
+    // constraint: a same-name re-add of a non-`_check` constraint does NOT
+    // exempt the de-constrain. (A `_key`/`_unique` name is never a widenable
+    // enum CHECK.)
+    assert!(trips(
+        "ALTER TABLE users DROP CONSTRAINT users_email_key;\n\
+         ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);"
+    ));
+}
+
 // ---- NEGATIVE self-checks: the matcher must NOT flag these. ---------------
+
+#[test]
+fn self_check_check_widen_drop_and_readd_same_name_does_not_trip() {
+    // ADR 0030 redefinition exception: dropping and re-adding the SAME
+    // named CHECK constraint (the only way to widen an enum CHECK in
+    // PostgreSQL — e.g. adding a `jobs.kind` value) leaves the table still
+    // constrained, so it is NOT a de-constrain and must NOT trip. This is
+    // exactly the shape of migration 016 (policy-reevaluation job kind).
+    assert!(!trips(
+        "ALTER TABLE public.jobs DROP CONSTRAINT jobs_kind_check;\n\
+         ALTER TABLE public.jobs ADD CONSTRAINT jobs_kind_check \
+         CHECK (kind IN ('scan', 'policy-reevaluation'));"
+    ));
+}
+
+#[test]
+fn self_check_check_widen_redefinition_survives_reformat_and_case() {
+    // The redefinition exception is whitespace- and case-insensitive on the
+    // constraint name (SQL identifiers are case-insensitive unquoted).
+    assert!(!trips(
+        "alter  table\n  JOBS\n  drop  constraint  Jobs_Kind_Check ;\n\
+         ALTER TABLE jobs ADD   CONSTRAINT   jobs_kind_check CHECK (kind IN ('x'));"
+    ));
+}
 
 #[test]
 fn self_check_comment_mentioning_drop_does_not_trip() {
@@ -708,6 +968,23 @@ fn self_check_is_sensitive_table_membership() {
     assert!(!is_sensitive_table("repo_security_scores"));
     assert!(!is_sensitive_table("scan_findings"));
     assert!(!is_sensitive_table("eventsourcing")); // not `events`/`events_`
+}
+
+#[test]
+fn self_check_is_widenable_check_name_allow_list() {
+    // Allow-list: only `_check` names (case-insensitive) are widenable.
+    assert!(is_widenable_check_name("jobs_kind_check"));
+    assert!(is_widenable_check_name("Jobs_Kind_Check")); // case-insensitive
+    assert!(is_widenable_check_name("foo_check"));
+    // Integrity constraints are NOT widenable — never exempt.
+    assert!(!is_widenable_check_name("api_tokens_pkey"));
+    assert!(!is_widenable_check_name("users_fk_org"));
+    assert!(!is_widenable_check_name("users_email_key"));
+    assert!(!is_widenable_check_name("repositories_name_unique"));
+    // An unconventionally-named constraint (no recognised suffix at all)
+    // is fail-closed: not `_check`, so not exempt.
+    assert!(!is_widenable_check_name("my_weird_constraint"));
+    assert!(!is_widenable_check_name("checkmate")); // substring, not suffix
 }
 
 #[test]

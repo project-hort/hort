@@ -742,8 +742,8 @@ pub(crate) mod tests {
     };
     use super::super::artifact_events::{
         ApprovalDecision, ArtifactCorrupted, ArtifactExpired, ArtifactPurged, IngestSource,
-        PolicyResult, ProvenanceRejected, ProvenanceVerified, RejectionReason, ReleaseReason,
-        SeveritySummary,
+        PolicyResult, ProvenanceRejected, ProvenanceVerified, ReEvaluationTrigger, RejectionReason,
+        ReleaseReason, SeveritySummary,
     };
     use super::super::artifact_group_events::{
         ArtifactGroupInitiated, ArtifactGroupMemberAdded, ArtifactGroupMemberRemoved,
@@ -912,7 +912,9 @@ pub(crate) mod tests {
             DomainEvent::ArtifactReEvaluated(ArtifactReEvaluated {
                 artifact_id: Uuid::nil(),
                 policy_id: Uuid::nil(),
-                trigger_exclusion_id: Uuid::nil(),
+                trigger: ReEvaluationTrigger::ExclusionAdded {
+                    exclusion_id: Uuid::nil(),
+                },
                 previous_status: QuarantineStatus::Rejected,
                 new_status: QuarantineStatus::Released,
             }),

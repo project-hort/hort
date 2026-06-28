@@ -67,6 +67,54 @@ review-gated edit to the test. Removing an entry, or weakening the matcher so
 a drop passes, is a blocking review finding — if a migration genuinely must
 drop a sensitive table, the correct response is to question the migration.
 
+#### Amendment 2026-06-28 — the DROP + re-ADD same-name enum-CHECK widening exception (`_check`-only)
+
+The de-constrain shape (`ALTER TABLE <sensitive> … DROP CONSTRAINT <c>`)
+carves out one refinement, restricted by a **fail-closed allow-list to
+constraint names ending in `_check`** (case-insensitive): a `DROP CONSTRAINT
+<c>` where `<c>` is a `_check` name, **immediately paired with an `ADD
+CONSTRAINT <c>` of the same name on the same table** in the same migration, is
+an enum-`CHECK` **widening**, not a de-constrain — the table emerges still
+constrained, with an equivalent-or-stricter constraint, so it does not breach
+the "no migration may drop or de-constrain a sensitive table" boundary (whose
+stated intent is the integrity / primary-key drop that leaves the table *less*
+protected).
+
+The `_check`-only restriction is load-bearing. The earlier shape-based
+exemption (any same-name, same-table re-add) did **not** verify the re-add was
+equivalent-or-stricter, so it was fail-open to the attack
+`ALTER TABLE api_tokens DROP CONSTRAINT api_tokens_pkey; ALTER TABLE api_tokens
+ADD CONSTRAINT api_tokens_pkey CHECK (true);` — drop a primary key, re-add a
+no-op same-named CHECK — under which the table emerges **less** protected while
+the guard passed. The only constraint that is ever legitimately drop+re-added
+under the same name to *widen* is an enum `CHECK` (PostgreSQL has no in-place
+`CHECK` alter and auto-names such constraints `<table>_<col>_check`); integrity
+constraints (`_pkey` / `_fkey` / `_key` / `_unique`, or any non-`_check` name)
+are **never** legitimately drop+re-added to widen, so their drop is **always**
+flagged regardless of any same-name re-add. The control is an **allow-list**
+(`name.to_ascii_lowercase().ends_with("_check")`), not a deny-list, precisely
+so that an unconventionally-named integrity constraint cannot slip through the
+exemption — a deny-list of known-bad suffixes would be fail-open to a name it
+did not anticipate.
+
+A **bare** `DROP CONSTRAINT` with no matching same-table same-name re-add, a
+`DROP CONSTRAINT` of any non-`_check` name (even with a same-name re-add), and
+any `DROP TABLE` / `DROP TABLE IF EXISTS`, remain hard failures.
+
+The motivating case is widening an enum `CHECK` constraint — the only way to
+extend an allowed-value set (e.g. adding a worker task kind to the `jobs.kind`
+`CHECK`, migration 016) is to drop and re-add the same named `_check`
+constraint over a superset of values. The exemption is **table-scoped**: the
+matching `ADD CONSTRAINT <c>` must be on the **same table** as the DROP — a
+same-name `ADD CONSTRAINT` on a *different* table does **not** exempt a
+sensitive de-constrain (that would be a false negative). The exception's
+enforced shape — the `_check`-only allow-list, what counts as a widening versus
+a genuine de-constrain, the no-op-CHECK-replaces-pkey negative case, and the
+cross-table negative self-test — lives in
+`crates/hort-app/tests/no_sensitive_drops.rs` (the `is_widenable_check_name`
+allow-list, the `readds_constraint(table, cname)` helper, and their
+self-checks); the test is the executable boundary, this note is its rationale.
+
 **(b) Automated event-stream retention may only ever target the four
 permitted categories** (`crates/hort-app/tests/retention_registration_guard.rs`).
 The guard pins `RETENTION_PERMITTED = {Artifact, AuthAttempts, DownloadAudit,

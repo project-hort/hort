@@ -301,6 +301,13 @@ impl TryFrom<ArtifactRow> for Artifact {
             md5_checksum: row.checksum_md5,
             content_type: row.content_type,
             quarantine_status,
+            // The structured rejection reason is not denormalised onto the
+            // `artifacts` projection — it lives on the artifact's
+            // `ArtifactRejected` event. The application layer re-hydrates
+            // it from the stream before a scan re-evaluation (ADR 0041);
+            // a fresh projection load always carries `None`, the same
+            // transient-hydration contract as `quarantine_deadline`.
+            rejection_reason: None,
             quarantine_window_start: row.quarantine_window_start,
             // The transient computed deadline is NEVER loaded from the
             // store; it is hydrated by the use-case layer on the read

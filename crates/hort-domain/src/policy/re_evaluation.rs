@@ -214,6 +214,7 @@ mod tests {
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
             quarantine_status: QuarantineStatus::Rejected,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,

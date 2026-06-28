@@ -42,6 +42,7 @@ accepted?*
 | [0007](0007-fail-closed-quarantine-release-predicate.md) | Fail-closed quarantine release predicate |
 | [0015](0015-apply-time-linter-inert-fields-and-naming.md) | Apply-time rejection of inert policy fields and misleading config names |
 | [0016](0016-cross-opt-in-interaction-matrix.md) | Cross-opt-in interaction matrix for release-gate-influencing knobs |
+| [0041](0041-continuous-scan-policy-enforcement.md) | Continuous scan-policy enforcement: re-derive each in-scope artifact's verdict from its **stored findings** under the new policy on every gate-affecting change, both directions (loosen → un-reject via authority #5; tighten → re-hold the now-non-compliant population, closing the fail-open gap); no rescan, evidence-based, fail-closed; unifies with curation's retroactive block |
 | [0027](0027-artifact-provenance-verification.md) | Artifact provenance verification (Sigstore/cosign, offline, policy-gated) |
 | [0038](0038-keyed-provenance-verification.md) | Keyed (pinned-public-key) provenance verification backend (extends 0027) |
 

@@ -722,6 +722,43 @@ mod tests {
         assert_eq!(f.cvss_score, None);
     }
 
+    /// End-to-end, no release required: an informational (`unmaintained`)
+    /// advisory shaped exactly as the worker's osv-scanner emits it
+    /// (affected-level `database_specific.informational`) must, once parsed,
+    /// land on the non-enforcing **negligible** lane via the domain's
+    /// `severity_summary_from_findings` — NOT in any blocking-severity bucket
+    /// and NOT in the SUP-4 Critical fail-closed fallback. Together with
+    /// `policy::scan`'s `negligible_only_*_is_clean` tests (negligible +
+    /// default/Ignore policy ⇒ `ScanOutcome::Clean`), this proves the real osv
+    /// output is not rejected — the behaviour we previously had to deploy to
+    /// observe.
+    #[test]
+    fn real_osv_informational_finding_routes_to_negligible_not_blocking() {
+        let pkg = pkg("proc-macro-error2", "crates.io", "2.0.1");
+        let mut v = vuln_skeleton();
+        v.id = "RUSTSEC-2026-0173".into();
+        v.affected = vec![OsvAffected {
+            ranges: vec![],
+            database_specific: Some(OsvDatabaseSpecific {
+                informational: Some("unmaintained".into()),
+            }),
+        }];
+        let findings = vec![vuln_to_finding(&pkg, &[], &v)];
+
+        let summary = hort_domain::types::severity_summary_from_findings(&findings);
+        assert_eq!(
+            summary.negligible, 1,
+            "informational advisory rides the negligible lane"
+        );
+        assert_eq!(
+            summary.critical, 0,
+            "NOT the SUP-4 Critical fail-closed fallback"
+        );
+        assert_eq!(summary.high, 0);
+        assert_eq!(summary.medium, 0);
+        assert_eq!(summary.low, 0);
+    }
+
     #[test]
     fn informational_marker_match_is_case_insensitive_across_classes() {
         let pkg = pkg("x", "crates.io", "1");

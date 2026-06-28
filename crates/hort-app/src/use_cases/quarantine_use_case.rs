@@ -6,9 +6,7 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{
     Artifact, ProvenanceClearance, QuarantineStatus, ReleaseAuthorization,
 };
-use hort_domain::entities::scan_policy::{
-    ExclusionProjection, ProvenanceMode, ScanPolicyProjection,
-};
+use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
@@ -621,30 +619,37 @@ impl QuarantineUseCase {
             }
             ScanOutcome::Reject(violations) => {
                 // First-violation message drives the `ArtifactRejected.reason`
-                // string; the full violation list is carried by
-                // `PolicyEvaluated.violations` for audit.
+                // string (used only on a fresh reject); the full violation list
+                // is carried by `PolicyEvaluated.violations` for audit.
                 let reason = violations
                     .first()
                     .map(|v| v.message.clone())
                     .unwrap_or_else(|| "policy evaluation rejected scan result".to_string());
 
+                // Transition to `Rejected`. A re-scan that re-derives a reject on
+                // an artifact ALREADY terminal (`Rejected` / `Released`) is a
+                // recoverable, idempotent re-scan: we still record the fresh
+                // `ScanCompleted` + findings below (so a manual rescan refreshes
+                // the stored result instead of silently doing nothing), but skip
+                // the duplicate `ArtifactRejected` event and the score re-count.
+                // Propagating the already-terminal invariant instead would fail
+                // the job and loop it forever (the original churn bug).
+                let already_terminal;
                 let reject_event = match artifact.reject_from_scan(reason) {
-                    Ok(ev) => ev,
-                    // Idempotent, recoverable skip: a re-scan that re-derives a
-                    // `Reject` outcome on an artifact already in the terminal
-                    // `Rejected` state hits `reject_from_scan`'s "cannot reject
-                    // artifact in state rejected" invariant. Propagating it fails
-                    // the job, which then retries forever and re-scans on every
-                    // attempt. Mirror `record_scan_indeterminate`'s
-                    // already-terminal branch: append nothing, return Ok.
+                    Ok(ev) => {
+                        already_terminal = false;
+                        Some(ev)
+                    }
                     Err(DomainError::Invariant(msg)) => {
+                        already_terminal = true;
                         tracing::debug!(
                             artifact_id = %artifact_id,
                             status = %artifact.quarantine_status,
                             reason = %msg,
-                            "skipping scan-reject: artifact already terminal"
+                            "re-scan of already-terminal artifact: recording fresh \
+                             findings, skipping duplicate reject + score re-count"
                         );
-                        return Ok(());
+                        None
                     }
                     Err(e) => return Err(AppError::Domain(e)),
                 };
@@ -680,16 +685,27 @@ impl QuarantineUseCase {
                 events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
                     policy_event,
                 )));
-                events_vec.push(EventToAppend::new(DomainEvent::ArtifactRejected(
-                    reject_event,
-                )));
+                if let Some(reject_event) = reject_event {
+                    events_vec.push(EventToAppend::new(DomainEvent::ArtifactRejected(
+                        reject_event,
+                    )));
+                }
 
-                let score_delta = RepoSecurityScoreProjector::compute_scan_completed_delta(
-                    prior_status,
-                    artifact.quarantine_status,
-                    &severity,
-                    now,
-                );
+                // No score re-count on an already-terminal re-scan: the status
+                // is unchanged and the original reject already counted it.
+                let score_update = if already_terminal {
+                    None
+                } else {
+                    Some((
+                        repository_id,
+                        RepoSecurityScoreProjector::compute_scan_completed_delta(
+                            prior_status,
+                            artifact.quarantine_status,
+                            &severity,
+                            now,
+                        ),
+                    ))
+                };
 
                 // See the matching block above
                 // for the clean-path; same reason.
@@ -706,39 +722,45 @@ impl QuarantineUseCase {
                     },
                     &scan_findings_rows,
                     now,
-                    Some((repository_id, score_delta)),
+                    score_update,
                     sbom_components_owned.as_deref(),
                 )
                 .await?;
 
-                // Refcount sweep on reject (post-commit,
-                // warn-on-fail; see prior implementation comment).
-                if let Err(e) = self.content_references.delete_by_source(artifact_id).await {
-                    tracing::warn!(
-                        artifact_id = %artifact_id,
-                        error = %e,
-                        stage = "content_references_delete_on_reject",
-                        "content_references delete failed on reject; refcount row not deleted on \
-                         reject — refcount eventual, operator reconcile is future work"
-                    );
-                }
+                // Post-commit refcount sweep + upstream-index invalidation run
+                // only on the FIRST reject (a fresh transition); an
+                // already-terminal re-scan already swept these when it was
+                // originally rejected.
+                if !already_terminal {
+                    // Refcount sweep on reject (post-commit,
+                    // warn-on-fail; see prior implementation comment).
+                    if let Err(e) = self.content_references.delete_by_source(artifact_id).await {
+                        tracing::warn!(
+                            artifact_id = %artifact_id,
+                            error = %e,
+                            stage = "content_references_delete_on_reject",
+                            "content_references delete failed on reject; refcount row not deleted \
+                             on reject — refcount eventual, operator reconcile is future work"
+                        );
+                    }
 
-                // Best-effort upstream-index
-                // cache invalidation. Same post-commit-warn-on-fail
-                // posture as the refcount sweep above: the reject
-                // append already committed; the `NonServableStatusFilter`
-                // on the next index build is the load-bearing close.
-                // No-op when the composition root did not wire an
-                // invalidator (`with_upstream_index_cache_invalidator`
-                // not called) — TTL-only posture.
-                if let Some(invalidator) = self.upstream_index_cache_invalidator.as_ref() {
-                    invalidate_after_reject(
-                        invalidator,
-                        artifact_id,
-                        repository_id,
-                        &artifact.name,
-                    )
-                    .await;
+                    // Best-effort upstream-index
+                    // cache invalidation. Same post-commit-warn-on-fail
+                    // posture as the refcount sweep above: the reject
+                    // append already committed; the `NonServableStatusFilter`
+                    // on the next index build is the load-bearing close.
+                    // No-op when the composition root did not wire an
+                    // invalidator (`with_upstream_index_cache_invalidator`
+                    // not called) — TTL-only posture.
+                    if let Some(invalidator) = self.upstream_index_cache_invalidator.as_ref() {
+                        invalidate_after_reject(
+                            invalidator,
+                            artifact_id,
+                            repository_id,
+                            &artifact.name,
+                        )
+                        .await;
+                    }
                 }
 
                 tracing::info!(
@@ -1095,27 +1117,17 @@ impl QuarantineUseCase {
             .map(|p| p.provenance_mode)
             .unwrap_or_default();
 
-        match mode {
-            // VerifyIfPresent never gates release; Off is inert.
-            ProvenanceMode::Off | ProvenanceMode::VerifyIfPresent => {
-                Ok(ProvenanceClearance::NotRequired)
-            }
-            ProvenanceMode::Required => {
-                let stream_id = StreamId::artifact(artifact_id);
-                let persisted = self
-                    .events
-                    .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-                    .await?;
-                let verified = persisted
-                    .iter()
-                    .any(|e| matches!(e.event, DomainEvent::ProvenanceVerified(_)));
-                Ok(if verified {
-                    ProvenanceClearance::Cleared
-                } else {
-                    ProvenanceClearance::Pending
-                })
-            }
-        }
+        // Single-source the verdict mapping (ADR 0027 + 0041): the
+        // post-exclusion scan re-evaluation pass in `PolicyUseCase` calls
+        // the SAME helper, so the two release-gating provenance
+        // computations cannot drift (the MR !39 `negligible_action`
+        // drift). This use case owns only the policy-mode resolution.
+        crate::use_cases::release_clearance::resolve_provenance_clearance(
+            &*self.events,
+            artifact_id,
+            mode,
+        )
+        .await
     }
 
     /// Admin override: release a quarantined artifact regardless of scan results.
@@ -4536,15 +4548,16 @@ mod tests {
         assert!(delta.last_scan_at.is_some());
     }
 
-    /// Idempotent skip: a re-scan that re-derives a `Reject` outcome on an
-    /// artifact already in the terminal `Rejected` state returns Ok (a
-    /// recoverable "already terminal" skip) and commits NO transition —
-    /// mirrors `record_scan_indeterminate`'s already-terminal branch. Without
-    /// it, `reject_from_scan`'s "cannot reject artifact in state rejected"
-    /// invariant fails the job, which then retries forever and re-scans on
-    /// every attempt.
+    /// A re-scan that re-derives a `Reject` on an artifact already in the
+    /// terminal `Rejected` state must (a) return Ok — no churn, no
+    /// `cannot reject artifact in state rejected` error — AND (b) RECORD the
+    /// fresh `ScanCompleted` + findings so a manual rescan refreshes the stored
+    /// result, while skipping the duplicate `ArtifactRejected` event and the
+    /// score re-count. The earlier pure-skip recorded nothing, which left the
+    /// operator unable to see the current scan result without a release; this
+    /// test pins that a rescan now updates findings.
     #[tokio::test]
-    async fn record_scan_result_reject_on_already_rejected_is_idempotent_skip() {
+    async fn record_scan_result_reject_on_already_rejected_records_findings_no_duplicate_reject() {
         let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Rejected);
@@ -4556,7 +4569,7 @@ mod tests {
             negligible: 0,
         };
 
-        // Returns Ok — a recoverable "already terminal" skip, not the hard
+        // Returns Ok — a recoverable re-scan, not the hard
         // `cannot reject artifact in state rejected` error that looped the job.
         uc.record_scan_result(
             artifact_id,
@@ -4567,9 +4580,38 @@ mod tests {
         .await
         .unwrap();
 
+        // The fresh scan IS recorded (the dual-write fired) so a rescan
+        // refreshes the stored result — not a silent no-op.
+        let txns = lifecycle.committed_transitions();
+        assert_eq!(
+            txns.len(),
+            1,
+            "the fresh scan must be recorded so a rescan refreshes findings"
+        );
+        let (saved, batch, _) = &txns[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Rejected,
+            "artifact stays terminal"
+        );
         assert!(
-            lifecycle.committed_transitions().is_empty(),
-            "no duplicate reject event/transition for an already-rejected artifact"
+            batch
+                .events
+                .iter()
+                .any(|e| matches!(&e.event, DomainEvent::ScanCompleted(_))),
+            "fresh ScanCompleted recorded"
+        );
+        // ... but NOT a duplicate ArtifactRejected, and no score re-count.
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(&e.event, DomainEvent::ArtifactRejected(_))),
+            "no duplicate ArtifactRejected on an already-rejected artifact"
+        );
+        assert!(
+            lifecycle.score_deltas().is_empty(),
+            "no score re-count on a terminal re-scan"
         );
     }
 

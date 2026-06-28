@@ -477,6 +477,7 @@ mod tests {
             md5_checksum: None,
             content_type: "application/gzip".into(),
             quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
             upstream_published_at: None,
