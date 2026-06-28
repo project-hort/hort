@@ -562,6 +562,76 @@ fn compute_backoff_attempts_zero_defensive_returns_60_seconds() {
     assert_eq!(compute_backoff(0), Duration::from_secs(60));
 }
 
+// -- merge_findings: informational classification preference ----------------
+
+/// Regression (the F1 cross-backend fail-open). A `[trivy, osv]` policy: the
+/// advisory / osv enrichment reads the RustSec class and classifies
+/// `RUSTSEC-2026-0173` as informational (severity `Low`,
+/// `informational_class = unmaintained`, no CVSS); Trivy cannot read the class
+/// and fails the unscored advisory closed to `Critical`. They collide on
+/// `(purl, vuln_id)` — all three backends build `pkg:cargo/proc-macro-error2@2.0.1`.
+/// The merge MUST preserve the informational reading; keeping Trivy's cosmetic
+/// `Critical` silently defeats the negligible lane and rejects an
+/// unmaintained-but-not-vulnerable crate.
+#[test]
+fn merge_preserves_informational_over_unscored_critical_collision() {
+    let purl = "pkg:cargo/proc-macro-error2@2.0.1";
+    let vuln = "RUSTSEC-2026-0173";
+
+    let mut informational = finding(purl, vuln, SeverityThreshold::Low);
+    informational.informational_class = Some("unmaintained".into());
+    informational.source_scanner = "osv".into();
+    assert!(informational.is_informational(), "fixture sanity");
+
+    let mut trivy_critical = finding(purl, vuln, SeverityThreshold::Critical);
+    trivy_critical.source_scanner = "trivy".into(); // informational_class stays None
+
+    // The informational reading must win regardless of contribution order
+    // (advisory enrichment is seeded first, but scanners append after).
+    for input in [
+        vec![informational.clone(), trivy_critical.clone()],
+        vec![trivy_critical.clone(), informational.clone()],
+    ] {
+        let merged = merge_findings(input);
+        assert_eq!(merged.len(), 1, "collision must dedup to one finding");
+        assert!(
+            merged[0].is_informational(),
+            "merged finding must stay informational (class={:?}, sev={:?})",
+            merged[0].informational_class,
+            merged[0].severity,
+        );
+    }
+}
+
+/// Fail-closed safety: the informational preference must NOT downgrade a
+/// genuinely-SCORED Critical. A real CVSS-scored finding is never
+/// `is_informational()` (the recognizer requires `cvss_score.is_none()`), so
+/// when it collides with an informational reading of the same id the scored
+/// finding wins — ADR 0007 / ADR 0040 fail-closed posture preserved.
+#[test]
+fn merge_does_not_downgrade_a_scored_critical_via_informational_collision() {
+    let purl = "pkg:cargo/x@1.0.0";
+    let vuln = "CVE-9999-0001";
+
+    let mut informational = finding(purl, vuln, SeverityThreshold::Low);
+    informational.informational_class = Some("unmaintained".into());
+
+    let scored_critical = finding_with_score(purl, vuln, SeverityThreshold::Critical, 9.8);
+
+    for input in [
+        vec![informational.clone(), scored_critical.clone()],
+        vec![scored_critical.clone(), informational.clone()],
+    ] {
+        let merged = merge_findings(input);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].severity, SeverityThreshold::Critical);
+        assert!(
+            !merged[0].is_informational(),
+            "a scored critical must stay enforced, not be demoted to negligible",
+        );
+    }
+}
+
 // ===========================================================================
 // run_scan branches
 // ===========================================================================
