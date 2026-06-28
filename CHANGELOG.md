@@ -7,25 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **A rescan of a rejected artifact now refreshes its findings.** The
-  `0.9.6-beta.2` idempotency fix made a re-scan of an already-`Rejected`
-  artifact a pure no-op (it recorded nothing), so a manual `admin rescan`
-  silently updated nothing — the current scan result was only observable by
-  deploying. The reject path now records the fresh `ScanCompleted` + findings on
-  a re-scan of an already-terminal artifact (skipping only the duplicate
-  `ArtifactRejected` event and the score re-count), so a rescan refreshes the
-  stored findings. Adds an end-to-end test proving real osv informational output
-  routes to the negligible lane (not rejected), so the detection no longer needs
-  a release to verify.
-
 ## [0.9.6] - 2026-06-27
 
-Beta release (`0.9.6-beta.1`). Headline: OSV **informational** advisories
-(`unmaintained` / `unsound` / `notice`) no longer over-block — they ride a
-non-enforcing **negligible** lane, operator-steered per policy. Plus a keyed
-cosign-key provenance backend and native-deploy / CI hardening.
+Beta release (`0.9.6-beta.3`). Headlines: scan-policy is now **continuously
+enforced** — a gate-affecting policy change re-derives every in-scope artifact's
+verdict from its stored findings in **both directions**, closing a fail-open
+where a tightened policy left already-decided artifacts un-re-evaluated (ADR 0041);
+and OSV **informational** advisories (`unmaintained` / `unsound` / `notice`) no
+longer over-block — they ride a non-enforcing **negligible** lane, operator-steered
+per policy (ADR 0040). Plus a keyed cosign-key provenance backend.
+
+### Security
+
+- **Scan-policy is continuously enforced — the fail-open tightening gap is
+  closed.** A gate-affecting `ScanPolicy` change (raising a severity threshold,
+  adding a blocked class, `negligibleAction: block`, or adding/removing an
+  exclusion) now re-derives every in-scope artifact's verdict from its **stored
+  scan findings** under the new policy, in **both directions** — releasing
+  now-passing rejections and re-holding now-failing releases — via an async
+  worker pass off the request path. Previously a *tightening* re-evaluated
+  nothing, leaving artifacts the operator had just declared unacceptable still
+  downloadable. No scanner is re-run (the stored findings are the evidence) and
+  no new release authority is added: a re-release fires only on the full
+  cross-axis conjunction scan ∧ curation ∧ provenance, preserving the fail-closed
+  release predicate. (ADR 0041)
 
 ### Added
 
@@ -47,11 +52,6 @@ cosign-key provenance backend and native-deploy / CI hardening.
 
 - **`cron-rescan-tick` is enabled by default** in the native `hort_timers`
   Ansible role, so proxied artifacts are rescanned on a cadence out of the box.
-- **CI publishes first-party images + chart to Zot on `-beta` tags**
-  (`0.9.6-beta.2`). The `build-images:*` and `helm:lint-and-publish` jobs gated
-  on a tag regex that allowed `-rc` but excluded `-beta`, so a `-beta` release
-  never produced images or a chart for the operator's local cluster. The regex
-  now admits `-beta`; pre-release tags push `:<version>` only, never `:latest`.
 
 ### Fixed
 
@@ -63,19 +63,10 @@ cosign-key provenance backend and native-deploy / CI hardening.
   trust the internal-PKI CA before it, and configure the cargo
   credential-provider + HTTP-Basic token, so federated CI works against a hort
   instance behind an internal CA.
-- **Re-scanning an already-rejected artifact no longer loops the worker**
-  (`0.9.6-beta.2`). A re-scan (e.g. `admin rescan`) that re-derived a `Reject`
-  outcome on an artifact already in the terminal `Rejected` state hit the
-  `cannot reject artifact in state rejected` invariant; `record_scan_result`
-  propagated it, failing the job, which the worker then retried indefinitely.
-  The reject path now treats an already-terminal artifact as a recoverable,
-  idempotent skip (mirroring the `ScanIndeterminate` path).
-- **hort-migrate re-runs on every deploy** (`0.9.6-beta.2`). The native and
-  podman Ansible flavors `started` the `Type=oneshot` migrate unit, which
-  no-ops once it is `active (exited)` — migrations ran on the first deploy and
-  never again, so a schema-advancing release booted a newer binary against a
-  trailing schema and the boot `assert_current` refused to serve. Both flavors
-  now `restart` the oneshot so every deploy applies pending migrations.
+- **Prefetch resolves cargo/npm download URLs from authoritative upstream
+  metadata.** Proxied cargo/npm dependency prefetch now derives each download URL
+  from the package's authoritative upstream metadata, so prefetched artifacts
+  fetch from the correct location.
 
 ## [0.9.5] - 2026-06-26
 
