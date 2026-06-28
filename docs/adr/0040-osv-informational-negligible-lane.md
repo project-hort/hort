@@ -20,7 +20,7 @@ The osv adapters lowered any unscored finding to `Critical` (the "SUP-4" fail-cl
 - Informational advisories no longer block by default; the registry's posture matches the project's own supply-chain gate.
 - Operators who want to refuse unmaintained/unsound dependencies set `negligibleAction: block`.
 - A new OSV informational class is persisted verbatim (the fact); teaching `is_informational_class` to recognise it later is a code change that re-derives correctly on the next evaluation — no data migration.
-- Migration `015_scan_findings_informational.sql` is an append-only `ALTER` per ADR 0022's 0.9.5 amendment.
+- The `scan_findings.informational_class` column lives in the `009_scan_jobs_and_findings.sql` baseline (folded into the `CREATE TABLE scan_findings` per ADR 0022's pre-1.0 baseline-reset amendment).
 
 ## Alternatives considered
 
@@ -33,6 +33,6 @@ The osv adapters lowered any unscored finding to `Critical` (the "SUP-4" fail-cl
 - `crates/hort-adapters-scanner-osv/`, `crates/hort-adapters-advisory-osv/` — adapters reading `database_specific.informational`.
 - `crates/hort-domain/src/types/finding.rs` — `informational_class`, `is_informational`, `is_informational_class`.
 - `crates/hort-domain/src/policy/{scan,threshold,cve}.rs` — `negligible_action` enforcement + the negligible-skipping threshold walk.
-- `migrations/015_scan_findings_informational.sql`.
+- `migrations/009_scan_jobs_and_findings.sql` — `scan_findings.informational_class`.
 - [0007](0007-fail-closed-quarantine-release-predicate.md) (fail-closed release — preserved), [0022](0022-pre-1.0-edit-existing-migrations.md) (append-only migrations from 0.9.5).
 - `docs/architecture/how-to/curator-workflow.md` — `negligibleAction` operator reference.

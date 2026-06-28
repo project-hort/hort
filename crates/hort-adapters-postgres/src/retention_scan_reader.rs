@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn finding_row_preserves_informational_class() {
-        // The persisted `informational_class` column (migration 015) must
+        // The persisted `scan_findings.informational_class` column must
         // reach the reconstructed Finding verbatim so the negligible-lane
         // routing stays stable under re-evaluation — not hardcoded to NULL.
         let r = FindingRow {
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(fs.len(), 2);
 
         // The scored finding read back: severity preserved,
-        // informational_class NULL (no marker) by migration 015.
+        // informational_class NULL (no marker — a scored vulnerability).
         let scored = fs
             .iter()
             .find(|f| f.vulnerability_id == "CVE-RR-1")

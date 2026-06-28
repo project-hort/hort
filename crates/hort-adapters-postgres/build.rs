@@ -10,7 +10,7 @@
 //! keeps a **stale embedded schema**. A stale migrator then silently
 //! applies an outdated schema and records the version in
 //! `_sqlx_migrations`; later (fresh-embed) migrators skip it by
-//! version number, so a later-added DDL (e.g. migration 013's
+//! version number, so a later-added DDL (e.g. migration 012's
 //! `subscriptions.created_by_token_id` FK) is never applied.
 //!
 //! Pointing `rerun-if-changed` at the migrations directory makes cargo

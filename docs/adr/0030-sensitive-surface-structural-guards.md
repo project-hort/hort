@@ -103,8 +103,15 @@ any `DROP TABLE` / `DROP TABLE IF EXISTS`, remain hard failures.
 
 The motivating case is widening an enum `CHECK` constraint — the only way to
 extend an allowed-value set (e.g. adding a worker task kind to the `jobs.kind`
-`CHECK`, migration 016) is to drop and re-add the same named `_check`
-constraint over a superset of values. The exemption is **table-scoped**: the
+`CHECK`) is to drop and re-add the same named `_check` constraint over a
+superset of values. Pre-1.0, such a widening is done **in place** in the
+defining CREATE (per ADR 0022 — the `jobs.kind` widening that originally
+motivated this exemption now lives in the `009_scan_jobs_and_findings.sql`
+baseline), so no current migration exercises the exemption; it is retained
+because `ALTER`-as-new-numbered-migration resumes once a non-wipeable
+production DB exists (1.0), at which point a `jobs.kind` widen again takes the
+DROP + re-ADD same-`_check` shape this guard exempts. The exemption is
+**table-scoped**: the
 matching `ADD CONSTRAINT <c>` must be on the **same table** as the DROP — a
 same-name `ADD CONSTRAINT` on a *different* table does **not** exempt a
 sensitive de-constrain (that would be a false negative). The exception's

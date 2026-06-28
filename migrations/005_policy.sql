@@ -80,6 +80,14 @@ CREATE TABLE public.policy_projections (
     stream_version bigint NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    -- Operator knob steering how negligible / informational advisories
+    -- (RustSec unmaintained / unsound / notice; carry no CVSS) affect the
+    -- release decision:
+    --   'ignore' (default) — never block (informational != vulnerable);
+    --   'warn'             — record a PolicyEvaluated observation, do not block;
+    --   'block'            — reject (refuse unmaintained / unsound dependencies).
+    -- The scan evaluator reads this column through the policy projection.
+    negligible_action text DEFAULT 'ignore' NOT NULL,
     CONSTRAINT policy_projections_severity_threshold_check CHECK (
         (severity_threshold = ANY (ARRAY['critical'::text, 'high'::text, 'medium'::text, 'low'::text]))
     ),
@@ -111,6 +119,10 @@ CREATE TABLE public.policy_projections (
                 '$[*] ? (@.type() == "object" && @.issuer.type() == "string" && @.issuer != "" && @.san.type() == "string" && @.san != "")'
             )
         )
+    ),
+    -- negligible_action is one of the three wire values.
+    CONSTRAINT policy_projections_negligible_action_check CHECK (
+        (negligible_action = ANY (ARRAY['ignore'::text, 'warn'::text, 'block'::text]))
     )
 );
 
