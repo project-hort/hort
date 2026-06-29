@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-06-29
+
+Beta release (`0.9.7-beta.1`). Headlines: ingest now commits the scan and
+provenance-verify enqueues **atomically** with the artifact transition, closing
+a dual-write window that could leave an artifact ingested-but-unscanned; a clean
+re-scan of a terminal (rejected) artifact no longer loops the worker job; and a
+RustSec advisory fix (anyhow → 1.0.103).
+
+### Security
+
+- **anyhow upgraded to 1.0.103 (RUSTSEC-2026-0190).** Fixes an unsoundness in
+  `anyhow::Error::downcast_mut()` — adding context via `Error::context` and then
+  calling `downcast_mut` constructed a mutable reference through a shared borrow,
+  violating Rust's aliasing rules (undefined behavior). The patched release
+  reworks how the reference is built.
+
+### Fixed
+
+- **Ingest commits its scan and provenance-verify enqueues atomically with the
+  artifact transition.** The auto-scan and provenance-gate `jobs` rows now land
+  in the **same transaction** as the `ArtifactIngested` / `ScanRequested` events,
+  so a crash or failure between the two can no longer strand an artifact with the
+  event but no job — which previously left it quarantined and unscanned until a
+  manual rescan. The no-strand guarantee is backend-agnostic: the Postgres
+  adapter fulfils it with one transaction; a native event-store backend must use
+  a transactional outbox.
+- **A clean re-scan of a terminal (rejected) artifact no longer loops the worker
+  job.** Recording a now-clean scan onto an already-`rejected` artifact now
+  records the fresh findings without attempting the illegal state transition,
+  instead of failing and retrying the job to exhaustion. The artifact stays
+  `rejected` (only an exclusion re-evaluation clears it); the refreshed findings
+  enable an honest later recovery.
+
 ## [0.9.6] - 2026-06-27
 
 Beta release (`0.9.6-beta.5`). Headlines: scan-policy is now **continuously
