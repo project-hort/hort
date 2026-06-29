@@ -1,6 +1,6 @@
 # 0039 — Keyed (pinned-public-key) provenance verification backend
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Extends:** ADR 0027 (artifact provenance verification) — adds a second
   `provenance_backends` entry behind the same `ProvenancePort`
   (`crates/hort-domain/src/ports/provenance.rs`), reusing `provenance_mode`,
@@ -9,10 +9,10 @@
   orchestrator. Only the verification primitive and its trust material differ.
   No new release authority (ADR 0007 unchanged); no new outbound surface
   (ADR 0010 — the keyed path is strictly *more* offline than the bundle path).
-- **Lands enforcement with implementation** — until then this records the
-  decision, not a guarantee. Code anchors below cite symbols, not line
-  numbers; re-validate against `develop` at implementation (the provenance
-  area is under concurrent edit).
+- **Enforcement has landed** — the keyed backend
+  (`crates/hort-adapters-provenance-cosign-key`), the apply-time linter, and the
+  worker wiring are on `develop` behind the same `ProvenancePort`. Code anchors
+  below cite symbols, not line numbers.
 
 ## Context
 
