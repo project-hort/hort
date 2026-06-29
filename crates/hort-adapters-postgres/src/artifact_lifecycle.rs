@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata};
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
+use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::event_store::{AppendEvents, AppendResult};
 use hort_domain::ports::repo_security_score_repository::ScoreDelta;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
@@ -15,6 +15,7 @@ use hort_domain::types::sbom::SbomComponent;
 use crate::artifact_metadata_repo::PgArtifactMetadataRepository;
 use crate::artifact_repo::PgArtifactRepository;
 use crate::event_store::PgEventStore;
+use crate::jobs_repository::{enqueue_provenance_verify_in_tx, enqueue_scan_in_tx};
 use crate::repo_security_score_repository::apply_delta_in_tx;
 use crate::sbom_components::replace_for_artifact_in_tx;
 use crate::scan_findings_repository::insert_findings_in_tx;
@@ -145,6 +146,75 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
 
             if let Some((repo_id, delta)) = &score_delta {
                 apply_delta_in_tx(uow.conn(), *repo_id, delta).await?;
+            }
+
+            uow.commit().await?;
+            Ok(result)
+        })
+    }
+
+    /// Atomic ingest transition + ingest-time job enqueue.
+    ///
+    /// Fulfils the [`ArtifactLifecyclePort::commit_transition_with_enqueues`]
+    /// no-strand guarantee for the Postgres backend by spanning **one** SQL
+    /// transaction: the events, the artifact projection, the optional metadata
+    /// upsert, and every ingest-time `jobs` insert commit-or-roll-back
+    /// together. A `ScanRequested` / provenance-gate event can therefore never
+    /// land without its `jobs` row. Lock order:
+    /// events → artifacts → artifact_metadata → jobs.
+    ///
+    /// The scan enqueue is idempotent (`enqueue_scan_in_tx` swallows the
+    /// `jobs_scan_unique` conflict); any other insert failure aborts the whole
+    /// transition (the ingest fails and is retriable), never a partial commit.
+    fn commit_transition_with_enqueues<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+        events: AppendEvents,
+        metadata: Option<ArtifactMetadata>,
+        enqueues: &'a [IngestEnqueue],
+    ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+        let artifact = artifact.clone();
+        let enqueues = enqueues.to_vec();
+        Box::pin(async move {
+            let mut uow = self.event_store.begin_unit_of_work().await?;
+
+            let result = self.event_store.append_in_tx(&mut uow, events).await?;
+            self.artifact_repo.save_in_tx(&mut uow, &artifact).await?;
+            if let Some(m) = &metadata {
+                self.metadata_repo.upsert_in_tx(&mut uow, m).await?;
+            }
+
+            for enq in &enqueues {
+                match enq {
+                    IngestEnqueue::Scan {
+                        format,
+                        priority,
+                        trigger_source,
+                    } => {
+                        enqueue_scan_in_tx(
+                            uow.conn(),
+                            artifact.id,
+                            artifact.repository_id,
+                            &artifact.sha256_checksum,
+                            format,
+                            *priority,
+                            trigger_source,
+                        )
+                        .await?;
+                    }
+                    IngestEnqueue::ProvenanceVerify {
+                        priority,
+                        trigger_source,
+                    } => {
+                        enqueue_provenance_verify_in_tx(
+                            uow.conn(),
+                            artifact.id,
+                            *priority,
+                            trigger_source,
+                        )
+                        .await?;
+                    }
+                }
             }
 
             uow.commit().await?;

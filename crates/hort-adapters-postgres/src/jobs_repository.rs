@@ -23,6 +23,75 @@ use serde_json::Value as JsonValue;
 
 use crate::{map_sqlx_error, BoxFuture};
 
+/// In-tx `kind='scan'` enqueue — the transactional sibling of
+/// [`JobsRepository::enqueue_scan`]. Used by
+/// `PgArtifactLifecycle::commit_transition_with_enqueues` to land the scan
+/// job inside the **same** transaction as the ingest transition, so no
+/// `ScanRequested` event is ever left without its `jobs` row (ADR 0002/0004
+/// no-strand).
+///
+/// **Idempotent.** `ON CONFLICT DO NOTHING` against the `jobs_scan_unique`
+/// partial-unique index (`(artifact_id) WHERE kind='scan'`): a pre-existing
+/// scan job is a benign no-op, NOT a rollback — re-ingesting an artifact that
+/// already has a queued scan must not fail the transition. (A `'scan'` insert
+/// can only collide on that one index — `idempotency_key` is NULL here and its
+/// unique index is `WHERE idempotency_key IS NOT NULL` — so the bare target is
+/// exact.)
+pub(crate) async fn enqueue_scan_in_tx(
+    tx: &mut sqlx::PgConnection,
+    artifact_id: Uuid,
+    repository_id: Uuid,
+    content_hash: &ContentHash,
+    format: &str,
+    priority: i16,
+    trigger_source: &str,
+) -> DomainResult<()> {
+    sqlx::query(
+        "INSERT INTO public.jobs\n\
+             (kind, artifact_id, repository_id, content_hash, format,\n\
+              priority, trigger_source, status)\n\
+         VALUES ('scan', $1, $2, $3, $4, $5, $6, 'pending')\n\
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(artifact_id)
+    .bind(repository_id)
+    .bind(content_hash.to_string())
+    .bind(format)
+    .bind(priority)
+    .bind(trigger_source)
+    .execute(tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| map_sqlx_error(&e, "ScanJob", &artifact_id.to_string()))
+}
+
+/// In-tx `kind='provenance-verify'` enqueue — the transactional sibling of the
+/// `enqueue_task("provenance-verify", …)` ingest path. Used by
+/// `commit_transition_with_enqueues`. `params` is `{"artifact_id": …}`; there
+/// is no idempotency key (one verify per ingest), so the insert always proceeds
+/// (a re-ingest adds a fresh verify job, which is harmless — the verifier is
+/// idempotent on the artifact). A failure here rolls back the ingest transition.
+pub(crate) async fn enqueue_provenance_verify_in_tx(
+    tx: &mut sqlx::PgConnection,
+    artifact_id: Uuid,
+    priority: i16,
+    trigger_source: &str,
+) -> DomainResult<()> {
+    let params = serde_json::json!({ "artifact_id": artifact_id });
+    sqlx::query(
+        "INSERT INTO public.jobs\n\
+             (kind, params, actor_id, priority, trigger_source, status)\n\
+         VALUES ('provenance-verify', $1, NULL, $2, $3, 'pending')",
+    )
+    .bind(params)
+    .bind(priority)
+    .bind(trigger_source)
+    .execute(tx)
+    .await
+    .map(|_| ())
+    .map_err(|e| map_sqlx_error(&e, "ProvenanceVerifyJob", &artifact_id.to_string()))
+}
+
 /// Multi-kind claim query (used by `claim_pending_by_kinds`).
 ///
 /// Lifted out of the function body so the inline test
