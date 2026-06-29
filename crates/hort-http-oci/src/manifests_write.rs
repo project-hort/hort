@@ -1233,15 +1233,15 @@ mod tests {
         artifact_groups: Arc<MockArtifactGroupRepository>,
         group_lifecycle: Arc<MockArtifactGroupLifecyclePort>,
         content_references: Arc<MockContentReferenceIndex>,
+        // Observe which ingest path ran via `lifecycle.scan_enqueues()`:
+        // a normal / mixed / non-bundle manifest routes via `ingest_verified`,
+        // which enqueues a scan ATOMICALLY with the transition (the seeded
+        // HTTP-test policy carries `scan_backends: ["trivy"]`); a pure
+        // Sigstore-bundle referrer routes via `ingest_signature_manifest` →
+        // NO scan enqueued.
         lifecycle: Arc<MockArtifactLifecycle>,
         #[allow(dead_code)]
         events: Arc<MockEventStore>,
-        // Observe which ingest path ran. A normal / mixed / non-bundle
-        // manifest routes via `ingest_verified` → `enqueue_scan` (the
-        // seeded HTTP-test policy carries `scan_backends: ["trivy"]`).
-        // A pure Sigstore-bundle referrer routes via
-        // `ingest_signature_manifest` → NO scan enqueued.
-        jobs: Arc<hort_app::use_cases::test_support::MockJobsRepository>,
     }
 
     fn harness() -> Harness {
@@ -1259,7 +1259,6 @@ mod tests {
             content_references: mocks.content_references,
             lifecycle: mocks.lifecycle,
             events: mocks.events,
-            jobs: mocks.jobs,
         }
     }
 
@@ -1979,7 +1978,7 @@ mod tests {
             let resp = router.oneshot(put_request(uri, body)).await.unwrap();
             let status = resp.status();
 
-            let scan_calls = h.jobs.enqueue_scan_calls().len();
+            let scan_calls = h.lifecycle.scan_enqueues().len();
             let oci_subject_rows = h
                 .content_references
                 .find_by_target(repo_id, &subject_hash, Some("oci_subject"))
@@ -2042,7 +2041,7 @@ mod tests {
             let uri = "/v2/myrepo/library/nginx/manifests/sha256.sig";
             let resp = router.oneshot(put_request(uri, body)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
-            h.jobs.enqueue_scan_calls().len()
+            h.lifecycle.scan_enqueues().len()
         });
         assert_eq!(
             scan_calls, 1,
@@ -2067,7 +2066,7 @@ mod tests {
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
             let resp = router.oneshot(put_request(uri, body)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
-            h.jobs.enqueue_scan_calls().len()
+            h.lifecycle.scan_enqueues().len()
         });
         assert_eq!(
             scan_calls, 1,
@@ -2099,7 +2098,7 @@ mod tests {
             let uri = "/v2/myrepo/library/nginx/manifests/sha256.sbom";
             let resp = router.oneshot(put_request(uri, body)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::CREATED);
-            let scan_calls = h.jobs.enqueue_scan_calls().len();
+            let scan_calls = h.lifecycle.scan_enqueues().len();
             // The oci_subject row is still written (the referrer machinery
             // is unchanged) — only the lifecycle treatment differs.
             let oci_subject_rows = h

@@ -10,6 +10,34 @@ use crate::types::sbom::SbomComponent;
 
 use super::BoxFuture;
 
+/// An ingest-time job to enqueue **atomically** with the artifact's creation
+/// transition. The common job fields (`artifact_id`, `repository_id`,
+/// `content_hash`) come from the `artifact` the commit method already carries;
+/// each variant adds only its kind-specific parameters.
+///
+/// Consumed by [`ArtifactLifecyclePort::commit_transition_with_enqueues`] to
+/// close the ingest dual-write hazard — an artifact must never be left with a
+/// `ScanRequested` / provenance-gate event but no `jobs` row, which strands it
+/// in quarantine (unscanned/unverified, recoverable only by a manual rescan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestEnqueue {
+    /// A `kind='scan'` job — the ingest-time auto-scan. **Idempotent** on the
+    /// `(artifact_id) WHERE kind='scan'` partial-unique index: a pre-existing
+    /// scan job is a benign no-op, NOT a commit rollback.
+    Scan {
+        format: String,
+        priority: i16,
+        trigger_source: String,
+    },
+    /// A `kind='provenance-verify'` job — the ingest-time provenance gate
+    /// (ADR 0027). The `jobs.params` is `{"artifact_id": <artifact.id>}`,
+    /// derived from the artifact; no idempotency key (one verify per ingest).
+    ProvenanceVerify {
+        priority: i16,
+        trigger_source: String,
+    },
+}
+
 /// Outbound port for atomic artifact lifecycle transitions.
 ///
 /// Each call persists both the domain events and the mutated artifact state
@@ -105,6 +133,58 @@ pub trait ArtifactLifecyclePort: Send + Sync {
         score_delta: Option<(Uuid, ScoreDelta)>,
         sbom_components: Option<&'a [SbomComponent]>,
     ) -> BoxFuture<'a, DomainResult<AppendResult>>;
+
+    /// Atomically commit a **creation transition** and enqueue its
+    /// ingest-time jobs (the auto-scan and the provenance gate).
+    ///
+    /// ## No-strand guarantee (backend-defined)
+    ///
+    /// Commits the `events` batch + artifact state + optional `metadata`
+    /// **and** ensures every [`IngestEnqueue`] in `enqueues` becomes a durable
+    /// `jobs` row, such that **no event-without-job intermediate state is ever
+    /// observable**: an artifact must never carry a `ScanRequested` /
+    /// provenance-gate event without its corresponding `jobs` row, which would
+    /// strand it in quarantine (unscanned / unverified — fail-closed, but
+    /// recoverable only by an operator-triggered manual rescan).
+    ///
+    /// *How* the guarantee is met is the adapter's choice — it is **not** part
+    /// of the contract, so callers must never assume a shared backend:
+    /// - The Postgres adapter spans **one SQL transaction** (events, artifact,
+    ///   metadata, and the `jobs` inserts commit-or-roll-back together) — the
+    ///   transparent fast path while the event store and the `jobs` table share
+    ///   one database.
+    /// - A **native event-store** adapter (a different backend from the
+    ///   Postgres `jobs` table) MUST NOT assume a shared transaction; it
+    ///   fulfils the same guarantee via a transactional outbox / event-stream
+    ///   materialization (the durable `ScanRequested` event is the enqueue
+    ///   intent; a subscriber materializes the `jobs` row, idempotent on the
+    ///   `(artifact_id) WHERE kind='scan'` partial-unique index). Tracked in
+    ///   the open-items register ("native event-store ingest-enqueue
+    ///   no-strand").
+    ///
+    /// The scan enqueue is **idempotent** (`ON CONFLICT DO NOTHING` on that
+    /// partial-unique index): a pre-existing scan job is a benign no-op, never
+    /// a rollback. Any *other* enqueue failure rolls back the whole transition
+    /// — the artifact is simply not ingested (the caller's upload fails and is
+    /// retriable), never ingested-but-stranded.
+    ///
+    /// ## Default impl — test doubles only
+    ///
+    /// The default forwards to [`Self::commit_transition`] and **drops** the
+    /// enqueues; it does **not** fulfil the no-strand guarantee and exists only
+    /// so transition-only test doubles compile (mirrors the lossy default on
+    /// [`Self::commit_transition_with_score`]). **Every production adapter MUST
+    /// override it.**
+    fn commit_transition_with_enqueues<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+        events: AppendEvents,
+        metadata: Option<ArtifactMetadata>,
+        enqueues: &'a [IngestEnqueue],
+    ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+        let _ = enqueues;
+        self.commit_transition(artifact, events, metadata)
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +294,108 @@ mod tests {
         )
         .await
         .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The defaulted `commit_transition_with_enqueues` forwards to
+    /// `commit_transition` and DROPS the enqueues — the test-double-only
+    /// behaviour (production adapters override to commit them atomically).
+    /// Also exercises the `IngestEnqueue` value type.
+    #[tokio::test]
+    async fn default_commit_transition_with_enqueues_forwards_and_drops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingLifecycle {
+            calls: Arc<AtomicUsize>,
+        }
+        impl ArtifactLifecyclePort for CountingLifecycle {
+            fn commit_transition(
+                &self,
+                _artifact: &Artifact,
+                _events: AppendEvents,
+                _metadata: Option<ArtifactMetadata>,
+            ) -> BoxFuture<'_, DomainResult<AppendResult>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(AppendResult {
+                        stream_position: 0,
+                        global_positions: vec![0],
+                    })
+                })
+            }
+            fn commit_scan_result_with_score<'a>(
+                &'a self,
+                _artifact: &'a Artifact,
+                _events: AppendEvents,
+                _scan_findings_rows: &'a [ScanFindingsRow],
+                _last_scan_at: DateTime<Utc>,
+                _score_delta: Option<(Uuid, ScoreDelta)>,
+                _sbom_components: Option<&'a [SbomComponent]>,
+            ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+                Box::pin(async { unreachable!() })
+            }
+        }
+
+        // `IngestEnqueue` value type: Clone + PartialEq + Debug.
+        let scan = IngestEnqueue::Scan {
+            format: "pypi".into(),
+            priority: 0,
+            trigger_source: "ingest".into(),
+        };
+        let prov = IngestEnqueue::ProvenanceVerify {
+            priority: 0,
+            trigger_source: "ingest".into(),
+        };
+        assert_eq!(scan.clone(), scan);
+        assert_ne!(scan, prov);
+        assert!(format!("{scan:?}").contains("Scan"));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let l = CountingLifecycle {
+            calls: calls.clone(),
+        };
+
+        let artifact = Artifact {
+            id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            name: "n".into(),
+            name_as_published: "n".into(),
+            version: None,
+            path: "/".into(),
+            size_bytes: 0,
+            sha256_checksum: "a".repeat(64).parse().unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: crate::entities::artifact::QuarantineStatus::None,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            is_deleted: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let events = AppendEvents {
+            stream_id: crate::events::StreamId::artifact(Uuid::nil()),
+            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
+            events: vec![],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: crate::events::system_actor(),
+        };
+
+        // The default forwards to commit_transition (dropping the enqueues).
+        l.commit_transition_with_enqueues(&artifact, events.clone(), None, &[scan, prov])
+            .await
+            .unwrap();
+        // Empty enqueues also forward.
+        l.commit_transition_with_enqueues(&artifact, events, None, &[])
+            .await
+            .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }

@@ -15,7 +15,7 @@ use hort_domain::events::{
 };
 use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
 use hort_domain::policy::scan::DefaultPolicy;
-use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
+use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
@@ -517,21 +517,18 @@ pub struct IngestUseCase {
     /// existing ingest behaviour is unchanged.
     policy_projections: Arc<dyn PolicyProjectionRepository>,
     /// Counterpart to [`Self::policy_projections`].
-    /// The ingest path calls [`JobsRepository::enqueue_scan`] after
-    /// `commit_transition` succeeds when a matching policy applies.
-    /// Ideally the insert would be atomic with the event commit;
-    /// today we commit the events first and enqueue separately —
-    /// failure of the enqueue side leaves the artifact ingested with a
-    /// `ScanRequested` event but no `jobs` row, which the operator
-    /// recovers from via the manual-rescan API.
     ///
-    /// TODO(scan-enqueue-atomicity): collapse the event-commit +
-    /// jobs-row insert into a single transaction by extending
-    /// [`ArtifactLifecyclePort`] with a
-    /// `commit_transition_with_scan_enqueue` method — a port-contract
-    /// change, escalate rather than do inline. The current shape
-    /// is the minimum-viable wiring; the atomicity refactor is
-    /// orthogonal.
+    /// The release-gating ingest enqueues — the auto-scan (`ScanRequested`)
+    /// and the provenance gate (`provenance-verify`) — do **not** go through
+    /// this field. They are committed **atomically** with the ingest
+    /// transition via
+    /// [`ArtifactLifecyclePort::commit_transition_with_enqueues`] (no
+    /// event-without-job strand; ADR 0002/0004). This field is retained for
+    /// the **best-effort, non-gating** post-commit enqueues — the
+    /// `prefetch-dependencies` transitive-cascade hook — which are
+    /// deliberately eventually-consistent (a lost cascade row strands
+    /// nothing; the next pull re-triggers), so warn-and-continue is the
+    /// correct posture for them.
     jobs: Arc<dyn JobsRepository>,
     /// The set of repository-format strings
     /// some registered `ProvenancePort` `applies_to`. Drives the
@@ -2680,8 +2677,53 @@ impl IngestUseCase {
             });
         }
 
+        // Ingest-time job enqueues, committed **atomically** with the
+        // transition (ADR 0002/0004 no-strand): `commit_transition_with_enqueues`
+        // lands the `ScanRequested` / provenance-gate events, the artifact
+        // projection, and these `jobs` rows in one transaction, so a
+        // crash/failure can never leave the artifact ingested-but-unscanned
+        // (the dual-write strand that previously needed an operator manual
+        // rescan to recover). The scan enqueue is idempotent at the adapter
+        // (`ON CONFLICT DO NOTHING`); any other enqueue failure aborts the
+        // whole ingest (retriable by the client), never a partial commit.
+        //
+        // Both gates resolve from the same `matched_policy` snapshot the
+        // `events` batch above used (no race). `scan_will_run` already decided
+        // whether `ScanRequested` is in `events`. The provenance gate mirrors
+        // ADR 0027: enqueue iff `mode != Off` AND a registered verifier
+        // `applies_to(format)` — gating on `mode != Off` alone would enqueue a
+        // no-op for every non-OCI ingest under the default `VerifyIfPresent`
+        // (Tier-1 cosign applies only to `"oci"`); the `provenance_capable_formats`
+        // set carries exactly the formats some registered port can act on, and
+        // the gate auto-activates when a Tier-2 verifier later registers (no
+        // migration). An absent policy resolves to the `ProvenanceMode` default
+        // (`VerifyIfPresent`).
+        let provenance_mode = matched_policy
+            .as_ref()
+            .map(|p| p.provenance_mode)
+            .unwrap_or_default();
+        let provenance_will_run = provenance_mode != ProvenanceMode::Off
+            && self
+                .provenance_capable_formats
+                .contains(&scan_enqueue_format);
+
+        let mut enqueues: Vec<IngestEnqueue> = Vec::new();
+        if scan_will_run {
+            enqueues.push(IngestEnqueue::Scan {
+                format: scan_enqueue_format.clone(),
+                priority: 0, // default tier for ingest-time enqueue
+                trigger_source: "ingest".to_string(),
+            });
+        }
+        if provenance_will_run {
+            enqueues.push(IngestEnqueue::ProvenanceVerify {
+                priority: 0, // default tier for ingest-time enqueue
+                trigger_source: "ingest".to_string(),
+            });
+        }
+
         self.lifecycle
-            .commit_transition(
+            .commit_transition_with_enqueues(
                 &artifact,
                 AppendEvents {
                     stream_id: stream_id.clone(),
@@ -2692,6 +2734,7 @@ impl IngestUseCase {
                     actor: Actor::Api(actor),
                 },
                 Some(artifact_metadata),
+                &enqueues,
             )
             .await
             .map_err(|e| {
@@ -2701,92 +2744,6 @@ impl IngestUseCase {
                     None,
                 )
             })?;
-
-        // Counterpart to the `ScanRequested`
-        // append above. Ideally this jobs-row insert lands in
-        // the same Postgres transaction as `commit_transition`; today
-        // the two operations are sequential (see the field-level TODO
-        // on `Self::jobs`). Failure here leaves the artifact ingested
-        // and the `ScanRequested` event in the stream but no `jobs`
-        // row — the operator-side recovery is the manual-
-        // rescan API. We log warn and continue so a transient DB
-        // hiccup doesn't unsubscribe the artifact from its primary
-        // ingest path.
-        if scan_will_run {
-            if let Err(e) = self
-                .jobs
-                .enqueue_scan(
-                    artifact_id,
-                    repository_id,
-                    &artifact.sha256_checksum,
-                    &scan_enqueue_format,
-                    0i16, // priority: default tier for ingest-time enqueue
-                    "ingest",
-                )
-                .await
-            {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    repository_id = %repository_id,
-                    error = %e,
-                    "ingest: enqueue_scan failed after commit_transition; \
-                     ScanRequested event is durable but no jobs row exists — \
-                     operator must trigger a manual rescan",
-                );
-            }
-        }
-
-        // Ingest-time `provenance-verify`
-        // enqueue, gated on `provenance_mode != Off` AND a registered
-        // verifier `applies_to(format)` (ADR 0027). Gating on
-        // `mode != Off` alone would enqueue a no-op job for every non-OCI
-        // ingest under the default `VerifyIfPresent` (Tier-1 cosign applies
-        // only to `"oci"`). The `provenance_capable_formats` set carries
-        // exactly the formats some registered port can act on, so a
-        // non-applicable ingest enqueues nothing (genuinely zero-overhead),
-        // and the gate auto-activates when a Tier-2 verifier later
-        // registers (no migration). The resolved-mode read uses the same
-        // `matched_policy` snapshot the scan enqueue above used (no race);
-        // an absent policy resolves to the `ProvenanceMode` default
-        // (`VerifyIfPresent`).
-        let provenance_mode = matched_policy
-            .as_ref()
-            .map(|p| p.provenance_mode)
-            .unwrap_or_default();
-        let provenance_will_run = provenance_mode != ProvenanceMode::Off
-            && self
-                .provenance_capable_formats
-                .contains(&scan_enqueue_format);
-        if provenance_will_run {
-            // Cross-kind row carrying `params.artifact_id`. Best-effort,
-            // mirroring the scan enqueue's warn-and-continue posture — a
-            // transient DB failure here must not unsubscribe the artifact
-            // from its primary ingest path. A `Required`-mode artifact whose
-            // enqueue is lost stays `Pending` at the release gate
-            // (fail-closed), so the operator-recoverable path is a re-ingest
-            // / manual re-trigger, never a silent early release.
-            let params = serde_json::json!({ "artifact_id": artifact_id });
-            if let Err(e) = self
-                .jobs
-                .enqueue_task(
-                    "provenance-verify",
-                    &params,
-                    None, // system-driven; no operator actor
-                    0i16, // default tier for ingest-time enqueue
-                    "ingest",
-                    None, // no idempotency key — one verify per ingest is fine
-                )
-                .await
-            {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    repository_id = %repository_id,
-                    error = %e,
-                    "ingest: provenance-verify enqueue failed after commit_transition; \
-                     no jobs row exists — a Required artifact stays Pending (fail-closed)",
-                );
-            }
-        }
 
         // Refcount projection writes. Run AFTER
         // `commit_transition` succeeds (the artifact is persisted-and-
@@ -11263,7 +11220,7 @@ mod tests {
         let upstream_digest: ContentHash = hash_hex.parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, lifecycle, _storage, repos, policy_projections, jobs) =
+            let (uc, _artifacts, lifecycle, _storage, repos, policy_projections, _jobs) =
                 make_scan_gated_use_case();
             repos.insert(repo);
             // Seed a global ScanPolicy. The ingest path's policy
@@ -11322,14 +11279,15 @@ mod tests {
                 "policy-driven quarantine must follow the ingest batch",
             );
 
-            // Jobs-side assertion: enqueue_scan called exactly once
-            // with the right shape.
-            let calls = jobs.enqueue_scan_calls();
-            assert_eq!(calls.len(), 1, "exactly one enqueue_scan call");
-            assert_eq!(calls[0].artifact_id, outcome.artifact.id);
-            assert_eq!(calls[0].repository_id, repo_id);
-            assert_eq!(calls[0].format, "pypi");
-            assert_eq!(calls[0].trigger_source, "ingest");
+            // The scan job is enqueued ATOMICALLY with the transition (no
+            // longer a separate jobs-mock call), carrying the right shape.
+            // `repository_id`/`content_hash` are taken from the committed
+            // artifact, so they cannot drift from the enqueue.
+            let scans = lifecycle.scan_enqueues();
+            assert_eq!(scans.len(), 1, "exactly one scan enqueue");
+            assert_eq!(scans[0].0, outcome.artifact.id);
+            assert_eq!(scans[0].1, "pypi");
+            assert_eq!(scans[0].3, "ingest");
         });
     }
 
@@ -11352,7 +11310,7 @@ mod tests {
         let upstream_digest: ContentHash = hash_hex.parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, lifecycle, _storage, repos, policy_projections, jobs) =
+            let (uc, _artifacts, lifecycle, _storage, repos, policy_projections, _jobs) =
                 make_scan_gated_use_case();
             repos.insert(repo);
             // Permissive policy: scanBackends set, but no quarantine hold.
@@ -11396,7 +11354,7 @@ mod tests {
 
             // The scan job is still enqueued — permissive mode opts out
             // of the hold, NOT out of scanning.
-            assert_eq!(jobs.enqueue_scan_calls().len(), 1);
+            assert_eq!(lifecycle.scan_enqueues().len(), 1);
         });
     }
 
@@ -11424,7 +11382,7 @@ mod tests {
         let upstream_digest: ContentHash = hash_hex.parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, lifecycle, _storage, repos, _policy_projections, jobs) =
+            let (uc, _artifacts, lifecycle, _storage, repos, _policy_projections, _jobs) =
                 make_scan_gated_use_case();
             repos.insert(repo);
             // Intentionally NO policy_projections.insert(...) — the
@@ -11489,14 +11447,13 @@ mod tests {
                 "DefaultPolicy (quarantine-by-default, ADR 0007) drives a quarantine transition",
             );
 
-            let calls = jobs.enqueue_scan_calls();
+            let scans = lifecycle.scan_enqueues();
             assert_eq!(
-                calls.len(),
+                scans.len(),
                 1,
-                "enqueue_scan must run under the DefaultPolicy fallback",
+                "scan enqueue must run under the DefaultPolicy fallback",
             );
-            assert_eq!(calls[0].repository_id, repo_id);
-            assert_eq!(calls[0].trigger_source, "ingest");
+            assert_eq!(scans[0].3, "ingest");
         });
     }
 
@@ -11512,7 +11469,7 @@ mod tests {
         let upstream_digest: ContentHash = hash_hex.parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, lifecycle, _storage, repos, policy_projections, jobs) =
+            let (uc, _artifacts, lifecycle, _storage, repos, policy_projections, _jobs) =
                 make_scan_gated_use_case();
             repos.insert(repo);
             // Waiver policy: scanning explicitly disabled, no hold.
@@ -11546,7 +11503,7 @@ mod tests {
                 "scan_backends:[] is an explicit waiver — no ScanRequested",
             );
             assert!(
-                jobs.enqueue_scan_calls().is_empty(),
+                lifecycle.scan_enqueues().is_empty(),
                 "enqueue_scan must NOT run when the policy waives scanning",
             );
         });
@@ -11790,6 +11747,7 @@ mod tests {
         Arc<MockRepositoryRepository>,
         Arc<MockPolicyProjectionRepository>,
         Arc<MockJobsRepository>,
+        Arc<MockArtifactLifecycle>,
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
@@ -11806,7 +11764,7 @@ mod tests {
 
         let uc = IngestUseCase::new(
             storage,
-            lifecycle,
+            lifecycle.clone(),
             artifacts,
             repos.clone(),
             crate::event_store_publisher::wrap_for_test(events),
@@ -11821,7 +11779,7 @@ mod tests {
         )
         .with_provenance_capable_formats(capable_formats.iter().map(ToString::to_string));
 
-        (uc, repos, policy_projections, jobs)
+        (uc, repos, policy_projections, jobs, lifecycle)
     }
 
     /// A provenance policy projection (global scope) at the requested mode.
@@ -11892,11 +11850,8 @@ mod tests {
         }
     }
 
-    fn provenance_verify_enqueues(jobs: &Arc<MockJobsRepository>) -> usize {
-        jobs.enqueue_calls()
-            .into_iter()
-            .filter(|(kind, _, _)| kind == "provenance-verify")
-            .count()
+    fn provenance_verify_enqueues(lifecycle: &Arc<MockArtifactLifecycle>) -> usize {
+        lifecycle.provenance_verify_enqueue_count()
     }
 
     /// (d) `Off` policy → no `provenance-verify` job enqueued (even on OCI
@@ -11905,7 +11860,7 @@ mod tests {
     fn off_mode_enqueues_no_provenance_verify_job() {
         let content: &[u8] = b"oci manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, repos, projections, jobs) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -11920,7 +11875,7 @@ mod tests {
             .expect("ingest must succeed");
 
             assert_eq!(
-                provenance_verify_enqueues(&jobs),
+                provenance_verify_enqueues(&lifecycle),
                 0,
                 "Off mode must enqueue NO provenance-verify job"
             );
@@ -11935,7 +11890,7 @@ mod tests {
         let content: &[u8] = b"pypi sdist bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             // The capable set is {"oci"} — pypi is NOT in it.
-            let (uc, repos, projections, jobs) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
             let repo = pypi_repository();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -11956,7 +11911,7 @@ mod tests {
                 .expect("ingest must succeed");
 
             assert_eq!(
-                provenance_verify_enqueues(&jobs),
+                provenance_verify_enqueues(&lifecycle),
                 0,
                 "VerifyIfPresent on a non-OCI format (no applicable verifier) must enqueue NO job",
             );
@@ -11969,7 +11924,7 @@ mod tests {
     fn verify_if_present_oci_enqueues_provenance_verify_job() {
         let content: &[u8] = b"oci manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, repos, projections, jobs) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -11984,21 +11939,13 @@ mod tests {
                 .await
                 .expect("ingest must succeed");
 
-            let prov_calls: Vec<_> = jobs
-                .enqueue_calls()
-                .into_iter()
-                .filter(|(kind, _, _)| kind == "provenance-verify")
-                .collect();
+            // Exactly one provenance-verify enqueue, committed atomically with
+            // the transition and bound to the ingested artifact (the adapter
+            // folds this artifact_id into the job's `params.artifact_id`).
             assert_eq!(
-                prov_calls.len(),
-                1,
-                "VerifyIfPresent on OCI (cosign applies) must enqueue exactly one job"
-            );
-            // params carries the artifact_id.
-            assert_eq!(
-                prov_calls[0].1["artifact_id"],
-                serde_json::json!(outcome.artifact.id),
-                "the enqueued provenance-verify params must carry the artifact_id"
+                lifecycle.provenance_verify_enqueue_artifact_ids(),
+                vec![outcome.artifact.id],
+                "VerifyIfPresent on OCI (cosign applies) must enqueue exactly one provenance-verify job for the artifact"
             );
         });
     }
@@ -12008,7 +11955,7 @@ mod tests {
     fn required_oci_enqueues_provenance_verify_job() {
         let content: &[u8] = b"oci manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, repos, projections, jobs) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -12023,7 +11970,7 @@ mod tests {
             .expect("ingest must succeed");
 
             assert_eq!(
-                provenance_verify_enqueues(&jobs),
+                provenance_verify_enqueues(&lifecycle),
                 1,
                 "Required on OCI must enqueue exactly one provenance-verify job"
             );
@@ -12039,7 +11986,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             // Capable set is EMPTY (the `new()` default — no
             // `with_provenance_capable_formats` call).
-            let (uc, repos, projections, jobs) = provenance_make_use_case(&[]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&[]);
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -12054,7 +12001,7 @@ mod tests {
             .expect("ingest must succeed");
 
             assert_eq!(
-                provenance_verify_enqueues(&jobs),
+                provenance_verify_enqueues(&lifecycle),
                 0,
                 "an empty capability set must enqueue NO provenance-verify job (fail-safe default)"
             );
@@ -12131,15 +12078,20 @@ mod tests {
                 "the persisted artifact must be status None"
             );
 
-            // Jobs: neither scan nor provenance enqueued.
+            // Neither scan nor provenance enqueued (both ride the atomic
+            // lifecycle path now), and no generic task either.
             assert!(
-                jobs.enqueue_scan_calls().is_empty(),
+                lifecycle.scan_enqueues().is_empty(),
                 "a signature manifest must NOT enqueue a scan job"
             );
             assert_eq!(
-                provenance_verify_enqueues(&jobs),
+                provenance_verify_enqueues(&lifecycle),
                 0,
                 "a signature manifest must NOT enqueue a provenance-verify job"
+            );
+            assert!(
+                jobs.enqueue_calls().is_empty(),
+                "a signature manifest must NOT enqueue any generic task"
             );
         });
     }
@@ -12198,7 +12150,7 @@ mod tests {
                 outcome.ingested_event_id
             );
             // No jobs of any kind.
-            assert!(jobs.enqueue_scan_calls().is_empty());
+            assert!(lifecycle.scan_enqueues().is_empty());
             assert!(jobs.enqueue_calls().is_empty());
         });
     }
@@ -12238,7 +12190,7 @@ mod tests {
 
             // Nothing committed, nothing enqueued.
             assert!(lifecycle.committed_transitions().is_empty());
-            assert!(jobs.enqueue_scan_calls().is_empty());
+            assert!(lifecycle.scan_enqueues().is_empty());
             assert!(jobs.enqueue_calls().is_empty());
         });
     }

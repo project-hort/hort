@@ -38,7 +38,7 @@ use hort_domain::ports::artifact_group_lifecycle::{
     ArtifactGroupLifecyclePort, GroupCommitOutcome, GroupMemberCommit,
 };
 use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
-use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
+use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
@@ -2077,6 +2077,12 @@ pub struct MockArtifactLifecycle {
     /// the lifecycle adapter (in production) applies the delta inside
     /// the same Postgres tx as the event append.
     score_deltas: Mutex<Vec<(Uuid, ScoreDelta)>>,
+    /// Every `(artifact_id, enqueues)` passed to
+    /// `commit_transition_with_enqueues`, in call order. Tests asserting the
+    /// ingest path requested the right atomic enqueues (scan / provenance)
+    /// use this snapshot — the enqueues no longer flow through the `jobs`
+    /// mock, they ride the lifecycle call so they commit atomically.
+    ingest_enqueues: Mutex<Vec<(Uuid, Vec<IngestEnqueue>)>>,
     /// When set, `commit_transition` returns this error verbatim without
     /// recording the transition. Used by tests exercising error-path
     /// metric emission (e.g. `register_by_hash` must
@@ -2096,6 +2102,7 @@ impl MockArtifactLifecycle {
             last_scan_at_writes: Mutex::new(Vec::new()),
             score_deltas: Mutex::new(Vec::new()),
             sbom_replace_calls: Mutex::new(Vec::new()),
+            ingest_enqueues: Mutex::new(Vec::new()),
             next_error: Mutex::new(None),
         }
     }
@@ -2156,6 +2163,61 @@ impl MockArtifactLifecycle {
         self.sbom_replace_calls.lock().unwrap().clone()
     }
 
+    /// Every `(artifact_id, enqueues)` passed to
+    /// `commit_transition_with_enqueues`, in call order. Tests assert the
+    /// ingest path requested the right atomic scan / provenance enqueues
+    /// (these no longer flow through the `jobs` mock).
+    pub fn ingest_enqueues(&self) -> Vec<(Uuid, Vec<IngestEnqueue>)> {
+        self.ingest_enqueues.lock().unwrap().clone()
+    }
+
+    /// Flattened `(artifact_id, format, priority, trigger_source)` for every
+    /// recorded [`IngestEnqueue::Scan`] — the lifecycle-side replacement for
+    /// the old `MockJobsRepository::enqueue_scan_calls()` assertions now that
+    /// the scan enqueue commits atomically with the transition.
+    pub fn scan_enqueues(&self) -> Vec<(Uuid, String, i16, String)> {
+        self.ingest_enqueues
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(aid, enqs)| {
+                enqs.iter().filter_map(move |e| match e {
+                    IngestEnqueue::Scan {
+                        format,
+                        priority,
+                        trigger_source,
+                    } => Some((*aid, format.clone(), *priority, trigger_source.clone())),
+                    IngestEnqueue::ProvenanceVerify { .. } => None,
+                })
+            })
+            .collect()
+    }
+
+    /// Count of recorded [`IngestEnqueue::ProvenanceVerify`] — the
+    /// lifecycle-side replacement for the old provenance-verify
+    /// `enqueue_task` count.
+    pub fn provenance_verify_enqueue_count(&self) -> usize {
+        self.provenance_verify_enqueue_artifact_ids().len()
+    }
+
+    /// The `artifact_id` each recorded [`IngestEnqueue::ProvenanceVerify`] was
+    /// committed against — the binding the adapter folds into the job's
+    /// `params.artifact_id`. Tests assert the provenance-verify enqueue
+    /// targets the right artifact.
+    pub fn provenance_verify_enqueue_artifact_ids(&self) -> Vec<Uuid> {
+        self.ingest_enqueues
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(aid, enqs)| {
+                enqs.iter().filter_map(move |e| match e {
+                    IngestEnqueue::ProvenanceVerify { .. } => Some(*aid),
+                    IngestEnqueue::Scan { .. } => None,
+                })
+            })
+            .collect()
+    }
+
     /// Seed a single failure — the next `commit_transition` call returns
     /// `Err(err)` and records no transition. Cleared after the call.
     pub fn fail_next_commit(&self, err: DomainError) {
@@ -2191,6 +2253,46 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             .push((artifact.clone(), events, metadata));
         self.artifacts.insert(artifact.clone());
         Box::pin(async move {
+            Ok(AppendResult {
+                stream_position: count.saturating_sub(1),
+                global_positions: (0..count).collect(),
+            })
+        })
+    }
+
+    /// Override the lossy default so the mock records the atomic enqueues
+    /// (and still performs the transition work) — mirrors the real Postgres
+    /// adapter committing the `jobs` rows in the same transaction.
+    fn commit_transition_with_enqueues<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+        events: AppendEvents,
+        metadata: Option<ArtifactMetadata>,
+        enqueues: &'a [IngestEnqueue],
+    ) -> BoxFut<'a, DomainResult<AppendResult>> {
+        let recorded = enqueues.to_vec();
+        Box::pin(async move {
+            // Failure-injection up front (mirrors `commit_transition`), before
+            // recording anything, so a forced error leaves no stray enqueue.
+            if let Some(err) = self.next_error.lock().unwrap().take() {
+                return Err(err);
+            }
+            self.ingest_enqueues
+                .lock()
+                .unwrap()
+                .push((artifact.id, recorded));
+            let count = events.events.len() as u64;
+            if let (Some(meta), Some(repo)) = (
+                metadata.as_ref(),
+                self.artifact_metadata.lock().unwrap().as_ref(),
+            ) {
+                repo.insert(meta.clone());
+            }
+            self.transitions
+                .lock()
+                .unwrap()
+                .push((artifact.clone(), events, metadata));
+            self.artifacts.insert(artifact.clone());
             Ok(AppendResult {
                 stream_position: count.saturating_sub(1),
                 global_positions: (0..count).collect(),
