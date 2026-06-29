@@ -85,8 +85,11 @@ async fn seed_repo(pool: &PgPool) -> Uuid {
 
 fn artifact(repo_id: Uuid) -> Artifact {
     let id = Uuid::new_v4();
-    // 32 hex chars padded to a valid 64-hex SHA-256 string.
-    let sha = format!("{:0<64}", id.simple());
+    // Two 32-hex uuid halves → a valid 64-lowercase-hex SHA-256 string,
+    // unique per artifact. NB: `format!("{:0<64}", id.simple())` does NOT
+    // work — `uuid::Simple`'s `Display` ignores the width/fill flags, so it
+    // stays 32 chars and `ContentHash::parse` rejects it.
+    let sha = id.simple().to_string().repeat(2);
     Artifact {
         id,
         repository_id: repo_id,
