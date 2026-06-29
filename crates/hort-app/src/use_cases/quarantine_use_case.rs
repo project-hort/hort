@@ -437,7 +437,30 @@ impl QuarantineUseCase {
                 // when the computed deadline has already elapsed; the
                 // window-completes-last case still leaves the artifact
                 // `Quarantined` for the `release_expired` sweep.
-                artifact.record_clean_scan()?;
+                // A clean re-scan of an artifact ALREADY terminal (`Rejected` /
+                // `Released`) is a recoverable, idempotent re-scan: record the
+                // fresh `ScanCompleted` + findings below (so a manual rescan
+                // refreshes the stored result), but do NOT mutate state — a
+                // clean signal must not un-reject a terminal artifact (ADR 0007
+                // fail-closed; `record_clean_scan` rejects the terminal state
+                // for exactly that reason). Propagating the invariant instead
+                // fails the job and loops it forever — the same churn bug the
+                // reject branch already fixes (see
+                // `record_scan_result_reject_on_already_rejected_...`).
+                let already_terminal = match artifact.record_clean_scan() {
+                    Ok(()) => false,
+                    Err(DomainError::Invariant(msg)) => {
+                        tracing::debug!(
+                            artifact_id = %artifact_id,
+                            status = %artifact.quarantine_status,
+                            reason = %msg,
+                            "clean re-scan of already-terminal artifact: recording \
+                             fresh scan, skipping state transition + score re-count"
+                        );
+                        true
+                    }
+                    Err(e) => return Err(AppError::Domain(e)),
+                };
 
                 let mut events_vec = Vec::with_capacity(3);
                 events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
@@ -578,7 +601,14 @@ impl QuarantineUseCase {
                     },
                     &scan_findings_rows,
                     now,
-                    Some((repository_id, score_delta)),
+                    // Mirror the reject branch: no score re-count on an
+                    // already-terminal re-scan — the status is unchanged and
+                    // the original reject already counted it.
+                    if already_terminal {
+                        None
+                    } else {
+                        Some((repository_id, score_delta))
+                    },
                     sbom_components_owned.as_deref(),
                 )
                 .await?;
@@ -4608,6 +4638,63 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.event, DomainEvent::ArtifactRejected(_))),
             "no duplicate ArtifactRejected on an already-rejected artifact"
+        );
+        assert!(
+            lifecycle.score_deltas().is_empty(),
+            "no score re-count on a terminal re-scan"
+        );
+    }
+
+    /// A re-scan that comes back CLEAN on an artifact already in the terminal
+    /// `Rejected` state must (a) return Ok — no churn, no `cannot record clean
+    /// scan for artifact in state rejected` invariant that loops the job
+    /// (`attempts=3`) — AND (b) RECORD the fresh `ScanCompleted` so the stored
+    /// result refreshes, while staying terminal (a clean signal must NOT
+    /// un-reject a rejected artifact; ADR 0007 fail-closed) and skipping the
+    /// score re-count. This is the clean-branch mirror of
+    /// `record_scan_result_reject_on_already_rejected_records_findings_no_duplicate_reject`
+    /// — the reject branch was taught the graceful already-terminal handling;
+    /// the clean branch had the same churn bug.
+    #[tokio::test]
+    async fn record_scan_result_clean_on_already_rejected_records_no_loop_stays_terminal() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Rejected);
+
+        // Clean re-scan (no findings) of a terminal artifact: returns Ok —
+        // not the hard `cannot record clean scan for artifact in state rejected`
+        // error that looped the job.
+        uc.record_scan_result(artifact_id, "trivy".into(), vec![], None)
+            .await
+            .unwrap();
+
+        // The fresh clean scan IS recorded (the dual-write fired) so a rescan
+        // refreshes the stored result — not a silent no-op and not a loop.
+        let txns = lifecycle.committed_transitions();
+        assert_eq!(
+            txns.len(),
+            1,
+            "the fresh clean scan must be recorded so a rescan refreshes findings"
+        );
+        let (saved, batch, _) = &txns[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Rejected,
+            "a clean scan must NOT un-reject a terminal artifact (ADR 0007 fail-closed)"
+        );
+        assert!(
+            batch
+                .events
+                .iter()
+                .any(|e| matches!(&e.event, DomainEvent::ScanCompleted(_))),
+            "fresh ScanCompleted recorded"
+        );
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(&e.event, DomainEvent::ArtifactReleased(_))),
+            "no release on a clean re-scan of a terminal artifact"
         );
         assert!(
             lifecycle.score_deltas().is_empty(),
