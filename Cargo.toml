@@ -139,7 +139,7 @@ axum = { version = "0.7", features = ["multipart", "tokio"] }
 # pairs with axum 0.8 — taking 0.10 would drag a second axum into the graph.
 axum-extra = { version = "0.9", features = ["query"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "timeout"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "timeout"] }
 # Explicit hyper-util Builder for the `axum::serve` replacement. We need
 # `http1_header_read_timeout` (the slowloris defence) plus the HTTP/1+H2
 # auto-negotiation; the `server-graceful` feature gives us a
