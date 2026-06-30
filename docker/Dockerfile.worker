@@ -108,7 +108,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # ---------- Stage 2: Trivy CLI ----------
 # Digest-pinned (B10/INFRA-7).
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS trivy
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS trivy
 
 # TARGETARCH is auto-populated by buildx from the build `--platform`
 # (amd64 / arm64). Declared here so the RUN below can map it to the
@@ -151,7 +151,7 @@ RUN set -eu && \
 
 # ---------- Stage 3: osv-scanner CLI ----------
 # Digest-pinned (B10/INFRA-7).
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS osv
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS osv
 
 ARG TARGETARCH
 ARG OSV_SCANNER_VERSION
@@ -203,7 +203,7 @@ RUN set -eu && \
 # (the worker process). The worker's tokio runtime does not waitpid
 # on grandchildren; tini does.
 # Digest-pinned (B10/INFRA-7).
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e AS tini
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS tini
 RUN apt-get update && \
     apt-get install -y --no-install-recommends tini && \
     rm -rf /var/lib/apt/lists/*
