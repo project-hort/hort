@@ -442,27 +442,44 @@ security:advisory-sync:
   script:
     - bash scripts/check-advisory-sync.sh
 
-# Default-branch gate: `docs/plans/` is the branch-lifetime home for design
-# docs + backlogs. They are distilled into ADRs (`docs/adr/`) and the
-# Diátaxis set (`docs/architecture/`) and removed before merging. This gate
-# fails the pipeline if the folder survived a merge onto the default branch.
-# Plain bash, no image deps.
+# No-plans gate (D7): `docs/plans/` is the branch-lifetime home for design docs
+# + backlogs, distilled into `docs/adr/` + `docs/architecture/` and removed
+# before they reach main. Runs PRE-MERGE on every MR to a protected branch:
+#   - MR to main    → HARD FAIL (plans must be gone before main).
+#   - MR to develop → WARNING only (plans may ride into integration; non-blocking).
+# Plus a post-merge backstop on the default branch (a fail). `exit 2` is the
+# allowed-failure (warning) code; `exit 1` is a hard fail. Plain bash, no deps.
 quality:no-plans-on-default-branch:
   stage: quality
   image: ${RUST_IMAGE}
   needs: []
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # Pre-merge gate: any MR targeting a protected branch.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|develop)$/'
+    # Post-merge backstop on the default branch (direct push / bypassed MR).
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  # exit 2 → allowed failure (yellow "warning", non-blocking) on MRs to develop;
+  # any other non-zero (exit 1) is a hard fail (blocks the merge to main).
+  allow_failure:
+    exit_codes:
+      - 2
   script:
     - |
       if [ -d docs/plans ] && [ -n "$(ls -A docs/plans 2>/dev/null)" ]; then
-        echo "ERROR: docs/plans/ exists on the default branch ($CI_DEFAULT_BRANCH)."
-        echo "Branch-lifetime planning docs must be distilled into docs/adr/ +"
-        echo "docs/architecture/ and removed before merge. Offending entries:"
+        target="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_COMMIT_BRANCH}"
+        echo "docs/plans/ is present. Offending entries:"
         ls -A docs/plans
+        if [ "$target" = "develop" ]; then
+          echo "WARNING: docs/plans/ on an MR to develop — allowed during integration,"
+          echo "but it MUST be distilled into docs/adr/ + docs/architecture/ and removed"
+          echo "before reaching main (the MR to main will FAIL otherwise)."
+          exit 2
+        fi
+        echo "ERROR: docs/plans/ would land on main (D7). Distil the durable decisions"
+        echo "into docs/adr/ + docs/architecture/ and remove docs/plans/ before merging."
         exit 1
       fi
-      echo "OK: no docs/plans/ on the default branch."
+      echo "OK: no docs/plans/ present."
 
 # cargo-deny gate. Runs the four sections in `deny.toml`: advisory floor,
 # license allowlist, banned crates (openssl-sys, native-tls, wasmtime*),
