@@ -316,7 +316,7 @@ rand = "0.8"
 # is O(1). Bounded at default 10k entries (`HORT_PAT_CACHE_SIZE`); on
 # overflow the oldest entry is evicted regardless of TTL. The 0.12.x line
 # is the latest as of 2026-Q2.
-lru = "0.12"
+lru = "0.16"
 
 # Lock-free atomic pointer swap for RBAC live-refresh. `ArcSwap` wraps the
 # `RbacEvaluator` snapshot so hot-path reads stay lock-free while the
