@@ -131,7 +131,7 @@ unused_qualifications = "warn"
 tokio = { version = "1.50", features = ["full"] }
 
 # Web framework
-axum = { version = "0.7", features = ["multipart", "tokio"] }
+axum = { version = "0.8", features = ["multipart", "tokio"] }
 # `axum_extra::extract::Query` (serde_html_form backend) for query strings
 # with repeated keys — the OCI `/v2/auth` `scope=…&scope=…` multi-value
 # parameter that plain axum `Query` (serde_urlencoded) cannot deserialize
