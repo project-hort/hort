@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.7] - 2026-06-30
 
-Beta release (`0.9.7-beta.2`). Headlines: ingest now commits the scan and
+Headlines: ingest now commits the scan and
 provenance-verify enqueues **atomically** with the artifact transition, closing
 a dual-write window that could leave an artifact ingested-but-unscanned; a clean
 re-scan of a terminal (rejected) artifact no longer loops the worker job; and a
