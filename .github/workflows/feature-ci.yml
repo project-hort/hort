@@ -1,0 +1,106 @@
+name: Feature CI (upstream + prefetch)
+
+# Feature-branch iteration builds against the ORIGINAL upstreams (fast, no
+# quarantine friction) and fire-and-forget prefetches the resolved dependency
+# set into hort, so the quarantine clock starts days before the eventual
+# merge-request gate builds against hort. See
+# docs/ci/hort-quarantine-integration.md.
+#
+# SECURITY (why `push` only): a `push` event fires only for branches in THIS
+# repository — a fork cannot push here — so the minted hort bearer is only ever
+# available to trusted members. Do NOT add `pull_request` (fork PRs must not
+# mint a hort token) or `pull_request_target` (hands fork code the credential).
+# The merge-request gate lives in ci.yml and is same-repo-gated there.
+
+on:
+  push:
+    branches-ignore: [main, develop, 'release/**', gh-pages]
+    paths-ignore:
+      - 'site/**'
+      - '**/*.md'
+      - 'docs/**'
+      - '.beads/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write            # mint the GitHub OIDC token for hort federation
+
+concurrency:
+  group: feature-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SQLX_OFFLINE: "true"
+  HORT_URL: https://registry.hort.rs
+  CARGO_SOURCE_REPO: cargo-virtual
+
+jobs:
+  build-and-prefetch:
+    name: 🌱 Build (upstream) + warm hort
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # ── prefetch-early (best-effort; never gates the feature build) ─────────
+      # No-op unless the instance is live. Mints its own short-lived reader
+      # bearer via GitHub OIDC → hort /exchange (same call as the hort-auth
+      # action), then prefetches the resolved registry deps. hort cascades
+      # transitively, so the resolved set is sufficient to warm the tree.
+      - name: Request OIDC token (audience=hort-server)
+        id: oidc
+        if: ${{ vars.HORT_PROXY_ENABLED == 'true' }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const token = await core.getIDToken('hort-server');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Prefetch resolved dependencies into hort
+        if: ${{ vars.HORT_PROXY_ENABLED == 'true' }}
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -uo pipefail
+          token=$(curl -sSf -X POST "${HORT_URL}/api/v1/auth/exchange" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "subject_token=${OIDC_TOKEN}" \
+            --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            | jq -r '.access_token // empty') || true
+          if [ -z "${token:-}" ]; then
+            echo "::warning::hort token exchange failed — skipping prefetch (feature build unaffected)"
+            exit 0
+          fi
+          echo "::add-mask::${token}"
+
+          # Resolve against upstream (no source-replacement here); prefetch the
+          # registry deps into hort in one batched request.
+          items=$(cargo metadata --format-version 1 --locked \
+            | jq -c '[.packages[]
+                      | select(.source != null and (.source | startswith("registry")))
+                      | {package: .name, version: .version}]')
+          echo "Prefetching $(printf '%s' "$items" | jq 'length') registry dependencies into hort/${CARGO_SOURCE_REPO}…"
+          curl -sS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "{\"items\": ${items}}" \
+            | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"' \
+            || echo "::warning::prefetch POST failed — quarantine not pre-warmed this run (non-fatal)"
+
+      # ── the feature-branch build itself: against UPSTREAM (crates.io) ───────
+      # hort-auth is intentionally NOT called here, so cargo pulls from the
+      # original upstreams — fast, and unblocked by quarantine. Lean scope
+      # (check + lib tests); the full suite runs at the merge-request gate.
+      - name: Build & unit-test against upstream
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --lib
