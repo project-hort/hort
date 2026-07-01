@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -534,6 +534,16 @@ pub struct ContentRange {
     pub end: u64,
 }
 
+/// An optional trailing body folded into a finalize `PUT` (or a `PATCH`
+/// chunk): the byte stream, an optional `Content-Range`, and an optional
+/// declared length — `None` = `Transfer-Encoding: chunked` (RFC 7230 §3.3.2),
+/// streamed and bounded in-stream by the publish-body cap.
+pub(crate) type TrailingBody = (
+    Box<dyn AsyncRead + Send + Unpin>,
+    Option<ContentRange>,
+    Option<u64>,
+);
+
 impl ContentRange {
     /// Span width — `end - start + 1` because the range is inclusive
     /// on both ends per the OCI spec.
@@ -608,23 +618,62 @@ pub(crate) async fn append_chunk(
     session_max_age: Duration,
 ) -> AppResult<UploadSessionRecord> {
     let key = session_key("oci", session_id);
-
     let result = append_chunk_core(
         ctx,
         session_id,
         &key,
         content_range,
         stream,
-        body_length,
+        Some(body_length),
         max_bytes,
         repo_id,
         session_max_age,
     )
     .await;
+    emit_abort_on_err(ctx, repo_id, &result).await;
+    result
+}
 
-    // On any unrecoverable error, emit `aborted` exactly once.  Kept
-    // outside the core so every error-producing `?` funnels through the
-    // same metric site.  Success is deliberately silent.
+/// Streaming variant for a PATCH that carries **no** `Content-Length`
+/// (`Transfer-Encoding: chunked` — RFC 7230 §3.3.2 forbids sending both a
+/// `Content-Length` and a `Transfer-Encoding`). The body is bounded
+/// in-stream by `max_bytes` inside [`append_chunk_core`]; the actual bytes
+/// landed are authoritative (no declared length to cross-check).
+#[tracing::instrument(skip(ctx, stream), fields(repository_id = %repo_id))]
+pub(crate) async fn append_chunk_streaming(
+    ctx: &AppContext,
+    session_id: Uuid,
+    content_range: Option<ContentRange>,
+    stream: Box<dyn AsyncRead + Send + Unpin>,
+    max_bytes: u64,
+    repo_id: Uuid,
+    session_max_age: Duration,
+) -> AppResult<UploadSessionRecord> {
+    let key = session_key("oci", session_id);
+    let result = append_chunk_core(
+        ctx,
+        session_id,
+        &key,
+        content_range,
+        stream,
+        None,
+        max_bytes,
+        repo_id,
+        session_max_age,
+    )
+    .await;
+    emit_abort_on_err(ctx, repo_id, &result).await;
+    result
+}
+
+/// On any unrecoverable `append_chunk*` error, emit `aborted` exactly
+/// once. Kept out of the core so every error-producing `?` funnels through
+/// the same metric site. Success is deliberately silent.
+async fn emit_abort_on_err(
+    ctx: &AppContext,
+    repo_id: Uuid,
+    result: &AppResult<UploadSessionRecord>,
+) {
     if result.is_err() {
         let repo_label = resolve_repo_label(ctx, repo_id).await;
         metrics::counter!(
@@ -635,8 +684,6 @@ pub(crate) async fn append_chunk(
         )
         .increment(1);
     }
-
-    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -646,7 +693,7 @@ async fn append_chunk_core(
     key: &str,
     content_range: Option<ContentRange>,
     stream: Box<dyn AsyncRead + Send + Unpin>,
-    body_length: u64,
+    body_length: Option<u64>,
     max_bytes: u64,
     repo_id: Uuid,
     session_max_age: Duration,
@@ -658,8 +705,8 @@ async fn append_chunk_core(
     // When the range is absent (containers/image, skopeo, podman send
     // chunks without `Content-Range`) we synthesise it after loading
     // the session record below.
-    if let Some(ref range) = content_range {
-        if range.span() != body_length {
+    if let (Some(range), Some(len)) = (content_range.as_ref(), body_length) {
+        if range.span() != len {
             return Err(AppError::BodyLengthMismatch);
         }
     }
@@ -691,68 +738,79 @@ async fn append_chunk_core(
         }));
     }
 
-    // --- Synthesise an absent Content-Range from the session offset.
-    // The OCI v1.1 spec recommends `Content-Range` on chunked PATCH
-    // but the dominant client implementation (containers/image, used
-    // by skopeo, podman, buildah) and the Docker Registry V2 reference
-    // omit it.  Treating an absent range as "append at current offset"
-    // is the unique meaningful interpretation and matches GHCR / Harbor
-    // / zot behaviour.  The strict `start == record.bytes_received`
-    // check below still applies and surfaces as RangeInvalid when an
-    // explicit (and incorrect) range is supplied.
-    let content_range = content_range.unwrap_or_else(|| ContentRange {
-        start: record.bytes_received,
-        end: record
-            .bytes_received
-            .saturating_add(body_length)
-            .saturating_sub(1),
-    });
-
-    // --- Validate Content-Range against session state.
-    if content_range.start != record.bytes_received {
-        return Err(AppError::RangeInvalid {
-            current: record.bytes_received,
-        });
+    // --- Validate the client-supplied range's START against session
+    // state (an append must land at the current offset). The range END is
+    // only meaningful with a declared length; when the length is absent
+    // (streaming) the actual bytes landed define it. An absent range is
+    // "append at current offset" — the unique meaningful interpretation,
+    // matching GHCR / Harbor / zot and the Docker Registry V2 reference.
+    if let Some(ref range) = content_range {
+        if range.start != record.bytes_received {
+            return Err(AppError::RangeInvalid {
+                current: record.bytes_received,
+            });
+        }
     }
 
-    // --- Size cap.  `checked_add` guards a pathological overflow
-    // before the comparison; falling through to a silent wrap would
-    // emit the wrong error code under very adversarial inputs.
-    let projected = record
-        .bytes_received
-        .checked_add(body_length)
-        .ok_or(AppError::SizeExceeded)?;
-    if projected > max_bytes {
-        return Err(AppError::SizeExceeded);
-    }
-
-    // --- Append via staging.  Returns the new TOTAL byte count after
-    // the append (not the chunk length).
-    let new_total = ctx
-        .stateful_upload_staging
-        .append(session_id, stream)
-        .await
-        .map_err(AppError::from)?;
-
-    // Staging-port invariant: the returned total must equal
-    // `bytes_received + body_length`.  A disagreement means either the
-    // body stream short-read (client hung up mid-chunk — the client
-    // lied about Content-Length) or an adapter bug.  Either way the
-    // session state is now inconsistent with the client's declared
-    // Content-Range and the safe response is `Invariant` → 500 via
-    // the OCI `Internal` envelope.  A naive `Conflict` here would
-    // invite clients to retry the same corrupt PATCH indefinitely.
-    if new_total != record.bytes_received + body_length {
-        tracing::warn!(
-            session_id = %session_id,
-            expected = record.bytes_received + body_length,
-            actual = new_total,
-            "staging append byte count disagreed with declared body length"
-        );
-        return Err(AppError::Domain(DomainError::Invariant(
-            "staging append byte count disagreed with declared body length".into(),
-        )));
-    }
+    let new_total = match body_length {
+        // Declared-length path (Content-Length present; the transport
+        // frames the body to exactly `len` bytes). Pre-flight the size cap,
+        // then cross-check staging landed exactly the declared count.
+        Some(len) => {
+            // `checked_add` guards a pathological overflow before the
+            // comparison; a silent wrap would emit the wrong error code.
+            let projected = record
+                .bytes_received
+                .checked_add(len)
+                .ok_or(AppError::SizeExceeded)?;
+            if projected > max_bytes {
+                return Err(AppError::SizeExceeded);
+            }
+            let new_total = ctx
+                .stateful_upload_staging
+                .append(session_id, stream)
+                .await
+                .map_err(AppError::from)?;
+            // Staging-port invariant: a disagreement means the body
+            // short-read (client hung up / lied about Content-Length) or an
+            // adapter bug. Either way the session is inconsistent with the
+            // declared length — `Invariant` → 500. A naive `Conflict` would
+            // invite endless retries of the same corrupt PATCH.
+            if new_total != record.bytes_received + len {
+                tracing::warn!(
+                    session_id = %session_id,
+                    expected = record.bytes_received + len,
+                    actual = new_total,
+                    "staging append byte count disagreed with declared body length"
+                );
+                return Err(AppError::Domain(DomainError::Invariant(
+                    "staging append byte count disagreed with declared body length".into(),
+                )));
+            }
+            new_total
+        }
+        // Streaming path (no Content-Length — `Transfer-Encoding: chunked`).
+        // The transport does not bound the body, so bound the read at the
+        // cap: `take(headroom)` (headroom = remaining cap + 1) truncates, so
+        // staging never grows past `max_bytes + 1`, and a body that reaches
+        // the +1 trips the post-append cap check. Actual bytes landed are
+        // authoritative — there is no declared length to cross-check.
+        None => {
+            let headroom = max_bytes
+                .saturating_sub(record.bytes_received)
+                .saturating_add(1);
+            let bounded: Box<dyn AsyncRead + Send + Unpin> = Box::new(stream.take(headroom));
+            let new_total = ctx
+                .stateful_upload_staging
+                .append(session_id, bounded)
+                .await
+                .map_err(AppError::from)?;
+            if new_total > max_bytes {
+                return Err(AppError::SizeExceeded);
+            }
+            new_total
+        }
+    };
 
     // --- CAS bump.  `new_record.version = record.version + 1` keeps
     // the in-record mirror in lock-step with the store's own counter
@@ -854,7 +912,7 @@ pub async fn finalize(
     ctx: &AppContext,
     session_id: Uuid,
     declared_digest: ContentHash,
-    trailing_body: Option<(Box<dyn AsyncRead + Send + Unpin>, Option<ContentRange>, u64)>,
+    trailing_body: Option<TrailingBody>,
     actor: ApiActor,
     repo_id: Uuid,
     name: &str,
@@ -932,7 +990,7 @@ async fn finalize_core(
     ctx: &AppContext,
     session_id: Uuid,
     declared_digest: ContentHash,
-    trailing_body: Option<(Box<dyn AsyncRead + Send + Unpin>, Option<ContentRange>, u64)>,
+    trailing_body: Option<TrailingBody>,
     actor: ApiActor,
     repo_id: Uuid,
     name: &str,
@@ -985,17 +1043,37 @@ async fn finalize_core(
     // corner case). Propagating the error unchanged lets the handler
     // emit the same 400/413/416 envelope it emits for a raw PATCH.
     if let Some((stream, content_range, body_length)) = trailing_body {
-        append_chunk(
-            ctx,
-            session_id,
-            content_range,
-            stream,
-            body_length,
-            max_bytes,
-            repo_id,
-            session_max_age,
-        )
-        .await?;
+        // Mirror the PATCH path: a declared length takes the cross-checked
+        // `append_chunk`; an absent length (a `Transfer-Encoding: chunked` PUT
+        // body — RFC 7230 §3.3.2 forbids Content-Length alongside chunked TE)
+        // streams via `append_chunk_streaming`, bounded in-stream by the cap.
+        match body_length {
+            Some(len) => {
+                append_chunk(
+                    ctx,
+                    session_id,
+                    content_range,
+                    stream,
+                    len,
+                    max_bytes,
+                    repo_id,
+                    session_max_age,
+                )
+                .await?;
+            }
+            None => {
+                append_chunk_streaming(
+                    ctx,
+                    session_id,
+                    content_range,
+                    stream,
+                    max_bytes,
+                    repo_id,
+                    session_max_age,
+                )
+                .await?;
+            }
+        }
     }
 
     // --- Open staging. If the session exists but staging does not,
@@ -2768,6 +2846,81 @@ mod tests {
     }
 
     #[test]
+    fn append_chunk_streaming_no_length_appends_actual_bytes() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            let session_id = Uuid::new_v4();
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+
+            // No declared length (Transfer-Encoding: chunked) and no range —
+            // exactly buildah's streaming PATCH shape.
+            let content = b"hello world".to_vec();
+            let out = append_chunk_streaming(
+                &ctx,
+                session_id,
+                None,
+                cursor_of(&content),
+                1_000_000,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .expect("streaming append must succeed without Content-Length");
+            assert_eq!(out.bytes_received, content.len() as u64);
+            assert_eq!(out.version, 2);
+            let staged = mocks.stateful_upload_staging.bytes_for(session_id).unwrap();
+            assert_eq!(staged, content);
+        });
+    }
+
+    #[test]
+    fn append_chunk_streaming_over_cap_rejects_and_bounds_staging() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            let session_id = Uuid::new_v4();
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+
+            // A streaming body over the cap: the bounded `take(max_bytes+1)`
+            // truncates and the post-append check rejects — staging never
+            // grows unbounded even though no length was declared.
+            let content = vec![0u8; 100];
+            let err = append_chunk_streaming(
+                &ctx,
+                session_id,
+                None,
+                cursor_of(&content),
+                16,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .expect_err("a streaming body over the cap must be rejected");
+            assert!(matches!(err, AppError::SizeExceeded));
+            let staged = mocks
+                .stateful_upload_staging
+                .bytes_for(session_id)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            assert!(
+                staged <= 17,
+                "staging must be bounded to max_bytes+1, got {staged}"
+            );
+        });
+    }
+
+    #[test]
     fn append_chunk_happy_path_bumps_version_and_appends_bytes() {
         run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
@@ -3529,7 +3682,11 @@ mod tests {
                 &ctx,
                 session_id,
                 hash.clone(),
-                Some((cursor_of(&trailing), Some(range), trailing.len() as u64)),
+                Some((
+                    cursor_of(&trailing),
+                    Some(range),
+                    Some(trailing.len() as u64),
+                )),
                 api_actor(),
                 repo_id,
                 "library/nginx",

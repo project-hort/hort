@@ -52,7 +52,9 @@ use super::coords::oci_blob_coords;
 use super::digest::{parse_digest, DigestParse};
 use super::error::OciError;
 use super::name::validate_oci_name;
-use super::upload_session::{append_chunk, finalize, ContentRange, InitiateResult};
+use super::upload_session::{
+    append_chunk, append_chunk_streaming, finalize, ContentRange, InitiateResult, TrailingBody,
+};
 use super::OciHttpConfig;
 
 // ---------------------------------------------------------------------------
@@ -609,27 +611,33 @@ pub(crate) async fn patch_upload_dispatch(
         }
     };
 
-    // `Content-Length` is required per the spec.  We trust it as the
-    // declared body length; `append_chunk` cross-checks that the
-    // content-range span matches and that the staging append actually
-    // landed `body_length` bytes.
-    let Some(content_length) = headers.get(CONTENT_LENGTH) else {
-        return OciError::BlobUploadInvalid {
-            message: "missing Content-Length header".into(),
+    // `Content-Length` is OPTIONAL on PATCH — same as `Content-Range`
+    // above. The dominant client (containers/image — skopeo, podman,
+    // buildah) streams the blob via `Transfer-Encoding: chunked`, which
+    // per RFC 7230 §3.3.2 MUST NOT carry a `Content-Length`; the Docker
+    // Registry V2 reference implementation and zot accept it. When
+    // present we trust it as the declared body length and `append_chunk`
+    // cross-checks it; when absent `append_chunk_streaming` streams the
+    // body bounded by `publish_body_limit_bytes` and treats the actual
+    // bytes landed as authoritative. A present-but-malformed value is
+    // still rejected.
+    let body_length: Option<u64> = match headers.get(CONTENT_LENGTH) {
+        None => None,
+        Some(content_length) => {
+            let Ok(content_length_str) = content_length.to_str() else {
+                return OciError::BlobUploadInvalid {
+                    message: "Content-Length header is not valid ASCII".into(),
+                }
+                .into_response();
+            };
+            let Ok(parsed) = content_length_str.trim().parse::<u64>() else {
+                return OciError::BlobUploadInvalid {
+                    message: "Content-Length is not a u64".into(),
+                }
+                .into_response();
+            };
+            Some(parsed)
         }
-        .into_response();
-    };
-    let Ok(content_length_str) = content_length.to_str() else {
-        return OciError::BlobUploadInvalid {
-            message: "Content-Length header is not valid ASCII".into(),
-        }
-        .into_response();
-    };
-    let Ok(body_length) = content_length_str.trim().parse::<u64>() else {
-        return OciError::BlobUploadInvalid {
-            message: "Content-Length is not a u64".into(),
-        }
-        .into_response();
     };
 
     let max_bytes: u64 = ctx
@@ -644,18 +652,36 @@ pub(crate) async fn patch_upload_dispatch(
     let reader = StreamReader::new(body_stream.map_err(std::io::Error::other));
     let stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(reader);
 
-    match append_chunk(
-        &ctx,
-        session_id,
-        content_range,
-        stream,
-        body_length,
-        max_bytes,
-        repo_id,
-        oci_cfg.session_max_age(),
-    )
-    .await
-    {
+    // Content-Length present → declared-length path; absent (streaming
+    // Transfer-Encoding: chunked) → the read is bounded in-stream by the cap.
+    let result = match body_length {
+        Some(len) => {
+            append_chunk(
+                &ctx,
+                session_id,
+                content_range,
+                stream,
+                len,
+                max_bytes,
+                repo_id,
+                oci_cfg.session_max_age(),
+            )
+            .await
+        }
+        None => {
+            append_chunk_streaming(
+                &ctx,
+                session_id,
+                content_range,
+                stream,
+                max_bytes,
+                repo_id,
+                oci_cfg.session_max_age(),
+            )
+            .await
+        }
+    };
+    match result {
         Ok(new_record) => {
             patch_success_response(&repo_key, &name, session_id, new_record.bytes_received)
         }
@@ -832,34 +858,27 @@ pub(crate) async fn put_upload_dispatch(
 
     // Extract headers before moving `request` into the body reader.
     let headers = request.headers().clone();
-    let body_length = headers
+    // Content-Length is OPTIONAL on the finalize PUT (mirrors the PATCH path).
+    // `None` = `Transfer-Encoding: chunked` (RFC 7230 §3.3.2 forbids a
+    // Content-Length alongside chunked TE); `Some(0)` = the dominant empty PUT
+    // that closes a session whose PATCH carried all bytes; `Some(n>0)` = the
+    // two-phase POST→PUT that folds the whole blob into the finalize request.
+    let content_length: Option<u64> = headers
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+        .and_then(|s| s.trim().parse::<u64>().ok());
 
-    // Construct the trailing-body tuple if the client sent one.  A
-    // zero-length PUT is the dominant path for the three-phase
-    // protocol (the final PATCH carried all bytes); a length > 0 is
-    // the two-phase POST→PUT pattern (skopeo, docker, podman,
-    // containers/image) where the client folds the entire blob into
-    // the finalize request.
+    // A trailing body is present unless the client explicitly declared it empty
+    // (`Content-Length: 0`). An absent Content-Length is a streaming (chunked)
+    // body, which may itself be empty — a zero-byte streamed append is a no-op.
     //
-    // `Content-Range` is OPTIONAL on a non-empty PUT body. The OCI
-    // The OCI distribution spec requires `Content-Range` on chunked
-    // PATCH but not on the two-phase finalize PUT — and in
-    // practice none of the major clients send it. When absent the
-    // server treats the body as a chunk anchored at the session's
-    // current `bytes_received`; `upload_session::finalize_core`
-    // performs that synthesis once it has loaded the session record.
-    // When present, we still parse + validate strictly and pass the
-    // parsed range through, so chunk-aware clients keep getting the
-    // tight invariant check.
-    let trailing_body: Option<(
-        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        Option<ContentRange>,
-        u64,
-    )> = if body_length > 0 {
+    // `Content-Range` is OPTIONAL on a non-empty PUT body: the OCI spec requires
+    // it on chunked PATCH but not on the two-phase finalize PUT, and no major
+    // client sends it. When absent, `finalize_core` anchors the body at the
+    // session's current `bytes_received`; when present it is parsed + validated
+    // strictly and threaded through for chunk-aware clients.
+    let has_trailing_body = !matches!(content_length, Some(0));
+    let trailing_body: Option<TrailingBody> = if has_trailing_body {
         let content_range = match headers.get("Content-Range") {
             None => None,
             Some(range_header) => {
@@ -880,7 +899,7 @@ pub(crate) async fn put_upload_dispatch(
         let body_stream = request.into_body().into_data_stream();
         let reader = StreamReader::new(body_stream.map_err(std::io::Error::other));
         let stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(reader);
-        Some((stream, content_range, body_length))
+        Some((stream, content_range, content_length))
     } else {
         // No body — drop the `Request` explicitly to drain any
         // unread stream state so a pathological client that sent
@@ -2696,7 +2715,12 @@ mod tests {
     }
 
     #[test]
-    fn patch_missing_content_length_returns_400() {
+    fn patch_without_content_length_streams_accepted() {
+        // A PATCH with no Content-Length is buildah / podman / skopeo's
+        // `Transfer-Encoding: chunked` streaming upload — RFC 7230 §3.3.2
+        // forbids a Content-Length alongside chunked TE. It must STREAM,
+        // not 400. The harness auto-adds `content-length` from the body,
+        // so remove it to reproduce the chunked-transfer shape.
         let status = run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
@@ -2704,22 +2728,49 @@ mod tests {
             h.repositories.insert(repo);
             let session_id = initiate_for(&h.ctx, repo_id).await;
             let router = router().with_state(h.ctx);
-            // axum's test harness adds Content-Length automatically from
-            // the body — skirt that by using Body::empty() and hardcoding
-            // Content-Range.  Length-zero bodies still require a
-            // Content-Length header for the PATCH contract; the harness
-            // will auto-emit `content-length: 0`, so build a request with
-            // a removed header.
             let mut req =
                 HttpRequest::patch(format!("/v2/myrepo/nginx/blobs/uploads/{session_id}"))
-                    .header("Content-Range", "bytes 0-0")
-                    .body(Body::empty())
+                    .body(Body::from(&b"chunk-bytes"[..]))
                     .unwrap();
+            req.headers_mut().remove(CONTENT_LENGTH);
+            let resp = router.oneshot(with_principal(req)).await.unwrap();
+            // The 11 streamed bytes ("chunk-bytes") flowed through the handler:
+            // the 202's Range advertises the new offset, 0-(n-1).
+            assert_eq!(
+                resp.headers().get("Range").and_then(|v| v.to_str().ok()),
+                Some("0-10")
+            );
+            resp.status()
+        });
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn put_finalize_with_chunked_trailing_body_no_content_length_finalizes() {
+        // Two-phase POST→PUT where the PUT folds the whole blob in via
+        // `Transfer-Encoding: chunked` (no Content-Length). Previously the PUT
+        // read Content-Length as 0, dropped the body, and finalised over zero
+        // staged bytes → digest mismatch → DIGEST_INVALID. Now it streams the
+        // trailing body and the declared digest matches → 201.
+        let content = b"put-streamed-blob".to_vec();
+        let hex = hex_of(&content);
+        let status = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let router = router().with_state(h.ctx);
+            let uri =
+                format!("/v2/myrepo/library/nginx/blobs/uploads/{session_id}?digest=sha256:{hex}");
+            let mut req = HttpRequest::put(&uri)
+                .body(Body::from(content.clone()))
+                .unwrap();
             req.headers_mut().remove(CONTENT_LENGTH);
             let resp = router.oneshot(with_principal(req)).await.unwrap();
             resp.status()
         });
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     #[test]
