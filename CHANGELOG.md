@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OCI chunked blob-upload push now works (buildah / podman / skopeo).** The OCI
+  blob-upload `PATCH` and finalize `PUT` handlers hard-required a `Content-Length`
+  header and rejected its absence with `BLOB_UPLOAD_INVALID`. Clients that stream a
+  layer via HTTP `Transfer-Encoding: chunked` send no `Content-Length` (RFC 7230
+  §3.3.2 forbids it alongside chunked TE), so every such push failed
+  deterministically. `Content-Length` is now optional on both handlers: when absent
+  the body is streamed and bounded in-stream by the publish-body limit (an
+  over-limit body is rejected `SIZE_INVALID` with staging capped), and the actual
+  bytes staged are authoritative; when present the declared-length cross-check is
+  unchanged. (issues 11, 12)
 - **OCI blob-upload-session cap no longer leaks (issue 9).** The
   per-`(repo, principal)` cap on concurrent OCI upload sessions was a
   free-floating counter that only decremented on explicit release: an abandoned
