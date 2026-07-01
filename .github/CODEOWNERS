@@ -1,0 +1,19 @@
+# Code owners — require maintainer review before a change to these paths merges.
+#
+# NOTE: this gates the MERGE, not the pre-merge CI run (a PR runs the workflow
+# from its own head). It complements — does not replace — the fork-run-approval
+# and short-lived reader-token controls documented in
+# docs/ci/hort-quarantine-integration.md.
+#
+# Enforcement requires branch protection / a ruleset with
+# "Require review from Code Owners" on main / develop. On a single-maintainer
+# repo, leave required-review OFF (you cannot approve your own PR) until a
+# maintainers team exists; the entries below are then live.
+
+# CI / Actions surface — the privileged, secret/OIDC-bearing definitions.
+/.github/                        @project-hort/maintainers
+/.github/workflows/              @project-hort/maintainers
+/.github/actions/                @project-hort/maintainers
+
+# Deploy + gitops config (service-account grants, federation trust anchors).
+/deploy/ansible/files/gitops/    @project-hort/maintainers

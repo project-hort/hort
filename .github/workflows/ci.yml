@@ -35,19 +35,65 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   SQLX_OFFLINE: "true"
+  # Source-replace to hort ONLY on the merge-request gate from a SAME-REPO
+  # (non-fork) PR, and only when the instance is live. Fork PRs and pushes build
+  # against the original upstreams. This is the S1 security gate — a fork PR must
+  # never mint or use a hort credential (see docs/ci/hort-quarantine-integration.md).
+  HORT_PROXY_ACTIVE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.HORT_PROXY_ENABLED == 'true' }}
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # TIER 1: FAST CI (Every Push/PR) - Target: < 5 minutes
   # ════════════════════════════════════════════════════════════════════════════
 
+  # ── hort dependency-resolution gate ──────────────────────────────────────────
+  # THE quarantine gate. On the same-repo MR (HORT_PROXY_ACTIVE), resolve the
+  # locked dependency set FROM hort. If a dependency is still quarantined /
+  # rejected, `cargo fetch` fails → this job is RED (make it a required status
+  # check to block the merge) and the build jobs below skip via `needs:`. The
+  # triage posts one comment explaining why (retry-after / rejected / stuck /
+  # not-quarantine). A green gate always means the code built against a clean
+  # dependency set — quarantine never yields a green gate.
+  #
+  # On push / fork PR (not active) the resolve step is skipped and the gate is a
+  # fast green pass, so upstream builds proceed unaffected.
+  hort-deps-gate:
+    name: 🔎 Hort dependency gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write       # mint the OIDC token for hort-auth
+      pull-requests: write  # triage posts the diagnosis comment
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/hort-auth
+        id: hort_auth
+        with:
+          proxy_enabled: ${{ env.HORT_PROXY_ACTIVE }}
+      # Resolve the locked set from hort. No continue-on-error: a failure here IS
+      # the merge-blocking signal. Skipped (gate passes) when not the MR gate.
+      - name: Resolve locked dependencies from hort
+        if: ${{ env.HORT_PROXY_ACTIVE == 'true' }}
+        run: cargo fetch --locked
+      # Diagnose only — does not change status; the resolve failure already reds
+      # the gate. Runs only after a resolve failure on the active gate.
+      - name: Quarantine triage (diagnose the red gate)
+        if: ${{ failure() && env.HORT_PROXY_ACTIVE == 'true' }}
+        uses: ./.github/actions/hort-quarantine-triage
+        with:
+          active: ${{ env.HORT_PROXY_ACTIVE }}
+          hort_token: ${{ steps.hort_auth.outputs.token }}
+
   check-rust:
     name: 🦀 Check Rust
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red (quarantine/rejected)
     permissions:
       contents: read
-      id-token: write   # required to mint the OIDC token for hort-auth
+      id-token: write   # mint the OIDC token for hort-auth
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -55,7 +101,7 @@ jobs:
       # No-op when vars.HORT_PROXY_ENABLED is unset (see action guard step).
       - uses: ./.github/actions/hort-auth
         with:
-          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          proxy_enabled: ${{ env.HORT_PROXY_ACTIVE }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -104,6 +150,7 @@ jobs:
     name: 🧪 Backend Unit Tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red
     permissions:
       contents: read
       id-token: write   # required to mint the OIDC token for hort-auth
@@ -113,7 +160,7 @@ jobs:
       # Route cargo fetches through registry.hort.rs when the instance is live.
       - uses: ./.github/actions/hort-auth
         with:
-          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          proxy_enabled: ${{ env.HORT_PROXY_ACTIVE }}
 
       - name: Run unit tests
         env:
@@ -124,6 +171,7 @@ jobs:
     name: 📊 Code Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red
     permissions:
       contents: read
       id-token: write   # required to mint the OIDC token for hort-auth
@@ -137,7 +185,7 @@ jobs:
       # Route cargo fetches through registry.hort.rs when the instance is live.
       - uses: ./.github/actions/hort-auth
         with:
-          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          proxy_enabled: ${{ env.HORT_PROXY_ACTIVE }}
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -379,6 +427,7 @@ jobs:
     name: 🔗 Backend Integration Tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red
     permissions:
       contents: read
       id-token: write   # required to mint the OIDC token for hort-auth
@@ -406,7 +455,7 @@ jobs:
       # Route cargo fetches through registry.hort.rs when the instance is live.
       - uses: ./.github/actions/hort-auth
         with:
-          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          proxy_enabled: ${{ env.HORT_PROXY_ACTIVE }}
 
       - name: Run integration tests
         env:
@@ -527,7 +576,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [check-rust, test-backend-unit, coverage, test-backend-integration, security-audit-sync, security-audit, cargo-deny]
+    needs: [hort-deps-gate, check-rust, test-backend-unit, coverage, test-backend-integration, security-audit-sync, security-audit, cargo-deny]
     if: always()
     steps:
       - name: Check CI status
@@ -536,6 +585,15 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           tier1_pass=true
+
+          # hort dependency-resolution gate (quarantine). Red ⇒ build jobs skipped.
+          gate="${{ needs.hort-deps-gate.result }}"
+          if [[ "$gate" == "success" ]]; then
+            echo "✅ hort-deps-gate" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🔎 hort-deps-gate: $gate — dependencies blocked by quarantine/rejection; build jobs skipped (see the PR comment for retry timing)" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
 
           # Tier 1 jobs (required)
           for job in check-rust test-backend-unit; do
