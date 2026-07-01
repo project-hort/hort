@@ -2692,6 +2692,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
+ "postcard",
  "regex",
  "serde",
  "serde_json",

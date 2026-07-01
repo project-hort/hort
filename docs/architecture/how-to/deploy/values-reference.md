@@ -492,7 +492,7 @@ endpoint — only enable if an external client explicitly needs it.
 `maxSessionsPerPrincipal` caps `(repo_id, principal)` outstanding
 upload sessions; beyond the cap, new session requests return
 `429 Too Many Requests` and emit
-`hort_oci_session_cap_rejections_total{repo, result}`.
+`hort_upload_session_cap_rejections_total{format="oci", repo, result}`.
 
 ### `shutdown`
 

@@ -399,7 +399,8 @@ distinct mechanism) is unchanged.
 - **Operator action required:** no.
 - **Verify post-install:** drive 33 concurrent
   `/v2/<repo>/blobs/uploads/` POSTs from one user; the 33rd returns 429.
-  `hort_oci_session_cap_rejections_total` ticks on the admin listener.
+  `hort_upload_session_cap_rejections_total{format="oci"}` ticks on the
+  admin listener.
 - **Relaxation:** raise via `oci.maxSessionsPerPrincipal` for CI
   populations that legitimately parallelise pushes from one service
   account.

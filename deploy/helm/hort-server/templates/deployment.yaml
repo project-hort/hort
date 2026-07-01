@@ -256,6 +256,10 @@ spec:
             - name: HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL
               value: {{ .Values.oci.maxSessionsPerPrincipal | quote }}
             {{- end }}
+            {{- if gt (int .Values.oci.sessionMaxAgeSecs) 0 }}
+            - name: HORT_OCI_SESSION_MAX_AGE_SECS
+              value: {{ .Values.oci.sessionMaxAgeSecs | quote }}
+            {{- end }}
             # ----- Shutdown -----
             - name: HORT_SHUTDOWN_GRACE_SECS
               value: {{ .Values.shutdown.gracefulSeconds | quote }}

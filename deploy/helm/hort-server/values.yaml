@@ -407,6 +407,11 @@ oci:
   # HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL — 0 ⇒ binary default (32). Cap
   # on concurrent OCI upload sessions per principal.
   maxSessionsPerPrincipal: 0
+  # HORT_OCI_SESSION_MAX_AGE_SECS — max age of a live OCI upload session
+  # before the cap reconcile age-prunes it; doubles as the session-set
+  # TTL. Default 3600 (1 h). Must be 1..=604800 (7 days); the binary
+  # rejects a value above the 7-day ceiling at boot.
+  sessionMaxAgeSecs: 3600
 
 # -------------------- Shutdown --------------------
 shutdown:
