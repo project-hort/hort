@@ -696,6 +696,12 @@
           "description": "HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL — max concurrent OCI upload sessions per principal. 0 ⇒ binary default (32).",
           "type": "integer",
           "minimum": 0
+        },
+        "sessionMaxAgeSecs": {
+          "description": "HORT_OCI_SESSION_MAX_AGE_SECS — max age (seconds) of a live OCI upload session before the cap age-prunes it; doubles as the session-set TTL. Default 3600 (1 h). Must be 1..=604800 (7 days).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 604800
         }
       }
     },

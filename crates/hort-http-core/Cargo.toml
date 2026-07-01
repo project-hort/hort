@@ -55,6 +55,11 @@ ipnet                       = { workspace = true }
 url                         = { workspace = true }
 uuid                        = { workspace = true }
 chrono                      = { workspace = true }
+# The generic upload-session-cap primitive
+# (`upload_session_cap`) stores the per-(format, repo, principal) live
+# session SET as one postcard-encoded value in `EphemeralStore`. Small,
+# fixed-shape payload; `serde` drives the codec.
+postcard                    = { workspace = true }
 # Basic-auth header decoding in `middleware::auth::extract_basic_credentials`.
 base64                      = "0.22"
 # `#[async_trait]` impls on `FromRequestParts` extractors in

@@ -414,13 +414,14 @@ pub fn oci_routes_with_config(
             axum::routing::get(catalog::get_repo_catalog),
         )
         // Pull dispatcher (blob + manifest + tags list). Wildcard
-        // catch-all on `:repo_key`. DELETE on the same template
-        // handles manifest delete.
+        // catch-all on `:repo_key`. DELETE on the same template is
+        // method-dispatched between manifest delete and upload-session
+        // cancel (`/blobs/uploads/<uuid>`).
         .route(
             "/v2/:repo_key/*tail",
             axum::routing::get(get_pull)
                 .head(head_pull)
-                .delete(manifests_write::delete_manifest_dispatch),
+                .delete(delete_dispatch),
         );
 
     if config.legacy_catalog_enabled {
@@ -433,11 +434,18 @@ pub fn oci_routes_with_config(
         );
     }
 
-    let read_and_admin_router = read_and_admin_router.layer(
-        hort_http_core::middleware::request_timeout::request_timeout_layer(
-            timeouts.request_timeout,
-        ),
-    );
+    let read_and_admin_router = read_and_admin_router
+        // Surface `OciHttpConfig` to `delete_dispatch` via Extension so
+        // the upload-session-cancel branch can consult
+        // `session_max_age`. The DELETE wildcard lives on this half
+        // (manifest delete + upload cancel), so the Extension must be
+        // present here too (the upload half carries its own copy).
+        .layer(axum::Extension(config.clone()))
+        .layer(
+            hort_http_core::middleware::request_timeout::request_timeout_layer(
+                timeouts.request_timeout,
+            ),
+        );
 
     // Merge the two halves. axum::Router::merge keeps each side's
     // layer stack — the upload routes carry the 60-minute ceiling,
@@ -477,6 +485,7 @@ pub fn oci_routes_with_config(
 async fn put_dispatch(
     access: hort_http_core::authz::WriteRepoAccess,
     State(ctx): State<Arc<AppContext>>,
+    axum::Extension(oci_cfg): axum::Extension<OciHttpConfig>,
     BoundedPath((repo_key, tail)): BoundedPath<(String, String)>,
     Query(query): Query<uploads::PutQuery>,
     request: Request<axum::body::Body>,
@@ -501,11 +510,93 @@ async fn put_dispatch(
         uploads::put_upload_dispatch(
             access,
             State(ctx),
+            axum::Extension(oci_cfg),
             BoundedPath((repo_key, tail)),
             Query(query),
             request,
         )
         .await
+    }
+}
+
+/// Method-level DELETE dispatcher that routes `/v2/:repo_key/*tail`
+/// DELETE between manifest delete and upload-session cancel.
+///
+/// Inspects the tail: `/blobs/uploads/<uuid>` → upload-session cancel
+/// (OCI Distribution-Spec §"Canceling an Upload"; releases the
+/// per-`(repo, principal)` live-session set member + staging and returns
+/// `204 No Content` per the spec), everything else → manifest delete
+/// (which owns the `/manifests/<ref>` tail and re-runs its own
+/// `DeleteRepoAccess`).
+///
+/// The two branches use different authorization levels — manifest
+/// delete requires `Delete`, upload cancel is a `Write`-level push
+/// operation (cancelling your own in-flight upload) — so this
+/// dispatcher splits the request into parts, inspects the tail, and
+/// runs the appropriate `FromRequestParts` access extractor per branch.
+/// This mirrors `put_dispatch`'s tail-inspection routing; the divergent
+/// extractor is why the tail is inspected before authz rather than
+/// declaring one access extractor in the signature.
+async fn delete_dispatch(
+    State(ctx): State<Arc<AppContext>>,
+    axum::Extension(oci_cfg): axum::Extension<OciHttpConfig>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    use axum::extract::FromRequestParts;
+
+    let (mut parts, body) = request.into_parts();
+
+    // Inspect the tail first — it decides both the branch AND the authz
+    // level. `BoundedPath` is a `FromRequestParts` extractor (bounded
+    // 512-byte captures); its rejection is already a rendered response.
+    let BoundedPath((repo_key, tail)) =
+        match BoundedPath::<(String, String)>::from_request_parts(&mut parts, &ctx).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+    if uploads::parse_patch_tail(&tail).is_some() {
+        // Upload-session cancel — `Write`-level (cancelling an in-flight
+        // push, the same authority that opened it).
+        //
+        // Branch on a PRECISE upload-tail match (`<name>/blobs/uploads/
+        // <uuid>` with a single trailing UUID segment), NOT an
+        // unanchored `tail.contains("/blobs/uploads/")` substring: a
+        // pathological manifest name like
+        // `x/blobs/uploads/y/manifests/latest` contains that substring
+        // but is a manifest reference, and must route to the
+        // Delete-gated manifest branch — the substring test would
+        // misroute it to this Write-gated cancel branch and 404.
+        let access = match hort_http_core::authz::WriteRepoAccess::from_request_parts(
+            &mut parts, &ctx,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        };
+        uploads::delete_upload_dispatch(
+            access,
+            State(ctx),
+            axum::Extension(oci_cfg),
+            &repo_key,
+            &tail,
+        )
+        .await
+    } else {
+        // Manifest delete — `Delete`-level. Reassemble the request so
+        // `delete_manifest_dispatch` runs its own `DeleteRepoAccess`
+        // extractor over the original parts.
+        let access =
+            match hort_http_core::authz::DeleteRepoAccess::from_request_parts(&mut parts, &ctx)
+                .await
+            {
+                Ok(a) => a,
+                Err(resp) => return resp,
+            };
+        let _ = body;
+        manifests_write::delete_manifest_dispatch(access, State(ctx), BoundedPath((repo_key, tail)))
+            .await
     }
 }
 
@@ -1228,6 +1319,113 @@ mod tests {
         assert_eq!(
             code, "DIGEST_INVALID",
             "top-level PUT dispatcher must route /blobs/uploads/ to uploads module"
+        );
+    }
+
+    /// The method-level DELETE dispatcher must route DELETE on
+    /// `/blobs/uploads/<uuid>` to the upload-session cancel branch, NOT
+    /// to manifest delete. An unknown session UUID forces the cancel
+    /// path to emit `BLOB_UPLOAD_UNKNOWN` — manifest delete does not
+    /// produce that envelope, so seeing it proves correct routing.
+    #[test]
+    fn delete_dispatch_routes_blob_upload_delete_to_uploads_cancel() {
+        let (status, code) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo", true);
+            h.repositories.insert(repo);
+
+            let router =
+                oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+            let fake_uuid = Uuid::new_v4();
+            let mut req = Request::delete(format!(
+                "/v2/myrepo/library/nginx/blobs/uploads/{fake_uuid}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+            hort_http_core::middleware::auth::test_support::inject_principal(
+                &mut req,
+                CallerPrincipal {
+                    user_id: Uuid::new_v4(),
+                    external_id: "test:sub".into(),
+                    username: "alice".into(),
+                    email: "alice@example.com".into(),
+                    claims: Vec::new(),
+                    token_kind: None,
+                    issued_at: Utc::now(),
+                    token_cap: None,
+                },
+            );
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = parsed["errors"][0]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            (status, code)
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            code, "BLOB_UPLOAD_UNKNOWN",
+            "top-level DELETE dispatcher must route /blobs/uploads/ to uploads cancel"
+        );
+    }
+
+    /// Regression (L1): a pathological manifest name that *contains* the
+    /// `/blobs/uploads/` substring but is a manifest reference
+    /// (`<name>/blobs/uploads/<x>/manifests/<ref>`) must route to the
+    /// Delete-gated manifest branch, NOT the Write-gated upload-cancel
+    /// branch. The dispatcher branches on a precise upload-tail match
+    /// (`parse_patch_tail(...).is_some()`), so this tail — whose trailing
+    /// segment is `/manifests/latest`, not a bare UUID — falls through to
+    /// manifest delete and surfaces `MANIFEST_UNKNOWN` (the manifest does
+    /// not exist), never the cancel branch's `BLOB_UPLOAD_UNKNOWN`.
+    #[test]
+    fn delete_dispatch_routes_pathological_manifest_name_to_manifest_branch() {
+        let (status, code) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo", true);
+            h.repositories.insert(repo);
+
+            let router =
+                oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+            // Contains `/blobs/uploads/` as a substring, but the tail's
+            // real shape is a manifest reference: name =
+            // `library/nginx/blobs/uploads/y`, reference = `latest`.
+            let mut req = Request::delete(
+                "/v2/myrepo/library/nginx/blobs/uploads/y/manifests/latest".to_string(),
+            )
+            .body(Body::empty())
+            .unwrap();
+            hort_http_core::middleware::auth::test_support::inject_principal(
+                &mut req,
+                CallerPrincipal {
+                    user_id: Uuid::new_v4(),
+                    external_id: "test:sub".into(),
+                    username: "alice".into(),
+                    email: "alice@example.com".into(),
+                    claims: Vec::new(),
+                    token_kind: None,
+                    issued_at: Utc::now(),
+                    token_cap: None,
+                },
+            );
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = parsed["errors"][0]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            (status, code)
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            code, "MANIFEST_UNKNOWN",
+            "a manifest tail containing the /blobs/uploads/ substring must route \
+             to the manifest-delete branch, not the upload-cancel branch"
         );
     }
 

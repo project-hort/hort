@@ -114,6 +114,19 @@ pub enum OciError {
     /// `TOOMANYREQUESTS` (HTTP 429) to avoid overloading rate-limit-
     /// adaptive retry heuristics in strict clients like Artifactory.
     Quarantined { retry_after_seconds: i64 },
+    /// 503 — a transient server-side contention hold. The OCI
+    /// three-phase blob-upload `initiate` returns this when the
+    /// per-`(repo, principal)` session-cap reconcile CAS loop exhausted
+    /// its retry budget under pathological write contention. It is
+    /// distinct from [`Self::TooManyRequests`] (429, a real cap breach)
+    /// and from [`Self::Internal`] (500, an unrecoverable error): the
+    /// request neither breached the cap nor hit an infra failure, it
+    /// simply lost every CAS race in the bounded window. Emits HTTP 503
+    /// plus a `Retry-After` header (`retry_after_seconds`) so the client
+    /// retries soon. Code is `UNAVAILABLE` — the same spec-extension as
+    /// [`Self::Quarantined`], carrying the closest upstream-compatible
+    /// "come back shortly" semantics.
+    Unavailable { retry_after_seconds: i64 },
     /// 500 — unrecoverable server error that doesn't map to any OCI
     /// standard code. Code is `INTERNAL`, an hort
     /// spec-extension. Body shape stays the OCI envelope for
@@ -226,6 +239,7 @@ impl OciError {
             Self::DigestInvalid { .. } => "DIGEST_INVALID",
             Self::ManifestNotAcceptable { .. } => "MANIFEST_UNKNOWN",
             Self::Quarantined { .. } => "UNAVAILABLE",
+            Self::Unavailable { .. } => "UNAVAILABLE",
             Self::Internal => "INTERNAL",
             Self::BlobUploadUnknown { .. } => "BLOB_UPLOAD_UNKNOWN",
             Self::BlobUploadInvalid { .. } => "BLOB_UPLOAD_INVALID",
@@ -257,6 +271,7 @@ impl OciError {
             Self::DigestInvalid { .. } => StatusCode::BAD_REQUEST,
             Self::ManifestNotAcceptable { .. } => StatusCode::NOT_ACCEPTABLE,
             Self::Quarantined { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BlobUploadUnknown { .. } => StatusCode::NOT_FOUND,
             Self::BlobUploadInvalid { .. } => StatusCode::BAD_REQUEST,
@@ -285,6 +300,7 @@ impl OciError {
             Self::DigestInvalid { message } => message.clone(),
             Self::ManifestNotAcceptable { .. } => "manifest media type not acceptable".to_string(),
             Self::Quarantined { .. } => "artifact is quarantined".to_string(),
+            Self::Unavailable { .. } => "service temporarily unavailable".to_string(),
             Self::Internal => "internal error".to_string(),
             Self::BlobUploadUnknown { .. } => "blob upload session unknown".to_string(),
             Self::BlobUploadInvalid { message } => message.clone(),
@@ -325,6 +341,11 @@ impl OciError {
             })),
             Self::Unsupported { .. } => None,
             Self::Quarantined {
+                retry_after_seconds,
+            } => Some(serde_json::json!({
+                "retry_after_seconds": retry_after_seconds,
+            })),
+            Self::Unavailable {
                 retry_after_seconds,
             } => Some(serde_json::json!({
                 "retry_after_seconds": retry_after_seconds,
@@ -393,6 +414,11 @@ impl IntoResponse for OciError {
         // plain i64 clone so the borrow is cheap.
         let retry_after: Option<i64> = match &self {
             Self::Quarantined {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            // Transient 503 contention hold — same `Retry-After`
+            // contract as `Quarantined`: come back shortly.
+            Self::Unavailable {
                 retry_after_seconds,
             } => Some(*retry_after_seconds),
             // `Retry-After` on 429 is RFC 9110 §15.5.18-recommended;
@@ -642,6 +668,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
         assert_eq!(parsed["errors"][0]["detail"]["retry_after_seconds"], 42);
+    }
+
+    #[tokio::test]
+    async fn unavailable_is_503_with_unavailable_code_and_retry_after_header() {
+        // M1: the transient cap-reconcile contention path returns 503 +
+        // Retry-After + the `UNAVAILABLE` spec-extension code — the same
+        // shape as `Quarantined`, distinct from the 429 `TOOMANYREQUESTS`
+        // cap breach and the 500 `INTERNAL` unrecoverable error.
+        let err = OciError::Unavailable {
+            retry_after_seconds: 15,
+        };
+        let response = err.into_response();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .expect("Retry-After header missing on Unavailable 503")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after, "15");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(parsed["errors"][0]["detail"]["retry_after_seconds"], 15);
     }
 
     #[tokio::test]

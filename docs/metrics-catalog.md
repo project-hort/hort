@@ -1634,18 +1634,29 @@ emit a parallel OCI-specific push counter; the combination
 (session-level lifecycle) covers the dashboard space without
 splitting the `format="oci"` attention across three metrics.
 
-### OCI session-cap rejections
+### Stateful-upload session-cap rejections
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_oci_session_cap_rejections_total` | counter | `repo`, `result` | — | `over_cap` |
+| `hort_upload_session_cap_rejections_total` | counter | `format`, `repo`, `result` | — | `over_cap` |
 
-Emitted by `hort-http-oci::upload_session::initiate` when the
-per-`(repo, principal)` outstanding-session counter would exceed the
-cap configured via `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` (default 32).
-The handler maps the rejection to `429 Too Many Requests` with the
-OCI `TOOMANYREQUESTS` envelope; the cap counter naturally TTL-cleans
-on the same window as `OCI_SESSION_TTL`.
+Emitted by a `StatefulUpload` format adapter when it maps
+[`upload_session_cap::AdmitOutcome::OverCap`](../crates/hort-http-core/src/upload_session_cap.rs)
+to a rejection — i.e. the per-`(format, repo, principal)` live session
+set is at the cap after age-pruning. Renamed from the OCI-specific
+`hort_oci_session_cap_rejections_total`; the cap is now a shared,
+format-parameterized primitive in `hort-http-core`, so the metric
+carries a `format` label (`oci`, and future formats such as `lfs`) and
+lives under a generic name. OCI is the first (today the only) consumer:
+`hort-http-oci::upload_session::initiate` emits `format="oci"` when the
+per-`(repo, principal)` cap configured via
+`HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` (default 32) is exceeded, and the
+handler maps the rejection to `429 Too Many Requests` with the OCI
+`TOOMANYREQUESTS` envelope.
+
+**`format` cardinality.** One series per stateful-upload format the
+registry serves — a tiny, closed set (`oci`; `lfs`/`maven` when those
+land). Not operator-influenced, so it cannot blow up cardinality.
 
 **`repo` cardinality.** Same shape as the workspace-wide
 `repository` label — bounded by the registry's repo count. Honours
@@ -1662,9 +1673,45 @@ cap currently produces.
 
 **No `principal_id` / `user_id` / `actor_id` label.** The architect
 catalog forbids these as cardinality vectors. Per-principal abuse
-investigation goes through tracing spans (`upload_session_initiate`
+investigation goes through tracing spans (`oci_upload_session_initiate`
 carries `repository_id` and the principal id is in the tracing
 context) and the audit-event log, not the metrics surface.
+
+### Stateful-upload session-set reconcile prunes
+
+| Metric | Type | Labels | Unit | `result` values |
+|--------|------|--------|------|-----------------|
+| `hort_upload_session_reconcile_pruned_total` | counter | `format`, `repo`, `result` | — | `pruned`, `none` |
+
+Emitted by the shared cap primitive
+([`upload_session_cap::admit`](../crates/hort-http-core/src/upload_session_cap.rs))
+once per successful admit (session created). Renamed from the
+OCI-specific `hort_oci_session_reconcile_pruned_total` and carrying the
+same `format` label as the cap-rejection counter above. The
+per-`(format, repo, principal)` cap is a live, self-pruning session set
+stored as one serialized value; on every admit the reconcile drops
+members older than the caller's configured session max-age (for OCI,
+`HORT_OCI_SESSION_MAX_AGE_SECS`, default 3600) before checking the cap.
+`result=pruned` when the admit reclaimed one or more aged-out
+(abandoned) sessions; `result=none` when nothing aged out. This is the
+first leak-visibility signal — a rising `pruned` rate means clients are
+abandoning upload sessions (`POST .../blobs/uploads/` with no final
+`PUT` and no `DELETE`) faster than they finalize / cancel them. On a
+prune the reconcile also logs a `debug!` carrying the pruned **count
+only** (never a principal or session id).
+
+**`format` / `repo` cardinality.** Same shape and toggle as
+`hort_upload_session_cap_rejections_total` above — `format` is the
+closed stateful-upload-format set; `repo` is bounded by the registry's
+repo count and honours `METRICS_INCLUDE_REPOSITORY_LABEL` (`_all` when
+disabled, `unknown` on lookup failure). Named `repo` (not `repository`),
+matching the sibling cap-rejection metric.
+
+**No `principal_id` / `user_id` / `actor_id` label.** Same cardinality
+rule as the cap-rejection metric; per-principal investigation goes
+through tracing / audit, not this counter. A cap rejection performs NO
+write and therefore does NOT emit this metric — it never refreshes the
+set (that is the structural fix for the old counter's TTL-refresh leak).
 
 ### Staging-orphan sweep
 

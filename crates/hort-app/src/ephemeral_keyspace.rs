@@ -147,9 +147,15 @@ pub const KEYSPACE_REGISTRY: &[(&str, EphemeralKeyspaceClass)] = &[
     // Literals: `crates/hort-app/src/use_cases/pat_validation_use_case.rs:100-106`.
     ("pat-attempt:", EphemeralKeyspaceClass::Durable),
     ("pat-attempt-counter:", EphemeralKeyspaceClass::Durable),
-    // OCI per-(repo, principal) upload-session cap counter. Literal from
-    // `crates/hort-http-oci/src/upload_session.rs:150-152`.
-    ("oci:session_count:", EphemeralKeyspaceClass::Durable),
+    // Per-(format, repo, principal) live upload-session set — the
+    // authoritative stateful-upload cap accounting (one serialized
+    // `SessionSet` value, self-pruning on admit). Format-agnostic: the
+    // format token is inline in the key
+    // (`upload_sessions:{format}:{repo}:{principal}`), so OCI, Git LFS,
+    // and future stateful-upload formats share this one entry. Literal
+    // from `crates/hort-http-core/src/upload_session_cap.rs`
+    // (`session_set_key`).
+    ("upload_sessions:", EphemeralKeyspaceClass::Durable),
     // Admin-task invoke idempotency tokens. Written by
     // `hort-http-admin-tasks::handlers::invoke` when the caller supplies an
     // `Idempotency-Key` header; read on the next request with the same key
@@ -372,9 +378,17 @@ mod tests {
     }
 
     #[test]
-    fn oci_session_count_resolves_to_durable() {
+    fn upload_sessions_resolves_to_durable() {
+        // The live per-(format, repo, principal) upload-session set — the
+        // authoritative stateful-upload cap accounting. Format-agnostic:
+        // OCI, LFS, and future formats all land under this one prefix
+        // with the format token inline.
         assert_eq!(
-            keyspace_class("oci:session_count:42:7"),
+            keyspace_class("upload_sessions:oci:42:7"),
+            Some(EphemeralKeyspaceClass::Durable),
+        );
+        assert_eq!(
+            keyspace_class("upload_sessions:lfs:42:7"),
             Some(EphemeralKeyspaceClass::Durable),
         );
     }

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OCI blob-upload-session cap no longer leaks (issue 9).** The
+  per-`(repo, principal)` cap on concurrent OCI upload sessions was a
+  free-floating counter that only decremented on explicit release: an abandoned
+  upload (POST with no final PUT and no DELETE) never decremented it, and its TTL
+  refreshed on every increment, so a retry storm could pin the counter at the cap
+  and raising the cap could not clear it. The cap is now an authoritative,
+  self-pruning live-session **set**, keyed per `(format, repo, principal)` and
+  reconciled on every admit: it age-prunes members older than the session max-age
+  (catching both POST-only and PATCHed abandons), rejects at cap with no write
+  (so a rejection never refreshes the TTL — the leak is structurally gone), and
+  fails closed on CAS-loop exhaustion. Pathological write contention now surfaces
+  as a transient `503 Service Unavailable` + short `Retry-After` (never a `500`).
+  Adds the `HORT_OCI_SESSION_MAX_AGE_SECS` config knob (1..=604800 s, default
+  3600; previously a hardcoded constant), a bounded cap-exceeded `Retry-After`
+  (15 s), and the OCI-spec `DELETE /v2/<name>/blobs/uploads/<uuid>` cancel route.
+
 ## [0.9.7] - 2026-06-30
 
 Headlines: ingest now commits the scan and

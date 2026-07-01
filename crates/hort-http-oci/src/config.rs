@@ -47,6 +47,29 @@ pub struct OciHttpConfig {
     /// image, multi-layer pipeline) while bounding the storage state a
     /// malicious or runaway client can pin until TTL expiry.
     pub max_sessions_per_principal: u32,
+    /// Maximum lifetime of an OCI upload session, in seconds. Serves a
+    /// dual role for the live per-`(repo, principal)` session set:
+    ///
+    /// - the TTL applied on every session-record + session-set write
+    ///   (backstop — an idle set / record self-expires after this long);
+    /// - the age-prune threshold on admit — a session-set member older
+    ///   than this is reclaimed on the next admit, so an abandoned
+    ///   session (opened, never finalized, never `DELETE`d) can never
+    ///   pin the cap past this window.
+    ///
+    /// Configured via `HORT_OCI_SESSION_MAX_AGE_SECS`. Default `3600`
+    /// (one hour) matches the Docker Registry v2 reference and gives a
+    /// human enough time to retry a multi-gigabyte push over a flaky
+    /// link without the session being GC'd out from under them.
+    pub session_max_age_secs: u64,
+}
+
+impl OciHttpConfig {
+    /// The configured session max-age as a [`std::time::Duration`], for
+    /// the upload-session admit / release / record-TTL paths.
+    pub fn session_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.session_max_age_secs)
+    }
 }
 
 impl Default for OciHttpConfig {
@@ -55,6 +78,8 @@ impl Default for OciHttpConfig {
             legacy_catalog_enabled: false,
             // Default 32 per audit guidance (DoS session-cap).
             max_sessions_per_principal: 32,
+            // Default one hour — matches the Docker Registry v2 reference.
+            session_max_age_secs: super::upload_session::OCI_SESSION_MAX_AGE_SECS,
         }
     }
 }
@@ -81,5 +106,17 @@ mod tests {
         // set the env var. A test here pins the catalogued default.
         let c = OciHttpConfig::default();
         assert_eq!(c.max_sessions_per_principal, 32);
+    }
+
+    #[test]
+    fn default_session_max_age_is_one_hour() {
+        // The session max-age doubles as the set TTL AND the age-prune
+        // threshold; the default MUST match the catalogued 3600 s (the
+        // Docker Registry v2 reference window). A shorter default would
+        // prune long single-blob pushes early; a longer one widens the
+        // window an abandoned session can pin the cap.
+        let c = OciHttpConfig::default();
+        assert_eq!(c.session_max_age_secs, 3600);
+        assert_eq!(c.session_max_age(), std::time::Duration::from_secs(3600));
     }
 }

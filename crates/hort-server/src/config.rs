@@ -402,6 +402,19 @@ pub struct Config {
     /// for every authenticated user, which is almost certainly not
     /// what the operator meant.
     pub oci_max_sessions_per_principal: u32,
+    /// Maximum lifetime of an OCI upload session, in seconds. Parsed
+    /// from `HORT_OCI_SESSION_MAX_AGE_SECS`; default `3600` (one hour).
+    /// Serves a dual role on the live per-`(repo, principal)` session
+    /// set: it is the TTL applied on every session-record / session-set
+    /// write, AND the age-prune threshold on admit — a session-set
+    /// member older than this is reclaimed on the next admit, so an
+    /// abandoned session (opened, never finalized, never `DELETE`d)
+    /// cannot pin the cap past this window.
+    ///
+    /// Zero surfaces as [`ConfigError::ValueNotPositive`] — a zero
+    /// max-age would prune every session immediately (including live
+    /// ones) and set a zero TTL, which is never operator-meaningful.
+    pub oci_session_max_age_secs: u64,
     /// Selection between the in-memory and
     /// Redis backends for the `EphemeralStore` port. Default in dev /
     /// test is [`EphemeralStoreBackend::Memory`]; operators running
@@ -861,6 +874,7 @@ impl std::fmt::Debug for Config {
             stateful_upload_staging_dir,
             oci_legacy_catalog_enabled,
             oci_max_sessions_per_principal,
+            oci_session_max_age_secs,
             ephemeral_store_backend,
             redis_url: _,
             redis_url_evictable: _,
@@ -943,6 +957,7 @@ impl std::fmt::Debug for Config {
                 "oci_max_sessions_per_principal",
                 oci_max_sessions_per_principal,
             )
+            .field("oci_session_max_age_secs", oci_session_max_age_secs)
             .field("ephemeral_store_backend", ephemeral_store_backend)
             .field("redis_url", &"<redacted>")
             // Per-class Redis URL overrides. Mirror
@@ -1986,6 +2001,11 @@ impl Config {
         // the audit guidance.
         let oci_max_sessions_per_principal = parse_oci_max_sessions_per_principal()?;
 
+        // OCI upload-session max-age (set TTL + admit age-prune
+        // threshold). Default 3600 s matches the Docker Registry v2
+        // reference window.
+        let oci_session_max_age_secs = parse_oci_session_max_age_secs()?;
+
         // `EphemeralStore` backend + Redis URL.
         // Default is Memory so dev / test envs boot without a Redis
         // sidecar. When backend is Redis, `HORT_REDIS_URL` is required.
@@ -2384,6 +2404,7 @@ impl Config {
             stateful_upload_staging_dir,
             oci_legacy_catalog_enabled,
             oci_max_sessions_per_principal,
+            oci_session_max_age_secs,
             ephemeral_store_backend,
             redis_url,
             redis_url_evictable,
@@ -2659,6 +2680,42 @@ fn parse_http_oci_upload_timeout_secs() -> Result<u64, ConfigError> {
 /// "disable cap" choice.
 fn parse_oci_max_sessions_per_principal() -> Result<u32, ConfigError> {
     parse_positive::<u32>("HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL", 32)
+}
+
+/// Upper bound on `HORT_OCI_SESSION_MAX_AGE_SECS`: 7 days. This value
+/// doubles as the live session-set TTL and the admit age-prune
+/// threshold, and it is converted to milliseconds via an `as i64` cast
+/// deep in the cap primitive — an absurd operator value (e.g. seconds
+/// approaching `i64::MAX`) would overflow that cast and produce a
+/// nonsensical prune window. A week is generously past any legitimate
+/// single-blob upload window while keeping the ms cast far from
+/// overflow, so anything larger is rejected at boot as a misconfiguration.
+const OCI_SESSION_MAX_AGE_CEILING_SECS: u64 = 7 * 24 * 60 * 60; // 604800
+
+/// Parse `HORT_OCI_SESSION_MAX_AGE_SECS`.
+///
+/// Absent or empty env var → the 3600-second (one-hour) default,
+/// matching the Docker Registry v2 reference window. Non-integer values
+/// surface as [`ConfigError::InvalidInt`]; zero surfaces as
+/// [`ConfigError::ValueNotPositive`] — a zero max-age would prune every
+/// session (including live ones) on the next admit and set a zero TTL,
+/// which is never the operator-meaningful choice. A value above
+/// [`OCI_SESSION_MAX_AGE_CEILING_SECS`] (7 days) surfaces as
+/// [`ConfigError::InvalidValue`] — the value feeds an `as i64`
+/// milliseconds cast in the cap primitive, so an absurd value would
+/// overflow it; a week is well past any legitimate upload window. This
+/// value doubles as the live session-set TTL and the admit age-prune
+/// threshold.
+fn parse_oci_session_max_age_secs() -> Result<u64, ConfigError> {
+    const VAR: &str = "HORT_OCI_SESSION_MAX_AGE_SECS";
+    let secs = parse_positive::<u64>(VAR, 3600)?;
+    if secs > OCI_SESSION_MAX_AGE_CEILING_SECS {
+        return Err(ConfigError::InvalidValue {
+            var: VAR,
+            reason: format!("must be <= {OCI_SESSION_MAX_AGE_CEILING_SECS} (7 days; got {secs})"),
+        });
+    }
+    Ok(secs)
 }
 
 /// Parse `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`.
@@ -3605,6 +3662,46 @@ mod tests {
         std::env::remove_var(VAR);
     }
 
+    #[test]
+    fn parse_oci_session_max_age_default_accept_and_ceiling_reject() {
+        const VAR: &str = "HORT_OCI_SESSION_MAX_AGE_SECS";
+        // Absent → the one-hour default.
+        temp_env::with_var(VAR, None::<&str>, || {
+            assert_eq!(parse_oci_session_max_age_secs().unwrap(), 3600);
+        });
+        // Zero is still rejected (ValueNotPositive), unchanged.
+        temp_env::with_var(VAR, Some("0"), || {
+            assert!(matches!(
+                parse_oci_session_max_age_secs().unwrap_err(),
+                ConfigError::ValueNotPositive { .. }
+            ));
+        });
+        // Exactly at the 7-day ceiling is accepted.
+        temp_env::with_var(
+            VAR,
+            Some(&OCI_SESSION_MAX_AGE_CEILING_SECS.to_string()),
+            || {
+                assert_eq!(
+                    parse_oci_session_max_age_secs().unwrap(),
+                    OCI_SESSION_MAX_AGE_CEILING_SECS
+                );
+            },
+        );
+        // One second over the ceiling is rejected as InvalidValue — an
+        // absurd value would overflow the `as i64` ms cast in the cap
+        // primitive.
+        temp_env::with_var(
+            VAR,
+            Some(&(OCI_SESSION_MAX_AGE_CEILING_SECS + 1).to_string()),
+            || {
+                assert!(matches!(
+                    parse_oci_session_max_age_secs().unwrap_err(),
+                    ConfigError::InvalidValue { var, .. } if var == VAR
+                ));
+            },
+        );
+    }
+
     // -- Debug-redaction regression tests ----------------------------------
     //
     // `StorageConfig::S3` carries AWS credentials. The struct must NOT
@@ -3697,6 +3794,7 @@ mod tests {
             stateful_upload_staging_dir: PathBuf::from("/tmp/hort-stateful-upload-staging"),
             oci_legacy_catalog_enabled: false,
             oci_max_sessions_per_principal: 32,
+            oci_session_max_age_secs: 3600,
             ephemeral_store_backend: EphemeralStoreBackend::Memory,
             redis_url: None,
             // Per-class overrides default to None
@@ -3817,6 +3915,7 @@ mod tests {
             stateful_upload_staging_dir: PathBuf::from("/tmp/hort-stateful-upload-staging"),
             oci_legacy_catalog_enabled: false,
             oci_max_sessions_per_principal: 32,
+            oci_session_max_age_secs: 3600,
             ephemeral_store_backend: EphemeralStoreBackend::Redis,
             redis_url: Some(format!(
                 "redis://user:{SENSITIVE_REDIS_PASSWORD}@localhost:6379/0"

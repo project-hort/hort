@@ -88,9 +88,24 @@ pub fn router() -> Router<Arc<AppContext>> {
             "/v2/:repo_key/*tail",
             axum::routing::post(post_upload_dispatch)
                 .patch(patch_upload_dispatch)
-                .put(put_upload_dispatch),
+                .put(put_upload_dispatch)
+                .delete(delete_upload_route),
         )
         .layer(Extension(OciHttpConfig::default()))
+}
+
+/// Thin route wrapper over [`delete_upload_dispatch`] for the standalone
+/// [`router`]. The production route tree dispatches DELETE through
+/// [`super::delete_dispatch`] (which shares the wildcard with manifest
+/// delete); this standalone router carries only the upload surface, so
+/// the wildcard DELETE maps straight to the upload-cancel handler.
+async fn delete_upload_route(
+    access: WriteRepoAccess,
+    State(ctx): State<Arc<AppContext>>,
+    oci_cfg: Extension<OciHttpConfig>,
+    BoundedPath((repo_key, tail)): BoundedPath<(String, String)>,
+) -> Response {
+    delete_upload_dispatch(access, State(ctx), oci_cfg, &repo_key, &tail).await
 }
 
 /// Tail-parse output specialised for blob upload routes.
@@ -203,6 +218,7 @@ pub(crate) async fn post_upload_dispatch(
                 actor,
                 &principal,
                 oci_cfg.max_sessions_per_principal,
+                oci_cfg.session_max_age(),
             )
             .await
         }
@@ -221,6 +237,7 @@ pub(crate) async fn post_upload_dispatch(
                 repo_id,
                 actor,
                 oci_cfg.max_sessions_per_principal,
+                oci_cfg.session_max_age(),
             )
             .await
         }
@@ -265,6 +282,7 @@ async fn handle_cross_mount(
     // source repo collapses to standard initiate semantics. The per-`(repo,
     // principal)` cap still applies on that fall-through.
     max_sessions_per_principal: u32,
+    session_max_age: std::time::Duration,
 ) -> Response {
     let hash = match parse_digest(mount_digest) {
         DigestParse::Ok(h) => h,
@@ -302,6 +320,7 @@ async fn handle_cross_mount(
                 target_repo_id,
                 actor,
                 max_sessions_per_principal,
+                session_max_age,
             )
             .await;
         }
@@ -494,7 +513,7 @@ fn parse_content_range(value: &str) -> Result<ContentRange, ContentRangeParseErr
 }
 
 /// Tail-parse output for PATCH requests.  `<name>/blobs/uploads/<session_id>`.
-enum PatchTail<'a> {
+pub(crate) enum PatchTail<'a> {
     AppendChunk { name: &'a str, session_id: Uuid },
 }
 
@@ -502,7 +521,14 @@ enum PatchTail<'a> {
 /// not match the `<name>/blobs/uploads/<uuid>` shape — the caller
 /// maps that to `NAME_UNKNOWN` (consistent with the POST branch's
 /// wrong-suffix handling).
-fn parse_patch_tail(tail: &str) -> Option<PatchTail<'_>> {
+///
+/// `pub(crate)` so the top-level DELETE dispatcher can use
+/// `parse_patch_tail(tail).is_some()` as its upload-cancel branch
+/// predicate — a precise upload-tail match, rather than an unanchored
+/// `tail.contains("/blobs/uploads/")` substring test that a
+/// pathological manifest name (`x/blobs/uploads/y/manifests/latest`)
+/// could spoof into the wrong (Write-gated cancel) branch.
+pub(crate) fn parse_patch_tail(tail: &str) -> Option<PatchTail<'_>> {
     // Find the last occurrence of `/blobs/uploads/` and split there.
     let idx = tail.rfind("/blobs/uploads/")?;
     let name = &tail[..idx];
@@ -527,6 +553,7 @@ fn parse_patch_tail(tail: &str) -> Option<PatchTail<'_>> {
 pub(crate) async fn patch_upload_dispatch(
     access: WriteRepoAccess,
     State(ctx): State<Arc<AppContext>>,
+    Extension(oci_cfg): Extension<OciHttpConfig>,
     BoundedPath((repo_key, tail)): BoundedPath<(String, String)>,
     request: Request<Body>,
 ) -> Response {
@@ -625,6 +652,7 @@ pub(crate) async fn patch_upload_dispatch(
         body_length,
         max_bytes,
         repo_id,
+        oci_cfg.session_max_age(),
     )
     .await
     {
@@ -743,6 +771,7 @@ pub struct PutQuery {
 pub(crate) async fn put_upload_dispatch(
     access: WriteRepoAccess,
     State(ctx): State<Arc<AppContext>>,
+    Extension(oci_cfg): Extension<OciHttpConfig>,
     BoundedPath((repo_key, tail)): BoundedPath<(String, String)>,
     Query(query): Query<PutQuery>,
     request: Request<Body>,
@@ -870,6 +899,7 @@ pub(crate) async fn put_upload_dispatch(
         repo_id,
         &name,
         max_bytes,
+        oci_cfg.session_max_age(),
     )
     .await
     {
@@ -919,6 +949,66 @@ fn map_put_error(err: AppError, session_id: Uuid) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// DELETE (cancel upload)
+// ---------------------------------------------------------------------------
+
+/// Cancel an in-flight OCI blob upload session
+/// (`DELETE /v2/:repo_key/*tail` where the tail is
+/// `<name>/blobs/uploads/<uuid>`).
+///
+/// Per the OCI Distribution Spec ("Canceling an Upload"): "Clients
+/// SHOULD send this request when aborting a blob upload, releasing
+/// server resources … If successful, the response SHOULD be a
+/// `204 No Content`." This releases the per-`(repo, principal)`
+/// live-session set member and the staging bytes via the shared
+/// [`upload_session::cancel`] path, giving a well-behaved client an
+/// immediate slot release instead of waiting for the session to age
+/// out.
+///
+/// The tail is parsed with [`parse_patch_tail`] (PATCH / PUT / DELETE
+/// share the `<name>/blobs/uploads/<uuid>` shape). A tail that does not
+/// match maps to `NAME_UNKNOWN`; an unknown / TTL-expired / foreign-repo
+/// session maps to `BLOB_UPLOAD_UNKNOWN` (anti-enumeration — never
+/// leaking that a session for that UUID lives in another repo). Access
+/// is `WriteRepoAccess`, extracted by the [`super::delete_dispatch`]
+/// method dispatcher before this handler runs.
+pub(crate) async fn delete_upload_dispatch(
+    access: WriteRepoAccess,
+    State(ctx): State<Arc<AppContext>>,
+    Extension(oci_cfg): Extension<OciHttpConfig>,
+    repo_key: &str,
+    tail: &str,
+) -> Response {
+    let (name, session_id) = match parse_patch_tail(tail) {
+        Some(PatchTail::AppendChunk { name, session_id }) => (name.to_string(), session_id),
+        None => {
+            return OciError::NameUnknown {
+                repository: format!("{repo_key}/{tail}"),
+            }
+            .into_response();
+        }
+    };
+    if let Err(e) = validate_oci_name(&name) {
+        return super::name_invalid_response(e);
+    }
+
+    let repo_id = access.repository.id;
+
+    match super::upload_session::cancel(&ctx, session_id, repo_id, oci_cfg.session_max_age()).await
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, Body::empty()).into_response(),
+        Err(AppError::Domain(DomainError::NotFound { .. })) => OciError::BlobUploadUnknown {
+            session_id: session_id.to_string(),
+        }
+        .into_response(),
+        Err(other) => {
+            tracing::error!(error = %other, "OCI upload-session cancel failed");
+            OciError::Internal.into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Three-phase initiate
 // ---------------------------------------------------------------------------
 
@@ -929,11 +1019,15 @@ fn map_put_error(err: AppError, session_id: Uuid) -> Response {
 /// [`super::upload_session::initiate`]. A
 /// [`InitiateResult::CapExceeded`] surfaces as `429 Too Many Requests`
 /// with the spec's `TOOMANYREQUESTS` envelope and an advisory
-/// `Retry-After` header. Cap rejections do NOT leak the cap value or
-/// the principal's identity in the response — the caller already
-/// knows their own session count via 4xx-rate observation, and
-/// disclosing the cap value to an attacker provides them a precise
-/// abuse budget.
+/// `Retry-After` header. A [`InitiateResult::Contended`] (the cap
+/// reconcile CAS loop lost every race in its bounded window — transient
+/// contention, not a cap breach) surfaces as `503 Service Unavailable`
+/// with the SAME short advisory `Retry-After`. Cap rejections do NOT
+/// leak the cap value or the principal's identity in the response — the
+/// caller already knows their own session count via 4xx-rate
+/// observation, and disclosing the cap value to an attacker provides
+/// them a precise abuse budget.
+#[allow(clippy::too_many_arguments)]
 async fn handle_initiate(
     ctx: Arc<AppContext>,
     repo_key: &str,
@@ -941,17 +1035,39 @@ async fn handle_initiate(
     repo_id: Uuid,
     actor: ApiActor,
     max_sessions_per_principal: u32,
+    session_max_age: std::time::Duration,
 ) -> Response {
-    match super::upload_session::initiate(&ctx, repo_id, actor, max_sessions_per_principal).await {
+    match super::upload_session::initiate(
+        &ctx,
+        repo_id,
+        actor,
+        max_sessions_per_principal,
+        session_max_age,
+    )
+    .await
+    {
         Ok(InitiateResult::Created(outcome)) => {
             initiate_response(repo_key, name, outcome.session_id)
         }
         Ok(InitiateResult::CapExceeded) => {
-            // 429 + advisory `Retry-After`. Use the OCI session TTL
-            // (3600s) as the hint — it's the upper bound on how long
-            // the slot can stay occupied without being released.
+            // 429 + a SHORT bounded advisory `Retry-After`. The cap is
+            // a transient live-count — abandoned members age out on the
+            // next admit — so the client should retry soon, NOT wait the
+            // full session max-age. See `OCI_CAP_RETRY_AFTER_SECS`.
             OciError::TooManyRequests {
-                retry_after_seconds: super::upload_session::OCI_SESSION_TTL.as_secs() as i64,
+                retry_after_seconds: super::upload_session::OCI_CAP_RETRY_AFTER_SECS,
+            }
+            .into_response()
+        }
+        Ok(InitiateResult::Contended) => {
+            // 503 + the SAME short `Retry-After` as the 429 path. The
+            // cap reconcile lost every CAS race in its bounded window —
+            // transient contention, not a cap breach and not an infra
+            // failure — so the client should retry soon. `warn!` was
+            // already emitted in `initiate_inner`; the envelope carries
+            // no per-request detail beyond the advisory retry hint.
+            OciError::Unavailable {
+                retry_after_seconds: super::upload_session::OCI_CAP_RETRY_AFTER_SECS,
             }
             .into_response()
         }
@@ -1255,6 +1371,7 @@ mod tests {
             let cfg = OciHttpConfig {
                 legacy_catalog_enabled: false,
                 max_sessions_per_principal: 1,
+                ..OciHttpConfig::default()
             };
             // Build a fresh router with the small-cap Extension layer.
             // `Router::layer` re-attaches; the post-merge ordering
@@ -1317,11 +1434,110 @@ mod tests {
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(code, "TOOMANYREQUESTS");
         let retry = retry_after.expect("Retry-After header MUST be set on 429");
-        // The header value is delta-seconds; matches the configured
-        // `OCI_SESSION_TTL` (3600).
-        assert!(
-            retry.parse::<u64>().is_ok(),
-            "Retry-After must be an integer delta-seconds value, got {retry:?}"
+        // The header value is a SHORT bounded delta-seconds — the cap
+        // is a transient live-count (abandoned members age out on the
+        // next admit), NOT a per-session hold, so the client should
+        // retry soon. It MUST be the short `OCI_CAP_RETRY_AFTER_SECS`
+        // (15), NOT the full session max-age (3600).
+        assert_eq!(
+            retry,
+            upload_session::OCI_CAP_RETRY_AFTER_SECS.to_string(),
+            "cap-exceeded Retry-After must be the short bounded value (15), not the session max-age"
+        );
+    }
+
+    /// M1 regression (router-level): when the cap-set reconcile CAS loop
+    /// exhausts its retry budget under pathological contention, the OCI
+    /// initiate handler must return `503 Service Unavailable` + the SAME
+    /// short advisory `Retry-After` as the 429 path — NOT a 500. Drives
+    /// the full router so the `handle_initiate` → `OciError::Unavailable`
+    /// mapping (and its 503 + Retry-After envelope) is exercised
+    /// end-to-end.
+    #[test]
+    fn three_phase_initiate_returns_503_with_retry_after_on_cap_reconcile_contention() {
+        use bytes::Bytes;
+        use hort_domain::error::DomainResult;
+        use hort_domain::ports::ephemeral_store::EphemeralStore;
+        use hort_domain::ports::BoxFuture;
+        use std::time::Duration;
+
+        // Cap admit that never wins its create race → retry budget
+        // exhausts → `AdmitOutcome::Contended`.
+        struct AlwaysContendedEphemeral;
+        impl EphemeralStore for AlwaysContendedEphemeral {
+            fn get(&self, _k: &str) -> BoxFuture<'_, DomainResult<Option<Bytes>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn put(&self, _k: &str, _v: Bytes, _t: Duration) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn put_if_absent(
+                &self,
+                _k: &str,
+                _v: Bytes,
+                _t: Duration,
+            ) -> BoxFuture<'_, DomainResult<bool>> {
+                Box::pin(async { Ok(false) })
+            }
+            fn compare_and_swap(
+                &self,
+                _k: &str,
+                _e: u64,
+                _v: Bytes,
+                _t: Duration,
+            ) -> BoxFuture<'_, DomainResult<Option<u64>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn delete(&self, _k: &str) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn extend_ttl(&self, _k: &str, _t: Duration) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let (status, retry_after, code) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            // Swap the durable ephemeral store for the contention stub.
+            // `build_mock_ctx` returns a sole Arc owner; the port mocks
+            // (repositories, etc.) are separate Arc clones, so
+            // `try_unwrap` succeeds and the repo lookup keeps working.
+            let mut base = Arc::try_unwrap(h.ctx)
+                .unwrap_or_else(|_| panic!("harness must return a sole Arc owner"));
+            base.ephemeral_durable = Arc::new(AlwaysContendedEphemeral);
+            let ctx = Arc::new(base);
+
+            let router = router().with_state(ctx);
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::post("/v2/myrepo/library/nginx/blobs/uploads/")
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = parsed["errors"][0]["code"].as_str().unwrap().to_string();
+            (status, retry_after, code)
+        });
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cap-reconcile contention must be a transient 503, not a 500"
+        );
+        assert_eq!(code, "UNAVAILABLE");
+        let retry = retry_after.expect("Retry-After header MUST be set on the 503 contention path");
+        assert_eq!(
+            retry,
+            upload_session::OCI_CAP_RETRY_AFTER_SECS.to_string(),
+            "contention Retry-After must be the short bounded value (15)"
         );
     }
 
@@ -1355,6 +1571,75 @@ mod tests {
         )
         .expect("created metric absent");
         assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    // -------------------- DELETE — cancel upload (router-level) -----------
+
+    /// A DELETE on `/blobs/uploads/<uuid>` cancels the session: the OCI
+    /// spec mandates `204 No Content`, and the session row is dropped
+    /// from `EphemeralStore` (a subsequent PATCH/PUT would see
+    /// BLOB_UPLOAD_UNKNOWN).
+    #[test]
+    fn delete_cancel_returns_204_and_drops_session() {
+        let (status, present_after) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+
+            // Seed a session via initiate.
+            let sid = initiate_for(&h.ctx, repo_id).await;
+            let key = upload_session::session_key("oci", sid);
+            assert!(h.ctx.ephemeral_durable.get(&key).await.unwrap().is_some());
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::delete(format!("/v2/myrepo/library/nginx/blobs/uploads/{sid}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let present_after = h.ctx.ephemeral_durable.get(&key).await.unwrap().is_some();
+            (status, present_after)
+        });
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "OCI cancel-upload must return 204 No Content"
+        );
+        assert!(
+            !present_after,
+            "cancel must drop the session row from EphemeralStore"
+        );
+    }
+
+    /// DELETE on an unknown session UUID must be 404 BLOB_UPLOAD_UNKNOWN.
+    #[test]
+    fn delete_unknown_session_returns_404_blob_upload_unknown() {
+        let (status, code) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let router = router().with_state(h.ctx);
+            let sid = Uuid::new_v4();
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::delete(format!("/v2/myrepo/library/nginx/blobs/uploads/{sid}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = parsed["errors"][0]["code"].as_str().unwrap().to_string();
+            (status, code)
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "BLOB_UPLOAD_UNKNOWN");
     }
 
     // -------------------- Missing / invalid tail --------------------
@@ -1972,6 +2257,7 @@ mod tests {
                 user_id: Uuid::new_v4(),
             },
             10_000,
+            OciHttpConfig::default().session_max_age(),
         )
         .await
         .unwrap();
@@ -1979,6 +2265,9 @@ mod tests {
             InitiateResult::Created(o) => o.session_id,
             InitiateResult::CapExceeded => {
                 panic!("test helper: cap exceeded on initiate — high cap should never reject")
+            }
+            InitiateResult::Contended => {
+                panic!("test helper: cap-reconcile contended on initiate — mock never contends")
             }
         }
     }
@@ -2236,7 +2525,7 @@ mod tests {
             // Overwrite unchanged to bump the store's version by one.
             h.ctx
                 .ephemeral_durable
-                .put(&key, current, upload_session::OCI_SESSION_TTL)
+                .put(&key, current, std::time::Duration::from_secs(3600))
                 .await
                 .unwrap();
 
