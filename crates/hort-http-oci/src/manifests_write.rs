@@ -16,8 +16,9 @@
 //!    malformed shapes as `NAME_UNKNOWN`.
 //! 2. Validate `Content-Type` against
 //!    [`SUPPORTED_MANIFEST_MEDIA_TYPES`]. Reject outside the allowlist
-//!    as `MANIFEST_INVALID` — index / manifest-list media types land on
-//!    the same 400 envelope per the index-support deferral.
+//!    as `MANIFEST_INVALID`. Single-image manifests and image indexes /
+//!    manifest lists are both accepted; the blob/child parse (step 4)
+//!    branches on the media type.
 //! 3. Pre-compute the manifest body's SHA-256 **before** calling
 //!    [`IngestUseCase::ingest`]. On a digest-reference PUT the declared
 //!    digest is compared against the computed hash via
@@ -28,15 +29,19 @@
 //!    `MANIFEST_INVALID`. On a tag PUT
 //!    the computed hash is used to mint the response's `Location`
 //!    header and `Docker-Content-Digest`.
-//! 4. Parse the manifest JSON for `config.digest` + `layers[*].digest`.
-//!    Resolve each referenced blob through
+//! 4. Parse the manifest JSON by media-type shape. A single-image
+//!    manifest yields `config.digest` + `layers[*].digest`; an image
+//!    index / manifest list yields `manifests[*].digest` (child
+//!    **manifest** references). Resolve each referenced blob / child
+//!    through
 //!    [`ArtifactRepository::find_by_checksum`]; enforce
 //!    `artifact.repository_id == repo` (cross-repo isolation). Any
-//!    missing blob returns 400 `MANIFEST_BLOB_UNKNOWN` with a
+//!    missing blob / child returns 400 `MANIFEST_BLOB_UNKNOWN` with a
 //!    `detail.blobs` array. The manifest artifact stays committed so
 //!    the client's retry-after-pushing-blobs path is idempotent; the
 //!    group is NOT created.
-//! 5. Attach manifest + config + layers to the group via
+//! 5. Attach the primary `manifest` member to the group, plus (single-
+//!    image only) config + layers, via
 //!    [`ArtifactGroupUseCase::add_member`]. Shared per-request
 //!    `correlation_id`; every call threads `causation_id =
 //!    Some(manifest_event_id)` — the audit-trail contract.
@@ -97,12 +102,11 @@ use super::name::validate_oci_name;
 /// Manifest media-types accepted on `PUT`. Anything outside the
 /// allowlist is rejected as `MANIFEST_INVALID`.
 ///
-/// Manifest-index / manifest-list media types are in the allowlist
-/// (Docker Hub + OCI both accept them on PUT in production), but the
-/// JSON parser here only understands the single-image shape
-/// (`config`, `layers[]`). An index PUT therefore lands in the allowlist
-/// but fails at the JSON-parse step — see [`parse_manifest_blobs`] for
-/// the explicit deferral.
+/// Both single-image manifests and multi-arch indexes / manifest lists
+/// are accepted. The blob/child parse branches on the media type: an
+/// index / list media type routes to [`index_child_digests`] (child
+/// **manifest** resolution); every other media type routes to the
+/// single-image [`parse_manifest_blobs`] (`config` + `layers[]`).
 const SUPPORTED_MANIFEST_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.oci.image.index.v1+json",
@@ -111,16 +115,15 @@ const SUPPORTED_MANIFEST_MEDIA_TYPES: &[&str] = &[
     "application/vnd.docker.distribution.manifest.v1+json",
 ];
 
-/// Media types that represent multi-manifest indexes / lists. An index
-/// push is explicitly deferred — the JSON shape differs from single-image
-/// manifests (it carries `manifests[]`, not `config` + `layers[]`), and
-/// full index support requires threading manifest-of-manifests membership
-/// into the group model. Rejecting the index at parse time keeps the
-/// contract clear until the follow-up item lands.
-const MANIFEST_INDEX_MEDIA_TYPES: &[&str] = &[
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-];
+/// Returns `true` iff `media_type` is an image-index / manifest-list
+/// media type — the shape that carries `manifests[]` (child descriptors)
+/// instead of `config` + `layers[]`. The write path dispatches the
+/// blob/child parse on this predicate: an index resolves its child
+/// manifests; every other media type runs the single-image parse.
+fn is_index_media_type(media_type: &str) -> bool {
+    media_type == hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE
+        || media_type == hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE
+}
 
 /// Upper bound on the manifest body read into memory before parsing.
 /// OCI manifests are typically a few KB; a 1 MiB ceiling accommodates
@@ -299,16 +302,30 @@ pub(crate) async fn put_manifest_dispatch(
         }
     };
 
-    // Explicit deferral: the manifest-index / list shape is in the
-    // supported media-type allowlist but the JSON parser only handles
-    // the single-image shape. Index support is deferred — it needs a
-    // follow-up that threads manifest-of-manifests membership into the
-    // group model.
-    if MANIFEST_INDEX_MEDIA_TYPES.contains(&media_type.as_str()) {
+    // Cross-check the client-declared media type against the manifest's
+    // actual shape BEFORE any state change. The blob/child parse
+    // dispatches on the declared `Content-Type` (`is_index_media_type`);
+    // `is_image_index` is the structural shape probe (non-empty
+    // `manifests[]`). If the two disagree the push is mislabeled and is
+    // rejected as `MANIFEST_INVALID`:
+    //   * declared index / manifest-list, but the bytes carry no
+    //     `manifests[]` (a single-image manifest sent under an index
+    //     Content-Type) — the index parse would find zero children; and
+    //   * declared single-image, but the bytes ARE an index — the
+    //     single-image parse would look for a `config` the index lacks,
+    //     silently mis-handling the children.
+    // Dispatching by declared type is preserved for the matching case;
+    // a well-formed push whose declared type matches its shape is
+    // unaffected.
+    let media_type_is_index = is_index_media_type(&media_type);
+    let bytes_are_index = hort_domain::oci::is_image_index(&body_bytes);
+    if media_type_is_index != bytes_are_index {
         return OciError::ManifestInvalid {
             detail: Some(serde_json::json!({
-                "reason": "manifest list / index not yet supported; push single-image manifests individually",
+                "reason": "declared media type does not match manifest shape",
                 "media_type": media_type,
+                "declared_index": media_type_is_index,
+                "shape_is_index": bytes_are_index,
             })),
         }
         .into_response();
@@ -535,14 +552,25 @@ pub(crate) async fn put_manifest_dispatch(
     let manifest_event_id = ingest_outcome.ingested_event_id;
     let manifest_digest = computed_hash.clone();
 
-    // Parse config + layer digests. The parser recognises the single-
-    // image shape only — an index media type would have been rejected
-    // above. A missing / malformed digest inside the blob list lands
-    // as `MANIFEST_INVALID`; in the current contract the manifest is
-    // already committed, and the client can retry with a corrected
-    // manifest (or push the blobs and retry). The partially-attached
-    // state is permitted to persist.
-    let referenced = match parse_manifest_blobs(&parsed_manifest) {
+    // Parse the referenced blobs / children by media-type shape.
+    //
+    // - Image index / manifest list: `manifests[*].digest` child
+    //   **manifest** references (no `config`, no `layers`). An over-cap
+    //   index is `MANIFEST_INVALID`, mirroring the single-image
+    //   reference-count rejection.
+    // - Single-image manifest: the unchanged `config` + `layers[]` parse.
+    //
+    // On either path a parse failure lands as `MANIFEST_INVALID`; the
+    // manifest artifact is already committed, so the client can retry
+    // with a corrected manifest (or push the blobs/children and retry).
+    // The partially-attached state is permitted to persist.
+    // `media_type_is_index` was computed up front (declared-vs-shape
+    // cross-check); reuse it here to dispatch the blob/child parse.
+    let referenced = match if media_type_is_index {
+        parse_index_children(&body_bytes)
+    } else {
+        parse_manifest_blobs(&parsed_manifest)
+    } {
         Ok(r) => r,
         Err(detail) => {
             tracing::warn!(
@@ -556,10 +584,14 @@ pub(crate) async fn put_manifest_dispatch(
         }
     };
 
-    // Resolve each referenced blob. Cross-repo isolation: a hash that
-    // exists in a foreign repo counts as missing — the blob must live in
-    // the same repo as the manifest (mount it across explicitly via
-    // `POST /v2/.../blobs/uploads/?mount=...&from=...`).
+    // Resolve each referenced blob / child manifest. Cross-repo
+    // isolation: a hash that exists in a foreign repo counts as missing —
+    // the blob must live in the same repo as the manifest (mount it
+    // across explicitly via
+    // `POST /v2/.../blobs/uploads/?mount=...&from=...`). For an index the
+    // children are resolved for **existence only** — a missing child is
+    // `MANIFEST_BLOB_UNKNOWN`, exactly like a missing layer (clients push
+    // the platform manifests before the index).
     let (config_artifact, layer_artifacts, missing) =
         match resolve_referenced_blobs(&ctx, repo_id, &referenced).await {
             Ok(t) => t,
@@ -582,28 +614,29 @@ pub(crate) async fn put_manifest_dispatch(
         );
         return OciError::ManifestBlobUnknown { blobs: missing }.into_response();
     }
-    // Unwrap the resolved config + at-least-empty layer list. A valid
-    // single-image manifest has a `config` object with a digest — if
-    // `parse_manifest_blobs` accepted it, `resolve_referenced_blobs`
-    // returns `Some(config_artifact)` (or one of the `missing` list
-    // got populated above).
-    let Some(config_artifact) = config_artifact else {
+    // A single-image manifest has a resolved `config`; an index carries
+    // none. Only require the config on the single-image path — an index
+    // that resolved its children with no config is the correct shape.
+    if !media_type_is_index && config_artifact.is_none() {
         // Defensive: reachable only if `parse_manifest_blobs` accepted
-        // a manifest with no config AND `resolve_referenced_blobs`
-        // didn't mark it missing. Current parser rejects missing
-        // config, so this branch is an assertion.
+        // a single-image manifest with no config AND
+        // `resolve_referenced_blobs` didn't mark it missing. The current
+        // parser rejects missing config, so this branch is an assertion.
         tracing::error!(
             manifest_artifact_id = %manifest_artifact.id,
             "resolve_referenced_blobs returned None config with empty missing list"
         );
         return OciError::Internal.into_response();
-    };
+    }
 
-    // Attach members to the group. Order: manifest (primary) first,
-    // then config, then every layer. The shared `correlation_id` +
-    // `causation_id = Some(manifest_event_id)` is the load-bearing
-    // audit contract — the causation-integrity test reads the
-    // recorded batches and asserts this on every member event.
+    // Attach members to the group. Order: manifest (primary) first, then
+    // (single-image only) config, then every layer. An index attaches
+    // only the primary `manifest` member — it has no config/layers and
+    // its child manifests are NOT group members (the index→child linkage
+    // is a content-reference edge, Item 3). The shared `correlation_id` +
+    // `causation_id = Some(manifest_event_id)` is the load-bearing audit
+    // contract — the causation-integrity test reads the recorded batches
+    // and asserts this on every member event.
     let group_coords = oci_group_coords(&name, &manifest_digest);
     let actor_any = Actor::Api(actor.clone());
 
@@ -632,29 +665,31 @@ pub(crate) async fn put_manifest_dispatch(
         return OciError::Internal.into_response();
     }
 
-    if let Err(e) = ctx
-        .artifact_group_use_case
-        .add_member(
-            repo_id,
-            group_coords.clone(),
-            "config".into(),
-            config_artifact.id,
-            /* is_primary = */ false,
-            actor_any.clone(),
-            correlation_id,
-            Some(manifest_event_id),
-            Some(&repo_key),
-            "oci",
-        )
-        .await
-    {
-        tracing::warn!(
-            manifest_artifact_id = %manifest_artifact.id,
-            stage = "group_attach_config",
-            error = %e,
-            "partial attachment; client retry will reconcile"
-        );
-        return OciError::Internal.into_response();
+    if let Some(config_artifact) = &config_artifact {
+        if let Err(e) = ctx
+            .artifact_group_use_case
+            .add_member(
+                repo_id,
+                group_coords.clone(),
+                "config".into(),
+                config_artifact.id,
+                /* is_primary = */ false,
+                actor_any.clone(),
+                correlation_id,
+                Some(manifest_event_id),
+                Some(&repo_key),
+                "oci",
+            )
+            .await
+        {
+            tracing::warn!(
+                manifest_artifact_id = %manifest_artifact.id,
+                stage = "group_attach_config",
+                error = %e,
+                "partial attachment; client retry will reconcile"
+            );
+            return OciError::Internal.into_response();
+        }
     }
 
     for layer in &layer_artifacts {
@@ -745,6 +780,58 @@ pub(crate) async fn put_manifest_dispatch(
                 error = %e,
                 stage = "content_references_insert",
                 "content_references insert failed; referrers index is eventual — operator rebuild is future work"
+            );
+            return OciError::Internal.into_response();
+        }
+    }
+
+    // Image-index membership edges (D3). For an image index / manifest
+    // list, record one `oci_index_member` content-reference row per child
+    // manifest: `source =` the index artifact, `target =` the child's own
+    // content hash, `kind =` the fixed literal `"oci_index_member"`. This
+    // both records the index→child membership and keeps every child
+    // manifest's blob alive under GC — the purge refcount counts rows of
+    // *every* kind against a target hash (`purge_use_case`), so a live
+    // index keeps its children exactly as a live `oci_subject` referrer
+    // keeps its subject.
+    //
+    // The widened PK `(repository_id, source_artifact_id,
+    // target_content_hash, kind)` (migration 013) lets N children share
+    // one `(source = index_id, kind = "oci_index_member")` — each row is
+    // distinguished by its `target_content_hash`, so the `insert` upsert
+    // no longer collapses them (the old narrow PK forced a hash-in-`kind`
+    // workaround; that is gone). `source = index` is pinned — the
+    // direction the GC-alive-keep and the index-DELETE sweep both key on.
+    // Written through the use case (ADR 0008), mirroring the `oci_subject`
+    // write. The `ChildManifest` entries come from `parse_index_children`
+    // (`hort_domain::oci::index_child_digests`); a single-image manifest
+    // has none, so this loop is a no-op there.
+    for child in referenced
+        .iter()
+        .filter(|r| r.role == BlobRole::ChildManifest)
+    {
+        let member_reference = ContentReference {
+            source_artifact_id: manifest_artifact.id,
+            target_content_hash: child.hash.clone(),
+            kind: "oci_index_member".into(),
+            metadata: serde_json::json!({
+                "child_digest": child.digest_raw,
+                "media_type": media_type,
+            }),
+            repository_id: repo_id,
+            recorded_at: Utc::now(),
+        };
+        if let Err(e) = ctx
+            .content_reference_use_case
+            .insert_for_repo(repo_id, member_reference)
+            .await
+        {
+            tracing::warn!(
+                manifest_artifact_id = %manifest_artifact.id,
+                child_digest = %child.digest_raw,
+                error = %e,
+                stage = "oci_index_member_insert",
+                "index-member content_references insert failed; GC alive-keep for this child is eventual — operator rebuild is future work"
             );
             return OciError::Internal.into_response();
         }
@@ -960,6 +1047,13 @@ struct ReferencedBlob {
 enum BlobRole {
     Config,
     Layer,
+    /// A child manifest referenced by an image index / manifest list via
+    /// `manifests[*].digest`. Resolved by the same same-repo existence
+    /// path a layer uses (a missing child → `MANIFEST_BLOB_UNKNOWN`), but
+    /// not attached as a group member — the index lands as a plain
+    /// primary `manifest` member; the index→child linkage is an
+    /// `oci_index_member` content-reference edge, not a group role.
+    ChildManifest,
 }
 
 /// Parse the single-image manifest shape:
@@ -1041,6 +1135,51 @@ fn parse_manifest_blobs(
     Ok(out)
 }
 
+/// Parse an image-index / manifest-list shape into the child **manifest**
+/// references it declares via `manifests[*].digest`:
+///
+/// ```json
+/// {
+///   "schemaVersion": 2,
+///   "mediaType": "application/vnd.oci.image.index.v1+json",
+///   "manifests": [ { "digest": "sha256:...", "platform": {...} }, ... ]
+/// }
+/// ```
+///
+/// Delegates the JSON parse + bound + sha256-only filtering to the domain
+/// helper [`index_child_digests`](hort_domain::oci::index_child_digests):
+/// a non-sha256 / malformed child digest is skipped, and an index
+/// declaring more than the domain cap is a
+/// [`DomainError::Validation`](hort_domain::error::DomainError::Validation).
+///
+/// Each resolved child becomes a [`ReferencedBlob`] with role
+/// [`BlobRole::ChildManifest`], so the shared [`resolve_referenced_blobs`]
+/// same-repo existence check treats a missing child exactly like a missing
+/// layer — a `MANIFEST_BLOB_UNKNOWN`. Clients push the platform child
+/// manifests before the index, so an unresolved child is the expected
+/// out-of-order case, not a hard error.
+///
+/// Error shape mirrors [`parse_manifest_blobs`]: an `Err(serde_json::Value)`
+/// carrying the `detail` object for a 400 `MANIFEST_INVALID`. An over-cap
+/// index (the domain `Validation`) maps here to the same envelope the
+/// single-image over-cap rejection produces.
+fn parse_index_children(body: &[u8]) -> Result<Vec<ReferencedBlob>, serde_json::Value> {
+    let children = hort_domain::oci::index_child_digests(body).map_err(|e| {
+        serde_json::json!({
+            "reason": format!("invalid image index: {e}"),
+        })
+    })?;
+
+    Ok(children
+        .into_iter()
+        .map(|hash| ReferencedBlob {
+            digest_raw: format!("sha256:{}", hash.as_ref()),
+            hash,
+            role: BlobRole::ChildManifest,
+        })
+        .collect())
+}
+
 /// Parse a `sha256:<hex>` digest into a `ContentHash`, returning the
 /// `serde_json::Value` `detail` payload on failure. Separate from
 /// [`parse_digest`] because this one produces the manifest-invalid
@@ -1113,8 +1252,24 @@ async fn resolve_referenced_blobs(
                     }
                 }
                 BlobRole::Layer => layers.push(a),
+                // A child manifest of an image index is resolved for
+                // existence only — it is NOT attached as a group member
+                // (the index lands as a plain primary `manifest`; the
+                // index→child linkage is a content-reference edge, Item
+                // 3). A present child is simply confirmed and dropped.
+                BlobRole::ChildManifest => {}
             },
             None => {
+                if r.role == BlobRole::ChildManifest {
+                    // Mirror the layer-missing path: a child pushed
+                    // out-of-order (index before its platform manifests)
+                    // is the expected retry case, surfaced as
+                    // `MANIFEST_BLOB_UNKNOWN` at the call site.
+                    tracing::warn!(
+                        child_digest = %r.digest_raw,
+                        "image index references an unknown child manifest; deferring until client retry"
+                    );
+                }
                 missing.push(r.digest_raw.clone());
             }
         }
@@ -2479,42 +2634,604 @@ mod tests {
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_INVALID");
     }
 
-    // -------------------- PUT — manifest index deferral --------------------
+    // -------------------- PUT — image index / manifest list --------------------
+    //
+    // An image index / manifest list is accepted on PUT (issue #15, Item
+    // 2). Its `manifests[*].digest` children are resolved as **manifests**
+    // via the same same-repo existence path a layer uses; a missing child
+    // → `MANIFEST_BLOB_UNKNOWN` (clients push children before the index).
+    // The index lands as a plain primary `manifest` group member (no
+    // config, no layers). Single-image PUTs are byte-for-byte unchanged.
 
+    /// Build a minimal image-index JSON referencing the supplied child
+    /// **manifest** digests via `manifests[*]`. `media_type` selects the
+    /// OCI-index or Docker-manifest-list shape.
+    fn build_index_json(child_hashes: &[ContentHash], media_type: &str) -> Vec<u8> {
+        let manifests: Vec<serde_json::Value> = child_hashes
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": format!("sha256:{}", h.as_ref()),
+                    "size": 0,
+                    "platform": { "architecture": "amd64", "os": "linux" },
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media_type,
+            "manifests": manifests,
+        });
+        serde_json::to_vec(&body).unwrap()
+    }
+
+    /// Build a PUT request with an image-index Content-Type + body.
+    fn put_index_request(uri: &str, body: Vec<u8>, media_type: &str) -> axum::http::Request<Body> {
+        let req = HttpRequest::put(uri)
+            .header(CONTENT_TYPE, media_type)
+            .body(Body::from(body))
+            .unwrap();
+        with_principal(req)
+    }
+
+    /// A PUT of an image index whose children are all present in-repo is
+    /// accepted (201) and lands as a committed `manifest` artifact with a
+    /// single primary group member (no config / layer members).
     #[test]
-    fn put_manifest_index_returns_400_with_deferred_note() {
-        let (status, body) = run(async {
+    fn put_image_index_with_present_children_is_committed_as_manifest() {
+        let (status, headers, group_calls, manifest_present, manifest_status) = run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
             h.repositories.insert(repo);
-            let router = router().with_state(h.ctx.clone());
-            // Minimal valid index JSON — the handler rejects it
-            // before full parse thanks to the media-type deferral.
-            let index_body = serde_json::json!({
-                "schemaVersion": 2,
-                "manifests": []
-            });
-            let req = with_principal(
-                HttpRequest::put("/v2/myrepo/library/nginx/manifests/v1")
-                    .header(CONTENT_TYPE, "application/vnd.oci.image.index.v1+json")
-                    .body(Body::from(serde_json::to_vec(&index_body).unwrap()))
-                    .unwrap(),
+            // Seed the two platform child manifests as artifacts in-repo.
+            let child_a = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let child_b = seed_blob(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
+            let body = build_index_json(
+                &[child_a, child_b],
+                "application/vnd.oci.image.index.v1+json",
             );
-            let resp = router.oneshot(req).await.unwrap();
+            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(
+                    uri,
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
             let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            let headers = resp.headers().clone();
+            // ONE add_member call — the primary manifest. No config /
+            // layer members for an index.
+            let group_calls = h.group_lifecycle.commit_call_count();
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let a = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap();
+            let manifest_status = a.as_ref().map(|a| a.quarantine_status);
+            (status, headers, group_calls, a.is_some(), manifest_status)
+        });
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(manifest_present, "index must commit as a manifest artifact");
+        // The index rides the generic `ingest_verified` manifest lifecycle
+        // (NOT the narrow signature path). Under this crate's permissive
+        // HTTP-test policy (`quarantine_duration_secs = 0`) ingest does not
+        // auto-quarantine, so the committed status is `None` — the same
+        // result a single-image manifest gets here. (The generic
+        // quarantine-on-ingest posture of Design §2 D4 is asserted at
+        // Item 4 with a quarantine-fired policy.)
+        assert_eq!(
+            manifest_status,
+            Some(QuarantineStatus::None),
+            "the index rides the generic ingest_verified path (permissive fixture → None)"
+        );
+        let dcd = headers
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            dcd.starts_with("sha256:") && dcd.len() == "sha256:".len() + 64,
+            "Docker-Content-Digest shape: {dcd}"
+        );
+        assert_eq!(
+            group_calls, 1,
+            "an index attaches ONLY the primary manifest member (no config / layers)"
+        );
+    }
+
+    /// A PUT of an image index records exactly one `oci_index_member`
+    /// content-reference row per parsed child manifest: `source =` the
+    /// index artifact, `target =` the child's own content hash,
+    /// `kind = "oci_index_member"` — no more, no fewer. This pins the D3
+    /// membership-write loop at the handler layer: a regression that
+    /// writes the wrong `kind`/`target`, skips a child, or writes a member
+    /// row for a hash the index did not name fails here. Inspection is via
+    /// the mock's `find_by_target` (keyed by target hash + kind), the same
+    /// accessor the `oci_subject` test uses — each child hash is a
+    /// distinct target, so the widened-PK mock keeps all N rows.
+    #[test]
+    fn put_image_index_records_oci_index_member_rows_for_each_child() {
+        let (
+            status,
+            member_rows_a,
+            member_rows_b,
+            source_a,
+            source_b,
+            index_artifact_id,
+            spurious_member_rows,
+        ) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child_a = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let child_b = seed_blob(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
+            let body = build_index_json(
+                &[child_a.clone(), child_b.clone()],
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(
+                    uri,
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            // The index artifact is the source of every member row.
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let index_artifact_id = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .expect("index committed as artifact")
+                .id;
+
+            // One `oci_index_member` row per child, keyed by the child's
+            // own content hash as the target.
+            let rows_a = h
+                .content_references
+                .find_by_target(repo_id, &child_a, Some("oci_index_member"))
+                .await
+                .unwrap();
+            let rows_b = h
+                .content_references
+                .find_by_target(repo_id, &child_b, Some("oci_index_member"))
+                .await
+                .unwrap();
+            let source_a = rows_a.first().map(|r| r.source_artifact_id);
+            let source_b = rows_b.first().map(|r| r.source_artifact_id);
+
+            // No `oci_index_member` row for a hash the index never named —
+            // proves the loop wrote members for exactly the parsed children
+            // (a spurious/mis-targeted write would surface here). We probe a
+            // hash that IS present in-repo (the index's own manifest digest)
+            // but is not one of the two child descriptors.
+            let index_own_hash: ContentHash = manifest_hex.parse().unwrap();
+            let spurious = h
+                .content_references
+                .find_by_target(repo_id, &index_own_hash, Some("oci_index_member"))
+                .await
+                .unwrap();
+            (
+                status,
+                rows_a.len(),
+                rows_b.len(),
+                source_a,
+                source_b,
+                index_artifact_id,
+                spurious.len(),
+            )
+        });
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(member_rows_a, 1, "one oci_index_member row for child A");
+        assert_eq!(member_rows_b, 1, "one oci_index_member row for child B");
+        assert_eq!(
+            source_a,
+            Some(index_artifact_id),
+            "child A member row's source is the index artifact"
+        );
+        assert_eq!(
+            source_b,
+            Some(index_artifact_id),
+            "child B member row's source is the index artifact"
+        );
+        assert_eq!(
+            spurious_member_rows, 0,
+            "no oci_index_member row is written for a hash the index did not name as a child"
+        );
+    }
+
+    /// A Docker manifest-list media type routes down the same index path.
+    #[test]
+    fn put_docker_manifest_list_with_present_children_is_committed() {
+        let status = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"child-manifest-bytes");
+            let media = "application/vnd.docker.distribution.manifest.list.v2+json";
+            let body = build_index_json(std::slice::from_ref(&child), media);
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            router
+                .oneshot(put_index_request(uri, body, media))
+                .await
+                .unwrap()
+                .status()
+        });
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// A push whose Content-Type declares an image index / manifest list
+    /// but whose bytes are a SINGLE-image manifest (no `manifests[]`) is a
+    /// declared-vs-shape mismatch → 400 `MANIFEST_INVALID`, rejected
+    /// pre-ingest (no artifact committed). This is the production consumer
+    /// of `hort_domain::oci::is_image_index` as a cross-check on the
+    /// client-declared media type.
+    #[test]
+    fn put_index_content_type_with_single_image_bytes_returns_400_manifest_invalid() {
+        let (status, body, manifest_present) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            // Single-image manifest bytes (config + layers, NO manifests[]).
+            let single_image_body = build_manifest_json(&config, &[]);
+            let manifest_hex = format!("{:x}", Sha256::digest(&single_image_body));
+            // ...but declared under an index Content-Type.
+            let media = "application/vnd.oci.image.index.v1+json";
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(uri, single_image_body, media))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let present = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .is_some();
+            (status, rbody, present)
         });
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_INVALID");
-        // Spot-check the deferral reason surfaces in detail.
-        let reason = parsed["errors"][0]["detail"]["reason"]
-            .as_str()
-            .unwrap_or_default();
         assert!(
-            reason.contains("not yet supported") || reason.contains("manifest list"),
-            "deferral reason must be explicit: {reason}"
+            !manifest_present,
+            "a declared/shape mismatch must reject pre-ingest; no artifact may land"
+        );
+    }
+
+    /// The mirror case: a push whose Content-Type declares a SINGLE-image
+    /// manifest but whose bytes ARE an image index (non-empty
+    /// `manifests[]`) is a declared-vs-shape mismatch → 400
+    /// `MANIFEST_INVALID`, rejected pre-ingest.
+    #[test]
+    fn put_single_image_content_type_with_index_bytes_returns_400_manifest_invalid() {
+        let (status, body, manifest_present) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"a-child-manifest");
+            // Index bytes (non-empty manifests[]) ...
+            let index_body = build_index_json(
+                std::slice::from_ref(&child),
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let manifest_hex = format!("{:x}", Sha256::digest(&index_body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            // ...but declared under the single-image Content-Type
+            // (`put_request` sets `application/vnd.oci.image.manifest.v1+json`).
+            let resp = router.oneshot(put_request(uri, index_body)).await.unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let present = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .is_some();
+            (status, rbody, present)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_INVALID");
+        assert!(
+            !manifest_present,
+            "an index sent under a single-image Content-Type must reject pre-ingest"
+        );
+    }
+
+    /// The matching cases are unaffected by the cross-check: a
+    /// single-image manifest under the single-image Content-Type, and an
+    /// index under an index Content-Type, both still commit (201). This
+    /// pins that the mismatch guard fires ONLY on a genuine
+    /// declared-vs-shape disagreement.
+    #[test]
+    fn put_matching_declared_type_and_shape_are_unaffected_by_cross_check() {
+        let (single_status, index_status) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+
+            // Single-image bytes under the single-image Content-Type.
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"cfg-match");
+            let single_body = build_manifest_json(&config, &[]);
+            let single_router = router().with_state(h.ctx.clone());
+            let single_status = single_router
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/single",
+                    single_body,
+                ))
+                .await
+                .unwrap()
+                .status();
+
+            // Index bytes under the index Content-Type.
+            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"child-match");
+            let media = "application/vnd.oci.image.index.v1+json";
+            let index_body = build_index_json(std::slice::from_ref(&child), media);
+            let index_router = router().with_state(h.ctx.clone());
+            let index_status = index_router
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/idx",
+                    index_body,
+                    media,
+                ))
+                .await
+                .unwrap()
+                .status();
+            (single_status, index_status)
+        });
+        assert_eq!(
+            single_status,
+            StatusCode::CREATED,
+            "matching single-image push is unaffected"
+        );
+        assert_eq!(
+            index_status,
+            StatusCode::CREATED,
+            "matching index push is unaffected"
+        );
+    }
+
+    /// An index referencing a child manifest that is NOT present in-repo
+    /// → 400 `MANIFEST_BLOB_UNKNOWN` (mirroring a missing layer). The
+    /// index artifact stays committed for client retry; the group is not
+    /// created.
+    #[test]
+    fn put_image_index_with_missing_child_returns_400_manifest_blob_unknown() {
+        let (status, body, group_calls, manifest_present) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            // A present child + a NEVER-seeded child.
+            let present = seed_blob(&h.artifacts, &h.storage, repo_id, b"present-child");
+            let missing_hex = format!("{:x}", Sha256::digest(b"never-pushed-child"));
+            let missing: ContentHash = missing_hex.parse().unwrap();
+            let body = build_index_json(
+                &[present, missing],
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(
+                    uri,
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let group_calls = h.group_lifecycle.commit_call_count();
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let present = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .is_some();
+            (status, rbody, group_calls, present)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+        let blobs = parsed["errors"][0]["detail"]["blobs"].as_array().unwrap();
+        assert_eq!(blobs.len(), 1, "exactly the one missing child echoed");
+        assert!(
+            blobs[0].as_str().unwrap().starts_with("sha256:"),
+            "blobs detail must echo raw sha256:<hex> shape"
+        );
+        assert!(
+            manifest_present,
+            "index artifact must persist so client retry (after pushing the child) reconciles"
+        );
+        assert_eq!(
+            group_calls, 0,
+            "group must NOT be created on the missing-child path"
+        );
+    }
+
+    /// A cross-repo child manifest counts as missing (same-repo isolation,
+    /// via `find_in_repo_by_hash`) → `MANIFEST_BLOB_UNKNOWN`.
+    #[test]
+    fn put_image_index_with_foreign_repo_child_returns_400_manifest_blob_unknown() {
+        let status = run(async {
+            let h = harness();
+            let repo_a = oci_repo("repo-a");
+            let repo_b = oci_repo("repo-b");
+            let repo_b_id = repo_b.id;
+            h.repositories.insert(repo_a);
+            h.repositories.insert(repo_b);
+            // Seed the child ONLY in repo_b.
+            let child = seed_blob(&h.artifacts, &h.storage, repo_b_id, b"child-in-other-repo");
+            let body = build_index_json(
+                std::slice::from_ref(&child),
+                "application/vnd.oci.image.index.v1+json",
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            // PUT to repo-a — the child lives in repo-b, so it's missing.
+            let uri = "/v2/repo-a/library/nginx/manifests/v1";
+            router
+                .oneshot(put_index_request(
+                    uri,
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// An index declaring MORE than the domain cap of children →
+    /// `MANIFEST_INVALID` (the domain `index_child_digests` returns
+    /// `Validation`; the handler maps it to the same shape the
+    /// single-image over-cap rejection produces). The manifest artifact
+    /// still commits (parse runs post-ingest) but no group is created.
+    #[test]
+    fn put_image_index_over_child_cap_returns_400_manifest_invalid() {
+        // MAX_INDEX_CHILDREN in hort-domain is 1024; declare 1025 children
+        // (synthetic sha256 digests — never resolved, the cap rejects
+        // before resolution).
+        let over_cap = 1025usize;
+        let (status, body, group_calls) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            h.repositories.insert(repo);
+            let manifests: Vec<serde_json::Value> = (0..over_cap)
+                .map(|i| {
+                    serde_json::json!({
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": format!("sha256:{i:064x}"),
+                        "size": 0,
+                    })
+                })
+                .collect();
+            let index = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": manifests,
+            });
+            let body = serde_json::to_vec(&index).unwrap();
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(
+                    uri,
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let group_calls = h.group_lifecycle.commit_call_count();
+            (status, rbody, group_calls)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["errors"][0]["code"], "MANIFEST_INVALID",
+            "an over-cap index must map to MANIFEST_INVALID"
+        );
+        assert_eq!(
+            group_calls, 0,
+            "no group created for an over-cap index (rejected pre-attach)"
+        );
+    }
+
+    /// §3.5 red test: an image index — even one carrying a `subject`
+    /// (defensively) — is NOT routed to `ingest_signature_manifest`.
+    /// The `is_pure_*` predicates key on layer media types, and an index
+    /// has no layers, so `is_pure_signature` is `false`. Observable: the
+    /// index routes via `ingest_verified`, which enqueues a scan (the
+    /// seeded HTTP-test policy carries `scan_backends: ["trivy"]`); the
+    /// narrow signature path enqueues none.
+    #[test]
+    fn put_image_index_with_subject_is_not_routed_to_signature_ingest() {
+        let (status, scan_calls) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"index-child-manifest");
+            let subject = seed_blob(&h.artifacts, &h.storage, repo_id, b"the-subject-image");
+            // An index shape WITH a defensive `subject` and NO layers.
+            let index = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": format!("sha256:{}", child.as_ref()),
+                        "size": 0,
+                        "platform": { "architecture": "amd64", "os": "linux" },
+                    }
+                ],
+                "subject": {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": format!("sha256:{}", subject.as_ref()),
+                    "size": 0,
+                },
+            });
+            let body = serde_json::to_vec(&index).unwrap();
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(
+                    uri,
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, h.lifecycle.scan_enqueues().len())
+        });
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            scan_calls, 1,
+            "an index (no layers) is NOT is_pure_signature — it stays on \
+             ingest_verified and IS scanned, even with a defensive subject"
         );
     }
 

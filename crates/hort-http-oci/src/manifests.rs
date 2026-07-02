@@ -1297,6 +1297,45 @@ fn map_manifest_tag_pull_error(
     }
 }
 
+/// Resolve the media-type a coalesced follower should stamp on its own
+/// per-repo manifest row, given the already-CAS-present `content_hash`.
+///
+/// The manifest bytes are content-addressed, so the leader's row (in
+/// whatever repo it ingested into) carries the authoritative
+/// `oci_media_type` for exactly these bytes. `find_by_checksum` is
+/// cross-repo (ADR 0026), so it locates that leader row even when the
+/// follower serves a DIFFERENT repo; its stored `oci_media_type` is
+/// read back verbatim. This preserves the real shape — an image index
+/// keeps `application/vnd.oci.image.index.v1+json`, a Docker manifest
+/// list keeps its list type, a single-image manifest keeps the
+/// single-image type — instead of collapsing every follower re-register
+/// to [`DEFAULT_MEDIA_TYPE`].
+///
+/// Falls back to [`DEFAULT_MEDIA_TYPE`] only when the type is genuinely
+/// unknown: no cross-repo row yet, that row has no metadata /
+/// `oci_media_type` field (e.g. a pre-metadata-migration artifact), or
+/// the lookup errors. Degrading to the established OCI single-image
+/// fallback here is safe — the byte-identical row it would have found is
+/// what `resolve_media_type` also defaults, and it is strictly better
+/// than the previous unconditional single-image label.
+async fn follower_media_type_for_hash(ctx: &Arc<AppContext>, content_hash: &ContentHash) -> String {
+    let source = match ctx.artifact_use_case.find_by_checksum(content_hash).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return DEFAULT_MEDIA_TYPE.to_string(),
+        Err(e) => {
+            tracing::warn!(
+                hash = %content_hash,
+                error = %e,
+                "coalesced-follower media-type resolve: cross-repo artifact lookup failed; \
+                 falling back to default media type"
+            );
+            return DEFAULT_MEDIA_TYPE.to_string();
+        }
+    };
+    // Reuse the exact stored-type read the serve path uses.
+    resolve_media_type(ctx, source.id).await
+}
+
 /// Final post-coalesce step: recover the artifact row via
 /// `find_in_repo_by_hash`. Both leader and
 /// follower take this path; the leader's `ingest_verified` (inside
@@ -1311,11 +1350,16 @@ fn map_manifest_tag_pull_error(
 /// `register_existing_cas_blob` rather than failing closed. Coords are
 /// reconstructed deterministically from `(name, content_hash)` —
 /// `oci_manifest_coords` is exactly what the leader's closure used.
-/// `DEFAULT_MEDIA_TYPE` is the follower's content_type: the upstream
-/// `fetch.media_type` is only observable inside the leader's closure
-/// (the follower never made the upstream call — the point of
-/// coalescing), and `DEFAULT_MEDIA_TYPE` is the established OCI
-/// fallback used elsewhere in this module for an unknown media type.
+///
+/// The follower's content_type is resolved via
+/// [`follower_media_type_for_hash`] — the leader's cross-repo row carries
+/// the authoritative `oci_media_type` for these content-addressed bytes,
+/// so a re-registered image index keeps
+/// `application/vnd.oci.image.index.v1+json` (and a Docker manifest list
+/// keeps its list type) rather than being mislabeled single-image. The
+/// resolved type is also written into `payload_metadata.oci_media_type`
+/// so the follower row's own serve path echoes it. Only a genuinely
+/// unknown type falls back to [`DEFAULT_MEDIA_TYPE`].
 async fn finalise_manifest_pull(
     ctx: &Arc<AppContext>,
     repo: &Repository,
@@ -1334,18 +1378,20 @@ async fn finalise_manifest_pull(
             artifact: Box::new(artifact),
         },
         Ok(None) => {
+            let media_type = follower_media_type_for_hash(ctx, &content_hash).await;
             match ctx
                 .ingest_use_case
                 .register_existing_cas_blob(
                     RegisterExistingCasBlobRequest {
                         repository_id: repo.id,
                         coords: oci_manifest_coords(name, &content_hash),
-                        content_type: DEFAULT_MEDIA_TYPE.to_string(),
+                        content_type: media_type.clone(),
                         actor: ApiActor {
                             user_id: Uuid::nil(),
                         },
                         payload_metadata: serde_json::json!({
                             "oci_source": "upstream_coalesced_follower",
+                            "oci_media_type": media_type,
                         }),
                         content_hash: content_hash.clone(),
                         // Coalesced-follower path is not a seed-import;
@@ -3555,6 +3601,178 @@ mod tests {
         }
     }
 
+    // ---------------- finalise_manifest_pull: follower media-type ----------------
+
+    /// Drive `finalise_manifest_pull` directly through its cross-repo
+    /// follower branch (`find_in_repo_by_hash(repo) → None`) with the
+    /// leader's row + `oci_media_type` metadata pre-seeded in a DIFFERENT
+    /// repo, and return the media-type stamped on the follower's
+    /// re-registered row.
+    ///
+    /// This is the exact shape a coalesced follower hits when the leader
+    /// ingested into another repo (`DedupKey::blob_by_hash` is cross-repo,
+    /// ADR 0026): the follower registers its own per-repo row from the
+    /// already-CAS-present bytes.
+    fn follower_reregister_media_type(leader_media: &str) -> String {
+        run(async {
+            let h = harness();
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            // Distinct repos are the whole point — the follower serves a
+            // repo the leader never ingested into.
+            assert_ne!(leader_repo.id, follower_repo.id);
+            h.repositories.insert(leader_repo.clone());
+            h.repositories.insert(follower_repo.clone());
+
+            // Manifest bytes are content-addressed; the leader's stored
+            // `oci_media_type` is authoritative for exactly these bytes.
+            let content = format!(r#"{{"schemaVersion":2,"mt":"{leader_media}"}}"#).into_bytes();
+            let hex = {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(&content))
+            };
+            // Seed ONLY the leader's row + metadata (in leader_repo). The
+            // follower_repo has no row → the Ok(None) branch fires.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                Some(leader_media),
+                QuarantineStatus::None,
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &h.ctx,
+                &follower_repo,
+                "library/app",
+                &format!("sha256:{hex}"),
+                content_hash,
+                /*write_tag=*/ false,
+            )
+            .await;
+
+            match outcome {
+                UpstreamManifestPullOutcome::Ingested { artifact, .. } => {
+                    // The follower re-registered a NEW per-repo row.
+                    assert_eq!(
+                        artifact.repository_id, follower_repo.id,
+                        "follower must register its own per-repo row"
+                    );
+                    artifact.content_type
+                }
+                other => panic!(
+                    "expected Ingested from cross-repo follower re-register; got {}",
+                    manifest_outcome_variant_name(&other)
+                ),
+            }
+        })
+    }
+
+    /// Regression (issue #15, Item 5): a cross-repo / coalesced follower
+    /// re-registering an image INDEX must keep
+    /// `application/vnd.oci.image.index.v1+json`, NOT collapse to the
+    /// single-image `DEFAULT_MEDIA_TYPE`. This is the mislabel the fix
+    /// closes: the follower reads the leader's authoritative stored type
+    /// rather than hardcoding single-image.
+    #[test]
+    fn follower_reregister_preserves_oci_index_media_type() {
+        let mt = follower_reregister_media_type(OCI_INDEX);
+        assert_eq!(
+            mt, OCI_INDEX,
+            "cross-repo follower re-register must preserve the image-index \
+             media-type, not the single-image default"
+        );
+        assert_ne!(
+            mt, DEFAULT_MEDIA_TYPE,
+            "an index must NOT be mislabeled single-image on follower re-register"
+        );
+    }
+
+    /// Companion to the index case: a Docker manifest LIST keeps its list
+    /// type through the same follower re-register path.
+    #[test]
+    fn follower_reregister_preserves_docker_manifest_list_media_type() {
+        let mt = follower_reregister_media_type(DOCKER_V2_MANIFEST_LIST);
+        assert_eq!(
+            mt, DOCKER_V2_MANIFEST_LIST,
+            "cross-repo follower re-register must preserve the Docker \
+             manifest-list media-type"
+        );
+    }
+
+    /// Companion guard: single-image re-register behaviour is UNCHANGED —
+    /// a re-registered single-image manifest still carries the
+    /// single-image type. This proves the fix is a no-op for the common
+    /// case (it only stops mislabeling indexes; it does not relabel
+    /// single-image manifests).
+    #[test]
+    fn follower_reregister_single_image_is_unchanged() {
+        let mt = follower_reregister_media_type(DEFAULT_MEDIA_TYPE);
+        assert_eq!(
+            mt, DEFAULT_MEDIA_TYPE,
+            "single-image follower re-register must stay single-image"
+        );
+    }
+
+    /// When the leader's cross-repo row has no `oci_media_type` metadata
+    /// (e.g. a pre-metadata-migration artifact) the follower degrades to
+    /// the established single-image default — the same fallback
+    /// `resolve_media_type` applies. Covers the None-metadata branch of
+    /// `follower_media_type_for_hash`.
+    #[test]
+    fn follower_reregister_falls_back_to_default_when_type_unknown() {
+        let mt = run(async {
+            let h = harness();
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            h.repositories.insert(leader_repo.clone());
+            h.repositories.insert(follower_repo.clone());
+
+            let content = br#"{"schemaVersion":2,"no-metadata":true}"#.to_vec();
+            let hex = {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(&content))
+            };
+            // `None` media_type → no metadata row for the leader's artifact.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::None,
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            match finalise_manifest_pull(
+                &h.ctx,
+                &follower_repo,
+                "library/app",
+                &format!("sha256:{hex}"),
+                content_hash,
+                false,
+            )
+            .await
+            {
+                UpstreamManifestPullOutcome::Ingested { artifact, .. } => artifact.content_type,
+                other => panic!(
+                    "expected Ingested; got {}",
+                    manifest_outcome_variant_name(&other)
+                ),
+            }
+        });
+        assert_eq!(
+            mt, DEFAULT_MEDIA_TYPE,
+            "unknown stored type must fall back to the single-image default"
+        );
+    }
+
     /// Concurrent-coalesce test (tag-ref path): spawn two
     /// `tokio::spawn` requests against the same OCI manifest tag.
     /// The wrapped `coalesce_to_hash` call site at the manifest
@@ -3874,5 +4092,414 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ================================================================
+    // Item 4 (issue #15) — a STORED image-index rides the generic
+    // manifest lifecycle on the HOSTED write path.
+    //
+    // The existing `pull_through_*` tests above cover a proxied index
+    // (upstream fetch → ingest → serve). These tests cover the
+    // complementary case the initiative is really about: an index that
+    // was PUT / stored locally (not proxied) serves generically by
+    // digest and by tag, and the layer-level safety invariant holds
+    // (a released index does NOT unhold a held child manifest).
+    //
+    // No index-specific serve code exists or is needed: the serve path
+    // is bytes-by-hash/tag, reads `oci_media_type` from the metadata
+    // row, and echoes it verbatim in `build_response` — an index is a
+    // manifest artifact like any other (design §2 D4/D5).
+    // ================================================================
+
+    /// OCI image-index media-type (design §2 D2 / `hort_domain::oci`).
+    const INDEX_MEDIA: &str = "application/vnd.oci.image.index.v1+json";
+
+    /// A realistic OCI image-index body carrying one child platform
+    /// descriptor. The child hash is arbitrary — the serve path never
+    /// parses `manifests[]`, so any well-formed JSON exercises the same
+    /// generic bytes-by-hash path. `is_image_index` (Item 1) is `true`
+    /// for this body, which is asserted below so a future serve-path
+    /// change that started keying on shape would be caught.
+    fn sample_index_body(child_hex: &str) -> Vec<u8> {
+        format!(
+            "{{\"schemaVersion\":2,\
+             \"mediaType\":\"{INDEX_MEDIA}\",\
+             \"manifests\":[{{\
+             \"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+             \"digest\":\"sha256:{child_hex}\",\
+             \"size\":528,\
+             \"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}}}}]}}"
+        )
+        .into_bytes()
+    }
+
+    /// The index fixture is genuinely an image-index (guards against a
+    /// fixture that silently degenerated into a single-image manifest,
+    /// which would make the "rides the generic path" claim vacuous).
+    #[test]
+    fn item4_index_fixture_is_an_image_index() {
+        let child = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(
+            hort_domain::oci::is_image_index(&sample_index_body(child)),
+            "the Item-4 index fixture must be recognised as an image index"
+        );
+    }
+
+    /// (a) A stored index serves by DIGEST with the verbatim index
+    /// Content-Type, the `Docker-Content-Digest` header, and the
+    /// streamed index body. Proves the read path needs no index-specific
+    /// code — it is generic bytes-by-hash.
+    #[test]
+    fn item4_stored_index_served_by_digest_verbatim_media_type() {
+        let child = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, headers, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            let router = manifest_router(h.ctx);
+            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, headers, body)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            INDEX_MEDIA,
+            "the stored index media-type must be echoed verbatim, not the single-image default"
+        );
+        assert_eq!(
+            headers
+                .get("docker-content-digest")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("sha256:{hex}"),
+        );
+        assert_eq!(body, content, "the full index body must stream back");
+    }
+
+    /// (a) The same stored index serves by TAG. The tag resolves to the
+    /// index digest via the generic `RefUseCase` lookup — no index-aware
+    /// branch. A `HEAD` of the same tag returns the identical headers
+    /// with an empty body (HEAD-before-GET parity), which is the shape a
+    /// multi-arch client uses to discover the index before pulling it.
+    #[test]
+    fn item4_stored_index_served_by_tag_and_head() {
+        let child = "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+        let content = sample_index_body(child);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (get, head) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (_id, hash) = seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            seed_tag(&h.refs, repo_id, "library/nginx", "multi", &hash);
+            let router = manifest_router(h.ctx);
+            let uri = "/v2/myrepo/library/nginx/manifests/multi";
+
+            let get_resp = router
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let get_status = get_resp.status();
+            let get_ct = get_resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let get_digest = get_resp
+                .headers()
+                .get("docker-content-digest")
+                .map(|v| v.to_str().unwrap().to_string());
+            let get_body = to_bytes(get_resp.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+
+            let head_resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let head_status = head_resp.status();
+            let head_ct = head_resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let head_digest = head_resp
+                .headers()
+                .get("docker-content-digest")
+                .map(|v| v.to_str().unwrap().to_string());
+            let head_body = to_bytes(head_resp.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+
+            (
+                (get_status, get_ct, get_digest, get_body),
+                (head_status, head_ct, head_digest, head_body),
+            )
+        });
+
+        let expected_digest = Some(format!("sha256:{hex}"));
+        assert_eq!(get.0, StatusCode::OK);
+        assert_eq!(get.1.as_deref(), Some(INDEX_MEDIA));
+        assert_eq!(get.2, expected_digest);
+        assert_eq!(get.3, content, "tag GET streams the full index body");
+
+        assert_eq!(head.0, StatusCode::OK);
+        assert_eq!(
+            head.1.as_deref(),
+            Some(INDEX_MEDIA),
+            "HEAD echoes the same verbatim index media-type as GET"
+        );
+        assert_eq!(head.2, expected_digest, "HEAD-before-GET digest parity");
+        assert!(head.3.is_empty(), "HEAD must carry an empty body");
+    }
+
+    /// (c) Provenance HEAD-200 for an INDEX subject. Under a provenance
+    /// hold the index is `Quarantined`; cosign's sign preflight is a
+    /// `HEAD manifests/<index-digest>`. A write-authorized HEAD must
+    /// report 200 (the existing issue-#13 `write_authorized_existence_probe`
+    /// — NOT index-specific), so the held index is signable. A GET, a
+    /// non-writer HEAD, and an anonymous HEAD all stay 503.
+    ///
+    /// Byte-for-byte reuse of the `quarantined_manifest_serve_status`
+    /// RBAC harness above, with the seeded manifest's bytes + media-type
+    /// swapped to an index. The exemption keys on `Write` authorization,
+    /// never on manifest shape — proving the payoff (a held INDEX can be
+    /// signed) rides the same generic gate.
+    fn quarantined_index_serve_status(head: bool, actor_claim: Option<&str>) -> StatusCode {
+        let child = "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
+        let content = sample_index_body(child);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::Quarantined,
+            );
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = actor_claim.map(principal_with_claim);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                principal.as_ref(),
+            )
+            .await
+            .status()
+        })
+    }
+
+    #[test]
+    fn item4_head_quarantined_index_write_authorized_reports_200() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ true, Some("ci-pusher")),
+            StatusCode::OK,
+            "a write-authorized HEAD on a held INDEX must report 200 so cosign can sign the \
+             index digest — this is the issue-#13 existence probe applied to an index, no \
+             index-specific code path"
+        );
+    }
+
+    #[test]
+    fn item4_get_quarantined_index_write_authorized_still_503() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ false, Some("ci-pusher")),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the held index body stays 503 for every caller — only the HEAD existence probe \
+             is released"
+        );
+    }
+
+    #[test]
+    fn item4_head_quarantined_index_non_writer_and_anonymous_still_503() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ true, Some("some-reader")),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a non-writer HEAD on a held index stays 503 (fail-closed)"
+        );
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ true, /* anonymous */ None),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an anonymous HEAD on a held index stays 503 — the existence probe never leaks a \
+             held index to a read/proxy caller (quarantine invariant #5)"
+        );
+    }
+
+    /// (d) The load-bearing D4 safety invariant: releasing an index does
+    /// NOT release its children. A RELEASED index (`QuarantineStatus::None`)
+    /// references a still-HELD child manifest; a `GET` and a `HEAD` of the
+    /// held child both 503. Each artifact is independently gated by its own
+    /// quarantine status — an index carries no runnable bytes, so serving it
+    /// never serves the held child. This is why v1 needs no child-status
+    /// rollup into the index release gate (design §2 D4).
+    #[test]
+    fn item4_released_index_does_not_release_held_child() {
+        // The child manifest bytes (single-image) and the index that
+        // references it. The child is Quarantined (held); the index is
+        // None (released).
+        let child_body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#.to_vec();
+        let child_hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&child_body))
+        };
+        let index_body = sample_index_body(&child_hex);
+        let index_hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&index_body))
+        };
+        let single_media = "application/vnd.oci.image.manifest.v1+json";
+
+        let (index_status, child_get) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            // Released index.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &index_hex,
+                &index_body,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            // Held child manifest.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &child_hex,
+                &child_body,
+                Some(single_media),
+                QuarantineStatus::Quarantined,
+            );
+            let router = manifest_router(h.ctx);
+
+            // The index itself serves (released, routing document).
+            let index_resp = router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/v2/myrepo/library/nginx/manifests/sha256:{index_hex}"
+                    ))
+                    .header(ACCEPT, INDEX_MEDIA)
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let index_status = index_resp.status();
+
+            // The held child manifest 503s on GET. A GET is the definitive
+            // gate: the existence-probe exemption is HEAD-only (invariant #1
+            // — the DOWNLOAD block never lifts), so a GET of a held child
+            // always 503s regardless of caller authorization. (A HEAD of the
+            // child is NOT asserted here: the default mock ctx runs
+            // `RbacAccess::Disabled`, which admits every caller as a writer,
+            // so the write-authorized HEAD existence probe would fire for an
+            // anonymous request too — that probe's write-only gating is
+            // covered by the RBAC-harness tests above; here the GET is the
+            // shape-independent proof that the held child is not served.)
+            let child_get = router
+                .oneshot(
+                    Request::get(format!(
+                        "/v2/myrepo/library/nginx/manifests/sha256:{child_hex}"
+                    ))
+                    .header(ACCEPT, single_media)
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+
+            (index_status, child_get)
+        });
+
+        assert_eq!(
+            index_status,
+            StatusCode::OK,
+            "the released index serves — it is a routing document with no runnable bytes"
+        );
+        assert_eq!(
+            child_get,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "releasing the index must NOT release its held child manifest — the child stays \
+             503 on GET, independently gated by its own quarantine status (design §2 D4)"
+        );
     }
 }

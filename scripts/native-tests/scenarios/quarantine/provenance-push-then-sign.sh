@@ -6,7 +6,13 @@
 # open-items register, "Combined real-verifier provenance E2E"). It drives the
 # canonical CI flow end to end against a HOSTED OCI repo governed by a
 # `provenanceMode: required` + `provenanceBackends: [cosign-key]` ScanPolicy, and
-# asserts the four states the hold-until-signed lifecycle promises:
+# asserts the four states the hold-until-signed lifecycle promises.
+#
+# The push is an IMAGE INDEX (multi-arch, `skopeo copy --all`), not a single
+# manifest: cosign signs the top-level index digest, so this exercises the real
+# index-shaped push-then-sign (issue #15). A single-manifest push returns 200
+# and gives false confidence — that the index PUT never failed — which is the
+# exact gap issue #15 closed. The digest cosign signs is the index digest.
 #
 #   [1] PUSH (unsigned)      — a keyed `required` image is HELD, not rejected:
 #                               * an anonymous manifest GET/pull -> 503 (held,
@@ -91,8 +97,12 @@ REPO_KEY="${PROVENANCE_REPO_KEY:-oci-provenance-e2e}"
 COSIGN_KEY="${COSIGN_KEY:-}"
 # cosign needs a password for a file-based key; empty for a keyless-file setup.
 export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
-# Source image to push (ghcr.io — no Docker Hub rate limit). Small is fine.
-SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/oci-playground/hello-world:latest}"
+# Source image to push — a genuine multi-arch IMAGE INDEX (ghcr.io, no Docker
+# Hub rate limit). Pushed with `skopeo copy --all` so the tag resolves to the
+# top-level index digest, and cosign signs THAT index digest (issue #15:
+# index-shaped push-then-sign). ghcr.io/stefanprodan/podinfo is an OCI image
+# index (mediaType application/vnd.oci.image.index.v1+json).
+SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:latest}"
 # How long the scenario is willing to wait for the window to elapse + the
 # release/expiry sweep to run. The gitops policy's quarantineDuration MUST be
 # <= this for the release/reject legs to complete in-run.
@@ -134,15 +144,15 @@ log "[auth] fetched DEV_TOKEN from Keycloak (dev-user write-authorized for ${REP
 # =============================================================================
 # [1/6] PUSH (unsigned) — accepted, held (write path ungated by the hold)
 # =============================================================================
-log "==> [1/6] Push ${SOURCE_IMAGE} -> docker://${DEST_SIGNED} (to-be-signed)"
-if skopeo copy \
+log "==> [1/6] Push --all ${SOURCE_IMAGE} -> docker://${DEST_SIGNED} (to-be-signed image INDEX)"
+if skopeo copy --all \
       --insecure-policy --dest-tls-verify=false \
       --dest-creds "$DEST_CREDS" \
       "docker://${SOURCE_IMAGE}" "docker://${DEST_SIGNED}" >/dev/null 2>&1; then
-    pass "push of the to-be-signed image accepted (write path ungated; image held under required)"
+    pass "push of the to-be-signed image INDEX accepted (index PUT ungated; was MANIFEST_INVALID before issue #15; held under required)"
 else
-    fail "push to required+cosign-key repo" \
-         "skopeo copy -> ${DEST_SIGNED} exited non-zero (a hosted push under required must still be accepted, then HELD)"
+    fail "index push to required+cosign-key repo" \
+         "skopeo copy --all -> ${DEST_SIGNED} exited non-zero (a hosted index PUT under required must still be accepted, then HELD — a rejected index PUT is the #15 regression)"
     summary
 fi
 
@@ -240,9 +250,9 @@ rm -f "$PULLED_ARCHIVE"
 if bounded_poll \
         "signed image pullable" \
         "$WINDOW_WAIT_SECS" \
-        "skopeo copy --insecure-policy --src-tls-verify=false --src-creds '${DEST_CREDS}' 'docker://${DEST_SIGNED}' 'oci-archive:${PULLED_ARCHIVE}'" \
+        "skopeo copy --all --insecure-policy --src-tls-verify=false --src-creds '${DEST_CREDS}' 'docker://${DEST_SIGNED}' 'oci-archive:${PULLED_ARCHIVE}'" \
         5; then
-    pass "signed image released and pulled after the quarantine window (Cleared + timer gate satisfied)"
+    pass "signed image index released and pulled after the quarantine window (Cleared + timer gate satisfied)"
 else
     fail "signed image releases + pulls" \
          "the signed+cleared image never became pullable within ${WINDOW_WAIT_SECS}s (window or provenance gate not satisfied)"
@@ -251,14 +261,14 @@ fi
 # =============================================================================
 # [6/6] NEGATIVE — never-signed image -> terminal Rejected{Unsigned} at expiry
 # =============================================================================
-log "==> [6/6] NEGATIVE: push an image, never sign it -> terminal Rejected{Unsigned} at window expiry"
-if skopeo copy \
+log "==> [6/6] NEGATIVE: push an image INDEX, never sign it -> terminal Rejected{Unsigned} at window expiry"
+if skopeo copy --all \
       --insecure-policy --dest-tls-verify=false \
       --dest-creds "$DEST_CREDS" \
       "docker://${SOURCE_IMAGE}" "docker://${DEST_UNSIGNED}" >/dev/null 2>&1; then
-    log "  pushed never-to-be-signed image ${DEST_UNSIGNED}"
+    log "  pushed never-to-be-signed image index ${DEST_UNSIGNED}"
 else
-    fail "push never-signed image" "skopeo copy -> ${DEST_UNSIGNED} exited non-zero"
+    fail "push never-signed image index" "skopeo copy --all -> ${DEST_UNSIGNED} exited non-zero"
     summary
 fi
 

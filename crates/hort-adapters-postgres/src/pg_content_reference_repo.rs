@@ -1,11 +1,14 @@
 //! PostgreSQL adapter for [`ContentReferenceIndex`].
 //!
 //! Implements the content-reference projection. One row per
-//! `(repository_id, source_artifact_id, kind)`. The same source artifact
-//! may carry rows of different `kind` simultaneously — e.g. an OCI
-//! manifest carries an `oci_subject` row (its `subject.digest`) AND a
-//! `primary_content` row (its own SHA-256). Lookup by target content
-//! hash is a direct btree hit via `idx_content_references_target`.
+//! `(repository_id, source_artifact_id, target_content_hash, kind)`. The
+//! same source artifact may carry rows of different `kind` simultaneously
+//! — e.g. an OCI manifest carries an `oci_subject` row (its
+//! `subject.digest`) AND a `primary_content` row (its own SHA-256) — and,
+//! since the PK includes `target_content_hash`, it may also carry
+//! **multiple targets under one `kind`** (an OCI image index carries one
+//! `oci_index_member` row per child manifest hash). Lookup by target
+//! content hash is a direct btree hit via `idx_content_references_target`.
 //!
 //! # `kind` values in scope today
 //!
@@ -22,6 +25,11 @@
 //!   `GET …/files/<wheel>.metadata`. Kept in lockstep with the domain
 //!   port's "Allocated kind values" list ([`ContentReferenceIndex`]
 //!   docstring).
+//! - `"oci_index_member"` — OCI image-index / manifest-list membership.
+//!   Written one-per-child on an index PUT (`source =` the index,
+//!   `target =` each child manifest's own hash). The first consumer of
+//!   the widened PK — N rows share `(source, kind)`, each with a
+//!   distinct `target_content_hash`.
 //!
 //! # Upsert semantics
 //!
@@ -30,17 +38,20 @@
 //! ```sql
 //! INSERT INTO content_references (...)
 //! VALUES (...)
-//! ON CONFLICT (repository_id, source_artifact_id, kind) DO UPDATE SET
-//!     target_content_hash = EXCLUDED.target_content_hash,
-//!     metadata            = EXCLUDED.metadata,
-//!     recorded_at         = EXCLUDED.recorded_at
+//! ON CONFLICT (repository_id, source_artifact_id, target_content_hash, kind)
+//! DO UPDATE SET
+//!     metadata    = EXCLUDED.metadata,
+//!     recorded_at = EXCLUDED.recorded_at
 //! ```
 //!
-//! Idempotent re-ingest of the same source under the same kind (the OCI
+//! Idempotent re-ingest of the same `(source, target, kind)` (the OCI
 //! manifest-PUT retry) refreshes the row rather than tripping a
-//! unique-constraint violation. Inserting the same source under a
-//! *different* kind adds a sibling row — the refcount design requires
-//! this.
+//! unique-constraint violation. `target_content_hash` is part of the
+//! conflict key, so it cannot change on a conflict — the `DO UPDATE`
+//! refreshes only `metadata` / `recorded_at`. Inserting the same source
+//! under a *different* kind OR a different target adds a sibling row —
+//! the refcount design and the OCI index's N-children membership both
+//! require this.
 
 use std::str::FromStr;
 
@@ -142,10 +153,10 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                        source_artifact_id, target_content_hash, kind, metadata,
                        repository_id, recorded_at
                    ) VALUES ($1, $2, $3, $4, $5, $6)
-                   ON CONFLICT (repository_id, source_artifact_id, kind) DO UPDATE SET
-                       target_content_hash = EXCLUDED.target_content_hash,
-                       metadata            = EXCLUDED.metadata,
-                       recorded_at         = EXCLUDED.recorded_at"#,
+                   ON CONFLICT (repository_id, source_artifact_id, target_content_hash, kind)
+                   DO UPDATE SET
+                       metadata    = EXCLUDED.metadata,
+                       recorded_at = EXCLUDED.recorded_at"#,
             )
             .bind(reference.source_artifact_id)
             .bind(&target_hex)
@@ -266,8 +277,15 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                 kind = %kind,
                 "find_by_source_and_kind"
             );
-            // Direct PK lookup — `(repository_id, source_artifact_id,
-            // kind)` is the unique key per the migration's PRIMARY KEY.
+            // Single-target-kind lookup. The PK is now
+            // `(repository_id, source_artifact_id, target_content_hash,
+            // kind)`, so `(repo, source, kind)` is unique only for the
+            // single-target kinds this method serves (`wheel_metadata`,
+            // `metadata_blob`, `oci_subject` — each has exactly one
+            // target per source). The N-target `oci_index_member` kind is
+            // never read through here (it is read cross-source via
+            // `find_by_target` and counted by GC), so `fetch_optional`'s
+            // at-most-one contract holds for every actual caller.
             let sql = format!(
                 r#"SELECT {SELECT_COLS}
                      FROM content_references
@@ -314,9 +332,13 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                 "find_by_sources_and_kind"
             );
             // `ANY($1)` over a UUID[] parameter is the canonical
-            // batched-PK form. The query planner uses the composite
-            // PRIMARY KEY on `(repository_id, source_artifact_id, kind)`
-            // for the index probe.
+            // batched form. The query planner uses the composite PRIMARY
+            // KEY on `(repository_id, source_artifact_id,
+            // target_content_hash, kind)` — its leading columns cover
+            // `(repository_id, source_artifact_id)` — for the index
+            // probe. Callers pass single-target kinds only, so each
+            // source yields at most one row and the result folds cleanly
+            // into a `source_id → reference` map.
             let sql = format!(
                 r#"SELECT {SELECT_COLS}
                      FROM content_references
@@ -705,9 +727,12 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// Insert with the same (repo, source) PK is an upsert — fields
-    /// are refreshed, not a 409. This is the contract idempotent
-    /// manifest-PUT retry relies on.
+    /// Idempotent re-insert of the SAME `(source, target, kind)` refreshes
+    /// the row (metadata / recorded_at) rather than tripping a 409 — the
+    /// contract the idempotent manifest-PUT retry relies on. With the
+    /// widened PK `(repository_id, source_artifact_id,
+    /// target_content_hash, kind)`, "same PK" now includes the target, so
+    /// this is the exact key an identical re-push presents.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn insert_upserts_on_primary_key() {
@@ -718,6 +743,7 @@ mod tests {
         let adapter = PgContentReferenceRepo::new(pool.clone());
 
         let source = seed_artifact(&pool, repo, "src-upsert").await;
+        let target: ContentHash = VALID_SHA256_A.parse().unwrap();
         adapter
             .insert(make_reference(
                 repo,
@@ -729,13 +755,12 @@ mod tests {
             .await
             .expect("first insert");
 
-        // Re-insert under the same PK with a different target and
-        // different metadata — should refresh, not fail.
-        let new_target: ContentHash = VALID_SHA256_B.parse().unwrap();
+        // Re-insert under the SAME (source, target, kind) with different
+        // metadata — must refresh the row, not fail and not append.
         adapter
             .insert(ContentReference {
                 source_artifact_id: source,
-                target_content_hash: new_target.clone(),
+                target_content_hash: target.clone(),
                 kind: "oci_subject".into(),
                 metadata: serde_json::json!({"artifact_type": "application/vnd.second"}),
                 repository_id: repo,
@@ -744,36 +769,103 @@ mod tests {
             .await
             .expect("second insert (upsert) must succeed");
 
-        // The new target wins.
-        let by_new = adapter
-            .find_by_target(repo, &new_target, None)
-            .await
-            .unwrap();
-        assert_eq!(by_new.len(), 1);
-        assert_eq!(by_new[0].source_artifact_id, source);
+        // Exactly one row, with the refreshed metadata.
+        let rows = adapter.find_by_target(repo, &target, None).await.unwrap();
         assert_eq!(
-            by_new[0].metadata,
+            rows.len(),
+            1,
+            "same (source, target, kind) upserts in place"
+        );
+        assert_eq!(rows[0].source_artifact_id, source);
+        assert_eq!(
+            rows[0].metadata,
             serde_json::json!({"artifact_type": "application/vnd.second"}),
+            "metadata is refreshed on the idempotent re-push",
         );
 
-        // The old target is gone — the upsert replaced, not appended.
-        let old_target: ContentHash = VALID_SHA256_A.parse().unwrap();
-        let by_old = adapter
-            .find_by_target(repo, &old_target, None)
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The widened PK makes a re-insert under the same `(source, kind)`
+    /// but a DIFFERENT `target_content_hash` a SIBLING row, not a
+    /// replacement — this is the many-to-many the OCI image index needs
+    /// (one index carries N `oci_index_member` rows). Under the old narrow
+    /// `(repo, source, kind)` PK the second insert would have overwritten
+    /// the first; here both coexist.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn insert_same_source_kind_distinct_targets_coexist() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgContentReferenceRepo::new(pool.clone());
+
+        let source = seed_artifact(&pool, repo, "src-multitarget").await;
+
+        // Two members under one (source, kind = "oci_index_member"),
+        // distinct only by target hash.
+        adapter
+            .insert(make_reference(
+                repo,
+                source,
+                VALID_SHA256_A,
+                "oci_index_member",
+                serde_json::json!({}),
+            ))
             .await
-            .unwrap();
-        assert!(
-            by_old.is_empty(),
-            "upsert must replace the target, not leave the old row",
+            .expect("first member insert");
+        adapter
+            .insert(make_reference(
+                repo,
+                source,
+                VALID_SHA256_B,
+                "oci_index_member",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("second member insert must NOT overwrite the first");
+
+        // Both targets are present and independently resolvable.
+        let target_a: ContentHash = VALID_SHA256_A.parse().unwrap();
+        let target_b: ContentHash = VALID_SHA256_B.parse().unwrap();
+        assert_eq!(
+            adapter
+                .find_by_target(repo, &target_a, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the first target survives the second insert",
         );
+        assert_eq!(
+            adapter
+                .find_by_target(repo, &target_b, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the second target is a sibling, not a replacement",
+        );
+
+        // Two rows under the one (source, kind).
+        let count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM content_references
+                WHERE source_artifact_id = $1 AND kind = 'oci_index_member'"#,
+        )
+        .bind(source)
+        .fetch_one(&pool)
+        .await
+        .expect("COUNT");
+        assert_eq!(count, 2, "N targets coexist under one (source, kind)");
 
         cleanup_repo(&pool, repo).await;
     }
 
     /// Two rows under the SAME `(repository_id, source_artifact_id)`
     /// but DIFFERENT `kind` values must coexist. The PK shape
-    /// `(repository_id, source_artifact_id, kind)` makes that an
-    /// additive insert, not an upsert.
+    /// `(repository_id, source_artifact_id, target_content_hash, kind)`
+    /// makes that an additive insert, not an upsert.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn insert_distinct_kinds_coexist() {
@@ -950,6 +1042,92 @@ mod tests {
         assert_eq!(
             count, 2,
             "kind-agnostic COUNT(*) over a shared target must include every kind"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The widened PK (migration 013) admits N `oci_index_member` rows
+    /// under ONE `(source = index, kind = "oci_index_member")`, one per
+    /// child manifest hash — the OCI image-index membership. This is the
+    /// contract the old narrow `(repo, source, kind)` PK could not hold
+    /// (it collapsed them to the last child). Also proves the GC
+    /// alive-keep basis: while the index's member rows are live, the
+    /// kind-agnostic COUNT over a child's `target_content_hash` is > 0,
+    /// and drops to 0 once `delete_by_source(index)` sweeps them.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn index_writes_n_member_rows_under_one_source_kind() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgContentReferenceRepo::new(pool.clone());
+
+        // The index artifact is the SINGLE source of every member row.
+        let index = seed_artifact(&pool, repo, "image-index").await;
+
+        // Three children under one (source = index, kind =
+        // "oci_index_member"), distinct only by target hash. Under the
+        // old narrow PK this would upsert to one surviving row; under
+        // the widened PK all three coexist.
+        for child_hex in [VALID_SHA256_A, VALID_SHA256_B, VALID_SHA256_C] {
+            adapter
+                .insert(make_reference(
+                    repo,
+                    index,
+                    child_hex,
+                    "oci_index_member",
+                    serde_json::json!({"child_digest": format!("sha256:{child_hex}")}),
+                ))
+                .await
+                .expect("oci_index_member insert");
+        }
+
+        // All three member rows persist under the ONE source.
+        let member_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM content_references
+                WHERE source_artifact_id = $1 AND kind = 'oci_index_member'"#,
+        )
+        .bind(index)
+        .fetch_one(&pool)
+        .await
+        .expect("member COUNT");
+        assert_eq!(
+            member_count, 3,
+            "the widened PK admits N members under one (source, kind)"
+        );
+
+        // GC alive-keep basis: while a member row is live, the
+        // kind-agnostic count over its child target is > 0.
+        let child_a: ContentHash = VALID_SHA256_A.parse().unwrap();
+        let live: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM content_references
+                WHERE target_content_hash = $1"#,
+        )
+        .bind(child_a.as_ref())
+        .fetch_one(&pool)
+        .await
+        .expect("live COUNT");
+        assert!(
+            live > 0,
+            "a live index keeps each child's CAS blob alive (target-keyed refcount)"
+        );
+
+        // Sweeping the index's rows (its DELETE / purge, or FK cascade)
+        // frees every child: the target-keyed count drops to 0.
+        adapter.delete_by_source(index).await.unwrap();
+        let after: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM content_references
+                WHERE target_content_hash = $1"#,
+        )
+        .bind(child_a.as_ref())
+        .fetch_one(&pool)
+        .await
+        .expect("post-sweep COUNT");
+        assert_eq!(
+            after, 0,
+            "once the index's member rows are swept, the child's refcount is 0"
         );
 
         cleanup_repo(&pool, repo).await;

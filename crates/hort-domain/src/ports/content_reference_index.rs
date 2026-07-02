@@ -5,22 +5,42 @@
 //!
 //! Records cross-artifact relationships keyed by the *target* content
 //! hash, with a free-form `kind` discriminator and per-row JSONB
-//! `metadata`. One row per `(repository_id, source_artifact_id, kind)` —
-//! the same source artifact may carry multiple rows simultaneously, one
-//! per `kind` (e.g. an OCI manifest that has both an `oci_subject`
-//! relation AND a `primary_content` refcount row).
+//! `metadata`. One row per `(repository_id, source_artifact_id,
+//! target_content_hash, kind)` — the same source artifact may carry
+//! multiple rows simultaneously, one per `kind` (e.g. an OCI manifest
+//! that has both an `oci_subject` relation AND a `primary_content`
+//! refcount row) AND, since the key includes the target hash, multiple
+//! targets under a single `kind` (an OCI image index carries one
+//! `oci_index_member` row per child manifest hash — a true
+//! many-to-many).
 //!
-//! The PK shape `(repository_id, source_artifact_id, kind)` is
-//! load-bearing for retention: the GC-eligibility query counts
-//! rows per `target_content_hash` across every `kind` to prove a blob is
-//! unreferenced. Adding a new `kind` is additive — existing callers see
-//! no change.
+//! The PK shape `(repository_id, source_artifact_id,
+//! target_content_hash, kind)` is load-bearing for retention: the
+//! GC-eligibility query counts rows per `target_content_hash` across
+//! every `kind` to prove a blob is unreferenced. Adding a new `kind` is
+//! additive — existing callers see no change.
 //!
 //! # Allocated `kind` values
 //!
 //! - `"oci_subject"` — OCI Referrers projection. Seeded by the
 //!   OCI manifest-write path on every PUT that carries a
 //!   `subject.digest`.
+//! - `"oci_index_member"` — OCI image-index / manifest-list membership.
+//!   Seeded by the OCI manifest-write path on every index PUT, **one row
+//!   per child**: `source =` the index artifact, `target =` the child
+//!   manifest's own content hash, `kind =` the fixed literal
+//!   `"oci_index_member"`. This is the first consumer of the widened PK
+//!   `(repository_id, source_artifact_id, target_content_hash, kind)` —
+//!   a single index has 1..N children, so N rows share `(source, kind)`,
+//!   each distinguished by its `target_content_hash`. `source = index`
+//!   is pinned so the GC-alive-keep and the index-DELETE sweep both key
+//!   on the index. A live index thus keeps every child manifest's blob
+//!   alive under GC (the refcount query counts rows of *every* kind
+//!   against `target_content_hash`), exactly as a live `oci_subject`
+//!   referrer keeps its subject; purging or deleting the index (both key
+//!   `delete`/cascade on `source = index`) drops the whole set. Excluded
+//!   from the Referrers API, which filters strictly on
+//!   `kind = "oci_subject"`.
 //! - `"primary_content"` — refcount row. Written for every
 //!   `ArtifactIngested` (every format) so the GC-eligibility query
 //!   can prove a blob is unreferenced.
@@ -120,18 +140,23 @@ pub struct ContentReference {
 
 /// Projection port for the content-reference index.
 ///
-/// One row per `(repository_id, source_artifact_id, kind)` — the same
-/// source may carry one row per kind, so the composite PK is the right
-/// uniqueness boundary. Re-ingesting the same source under the same
-/// kind (idempotent PUT) upserts: the `insert` implementation refreshes
-/// `target_content_hash` / `metadata` / `recorded_at` on conflict.
+/// One row per `(repository_id, source_artifact_id, target_content_hash,
+/// kind)` — the same source may carry one row per kind AND, since the
+/// key includes the target hash, several targets under one kind (the OCI
+/// image index's `oci_index_member` children), so the widened composite
+/// PK is the right uniqueness boundary. Re-ingesting the same
+/// `(source, target, kind)` (idempotent PUT) upserts: the `insert`
+/// implementation refreshes `metadata` / `recorded_at` on conflict.
 pub trait ContentReferenceIndex: Send + Sync {
     /// Record a content reference. Upsert on `(repository_id,
-    /// source_artifact_id, kind)`. Inserting the same source under a
-    /// *different* kind adds a sibling row, not a replacement; this is
-    /// what retention requires to maintain a true refcount.
-    /// Repeated calls under the same kind refresh the row — the OCI
-    /// manifest-PUT idempotency test relies on this shape.
+    /// source_artifact_id, target_content_hash, kind)`. Inserting the
+    /// same source under a *different* kind — or the same `(source,
+    /// kind)` with a *different* target — adds a sibling row, not a
+    /// replacement; this is what retention requires to maintain a true
+    /// refcount and what an OCI index's N-children membership requires.
+    /// Repeated calls under the same `(source, target, kind)` refresh
+    /// the row — the OCI manifest-PUT idempotency test relies on this
+    /// shape.
     fn insert(&self, reference: ContentReference) -> BoxFuture<'_, DomainResult<()>>;
 
     /// Look up every reference that points at `target` in this repo,
@@ -161,9 +186,17 @@ pub trait ContentReferenceIndex: Send + Sync {
     /// directly.
     fn delete_by_source(&self, source: Uuid) -> BoxFuture<'_, DomainResult<()>>;
 
-    /// Look up the single reference row for `(repo, source, kind)` —
-    /// the PK shape. Returns `Ok(None)` if no row exists; never
-    /// returns multiple rows (the PK is unique).
+    /// Look up the single reference row for `(repo, source, kind)`.
+    /// Returns `Ok(None)` if no row exists; contractually at most one
+    /// row for the **single-target kinds** this serves.
+    ///
+    /// The PK is now `(repository_id, source_artifact_id,
+    /// target_content_hash, kind)`, so `(repo, source, kind)` is unique
+    /// only for kinds that carry exactly one target per source
+    /// (`wheel_metadata`, `metadata_blob`, `oci_subject`). This method is
+    /// for exactly those per-source-attribute reads; the N-target
+    /// `oci_index_member` kind is never read through here (it is
+    /// enumerated cross-source via [`Self::find_by_target`]).
     ///
     /// Used by per-source-attribute read paths — the PEP
     /// 658 `.metadata` endpoint reads the `wheel_metadata` row keyed
