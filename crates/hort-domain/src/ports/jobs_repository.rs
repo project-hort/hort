@@ -413,6 +413,37 @@ pub trait JobsRepository: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Return the id of an in-flight `kind='provenance-verify'` row for
+    /// `artifact_id`, where "in-flight" means `status IN
+    /// ('pending','running')`. Returns `Ok(None)` when no such row
+    /// exists.
+    ///
+    /// Mirrors [`Self::find_active_scan_for_artifact`] for the provenance
+    /// pipeline. Unlike the `kind='scan'` rows, a `provenance-verify` row
+    /// carries its `artifact_id` in the `params` JSONB (`{"artifact_id":
+    /// …}`), not the scan-typed `artifact_id` column — the Postgres
+    /// adapter matches on `params->>'artifact_id'`. There is no partial-
+    /// unique index for provenance-verify, so this read is the dedup
+    /// mechanism the expiry backstop
+    /// ([`QuarantineUseCase::release_expired`](crate)) uses to avoid
+    /// piling up duplicate open jobs for the same `Pending` candidate
+    /// across sweep ticks.
+    ///
+    /// **Default implementation:** returns `Ok(None)` so existing test
+    /// fixtures (mocks in `hort-app::use_cases::scan_orchestration_tests`
+    /// and the `MockJobsRepository` in `test_support`) compile without
+    /// modification (same additive-default pattern as
+    /// [`Self::find_active_scan_for_artifact`]). A `None` default means
+    /// "no in-flight verify seen" — fail-safe for a mock that does not
+    /// override it (the backstop enqueues rather than silently skipping).
+    fn find_active_provenance_for_artifact<'a>(
+        &'a self,
+        artifact_id: Uuid,
+    ) -> BoxFuture<'a, DomainResult<Option<Uuid>>> {
+        let _ = artifact_id;
+        Box::pin(async { Ok(None) })
+    }
+
     /// Insert a cross-kind `jobs` row with `status='pending'`.
     ///
     /// Used by `TaskUseCase::enqueue` to create

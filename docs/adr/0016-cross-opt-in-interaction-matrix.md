@@ -14,6 +14,18 @@ Every new operator opt-in that lets untrusted input influence the release predic
 
 The structural close is **fail-closed apply-time rejection** of the dangerous combination — never a runtime "fall back to a degraded authority" path, which would re-introduce the collapse with an escape hatch. The matrix grows a column whenever a new such opt-in lands; an opt-in landing without its matrix row is a review hard-block.
 
+The canonical matrix table is maintained in the architect skill (`.claude/commands/hort-architect.md` → "Cross-opt-in interaction matrix"); the rows below record each registered opt-in and its verdict as of the ADR's latest amendment.
+
+### Registered rows
+
+- **`ScanPolicy.scan_backends: []`** × **`trust_upstream_publish_time = true`** — **apply-rejected** (`trust_upstream_publish_time_requires_scan_backends`): together the deadline is anchored to attacker-asserted `published_at` *and* release no longer requires a successful scan, collapsing the Gate-2 window to ≤ sweep-tick latency. The canonical exemplar.
+- **`RepositoryUpstreamMapping.trust_upstream_publish_time = true`** × **`Repository.index_mode: IncludePending`** — **benign, documented**: `NonServableStatusFilter` runs first and the mode's additive set (`Unknown`) was never gate-eligible.
+- **`ScanPolicy.provenance_mode: Required`** (hold-until-signed — ADR 0027 amendment, issue #13) — **benign, documented (NOT apply-rejected).** `Required` provenance only *tightens* the release gate: it is an AND-precondition on the timer arm (ADR 0027/0007) and adds no release authority. The provenance *hold window* is bounded by the same quarantine deadline the other knobs move, so:
+  - × **`trust_upstream_publish_time = true`** — **benign**: a shrunk deadline shortens the *legitimate signer's* time-to-sign (an availability effect on first-party CI, surfaced as `held_pending_signature`), and can **never** release an unsigned artifact. `Pending` never timer-releases; an expiry with no signature rejects `Unsigned` (fail-closed). Safety is intact; only the operator's signing budget shrinks.
+  - × **`scan_backends: []`** — **benign**: a scan waiver (`ScanWaived`) does not grant provenance clearance. Under `Required`, `Cleared` still requires a `ProvenanceVerified` event on the artifact stream; a waived scan cannot substitute for a signature.
+
+  Because the interaction only ever *tightens* (never releases-by-fallback), there is no dangerous combination to fail-closed-reject — the correct verdict is documented-benign, not apply-time rejection.
+
 ## Consequences
 
 - A new release-gate-influencing knob cannot be added without analysing it against every existing one — the interaction is enumerated, not discovered in production.

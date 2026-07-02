@@ -41,6 +41,7 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::scan_policy::{ProvenanceMode, ScanPolicyProjection};
 use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource, PolicyScope};
+use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
@@ -108,6 +109,12 @@ pub enum ProvenanceVerdictSummary {
     /// (`VerifyIfPresent`/`Off` no-op, no event) — a previously-silent
     /// case, made observable here.
     NoAttestation,
+    /// A `Required`-mode artifact was found unsigned while its quarantine
+    /// observation window is still open (issue #13): no event, status stays
+    /// `Quarantined` (HELD, read as `Pending` by the release gate). Distinct
+    /// from `NoAttestation` so the task handler's `result_summary`
+    /// separates "waiting to be signed" from "allowed unsigned".
+    HeldPendingSignature,
 }
 
 /// Result of a single `verify` invocation, before the job row is closed.
@@ -204,6 +211,38 @@ impl ProvenanceOrchestrationUseCase {
             .map(|p| p.provenance_mode)
             .unwrap_or_default();
 
+        // Compute the observation-window state (issue #13, design §2 S1/S4).
+        // A missing signature under `Required` is time-dependent — the
+        // artifact may yet be signed — so it is HELD while this window is
+        // open (mirroring an incomplete scan) rather than terminally rejected
+        // at the first verify. The deadline is derived (never persisted) from
+        // the artifact's immutable quarantine anchor + the resolved
+        // `ScanPolicy.quarantineDuration` (or the default), through the SAME
+        // `effective_quarantine_deadline` helper the release sweep uses.
+        //
+        // A missing `quarantine_window_start` resolves `window_open = false`:
+        // the ingest path always quarantines an OCI subject before enqueuing
+        // the verify, so a `None` anchor here is a defensive / mis-ordered run
+        // only — and a defensive run must not HOLD indefinitely (no anchor ⇒
+        // no window ⇒ terminal). `window_open` gates only the
+        // `NoAttestation × Required` arm in `complete_provenance`; the expiry
+        // backstop (`release_expired`) re-runs the verify after the deadline,
+        // where this resolves to `false` by construction.
+        let effective_duration_secs: i64 = policy
+            .as_ref()
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+        let now = chrono::Utc::now();
+        let window_open = artifact
+            .quarantine_window_start
+            .map(|anchor| {
+                effective_quarantine_deadline(
+                    anchor,
+                    chrono::Duration::seconds(effective_duration_secs),
+                ) > now
+            })
+            .unwrap_or(false);
+
         // Off — provenance is inert for this scope. The ingest gate should
         // never enqueue here; the orchestrator no-ops defensively.
         if mode == ProvenanceMode::Off {
@@ -243,7 +282,7 @@ impl ProvenanceOrchestrationUseCase {
             Ok(b) => b,
             Err(e) => {
                 return self
-                    .apply_fetch_failure(artifact, &backend, mode, "bundle fetch", e)
+                    .apply_fetch_failure(artifact, &backend, mode, window_open, "bundle fetch", e)
                     .await;
             }
         };
@@ -282,6 +321,7 @@ impl ProvenanceOrchestrationUseCase {
                                         artifact,
                                         &backend,
                                         mode,
+                                        window_open,
                                         "post-proxy bundle re-read",
                                         e,
                                     )
@@ -295,6 +335,7 @@ impl ProvenanceOrchestrationUseCase {
                                 artifact,
                                 &backend,
                                 mode,
+                                window_open,
                                 "upstream referrer fetch",
                                 e,
                             )
@@ -311,7 +352,14 @@ impl ProvenanceOrchestrationUseCase {
             Ok(bytes) => bytes,
             Err(e) => {
                 return self
-                    .apply_fetch_failure(artifact, &backend, mode, "CAS preimage read", e)
+                    .apply_fetch_failure(
+                        artifact,
+                        &backend,
+                        mode,
+                        window_open,
+                        "CAS preimage read",
+                        e,
+                    )
                     .await;
             }
         };
@@ -348,7 +396,7 @@ impl ProvenanceOrchestrationUseCase {
         } else {
             verdict_backend
         };
-        self.apply_verdict(artifact, &metric_backend, verdict, mode)
+        self.apply_verdict(artifact, &metric_backend, verdict, mode, window_open)
             .await
     }
 
@@ -834,10 +882,45 @@ impl ProvenanceOrchestrationUseCase {
         backend: &str,
         verdict: ProvenanceVerdict,
         mode: ProvenanceMode,
+        window_open: bool,
     ) -> AppResult<ProvenanceRunOutcome> {
-        let event = artifact.complete_provenance(verdict, mode, backend)?;
+        // Under `Required` an unsigned-but-still-in-window artifact is HELD
+        // (issue #13): `complete_provenance` returns `Ok(None)` and leaves
+        // the status `Quarantined` → the release gate reads it as `Pending`
+        // (fail-closed / held), not an allowed-unsigned no-op. Captured
+        // before the value is moved into `complete_provenance` so the `None`
+        // branch can distinguish the hold from the VerifyIfPresent/Off allow.
+        let held_pending_signature = mode == ProvenanceMode::Required
+            && window_open
+            && matches!(
+                verdict.outcome,
+                hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
+            );
+        let event = artifact.complete_provenance(verdict, mode, backend, window_open)?;
 
         let Some(event) = event else {
+            if held_pending_signature {
+                // Hold-pending-signature: no event, status stays Quarantined.
+                // `info!` (no `err`) — the operator audit signal that an image
+                // is waiting to be signed. Ticks the distinct
+                // `held_pending_signature` result value (NOT `no_attestation`),
+                // so a `Required` hold is separable from the allowed-unsigned
+                // no-op. Single emission layer — the orchestration use case.
+                tracing::info!(
+                    artifact_id = %artifact.id,
+                    backend = %backend,
+                    "provenance held pending signature (Required, observation window open)",
+                );
+                crate::metrics::emit_provenance_verify(
+                    backend,
+                    mode,
+                    crate::metrics::ProvenanceVerifyResult::HeldPendingSignature,
+                );
+                return Ok(ProvenanceRunOutcome::Applied {
+                    event_appended: false,
+                    verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+                });
+            }
             // NoAttestation under VerifyIfPresent / Off — no event, status
             // unchanged. The allowed-unsigned case ticks `no_attestation`
             // (no reject sibling). Single emission layer — the
@@ -926,11 +1009,20 @@ impl ProvenanceOrchestrationUseCase {
     ///   verified `Required` artifact must never timer-release);
     /// - `VerifyIfPresent` / `Off` → degrade to `NoAttestation` (allow —
     ///   never fail-closed on infra flakiness).
+    ///
+    /// `window_open` is threaded to `apply_verdict` for signature parity with
+    /// the verdict path, but is **inert on the `Required` arm**: a fetch
+    /// failure produces a `Rejected{RekorNotFound}` verdict, and
+    /// `complete_provenance`'s `Rejected` arm never consults `window_open` — a
+    /// fetch failure is NOT an unsigned-hold, so it stays fail-closed even
+    /// mid-window (issue #13, design §2 S1). Threading the value through does
+    /// not weaken this.
     async fn apply_fetch_failure(
         &self,
         artifact: Artifact,
         backend: &str,
         mode: ProvenanceMode,
+        window_open: bool,
         stage: &str,
         err: crate::error::AppError,
     ) -> AppResult<ProvenanceRunOutcome> {
@@ -948,7 +1040,8 @@ impl ProvenanceOrchestrationUseCase {
                 // growing the enum — the audit event's `backend` label disambiguates
                 // which backend's fetch failed.
                 let verdict = ProvenanceVerdict::rejected(ProvenanceRejectReason::RekorNotFound);
-                self.apply_verdict(artifact, backend, verdict, mode).await
+                self.apply_verdict(artifact, backend, verdict, mode, window_open)
+                    .await
             }
             ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => {
                 tracing::warn!(
@@ -959,7 +1052,8 @@ impl ProvenanceOrchestrationUseCase {
                      degrade to NoAttestation (allow)",
                 );
                 let verdict = ProvenanceVerdict::no_attestation();
-                self.apply_verdict(artifact, backend, verdict, mode).await
+                self.apply_verdict(artifact, backend, verdict, mode, window_open)
+                    .await
             }
         }
     }

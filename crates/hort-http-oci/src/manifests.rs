@@ -245,8 +245,39 @@ pub(super) async fn serve(
     //    → 503 + Retry-After via the shared helper; rejected is hidden
     //    as MANIFEST_UNKNOWN (format-specific envelope, so inline here
     //    rather than in the helper).
-    if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
-        return resp;
+    //
+    //    Push-then-sign exception (mirrors the blob-HEAD existence probe
+    //    in `blobs.rs`): a write-authorized caller's manifest-EXISTENCE
+    //    check (`HEAD`) must report the descriptor (200, headers, empty
+    //    body) so a held subject can be signed. Under `provenance_mode:
+    //    Required` the subject image is held `Quarantined` until a
+    //    signature arrives, but cosign's `sign` preflight is exactly a
+    //    `HEAD manifests/<digest>` — a 503 there aborts the sign and the
+    //    signature can never attach (issue #13). The 503 hold stays in
+    //    force for: the manifest GET (every caller, `head == false`), and
+    //    read HEADs (non-writers / anonymous / proxy scopes). So the
+    //    transparent-proxy contract (quarantine invariant #5) is
+    //    untouched; only the write-authorized existence probe is released.
+    //    Fail closed: ONLY a definitive `Write` authorization skips the
+    //    503 — a denied or errored resolve keeps it. The extra resolve
+    //    fires solely on the narrow quarantined-manifest-HEAD path (the
+    //    `matches!` short-circuits first), so the hot read path is
+    //    unaffected.
+    let write_authorized_existence_probe = head
+        && matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
+        && ctx
+            .repository_access_use_case
+            .resolve(
+                repo_key,
+                actor,
+                hort_app::use_cases::repository_access::AccessLevel::Write,
+            )
+            .await
+            .is_ok();
+    if !write_authorized_existence_probe {
+        if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
+            return resp;
+        }
     }
     if matches!(artifact.quarantine_status, QuarantineStatus::Rejected) {
         return OciError::ManifestUnknown {
@@ -2122,6 +2153,191 @@ mod tests {
         assert!(
             parsed["errors"][0]["detail"]["retry_after_seconds"].is_i64(),
             "detail.retry_after_seconds must be a number"
+        );
+    }
+
+    // -- Write-authorized manifest HEAD existence-probe exemption (issue #13) --
+    //
+    // Mirrors the blob-HEAD existence-probe pair in `blobs.rs`. Under
+    // `provenance_mode: Required` the subject image is held `Quarantined`
+    // until a signature arrives; cosign's `sign` preflight is a
+    // `HEAD manifests/<digest>`, so a write-authorized HEAD on a held
+    // manifest must report the descriptor (200) rather than 503 — else the
+    // signature can never attach. Everything else (GET / non-writers /
+    // anonymous) stays 503.
+
+    /// Build an RBAC-enabled context that grants `claim` repo-wide `Write`,
+    /// reusing the harness's `repositories` mock so seeded repos resolve.
+    /// Byte-for-byte mirror of the blob test's `write_grant_ctx`.
+    fn write_grant_ctx(
+        base: &Arc<AppContext>,
+        repositories: Arc<MockRepositoryRepository>,
+        claim: &str,
+    ) -> Arc<AppContext> {
+        use hort_app::rbac::RbacEvaluator;
+        use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
+        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
+        use hort_app::use_cases::test_support::{MockIdentityProvider, MockUserRepository};
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+        use hort_domain::ports::identity_provider::IdentityProvider;
+        use hort_domain::ports::user_repository::UserRepository;
+        use hort_http_core::context::AuthContext;
+        use hort_http_core::test_support::{with_auth, with_repository_access};
+
+        let grant = PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(vec![claim.to_string()]),
+            repository_id: None,
+            permission: Permission::Write,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        };
+        let rbac_swap = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            grant,
+        ])));
+        let authenticate = Arc::new(AuthenticateUseCase::new(
+            Arc::new(MockIdentityProvider::new()) as Arc<dyn IdentityProvider>,
+            Arc::new(MockUserRepository::new()) as Arc<dyn UserRepository>,
+            Vec::new(),
+        ));
+        let ctx = with_auth(
+            base,
+            AuthContext::Enabled {
+                authenticate,
+                rbac: rbac_swap.clone(),
+                issuer_url: None,
+            },
+        );
+        let access = Arc::new(RepositoryAccessUseCase::new(
+            repositories,
+            RbacAccess::Enabled(rbac_swap),
+            true,
+        ));
+        with_repository_access(&ctx, access)
+    }
+
+    /// A `CallerPrincipal` carrying exactly `claim`.
+    fn principal_with_claim(claim: &str) -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: Uuid::from_u128(0xC1),
+            external_id: "kc:ci".into(),
+            username: "ci".into(),
+            email: "ci@example.com".into(),
+            claims: vec![claim.to_string()],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        }
+    }
+
+    /// Drive `serve()` for a digest-referenced *quarantined* manifest in a
+    /// public OCI repo, returning the response status. The repo is public
+    /// (anonymous Read is free) so the `Write` grant is the sole
+    /// discriminator the quarantine gate sees — matching the blob helper.
+    fn quarantined_manifest_serve_status(head: bool, actor_claim: Option<&str>) -> StatusCode {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Quarantined,
+            );
+            // A `ci-pusher` Write grant always exists in the system; whether
+            // the *caller* carries it is the variable under test.
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = actor_claim.map(principal_with_claim);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                principal.as_ref(),
+            )
+            .await
+            .status()
+        })
+    }
+
+    /// Push-then-sign regression: a write-authorized caller's
+    /// `HEAD /v2/<repo>/<name>/manifests/<digest>` is cosign's sign
+    /// preflight. It MUST report the manifest EXISTS (200) so a held
+    /// subject can be signed — even while the manifest is `Quarantined`
+    /// under a provenance hold. Returning 503 here aborts `cosign sign`
+    /// and the signature can never attach (issue #13).
+    #[test]
+    fn head_manifest_quarantined_by_write_authorized_caller_reports_exists_not_503() {
+        let status = quarantined_manifest_serve_status(/* head = */ true, Some("ci-pusher"));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a write-authorized caller's manifest-existence HEAD on a quarantined \
+             manifest must report 200 (exists) so cosign can sign the held subject — \
+             not 503, which aborts the sign"
+        );
+    }
+
+    /// Security scope guard: the existence-probe exemption is gated on WRITE
+    /// authorization. An anonymous (read-only) caller's HEAD on a quarantined
+    /// manifest still 503s, so the exemption never leaks a held manifest's
+    /// existence to a non-writer or to the transparent-proxy pull path
+    /// (quarantine invariant #5).
+    #[test]
+    fn head_manifest_quarantined_anonymous_caller_still_returns_503() {
+        let status =
+            quarantined_manifest_serve_status(/* head = */ true, /* anonymous */ None);
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "anonymous HEAD on a quarantined manifest must stay 503 — the existence-probe \
+             exemption is write-authorized only, never open to pull/read/proxy callers"
+        );
+    }
+
+    /// Security scope guard: fail-closed. A caller whose claim does NOT carry
+    /// the `Write` grant (the resolve denies) gets 503 on a HEAD of a
+    /// quarantined manifest — only a definitive `Write` authorization skips
+    /// the hold.
+    #[test]
+    fn head_manifest_quarantined_non_writer_denied_resolve_returns_503() {
+        let status = quarantined_manifest_serve_status(/* head = */ true, Some("some-reader"));
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a HEAD by a caller without the Write grant must stay 503 — fail-closed: \
+             only a definitive Write authorization releases the existence probe"
+        );
+    }
+
+    /// Security scope guard: the exemption is HEAD-only. A write-authorized
+    /// caller's manifest GET of a quarantined manifest still 503s — the
+    /// quarantine DOWNLOAD block (invariant #1) holds even for the pusher and
+    /// the GET/proxy path (invariant #5) is untouched; only the existence
+    /// probe is released, never the held manifest body.
+    #[test]
+    fn get_manifest_quarantined_write_authorized_caller_still_returns_503() {
+        let status = quarantined_manifest_serve_status(/* head = */ false, Some("ci-pusher"));
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write-authorized GET of a quarantined manifest must stay 503 — only the \
+             HEAD existence probe is released; the manifest body stays held for every caller"
         );
     }
 

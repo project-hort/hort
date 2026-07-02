@@ -29,9 +29,10 @@ verifiers slot in as additional `provenance_backends` entries behind the same
 
 The excluded class is the **sovereign, internal-audience operator who signs
 first-party artifacts with a long-lived key** (`cosign sign --key`, the
-`simplesigning` shape — the live signer here additionally uses
-`--registry-referrers-mode=legacy`). For that operator the keyless path is not
-merely inconvenient, it is unreachable:
+`simplesigning` shape). Hosted keyed signing on Hort **requires OCI referrers
+mode** (`cosign sign --registry-referrers-mode=oci-1-1`); see §9 — the canary
+signer must use `oci-1-1`, **not** `--registry-referrers-mode=legacy`. For that
+operator the keyless path is not merely inconvenient, it is unreachable:
 
 1. **No public Fulcio will issue for the signing identity.** Public Fulcio
    trusts a fixed set of OIDC issuers; a self-hosted GitLab is not one. The
@@ -215,6 +216,31 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    simplesigning `bytes` is not one → `NoAttestation`). One bundle list thus carries
    both shapes and each verifier self-selects (§6).
 
+9. **Keyed hosted signing requires OCI referrers mode (added 2026-07-02, issue
+   #13).** The simplesigning-aware carriage (§8) collects a keyed `.sig` from a
+   subject-linked **referrer** manifest — the `oci_subject` content-reference
+   row that push writes (`crates/hort-http-oci/src/manifests_write.rs`) is what
+   binds the signature to the image the verifier is judging, and what S3's
+   signature-arrival re-verify (ADR 0027 amendment) resolves. The legacy cosign
+   `sha256-<hex>.sig` **tag scheme** is honored only on the **upstream-proxy
+   fetch** path (`UpstreamProxy::fetch_referrers`'s tag-scheme fallback, ADR
+   0027 §8 / `provenance_orchestration.rs`), **not** on the hosted push path: a
+   signature pushed to a `sha256-<hex>.sig` tag carries no `subject` and so is
+   never subject-linked into local carriage, stays invisible to the verifier,
+   and — under `provenance_mode: Required` with the hold-until-signed amendment
+   — the subject image is never cleared and rejects `Unsigned` at window expiry.
+   Therefore **first-party hosted keyed signing MUST use
+   `cosign sign --registry-referrers-mode=oci-1-1`** (subject-based referrers,
+   already handled by carriage), and the enablement how-to states this. Legacy
+   tag-scheme support on the hosted push path is deliberately **not built**
+   (recorded operator intent: if it is ever needed, it is a follow-on that
+   mirrors the proxy-side tag-scheme fallback onto push — `manifests_write`
+   recognition + `oci_subject` linkage — not part of this decision). The canary
+   / test signer must accordingly use `--registry-referrers-mode=oci-1-1`, not
+   `legacy`. This is the one operator-facing behaviour change; it is a
+   documentation requirement, not new code (the OCI-referrers path was already
+   the supported carriage).
+
 ## Consequences
 
 - A sovereign keyed-cosign operator gets `provenance_mode: Required`
@@ -248,6 +274,12 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
   byte-for-byte unchanged: `signature = None`, same `bytes`).
 - The `backend` metric label gains the `cosign-key` value (catalog update in
   the implementing PR — §5).
+- Hosted keyed signing has one operator requirement: sign with
+  `--registry-referrers-mode=oci-1-1` (§9). A legacy `sha256-<hex>.sig`-tagged
+  signature pushed to Hort is not subject-linked and stays invisible to the
+  verifier — under `Required` (with the ADR 0027 hold-until-signed amendment)
+  the image then rejects `Unsigned` at window expiry. The legacy tag scheme
+  remains honored only on the upstream-proxy fetch path.
 
 ## Alternatives considered
 
@@ -302,5 +334,8 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
   single-verifier `applicable[0]` selection, the `backend` metric label, and the
   verdict fold this ADR makes the first multi-verifier user of.
 - `crates/hort-domain/src/entities/artifact.rs` — `ProvenanceClearance` /
-  `complete_provenance` / the release timer-arm AND-precondition, reused
-  unchanged.
+  `complete_provenance` (now window-aware — ADR 0027 hold-until-signed
+  amendment) / the release timer-arm AND-precondition, reused unchanged.
+- `crates/hort-http-oci/src/manifests_write.rs` — the `oci_subject`
+  content-reference row that subject-links a pushed referrer (why §9 requires
+  `--registry-referrers-mode=oci-1-1` for hosted keyed signing).

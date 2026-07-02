@@ -80,7 +80,8 @@ impl TaskHandler for ProvenanceVerifyHandler {
                     // `result_summary`, including the previously-silent
                     // `no_attestation` case. Closed taxonomy:
                     // `verified` / `rejected:<reason>` /
-                    // `no_attestation` / `skipped:<why>`.
+                    // `no_attestation` / `held_pending_signature` /
+                    // `skipped:<why>`.
                     let result = result_summary_label(&outcome);
                     // A single `debug!` on the silent path is the most that
                     // is allowed — NO per-`no_attestation` `info!` (firehose
@@ -114,7 +115,8 @@ impl TaskHandler for ProvenanceVerifyHandler {
 /// Map a [`ProvenanceRunOutcome`] to the compact `result_summary` label
 /// written on the job row. The closed
 /// taxonomy is `verified` / `rejected:<reason>` / `no_attestation` /
-/// `skipped:<why>`; `<reason>` reuses the metrics-catalog wire string so the
+/// `held_pending_signature` / `skipped:<why>`; `<reason>` reuses the
+/// metrics-catalog wire string so the
 /// `result_summary` trail and the `hort_provenance_reject_total{reason}`
 /// series agree. Pure — testable without the use case.
 fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
@@ -130,6 +132,7 @@ fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
                 )
             }
             ProvenanceVerdictSummary::NoAttestation => "no_attestation".to_string(),
+            ProvenanceVerdictSummary::HeldPendingSignature => "held_pending_signature".to_string(),
         },
     }
 }
@@ -391,6 +394,21 @@ mod tests {
             summary,
             serde_json::json!({ "result": "rejected:untrusted_identity" })
         );
+    }
+
+    /// The S1 hold verdict (issue #13) maps to the distinct
+    /// `held_pending_signature` `result_summary` label — separable from the
+    /// allowed-unsigned `no_attestation` no-op. Asserted on the pure
+    /// `result_summary_label` mapper (its doc contract: testable without the
+    /// use case); the emission on the real hold path is covered by the
+    /// orchestration use-case metric test.
+    #[test]
+    fn held_pending_signature_maps_to_result_summary_label() {
+        let outcome = ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+        };
+        assert_eq!(result_summary_label(&outcome), "held_pending_signature");
     }
 
     /// Under `Off` the handler records `skipped:off` (defensive — the ingest

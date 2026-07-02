@@ -164,6 +164,83 @@ verify identically.**
    root, not in the upstream registry — which is what makes proxied
    verification meaningful rather than theatre.
 
+## Amendment (2026-07-02, issue #13 — hold-until-signed)
+
+The original decision applied the `NoAttestation × Required` verdict
+**terminally at ingest**. Because a keyed cosign signature signs the
+*already-pushed* digest, the image must exist before it can be signed, so the
+ingest-time verify (~12 s after push) always found `NoAttestation` and rejected
+immediately — a manifest read then 404s, the CI's `cosign sign` preflight
+(`HEAD manifests/<digest>`) gets 404, and the signature can never attach. The
+push-then-sign CI round-trip was structurally impossible under `Required`. This
+amendment makes the missing-signature verdict **observation-window-aware** and
+lets a write-authorized caller probe a held manifest's existence, without adding
+any new release authority.
+
+1. **`NoAttestation × Required` is held over the quarantine observation window,
+   not rejected at ingest.** `Artifact::complete_provenance`
+   (`crates/hort-domain/src/entities/artifact.rs`) gains a `window_open: bool`
+   parameter. The domain stays I/O-free; the app layer computes the flag from
+   `effective_quarantine_deadline(quarantine_window_start, resolved-duration) >
+   now` in `provenance_orchestration.rs::verify_artifact` and threads it in.
+   Only the `NoAttestation × Required` arm consults it:
+   - **window open** → `Ok(None)`: no event, status stays `Quarantined` →
+     clearance `Pending` (held, exactly like an incomplete scan);
+   - **window closed** → terminal `Rejected` + `ProvenanceRejected{Unsigned}`
+     (the original behaviour, deferred to expiry).
+
+   The `Verified` and `Rejected` arms **never** consult `window_open`: a valid
+   signature clears and a **bad** signature (`Rejected` — forged, wrong-key,
+   digest-mismatch) rejects **immediately, even mid-window**. The design
+   principle is that a *missing* signature is time-dependent (the artifact may
+   yet be signed) and is held; a *bad* signature is time-independent (already
+   wrong) and is terminal at once. The hold state itself is not new — `Pending`
+   already denies the timer arm; the fix is deferring the terminal decision, not
+   adding a fail-open path.
+
+2. **The transition is driven by re-verification, in one place.** On
+   subject-based signature arrival, `IngestUseCase::ingest_signature_manifest`
+   resolves the referrer's subject artifact and enqueues a best-effort,
+   non-gating `provenance-verify` for it (S3), so a held image reaches `Cleared`
+   promptly. At window expiry the release sweep
+   (`quarantine_use_case.rs::release_expired`) enqueues a **final**
+   `provenance-verify` for any `Required` + `Pending` past-deadline candidate;
+   that run computes `window_open = false`, so `complete_provenance` either
+   clears it (a signature that landed just before expiry) or emits terminal
+   `ProvenanceRejected{Unsigned}`. The expiry enqueue is idempotent per tick
+   (`JobsRepository::find_active_provenance_for_artifact` short-circuits a
+   re-enqueue while one is in flight) and doubles as the backstop if the S3
+   enqueue was lost. The sweep never itself releases a `Pending` candidate — the
+   domain predicate still refuses it.
+
+3. **Write-authorized manifest-HEAD existence-probe exemption.** A
+   `Write`-authorized caller's `HEAD` on a `Quarantined` manifest reports the
+   descriptor (200, headers, empty body) so cosign's `sign` preflight succeeds
+   and a signature can attach; the manifest **GET** stays 503 for every caller,
+   and read HEADs (anonymous / non-writers / proxy scopes) stay 503. This
+   mirrors the already-established blob-HEAD `write_authorized_existence_probe`
+   exactly: HEAD-only, `Quarantined`-only, gated on a definitive
+   `AccessLevel::Write` resolve via `repository_access_use_case`, and
+   fail-closed (a denied or errored resolve keeps the 503). See
+   `crates/hort-http-oci/src/manifests.rs`
+   (`write_authorized_existence_probe`), mirroring
+   `crates/hort-http-oci/src/blobs.rs`. **Quarantine invariant #5 (transparent
+   proxy 503) is preserved for the GET/proxy path** and amended only for the
+   write-authorized manifest HEAD — no anonymous manifest-metadata disclosure,
+   and the proxy/Artifactory retry semantics are untouched.
+
+4. **Observability.** The held-pending-signature case (the `Ok(None)` under
+   `Required` with the window open) ticks a distinct `held_pending_signature`
+   value of `hort_provenance_verify_total{result}` (via
+   `ProvenanceVerifyResult::HeldPendingSignature`), separable from the
+   allowed-unsigned `no_attestation` no-op, plus an `info!` audit line — so an
+   operator can see images *waiting to be signed*.
+
+The fail-closed release predicate (ADR 0007), the digest binding, the
+pure-bundle quarantine exemption, and the apply-time linter are all unchanged;
+this amendment only defers the `Required`-unsigned terminal decision to window
+expiry and opens the write-authorized manifest HEAD.
+
 ## Consequences
 
 - A combined real-verifier end-to-end test remains open: the full chain
@@ -178,8 +255,9 @@ verify identically.**
 - `Required` is deliberately sharp: it rejects genuinely-unsigned upstream
   images on a proxy (that is what it means), and an operator who enables
   `Required` while leaving the worker verifier disabled gets artifacts that
-  stay `Pending` forever — fail-closed, never fail-open, but operationally
-  surprising; the enablement how-to warns about it.
+  stay `Pending` for the observation window and then reject `Unsigned` at
+  expiry (per the hold-until-signed amendment) — fail-closed, never fail-open,
+  but operationally surprising; the enablement how-to warns about it.
 - Only the Sigstore v0.3 bundle format verifies. A signature published solely
   in the legacy cosign `simplesigning` shape yields `NoAttestation` (allowed
   under `VerifyIfPresent`, rejected `Unsigned` under `Required`).

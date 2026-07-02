@@ -18,8 +18,19 @@ the publish-body limit. And the per-`(repo, principal)` OCI **upload-session cap
 no longer leaks** on abandoned uploads — it is now an authoritative,
 self-pruning live-session set rather than a free-floating counter.
 
+### Changed
+
+- **Keyed cosign signing against a hosted repo must use
+  `--registry-referrers-mode=oci-1-1`** (subject-based referrers); the legacy
+  `sha256-<hex>.sig` tag mode is not linked to its subject on the push path, so
+  a signature pushed that way stays invisible to the verifier.
+
 ### Fixed
 
+- **`provenance_mode: Required` now supports the push-then-sign CI flow**:
+  unsigned artifacts are held for the quarantine window and re-verified when the
+  signature arrives, instead of being rejected at ingest before the signature
+  can be attached (issue #13).
 - **OCI chunked blob-upload push now works (buildah / podman / skopeo).** The OCI
   blob-upload `PATCH` and finalize `PUT` handlers hard-required a `Content-Length`
   header and rejected its absence with `BLOB_UPLOAD_INVALID`. Clients that stream a

@@ -2968,7 +2968,7 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation` |
+| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
 
 Both counters are emitted at exactly **one layer** — the orchestration
@@ -2989,7 +2989,8 @@ labels carry repo names, so operators **must** restrict it with a
 NetworkPolicy (see the how-to
 `docs/architecture/how-to/enable-provenance-verification.md` → *Worker
 metrics*). The companion per-job `result_summary`
-(`verified` / `rejected:<reason>` / `no_attestation` / `skipped:<why>`) is
+(`verified` / `rejected:<reason>` / `no_attestation` /
+`held_pending_signature` / `skipped:<why>`) is
 the per-artifact trail and is **not** a metric.
 
 The verify counter ticks on every applied verdict;
@@ -3040,7 +3041,15 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   `Required`-mode fetch-exhaustion fail-closed (`Rejected{RekorNotFound}`).
 - `no_attestation` — no bundle was found/passed and the mode allowed it
   (`VerifyIfPresent` no-op, no event). Strictly the allowed-unsigned
-  case: an unsigned artifact under `Required` ticks `rejected` instead.
+  case: an unsigned artifact under `Required` within its window ticks
+  `held_pending_signature`, and past its window ticks `rejected`.
+- `held_pending_signature` — Required-mode unsigned artifact held pending
+  signature within its quarantine window (issue #13). No event;
+  `complete_provenance` returns `Ok(None)` and the artifact stays
+  `Quarantined` (read as `Pending`/fail-closed by the release gate) so it
+  can still be signed. Separates images *waiting to be signed* from the
+  allowed-unsigned `no_attestation` no-op; at window expiry the terminal
+  decision ticks `verified` (a signature landed) or `rejected` (`Unsigned`).
 
 **`reason` semantics** (`hort_provenance_reject_total`) — one per
 `ProvenanceRejectReason` variant:
@@ -3067,7 +3076,7 @@ accompanying `info!` audit line on the `ProvenanceVerified` /
 not `err`).
 
 Cardinality: `hort_provenance_verify_total` ≤ `backend` (~few) × `mode`
-(3) × `result` (3); `hort_provenance_reject_total` ≤ `backend` × `reason`
+(3) × `result` (4); `hort_provenance_reject_total` ≤ `backend` × `reason`
 (5). Both are tiny in Tier 1 (one backend).
 
 ### Admin task dispatcher
