@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-07-01
+
+Beta release (`0.9.8-beta.1`). Headlines: OCI **chunked blob-upload push** now
+works — buildah / podman / skopeo stream layers via HTTP `Transfer-Encoding:
+chunked` (no `Content-Length`, which RFC 7230 §3.3.2 forbids alongside chunked
+TE), which the blob-upload `PATCH` and finalize `PUT` handlers previously
+rejected deterministically; the body is now streamed and bounded in-stream by
+the publish-body limit. And the per-`(repo, principal)` OCI **upload-session cap
+no longer leaks** on abandoned uploads — it is now an authoritative,
+self-pruning live-session set rather than a free-floating counter.
+
 ### Fixed
 
 - **OCI chunked blob-upload push now works (buildah / podman / skopeo).** The OCI
