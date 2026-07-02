@@ -7,16 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.8] - 2026-07-01
+## [0.9.8] - 2026-07-02
 
-Beta release (`0.9.8-beta.1`). Headlines: OCI **chunked blob-upload push** now
-works — buildah / podman / skopeo stream layers via HTTP `Transfer-Encoding:
-chunked` (no `Content-Length`, which RFC 7230 §3.3.2 forbids alongside chunked
-TE), which the blob-upload `PATCH` and finalize `PUT` handlers previously
-rejected deterministically; the body is now streamed and bounded in-stream by
-the publish-body limit. And the per-`(repo, principal)` OCI **upload-session cap
-no longer leaks** on abandoned uploads — it is now an authoritative,
-self-pruning live-session set rather than a free-floating counter.
+Headlines: OCI **chunked blob-upload push** (buildah / podman / skopeo stream
+layers via HTTP `Transfer-Encoding: chunked`, no `Content-Length`, streamed and
+bounded by the publish-body limit); an authoritative, self-pruning
+per-`(repo, principal)` OCI **upload-session cap**; and **push-then-sign support
+under `provenance_mode: Required`**, where an unsigned artifact is held for the
+quarantine window and re-verified when the cosign signature arrives (issue #13).
 
 ### Changed
 
@@ -27,10 +25,10 @@ self-pruning live-session set rather than a free-floating counter.
 
 ### Fixed
 
-- **`provenance_mode: Required` now supports the push-then-sign CI flow**:
-  unsigned artifacts are held for the quarantine window and re-verified when the
-  signature arrives, instead of being rejected at ingest before the signature
-  can be attached (issue #13).
+- **`provenance_mode: Required` supports the push-then-sign CI flow.** An
+  unsigned artifact is held for its quarantine window and re-verified when the
+  cosign signature arrives; it is rejected `Unsigned` only if still unsigned at
+  window expiry (issue #13).
 - **OCI chunked blob-upload push now works (buildah / podman / skopeo).** The OCI
   blob-upload `PATCH` and finalize `PUT` handlers hard-required a `Content-Length`
   header and rejected its absence with `BLOB_UPLOAD_INVALID`. Clients that stream a
@@ -56,6 +54,15 @@ self-pruning live-session set rather than a free-floating counter.
   Adds the `HORT_OCI_SESSION_MAX_AGE_SECS` config knob (1..=604800 s, default
   3600; previously a hardcoded constant), a bounded cap-exceeded `Retry-After`
   (15 s), and the OCI-spec `DELETE /v2/<name>/blobs/uploads/<uuid>` cancel route.
+
+### Security
+
+- **`quick-xml` DoS advisories RUSTSEC-2026-0194 / -0195 accepted as a bounded
+  risk.** `quick-xml` (transitive via `object_store`) has no `object_store`-
+  compatible fixed release. It is reachable only through `object_store` parsing
+  XML from the TLS-verified, operator-configured S3/Azure backend, not the
+  artifact push/pull path. Ignored in `.cargo/audit.toml` + `deny.toml`; revisit
+  when `object_store` adopts `quick-xml >= 0.41.0`.
 
 ## [0.9.7] - 2026-06-30
 
