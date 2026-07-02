@@ -167,6 +167,40 @@ impl PgJobsRepository {
         .map_err(|e| map_sqlx_error(&e, "ScanJob", &artifact_id.to_string()))?;
         Ok(id_opt)
     }
+
+    /// Return the id of an in-flight `kind='provenance-verify'` row
+    /// (status `'pending'` or `'running'`) for `artifact_id`, or `None`
+    /// when no such row exists.
+    ///
+    /// Powers the expiry backstop's per-tick dedup
+    /// (`QuarantineUseCase::release_expired`): a `Required` + `Pending`
+    /// candidate enqueues a final verify only when none is already
+    /// in-flight, so repeated sweep ticks between the enqueue and the
+    /// worker running it do not pile up duplicate open rows.
+    ///
+    /// `provenance-verify` rows carry `artifact_id` inside the `params`
+    /// JSONB (`{"artifact_id": …}`), NOT the scan-typed `artifact_id`
+    /// column (see `enqueue_provenance_verify_in_tx` +
+    /// `enqueue_task("provenance-verify", …)`), so the predicate matches
+    /// on `params->>'artifact_id'`.
+    async fn find_active_provenance_for_artifact_impl(
+        &self,
+        artifact_id: Uuid,
+    ) -> DomainResult<Option<Uuid>> {
+        let id_opt: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id \
+             FROM public.jobs \
+             WHERE kind = 'provenance-verify' \
+               AND params->>'artifact_id' = $1 \
+               AND status IN ('pending', 'running') \
+             LIMIT 1",
+        )
+        .bind(artifact_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "ProvenanceVerifyJob", &artifact_id.to_string()))?;
+        Ok(id_opt)
+    }
 }
 
 /// PostgreSQL `unique_violation` SQLSTATE — surfaced when the partial
@@ -608,6 +642,13 @@ impl JobsRepository for PgJobsRepository {
         artifact_id: Uuid,
     ) -> BoxFuture<'a, DomainResult<Option<Uuid>>> {
         Box::pin(self.find_active_scan_for_artifact_impl(artifact_id))
+    }
+
+    fn find_active_provenance_for_artifact<'a>(
+        &'a self,
+        artifact_id: Uuid,
+    ) -> BoxFuture<'a, DomainResult<Option<Uuid>>> {
+        Box::pin(self.find_active_provenance_for_artifact_impl(artifact_id))
     }
 
     fn pending_scan_count<'a>(&'a self) -> BoxFuture<'a, DomainResult<i64>> {

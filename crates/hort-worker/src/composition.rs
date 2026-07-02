@@ -470,6 +470,10 @@ pub async fn build_app_context(
         policy_projections.clone(),
         content_references.clone(),
         storage.clone(),
+        // S4 provenance expiry backstop: `release_expired` enqueues a
+        // final `provenance-verify` for Required + Pending + expired
+        // candidates via the shared `jobs` adapter.
+        jobs.clone(),
     ));
 
     // -----------------------------------------------------------------

@@ -1445,6 +1445,14 @@ pub async fn build_app_context(
     // `commit_scan_result_with_score` SQL transaction; hort-server
     // itself does not need a separate `ScanFindingsRepository`
     // handle.
+    // The `jobs` table adapter is needed earlier
+    // than its later use site (`TaskUseCase`) because `IngestUseCase`
+    // calls `enqueue_scan` on it for the ingest-time scan auto-enqueue
+    // (when a `ScanPolicy` matches the inbound repository), and
+    // `QuarantineUseCase::release_expired` uses it for the S4 provenance
+    // expiry backstop. Single Arc shared with `IngestUseCase` +
+    // `TaskUseCase` + `ManualRescanUseCase` below.
+    let jobs_repo = Arc::new(PgJobsRepository::new(db.clone()));
     let quarantine_use_case = Arc::new(
         QuarantineUseCase::new(
             artifact_repo.clone(),
@@ -1458,6 +1466,10 @@ pub async fn build_app_context(
             // use case writes through; both observe the same projection.
             content_references.clone(),
             storage.clone(),
+            // S4 provenance expiry backstop: `release_expired` enqueues a
+            // final `provenance-verify` for Required + Pending + expired
+            // candidates via this handle.
+            jobs_repo.clone(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`record_scan_result` Reject-branch
@@ -1480,12 +1492,6 @@ pub async fn build_app_context(
         artifact_group_lifecycle.clone(),
         include_repository_label,
     ));
-    // The `jobs` table adapter is needed earlier
-    // than its later use site (`TaskUseCase`) because `IngestUseCase`
-    // calls `enqueue_scan` on it for the ingest-time scan auto-enqueue
-    // (when a `ScanPolicy` matches the inbound repository). Single
-    // Arc shared with `TaskUseCase` + `ManualRescanUseCase` below.
-    let jobs_repo = Arc::new(PgJobsRepository::new(db.clone()));
     let ingest_use_case = Arc::new(
         IngestUseCase::new(
             storage.clone(),

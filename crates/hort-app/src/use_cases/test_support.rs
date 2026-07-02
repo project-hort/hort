@@ -5347,6 +5347,11 @@ pub struct MockJobsRepository {
     /// Empty by default (the manual-rescan use case sees "no in-flight
     /// scan" and proceeds to enqueue).
     active_scans: Mutex<HashMap<Uuid, Uuid>>,
+    /// Seed map returned by
+    /// `find_active_provenance_for_artifact`. `(artifact_id) -> existing
+    /// job_id`. Empty by default (the expiry backstop sees "no in-flight
+    /// provenance-verify" and proceeds to enqueue).
+    active_provenance: Mutex<HashMap<Uuid, Uuid>>,
     /// Recorded calls to `enqueue_scan`.
     enqueue_scan_calls: Mutex<Vec<EnqueueScanCall>>,
     /// When `Some`, `enqueue_scan` returns this error instead of Ok.
@@ -5401,6 +5406,7 @@ impl Default for MockJobsRepository {
             reschedule_calls: Mutex::new(Vec::new()),
             mark_failed_calls: Mutex::new(Vec::new()),
             active_scans: Mutex::new(HashMap::new()),
+            active_provenance: Mutex::new(HashMap::new()),
             enqueue_scan_calls: Mutex::new(Vec::new()),
             enqueue_scan_error: Mutex::new(None),
             prefetch_batch_calls: Mutex::new(Vec::new()),
@@ -5485,6 +5491,18 @@ impl MockJobsRepository {
     /// conflict-detection tests.
     pub fn seed_active_scan(&self, artifact_id: Uuid, job_id: Uuid) {
         self.active_scans
+            .lock()
+            .unwrap()
+            .insert(artifact_id, job_id);
+    }
+
+    /// Seed an in-flight `provenance-verify` job for
+    /// an artifact so `find_active_provenance_for_artifact(artifact_id)`
+    /// returns `Ok(Some(existing_job_id))`. Used by the expiry-backstop
+    /// idempotency test to prove a second tick does not re-enqueue while
+    /// a verify is already in-flight.
+    pub fn seed_active_provenance(&self, artifact_id: Uuid, job_id: Uuid) {
+        self.active_provenance
             .lock()
             .unwrap()
             .insert(artifact_id, job_id);
@@ -5630,6 +5648,19 @@ impl JobsRepository for MockJobsRepository {
         artifact_id: Uuid,
     ) -> BoxFuture<'a, DomainResult<Option<Uuid>>> {
         let res = self.active_scans.lock().unwrap().get(&artifact_id).copied();
+        Box::pin(async move { Ok(res) })
+    }
+
+    fn find_active_provenance_for_artifact<'a>(
+        &'a self,
+        artifact_id: Uuid,
+    ) -> BoxFuture<'a, DomainResult<Option<Uuid>>> {
+        let res = self
+            .active_provenance
+            .lock()
+            .unwrap()
+            .get(&artifact_id)
+            .copied();
         Box::pin(async move { Ok(res) })
     }
 

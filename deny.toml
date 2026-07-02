@@ -70,6 +70,17 @@ ignore = [
     # Only path is dev-dep `axum-server` for the mTLS / pinning test
     # servers; production migrated to `PemObject`.
     "RUSTSEC-2025-0134",
+
+    # quick-xml 0.39.4 — two high-severity DoS advisories (RUSTSEC-2026-0194
+    # quadratic duplicate-attribute check; RUSTSEC-2026-0195 unbounded
+    # namespace-declaration allocation). Fix is quick-xml >= 0.41.0, but no
+    # `object_store` release adopts it yet (0.13.2 → ^0.39, latest 0.14.0 →
+    # ^0.40.1, both < 0.41.0). Reached only via `object_store` parsing XML from
+    # the TLS-verified, operator-configured S3 backend — not reachable from the
+    # artifact push/pull path. Time-boxed; drop when object_store adopts
+    # quick-xml >= 0.41.0. See `.cargo/audit.toml` for the full rationale.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 # ===========================================================================

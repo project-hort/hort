@@ -608,6 +608,238 @@ async fn required_unsigned_rejects_unsigned() {
 }
 
 // ===========================================================================
+// window_open computation + threading (issue #13, Item 2 / design §2 S1/S4).
+//
+// `verify_artifact` computes
+//   window_open = effective_quarantine_deadline(quarantine_window_start,
+//                   resolved ScanPolicy.quarantineDuration) > now
+// and threads it into `complete_provenance`. The default fixture policy
+// (`quarantine_duration_secs: 0`) yields `window_open = false` (deadline ==
+// anchor == now, and `now > now` is false), which is why every existing
+// `Required + unsigned` test above still terminally rejects. These tests
+// seed a POSITIVE duration so the window is open, and cover the
+// missing-anchor + fetch-failure-stays-closed edges.
+// ===========================================================================
+
+/// Seed a `Required` policy for the fixture's repo whose quarantine window
+/// is `duration_secs` wide (repo-scoped). Build the fixture with `mode:
+/// None` so this is the ONLY active policy (no duplicate repo-scoped rows).
+fn seed_required_policy_with_duration(f: &Fixture, duration_secs: i64) {
+    let mut p = projection(
+        PolicyScope::Repository(f.repository_id),
+        ProvenanceMode::Required,
+        vec![sample_pattern()],
+    );
+    p.quarantine_duration_secs = duration_secs;
+    f.projections.insert(p);
+}
+
+// ---------------------------------------------------------------------------
+// Required + unsigned + observation window STILL OPEN → HELD.
+// `complete_provenance` returns Ok(None); no event is appended; the artifact
+// stays `Quarantined` (the release gate reads it as Pending / held). This is
+// the push-then-sign round-trip's core: an unsigned image is not rejected at
+// the first verify while it may yet be signed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn required_unsigned_window_open_holds_pending_no_event() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None, // no default policy — seed the positive-duration one below
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    // A wide window (24h) with the fixture's fresh `quarantine_window_start`
+    // (= now) ⇒ deadline is far in the future ⇒ window_open = true.
+    seed_required_policy_with_duration(&f, 24 * 3600);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+        },
+        "Required + unsigned mid-window must HOLD (no event) as HeldPendingSignature, not reject \
+         and not conflated with the allowed-unsigned NoAttestation no-op",
+    );
+    // The verifier ran (with zero bundles — genuinely unsigned).
+    assert_eq!(port.last_inputs(), Some((0, ARTIFACT_PAYLOAD.len())));
+    // Status is UNCHANGED — held Quarantined, not Rejected.
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Quarantined,
+        "an unsigned Required artifact holds Quarantined while the window is open",
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "the hold path appends NO provenance verdict event",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Required + unsigned + observation window CLOSED → terminal Rejected{Unsigned}.
+// A zero-width window (anchor == deadline == now, `now > now` is false) makes
+// window_open = false, so `complete_provenance` maps NoAttestation to the
+// terminal rejection. This is the window-closed terminal branch reached via
+// the app-computed window_open (distinct from the always-closed default
+// fixture: here the policy IS Required with an explicit anchor).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn required_unsigned_window_closed_rejects_unsigned() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    // A zero-width window: deadline == anchor == now ⇒ `now > now` == false ⇒
+    // window_open = false ⇒ terminal rejection at this verify.
+    seed_required_policy_with_duration(&f, 0);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::Unsigned),
+        },
+        "Required + unsigned + window closed must terminally reject Unsigned",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+    let transitions = f.lifecycle.committed_transitions();
+    assert_eq!(transitions.len(), 1);
+    let DomainEvent::ProvenanceRejected(ev) = &transitions[0].1.events[0].event else {
+        panic!("expected ProvenanceRejected");
+    };
+    assert_eq!(ev.reason, ProvenanceRejectReason::Unsigned);
+}
+
+// ---------------------------------------------------------------------------
+// Required + unsigned + MISSING quarantine_window_start → window_open = false
+// (defensive-only branch, design §2 S1/S4). The ingest path always
+// quarantines an OCI subject before enqueuing the verify, so a `None` anchor
+// is a mis-ordered / defensive run; it must resolve fail-closed-safely to a
+// CLOSED window (terminal reject) rather than HOLD indefinitely. Even with a
+// wide (24h) configured duration, the absent anchor ⇒ no window ⇒ reject.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn required_unsigned_missing_window_start_resolves_closed_and_rejects() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    // A WIDE window would hold IF an anchor were present — prove the missing
+    // anchor (not the duration) forces the closed/terminal resolution.
+    seed_required_policy_with_duration(&f, 24 * 3600);
+    // Overwrite the fixture artifact with a NULL quarantine anchor.
+    let mut artifact = f.artifacts.get(f.artifact_id).unwrap();
+    artifact.quarantine_window_start = None;
+    f.artifacts.insert(artifact);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::Unsigned),
+        },
+        "a missing quarantine_window_start resolves window_open=false → terminal reject \
+         (a defensive/mis-ordered run must not hold indefinitely)",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+    let transitions = f.lifecycle.committed_transitions();
+    assert_eq!(transitions.len(), 1);
+    let DomainEvent::ProvenanceRejected(ev) = &transitions[0].1.events[0].event else {
+        panic!("expected ProvenanceRejected");
+    };
+    assert_eq!(ev.reason, ProvenanceRejectReason::Unsigned);
+}
+
+// ---------------------------------------------------------------------------
+// Required + bundle-fetch EXHAUSTED + window STILL OPEN → STILL fail-closed
+// Rejected{RekorNotFound}. A fetch failure is NOT an unsigned-hold: it
+// produces a `Rejected` verdict, and `complete_provenance`'s `Rejected` arm
+// never consults window_open. Threading window_open=true through
+// `apply_fetch_failure` must NOT weaken the Required fail-closed guarantee
+// (design §2 S1: only NoAttestation×Required×window-open holds).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn required_fetch_failure_stays_fail_closed_even_with_window_open() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    // A WIDE OPEN window (24h) — proves the fetch-failure fail-closed path is
+    // NOT gated by window_open (an unsigned HOLD would be Ok(None); this must
+    // still terminally reject).
+    seed_required_policy_with_duration(&f, 24 * 3600);
+    // Force the bundle fetch to exhaust: a content-reference to a nonexistent
+    // source artifact → find_by_id NotFound on every retry.
+    f.content_references
+        .insert(ContentReference {
+            source_artifact_id: Uuid::new_v4(), // dangling
+            target_content_hash: f.content_hash.clone(),
+            kind: "oci_subject".to_string(),
+            metadata: serde_json::Value::Null,
+            repository_id: f.repository_id,
+            recorded_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::RekorNotFound),
+        },
+        "a Required fetch failure stays fail-closed (RekorNotFound) even mid-window — \
+         window_open gates only NoAttestation, never a Rejected verdict",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Rejected,
+        "the fetch-failure fail-closed guarantee is not weakened by an open window",
+    );
+    let transitions = f.lifecycle.committed_transitions();
+    assert_eq!(transitions.len(), 1);
+    let DomainEvent::ProvenanceRejected(ev) = &transitions[0].1.events[0].event else {
+        panic!("expected ProvenanceRejected");
+    };
+    assert_eq!(ev.reason, ProvenanceRejectReason::RekorNotFound);
+    assert!(
+        port.last_inputs().is_none(),
+        "the fetch failed before the verifier ran",
+    );
+}
+
+// ===========================================================================
 // No policy at all → mode defaults to VerifyIfPresent; an empty bundle set
 // → NoAttestation (allow), no event.
 // ===========================================================================
@@ -1077,6 +1309,74 @@ fn metric_no_attestation_fires_verify_only() {
         snap.iter()
             .all(|(k, _)| k.key().name() != "hort_provenance_reject_total"),
         "the allowed-unsigned case must not emit hort_provenance_reject_total",
+    );
+}
+
+/// Issue #13 / Item 5: the S1 hold path — Required + unsigned + observation
+/// window OPEN — ticks the DISTINCT `held_pending_signature` result value
+/// (an image *waiting to be signed*), NOT `no_attestation` (which is strictly
+/// the allowed-unsigned no-op) and NOT `rejected`. No reject-counter tick (no
+/// verdict event is appended on a hold).
+#[test]
+fn metric_held_pending_signature_fires_on_required_window_open_hold() {
+    let snap = capture_provenance_metrics(|| {
+        Box::pin(async {
+            let port = Arc::new(MockProvenancePort::cosign_returning(
+                ProvenanceVerdict::no_attestation(),
+            ));
+            let f = build(
+                RepositoryFormat::Oci,
+                None, // seed the positive-duration Required policy below
+                vec![],
+                vec![port as Arc<dyn ProvenancePort>],
+            );
+            // Wide window (24h) + the fixture's fresh quarantine anchor (= now)
+            // ⇒ window_open = true ⇒ an unsigned Required artifact is HELD.
+            seed_required_policy_with_duration(&f, 24 * 3600);
+            f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+        })
+    });
+    assert_eq!(
+        counter_with_labels(
+            &snap,
+            "hort_provenance_verify_total",
+            &[("backend", "cosign"), ("mode", "required"), ("result", "held_pending_signature")],
+        ),
+        Some(1),
+        "Required + unsigned mid-window must tick hort_provenance_verify_total{{...,result=held_pending_signature}}",
+    );
+    // The hold path must NOT tick `no_attestation` (that is the allowed-unsigned
+    // no-op) nor `rejected` (no verdict is decided while held).
+    assert_eq!(
+        counter_with_labels(
+            &snap,
+            "hort_provenance_verify_total",
+            &[
+                ("backend", "cosign"),
+                ("mode", "required"),
+                ("result", "no_attestation")
+            ],
+        ),
+        None,
+        "a Required hold must NOT be conflated with the allowed-unsigned no_attestation count",
+    );
+    assert!(
+        snap.iter()
+            .all(|(k, _)| k.key().name() != "hort_provenance_reject_total"),
+        "a held (no-verdict) artifact must not emit hort_provenance_reject_total",
+    );
+    assert_eq!(
+        counter_with_labels(
+            &snap,
+            "hort_provenance_verify_total",
+            &[
+                ("backend", "cosign"),
+                ("mode", "required"),
+                ("result", "rejected")
+            ],
+        ),
+        None,
+        "a held artifact is not rejected — no rejected tick",
     );
 }
 

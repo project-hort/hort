@@ -1041,6 +1041,8 @@ pub fn build_mock_ctx_with_label_flag(
         // refcount mock used by the ingest write path above.
         content_references.clone(),
         storage.clone(),
+        // S4 provenance expiry backstop shares the same `jobs` mock.
+        jobs.clone(),
     ));
     let promotion_use_case = Arc::new(PromotionUseCase::new(
         artifacts.clone(),

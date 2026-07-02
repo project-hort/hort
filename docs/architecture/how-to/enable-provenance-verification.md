@@ -297,6 +297,77 @@ widen any scan-evasion surface.
 
 ---
 
+## The push-then-sign CI flow under `required`
+
+The canonical CI flow builds an image, **pushes** it, then **signs the
+pushed digest** — cosign signs an image that already exists in the
+registry:
+
+```sh
+buildah bud -t "$HORT/internal-images/app:$TAG" .
+DIGEST=$(buildah push --digestfile /dev/stdout \
+  "$HORT/internal-images/app:$TAG" "docker://$HORT/internal-images/app:$TAG")
+cosign sign --key hashivault://ci-signing \
+  --registry-referrers-mode=oci-1-1 \
+  "$HORT/internal-images/app@$DIGEST"
+```
+
+This flow **works under `provenanceMode: required`**. hort verifies
+provenance at ingest, ~seconds after the push — before the signature
+exists — so the first verify finds no attestation. Instead of rejecting
+the image outright at that point (which would 404 the manifest and leave
+cosign nothing to sign), hort **holds** the unsigned image for its
+quarantine window and re-verifies when the signature arrives (issue #13).
+
+> **Required operator step: sign with
+> `--registry-referrers-mode=oci-1-1`.** Keyed cosign signing against a hosted
+> hort repo **must** use subject-based referrers
+> (`cosign sign --registry-referrers-mode=oci-1-1 …`). The legacy
+> `sha256-<hex>.sig` tag mode is **not** linked to its subject on the
+> hosted push path — a signature pushed that way carries no `subject`, is
+> never linked into local carriage, and stays **invisible to the
+> verifier**, so the image is never cleared and rejects `Unsigned` at
+> window expiry. The `oci-1-1` referrers mode is the supported carriage; the
+> legacy tag scheme is honored only on the upstream-proxy fetch path. See
+> [ADR 0039 §9](../../adr/0039-keyed-provenance-verification.md).
+
+### What you will observe while the image is held
+
+For an unsigned `required` image **within** its `quarantineDuration`
+window:
+
+- A **pull** (anonymous or read-only manifest `GET`, and any layer blob)
+  returns **503** — the image is not yet consumable.
+- A **write-authorized `HEAD`** on the manifest **succeeds** (200, headers,
+  empty body) — so the signer's cosign preflight resolves the digest and
+  can **attach** the signature. Only a `Write`-authorized caller sees this;
+  a non-writer's `HEAD` stays 503.
+- When the **signature arrives** (a subject-linked referrer via
+  `--registry-referrers-mode=oci-1-1`), hort **re-verifies** the subject image;
+  a valid signature emits `ProvenanceVerified` and the image **clears** and
+  releases (once the scan/time gate is also satisfied).
+- If the image is **still unsigned at window expiry**, hort makes the
+  terminal decision and rejects it `Unsigned` (`ProvenanceRejected`).
+
+A **bad** signature is not held — a forged, wrong-key, or
+digest-mismatched signature is rejected **immediately**, even mid-window (a
+missing signature is time-dependent; a wrong one is already wrong).
+
+> **The "images waiting to be signed" signal.** The
+> `hort_provenance_verify_total{result="held_pending_signature"}` counter
+> increments each time an unsigned `required` image is held mid-window.
+> A sustained non-zero rate with no matching `verified` follow-through means
+> images are being pushed but not signed — a broken or misconfigured signer
+> (e.g. the legacy tag mode). See `docs/metrics-catalog.md`.
+
+For the design rationale — provenance as an AND-precondition on the timer
+release arm, the fail-closed hold, and the write-authorized-HEAD
+existence-probe exemption — see
+[ADR 0027](../../adr/0027-artifact-provenance-verification.md) and
+[ADR 0039](../../adr/0039-keyed-provenance-verification.md).
+
+---
+
 ## 3. Verify it is working
 
 - Worker boot log: `cosign provenance verifier health check OK (pinned
@@ -401,3 +472,4 @@ Why this is structured as one knob, not two:
 | Proxy image always `no_attestation` despite an upstream signature | The upstream signed only with **legacy `simplesigning`** (no `--new-bundle-format`) — not verified in Tier 1 | Re-sign upstream with a v0.3 Sigstore bundle (`cosign sign --new-bundle-format`); the legacy `.sig` is not reconstructed. |
 | No `hort_provenance_*` series in Prometheus | The worker `/metrics` listener is disabled (default) | Set `worker.metrics.enabled: true` + a `worker.metrics.scrapeFrom` Prometheus selector — the chart sets the bind, exposes the port, and co-renders the scrape NetworkPolicy (*Worker metrics* above). |
 | `cosign verify $HORT/image` 503s right after push (older builds) | Signature was quarantined — fixed: pushed Sigstore-bundle signatures land status `None` now | Upgrade to a build with the pure-bundle signature-manifest exemption; no quarantine wait for pure-signature pushes. |
+| `required` image never clears despite a `cosign sign` — rejects `Unsigned` at window expiry | Signed with the legacy `sha256-<hex>.sig` tag mode — not subject-linked on the hosted push path, so invisible to the verifier | Re-sign with `cosign sign --registry-referrers-mode=oci-1-1 <ref>@<digest>` (subject-based referrers) within the `quarantineDuration` window (*The push-then-sign CI flow* above). |

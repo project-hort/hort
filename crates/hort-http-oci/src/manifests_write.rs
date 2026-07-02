@@ -488,6 +488,13 @@ pub(crate) async fn put_manifest_dispatch(
                 actor.clone(),
                 payload_metadata,
                 upstream_digest,
+                // S3 (design §2 S3): the subject image's content hash, so
+                // the ingest use case can resolve the subject artifact and
+                // enqueue a best-effort provenance-verify for it — clearing
+                // a held image within seconds of `cosign sign`. Always
+                // `Some` here (an `is_pure_signature` manifest carries a
+                // `subject.digest`, gated at `is_pure_signature` above).
+                subject_digest_parsed.clone(),
                 stream,
             )
             .await
