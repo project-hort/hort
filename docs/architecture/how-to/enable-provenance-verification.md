@@ -319,6 +319,16 @@ the image outright at that point (which would 404 the manifest and leave
 cosign nothing to sign), hort **holds** the unsigned image for its
 quarantine window and re-verifies when the signature arrives (issue #13).
 
+> **Multi-arch images / image indexes push-then-sign the same way.** A
+> hosted OCI repo accepts an OCI image index / Docker manifest list (e.g.
+> `skopeo copy --all`, or `buildah manifest push` of a multi-arch image) —
+> its child manifests are pushed first, then the index. cosign signs the
+> **index** digest (`cosign sign …@<index-digest>`), and the whole flow
+> above holds unchanged: the held index is signable via the
+> write-authorized-HEAD exemption, and the index rides the same
+> quarantine/scan/release/provenance lifecycle as any manifest. See
+> [ADR 0043](../../adr/0043-oci-image-index-support.md).
+
 > **Required operator step: sign with
 > `--registry-referrers-mode=oci-1-1`.** Keyed cosign signing against a hosted
 > hort repo **must** use subject-based referrers

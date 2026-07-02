@@ -133,7 +133,8 @@ fn parse_hash(raw: &str, ctx: &str) -> DomainResult<ContentHash> {
 impl PgPurgeGcPort {
     /// Cross-`kind` remaining `content_references` count for one hash,
     /// run inside the open transaction so it observes the step-2
-    /// `DELETE`. Counts **every** kind (incl. `oci_subject`).
+    /// `DELETE`. Counts **every** kind (incl. `oci_subject` and each
+    /// `oci_index_member` edge from a live image index).
     async fn remaining_refs(
         tx: &mut Transaction<'_, Postgres>,
         hash: &ContentHash,
@@ -745,6 +746,103 @@ mod tests {
             .collect();
         assert_eq!(by_hash.get(HASH_A), Some(&0));
         assert_eq!(by_hash.get(HASH_B), Some(&0));
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Image-index membership (`oci_index_member`, D3): a live index
+    /// keeps each of its child manifests' blobs alive under GC, and a
+    /// child is freed once no index references it.
+    ///
+    /// The membership edges are all `source =` the index artifact,
+    /// `kind =` the fixed literal `"oci_index_member"`, `target =` each
+    /// child's own hash. Two children (HASH_A, HASH_C) share one
+    /// `(source = index, kind = "oci_index_member")` — the widened PK
+    /// `(repository_id, source_artifact_id, target_content_hash, kind)`
+    /// (migration 013) makes that a true many-to-many, distinguished by
+    /// `target_content_hash` (no more hash-in-`kind`). This mirrors
+    /// `live_oci_subject_keeps_blob_refs_remaining_gt_zero`: the GC's
+    /// cross-`kind` refcount counts the surviving index-member row
+    /// against the child's hash, so purging a CHILD keeps its blob while
+    /// the index still points at it, then frees it once that row is gone.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn live_index_member_keeps_child_blob_then_frees_it() {
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let repo = seed_repo(&pool).await;
+        // Two child manifest artifacts (own blobs HASH_A, HASH_C) and the
+        // image-index artifact that references both (its own blob HASH_B).
+        let child_a = seed_artifact(&pool, repo, "child-a", HASH_A, Some("released")).await;
+        let child_c = seed_artifact(&pool, repo, "child-c", HASH_C, Some("released")).await;
+        let index = seed_artifact(&pool, repo, "image-index", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id IN ($1, $2, $3)")
+            .bind(child_a)
+            .bind(child_c)
+            .bind(index)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Each child's own primary_content refcount (target = child hash).
+        insert_cr(&pool, repo, child_a, "primary_content", HASH_A).await;
+        insert_cr(&pool, repo, child_c, "primary_content", HASH_C).await;
+        // The index → children membership: TWO rows under one
+        // `(source = index, kind = "oci_index_member")`, distinct only by
+        // target — the widened PK admits this (the old narrow PK forced
+        // a hash-in-`kind` workaround, now removed).
+        insert_cr(&pool, repo, index, "oci_index_member", HASH_A).await;
+        insert_cr(&pool, repo, index, "oci_index_member", HASH_C).await;
+        // Sanity: N rows genuinely coexist under one (source, kind).
+        assert_eq!(
+            cr_rows_for(&pool, index).await,
+            vec![
+                ("oci_index_member".into(), HASH_A.into()),
+                ("oci_index_member".into(), HASH_C.into()),
+            ],
+            "N children coexist under one (source = index, kind = oci_index_member)"
+        );
+        append_event(&pool, child_a, "ArtifactExpired", 0).await;
+
+        let adapter = PgPurgeGcPort::new(pool.clone());
+
+        // -- Phase 1: index is live → purging child_a keeps its blob ----
+        let refs = adapter.purge_artifact_refs(child_a).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].content_hash.as_ref(), HASH_A);
+        assert_eq!(
+            refs[0].refs_remaining, 1,
+            "a live index keeps the child manifest's blob (cross-kind count)"
+        );
+        // child_a's own primary_content row was swept; the index-member
+        // rows survive (source = index, not the purged child).
+        assert!(cr_rows_for(&pool, child_a).await.is_empty());
+        assert_eq!(
+            cr_rows_for(&pool, index).await,
+            vec![
+                ("oci_index_member".into(), HASH_A.into()),
+                ("oci_index_member".into(), HASH_C.into()),
+            ],
+            "the index's oci_index_member edges survive the child purge"
+        );
+
+        // -- Phase 2: index no longer references the child → child freed -
+        // The index's own DELETE / purge sweeps every `source = index`
+        // row (both members). With no remaining reference to HASH_A, a
+        // re-purge of child_a reports the blob GC-eligible.
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(index)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let refs_after = adapter.purge_artifact_refs(child_a).await.unwrap();
+        assert_eq!(refs_after.len(), 1);
+        assert_eq!(refs_after[0].content_hash.as_ref(), HASH_A);
+        assert_eq!(
+            refs_after[0].refs_remaining, 0,
+            "once no index references the child, its blob is GC-eligible"
+        );
 
         cleanup(&pool, repo).await;
     }

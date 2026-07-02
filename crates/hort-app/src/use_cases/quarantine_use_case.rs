@@ -3695,6 +3695,51 @@ mod tests {
         assert_eq!(ev.released_by, ReleaseReason::Timer);
     }
 
+    /// Item 4 (issue #15) — an image-INDEX artifact rides the generic
+    /// quarantine/release sweep. The release path (`release_expired`) keys on
+    /// the artifact id + the stream's `ScanCompleted`, never on manifest
+    /// shape: an index's degenerate scan (it has no layers of its own — the
+    /// scanner scans its harmless routing JSON) produces a clean
+    /// `ScanCompleted` exactly like a single-image manifest, so the timer arm
+    /// releases it identically. Design §2 D4: the index rides the generic
+    /// manifest lifecycle unchanged; releasing it releases no runnable bytes.
+    #[tokio::test]
+    async fn release_expired_releases_an_image_index_via_scan_succeeded() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        // Seed a quarantined artifact whose declared content_type is the OCI
+        // image-index media-type — i.e. this artifact IS a stored index.
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        artifact.content_type = hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string();
+        let mut repo = sample_repository();
+        repo.format = hort_domain::entities::repository::RepositoryFormat::Oci;
+        repo.id = artifact.repository_id;
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        repositories.insert(repo);
+        // Degenerate clean scan on the index's own bytes → ScanCompleted.
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "a clean-scanned index must release on the generic timer/scan sweep"
+        );
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Released,
+            "the index rides the same Quarantined → Released transition as any manifest"
+        );
+        let DomainEvent::ArtifactReleased(ev) = &batch.events[0].event else {
+            panic!("ArtifactReleased expected");
+        };
+        assert_eq!(ev.released_by, ReleaseReason::Timer);
+    }
+
     /// Seed a repo-scoped policy with
     /// `provenance_mode = Required` (+ a valid identity so the apply-time
     /// linter would accept it; the projection

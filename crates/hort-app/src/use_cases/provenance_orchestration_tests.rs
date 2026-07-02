@@ -160,6 +160,25 @@ fn build(
     identities: Vec<SignerIdentityPattern>,
     ports: Vec<Arc<dyn ProvenancePort>>,
 ) -> Fixture {
+    build_with_payload(format, mode, identities, ports, ARTIFACT_PAYLOAD)
+}
+
+/// [`build`] with the subject artifact's CAS bytes parameterized. The
+/// subject's `content_hash` is pinned to `sha256(payload)` and the
+/// `oci_subject` referrer written by [`seed_manifest_and_bundle`] targets
+/// that hash — so supplying an image-index body makes the SIGNED subject
+/// an index, and the whole provenance path (fetch bundles → verify →
+/// clearance) runs against the index digest unchanged. This is the
+/// mechanized proof of design §2 D4's push-then-sign payoff: cosign signs
+/// the index digest and the existing `oci_subject` + provenance-verify
+/// path targets it by hash, shape-agnostically.
+fn build_with_payload(
+    format: RepositoryFormat,
+    mode: Option<ProvenanceMode>,
+    identities: Vec<SignerIdentityPattern>,
+    ports: Vec<Arc<dyn ProvenancePort>>,
+    payload: &[u8],
+) -> Fixture {
     let artifacts = Arc::new(MockArtifactRepository::new());
     let repositories = Arc::new(MockRepositoryRepository::new());
     let projections = Arc::new(MockPolicyProjectionRepository::new());
@@ -177,14 +196,14 @@ fn build(
 
     let mut artifact: Artifact = sample_artifact(QuarantineStatus::Quarantined);
     artifact.repository_id = repository_id;
-    // Pin the CAS hash to the digest of ARTIFACT_PAYLOAD so the stored
-    // bytes round-trip (sha256(payload) == content_hash).
-    let hash_hex = format!("{:x}", sha2::Sha256::digest(ARTIFACT_PAYLOAD));
+    // Pin the CAS hash to the digest of `payload` so the stored bytes
+    // round-trip (sha256(payload) == content_hash).
+    let hash_hex = format!("{:x}", sha2::Sha256::digest(payload));
     let content_hash: ContentHash = hash_hex.parse().expect("valid sha256");
     artifact.sha256_checksum = content_hash.clone();
     let artifact_id = artifact.id;
     artifacts.insert(artifact);
-    storage.insert_content(content_hash.clone(), ARTIFACT_PAYLOAD.to_vec());
+    storage.insert_content(content_hash.clone(), payload.to_vec());
 
     if let Some(m) = mode {
         let mut p = projection(PolicyScope::Repository(repository_id), m, identities);
@@ -2888,4 +2907,145 @@ async fn referrer_manifest_with_no_cache_handle_is_skipped() {
     );
     let saved = f.artifacts.get(f.artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
+}
+
+// ===========================================================================
+// Item 4 (issue #15) — an image-INDEX subject rides the generic provenance
+// path. Design §2 D4: the index carries no runnable bytes, so it rides the
+// issue-#13 provenance hold + re-verify-on-signature unchanged. cosign signs
+// the INDEX digest → the `oci_subject.subject.digest` = index digest → the
+// existing verify path targets the index artifact by hash, shape-agnostically.
+//
+// These reuse the provenance-orchestration harness verbatim; the only change
+// is that the SIGNED subject's CAS bytes are an image-index body (so its
+// content hash — the `oci_subject` target — is the index digest).
+// ===========================================================================
+
+/// A minimal OCI image-index body carrying one child platform descriptor.
+/// `is_image_index` (Item 1) is `true` for it; the provenance path never
+/// parses `manifests[]`, so any well-formed index body exercises the same
+/// generic verify-by-hash path.
+fn index_subject_payload() -> Vec<u8> {
+    let body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "size": 528,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            }
+        ]
+    })
+    .to_string()
+    .into_bytes();
+    // Guard: a fixture that degenerated into a single-image manifest would
+    // make "the index rides the generic path" vacuous.
+    assert!(
+        hort_domain::oci::is_image_index(&body),
+        "the Item-4 provenance subject fixture must be an image index"
+    );
+    body
+}
+
+/// (c) Required + verified signature TARGETING THE INDEX DIGEST → the index
+/// is CLEARED (a `ProvenanceVerified` clearance event is recorded). This is
+/// the push-then-sign payoff: cosign signed the index digest, the
+/// `oci_subject` referrer targets the index's content hash, and the verifier
+/// was handed the INDEX CAS preimage. Status stays `Quarantined` here — a
+/// `Verified` under `Required` records clearance and the generic timer/scan
+/// release path (quarantine_use_case `release_expired`, exercised separately)
+/// then reads the recorded clearance and releases; the provenance use case
+/// itself never releases early (mirrors the single-image
+/// `required_verified_records_clearance_event_status_unchanged`).
+#[tokio::test]
+async fn item4_required_verified_index_records_clearance_targeting_index_digest() {
+    let payload = index_subject_payload();
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::verified(sample_identity(), None),
+    ));
+    let f = build_with_payload(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        vec![sample_pattern()],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+        &payload,
+    );
+    // The `oci_subject` referrer targets `f.content_hash` = sha256(index).
+    seed_bundle(&f, b"valid-index-signature-bundle");
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Verified,
+        },
+        "a verified signature on the index digest must record a clearance"
+    );
+
+    // The verifier ran against the INDEX CAS preimage (one bundle + the
+    // index body), proving the subject that was verified is the index.
+    assert_eq!(
+        port.last_inputs(),
+        Some((1, payload.len())),
+        "the verifier must receive the fetched bundle and the INDEX CAS preimage"
+    );
+
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Quarantined,
+        "clearance is recorded — the generic release path releases later, not the verifier"
+    );
+    let transitions = f.lifecycle.committed_transitions();
+    assert_eq!(transitions.len(), 1);
+    assert!(
+        matches!(
+            &transitions[0].1.events[0].event,
+            DomainEvent::ProvenanceVerified(_)
+        ),
+        "a ProvenanceVerified clearance event must be appended for the signed index"
+    );
+}
+
+/// (c) Companion / negative: Required + UNSIGNED index (no bundle) rejects
+/// `Unsigned`, exactly like a single-image manifest under `Required`. Proves
+/// the index rides the same fail-closed `Required` gate — it is not silently
+/// exempted from provenance because of its shape.
+#[tokio::test]
+async fn item4_required_unsigned_index_rejects_unsigned() {
+    let payload = index_subject_payload();
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build_with_payload(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        vec![sample_pattern()],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+        &payload,
+    );
+    // No bundle seeded → the verifier is handed zero bundles.
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::Unsigned),
+        },
+    );
+    assert_eq!(
+        port.last_inputs(),
+        Some((0, payload.len())),
+        "the verifier ran against the INDEX preimage with zero bundles"
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Rejected,
+        "an unsigned Required index rejects — no shape-based exemption from the provenance gate"
+    );
 }

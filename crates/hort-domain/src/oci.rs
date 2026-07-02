@@ -32,6 +32,28 @@ pub const COSIGN_SIMPLESIGNING_MEDIA_TYPE: &str =
 /// over a [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`] payload layer.
 pub const COSIGN_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
 
+/// The `mediaType` of an OCI image index (multi-arch "manifest of manifests"):
+/// `application/vnd.oci.image.index.v1+json`. An index carries a `manifests[]`
+/// array of child descriptors (one per platform) instead of `config`/`layers`.
+pub const OCI_IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+
+/// The `mediaType` of a Docker v2 manifest list — the Docker-schema analogue of
+/// [`OCI_IMAGE_INDEX_MEDIA_TYPE`]. Same `manifests[]` shape; recognised so a
+/// Docker-toolchain multi-arch push is treated as an index too.
+pub const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
+    "application/vnd.docker.distribution.manifest.list.v2+json";
+
+/// Upper bound on the number of child manifest hashes [`index_child_digests`]
+/// returns from a single image index. Mirrors the write-path
+/// `MAX_BLOB_REFERENCES` cap (`hort-http-oci`) so a pathological
+/// `manifests[]` array cannot force the caller to hold an unbounded reference
+/// set. A real multi-arch index has a handful of children; 1024 is a generous
+/// ceiling. An index declaring more than the cap is **rejected**
+/// ([`DomainError::Validation`] from [`index_child_digests`]), never truncated —
+/// an over-cap index is refused rather than silently accepted with un-linked
+/// children.
+const MAX_INDEX_CHILDREN: usize = 1024;
+
 /// Minimal OCI image-manifest projection — only the fields bundle-layer
 /// extraction needs. `serde` ignores every other manifest field.
 #[derive(Deserialize)]
@@ -221,6 +243,84 @@ pub fn simplesigning_signature_layers(
                 signature: signature.clone(),
             })
         })
+        .collect())
+}
+
+/// Minimal OCI image-index projection — only the `manifests[]` child
+/// descriptor array the index helpers read. A distinct type from
+/// [`OciManifest`] (which reads `config`/`layers`): an index carries neither,
+/// so parsing it as a manifest would silently drop its children. `serde`
+/// ignores every other index field (`schemaVersion`, `mediaType`,
+/// `annotations`, …). See ADR 0027 and design `docs/plans/oci-image-index.md`
+/// §2 (D2).
+#[derive(Deserialize)]
+struct OciImageIndex {
+    /// Child manifest descriptors — one per platform. Defaults to empty for a
+    /// single-image manifest (which carries no `manifests` key), so
+    /// [`is_image_index`] on such a manifest is `false`.
+    #[serde(default)]
+    manifests: Vec<OciIndexChild>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OciIndexChild {
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// Returns `true` iff `manifest_json` parses as a JSON object carrying a
+/// **non-empty** `manifests[]` array — i.e. it is an image index / Docker
+/// manifest list rather than a single-image manifest (which has `config` +
+/// `layers` and no `manifests`).
+///
+/// Mirrors the shape of [`is_pure_sigstore_bundle`]: recognition is purely
+/// structural (presence of children), not media-type-keyed, so an index whose
+/// `mediaType` is absent or unexpected is still recognised by its
+/// `manifests[]`. A single-image manifest, an empty `manifests: []`, or
+/// malformed / non-object JSON all yield `false` (never a panic) — the callers
+/// (the write-path dispatch, Item 2) use this as a fail-open shape probe, so a
+/// non-index simply routes down the single-image path.
+pub fn is_image_index(manifest_json: &[u8]) -> bool {
+    serde_json::from_slice::<OciImageIndex>(manifest_json)
+        .map(|index| !index.manifests.is_empty())
+        .unwrap_or(false)
+}
+
+/// Returns the CAS content hash of every child manifest an image index
+/// references via `manifests[*].digest`.
+///
+/// `sha256`-only: a child whose digest uses another algorithm or is malformed
+/// hex is **skipped** (not an error), mirroring how [`sigstore_bundle_layers`]
+/// treats a non-CAS layer digest — the domain's uniform sha256-only digest
+/// handling. A child descriptor with no `digest` is likewise skipped.
+///
+/// An index declaring more than [`MAX_INDEX_CHILDREN`] children is **rejected**
+/// as [`crate::error::DomainError::Validation`] — never silently truncated —
+/// mirroring the single-image reference-count cap the write path enforces
+/// (`manifests_write.rs` `MAX_BLOB_REFERENCES`), so an over-cap index is refused
+/// rather than accepted with un-linked children.
+///
+/// A single-image manifest (no `manifests[]`) or an empty `manifests: []`
+/// yields `Ok(vec![])`. Malformed / non-object JSON is
+/// [`crate::error::DomainError::Validation`] — the same error shape
+/// [`sigstore_bundle_layers`] produces.
+pub fn index_child_digests(manifest_json: &[u8]) -> DomainResult<Vec<ContentHash>> {
+    let index: OciImageIndex = serde_json::from_slice(manifest_json)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI image index: {e}")))?;
+
+    if index.manifests.len() > MAX_INDEX_CHILDREN {
+        return Err(DomainError::Validation(format!(
+            "image index references {} child manifests; max is {}",
+            index.manifests.len(),
+            MAX_INDEX_CHILDREN,
+        )));
+    }
+
+    Ok(index
+        .manifests
+        .iter()
+        .filter_map(|child| child.digest.as_deref().and_then(parse_sha256_digest))
         .collect())
 }
 
@@ -634,6 +734,170 @@ mod tests {
     #[test]
     fn pure_predicate_non_object_json_is_validation_error() {
         let err = is_pure_sigstore_bundle(b"[1, 2, 3]").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // image-index parsing (design §2 D2)
+    // ----------------------------------------------------------------
+    //
+    // `is_image_index` is a structural shape probe (non-empty `manifests[]`);
+    // `index_child_digests` extracts the sha256 child manifest hashes,
+    // sha256-only + bounded, skipping malformed children (mirroring
+    // `sigstore_bundle_layers`) and erroring only on malformed JSON.
+
+    fn index(children: &serde_json::Value) -> Vec<u8> {
+        manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": children,
+        }))
+    }
+
+    #[test]
+    fn index_media_type_constants_are_the_registered_types() {
+        assert_eq!(
+            OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "application/vnd.oci.image.index.v1+json"
+        );
+        assert_eq!(
+            DOCKER_MANIFEST_LIST_MEDIA_TYPE,
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        );
+    }
+
+    #[test]
+    fn is_image_index_true_for_non_empty_manifests() {
+        let m = index(&serde_json::json!([
+            { "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "digest": format!("sha256:{}", hex64('a')), "platform": { "architecture": "amd64", "os": "linux" } },
+            { "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "digest": format!("sha256:{}", hex64('b')), "platform": { "architecture": "arm64", "os": "linux" } }
+        ]));
+        assert!(is_image_index(&m));
+    }
+
+    #[test]
+    fn is_image_index_false_for_empty_manifests_array() {
+        let m = index(&serde_json::json!([]));
+        assert!(!is_image_index(&m));
+    }
+
+    #[test]
+    fn is_image_index_false_for_single_image_manifest() {
+        // A single-image manifest carries `config` + `layers`, no `manifests`.
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", hex64('c')), "size": 7 },
+            "layers": [
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                  "digest": format!("sha256:{}", hex64('d')) }
+            ]
+        }));
+        assert!(!is_image_index(&m));
+    }
+
+    #[test]
+    fn is_image_index_false_for_malformed_json() {
+        assert!(!is_image_index(b"not json at all"));
+    }
+
+    #[test]
+    fn is_image_index_false_for_non_object_json() {
+        assert!(!is_image_index(b"[1, 2, 3]"));
+    }
+
+    #[test]
+    fn index_child_digests_returns_all_sha256_children_in_order() {
+        let (ha, hb) = (hex64('a'), hex64('b'));
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{ha}") },
+            { "digest": format!("sha256:{hb}") }
+        ]));
+        let got = index_child_digests(&m).expect("valid index");
+        let hashes: Vec<&str> = got.iter().map(AsRef::as_ref).collect();
+        assert_eq!(hashes, vec![ha.as_str(), hb.as_str()]);
+    }
+
+    #[test]
+    fn index_child_digests_skips_non_sha256_child() {
+        let hex = hex64('a');
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{hex}") },
+            { "digest": format!("sha512:{}", "a".repeat(128)) }
+        ]));
+        let got = index_child_digests(&m).expect("valid index");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref(), hex.as_str());
+    }
+
+    #[test]
+    fn index_child_digests_skips_malformed_hex_child() {
+        let m = index(&serde_json::json!([
+            { "digest": "sha256:not-valid-hex" }
+        ]));
+        assert!(index_child_digests(&m).expect("valid index").is_empty());
+    }
+
+    #[test]
+    fn index_child_digests_skips_child_missing_digest() {
+        let m = index(&serde_json::json!([
+            { "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "platform": { "architecture": "amd64", "os": "linux" } }
+        ]));
+        assert!(index_child_digests(&m).expect("valid index").is_empty());
+    }
+
+    #[test]
+    fn index_child_digests_empty_manifests_is_empty() {
+        let m = index(&serde_json::json!([]));
+        assert!(index_child_digests(&m).expect("valid index").is_empty());
+    }
+
+    #[test]
+    fn index_child_digests_single_image_manifest_is_empty() {
+        // A single-image manifest has no `manifests[]` → empty (not an error).
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": format!("sha256:{}", hex64('c')) },
+            "layers": [ { "digest": format!("sha256:{}", hex64('d')) } ]
+        }));
+        assert!(index_child_digests(&m).expect("valid manifest").is_empty());
+    }
+
+    #[test]
+    fn index_child_digests_over_cap_is_rejected() {
+        // Declaring MORE than the cap is REJECTED (never silently truncated),
+        // mirroring the single-image reference-count rejection in the write path.
+        let over: Vec<serde_json::Value> = (0..MAX_INDEX_CHILDREN + 5)
+            .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}") }))
+            .collect();
+        let err = index_child_digests(&index(&serde_json::json!(over))).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation(_)),
+            "over-cap index must be a Validation error, got {err:?}"
+        );
+
+        // Exactly AT the cap succeeds (boundary).
+        let at_cap: Vec<serde_json::Value> = (0..MAX_INDEX_CHILDREN)
+            .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}") }))
+            .collect();
+        let got = index_child_digests(&index(&serde_json::json!(at_cap))).expect("at-cap index");
+        assert_eq!(got.len(), MAX_INDEX_CHILDREN);
+    }
+
+    #[test]
+    fn index_child_digests_malformed_json_is_validation_error() {
+        let err = index_child_digests(b"not json at all").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn index_child_digests_non_object_json_is_validation_error() {
+        let err = index_child_digests(b"[1, 2, 3]").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 }

@@ -4061,26 +4061,32 @@ impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
 // generalized content-reference projection (widened to a
 // refcount projection).
 //
-// Keyed by (repository_id, source_artifact_id, kind) to match the
-// Postgres adapter's PK shape exactly — upsert semantics fall out of
-// `HashMap::insert`, which overwrites within a single key. The same
-// source under a different `kind` is a sibling row, NOT a replacement
-// (a single `ArtifactIngested` writes a `primary_content`
+// Keyed by (repository_id, source_artifact_id, target_content_hash,
+// kind) to match the Postgres adapter's widened PK shape exactly —
+// upsert semantics fall out of `HashMap::insert`, which overwrites
+// within a single key. The same source under a different `kind` is a
+// sibling row (a single `ArtifactIngested` writes a `primary_content`
 // row; an OCI manifest with `subject.digest` adds an `oci_subject`
 // sibling row; an ingest with a HashReference-strategy metadata blob
-// adds a `metadata_blob` sibling). A `Vec<ContentReference>` would
-// force the mock to re-implement PK uniqueness in application code
-// and quietly diverge from the adapter on that behaviour.
+// adds a `metadata_blob` sibling), AND — because `target_content_hash`
+// is part of the key — the same `(source, kind)` under a *different*
+// target is ALSO a sibling row (an OCI image index carries N
+// `oci_index_member` rows, one per child manifest hash). A narrower key
+// would collapse those N members to one and quietly diverge from the
+// adapter. A `Vec<ContentReference>` would force the mock to
+// re-implement PK uniqueness in application code.
 // ---------------------------------------------------------------------------
 
 /// In-memory mock for [`ContentReferenceIndex`]. Entries live in a
-/// `HashMap<(Uuid, Uuid, String), ContentReference>` keyed by
-/// `(repository_id, source_artifact_id, kind)`, matching the shape of
-/// the Postgres table's PRIMARY KEY. `insert` is upsert on the full
-/// key (so the same source can hold multiple sibling rows under
-/// different kinds simultaneously); `find_by_target` optionally
-/// filters by `kind`; `delete_by_source` sweeps every entry whose
-/// source matches, regardless of kind.
+/// `HashMap<(Uuid, Uuid, String, String), ContentReference>` keyed by
+/// `(repository_id, source_artifact_id, target_content_hash, kind)`,
+/// matching the shape of the Postgres table's widened PRIMARY KEY.
+/// `insert` is upsert on the full key (so the same source can hold
+/// multiple sibling rows under different kinds — and N members under one
+/// `(source, kind)` distinguished by target — simultaneously);
+/// `find_by_target` optionally filters by `kind`; `delete_by_source`
+/// sweeps every entry whose source matches, regardless of kind or
+/// target.
 ///
 /// Failure-injection hooks (`fail_next_insert`, `fail_next_insert_for_kind`,
 /// `fail_next_delete`) cover the warn-on-fail arms in
@@ -4098,7 +4104,7 @@ impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
 /// `metadata_blob` arm) without also failing the preceding
 /// `primary_content` arm.
 pub struct MockContentReferenceIndex {
-    entries: Mutex<HashMap<(Uuid, Uuid, String), ContentReference>>,
+    entries: Mutex<HashMap<(Uuid, Uuid, String, String), ContentReference>>,
     next_insert_error: Mutex<Option<DomainError>>,
     next_insert_error_for_kind: Mutex<Option<(String, DomainError)>>,
     next_delete_error: Mutex<Option<DomainError>>,
@@ -4176,10 +4182,11 @@ impl MockContentReferenceIndex {
 
 impl ContentReferenceIndex for MockContentReferenceIndex {
     fn insert(&self, reference: ContentReference) -> BoxFuture<'_, DomainResult<()>> {
-        // Upsert via `HashMap::insert` — the existing entry (if any)
-        // for the SAME `(repo, source, kind)` key is replaced, matching
-        // the adapter's `ON CONFLICT DO UPDATE` shape. A different
-        // `kind` is a different key — a sibling row, not a replacement.
+        // Upsert via `HashMap::insert` — the existing entry (if any) for
+        // the SAME `(repo, source, target, kind)` key is replaced,
+        // matching the adapter's `ON CONFLICT DO UPDATE` shape. A
+        // different `kind` OR a different `target_content_hash` is a
+        // different key — a sibling row, not a replacement.
         if let Some(err) = self.next_insert_error.lock().unwrap().take() {
             return Box::pin(async move { Err(err) });
         }
@@ -4197,6 +4204,7 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         let key = (
             reference.repository_id,
             reference.source_artifact_id,
+            reference.target_content_hash.as_ref().to_owned(),
             reference.kind.clone(),
         );
         self.entries.lock().unwrap().insert(key, reference);
@@ -4245,7 +4253,7 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         self.entries
             .lock()
             .unwrap()
-            .retain(|(_repo, src, _kind), _| *src != source);
+            .retain(|(_repo, src, _target, _kind), _| *src != source);
         Box::pin(async move { Ok(()) })
     }
 
@@ -4255,14 +4263,20 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         source: Uuid,
         kind: &str,
     ) -> BoxFuture<'_, DomainResult<Option<ContentReference>>> {
-        // PK lookup — `(repo, source, kind)` is unique by the
-        // adapter contract; the mock keys its `HashMap` on exactly
-        // that tuple so this is a one-shot get.
+        // Single-target-kind lookup — every caller of this method passes
+        // a single-target kind (`wheel_metadata`, `metadata_blob`,
+        // `oci_subject`), so at most one entry matches `(repo, source,
+        // kind)` regardless of the widened key including
+        // `target_content_hash` (mirrors the adapter's
+        // `fetch_optional` contract for single-target kinds). Scan the
+        // values rather than a direct `get`, since the mock's key now
+        // carries the target hash the caller does not supply.
         let entry = self
             .entries
             .lock()
             .unwrap()
-            .get(&(repo, source, kind.to_string()))
+            .values()
+            .find(|e| e.repository_id == repo && e.source_artifact_id == source && e.kind == kind)
             .cloned();
         Box::pin(async move { Ok(entry) })
     }
@@ -4279,7 +4293,7 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         let sources_set: std::collections::HashSet<Uuid> = sources.iter().copied().collect();
         let kind = kind.to_string();
         let mut out: HashMap<Uuid, ContentReference> = HashMap::new();
-        for ((entry_repo, entry_source, entry_kind), reference) in
+        for ((entry_repo, entry_source, _entry_target, entry_kind), reference) in
             self.entries.lock().unwrap().iter()
         {
             if *entry_repo == repo && entry_kind == &kind && sources_set.contains(entry_source) {
@@ -6656,6 +6670,54 @@ mod tests {
         // None filter → both rows.
         let all = idx.find_by_target(repo, &target, None).await.unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// Mirrors the adapter's
+    /// `insert_same_source_kind_distinct_targets_coexist` /
+    /// `index_writes_n_member_rows_under_one_source_kind` DB-gated tests:
+    /// with the widened key `(repo, source, target, kind)`, N
+    /// `oci_index_member` rows under ONE `(source, kind)` — distinct only
+    /// by target — coexist rather than collapsing to one. Guards the mock
+    /// against silently diverging from the adapter's widened PK.
+    #[tokio::test]
+    async fn mock_references_same_source_kind_distinct_targets_coexist() {
+        let idx = MockContentReferenceIndex::new();
+        let repo = Uuid::new_v4();
+        let index_source = Uuid::new_v4();
+
+        // Three children under one (source = index, kind =
+        // "oci_index_member"), distinct only by target hash.
+        for child_hex in [VALID_SHA256_A, VALID_SHA256_B, VALID_SHA256_C] {
+            idx.insert(sample_reference(
+                repo,
+                index_source,
+                child_hex,
+                "oci_index_member",
+                serde_json::json!({"child_digest": format!("sha256:{child_hex}")}),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // All three coexist — a narrow (repo, source, kind) key would
+        // have collapsed them to the last child.
+        assert_eq!(idx.entry_count(), 3);
+
+        // Each child target is independently resolvable under the one
+        // (source, kind).
+        for child_hex in [VALID_SHA256_A, VALID_SHA256_B, VALID_SHA256_C] {
+            let target: ContentHash = child_hex.parse().unwrap();
+            let rows = idx
+                .find_by_target(repo, &target, Some("oci_index_member"))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "each member target survives");
+            assert_eq!(rows[0].source_artifact_id, index_source);
+        }
+
+        // Sweeping the index source frees every member.
+        idx.delete_by_source(index_source).await.unwrap();
+        assert_eq!(idx.entry_count(), 0);
     }
 
     #[tokio::test]
