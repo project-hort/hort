@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `GET /v2/` auth-discovery probe advertises the Bearer `/v2/auth`
+  challenge when native tokens are enabled.** The probe hardcoded
+  `WWW-Authenticate: Basic realm="hort"`, so OCI clients (skopeo, docker,
+  podman, cosign) cached Basic for the session and never minted a capability
+  token at `/v2/auth` — an opaque `hort_pat_*`/`hort_svc_*` credential then
+  rode the Basic password slot, which no read-path validator accepts, and
+  every read degraded to anonymous (private repos anti-enumerate to 404:
+  pushes succeeded, the pushed image could not be read back or signed). The
+  probe now emits the same challenge the `/v2/*` middleware selects: `Bearer
+  realm="<base>/v2/auth",service="<host>"` with the signing key wired, legacy
+  Basic otherwise. (issues #13, #16)
+
 ## [0.9.8] - 2026-07-03
 
 Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
