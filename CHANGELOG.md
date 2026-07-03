@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-07-03
+
+Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
+push-then-sign under `provenance_mode: Required`** end to end — an unsigned
+image (index-shaped included) is held for the quarantine window, keyed cosign
+v3 signatures verify against the pinned key, and a verified signature clears
+the signed tree so the released image pulls (issues #13, #14, #15); OCI
+**chunked blob-upload push** (buildah / podman / skopeo stream layers via HTTP
+`Transfer-Encoding: chunked`, no `Content-Length`, streamed and bounded by the
+publish-body limit); and an authoritative, self-pruning per-`(repo, principal)`
+OCI **upload-session cap**.
+
 ### Added
 
 - **OCI image-index / manifest-list (multi-arch) support.** Hosted OCI repos
@@ -31,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   push-then-sign. A manifest is a routing document — layer blobs stay gated
   (503) for every caller while held, and non-writers still receive 503 for
   both verbs. (issue #14, ADR 0039)
+- **Keyed cosign signing against a hosted repo must use
+  `--registry-referrers-mode=oci-1-1`** (subject-based referrers); the legacy
+  `sha256-<hex>.sig` tag mode is not linked to its subject on the push path, so
+  a signature pushed that way stays invisible to the verifier.
 
 ### Fixed
 
@@ -44,7 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejecting a signature over a different digest. The legacy `simplesigning`
   carriage and keyless (Fulcio-chain) bundle routing are unchanged.
   (issue #14, ADR 0039)
-
 - **A validly signed image is now consumable under `provenanceMode: required`
   (provenance-clearance cascade).** cosign signs only the top-level digest, so
   the per-artifact provenance gate terminally rejected every constituent of a
@@ -58,27 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected constituent stays rejected), clears only the provenance gate (scan
   and quarantine-window gates remain per-artifact), and records each cascaded
   clearance as a `ProvenanceVerified` attributed to the root digest via
-  `cascaded_from`. A never-signed image and its constituents still reject
+  `cascaded_from`; the cascade append retries once on a version conflict and a
+  re-verify of a directly-cleared subject re-drives it, so re-signing heals a
+  partial cascade. A never-signed image and its constituents still reject
   `Unsigned` at window expiry. (ADR 0039 §11, ADR 0043)
-
-## [0.9.8] - 2026-07-02
-
-Headlines: OCI **chunked blob-upload push** (buildah / podman / skopeo stream
-layers via HTTP `Transfer-Encoding: chunked`, no `Content-Length`, streamed and
-bounded by the publish-body limit); an authoritative, self-pruning
-per-`(repo, principal)` OCI **upload-session cap**; and **push-then-sign support
-under `provenance_mode: Required`**, where an unsigned artifact is held for the
-quarantine window and re-verified when the cosign signature arrives (issue #13).
-
-### Changed
-
-- **Keyed cosign signing against a hosted repo must use
-  `--registry-referrers-mode=oci-1-1`** (subject-based referrers); the legacy
-  `sha256-<hex>.sig` tag mode is not linked to its subject on the push path, so
-  a signature pushed that way stays invisible to the verifier.
-
-### Fixed
-
 - **`provenance_mode: Required` supports the push-then-sign CI flow.** An
   unsigned artifact is held for its quarantine window and re-verified when the
   cosign signature arrives; it is rejected `Unsigned` only if still unsigned at
