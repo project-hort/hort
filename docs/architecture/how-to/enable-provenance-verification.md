@@ -329,6 +329,19 @@ quarantine window and re-verifies when the signature arrives (issue #13).
 > quarantine/scan/release/provenance lifecycle as any manifest. See
 > [ADR 0043](../../adr/0043-oci-image-index-support.md).
 
+> **The signing principal needs `read` AND `write` grants on a private
+> repo.** `cosign sign` reads the subject manifest back (HEAD + GET)
+> before attaching the signature referrer, and hort permissions are
+> flat — a `write` grant does not imply `read`. On a public repo the
+> read rides anonymous access, so a write-only grant suffices; on a
+> **private** repo a write-only principal can push but every read
+> anti-enumerates to 404, so the sign aborts on its subject preflight.
+> Grant the CI subject both `permission: read` and `permission: write`
+> on the target repository (two `PermissionGrant` docs). The `/v2/auth`
+> token mint narrows a `pull,push` scope request to the granted subset
+> (Docker token spec) — `actions:["push"]` in the minted JWT is the
+> tell-tale that the `read` grant is missing.
+
 > **Required operator step: sign with
 > `--registry-referrers-mode=oci-1-1`.** Keyed cosign signing against a hosted
 > hort repo **must** use subject-based referrers

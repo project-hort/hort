@@ -301,8 +301,10 @@ pub fn v2_auth_challenge_value(
 
 /// Extract just the host portion of a URL string. Used for the
 /// `service=` parameter: per spec the `aud` claim and the `service=`
-/// echo are the registry hostname (no scheme, no path).
-fn host_of(url: &str) -> &str {
+/// echo are the registry hostname (no scheme, no path). `pub(crate)`
+/// so the `GET /v2/` version probe builds the same `service=` value
+/// for its challenge.
+pub(crate) fn host_of(url: &str) -> &str {
     // Strip scheme.
     let after_scheme = match url.find("://") {
         Some(pos) => &url[pos + 3..],
