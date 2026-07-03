@@ -194,8 +194,8 @@ async fn migration_011_service_account_user_delete_restricts() {
     let sa_name = format!("mig011-sa-{}", Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO public.service_accounts \
-            (name, backing_user_id, role, repositories) \
-         VALUES ($1, $2, 'developer', ARRAY['pypi-internal']::text[])",
+            (name, backing_user_id) \
+         VALUES ($1, $2)",
     )
     .bind(&sa_name)
     .bind(user_id)
@@ -246,8 +246,8 @@ async fn migration_011_federated_identities_cascade_and_unique_position() {
     let user_id = seed_user(&pool, "mig011_fi_user").await;
     let sa_id: Uuid = sqlx::query_scalar(
         "INSERT INTO public.service_accounts \
-            (name, backing_user_id, role, repositories) \
-         VALUES ($1, $2, 'developer', ARRAY['pypi-internal']::text[]) \
+            (name, backing_user_id) \
+         VALUES ($1, $2) \
          RETURNING id",
     )
     .bind(format!("mig011-fi-{}", Uuid::new_v4().simple()))
@@ -381,8 +381,8 @@ async fn migration_011_fallback_rotation_check_constraints() {
     let user_id = seed_user(&pool, "mig011_fr_user").await;
     let sa_id: Uuid = sqlx::query_scalar(
         "INSERT INTO public.service_accounts \
-            (name, backing_user_id, role, repositories) \
-         VALUES ($1, $2, 'developer', ARRAY['pypi-internal']::text[]) \
+            (name, backing_user_id) \
+         VALUES ($1, $2) \
          RETURNING id",
     )
     .bind(format!("mig011-fr-{}", Uuid::new_v4().simple()))
@@ -502,9 +502,8 @@ async fn migration_011_service_account_aggregate_round_trip() {
     let sa_name = format!("mig011-rt-{}", Uuid::new_v4().simple());
     let sa_id: Uuid = sqlx::query_scalar(
         "INSERT INTO public.service_accounts \
-            (name, backing_user_id, role, repositories) \
-         VALUES ($1, $2, 'developer', \
-                 ARRAY['pypi-internal','npm-internal']::text[]) \
+            (name, backing_user_id) \
+         VALUES ($1, $2) \
          RETURNING id",
     )
     .bind(&sa_name)
@@ -545,7 +544,7 @@ async fn migration_011_service_account_aggregate_round_trip() {
     // -- Read SA row through ServiceAccountRow → ServiceAccount ----------
 
     let sa_row: ServiceAccountRow = sqlx::query_as(
-        "SELECT id, name, backing_user_id, role, repositories, created_at, updated_at \
+        "SELECT id, name, backing_user_id, created_at, updated_at \
          FROM public.service_accounts WHERE id = $1",
     )
     .bind(sa_id)
@@ -554,8 +553,6 @@ async fn migration_011_service_account_aggregate_round_trip() {
     .expect("read SA row");
     let mut sa: ServiceAccount = sa_row.into();
     assert_eq!(sa.name, sa_name);
-    assert_eq!(sa.role, "developer");
-    assert_eq!(sa.repositories.len(), 2);
     // Sub-aggregates start empty — composed below.
     assert!(sa.federated_identities.is_empty());
     assert!(sa.fallback_rotation.is_none());

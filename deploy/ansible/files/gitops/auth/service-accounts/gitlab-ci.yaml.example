@@ -2,15 +2,12 @@ apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount
 metadata:
   name: gitlab-ci
+# CI pull identity for GitLab CI builds: same scope as gha-ci.
+#
+# The envelope is identity + federation binding only. The read
+# authority is the per-repo serviceAccount-subject PermissionGrants in
+# `auth/grants/gitlab-ci-read-*.yaml`.
 spec:
-  # Pull access for GitLab CI builds: same scope as gha-ci.
-  role: reader
-  repositories:
-    - cargo-virtual
-    - crates-proxy
-    - dockerhub-proxy
-    - quay-proxy
-    - npm-proxy
   federatedIdentities:
     - issuer: gitlab                  # references OidcIssuer metadata.name
       claims:

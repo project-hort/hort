@@ -231,7 +231,7 @@ EOF
 
 # -- Phase 2: seed the gitops config tree -----------------------------
 
-echo "[2/7] Seeding gitops config (example-config + OidcIssuer + ServiceAccount)..."
+echo "[2/7] Seeding gitops config (example-config + OidcIssuer + ServiceAccount + grants)..."
 cp -r "${EXAMPLE_CONFIG}/." "${CONFIG_DIR}/"
 
 cat > "${CONFIG_DIR}/oidc-issuers/federation-test-issuer.yaml" <<EOF
@@ -252,13 +252,43 @@ kind: ServiceAccount
 metadata:
   name: ci-federation-test
 spec:
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: federation-test-issuer
       claims:
         repository: my-org/my-repo
         environment: production
+EOF
+
+# The SA envelope is identity-only; its authority is the
+# serviceAccount-subject PermissionGrants seeded beside it. The
+# twine-push leg (Phase 6) needs write on pypi-internal, and read is
+# granted alongside for any read-back — write does not imply read.
+# Grants apply after repositories and service accounts within one
+# gitops pass, so a single seeded tree covers the references.
+cat > "${CONFIG_DIR}/auth/ci-federation-test-write.yaml" <<EOF
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: ci-federation-test-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: ci-federation-test
+  permission: write
+  repository: pypi-internal
+EOF
+
+cat > "${CONFIG_DIR}/auth/ci-federation-test-read.yaml" <<EOF
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: ci-federation-test-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: ci-federation-test
+  permission: read
+  repository: pypi-internal
 EOF
 
 # -- Phase 3: bring up the self-owned stack ---------------------------

@@ -58,7 +58,6 @@ use crate::lint::{LintConfig, RuleAction};
 // with apply via `hort_app::provenance` (single source, no duplication).
 use crate::provenance::{provenance_identities_from_spec, provenance_mode_from_spec};
 use crate::storage_backend::EffectiveStorageBackend;
-use crate::use_cases::apply_config_use_case::service_account_permission_for_role;
 
 /// `rule` label value for
 /// `hort_apply_config_linter_total` emitted when
@@ -386,15 +385,15 @@ impl StaticConfigValidator {
     ///
     /// The apply stage (`apply_permission_grants`) builds the desired
     /// grant set by resolving repository / service-account references to
-    /// their **DB ids** and synthesising the SA-owned `User`-subject
-    /// grants. The grant rules, however, read only `grant.subject`
-    /// (`Claims(sorted)` / `User(uid)`), `grant.repository_id.is_none()`,
-    /// `grant.permission`, and `sa_owned_user_ids` membership — **never**
-    /// any id *value*. So the verdict is invariant to which concrete
-    /// UUIDs the DB would have assigned: this method replicates the
-    /// expansion with **placeholder** ids (a fixed non-nil repo id when a
-    /// grant is repo-scoped; a deterministic per-SA backing-user id), and
-    /// the only consistency requirement — that an SA-owned grant's
+    /// their **DB ids**. The grant rules, however, read only
+    /// `grant.subject` (`Claims(sorted)` / `User(uid)`),
+    /// `grant.repository_id.is_none()`, `grant.permission`, and
+    /// `sa_owned_user_ids` membership — **never** any id *value*. So the
+    /// verdict is invariant to which concrete UUIDs the DB would have
+    /// assigned: this method replicates the expansion with
+    /// **placeholder** ids (a fixed non-nil repo id when a grant is
+    /// repo-scoped; a deterministic per-SA backing-user id), and the
+    /// only consistency requirement — that an SA-subject grant's
     /// `User(uid)` matches an entry in `sa_owned_user_ids` — is preserved
     /// by threading the *same* synthetic id into both.
     ///
@@ -465,29 +464,16 @@ impl StaticConfigValidator {
             grants.push(synthetic_grant(subject, repository_id, permission));
         }
 
-        // (b) ServiceAccount-owned `User`-subject grants —
-        // mirrors apply's branch (b). Apply reads the SA's `backing_user_id`
-        // from the DB; offline we synthesise a *deterministic per-SA* id
-        // and thread it into BOTH the grant subject and `sa_owned_user_ids`,
-        // so the `direct-user-grant-without-justification` exemption fires
-        // exactly as it does on the apply path.
+        // (b) ServiceAccount-declared identities. Every declared SA's
+        // backing user belongs in the `sa_owned_user_ids` exemption set
+        // — explicit SA-subject grant docs resolve to
+        // `User(backing_user_id)` and rely on the set to pass the
+        // `direct-user-grant-without-justification` rule (non-Admin
+        // arm). The set derives from the service-account set itself,
+        // unconditionally; the SA envelope contributes no grants (it is
+        // identity + federation binding only).
         for env in &desired.service_accounts {
-            // `service_account_permission_for_role` is the same code-
-            // expansion apply uses; an unknown role is row 0's concern
-            // (the SA aggregate pass rejects it) so we skip rather than
-            // emit a row-8 finding.
-            let Ok(permission) = service_account_permission_for_role(&env.spec.role) else {
-                continue;
-            };
-            let backing_user_id = synthetic_sa_backing_user_id(&env.metadata.name);
-            sa_owned_user_ids.insert(backing_user_id);
-            for _repo_name in &env.spec.repositories {
-                grants.push(synthetic_grant(
-                    GrantSubject::User(backing_user_id),
-                    Some(placeholder_repo_id),
-                    permission,
-                ));
-            }
+            sa_owned_user_ids.insert(synthetic_sa_backing_user_id(&env.metadata.name));
         }
 
         // claim_mappings — the `claim-name-collision` rule reads only
@@ -799,12 +785,12 @@ fn synthetic_grant(
 
 /// Row 8 — a stable synthetic backing-user id for a
 /// ServiceAccount, derived deterministically from its name. Only its
-/// *consistency* matters: the same id is threaded into both the SA-owned
-/// grant's `User(uid)` subject and the `sa_owned_user_ids` exemption set,
-/// so the linter's provenance exemption fires exactly as on the apply
-/// path (where it would be the SA's real DB `backing_user_id`). A v5 UUID
-/// over a fixed namespace keeps distinct SAs distinct and is stable
-/// across runs.
+/// *consistency* matters: the same id is threaded into both an
+/// SA-subject grant's `User(uid)` subject and the `sa_owned_user_ids`
+/// exemption set, so the linter's provenance exemption fires exactly as
+/// on the apply path (where it would be the SA's real DB
+/// `backing_user_id`). A v5 UUID over a fixed namespace keeps distinct
+/// SAs distinct and is stable across runs.
 fn synthetic_sa_backing_user_id(sa_name: &str) -> Uuid {
     // Fixed, arbitrary namespace UUID for SA-backing-user synthesis.
     const NS: Uuid = Uuid::from_u128(0x5341_4f57_4e45_4400_0000_0000_0000_0001);
@@ -924,8 +910,6 @@ mod tests {
             kind: Kind::ServiceAccount,
             metadata: Metadata { name: name.into() },
             spec: ServiceAccountSpec {
-                role: "developer".into(),
-                repositories: vec![],
                 federated_identities: vec![FederatedIdentitySpec {
                     issuer: issuer.into(),
                     claims,
@@ -945,8 +929,6 @@ mod tests {
             kind: Kind::ServiceAccount,
             metadata: Metadata { name: name.into() },
             spec: ServiceAccountSpec {
-                role: "developer".into(),
-                repositories: vec![],
                 federated_identities: vec![FederatedIdentitySpec {
                     issuer: issuer.into(),
                     claims,
@@ -1670,16 +1652,13 @@ mod tests {
         }
     }
 
-    /// A `ServiceAccount` envelope (role `developer` ⇒ Write) granting
-    /// over `repos`.
-    fn sa_env_with_repos(name: &str, role: &str, repos: &[&str]) -> Envelope<ServiceAccountSpec> {
+    /// A minimal identity-only `ServiceAccount` envelope.
+    fn sa_env(name: &str) -> Envelope<ServiceAccountSpec> {
         Envelope {
             api_version: ApiVersion::V1Beta1,
             kind: Kind::ServiceAccount,
             metadata: Metadata { name: name.into() },
             spec: ServiceAccountSpec {
-                role: role.into(),
-                repositories: repos.iter().map(|s| (*s).into()).collect(),
                 federated_identities: vec![],
                 fallback_rotation: None,
             },
@@ -1773,28 +1752,7 @@ mod tests {
                 && f.message.contains("claim-name-collision")));
     }
 
-    /// (e) An SA-owned direct-User grant is NOT rejected — the synthetic
-    /// backing_user_id is threaded into both the grant subject and the
-    /// sa_owned set, so the provenance exemption fires (proves the
-    /// placeholder id threading is consistent). Without the threading this
-    /// would reject as an unjustified high-priv direct-user grant.
-    #[test]
-    fn row8_sa_owned_direct_user_grant_is_exempt() {
-        let desired = DesiredState {
-            // role developer ⇒ Write; the SA owns a repo-scoped grant.
-            service_accounts: vec![sa_env_with_repos("ci-bot", "developer", &["repo-x"])],
-            ..Default::default()
-        };
-        let report = grant_lint_validator().validate(&desired);
-        assert_eq!(
-            grant_findings(&report),
-            0,
-            "SA-owned grant must be exempt (provenance): {:?}",
-            report.errors
-        );
-    }
-
-    /// (e2) A standalone GLOBAL `serviceAccount`-subject grant naming a
+    /// (e) A standalone GLOBAL `serviceAccount`-subject grant naming a
     /// declared SA is exempt offline (ADR 0037 / spec §9) — it resolves
     /// to the SA's (deterministic, synthetic) backing user, which is
     /// threaded into the sa_owned set, so the provenance exemption fires
@@ -1803,11 +1761,7 @@ mod tests {
     #[test]
     fn row8_global_service_account_subject_grant_is_exempt() {
         let desired = DesiredState {
-            service_accounts: vec![sa_env_with_repos(
-                "maintainer-dev",
-                "developer",
-                &["repo-x"],
-            )],
+            service_accounts: vec![sa_env("maintainer-dev")],
             permission_grants: vec![sa_grant_env(
                 "maintainer-dev-global-read",
                 "maintainer-dev",
@@ -1826,7 +1780,8 @@ mod tests {
     }
 
     /// (f) A clean grant set produces no row-8 findings: a multi-claim
-    /// repo-scoped grant + an SA-owned grant + ordinary claim mappings.
+    /// repo-scoped grant + a declared SA + ordinary claim mappings. The
+    /// SA envelope contributes only its exemption-set entry — no grants.
     #[test]
     fn row8_clean_set_no_findings() {
         let desired = DesiredState {
@@ -1836,7 +1791,7 @@ mod tests {
                 "write",
                 Some("repo-x"),
             )],
-            service_accounts: vec![sa_env_with_repos("ci-bot", "reader", &["repo-x"])],
+            service_accounts: vec![sa_env("ci-bot")],
             claim_mappings: vec![claim_mapping_env("m1", "dev-group", "developer")],
             ..Default::default()
         };

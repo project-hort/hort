@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The `ServiceAccount` gitops envelope is identity-only** — it declares who
+  may assume the account (`federatedIdentities[].claims`, `fallbackRotation`)
+  and confers no authority. A service account's authority is exclusively its
+  explicit `PermissionGrant`s (`serviceAccount`-subject grants, ADR 0037), and
+  the two unattended issuance sites — the federation `/exchange` and the
+  fallback-rotation mint — derive the issued token's cap as a snapshot of the
+  effective grants at issuance (the exchange additionally intersects the
+  RFC 8693 `scope` parameter; rotated fallback tokens now carry the SA's real
+  granted authority instead of an empty, deny-all cap). Grants added apply at
+  the next exchange or rotation; revocations bite outstanding tokens
+  immediately through the live grants leg. (issue #13, ADR 0044)
+
+### Removed
+
+- The `role:` and `repositories:` fields of the `ServiceAccount` gitops
+  envelope. An envelope still declaring them fails apply at parse; migration
+  014 drops the columns. (ADR 0044)
+
 ### Fixed
 
 - **The `GET /v2/` auth-discovery probe advertises the Bearer `/v2/auth`

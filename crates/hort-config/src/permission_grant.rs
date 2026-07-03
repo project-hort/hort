@@ -311,6 +311,7 @@ pub fn validate_permission_grant(env: &Envelope<PermissionGrantSpec>) -> Vec<Val
                 "admin",
                 "admin_task_invoke",
                 "curate",
+                "prefetch",
             ],
         });
     }
@@ -763,20 +764,47 @@ mod tests {
                 _ => None,
             })
             .expect("UnknownEnumValue for spec.permission must be present");
-        for want in [
-            "read",
-            "write",
-            "delete",
-            "admin",
-            "admin_task_invoke",
-            "curate",
-        ] {
+        for want in ALL_PERMISSIONS.map(wire_literal) {
             assert!(
                 expected_list.contains(&want),
                 "expected list must contain `{want}`: {expected_list:?}"
             );
         }
+        assert_eq!(
+            expected_list.len(),
+            ALL_PERMISSIONS.len(),
+            "diagnostic list and the Permission variant set must be the same size"
+        );
     }
+
+    /// Compile-time-exhaustive `Permission` → wire-literal mapping. The
+    /// no-wildcard match makes a new `Permission` variant a compile error
+    /// here, forcing `ALL_PERMISSIONS`, the diagnostic `expected` list, and
+    /// the acceptance loop to be revisited together.
+    fn wire_literal(p: Permission) -> &'static str {
+        match p {
+            Permission::Read => "read",
+            Permission::Write => "write",
+            Permission::Delete => "delete",
+            Permission::Admin => "admin",
+            Permission::AdminTaskInvoke => "admin_task_invoke",
+            Permission::Curate => "curate",
+            Permission::Prefetch => "prefetch",
+        }
+    }
+
+    /// Every `Permission` variant, for the diagnostic-list and acceptance
+    /// loops. Kept adjacent to [`wire_literal`], whose exhaustive match is
+    /// the staleness guard for both.
+    const ALL_PERMISSIONS: [Permission; 7] = [
+        Permission::Read,
+        Permission::Write,
+        Permission::Delete,
+        Permission::Admin,
+        Permission::AdminTaskInvoke,
+        Permission::Curate,
+        Permission::Prefetch,
+    ];
 
     /// Validation must accept every `Permission` variant that
     /// `Permission::FromStr` accepts. The test name reflects "every variant"
@@ -784,14 +812,7 @@ mod tests {
     /// this in one spot rather than racing the in-file `expected` literal.
     #[test]
     fn validate_accepts_every_permission_variant() {
-        for perm in [
-            "read",
-            "write",
-            "delete",
-            "admin",
-            "admin_task_invoke",
-            "curate",
-        ] {
+        for perm in ALL_PERMISSIONS.map(wire_literal) {
             let body = format!(
                 "
   subject: {{ kind: claims, required: [developer] }}

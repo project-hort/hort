@@ -936,8 +936,6 @@ pub struct ServiceAccountRow {
     pub id: Uuid,
     pub name: String,
     pub backing_user_id: Uuid,
-    pub role: String,
-    pub repositories: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -945,16 +943,11 @@ pub struct ServiceAccountRow {
 impl From<ServiceAccountRow> for ServiceAccount {
     fn from(row: ServiceAccountRow) -> Self {
         // Pure 1:1 translation — every field maps directly with no
-        // fallible parsing. Apply validator gates `role` to
-        // {developer, reader} at write time; the mapper carries the
-        // raw string so the future REST surface (if/when it exists)
-        // can surface unexpected values without panicking here.
+        // fallible parsing.
         ServiceAccount {
             id: row.id,
             name: row.name,
             backing_user_id: row.backing_user_id,
-            role: row.role,
-            repositories: row.repositories,
             federated_identities: Vec::new(),
             fallback_rotation: None,
             created_at: row.created_at,
@@ -2591,8 +2584,6 @@ mod tests {
             id: Uuid::nil(),
             name: "ci-pypi-pusher".into(),
             backing_user_id: Uuid::from_u128(1),
-            role: "developer".into(),
-            repositories: vec!["pypi-internal".into()],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2606,40 +2597,10 @@ mod tests {
         assert_eq!(sa.id, id);
         assert_eq!(sa.name, "ci-pypi-pusher");
         assert_eq!(sa.backing_user_id, Uuid::from_u128(1));
-        assert_eq!(sa.role, "developer");
-        assert_eq!(sa.repositories, vec!["pypi-internal"]);
         // Sub-aggregates are empty; the repository impl populates them
         // via separate queries.
         assert!(sa.federated_identities.is_empty());
         assert!(sa.fallback_rotation.is_none());
-    }
-
-    #[test]
-    fn service_account_row_multi_repository_conversion() {
-        let row = ServiceAccountRow {
-            repositories: vec![
-                "pypi-internal".into(),
-                "npm-internal".into(),
-                "oci-internal".into(),
-            ],
-            ..base_sa_row()
-        };
-        let sa: ServiceAccount = row.into();
-        assert_eq!(sa.repositories.len(), 3);
-    }
-
-    #[test]
-    fn service_account_row_preserves_role_text_verbatim() {
-        // Apply validator gates `role` to {developer, reader}; the
-        // mapper carries whatever the column holds. This test pins the
-        // raw-string posture so a future REST surface can decide how
-        // to handle unexpected values.
-        let row = ServiceAccountRow {
-            role: "reader".into(),
-            ..base_sa_row()
-        };
-        let sa: ServiceAccount = row.into();
-        assert_eq!(sa.role, "reader");
     }
 
     // -- FederatedIdentityRow → FederatedIdentity ----------------------------

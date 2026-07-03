@@ -7,20 +7,18 @@ impl ApplyConfigUseCase {
     /// `managed_by = gitops` partition (atomic delete-absent +
     /// upsert-present, keyed on the subject-dependent identity —
     /// `(sorted required_claims, repository_id, permission)` for
-    /// `Claims`; `(user_id, repository_id, permission)` for `User`). The
-    /// envelope-declared grants AND the ServiceAccount-owned
-    /// `User`-subject grants therefore MUST be unioned into one
-    /// call — two independent writers would delete each other's rows.
+    /// `Claims`; `(user_id, repository_id, permission)` for `User`).
+    /// The `PermissionGrant` envelopes are the single authority source
+    /// — a `ServiceAccount` envelope materialises no grants (identity +
+    /// federation binding only; SA authority is declared as explicit
+    /// `serviceAccount`-subject grant envelopes, ADR 0037).
     ///
     /// Steps:
     ///
     /// 1. build the complete desired set: every `desired.permission_grants`
     ///    envelope mapped to a domain `PermissionGrant` (with the
-    ///    sum-typed [`GrantSubject`]), plus one
-    ///    `GrantSubject::User(backing_user_id)` row per
-    ///    `(ServiceAccount, repo)` pair (the role
-    ///    bundle is code-expanded by `service_account_permission_for_role`,
-    ///    NOT a `claim_mappings` consultation, NOT a `Claims` subject);
+    ///    sum-typed [`GrantSubject`]; a `serviceAccount` subject
+    ///    resolves to `GrantSubject::User(backing_user_id)`);
     /// 2. diff the prior managed set (`list_managed_by_gitops`) against
     ///    the desired set by subject-dependent identity to emit one
     ///    `PermissionGrantApplied` per added-or-changed row and one
@@ -133,9 +131,8 @@ impl ApplyConfigUseCase {
                     // This backing user-id is an SA-owned
                     // (provenance-justified) direct-user subject — exempt
                     // it from the `direct-user-grant-without-justification`
-                    // linter rule, exactly like the SA-role-derived grants
-                    // in step (b). Without this a global serviceAccount
-                    // grant (the audited operator path for global / curate
+                    // linter rule. Without this a serviceAccount grant
+                    // (the audited operator path for read / write / curate
                     // / admin_task_invoke authority) would trip the
                     // high-privilege reject arm.
                     sa_owned_user_ids.insert(backing_user_id);
@@ -153,71 +150,12 @@ impl ApplyConfigUseCase {
             );
         }
 
-        // (b) ServiceAccount-owned `User`-subject grants.
-        // The role bundle is code-expanded over the fixed
-        // {developer, reader} enum — never a `claim_mappings`
-        // consultation, never a `Claims` subject.
-        // `apply_service_accounts` (the pass before this consolidated
-        // reconcile) has already upserted the SA aggregate + backing
-        // user, so both resolve here.
-        for env in &desired.service_accounts {
-            let permission = service_account_permission_for_role(&env.spec.role)?;
-            let sa = self
-                .service_accounts
-                .get_by_name(&env.metadata.name)
-                .await?
-                .ok_or_else(|| {
-                    DomainError::Invariant(format!(
-                        "ServiceAccount `{}` not found after apply_service_accounts — \
-                         the SA aggregate pass must run before the grant reconcile",
-                        env.metadata.name
-                    ))
-                })?;
-            let backing_user_id = sa.backing_user_id;
-            // This backing user-id is an SA-owned
-            // (provenance-justified) direct-user subject — exempt from
-            // the `direct-user-grant-without-justification` linter rule.
-            sa_owned_user_ids.insert(backing_user_id);
-            // SA-owned digest: keyed on `sa.id` and stable across YAML
-            // repo re-orderings — byte-identical to the snapshot's
-            // `sa_owned_grant_digests` canonical form
-            // (`sha256("sa-grant|{sa.id}|{role}|{permission}|{sorted_repos}")`,
-            // computed in `build_snapshot`), so the diff layer's
-            // SA-exclusion keeps these rows out of
-            // the per-envelope PG plan while this consolidated reconcile
-            // owns their lifecycle.
-            let mut sorted_repos: Vec<&str> =
-                env.spec.repositories.iter().map(String::as_str).collect();
-            sorted_repos.sort_unstable();
-            let canonical = format!(
-                "sa-grant|{}|{}|{}|{}",
-                sa.id,
-                env.spec.role,
-                permission,
-                sorted_repos.join(",")
-            );
-            let digest = sha256_of(&canonical);
-            for repo_name in &env.spec.repositories {
-                let repository_id = Some(self.repositories.find_by_key(repo_name).await?.id);
-                self.push_desired_grant(
-                    GrantSubject::User(backing_user_id),
-                    repository_id,
-                    permission,
-                    digest,
-                    &prior_by_identity,
-                    &mut desired_set,
-                    &mut desired_identities,
-                );
-            }
-        }
-
         // ---- permission-grant linter (ADR 0015) ----
         //
         // This linter is the load-bearing mitigation for
         // additive-claims' deliberate loss of *server-enforced*
         // "every grant has both legs". It runs over the fully-built
-        // desired set (envelope grants ∪ SA-owned
-        // `User`-subject grants) AND the desired `claim_mappings`,
+        // desired set AND the desired `claim_mappings`,
         // BEFORE the whole-partition `save_managed` commit and BEFORE
         // any audit event is constructed — a `Reject` aborts the
         // apply strict-atomic so no row and no `PermissionGrantApplied`
@@ -317,11 +255,7 @@ impl ApplyConfigUseCase {
             }
         }
 
-        // Per-envelope report + metric counters from the diff plan. The
-        // diff layer already excludes SA-owned digests from the PG plan
-        // (`sa_owned_grant_digests`), so the
-        // SA-owned rows do not double-count here; their lifecycle is
-        // attested by the audit diff above.
+        // Per-envelope report + metric counters from the diff plan.
         for _ in &plan.create {
             emit_gitops_object(gitops_kind::PERMISSION_GRANT, GitopsObjectResult::Created);
             report.created += 1;
@@ -391,31 +325,5 @@ impl ApplyConfigUseCase {
             managed_by: ManagedBy::GitOps,
             managed_by_digest: Some(digest),
         });
-    }
-}
-
-/// Map a service-account role name to the matching `Permission`. The
-/// apply-time validator gates `role ∈ {developer, reader}`, so any
-/// other value reaching this helper is an `Invariant`.
-///
-/// - `developer` → `Permission::Write` (by convention
-///   developer = read+write+delete, with `Write` standing in
-///   for the bundled grant because the `Permission` enum is flat).
-/// - `reader` → `Permission::Read`.
-///
-/// `pub` so cross-crate callers (notably the `hort-http-core` federation
-/// `/api/v1/token/exchange` handler, which mints SA tokens from
-/// validated JWTs) can stamp the federation token's
-/// `declared_permissions` from the same role-mapping table the apply
-/// pipeline uses; otherwise the federation cap leg of
-/// `RbacEvaluator::authorize` denies every check (empty cap permissions
-/// never `contains(&requested)` — see `cap_allows_optional_repo`).
-pub fn service_account_permission_for_role(role: &str) -> Result<Permission, DomainError> {
-    match role {
-        "developer" => Ok(Permission::Write),
-        "reader" => Ok(Permission::Read),
-        other => Err(DomainError::Invariant(format!(
-            "service-account role `{other}` is not in {{developer, reader}}"
-        ))),
     }
 }

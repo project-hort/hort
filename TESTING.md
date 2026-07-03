@@ -32,7 +32,6 @@ cargo test -p hort-config --test alpha_fixtures                  # alpha gitops 
 cargo test -p hort-domain --test streaming_metadata_port         # ADR 0026 streaming-metadata contract
 cargo test -p hort-app    --test no_sensitive_drops              # ADR 0030 sensitive-table drop guard
 cargo test -p hort-app    --test retention_registration_guard    # ADR 0030 eventstore-retention permitted-category guard
-cargo test -p hort-app    --test no_retired_config_names         # ADR 0029 retired env-var / Helm-key straggler guard
 ```
 
 ### Integration tests (Tier 2 — requires PostgreSQL)

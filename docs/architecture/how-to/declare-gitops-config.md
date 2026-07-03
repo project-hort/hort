@@ -398,8 +398,19 @@ section documents the operator-facing YAML and apply semantics.
   set would be an unintended wildcard — rejected by validation and
   by the DB `claims_nonempty` CHECK).
 - `kind: user` — direct binding to one `users.id` UUID. Bypasses
-  the claim mechanism entirely. The natural fit for service-account
-  grants and audited break-glass escalations.
+  the claim mechanism entirely. The natural fit for audited
+  break-glass escalations.
+- `kind: serviceAccount` — names a `ServiceAccount` envelope by
+  `metadata.name`; the apply pipeline resolves it to
+  `GrantSubject::User(backing_user_id)`
+  ([ADR 0037](../../adr/0037-gitops-service-account-grant.md)). This
+  is how service accounts hold authority — the SA envelope itself
+  carries none
+  ([ADR 0044](../../adr/0044-service-accounts-identity-only.md)). A
+  grant naming an absent SA fails apply (dangling reference). A
+  `serviceAccount` subject with `permission: admin` is rejected at
+  parse — service accounts are strictly non-admin
+  ([ADR 0038](../../adr/0038-admin-identity-model.md)).
 
 **Permission** is a single string, one of
 `read | write | delete | admin | admin_task_invoke | curate`.
@@ -441,13 +452,28 @@ spec:
   repository: pypi-alpha
 ```
 
-#### User-bound grant (service accounts, break-glass)
+#### ServiceAccount-subject grant (the SA authority mechanism)
 
 ```yaml
 apiVersion: project-hort.de/v1beta1
 kind: PermissionGrant
 metadata:
-  name: curator-ci-rotation-bot
+  name: ci-rotation-bot-read-npm-proxy
+spec:
+  subject:
+    kind: serviceAccount
+    name: ci-rotation-bot        # ServiceAccount metadata.name
+  permission: read
+  repository: npm-proxy
+```
+
+#### User-bound grant (break-glass)
+
+```yaml
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: oncall-read-npm-proxy
 spec:
   subject:
     kind: user
@@ -788,13 +814,26 @@ See: [`federate-ci-oidc.md`](./federate-ci-oidc.md),
 
 ### `kind: ServiceAccount`
 
-Declares a non-human identity. Three valid shapes — federation
-only, rotation only, or both. The "neither" case (no
-`federatedIdentities:` and no `fallbackRotation:`) is also valid
-and represents a PAT-only identity an operator mints via `hort-cli
-admin token issue`.
+Declares a non-human identity. The envelope is **identity +
+federation binding only** — `metadata.name`, `federatedIdentities`,
+`fallbackRotation` — and confers **no authority**
+([ADR 0044](../../adr/0044-service-accounts-identity-only.md)). The
+SA's authority is exactly its explicit `PermissionGrant`s, declared
+alongside with a `serviceAccount` subject (§4a,
+[ADR 0037](../../adr/0037-gitops-service-account-grant.md)). Tokens
+issued for the SA — the federation exchange and the fallback-rotation
+mint — carry a cap that snapshots those grants at issuance, so an SA
+with no grants holds a token that authorizes nothing. Apply the
+envelope **and** its grants together.
 
-**Federation only** — most common for OIDC-capable workloads:
+Three valid shapes — federation only, rotation only, or both. The
+"neither" case (no `federatedIdentities:` and no `fallbackRotation:`)
+is also valid and represents a PAT-only identity an operator mints
+via `hort-cli admin token issue`.
+
+**Federation only** — most common for OIDC-capable workloads. The
+envelope binds the identity; the grants beside it confer read+write
+on one repository:
 
 ```yaml
 apiVersion: project-hort.de/v1beta1
@@ -802,16 +841,41 @@ kind: ServiceAccount
 metadata:
   name: gha-myorg-myrepo-pypi
 spec:
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
         repository: my-org/my-repo
         environment: production
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-myorg-myrepo-pypi-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: gha-myorg-myrepo-pypi
+  permission: write
+  repository: pypi-internal
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-myorg-myrepo-pypi-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: gha-myorg-myrepo-pypi
+  permission: read
+  repository: pypi-internal
 ```
 
-**Rotation only** — for workloads that cannot do OIDC:
+Permissions are flat — `write` does not imply `read`. A publisher
+that also reads back what it pushed (e.g. push-then-sign, or twine's
+post-upload check) needs both grants.
+
+**Rotation only** — for workloads that cannot do OIDC. A pull-only
+consumer needs just the `read` grant:
 
 ```yaml
 apiVersion: project-hort.de/v1beta1
@@ -819,8 +883,6 @@ kind: ServiceAccount
 metadata:
   name: legacy-docker-puller
 spec:
-  role: reader
-  repositories: [oci-internal]
   fallbackRotation:
     targetSecret:
       name: hort-pull-secret
@@ -828,10 +890,23 @@ spec:
       format: dockerconfigjson      # or `opaque`
     rotationInterval: 6h
     validity: 24h
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: legacy-docker-puller-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: legacy-docker-puller
+  permission: read
+  repository: oci-internal
 ```
 
 **Both** — federation as primary path, rotation as fallback for
-non-OIDC clients in the same identity scope:
+non-OIDC clients in the same identity scope. The grants are shared:
+whichever path issued the token, the cap snapshots the same grant
+set:
 
 ```yaml
 apiVersion: project-hort.de/v1beta1
@@ -839,8 +914,6 @@ kind: ServiceAccount
 metadata:
   name: ci-pypi-pusher
 spec:
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -853,14 +926,28 @@ spec:
       format: opaque
     rotationInterval: 6h
     validity: 24h
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: ci-pypi-pusher-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: ci-pypi-pusher
+  permission: write
+  repository: pypi-internal
 ```
 
 Apply-time validation rules:
 
-- `role` ∈ `{developer, reader}`. **`admin` is forbidden** —
-  admin authority is reserved for short-lived interactive
-  sessions ([ADR 0013](../../adr/0013-idp-authoritative-cli-sessions.md)).
-- `repositories` non-empty (no global service-account grants).
+- `role:` and `repositories:` are **not fields** — the envelope
+  carries no authority, and the parser
+  (`deny_unknown_fields`) fails the apply for an envelope declaring
+  them. Authority is the SA's `PermissionGrant`s; a
+  `serviceAccount`-subject grant with `permission: admin` is
+  rejected at parse — service accounts are strictly non-admin
+  ([ADR 0038](../../adr/0038-admin-identity-model.md)).
 - `federatedIdentities[].issuer` must reference an existing
   `OidcIssuer` (cross-spec FK).
 - `federatedIdentities[].claims` **non-empty**. Empty claims
@@ -881,8 +968,9 @@ Apply-time validation rules:
 `service_accounts`, plus rows in `federated_identities` and the
 `fallback_rotation` sub-table. On first apply the use case also
 ensures a backing `users` row exists with
-`is_service_account = true` and `username = "sa:<metadata.name>"`,
-and emits `PermissionGrant` rows for `role × repositories`.
+`is_service_account = true` and `username = "sa:<metadata.name>"`.
+The SA's `serviceAccount`-subject grants resolve to that backing
+user (`GrantSubject::User(backing_user_id)`) in the same apply.
 Counter: `hort_gitops_objects_total{kind=service_account,result=...}`.
 
 **Identity:** the diff layer keys on `metadata.name`. Renaming an

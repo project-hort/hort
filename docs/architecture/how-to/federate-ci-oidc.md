@@ -182,20 +182,48 @@ environment)`. Use environments (the GitHub feature, not
 arbitrary strings) to bind production-push capability to the
 `production` environment, requiring its approval rules:
 
+The envelope binds the identity; the `PermissionGrant`s beside it
+are the SA's authority
+([ADR 0044](../../adr/0044-service-accounts-identity-only.md)) —
+the exchanged token's cap snapshots them at exchange time:
+
 ```yaml
 apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount
 metadata:
   name: gha-myorg-myrepo-prod-pypi
 spec:
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
         repository: my-org/my-repo
         environment: production
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-myorg-myrepo-prod-pypi-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: gha-myorg-myrepo-prod-pypi
+  permission: write
+  repository: pypi-internal
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-myorg-myrepo-prod-pypi-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: gha-myorg-myrepo-prod-pypi
+  permission: read
+  repository: pypi-internal
 ```
+
+Permissions are flat — `write` does not imply `read`; a publisher
+that reads back what it pushed needs both grants.
 
 Other useful claim discriminators when `environment` is not in
 play: `ref: refs/heads/main` restricts to `main` pushes;
@@ -315,14 +343,23 @@ kind: ServiceAccount
 metadata:
   name: glci-myorg-myrepo-pypi
 spec:
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: gitlab-com
       claims:
         project_path: my-org/my-repo
         ref: main
         ref_protected: 'true'
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: glci-myorg-myrepo-pypi-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: glci-myorg-myrepo-pypi
+  permission: write
+  repository: pypi-internal
 ```
 
 Note `'true'` is a string — JWT claim values are typically

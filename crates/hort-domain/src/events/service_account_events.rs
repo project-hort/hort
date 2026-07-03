@@ -143,8 +143,8 @@ impl ServiceAccountCreated {
 // ---------------------------------------------------------------------------
 
 /// Recorded when the apply pass updated an existing `service_accounts`
-/// row — role, repositories, federated identities, or fallback rotation
-/// changed for the matching `metadata.name`.
+/// row — the federated identities or fallback rotation changed for the
+/// matching `metadata.name`.
 ///
 /// Identity is `service_account_name`. Before/after values stay
 /// out of the payload (see module docstring).

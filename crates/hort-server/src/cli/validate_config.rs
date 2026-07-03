@@ -845,8 +845,6 @@ kind: ServiceAccount
 metadata:
   name: ci-loose
 spec:
-  role: developer
-  repositories: []
   federatedIdentities:
     - issuer: github-actions
       claims:

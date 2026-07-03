@@ -1,7 +1,11 @@
 //! `kind: ServiceAccount` schema, parser, and per-spec validation.
 //!
 //! Declares a non-human identity (see ADR 0018). One envelope per
-//! identity; envelope identity is `metadata.name`. Valid shapes:
+//! identity; envelope identity is `metadata.name`. The envelope is
+//! identity + federation binding only — it carries no authority.
+//! Authority comes exclusively from explicit `PermissionGrant`
+//! documents targeting the SA (`subject: serviceAccount`, ADR 0037).
+//! Valid shapes:
 //! - `federatedIdentities` + `fallbackRotation` (both blocks set)
 //! - `federatedIdentities` only (federation-only SA)
 //! - `fallbackRotation` only (legacy CI that can't do OIDC)
@@ -12,9 +16,6 @@
 //!
 //! # Apply-time invariants
 //!
-//! - `role` ∈ `{developer, reader}`. Admin SAs are forbidden by design
-//!   — admin is reserved for short-lived interactive sessions.
-//! - `repositories` non-empty (no global service-account grants).
 //! - `federatedIdentities[].issuer` non-blank. **Cross-kind FK
 //!   resolution lives in
 //!   `ApplyConfigUseCase::validate_service_account_issuer_fk`** —
@@ -41,10 +42,6 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::{Envelope, Kind};
 use crate::error::{ParseError, ValidationError};
 
-/// `role` values the apply-time validator accepts. Admin is forbidden
-/// — admin is reserved for short-lived interactive sessions.
-const ALLOWED_ROLES: &[&str] = &["developer", "reader"];
-
 /// `fallbackRotation.format` values the apply-time validator accepts.
 /// Mirrors the domain enum
 /// ([`SecretFormat`](hort_domain::entities::service_account::SecretFormat)).
@@ -64,15 +61,13 @@ const MAX_K8S_NAME_LEN: usize = 63;
 
 /// Shape of a `kind: ServiceAccount` YAML body.
 ///
-/// `deny_unknown_fields` rejects typos at parse time.
+/// Identity + federation binding only — the spec carries no
+/// authority fields. `deny_unknown_fields` rejects typos at parse
+/// time and rejects any envelope still declaring authority inline
+/// (`role:` / `repositories:` are unknown fields).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceAccountSpec {
-    /// Role granted to the SA. Apply-time validator gates to
-    /// `{developer, reader}`.
-    pub role: String,
-    /// Repositories the role is scoped to. Non-empty at apply time.
-    pub repositories: Vec<String>,
     /// Federation trust policy. Optional — an SA may exist without any
     /// federated identities (PAT-only path).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,35 +166,6 @@ pub fn validate_service_account(env: &Envelope<ServiceAccountSpec>) -> Vec<Valid
             name: name.clone(),
             detail: "metadata.name must not be blank".into(),
         });
-    }
-
-    // -- role ---------------------------------------------------------------
-    if !ALLOWED_ROLES.contains(&env.spec.role.as_str()) {
-        errors.push(ValidationError::UnknownEnumValue {
-            field: "spec.role",
-            got: env.spec.role.clone(),
-            expected: ALLOWED_ROLES.to_vec(),
-        });
-    }
-
-    // -- repositories -------------------------------------------------------
-    if env.spec.repositories.is_empty() {
-        errors.push(ValidationError::Invalid {
-            kind: Kind::ServiceAccount,
-            name: name.clone(),
-            detail: "spec.repositories must contain at least one entry \
-                     — no global service-account grants"
-                .into(),
-        });
-    }
-    for repo in &env.spec.repositories {
-        if repo.trim().is_empty() {
-            errors.push(ValidationError::Invalid {
-                kind: Kind::ServiceAccount,
-                name: name.clone(),
-                detail: "spec.repositories[*] must not be blank".into(),
-            });
-        }
     }
 
     // -- federatedIdentities ------------------------------------------------
@@ -524,14 +490,10 @@ mod tests {
     #[test]
     fn parse_minimal_pat_only_round_trip() {
         // Neither federation nor rotation declared — valid (operator
-        // mints PATs via hort-cli admin token issue).
-        let body = "
-  role: developer
-  repositories: [pypi-internal]
-";
+        // mints PATs via hort-cli admin token issue). The empty spec is
+        // the minimal identity-only envelope.
+        let body = " {}";
         let env = parse_service_account(&p(), yaml("pat-only", body).as_bytes()).unwrap();
-        assert_eq!(env.spec.role, "developer");
-        assert_eq!(env.spec.repositories, vec!["pypi-internal"]);
         assert!(env.spec.federated_identities.is_empty());
         assert!(env.spec.fallback_rotation.is_none());
         assert!(validate_service_account(&env).is_empty());
@@ -540,8 +502,6 @@ mod tests {
     #[test]
     fn parse_federation_only_round_trip() {
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -558,8 +518,6 @@ mod tests {
     #[test]
     fn parse_full_round_trip() {
         let body = "
-  role: developer
-  repositories: [pypi-internal, npm-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -573,7 +531,6 @@ mod tests {
     validity: 24h
 ";
         let env = parse_service_account(&p(), yaml("ci-full", body).as_bytes()).unwrap();
-        assert_eq!(env.spec.role, "developer");
         let rot = env.spec.fallback_rotation.as_ref().unwrap();
         assert_eq!(rot.target_secret.format, "dockerconfigjson");
         assert_eq!(rot.rotation_interval, "6h");
@@ -586,8 +543,6 @@ mod tests {
         // `rotationInterval` and `validity` carry serde defaults; only
         // `targetSecret` is required.
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: my-secret
@@ -606,8 +561,6 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_field() {
         let body = "
-  role: developer
-  repositories: [r]
   bogus: 1
 ";
         let err = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap_err();
@@ -616,32 +569,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_missing_role() {
-        let body = "
-  repositories: [r]
-";
-        let err = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap_err();
-        assert!(matches!(err, ParseError::Yaml(_)));
-    }
-
-    #[test]
-    fn parse_rejects_missing_repositories() {
+    fn parse_rejects_role_field() {
+        // The envelope carries no authority: `role` is not a schema
+        // field, so `deny_unknown_fields` rejects it at parse time —
+        // the deployer signal that authority belongs in explicit
+        // `PermissionGrant` documents.
         let body = "
   role: developer
 ";
         let err = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::Yaml(_)));
+        assert!(
+            err.to_string().contains("role"),
+            "parse error must name the rejected `role` field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_repositories_field() {
+        // Same rejection for `repositories` — repo scoping lives on the
+        // explicit `PermissionGrant` documents, not the SA envelope.
+        let body = "
+  repositories: [pypi-internal]
+";
+        let err = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap_err();
+        assert!(matches!(err, ParseError::Yaml(_)));
+        assert!(
+            err.to_string().contains("repositories"),
+            "parse error must name the rejected `repositories` field: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_role_and_repositories_envelope() {
+        // The full retired-authority envelope shape fails apply at
+        // parse — no field is silently ignored.
+        let doc = "\
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: ci-pypi-pusher
+spec:
+  role: developer
+  repositories: [pypi-internal, npm-internal]
+  federatedIdentities:
+    - issuer: github-actions
+      claims:
+        repository: my-org/my-repo
+";
+        let err = parse_service_account(&p(), doc.as_bytes()).unwrap_err();
+        assert!(matches!(err, ParseError::Yaml(_)));
+        assert!(
+            err.to_string().contains("role") || err.to_string().contains("repositories"),
+            "parse error must name a rejected authority field: {err}"
+        );
     }
 
     #[test]
     fn parse_rejects_empty_metadata_name() {
-        let body = "
-  role: developer
-  repositories: [r]
-";
-        let yaml_doc = format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: ServiceAccount\nmetadata:\n  name: ''\nspec:{body}"
-        );
+        let yaml_doc = "apiVersion: project-hort.de/v1beta1\nkind: ServiceAccount\nmetadata:\n  name: ''\nspec: {}".to_string();
         let err = parse_service_account(&p(), yaml_doc.as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::EmptyMetadataName));
     }
@@ -649,78 +635,8 @@ mod tests {
     // -- Validate rejects ---------------------------------------------------
 
     #[test]
-    fn validate_rejects_admin_role() {
-        // Admin is reserved for short-lived interactive sessions.
-        let body = "
-  role: admin
-  repositories: [r]
-";
-        let env = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap();
-        let errs = validate_service_account(&env);
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            ValidationError::UnknownEnumValue { field, got, .. }
-                if *field == "spec.role" && got == "admin"
-        )));
-    }
-
-    #[test]
-    fn validate_rejects_unknown_role() {
-        let body = "
-  role: superuser
-  repositories: [r]
-";
-        let env = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap();
-        let errs = validate_service_account(&env);
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            ValidationError::UnknownEnumValue { field, .. } if *field == "spec.role"
-        )));
-    }
-
-    #[test]
-    fn validate_accepts_developer_and_reader() {
-        for role in ["developer", "reader"] {
-            let body = format!(
-                "
-  role: {role}
-  repositories: [r]
-"
-            );
-            let env = parse_service_account(&p(), yaml("x", &body).as_bytes()).unwrap();
-            assert!(validate_service_account(&env).is_empty());
-        }
-    }
-
-    #[test]
-    fn validate_rejects_empty_repositories() {
-        let body = "
-  role: developer
-  repositories: []
-";
-        let env = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap();
-        let errs = validate_service_account(&env);
-        assert!(errs.iter().any(|e| e.to_string().contains("repositories")));
-    }
-
-    #[test]
-    fn validate_rejects_blank_repository_entry() {
-        let body = "
-  role: developer
-  repositories: ['   ']
-";
-        let env = parse_service_account(&p(), yaml("x", body).as_bytes()).unwrap();
-        let errs = validate_service_account(&env);
-        assert!(errs
-            .iter()
-            .any(|e| e.to_string().contains("repositories[*]")));
-    }
-
-    #[test]
     fn validate_rejects_blank_issuer_reference() {
         let body = "
-  role: developer
-  repositories: [r]
   federatedIdentities:
     - issuer: ''
       claims:
@@ -736,8 +652,6 @@ mod tests {
         // Load-bearing anti-footgun rule: empty claims = "any JWT from
         // this issuer can assume me." Must be a hard reject.
         let body = "
-  role: developer
-  repositories: [r]
   federatedIdentities:
     - issuer: github-actions
       claims: {}
@@ -758,8 +672,6 @@ mod tests {
         // Repository-only fragment, no ref/environment/workflow/aud —
         // any workflow in my-org/my-repo can assume this identity.
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -787,8 +699,6 @@ mod tests {
     fn under_constrained_warning_silent_when_environment_pins_it() {
         // repository + environment ⇒ discriminating ⇒ no finding.
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -803,8 +713,6 @@ mod tests {
     fn under_constrained_warning_silent_when_aud_pins_it() {
         // repository + aud ⇒ a discriminating claim ⇒ silent.
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: gitlab-ci
       claims:
@@ -826,8 +734,6 @@ mod tests {
         // is MORE under-constrained than the repo-with-no-discriminator
         // case; it must emit the "no scope-narrowing claim" warning class.
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -859,8 +765,6 @@ mod tests {
         // repository/project claim" shape, distinct from the sub-only
         // class-2 "no scope-narrowing claim" message.
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -886,8 +790,6 @@ mod tests {
         // (test c) repository + ref ⇒ a repo-scope claim AND a
         // discriminating claim ⇒ well-formed ⇒ NO warning of either class.
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -915,8 +817,6 @@ mod tests {
         // shape (it has neither a repo-scope nor a discriminator member,
         // but the upstream reject is the load-bearing control).
         let body = "
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: github-actions
       claims: {}
@@ -933,8 +833,6 @@ mod tests {
     #[test]
     fn validate_rejects_blank_claim_value() {
         let body = "
-  role: developer
-  repositories: [r]
   federatedIdentities:
     - issuer: github-actions
       claims:
@@ -950,8 +848,6 @@ mod tests {
     #[test]
     fn validate_rejects_blank_target_secret_name() {
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ''
@@ -968,8 +864,6 @@ mod tests {
     #[test]
     fn validate_rejects_blank_target_secret_namespace() {
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ci-token
@@ -986,8 +880,6 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_k8s_secret_name() {
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: 'Has_Underscores'
@@ -1006,8 +898,6 @@ mod tests {
         let long_name = "a".repeat(MAX_K8S_NAME_LEN + 1);
         let body = format!(
             "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: '{long_name}'
@@ -1025,8 +915,6 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_secret_format() {
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ci-token
@@ -1047,8 +935,6 @@ mod tests {
         for fmt in ["dockerconfigjson", "opaque"] {
             let body = format!(
                 "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ci-token
@@ -1064,8 +950,6 @@ mod tests {
     #[test]
     fn validate_rejects_short_rotation_interval() {
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ci-token
@@ -1084,8 +968,6 @@ mod tests {
     #[test]
     fn validate_rejects_unparseable_durations() {
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ci-token
@@ -1107,8 +989,6 @@ mod tests {
         // The validity must be at least 2× the rotation interval —
         // load-bearing safety margin for consumer-side Secret reload.
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ci-token
@@ -1129,8 +1009,6 @@ mod tests {
     #[test]
     fn validate_accepts_validity_exactly_twice_rotation_interval() {
         let body = "
-  role: developer
-  repositories: [r]
   fallbackRotation:
     targetSecret:
       name: ci-token
@@ -1154,8 +1032,6 @@ mod tests {
             kind: Kind::ServiceAccount,
             metadata: crate::envelope::Metadata { name: "   ".into() },
             spec: ServiceAccountSpec {
-                role: "developer".into(),
-                repositories: vec!["r".into()],
                 federated_identities: vec![],
                 fallback_rotation: None,
             },

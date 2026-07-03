@@ -289,14 +289,7 @@ asserts the code-held eventstore-retention rule set
 `{Artifact, AuthAttempts, DownloadAudit, TokenUse}`, with a no-wildcard
 exhaustiveness match over every `StreamCategory` so a future variant — or an
 accidentally-seeded privileged category — cannot silently become eligible for
-automated stream deletion), `no_retired_config_names` (ADR 0029 —
-whole-token, breadcrumb-aware source-scan of `crates/` + `deploy/` + `scripts/` +
-`docs/architecture/` that rejects any reintroduced retired `HORT_*` env-var name
-or retired Helm `values` key from the hard-rename normalization: a retired env var
-is silently ignored at boot and a retired Helm key now fails the strict
-`values.schema.json`, so a `name` regression — which coverage % cannot catch —
-becomes a red test; the upgrade note and the deliberate-typo Helm
-fixtures are the only allowed homes for the old names) are pure source-/fixture-scan
+automated stream deletion) are pure source-/fixture-scan
 guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`

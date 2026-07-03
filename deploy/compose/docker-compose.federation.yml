@@ -62,6 +62,12 @@ services:
       HORT_OIDC_CLI_CLIENT_ID: "hort-cli"
       HORT_OCI_TOKEN_SIGNING_KEY_FILE: "/etc/hort/sign/signing-key.pem"
       HORT_EXTRA_CA_BUNDLE: "/etc/hort/ca/issuer-ca.pem"
+      # The smoke exercises the minted hort_svc_* bearer against the
+      # plaintext localhost listener (the twine-upload leg). The
+      # PAT-over-HTTP gate refuses native tokens on unencrypted
+      # connections; a loopback smoke is the documented case for the
+      # override (same rationale as the k8s rotation smoke).
+      HORT_BEARER_ALLOW_OVER_HTTP: "true"
     volumes:
       # Full re-declaration (last-file-wins on the /etc/hort/config target,
       # additive for the rest). The base mounts ./example-config:ro; the
