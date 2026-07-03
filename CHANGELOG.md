@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-07-03
+
+Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
+push-then-sign under `provenance_mode: Required`** end to end — an unsigned
+image (index-shaped included) is held for the quarantine window, keyed cosign
+v3 signatures verify against the pinned key, and a verified signature clears
+the signed tree so the released image pulls (issues #13, #14, #15);
+**identity-only service accounts** — authority comes exclusively from explicit
+`PermissionGrant`s and issued-token caps snapshot the effective grants
+(ADR 0044); OCI **chunked blob-upload push** (buildah / podman / skopeo stream
+layers via HTTP `Transfer-Encoding: chunked`, no `Content-Length`, streamed and
+bounded by the publish-body limit); and an authoritative, self-pruning
+per-`(repo, principal)` OCI **upload-session cap**.
+
+### Added
+
+- **OCI image-index / manifest-list (multi-arch) support.** Hosted OCI repos
+  accept `application/vnd.oci.image.index.v1+json` and Docker manifest-list
+  PUTs (previously rejected `MANIFEST_INVALID`), so `skopeo copy --all`,
+  buildah/podman multi-arch pushes, and cosign signing of the index digest
+  work. An index is stored as a generic manifest artifact riding the normal
+  quarantine/scan/release/provenance lifecycle; each child manifest is
+  validated to exist in-repo on PUT, the declared media type is cross-checked
+  against the manifest shape, and index→child membership keeps every child's
+  content alive under GC. (issue #15, ADR 0043)
+- A `hort-sweep-ticker` sidecar in the reference compose deployment enqueues
+  the quarantine-release sweep periodically — compose's stand-in for the Helm
+  `scheduledTasks` CronJobs / native `hort_timers`, so release and expiry
+  decisions happen without a surrounding scheduler. (issue #14)
+
 ### Changed
 
 - **The `ServiceAccount` gitops envelope is identity-only** — it declares who
@@ -20,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   granted authority instead of an empty, deny-all cap). Grants added apply at
   the next exchange or rotation; revocations bite outstanding tokens
   immediately through the live grants leg. (issue #13, ADR 0044)
+- A **write-authorized** caller may now `GET` (not just `HEAD`) a held
+  manifest: keyed `cosign sign` resolves the subject manifest by GET before
+  attaching a signature, so the HEAD-only exemption blocked in-place
+  push-then-sign. A manifest is a routing document — layer blobs stay gated
+  (503) for every caller while held, and non-writers still receive 503 for
+  both verbs. (issue #14, ADR 0039)
+- **Keyed cosign signing against a hosted repo must use
+  `--registry-referrers-mode=oci-1-1`** (subject-based referrers); the legacy
+  `sha256-<hex>.sig` tag mode is not linked to its subject on the push path, so
+  a signature pushed that way stays invisible to the verifier.
 
 ### Removed
 
@@ -40,50 +80,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe now emits the same challenge the `/v2/*` middleware selects: `Bearer
   realm="<base>/v2/auth",service="<host>"` with the signing key wired, legacy
   Basic otherwise. (issues #13, #16)
-
-## [0.9.8] - 2026-07-03
-
-Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
-push-then-sign under `provenance_mode: Required`** end to end — an unsigned
-image (index-shaped included) is held for the quarantine window, keyed cosign
-v3 signatures verify against the pinned key, and a verified signature clears
-the signed tree so the released image pulls (issues #13, #14, #15); OCI
-**chunked blob-upload push** (buildah / podman / skopeo stream layers via HTTP
-`Transfer-Encoding: chunked`, no `Content-Length`, streamed and bounded by the
-publish-body limit); and an authoritative, self-pruning per-`(repo, principal)`
-OCI **upload-session cap**.
-
-### Added
-
-- **OCI image-index / manifest-list (multi-arch) support.** Hosted OCI repos
-  accept `application/vnd.oci.image.index.v1+json` and Docker manifest-list
-  PUTs (previously rejected `MANIFEST_INVALID`), so `skopeo copy --all`,
-  buildah/podman multi-arch pushes, and cosign signing of the index digest
-  work. An index is stored as a generic manifest artifact riding the normal
-  quarantine/scan/release/provenance lifecycle; each child manifest is
-  validated to exist in-repo on PUT, the declared media type is cross-checked
-  against the manifest shape, and index→child membership keeps every child's
-  content alive under GC. (issue #15, ADR 0043)
-- A `hort-sweep-ticker` sidecar in the reference compose deployment enqueues
-  the quarantine-release sweep periodically — compose's stand-in for the Helm
-  `scheduledTasks` CronJobs / native `hort_timers`, so release and expiry
-  decisions happen without a surrounding scheduler. (issue #14)
-
-### Changed
-
-- A **write-authorized** caller may now `GET` (not just `HEAD`) a held
-  manifest: keyed `cosign sign` resolves the subject manifest by GET before
-  attaching a signature, so the HEAD-only exemption blocked in-place
-  push-then-sign. A manifest is a routing document — layer blobs stay gated
-  (503) for every caller while held, and non-writers still receive 503 for
-  both verbs. (issue #14, ADR 0039)
-- **Keyed cosign signing against a hosted repo must use
-  `--registry-referrers-mode=oci-1-1`** (subject-based referrers); the legacy
-  `sha256-<hex>.sig` tag mode is not linked to its subject on the push path, so
-  a signature pushed that way stays invisible to the verifier.
-
-### Fixed
-
 - **cosign v3 keyed signatures now verify.** `cosign sign --key
   --registry-referrers-mode=oci-1-1` (cosign v3) emits a Sigstore v0.3 bundle
   referrer carrying a DSSE envelope, not the legacy `simplesigning` layer the
