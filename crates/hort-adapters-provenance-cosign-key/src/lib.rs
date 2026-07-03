@@ -1,25 +1,40 @@
 //! Keyed (pinned-public-key) cosign provenance verifier — `ProvenancePort`
 //! impl for the `"cosign-key"` backend (ADR 0039).
 //!
-//! Verifies a legacy cosign `simplesigning` signature (`cosign sign --key`)
-//! over the simplesigning payload against an operator-pinned public key, with
+//! Verifies a keyed cosign signature against an operator-pinned public key with
 //! **no** Fulcio chain, Rekor proof, SCT, or trust root — strictly more offline
-//! than the Sigstore verifier (no network at all). The orchestrator hands this
-//! adapter the keyed [`AttestationBundle`]s the §8 carriage built
-//! (`bytes` = the simplesigning payload-layer blob, `signature` = the decoded
-//! `dev.cosignproject.cosign/signature` annotation); a keyless v0.3 bundle
-//! (`signature == None`) is the Sigstore verifier's and is ignored here.
+//! than the Sigstore verifier (no network at all). It consumes **both** keyed
+//! carriages the orchestrator's §8 carriage builds:
 //!
-//! **Two load-bearing checks, both required (ADR 0039 §2):**
-//! 1. ECDSA-verify the detached signature **over the payload** against a pinned
-//!    public key (P-256, the cosign default; SHA-256 prehash is intrinsic).
-//! 2. **Bind** the payload's `critical.image.docker-manifest-digest` to the
-//!    served artifact's actual manifest digest — the `.sig` tag is
-//!    attacker-writable, so a validly-signed payload for image A re-tagged onto
-//!    image B must be `Rejected`, never `Verified`.
+//! - **legacy `simplesigning`** (`cosign sign --key`, `--registry-referrers-mode=legacy`):
+//!   `bytes` = the `simplesigning` payload-layer blob, `signature` = the decoded
+//!   `dev.cosignproject.cosign/signature` annotation. The signature is over the
+//!   raw payload; the bound digest is `critical.image.docker-manifest-digest`.
+//! - **cosign v3 keyed Sigstore v0.3 bundle** (`cosign sign --key
+//!   --registry-referrers-mode=oci-1-1`): `bytes` = the v0.3 bundle blob,
+//!   `signature = Some(raw DSSE sig)`. The bundle carries a **DSSE envelope**
+//!   over an in-toto Statement — the signature is over the DSSE PAE (not the raw
+//!   payload) and the bound digest is the in-toto `subject[].digest.sha256`.
+//!   The keyed shape is a v0.3 bundle whose `verificationMaterial` is a bare
+//!   `publicKey` (no Fulcio cert); a keyless (cert-chain) v0.3 bundle stays the
+//!   Sigstore verifier's.
+//!
+//! A keyless bundle (`signature == None`) is the Sigstore verifier's and is
+//! ignored here.
+//!
+//! **Two load-bearing checks, both required (ADR 0039 §2), for either carriage:**
+//! 1. ECDSA-verify the signature **over the signed bytes** (the raw payload for
+//!    simplesigning; the DSSE PAE for the v0.3 bundle) against a pinned public
+//!    key (P-256, the cosign default; SHA-256 prehash is intrinsic).
+//! 2. **Bind** the signed subject digest to the served artifact's actual
+//!    manifest digest — the referrer tag is attacker-writable, so a validly-
+//!    signed payload for image A re-tagged onto image B must be `Rejected`,
+//!    never `Verified`.
 //!
 //! Minimal crypto surface: `p256` (already in the locked graph), **not** the
-//! `sigstore` PKI crate (ADR 0039 Consequences).
+//! `sigstore` PKI crate (ADR 0039 Consequences). The keyed v0.3 bundle's
+//! signature-material extraction (DSSE PAE, in-toto subject, keyed/keyless
+//! discriminator) is the pure `hort_domain::provenance_bundle` helper.
 
 use serde::Deserialize;
 
@@ -83,33 +98,72 @@ impl CosignKeyVerifier {
         self.keys.len()
     }
 
-    /// Verify one keyed bundle: digest-bind FIRST (catch the re-tag attack even
-    /// for a payload validly signed for another image), then ECDSA-verify the
-    /// detached signature over the payload against any pinned key.
+    /// Verify one keyed bundle, recognising **either** carriage from `bytes`:
+    ///
+    /// - a **cosign v3 keyed Sigstore v0.3 bundle** (`bytes` parses as one whose
+    ///   `verificationMaterial` is a bare `publicKey`) — verify the DSSE
+    ///   signature over the PAE and bind the in-toto subject digest; or
+    /// - a **legacy `simplesigning` payload** (anything the v0.3 extractor does
+    ///   not claim) — verify the detached signature over the raw payload and
+    ///   bind `critical.image.docker-manifest-digest`.
+    ///
+    /// In both cases: digest-bind FIRST (catch the re-tag attack even for a
+    /// signature validly made for another image), then ECDSA-verify against any
+    /// pinned key. The extractor's `Err` (a keyed v0.3 bundle whose DSSE
+    /// material is structurally undecodable) is `Malformed` — it must not fall
+    /// through to the simplesigning path.
     fn verify_one(
         &self,
         subject: &ProvenanceSubject<'_>,
-        payload: &[u8],
+        bytes: &[u8],
         sig: &[u8],
     ) -> KeyedOutcome {
-        // 1. Parse the simplesigning payload + its claimed manifest digest.
-        let Some(claimed) = parse_simplesigning_digest(payload) else {
-            return KeyedOutcome::Malformed;
-        };
-        // 2. Bind: the signed payload must name THIS artifact's manifest digest.
+        match hort_domain::provenance_bundle::extract_keyed_dsse_signature(bytes) {
+            // A keyed v0.3 DSSE bundle: bind the in-toto subject, verify the
+            // DSSE signature over the PAE signing input.
+            Ok(Some(material)) => self.verify_signed(
+                subject,
+                &material.subject_digest,
+                &material.signing_input,
+                sig,
+            ),
+            // Not a keyed v0.3 bundle (keyless cert-chain, or not a bundle at
+            // all) → the legacy simplesigning payload interpretation.
+            Ok(None) => match parse_simplesigning_digest(bytes) {
+                Some(claimed) => self.verify_signed(subject, &claimed, bytes, sig),
+                None => KeyedOutcome::Malformed,
+            },
+            // The bundle claims to be a keyed v0.3 DSSE bundle but its material
+            // (base64 / in-toto payload) is undecodable → Malformed, never a
+            // silent fall-through.
+            Err(_) => KeyedOutcome::Malformed,
+        }
+    }
+
+    /// Bind `claimed_digest` to the served artifact, then ECDSA-verify `sig`
+    /// (DER) over `signing_input` against any pinned key. Shared by both
+    /// carriages — the ONE place the re-tag bind and the crypto check live.
+    fn verify_signed(
+        &self,
+        subject: &ProvenanceSubject<'_>,
+        claimed_digest: &str,
+        signing_input: &[u8],
+        sig: &[u8],
+    ) -> KeyedOutcome {
+        // Bind: the signed digest must name THIS artifact's manifest digest.
         let expected = format!("sha256:{}", subject.content_hash);
-        if claimed != expected {
+        if claimed_digest != expected {
             return KeyedOutcome::DigestMismatch;
         }
-        // 3. ECDSA-verify the detached signature over the payload against any
-        //    pinned key (P-256 `Verifier` prehashes with SHA-256).
+        // ECDSA-verify against any pinned key (P-256 `Verifier` prehashes with
+        // SHA-256).
         let Ok(signature) = Signature::from_der(sig) else {
             return KeyedOutcome::Malformed;
         };
         if self
             .keys
             .iter()
-            .any(|k| k.verify(payload, &signature).is_ok())
+            .any(|k| k.verify(signing_input, &signature).is_ok())
         {
             KeyedOutcome::Verified
         } else {

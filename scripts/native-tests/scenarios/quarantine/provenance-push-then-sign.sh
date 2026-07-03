@@ -18,43 +18,35 @@
 #                               * an anonymous manifest GET/pull -> 503 (held,
 #                                 not consumable);
 #                               * a WRITE-authorized manifest HEAD -> 200/exists
-#                                 (the existence-probe exemption, so the signer's
+#                                 (the hold-read exemption, so the signer's
 #                                 cosign preflight can resolve the digest and
-#                                 ATTACH the signature). GET stays 503 for all.
+#                                 ATTACH the signature). An anonymous GET stays
+#                                 503.
 #   [2] SIGN                  — `cosign sign --key <keyed> --registry-referrers-mode=oci-1-1
 #                               <ref>@<digest>` attaches a subject-linked referrer.
 #                               hort re-verifies the SUBJECT image (S3), emits
 #                               `ProvenanceVerified`, clearance -> Cleared.
 #   [3] RELEASE               — once the quarantine window elapses AND provenance
 #                               is Cleared, the image RELEASES and PULLS.
-#   [4] NEGATIVE (never-sign) — a second image is pushed and never signed; at
-#                               `quarantineDuration` expiry the backstop (S4)
-#                               makes the TERMINAL decision -> `ProvenanceRejected
-#                               {Unsigned}`; the manifest then returns 404
-#                               (MANIFEST_UNKNOWN), not 503.
+#   [4] NEGATIVE (never-sign) — a second image (a DISTINCT digest — same bytes
+#                               would CAS-dedup to the signed artifact) is
+#                               pushed and never signed; at `quarantineDuration`
+#                               expiry the backstop (S4) makes the TERMINAL
+#                               decision -> `ProvenanceRejected{Unsigned}`; an
+#                               anonymous manifest GET transitions 503 (held)
+#                               -> 404 (MANIFEST_UNKNOWN).
 #
 # -----------------------------------------------------------------------------
-# COSIGN HEAD-vs-GET FINDING (design doc §2 S2, Item 8 acceptance) — READ THIS.
+# COSIGN RESOLVES THE SUBJECT BY GET (ADR 0039 §10).
 # -----------------------------------------------------------------------------
-# The design (§2 S2) ASSUMES keyed `cosign sign` needs only the manifest HEAD to
-# resolve the subject digest before it PUTs the signature manifest, and Item 3
-# therefore exempts ONLY a write-authorized manifest HEAD from the quarantine
-# 503 (GET stays 503 for every caller during the hold). This scenario is the
-# check on that assumption:
-#
-#   * If step [2] SUCCEEDS with only the HEAD exemption in place, the assumption
-#     holds — keyed cosign sign resolves via HEAD, and Item 3's manifest-HEAD
-#     exemption is sufficient. (Expected.)
-#   * If step [2] FAILS because cosign issues a manifest GET during signing
-#     (observable as a 503 on `GET /v2/<repo>/manifests/<digest>` in the cosign
-#     output, NOT a HEAD), then the HEAD-only exemption is INSUFFICIENT: Item 3
-#     must be extended to a WRITE-AUTHORIZED manifest GET (still narrower than
-#     serving the manifest to all callers). File that as a FAST-FOLLOW to Item 3
-#     — do NOT widen the exemption inside this scenario.
-#
-# When this scenario runs in CI, its pass/fail on step [2] IS the empirical
-# answer. Until then the HEAD-only assumption is a CI-validated OPEN point,
-# recorded here and in ADR 0000.
+# Keyed `cosign sign` resolves the subject manifest by a `GET manifests/<digest>`
+# (not only a `HEAD`) before it attaches the signature manifest. The manifest
+# hold exemption therefore covers a write-authorized manifest HEAD AND GET, so a
+# held subject is signable: the manifest is metadata (config + layer digests),
+# not runnable content; the layer blobs keep their HEAD-only probe, so no
+# runnable bytes leave quarantine and a non-writer / anonymous read stays 503.
+# Step [3] below runs the sign for real against that widened exemption and
+# asserts the full round-trip (sign -> re-verify -> release -> pull) completes.
 #
 # -----------------------------------------------------------------------------
 # WHY THIS MAY SELF-SKIP on the current compose stack.
@@ -94,7 +86,11 @@ fi
 REPO_KEY="${PROVENANCE_REPO_KEY:-oci-provenance-e2e}"
 # Keyed cosign private key to SIGN with (cosign --key). Its PUBLIC half must be
 # the one the worker loaded to register `cosign-key`, or the verify will Reject.
-COSIGN_KEY="${COSIGN_KEY:-}"
+# Defaults to the committed test-only fixture keypair whose public half the
+# compose worker mounts (deploy/compose/example-config/provenance/cosign.pub);
+# $FIXTURES is set by the native-tests runner (=/work/fixtures). A CI job with a
+# different keypair overrides COSIGN_KEY.
+COSIGN_KEY="${COSIGN_KEY:-${FIXTURES:-}/cosign/cosign.key}"
 # cosign needs a password for a file-based key; empty for a keyless-file setup.
 export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
 # Source image to push — a genuine multi-arch IMAGE INDEX (ghcr.io, no Docker
@@ -103,6 +99,14 @@ export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
 # index-shaped push-then-sign). ghcr.io/stefanprodan/podinfo is an OCI image
 # index (mediaType application/vnd.oci.image.index.v1+json).
 SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:latest}"
+# The never-signed image for the [6/6] negative leg MUST have a DIFFERENT
+# digest than SOURCE_IMAGE: storage is content-addressed, so pushing the same
+# bytes under a second name dedups to the SAME artifact — and once the signed
+# leg's signature verifies THAT digest, the "unsigned" name serves the
+# already-released artifact (a cosign signature covers the digest, not the
+# name; 200 there is the registry being correct, not a hold bypass). A pinned
+# older podinfo tag is likewise a multi-arch OCI image index.
+UNSIGNED_SOURCE_IMAGE="${UNSIGNED_SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:6.5.0}"
 # How long the scenario is willing to wait for the window to elapse + the
 # release/expiry sweep to run. The gitops policy's quarantineDuration MUST be
 # <= this for the release/reject legs to complete in-run.
@@ -129,6 +133,8 @@ command -v cosign >/dev/null 2>&1 || \
     skip "cosign not in client image — provision cosign + a keyed key + a required/cosign-key repo, then re-run (see header)"
 [ -n "$COSIGN_KEY" ] || \
     skip "COSIGN_KEY unset — no keyed cosign private key to sign with (its public half must be the worker's registered cosign-key)"
+[ -f "$COSIGN_KEY" ] || \
+    skip "keyed cosign private key '$COSIGN_KEY' not found (expected the committed fixture at \$FIXTURES/cosign/cosign.key, or a CI-provided COSIGN_KEY)"
 
 trap 'rm -f "$PULLED_ARCHIVE"' EXIT
 
@@ -141,31 +147,59 @@ DEV_TOKEN="$(fetch_token dev-user dev)"
 DEST_CREDS="dev-user:${DEV_TOKEN}"
 log "[auth] fetched DEV_TOKEN from Keycloak (dev-user write-authorized for ${REPO_KEY})"
 
+# push_source_index <dest-ref> [<src-ref>] — `skopeo copy --all` a multi-arch
+# source (default SOURCE_IMAGE) to a hosted dest, with a bounded retry. The
+# pull leg reaches out to a public registry (ghcr.io) for four per-arch images;
+# a cold-cache pull occasionally drops a blob mid-copy (transient egress, not a
+# Hort defect), and skopeo is not idempotent-resumable on that failure. Three
+# attempts make the source pull deterministic without masking a genuine PUT
+# rejection (the #15 regression): on a real MANIFEST_INVALID the dest PUT fails
+# every attempt. Returns skopeo's last exit status. Runs under
+# `set -euo pipefail`, so the `if` consumes each non-final failure's status.
+push_source_index() {
+    local dest="$1" src="${2:-$SOURCE_IMAGE}" attempt rc=1
+    for attempt in 1 2 3; do
+        # `|| rc=$?` captures skopeo's real exit under `set -e` (a bare failing
+        # command in an `if` would leave `$?`=0 for the whole compound). rc reset
+        # to 0 first so a success leaves it 0.
+        rc=0
+        skopeo copy --all --insecure-policy --dest-tls-verify=false \
+              --dest-creds "$DEST_CREDS" \
+              "docker://${src}" "docker://${dest}" >/dev/null 2>&1 || rc=$?
+        [ "$rc" -eq 0 ] && break
+        log "  [push retry] skopeo copy --all ${src} -> ${dest} failed (attempt ${attempt}/3, rc=${rc}); retrying"
+        sleep 3
+    done
+    return "$rc"
+}
+
 # =============================================================================
 # [1/6] PUSH (unsigned) — accepted, held (write path ungated by the hold)
 # =============================================================================
 log "==> [1/6] Push --all ${SOURCE_IMAGE} -> docker://${DEST_SIGNED} (to-be-signed image INDEX)"
-if skopeo copy --all \
-      --insecure-policy --dest-tls-verify=false \
-      --dest-creds "$DEST_CREDS" \
-      "docker://${SOURCE_IMAGE}" "docker://${DEST_SIGNED}" >/dev/null 2>&1; then
+if push_source_index "$DEST_SIGNED"; then
     pass "push of the to-be-signed image INDEX accepted (index PUT ungated; was MANIFEST_INVALID before issue #15; held under required)"
 else
     fail "index push to required+cosign-key repo" \
-         "skopeo copy --all -> ${DEST_SIGNED} exited non-zero (a hosted index PUT under required must still be accepted, then HELD — a rejected index PUT is the #15 regression)"
+         "skopeo copy --all -> ${DEST_SIGNED} exited non-zero after retries (a hosted index PUT under required must still be accepted, then HELD — a rejected index PUT is the #15 regression)"
     summary
 fi
 
 # Resolve the pushed digest (cosign signs <ref>@<digest>, not the tag).
+# `skopeo inspect` issues a manifest GET, which the hold answers with 503 — an
+# EXPECTED non-zero exit. common.sh runs the scenario under `set -euo pipefail`,
+# so the failing command substitution must be neutralised with `|| true` or
+# errexit aborts the script before the write-authorized-HEAD fallback below can
+# run (that fallback is the whole point: the HEAD exemption serves the digest
+# while GET stays 503).
 DIGEST="$(skopeo inspect --tls-verify=false --creds "$DEST_CREDS" \
-    "docker://${DEST_SIGNED}" 2>/dev/null | jq -r '.Digest // empty')"
+    "docker://${DEST_SIGNED}" 2>/dev/null | jq -r '.Digest // empty' || true)"
 if [ -z "$DIGEST" ]; then
-    # skopeo inspect issues a manifest GET; under the hold that is 503 (correct).
     # Fall back to the Docker-Content-Digest header of a write-authorized HEAD,
-    # which the exemption serves.
+    # which the existence-probe exemption serves (200) even under the hold.
     DIGEST="$(curl -sSI -H "Authorization: Bearer ${DEV_TOKEN}" \
         "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/v1" 2>/dev/null \
-        | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')"
+        | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' || true)"
 fi
 [ -n "$DIGEST" ] || { fail "resolve pushed digest" "neither skopeo inspect nor a write-authorized HEAD returned a digest"; summary; }
 log "[digest] pushed manifest digest = ${DIGEST}"
@@ -187,20 +221,40 @@ WRITE_HEAD_CODE="$(curl -s -o /dev/null -w '%{http_code}' -I \
     -H "Authorization: Bearer ${DEV_TOKEN}" \
     "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/${DIGEST}" 2>/dev/null || echo 000)"
 if [ "$WRITE_HEAD_CODE" = "200" ]; then
-    pass "write-authorized manifest HEAD on held image -> 200/exists (existence-probe exemption; signer can attach)"
+    pass "write-authorized manifest HEAD on held image -> 200/exists (hold-read exemption; signer can preflight)"
 else
     fail "write-authorized manifest HEAD -> 200" \
-         "got HTTP ${WRITE_HEAD_CODE} (the write-authorized manifest-HEAD exemption must report exists so cosign can preflight)"
+         "got HTTP ${WRITE_HEAD_CODE} (the write-authorized manifest hold-read exemption must report exists so cosign can preflight)"
+fi
+
+# Keyed cosign resolves the subject by GET too (ADR 0039 §10): a write-authorized
+# manifest GET of the held subject SERVES (200), so the sign in [3] can resolve
+# the subject. The manifest is metadata, not runnable content; layer bytes stay
+# held (anonymous GET above is 503, layer blobs stay HEAD-only).
+WRITE_GET_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer ${DEV_TOKEN}" \
+    "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/${DIGEST}" 2>/dev/null || echo 000)"
+if [ "$WRITE_GET_CODE" = "200" ]; then
+    pass "write-authorized manifest GET on held image -> 200/serves (hold-read exemption; keyed cosign resolves the subject by GET)"
+else
+    fail "write-authorized manifest GET -> 200" \
+         "got HTTP ${WRITE_GET_CODE} (ADR 0039 §10: a write-authorized GET of a held manifest must SERVE so keyed cosign can resolve the subject before signing)"
 fi
 
 # =============================================================================
 # [3/6] SIGN — cosign sign --key --registry-referrers-mode=oci-1-1 <ref>@<digest>
 # =============================================================================
-# THE HEAD-vs-GET check: this runs with ONLY the manifest-HEAD exemption in
-# place. If cosign also needs a manifest GET it will 503 here — capture cosign's
-# output so a reviewer can see whether the blocked op was a HEAD or a GET.
+# Keyed cosign resolves the subject by GET (ADR 0039 §10); the widened manifest
+# hold-read exemption serves that GET to the write-authorized signer, so the
+# sign must COMPLETE against the held subject. Capture cosign's output so a
+# reviewer can see the exact blocked op if it ever regresses.
 log "==> [3/6] cosign sign --key ... --registry-referrers-mode=oci-1-1 ${DEST_SIGNED%:*}@${DIGEST}"
 export COSIGN_DOCKER_MEDIA_TYPES=1
+# cosign v3 still gates `--registry-referrers-mode=oci-1-1` (the subject-based
+# OCI 1.1 referrers carriage ADR 0039 §9 REQUIRES for hosted keyed signing)
+# behind COSIGN_EXPERIMENTAL=1; without it cosign errors out before any registry
+# call. The operator running `cosign v3.0.4` sets the same flag.
+export COSIGN_EXPERIMENTAL=1
 SIGN_OUT=""
 SIGN_RC=0
 SIGN_OUT="$(cosign sign --yes \
@@ -209,15 +263,15 @@ SIGN_OUT="$(cosign sign --yes \
     --registry-username=dev-user \
     --registry-password="$DEV_TOKEN" \
     --allow-insecure-registry \
+    --allow-http-registry \
     "${REGISTRY_HOST}/${REPO_KEY}/${SIGNED_NAME}@${DIGEST}" 2>&1)" || SIGN_RC=$?
 if [ "$SIGN_RC" -eq 0 ]; then
-    pass "cosign sign (keyed, oci referrers) succeeded — the manifest-HEAD exemption was sufficient for signing"
-    log "[HEAD-vs-GET] cosign signed with only the write-authorized manifest-HEAD exemption in place -> Item 3's HEAD-only exemption is sufficient (assumption CONFIRMED)."
+    pass "cosign sign (keyed, oci referrers) succeeded — the write-authorized manifest HEAD-and-GET hold-read exemption served the subject to the signer"
 else
     log "[cosign output]"; printf '%s\n' "$SIGN_OUT" | sed 's/^/    /'
     if printf '%s' "$SIGN_OUT" | grep -Eqi 'GET .*/manifests/.*503|503 .*manifests'; then
-        fail "cosign sign under HEAD-only exemption" \
-             "cosign issued a manifest GET (503) during signing -> Item 3's HEAD-only exemption is INSUFFICIENT; FAST-FOLLOW: extend it to a write-authorized manifest GET (see header). HEAD-vs-GET finding: GET REQUIRED."
+        fail "cosign sign hold-read exemption regressed" \
+             "cosign got a 503 on a manifest GET during signing -> the write-authorized manifest hold-read exemption (ADR 0039 §10) is not serving the held subject to the signer; the exemption regressed to HEAD-only"
     else
         fail "cosign sign (keyed, oci referrers)" \
              "cosign exited ${SIGN_RC}; see output above (not obviously a manifest-GET 503 — inspect the cosign error)"
@@ -261,31 +315,50 @@ fi
 # =============================================================================
 # [6/6] NEGATIVE — never-signed image -> terminal Rejected{Unsigned} at expiry
 # =============================================================================
-log "==> [6/6] NEGATIVE: push an image INDEX, never sign it -> terminal Rejected{Unsigned} at window expiry"
-if skopeo copy --all \
-      --insecure-policy --dest-tls-verify=false \
-      --dest-creds "$DEST_CREDS" \
-      "docker://${SOURCE_IMAGE}" "docker://${DEST_UNSIGNED}" >/dev/null 2>&1; then
-    log "  pushed never-to-be-signed image index ${DEST_UNSIGNED}"
+log "==> [6/6] NEGATIVE: push an image INDEX (distinct digest), never sign it -> terminal Rejected{Unsigned} at window expiry"
+# Distinct-digest source (UNSIGNED_SOURCE_IMAGE) — same-bytes would CAS-dedup
+# to the signed leg's already-released artifact (see the env-contract comment).
+if push_source_index "$DEST_UNSIGNED" "$UNSIGNED_SOURCE_IMAGE"; then
+    log "  pushed never-to-be-signed image index ${UNSIGNED_SOURCE_IMAGE} -> ${DEST_UNSIGNED}"
 else
-    fail "push never-signed image index" "skopeo copy --all -> ${DEST_UNSIGNED} exited non-zero"
+    fail "push never-signed image index" "skopeo copy --all ${UNSIGNED_SOURCE_IMAGE} -> ${DEST_UNSIGNED} exited non-zero"
     summary
 fi
 
 # At window expiry the release sweep enqueues a final provenance-verify with
 # window_open=false; complete_provenance then emits ProvenanceRejected{Unsigned}
 # and the manifest transitions from 503 (held) to 404 (MANIFEST_UNKNOWN).
+#
+# Poll ANONYMOUSLY: the hold-read exemption (ADR 0039 §10) legitimately serves
+# 200 to a WRITE-authorized manifest GET while held, so a credentialed poll
+# cannot observe the held state at all. The anonymous view is the puller's
+# view and traverses the exact transition the lifecycle promises: 503 (held)
+# -> 404 (terminal Rejected{Unsigned}).
+ANON_UNSIGNED_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+    "${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1" 2>/dev/null || echo 000)"
+if [ "$ANON_UNSIGNED_CODE" = "503" ]; then
+    pass "never-signed image starts HELD (anonymous manifest GET -> 503)"
+elif [ "$ANON_UNSIGNED_CODE" = "404" ]; then
+    # The window (30s in the compose fixture) can expire before this probe
+    # runs — e.g. the [5/6] poll above consumed it. Already-terminal is the
+    # SAME correct end state, just observed late; only a non-{503,404} code
+    # (200 = released-unsigned!) is a real failure.
+    pass "never-signed image already terminal at first probe (anonymous GET -> 404; window expired during [5/6])"
+else
+    fail "never-signed image held (anonymous GET -> 503)" \
+         "got HTTP ${ANON_UNSIGNED_CODE} (a held required image must 503 anonymously; 200 would mean an unsigned image is being served)"
+fi
 if bounded_poll \
         "never-signed manifest -> 404 (terminal Rejected{Unsigned})" \
         "$WINDOW_WAIT_SECS" \
-        "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ${DEV_TOKEN}' '${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1' 2>/dev/null)\" = '404' ]" \
+        "[ \"\$(curl -s -o /dev/null -w '%{http_code}' '${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1' 2>/dev/null)\" = '404' ]" \
         5; then
-    pass "never-signed image is terminally Rejected{Unsigned} at window expiry (manifest -> 404, not 503)"
+    pass "never-signed image is terminally Rejected{Unsigned} at window expiry (anonymous manifest 503 -> 404, not released)"
 else
-    LAST_CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${DEV_TOKEN}" \
+    LAST_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
         "${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1" 2>/dev/null || echo 000)"
     fail "never-signed image -> terminal Rejected{Unsigned}" \
-         "manifest still HTTP ${LAST_CODE} after ${WINDOW_WAIT_SECS}s (expected 404; the expiry backstop should have made the terminal Unsigned decision)"
+         "anonymous manifest GET still HTTP ${LAST_CODE} after ${WINDOW_WAIT_SECS}s (expected 404; the expiry backstop should have made the terminal Unsigned decision)"
 fi
 
 summary

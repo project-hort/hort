@@ -4747,6 +4747,7 @@ mod tests {
                             san: "san".into(),
                         },
                         predicate_type: None,
+                        cascaded_from: None,
                     }),
                     correlation_id: Uuid::new_v4(),
                     causation_id: None,

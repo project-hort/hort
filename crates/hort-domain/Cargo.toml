@@ -19,6 +19,10 @@ thiserror = { workspace = true }
 # Serialisation of domain events
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Pure base64 decode of the DSSE-envelope payload/signature a cosign v3
+# Sigstore v0.3 keyed bundle carries (ADR 0039 §8 keyed-bundle extraction).
+# Zero-I/O — a decode, not a boundary crossing.
+base64 = { workspace = true }
 
 # Async trait definitions (AsyncRead) — io-util only, no runtime
 tokio = { workspace = true, features = ["io-util"] }

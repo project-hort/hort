@@ -21,6 +21,12 @@ secret:
     - name: "Test RSA key for unit tests"
       match: "END PRIVATE KEY"
 
+    # E2E fixture cosign key (scripts/native-tests/fixtures/cosign/) — also
+    # covered by the path rules above; the header match keeps the fixture
+    # suppressed if it is ever moved outside the ignored paths.
+    - name: "E2E fixture encrypted Sigstore private key"
+      match: "ENCRYPTED SIGSTORE PRIVATE KEY"
+
     # Default test passwords used in examples and unit tests
     - name: "Default test password"
       match: "admin123"

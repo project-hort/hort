@@ -246,6 +246,71 @@ pub fn simplesigning_signature_layers(
         .collect())
 }
 
+/// Upper bound on the number of blob digests [`manifest_blob_digests`]
+/// returns from a single image manifest (`config` + `layers[]`). Mirrors the
+/// write-path `MAX_BLOB_REFERENCES` cap (`hort-http-oci` `manifests_write.rs`)
+/// so a pathological manifest cannot force the provenance cascade to hold an
+/// unbounded reference set. A manifest declaring more is **rejected**
+/// ([`DomainError::Validation`]), never truncated — mirroring
+/// [`index_child_digests`]'s over-cap posture.
+const MAX_MANIFEST_BLOBS: usize = 1024;
+
+/// Minimal single-image-manifest projection for
+/// [`manifest_blob_digests`] — only the `config` + `layers[]` descriptor
+/// digests. A distinct type from [`OciManifest`] (whose parse the
+/// media-type/annotation helpers share) so widening this projection can
+/// never perturb those parsers. `serde` ignores every other field.
+#[derive(Deserialize)]
+struct OciManifestBlobRefs {
+    #[serde(default)]
+    config: Option<OciBlobDescriptor>,
+    #[serde(default)]
+    layers: Vec<OciBlobDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct OciBlobDescriptor {
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// Returns the CAS content hash of every blob a **single-image manifest**
+/// references: the `config` descriptor's digest plus each `layers[*]` digest,
+/// in manifest order (config first).
+///
+/// This is the constituent-derivation primitive of the provenance-clearance
+/// cascade (ADR 0039): a manifest's bytes bind its config/layer digests, so a
+/// signature verified over the manifest (or over an index that binds the
+/// manifest) covers exactly these blobs.
+///
+/// `sha256`-only: a descriptor whose digest uses another algorithm or is
+/// malformed hex is **skipped** (not an error), mirroring
+/// [`index_child_digests`]. A descriptor with no `digest`, a missing `config`,
+/// or an absent `layers` key are likewise skipped/empty. An image index (no
+/// `config`/`layers`) yields `Ok(vec![])`. A manifest declaring more than
+/// [`MAX_MANIFEST_BLOBS`] config+layer descriptors is **rejected** as
+/// [`DomainError::Validation`] — never silently truncated. Malformed /
+/// non-object JSON is [`DomainError::Validation`] — the same error shape
+/// [`sigstore_bundle_layers`] produces.
+pub fn manifest_blob_digests(manifest_json: &[u8]) -> DomainResult<Vec<ContentHash>> {
+    let manifest: OciManifestBlobRefs = serde_json::from_slice(manifest_json)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
+
+    let declared = manifest.layers.len() + usize::from(manifest.config.is_some());
+    if declared > MAX_MANIFEST_BLOBS {
+        return Err(DomainError::Validation(format!(
+            "image manifest references {declared} config/layer blobs; max is {MAX_MANIFEST_BLOBS}",
+        )));
+    }
+
+    Ok(manifest
+        .config
+        .iter()
+        .chain(manifest.layers.iter())
+        .filter_map(|d| d.digest.as_deref().and_then(parse_sha256_digest))
+        .collect())
+}
+
 /// Minimal OCI image-index projection — only the `manifests[]` child
 /// descriptor array the index helpers read. A distinct type from
 /// [`OciManifest`] (which reads `config`/`layers`): an index carries neither,
@@ -892,6 +957,122 @@ mod tests {
     #[test]
     fn index_child_digests_malformed_json_is_validation_error() {
         let err = index_child_digests(b"not json at all").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // manifest_blob_digests (provenance-cascade constituent derivation,
+    // ADR 0039)
+    // ----------------------------------------------------------------
+    //
+    // config digest first, then layer digests in manifest order;
+    // sha256-only + bounded, skipping malformed descriptors (mirroring
+    // `index_child_digests`) and erroring only on malformed JSON or an
+    // over-cap declaration.
+
+    #[test]
+    fn manifest_blob_digests_returns_config_then_layers_in_order() {
+        let (hc, ha, hb) = (hex64('c'), hex64('a'), hex64('b'));
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{hc}"), "size": 7 },
+            "layers": [
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                  "digest": format!("sha256:{ha}") },
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                  "digest": format!("sha256:{hb}") }
+            ]
+        }));
+        let got = manifest_blob_digests(&m).expect("valid manifest");
+        let hashes: Vec<&str> = got.iter().map(AsRef::as_ref).collect();
+        assert_eq!(hashes, vec![hc.as_str(), ha.as_str(), hb.as_str()]);
+    }
+
+    #[test]
+    fn manifest_blob_digests_missing_config_returns_layers_only() {
+        let ha = hex64('a');
+        let m = manifest(&serde_json::json!({
+            "layers": [ { "digest": format!("sha256:{ha}") } ]
+        }));
+        let got = manifest_blob_digests(&m).expect("valid manifest");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref(), ha.as_str());
+    }
+
+    #[test]
+    fn manifest_blob_digests_skips_non_sha256_and_missing_digests() {
+        let ha = hex64('a');
+        let m = manifest(&serde_json::json!({
+            "config": { "digest": format!("sha512:{}", "a".repeat(128)) },
+            "layers": [
+                { "digest": format!("sha256:{ha}") },
+                { "digest": "sha256:not-valid-hex" },
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip" }
+            ]
+        }));
+        let got = manifest_blob_digests(&m).expect("valid manifest");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref(), ha.as_str());
+    }
+
+    #[test]
+    fn manifest_blob_digests_image_index_is_empty() {
+        // An index carries no config/layers → empty (not an error): the
+        // cascade's caller branches on `is_image_index` first, but the
+        // function stays total over the other shape.
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{}", hex64('a')) }
+        ]));
+        assert!(manifest_blob_digests(&m).expect("valid").is_empty());
+    }
+
+    #[test]
+    fn manifest_blob_digests_empty_object_is_empty() {
+        assert!(manifest_blob_digests(b"{}").expect("valid").is_empty());
+    }
+
+    #[test]
+    fn manifest_blob_digests_over_cap_is_rejected() {
+        // config + layers together over the cap is REJECTED (never
+        // truncated), mirroring `index_child_digests`. The config
+        // descriptor counts toward the total: exactly MAX layers + a
+        // config is one over.
+        let at_cap_layers: Vec<serde_json::Value> = (0..MAX_MANIFEST_BLOBS)
+            .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}") }))
+            .collect();
+        let over = manifest(&serde_json::json!({
+            "config": { "digest": format!("sha256:{}", hex64('c')) },
+            "layers": at_cap_layers,
+        }));
+        let err = manifest_blob_digests(&over).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation(_)),
+            "over-cap manifest must be a Validation error, got {err:?}"
+        );
+
+        // Exactly AT the cap succeeds (boundary): MAX-1 layers + config.
+        let under_layers: Vec<serde_json::Value> = (0..MAX_MANIFEST_BLOBS - 1)
+            .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}") }))
+            .collect();
+        let at_cap = manifest(&serde_json::json!({
+            "config": { "digest": format!("sha256:{}", hex64('c')) },
+            "layers": under_layers,
+        }));
+        let got = manifest_blob_digests(&at_cap).expect("at-cap manifest");
+        assert_eq!(got.len(), MAX_MANIFEST_BLOBS);
+    }
+
+    #[test]
+    fn manifest_blob_digests_malformed_json_is_validation_error() {
+        let err = manifest_blob_digests(b"not json at all").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn manifest_blob_digests_non_object_json_is_validation_error() {
+        let err = manifest_blob_digests(b"[1, 2, 3]").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 

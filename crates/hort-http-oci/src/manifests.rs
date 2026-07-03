@@ -246,35 +246,38 @@ pub(super) async fn serve(
     //    as MANIFEST_UNKNOWN (format-specific envelope, so inline here
     //    rather than in the helper).
     //
-    //    Push-then-sign exception (mirrors the blob-HEAD existence probe
-    //    in `blobs.rs`): a write-authorized caller's manifest-EXISTENCE
-    //    check (`HEAD`) must report the descriptor (200, headers, empty
-    //    body) so a held subject can be signed. Under `provenance_mode:
-    //    Required` the subject image is held `Quarantined` until a
-    //    signature arrives, but cosign's `sign` preflight is exactly a
-    //    `HEAD manifests/<digest>` — a 503 there aborts the sign and the
-    //    signature can never attach (issue #13). The 503 hold stays in
-    //    force for: the manifest GET (every caller, `head == false`), and
-    //    read HEADs (non-writers / anonymous / proxy scopes). So the
-    //    transparent-proxy contract (quarantine invariant #5) is
-    //    untouched; only the write-authorized existence probe is released.
-    //    Fail closed: ONLY a definitive `Write` authorization skips the
-    //    503 — a denied or errored resolve keeps it. The extra resolve
-    //    fires solely on the narrow quarantined-manifest-HEAD path (the
-    //    `matches!` short-circuits first), so the hot read path is
-    //    unaffected.
-    let write_authorized_existence_probe = head
-        && matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
-        && ctx
-            .repository_access_use_case
-            .resolve(
-                repo_key,
-                actor,
-                hort_app::use_cases::repository_access::AccessLevel::Write,
-            )
-            .await
-            .is_ok();
-    if !write_authorized_existence_probe {
+    //    Push-then-sign exception (ADR 0039): a write-authorized caller
+    //    may read a held MANIFEST — the existence check (`HEAD`) AND the
+    //    body (`GET`) — so a held subject image can be signed. Under
+    //    `provenance_mode: Required` the subject is held `Quarantined`
+    //    until a signature arrives, and keyed `cosign sign` resolves the
+    //    subject manifest by `GET` before attaching the signature. A
+    //    manifest is a routing document (config + layer digests), not
+    //    runnable content; the real bytes are the layer blobs, and
+    //    `blobs.rs` keeps its existence probe `HEAD`-only, so a held
+    //    layer's bytes are never served — the image cannot be pulled or
+    //    run. The 503 hold stays in force for every read caller WITHOUT
+    //    `Write` (non-writers / anonymous / proxy read scopes) and for
+    //    every layer blob. So no runnable content leaves quarantine (only
+    //    the metadata manifest, only to a write-authorized caller), the
+    //    transparent-proxy contract (quarantine invariant #5) is untouched,
+    //    and a `Rejected` manifest is still hidden below. Fail closed:
+    //    ONLY a definitive `Write` authorization skips the 503 — a denied
+    //    or errored resolve keeps it. The resolve fires solely on the
+    //    narrow quarantined-manifest path (the `matches!` short-circuits
+    //    first), so the hot read path is unaffected.
+    let write_authorized_hold_read =
+        matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
+            && ctx
+                .repository_access_use_case
+                .resolve(
+                    repo_key,
+                    actor,
+                    hort_app::use_cases::repository_access::AccessLevel::Write,
+                )
+                .await
+                .is_ok();
+    if !write_authorized_hold_read {
         if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
             return resp;
         }
@@ -314,9 +317,19 @@ pub(super) async fn serve(
         return build_response(&artifact, &hash, &media_type, /* body = */ None);
     }
 
-    // Thread the resolved principal for opt-in download-audit attribution
+    // A held manifest served under the write-authorized hold-read exemption
+    // (ADR 0039 §10) streams via `download_hold_read`: the audited `download`
+    // path refuses a `Quarantined` artifact (`is_downloadable()` is false),
+    // so it cannot serve the held subject keyed `cosign sign` resolves by GET.
+    // Otherwise (a released / `None` artifact) thread the resolved principal
+    // through the audited `download` for opt-in download-audit attribution
     // (ADR 0020). No per-handler auth code.
-    let (_a, stream) = match ctx.artifact_use_case.download(artifact.id, actor).await {
+    let download_result = if write_authorized_hold_read {
+        ctx.artifact_use_case.download_hold_read(artifact.id).await
+    } else {
+        ctx.artifact_use_case.download(artifact.id, actor).await
+    };
+    let (_a, stream) = match download_result {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
@@ -2169,12 +2182,24 @@ mod tests {
                 None,
                 QuarantineStatus::Quarantined,
             );
-            let router = manifest_router(h.ctx);
-            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
+            // Anonymous read of a held manifest. Route through an
+            // RBAC-ENABLED context (not the admit-everything mock default)
+            // so the anonymous caller genuinely lacks `Write` — otherwise
+            // the widened hold-read exemption (ADR 0039) would admit the
+            // admit-everything mock's anonymous "Write" and serve the body.
+            // In production an anonymous caller's Write resolve fails, so
+            // the 503 hold stands; this exercises that path faithfully.
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                /* anonymous */ None,
+            )
+            .await;
             let status = resp.status();
             let retry_after = resp
                 .headers()
@@ -2202,15 +2227,17 @@ mod tests {
         );
     }
 
-    // -- Write-authorized manifest HEAD existence-probe exemption (issue #13) --
+    // -- Write-authorized manifest hold-read exemption (ADR 0039) --
     //
-    // Mirrors the blob-HEAD existence-probe pair in `blobs.rs`. Under
-    // `provenance_mode: Required` the subject image is held `Quarantined`
-    // until a signature arrives; cosign's `sign` preflight is a
-    // `HEAD manifests/<digest>`, so a write-authorized HEAD on a held
-    // manifest must report the descriptor (200) rather than 503 — else the
-    // signature can never attach. Everything else (GET / non-writers /
-    // anonymous) stays 503.
+    // Under `provenance_mode: Required` the subject image is held
+    // `Quarantined` until a signature arrives; keyed `cosign sign` resolves
+    // the subject manifest by both `HEAD` and `GET manifests/<digest>` before
+    // attaching the signature, so a write-authorized HEAD *and* GET on a held
+    // manifest must serve (200) rather than 503 — else the signature can never
+    // attach. A manifest is metadata (config + layer digests), not runnable
+    // content; the layer blobs stay HEAD-only in `blobs.rs`, so serving a held
+    // manifest never serves a held layer. Non-writers / anonymous callers stay
+    // 503 on every read.
 
     /// Build an RBAC-enabled context that grants `claim` repo-wide `Write`,
     /// reusing the harness's `repositories` mock so seeded repos resolve.
@@ -2371,19 +2398,40 @@ mod tests {
         );
     }
 
-    /// Security scope guard: the exemption is HEAD-only. A write-authorized
-    /// caller's manifest GET of a quarantined manifest still 503s — the
-    /// quarantine DOWNLOAD block (invariant #1) holds even for the pusher and
-    /// the GET/proxy path (invariant #5) is untouched; only the existence
-    /// probe is released, never the held manifest body.
+    /// Push-then-sign (ADR 0039 §9): keyed `cosign sign` resolves the subject
+    /// manifest by GET before attaching the signature, so the hold exemption
+    /// covers a write-authorized manifest GET as well as HEAD. A held manifest
+    /// is a routing document (config + layer digests), not runnable content —
+    /// the real bytes are the layer blobs, and `blobs.rs` keeps its existence
+    /// probe HEAD-only, so serving a held manifest never serves a held layer.
+    /// A write-authorized caller's GET of a quarantined manifest therefore
+    /// SERVES (200) — earlier this test asserted 503; the exemption widened.
+    /// The non-writer / anonymous GET path stays 503 (asserted below).
     #[test]
-    fn get_manifest_quarantined_write_authorized_caller_still_returns_503() {
+    fn get_manifest_quarantined_write_authorized_caller_now_serves() {
         let status = quarantined_manifest_serve_status(/* head = */ false, Some("ci-pusher"));
         assert_eq!(
             status,
+            StatusCode::OK,
+            "write-authorized GET of a quarantined manifest now serves (200) so keyed cosign \
+             can resolve the subject and sign it — the manifest is metadata, not runnable \
+             content; the layer blobs stay HEAD-only, so no runnable bytes leave quarantine"
+        );
+    }
+
+    /// Security scope guard: the widened hold exemption is WRITE-only. A
+    /// non-writer's GET of a quarantined manifest still 503s — only a
+    /// definitive `Write` authorization releases the hold read, so the held
+    /// manifest never leaks to a read/proxy caller (quarantine invariant #5).
+    #[test]
+    fn get_manifest_quarantined_non_writer_still_returns_503() {
+        let status =
+            quarantined_manifest_serve_status(/* head = */ false, Some("some-reader"));
+        assert_eq!(
+            status,
             StatusCode::SERVICE_UNAVAILABLE,
-            "write-authorized GET of a quarantined manifest must stay 503 — only the \
-             HEAD existence probe is released; the manifest body stays held for every caller"
+            "a non-writer GET of a quarantined manifest must stay 503 — the widened hold \
+             read exemption is write-authorized only, never open to read/proxy callers"
         );
     }
 
@@ -2420,6 +2468,60 @@ mod tests {
             (status, body)
         });
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+    }
+
+    /// Security scope guard, RBAC-enabled mirror of the test above: the
+    /// hold-read exemption is `Quarantined`-only, so even a WRITE-authorized
+    /// caller's GET of a `Rejected` manifest stays hidden as 404
+    /// (`MANIFEST_UNKNOWN`) — a Write grant never resurrects a rejected
+    /// manifest. Pins the property under the same `write_grant_ctx` harness
+    /// the Quarantined suite uses, not just the RBAC-disabled ctx.
+    #[test]
+    fn rejected_manifest_write_authorized_get_still_hidden_as_404() {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let (status, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Rejected,
+            );
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = principal_with_claim("ci-pusher");
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await;
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a write-authorized GET of a Rejected manifest must stay hidden — \
+             the hold-read exemption covers Quarantined only"
+        );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
     }
@@ -4310,18 +4412,20 @@ mod tests {
         assert!(head.3.is_empty(), "HEAD must carry an empty body");
     }
 
-    /// (c) Provenance HEAD-200 for an INDEX subject. Under a provenance
-    /// hold the index is `Quarantined`; cosign's sign preflight is a
-    /// `HEAD manifests/<index-digest>`. A write-authorized HEAD must
-    /// report 200 (the existing issue-#13 `write_authorized_existence_probe`
-    /// — NOT index-specific), so the held index is signable. A GET, a
-    /// non-writer HEAD, and an anonymous HEAD all stay 503.
+    /// (c) Provenance hold-read exemption for an INDEX subject. Under a
+    /// provenance hold the index is `Quarantined`; keyed cosign resolves the
+    /// subject index by both `HEAD` and `GET manifests/<index-digest>`. A
+    /// write-authorized HEAD *and* GET must serve 200 (the ADR 0039
+    /// `write_authorized_hold_read` exemption — NOT index-specific), so the
+    /// held index is signable. A non-writer HEAD and an anonymous HEAD stay
+    /// 503.
     ///
     /// Byte-for-byte reuse of the `quarantined_manifest_serve_status`
     /// RBAC harness above, with the seeded manifest's bytes + media-type
     /// swapped to an index. The exemption keys on `Write` authorization,
     /// never on manifest shape — proving the payoff (a held INDEX can be
-    /// signed) rides the same generic gate.
+    /// signed) rides the same generic gate. An index carries only child
+    /// digests, not runnable bytes; the child layer blobs stay HEAD-only.
     fn quarantined_index_serve_status(head: bool, actor_claim: Option<&str>) -> StatusCode {
         let child = "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
         let content = sample_index_body(child);
@@ -4372,12 +4476,24 @@ mod tests {
     }
 
     #[test]
-    fn item4_get_quarantined_index_write_authorized_still_503() {
+    fn item4_get_quarantined_index_write_authorized_now_serves() {
         assert_eq!(
             quarantined_index_serve_status(/* head = */ false, Some("ci-pusher")),
+            StatusCode::OK,
+            "a write-authorized GET of a held index now serves (200) so keyed cosign can \
+             resolve the index digest and sign it — the index is metadata (child digests), \
+             not runnable content; the child layer blobs stay HEAD-only, so serving the \
+             held index leaks no runnable bytes"
+        );
+    }
+
+    #[test]
+    fn item4_get_quarantined_index_non_writer_still_503() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ false, Some("some-reader")),
             StatusCode::SERVICE_UNAVAILABLE,
-            "the held index body stays 503 for every caller — only the HEAD existence probe \
-             is released"
+            "a non-writer GET of a held index stays 503 — the widened hold read exemption \
+             is write-authorized only"
         );
     }
 
@@ -4391,18 +4507,24 @@ mod tests {
         assert_eq!(
             quarantined_index_serve_status(/* head = */ true, /* anonymous */ None),
             StatusCode::SERVICE_UNAVAILABLE,
-            "an anonymous HEAD on a held index stays 503 — the existence probe never leaks a \
+            "an anonymous HEAD on a held index stays 503 — the exemption never leaks a \
              held index to a read/proxy caller (quarantine invariant #5)"
         );
     }
 
     /// (d) The load-bearing D4 safety invariant: releasing an index does
     /// NOT release its children. A RELEASED index (`QuarantineStatus::None`)
-    /// references a still-HELD child manifest; a `GET` and a `HEAD` of the
-    /// held child both 503. Each artifact is independently gated by its own
+    /// references a still-HELD child manifest; a non-writer `GET` of the held
+    /// child stays 503. Each artifact is independently gated by its own
     /// quarantine status — an index carries no runnable bytes, so serving it
     /// never serves the held child. This is why v1 needs no child-status
     /// rollup into the index release gate (design §2 D4).
+    ///
+    /// Routed through an RBAC-ENABLED context with an anonymous caller: the
+    /// widened hold-read exemption (ADR 0039) serves a held manifest to a
+    /// write-authorized caller, so the held-child 503 must be exercised via a
+    /// caller that genuinely lacks `Write` (the admit-everything mock default
+    /// would admit anonymous "Write" and serve the child).
     #[test]
     fn item4_released_index_does_not_release_held_child() {
         // The child manifest bytes (single-image) and the index that
@@ -4447,45 +4569,49 @@ mod tests {
                 Some(single_media),
                 QuarantineStatus::Quarantined,
             );
-            let router = manifest_router(h.ctx);
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let index_accept = {
+                let mut m = HeaderMap::new();
+                m.insert(ACCEPT, HeaderValue::from_static(INDEX_MEDIA));
+                m
+            };
+            let single_accept = {
+                let mut m = HeaderMap::new();
+                m.insert(ACCEPT, HeaderValue::from_static(single_media));
+                m
+            };
 
-            // The index itself serves (released, routing document).
-            let index_resp = router
-                .clone()
-                .oneshot(
-                    Request::get(format!(
-                        "/v2/myrepo/library/nginx/manifests/sha256:{index_hex}"
-                    ))
-                    .header(ACCEPT, INDEX_MEDIA)
-                    .body(Body::empty())
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            let index_status = index_resp.status();
+            // The released index itself serves (routing document) — to an
+            // anonymous caller, since it is no longer held.
+            let index_status = serve(
+                ctx.clone(),
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{index_hex}"),
+                &index_accept,
+                /* head = */ false,
+                /* anonymous */ None,
+            )
+            .await
+            .status();
 
-            // The held child manifest 503s on GET. A GET is the definitive
-            // gate: the existence-probe exemption is HEAD-only (invariant #1
-            // — the DOWNLOAD block never lifts), so a GET of a held child
-            // always 503s regardless of caller authorization. (A HEAD of the
-            // child is NOT asserted here: the default mock ctx runs
-            // `RbacAccess::Disabled`, which admits every caller as a writer,
-            // so the write-authorized HEAD existence probe would fire for an
-            // anonymous request too — that probe's write-only gating is
-            // covered by the RBAC-harness tests above; here the GET is the
-            // shape-independent proof that the held child is not served.)
-            let child_get = router
-                .oneshot(
-                    Request::get(format!(
-                        "/v2/myrepo/library/nginx/manifests/sha256:{child_hex}"
-                    ))
-                    .header(ACCEPT, single_media)
-                    .body(Body::empty())
-                    .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status();
+            // The held child manifest 503s on a non-writer GET: the child is
+            // independently gated by its own quarantine status, and the
+            // hold-read exemption is write-authorized only. The
+            // caller-and-shape-independent content gate is the layer blobs
+            // (HEAD-only, `blobs.rs`); here the non-writer GET is the proof
+            // the held child is not served to a reader.
+            let child_get = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{child_hex}"),
+                &single_accept,
+                /* head = */ false,
+                /* anonymous */ None,
+            )
+            .await
+            .status();
 
             (index_status, child_get)
         });
@@ -4499,7 +4625,8 @@ mod tests {
             child_get,
             StatusCode::SERVICE_UNAVAILABLE,
             "releasing the index must NOT release its held child manifest — the child stays \
-             503 on GET, independently gated by its own quarantine status (design §2 D4)"
+             503 on a non-writer GET, independently gated by its own quarantine status \
+             (design §2 D4)"
         );
     }
 }

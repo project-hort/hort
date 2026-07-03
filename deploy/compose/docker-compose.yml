@@ -377,6 +377,19 @@ services:
       HORT_SCANNER_MAX_ATTEMPTS: "5"
       HORT_SCANNER_LOCK_DURATION_SECS: "900"
       HORT_WORKER_ID: "hort-worker-v2"
+      # Keyed (pinned-public-key) cosign provenance backend (ADR 0039).
+      # HORT_PROVENANCE_COSIGN_ENABLED gates the KEYLESS Sigstore backend;
+      # the keyed `cosign-key` backend is enabled INDEPENDENTLY by the mere
+      # presence of HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE — its presence
+      # makes the composition root load the pinned public-key set and register
+      # the `cosign-key` ProvenancePort + the ProvenanceVerifyHandler. Points
+      # at the test-only public key mounted read-only below; the private half
+      # (scripts/native-tests/fixtures/cosign/cosign.key) is what the
+      # provenance-push-then-sign scenario signs with. Keyless stays OFF (no
+      # trusted-root file provisioned) so this worker runs ONLY the keyed
+      # verifier — the deterministic single-backend setup ADR 0039 §6 describes.
+      HORT_PROVENANCE_COSIGN_ENABLED: "false"
+      HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE: "/etc/hort/provenance/cosign.pub"
     volumes:
       # Shared CAS volume with hort-server. The worker needs WRITE access
       # so `ScanOrchestrationUseCase::record_outcome` can persist
@@ -386,6 +399,57 @@ services:
       # failed: Permission denied` (EACCES) the moment a scan produces
       # findings.
       - cas:/var/lib/hort-server/cas
+      # Test-only pinned cosign PUBLIC key (ADR 0039). Read-only; the worker
+      # loads it via HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE to register the
+      # `cosign-key` verifier. Its private half lives under
+      # scripts/native-tests/fixtures/cosign/ and signs only throwaway test
+      # images — see that dir's README.
+      - ./example-config/provenance/cosign.pub:/etc/hort/provenance/cosign.pub:ro
+
+  hort-sweep-ticker:
+    # Compose's stand-in for the Helm `scheduledTasks.quarantineReleaseSweep`
+    # CronJob (native deploys: the `hort_timers` systemd timer). Production
+    # schedules `hort-server enqueue-quarantine-release-sweep` every 5 minutes
+    # (values.yaml `schedule: "*/5 * * * *"`); compose has no cron, so this
+    # sidecar loops the same DB-only enqueue subcommand every 15 seconds —
+    # tight enough that the E2E policies' short quarantine windows (30s)
+    # release/expire within a smoke run. The enqueued row drives BOTH
+    # release-gate decisions: releasing a window-elapsed Cleared artifact AND
+    # the terminal ProvenanceRejected{Unsigned} at expiry (release_expired
+    # enqueues the final window_open=false provenance-verify itself — no
+    # separate expiry tick exists in production either). Lives under the
+    # `worker` profile: only the worker consumes the enqueued rows, so ticking
+    # a workerless stack would just pile up pending jobs.
+    profiles:
+      - worker
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    container_name: hort-sweep-ticker
+    mem_limit: 256m
+    cpus: "0.5"
+    cap_drop:
+      - ALL
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hort-server-migrate:
+        condition: service_completed_successfully
+    # The image ENTRYPOINT is the hort-server binary; override with a shell
+    # loop. `enqueue-quarantine-release-sweep` is DB-only (MinimalConfig: DSN
+    # + log format, nothing else) and exits per invocation — `|| echo` keeps
+    # one failed tick (e.g. postgres restarting) from killing the loop.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          /usr/local/bin/hort-server enqueue-quarantine-release-sweep \
+            || echo "[sweep-ticker] enqueue failed; retrying next tick" >&2
+          sleep 15
+        done
+    environment:
+      DATABASE_URL: "postgres://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/artifact_registry"
+      HORT_LOG_FORMAT: "json"
 
 volumes:
   # Postgres data is on a tmpfs (see the `postgres` service) — no

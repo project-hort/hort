@@ -1,0 +1,15 @@
+# PermissionGrant: [developer, ci-pusher] -> write oci-provenance-e2e
+# (dev-user skopeo push + cosign sign via --dest-creds/--registry-password,
+# scenarios/quarantine/provenance-push-then-sign.sh). Mirror of
+# dev-write-oci-quarantine-e2e.yaml — per-repo + two-claim subject passes the
+# allowlist linter. Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-write-oci-provenance-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: oci-provenance-e2e

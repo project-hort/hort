@@ -682,6 +682,17 @@ impl ScanIndeterminate {
 /// `signer` is the verified `{issuer, san}` identity; `predicate_type` is
 /// the attestation predicate URI (e.g. `https://slsa.dev/provenance/v1`),
 /// `None` for a bare signature with no structured predicate.
+///
+/// `cascaded_from` distinguishes a **cascaded** clearance (ADR 0039
+/// provenance-clearance cascade) from a direct verification: `Some(root)`
+/// means no verifier ran against *this* artifact's bytes — the clearance
+/// derives from the signature verified over the subject at `root`, whose
+/// signed bytes bind this artifact's digest (an index's `manifests[]`
+/// digests are inside the signed index bytes; a manifest's config/layer
+/// digests are inside its bytes). The audit trail thus reads "cleared via
+/// signature over `root`". `None` is a direct verification of this
+/// artifact's own attestation (the pre-cascade shape — absent on older
+/// persisted events, deserialized as `None`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvenanceVerified {
     /// The artifact whose attestation was verified. Same UUID as the
@@ -696,6 +707,11 @@ pub struct ProvenanceVerified {
     /// The attestation predicate type URI, when the bundle carried a
     /// structured predicate.
     pub predicate_type: Option<String>,
+    /// For a cascaded clearance: the CAS content hash of the **verified
+    /// subject** whose signed bytes bind this artifact's digest. `None`
+    /// for a direct verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascaded_from: Option<ContentHash>,
 }
 
 impl ProvenanceVerified {

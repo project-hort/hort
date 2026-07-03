@@ -1,0 +1,31 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: oci-provenance-e2e-required
+spec:
+  # Keyed hold-until-signed (ADR 0039). `provenanceMode: required` +
+  # `provenanceBackends: [cosign-key]` holds every pushed OCI manifest in
+  # Quarantined until a keyed cosign signature over its digest, verifiable
+  # against the worker's pinned public key, arrives — then the artifact clears
+  # provenance and, once the (short) quarantine window elapses, releases.
+  #
+  # `provenanceIdentities` MUST be empty for a cosign-key-only scope: the
+  # pinned public key is the trust anchor, not an OIDC {issuer, san} identity;
+  # a non-empty list is apply-rejected (ADR 0039 §4, the inert-field guard).
+  #
+  # `scanBackends: []` keeps the release gate purely provenance + time: with no
+  # scanner the release authority is ScanWaived, so the ONLY gates are
+  # ProvenanceClearance=Cleared AND the quarantine timer — a deterministic
+  # single-axis round-trip. A 30s window is long enough that a keyed
+  # `cosign sign` lands inside it, short enough that the release/expiry sweep
+  # completes well within a smoke run.
+  scope:
+    repository: oci-provenance-e2e
+  severityThreshold: critical
+  quarantineDuration: 30s
+  requireApproval: false
+  provenanceMode: required
+  provenanceBackends: [cosign-key]
+  provenanceIdentities: []
+  scanBackends: []
+  licensePolicy: {}
