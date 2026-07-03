@@ -189,7 +189,16 @@ one `RoleBinding` per target namespace.
 
 ## 5. Step 2 — declare the `ServiceAccount`
 
-The envelope below produces a `dockerconfigjson` Secret for a
+The envelope binds the identity; the `PermissionGrant`(s) beside it
+are the SA's authority
+([ADR 0044](../../adr/0044-service-accounts-identity-only.md)).
+Every rotated token's cap snapshots those grants at mint time — an
+SA with no grants rotates a token that authorizes nothing, and a
+grant added or removed takes effect on the next rotation tick
+(revocations bite outstanding tokens immediately through the live
+grants leg).
+
+The pair below produces a `dockerconfigjson` Secret for a
 docker-pull client:
 
 ```yaml
@@ -198,8 +207,6 @@ kind: ServiceAccount
 metadata:
   name: legacy-docker-puller
 spec:
-  role: reader
-  repositories: [oci-internal]
   fallbackRotation:
     targetSecret:
       name: hort-pull-secret
@@ -207,10 +214,22 @@ spec:
       format: dockerconfigjson
     rotationInterval: 6h
     validity: 24h
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: legacy-docker-puller-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: legacy-docker-puller
+  permission: read
+  repository: oci-internal
 ```
 
 And here is the `opaque` shape for a twine / npm / curl
-consumer:
+consumer (a publisher: `write` plus the `read` for the post-upload
+check — permissions are flat, `write` does not imply `read`):
 
 ```yaml
 apiVersion: project-hort.de/v1beta1
@@ -218,8 +237,6 @@ kind: ServiceAccount
 metadata:
   name: legacy-pypi-pusher
 spec:
-  role: developer
-  repositories: [pypi-internal]
   fallbackRotation:
     targetSecret:
       name: hort-pypi-token
@@ -227,14 +244,37 @@ spec:
       format: opaque
     rotationInterval: 6h
     validity: 24h
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: legacy-pypi-pusher-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: legacy-pypi-pusher
+  permission: write
+  repository: pypi-internal
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: legacy-pypi-pusher-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: legacy-pypi-pusher
+  permission: read
+  repository: pypi-internal
 ```
 
 Validation rules the apply pipeline enforces (full list in
 [`declare-gitops-config.md`](./declare-gitops-config.md)
 `kind: ServiceAccount`):
 
-- `role` ∈ `{developer, reader}` — admin SAs forbidden.
-- `repositories` non-empty.
+- The envelope carries no authority fields — `role:` /
+  `repositories:` fail apply at parse; authority is the SA's
+  `PermissionGrant`s (admin rejected — SAs are strictly non-admin).
 - `fallbackRotation.targetSecret.format` ∈
   `{dockerconfigjson, opaque}`.
 - `fallbackRotation.rotationInterval` ≥ `1h`.

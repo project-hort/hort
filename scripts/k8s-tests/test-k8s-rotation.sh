@@ -594,19 +594,21 @@ scheduledTasks:
     schedule: "*/1 * * * *"
 
 # Gitops config bootstrap: declare the ServiceAccount the rotation
-# handler will mint Secrets for. No OidcIssuer needed — federation is
-# NOT exercised here; rotation runs in the worker via the system-mint
-# path.
+# handler will mint Secrets for, plus its write grant. No OidcIssuer
+# needed — federation is NOT exercised here; rotation runs in the
+# worker via the system-mint path.
 gitopsConfig:
   # ConfigMap data keys must match [-._a-zA-Z0-9]+ — no slashes. The
   # parser (ApplyConfigUseCase) walks the whole config dir and dispatches
   # by each envelope's \`kind:\` field, so the key shape is only for
   # human organisation; the dotted form here is equivalent to a
   # repositories/pypi-internal.yaml + service-accounts/${SA_NAME}.yaml
-  # pair in a flat layout. Repository apply runs before ServiceAccount
-  # apply within a single gitops pass (ApplyConfigUseCase::apply order
-  # — apply_repository_rows then apply_service_accounts), so a single
-  # envelope batch covers the SA's \`repositories:\` reference below.
+  # pair in a flat layout. Repositories apply before ServiceAccounts,
+  # and PermissionGrants apply after both within a single gitops pass
+  # (ApplyConfigUseCase::apply order — apply_repository_rows, then
+  # apply_service_accounts, then apply_permission_grants), so a single
+  # envelope batch covers the grant's \`repository:\` and
+  # \`subject.name\` references below.
   "repository.pypi-internal.yaml": |
     apiVersion: project-hort.de/v1beta1
     kind: ArtifactRepository
@@ -628,9 +630,6 @@ gitopsConfig:
     metadata:
       name: ${SA_NAME}
     spec:
-      role: developer
-      repositories:
-        - pypi-internal
       federatedIdentities: []
       fallbackRotation:
         targetSecret:
@@ -639,6 +638,19 @@ gitopsConfig:
           format: dockerconfigjson
         rotationInterval: 6h
         validity: 24h
+  # The SA envelope is identity-only; the CI pusher's authority is the
+  # serviceAccount-subject PermissionGrant beside it.
+  "grant.${SA_NAME}-write.yaml": |
+    apiVersion: project-hort.de/v1beta1
+    kind: PermissionGrant
+    metadata:
+      name: ${SA_NAME}-write
+    spec:
+      subject:
+        kind: serviceAccount
+        name: ${SA_NAME}
+      permission: write
+      repository: pypi-internal
 EOF
 
 echo "==> Installing hort-server chart with rotation enabled..."

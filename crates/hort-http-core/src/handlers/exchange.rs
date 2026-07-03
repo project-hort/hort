@@ -432,6 +432,7 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
             ctx,
             subject_token,
             form.requested_token_type.as_deref(),
+            form.scope.as_deref(),
             form.client_id.as_deref(),
             source_ip,
         )
@@ -456,23 +457,9 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
     //     (bad_request). The `lifetime` value itself is bounds-checked
     //     by `clamp_lifetime` inside `issue_cli_session_inner`; this
     //     site only enforces basic parse hygiene.
-    let requested_scope: Vec<hort_domain::entities::rbac::Permission> = match form.scope.as_deref()
-    {
-        None | Some("") => Vec::new(),
-        Some(raw) => {
-            let mut out = Vec::new();
-            for token in raw.split_whitespace() {
-                match token.parse::<hort_domain::entities::rbac::Permission>() {
-                    Ok(p) => out.push(p),
-                    Err(_) => {
-                        return invalid_request_outcome(format!(
-                            "scope contains unknown permission: {token}"
-                        ));
-                    }
-                }
-            }
-            out
-        }
+    let requested_scope = match parse_requested_scope(form.scope.as_deref()) {
+        Ok(scope) => scope,
+        Err(msg) => return invalid_request_outcome(msg),
     };
     let requested_lifetime_secs = form.requested_token_lifetime;
 
@@ -754,6 +741,28 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Parse the RFC 8693 `scope` form field: space-separated permission
+/// names. Absent / empty ⇒ empty vec (both dispatch branches treat that
+/// as "no scope requested" — the CliSession branch substitutes its
+/// `[Read, Write, Delete]` default, the federation branch applies no
+/// narrowing). An unknown permission name is a wire-shape error; the
+/// caller maps the message to a `bad_request`-labelled 400.
+fn parse_requested_scope(
+    raw: Option<&str>,
+) -> Result<Vec<hort_domain::entities::rbac::Permission>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for token in raw.split_whitespace() {
+        match token.parse::<hort_domain::entities::rbac::Permission>() {
+            Ok(p) => out.push(p),
+            Err(_) => return Err(format!("scope contains unknown permission: {token}")),
+        }
+    }
+    Ok(out)
+}
+
 fn invalid_request_outcome(description: String) -> Outcome {
     // RFC 6749 wire-shape rejection. Metric label
     // `bad_request`, NOT `source_token_invalid`. Wire body still uses
@@ -1014,6 +1023,7 @@ async fn handle_federated_jwt(
     ctx: &Arc<AppContext>,
     subject_token: &str,
     requested_token_type: Option<&str>,
+    scope: Option<&str>,
     client_id: Option<&str>,
     source_ip: &str,
 ) -> Outcome {
@@ -1031,6 +1041,24 @@ async fn handle_federated_jwt(
             );
         }
     }
+
+    // 0b. Parse the RFC 8693 `scope` parameter before any validator
+    //     work — an unknown permission name is a wire-shape error, the
+    //     same `bad_request` labelling as on the access_token branch.
+    //     A present scope narrows the grants-snapshot cap derived below
+    //     (step 5); an absent scope applies no narrowing.
+    let requested_scope = match parse_requested_scope(scope) {
+        Ok(scope) => scope,
+        Err(msg) => {
+            return error_outcome_with_kind(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                msg,
+                metrics::RESULT_BAD_REQUEST,
+                metrics::KIND_FEDERATED_JWT,
+            );
+        }
+    };
 
     // 1. Ports must be wired. Federation is opt-in (composition wires
     //    both slots only when auth is enabled); a None slot at this
@@ -1183,18 +1211,19 @@ async fn handle_federated_jwt(
     //    `description` carries the source IP for revocation UX,
     //    mirroring the CliSession path.
     //
-    //    `declared_permissions` is derived from the SA's role via
-    //    `service_account_permission_for_role` — the SAME mapping the
-    //    apply pipeline uses to expand the SA's role into a
-    //    `GrantSubject::User(backing_user_id)` grant. An empty
-    //    `declared_permissions` would be a bug: the cap leg of
+    //    `declared_permissions` is the cap: a snapshot of the SA's
+    //    effective grants at exchange time — the distinct permission
+    //    set of the backing user's grants from the live evaluator (the
+    //    same enumeration the request-time gate walks), narrowed to the
+    //    RFC 8693 `scope` parameter when one is present. A zero-grant
+    //    SA mints an empty-permissions cap: the cap leg of
     //    `RbacEvaluator::authorize` (`cap_allows_optional_repo`)
-    //    requires `cap.permissions.contains(&requested)` — empty
-    //    permissions never contain anything, so an empty cap denies
-    //    every authz check regardless of the User-subject grant.
+    //    requires `cap.permissions.contains(&requested)`, so the token
+    //    authorizes nothing — fail-closed by intersection, not an
+    //    issuance error.
     //    Per-repo scoping stays on the User-subject grant —
-    //    we leave `repository_ids = None` so a future apply that
-    //    extends the SA's `repositories` list doesn't strand
+    //    we leave `repository_ids = None` so an apply that
+    //    changes the SA's granted repositories doesn't strand
     //    already-minted tokens with a stale cap.
     // Resolve the matched
     // issuer's `require_jti` flag so the use-case replay guard can pick
@@ -1239,40 +1268,55 @@ async fn handle_federated_jwt(
     };
 
     let client_label = client_id.unwrap_or("federated").to_string();
-    // Role-derived cap permission. A corrupt `sa.role` is an invariant
-    // violation from the apply pipeline (apply-time validator gates
-    // role ∈ {developer, reader}), so unreachable here in practice;
-    // surface it as a 500 rather than mint an empty-cap token that
-    // would deterministically deny.
-    let role_permission =
-        match hort_app::use_cases::apply_config_use_case::service_account_permission_for_role(
-            &sa.role,
-        ) {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    sa_name = %sa.name,
-                    role = %sa.role,
-                    "federation: ServiceAccount carries an invalid role — \
-                     apply-time validator should have rejected this. \
-                     Failing closed."
-                );
-                return error_outcome_with_kind(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "internal error".to_string(),
-                    metrics::RESULT_INTERNAL_ERROR,
-                    metrics::KIND_FEDERATED_JWT,
-                );
-            }
-        };
+    // Grants-snapshot cap. The evaluator rides
+    // `AuthContext::{Enabled, BearerOnly}`, and the federation ports are
+    // wired only alongside an auth context, so a missing evaluator here
+    // is a composition bug — fail closed with the same shape as the
+    // unwired-port arms at step 1.
+    let Some(rbac) = ctx.auth.rbac() else {
+        tracing::error!(
+            "/exchange (federated_jwt) invoked with no RBAC evaluator wired — composition bug"
+        );
+        return error_outcome_with_kind(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "federation subsystem not configured".to_string(),
+            metrics::RESULT_INTERNAL_ERROR,
+            metrics::KIND_FEDERATED_JWT,
+        );
+    };
+    let declared_permissions = rbac
+        .load()
+        .service_account_cap_permissions(sa.backing_user_id, &requested_scope);
+    // A requested scope of which the SA holds nothing is the same
+    // denial the CliSession branch surfaces for an empty derived
+    // footprint: 403 `access_denied`, result `cap_exceeds_authority`.
+    // Minting an empty-cap token for an explicitly requested scope
+    // would look like success while authorizing nothing. An ABSENT
+    // scope with a zero-grant SA mints normally — the empty cap IS the
+    // snapshot.
+    if !requested_scope.is_empty() && declared_permissions.is_empty() {
+        tracing::info!(
+            sa_name = %sa.name,
+            denial_reason = "cap_exceeds_authority",
+            requested_permission_count = requested_scope.len(),
+            "federation mint denied: requested scope exceeds the \
+             service account's granted authority"
+        );
+        return error_outcome_with_kind(
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            "requested scope not authorized for the matched service account".to_string(),
+            metrics::RESULT_CAP_EXCEEDS_AUTHORITY,
+            metrics::KIND_FEDERATED_JWT,
+        );
+    }
     let issue_request = IssueTokenRequest {
         name: sa.name.clone(),
         description: Some(format!(
             "Federated via /exchange from {source_ip} (client={client_label})"
         )),
-        declared_permissions: vec![role_permission],
+        declared_permissions,
         repository_ids: None,
         expires_in_days: None,
         expires_in_seconds: Some(lifetime_secs),
@@ -3351,12 +3395,29 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         Arc<hort_app::use_cases::test_support::MockServiceAccountRepository>,
         MockPorts,
     ) {
-        build_federation_router_full(guard, true)
+        build_federation_router_full(guard, true, Vec::new())
+    }
+
+    /// Federation router whose auth-context `RbacEvaluator` holds the
+    /// supplied grant set — the source of the federation mint's
+    /// grants-snapshot cap. Tests seed `GrantSubject::User` grants for
+    /// the sample SA's backing user here.
+    fn build_federation_router_with_grants(
+        sa_grants: Vec<PermissionGrant>,
+    ) -> (
+        Router,
+        Arc<hort_app::use_cases::test_support::MockFederatedJwtValidator>,
+        Arc<hort_app::use_cases::test_support::MockServiceAccountRepository>,
+        MockPorts,
+    ) {
+        let guard = Arc::new(hort_app::use_cases::test_support::MockReplayGuardPort::first_seen());
+        build_federation_router_full(guard, true, sa_grants)
     }
 
     fn build_federation_router_full(
         guard: Arc<dyn hort_domain::ports::replay_guard::ReplayGuardPort>,
         require_jti: bool,
+        sa_grants: Vec<PermissionGrant>,
     ) -> (
         Router,
         Arc<hort_app::use_cases::test_support::MockFederatedJwtValidator>,
@@ -3405,6 +3466,18 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             oidc_repo as Arc<dyn OidcIssuerRepository>,
         );
 
+        // Replace the auth-context evaluator with the caller-supplied
+        // grant set so the federation cap derivation (the
+        // grants-snapshot in `handle_federated_jwt`) sees exactly these
+        // grants. The `ArcSwap` is shared by every ctx layer, so the
+        // store is visible to the router built below.
+        if !sa_grants.is_empty() {
+            ctx.auth
+                .rbac()
+                .expect("enabled auth context carries an evaluator")
+                .store(Arc::new(RbacEvaluator::new(sa_grants)));
+        }
+
         // Rebuild the ApiTokenUseCase with the replay guard attached so
         // the federation system-mint path is guarded. The
         // mock harness wraps the same MockEventStore in a no-broadcast
@@ -3437,6 +3510,30 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             ("subject_token_type", TOKEN_TYPE_JWT),
             ("client_id", "ci-runner/1.0"),
         ])
+    }
+
+    fn federation_form_with_scope(token: &str, scope: &str) -> String {
+        form_body(&[
+            ("grant_type", EXCHANGE_GRANT_TYPE),
+            ("subject_token", token),
+            ("subject_token_type", TOKEN_TYPE_JWT),
+            ("client_id", "ci-runner/1.0"),
+            ("scope", scope),
+        ])
+    }
+
+    /// `GrantSubject::User` grant for the sample SA's backing user —
+    /// the authority shape the federation cap snapshots.
+    fn sa_user_grant(repo: Option<Uuid>, permission: Permission) -> PermissionGrant {
+        PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::User(sample_sa().backing_user_id),
+            repository_id: repo,
+            permission,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        }
     }
 
     /// Build a `ValidatedClaims` shaped like a typical GitHub Actions
@@ -3478,8 +3575,6 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             id: Uuid::from_u128(0xC1A),
             name: "ci-pypi-pusher".into(),
             backing_user_id: Uuid::from_u128(0xC1AB),
-            role: "developer".into(),
-            repositories: vec!["pypi-internal".into()],
             federated_identities: vec![hort_domain::entities::service_account::FederatedIdentity {
                 issuer_name: "github-actions".into(),
                 claims,
@@ -3490,9 +3585,8 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         }
     }
 
-    /// Seed a backing service-account user with role `developer` (no
-    /// admin authority) so the system-mint path passes its
-    /// `is_service_account` gate.
+    /// Seed a backing service-account user (no admin authority) so the
+    /// system-mint path passes its `is_service_account` gate.
     fn seed_sa_user(mocks: &MockPorts, sa: &ServiceAccount) {
         mocks.users.insert(User {
             id: sa.backing_user_id,
@@ -3658,8 +3752,6 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             id: Uuid::from_u128(0xA0D0),
             name: "ci-aud-bound".into(),
             backing_user_id: Uuid::from_u128(0xA0D1),
-            role: "developer".into(),
-            repositories: vec!["pypi-internal".into()],
             federated_identities: vec![hort_domain::entities::service_account::FederatedIdentity {
                 issuer_name: "github-actions".into(),
                 claims,
@@ -3828,8 +3920,6 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             id: Uuid::from_u128(0xE0C1),
             name: "ci-empty-claims".into(),
             backing_user_id: Uuid::from_u128(0xE0C2),
-            role: "developer".into(),
-            repositories: vec!["pypi-internal".into()],
             federated_identities: vec![hort_domain::entities::service_account::FederatedIdentity {
                 issuer_name: "github-actions".into(),
                 claims: std::collections::BTreeMap::new(),
@@ -4062,7 +4152,8 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                 let guard =
                     Arc::new(hort_app::use_cases::test_support::MockReplayGuardPort::replayed());
                 // require_jti = false on the seeded issuer.
-                let (router, validator, sas, mocks) = build_federation_router_full(guard, false);
+                let (router, validator, sas, mocks) =
+                    build_federation_router_full(guard, false, Vec::new());
                 let sa = sample_sa();
                 seed_sa_user(&mocks, &sa);
                 sas.insert(sa);
@@ -4258,37 +4349,45 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         });
     }
 
-    /// A federation-minted SA token MUST carry the SA's role-derived
-    /// permission in `declared_permissions`; an empty cap
-    /// deterministically denies every authz check because
-    /// `cap_allows_optional_repo` requires
-    /// `cap.permissions.contains(requested)`. Pin developer → Write.
+    /// Extract the most recent `ApiTokenIssued` event from the mock
+    /// event store — the federation mint's audit row, which carries the
+    /// minted cap (`declared_permissions` + `repository_ids`).
+    fn last_issued_event(mocks: &MockPorts) -> hort_domain::events::ApiTokenIssued {
+        let batches = mocks.events.appended_batches();
+        batches
+            .iter()
+            .rev()
+            .find_map(|b| match b.events.first().map(|e| &e.event) {
+                Some(hort_domain::events::DomainEvent::ApiTokenIssued(e)) => Some(e.clone()),
+                _ => None,
+            })
+            .expect("ApiTokenIssued event on the SA stream")
+    }
+
+    /// The federation-minted cap is a snapshot of the SA's effective
+    /// grants: the distinct permission set of the backing user's
+    /// grants, repo dimension flattened (a per-repo Read and a global
+    /// Write both enter the flat cap), `repository_ids` left `None`.
     #[test]
-    fn federation_minted_token_carries_role_derived_write_for_developer_sa() {
+    fn federation_minted_token_cap_is_grants_snapshot() {
         rt().block_on(async {
-            let (router, validator, sas, mocks) = build_federation_router();
+            let (router, validator, sas, mocks) = build_federation_router_with_grants(vec![
+                sa_user_grant(Some(Uuid::from_u128(0x4E90)), Permission::Read),
+                sa_user_grant(None, Permission::Write),
+            ]);
             let sa = sample_sa();
-            assert_eq!(sa.role, "developer", "sample_sa() is the developer SA");
             seed_sa_user(&mocks, &sa);
             sas.insert(sa.clone());
             validator.register_token("ok-jwt", sample_validated_claims(600));
             let resp = post_form(router, federation_form("ok-jwt")).await;
             assert_eq!(resp.status(), StatusCode::OK);
 
-            let batches = mocks.events.appended_batches();
-            let issued = batches
-                .iter()
-                .rev()
-                .find_map(|b| match b.events.first().map(|e| &e.event) {
-                    Some(hort_domain::events::DomainEvent::ApiTokenIssued(e)) => Some(e.clone()),
-                    _ => None,
-                })
-                .expect("ApiTokenIssued event on the SA stream");
+            let issued = last_issued_event(&mocks);
             assert_eq!(
                 issued.declared_permissions,
-                vec![Permission::Write],
-                "developer SA federation mint must carry [Write]; an empty cap \
-                 would deny every authz check (cap leg requires permissions.contains(requested))"
+                vec![Permission::Read, Permission::Write],
+                "the cap is the distinct permission set of the backing \
+                 user's grants at exchange time"
             );
             assert!(
                 issued.repository_ids.is_none(),
@@ -4298,34 +4397,130 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         });
     }
 
-    /// Symmetric pin for the `reader` role → Read.
+    /// A read-only-granted SA mints a `[Read]` cap — grants only,
+    /// nothing role-shaped enters the cap.
     #[test]
-    fn federation_minted_token_carries_role_derived_read_for_reader_sa() {
+    fn federation_minted_token_cap_read_only_for_read_granted_sa() {
         rt().block_on(async {
-            let (router, validator, sas, mocks) = build_federation_router();
-            let mut sa = sample_sa();
-            sa.role = "reader".into();
+            let (router, validator, sas, mocks) =
+                build_federation_router_with_grants(vec![sa_user_grant(None, Permission::Read)]);
+            let sa = sample_sa();
             seed_sa_user(&mocks, &sa);
             sas.insert(sa.clone());
             validator.register_token("ok-jwt", sample_validated_claims(600));
             let resp = post_form(router, federation_form("ok-jwt")).await;
             assert_eq!(resp.status(), StatusCode::OK);
-
-            let batches = mocks.events.appended_batches();
-            let issued = batches
-                .iter()
-                .rev()
-                .find_map(|b| match b.events.first().map(|e| &e.event) {
-                    Some(hort_domain::events::DomainEvent::ApiTokenIssued(e)) => Some(e.clone()),
-                    _ => None,
-                })
-                .expect("ApiTokenIssued event on the SA stream");
             assert_eq!(
-                issued.declared_permissions,
+                last_issued_event(&mocks).declared_permissions,
                 vec![Permission::Read],
-                "reader SA federation mint must carry [Read]"
             );
         });
+    }
+
+    /// A zero-grant SA mints normally — the cap is `Some` with EMPTY
+    /// permissions (fail-closed by intersection at use time), never an
+    /// issuance error.
+    #[test]
+    fn federation_zero_grant_sa_mints_empty_cap() {
+        rt().block_on(async {
+            let (router, validator, sas, mocks) = build_federation_router();
+            let sa = sample_sa();
+            seed_sa_user(&mocks, &sa);
+            sas.insert(sa.clone());
+            validator.register_token("ok-jwt", sample_validated_claims(600));
+            let resp = post_form(router, federation_form("ok-jwt")).await;
+            assert_eq!(resp.status(), StatusCode::OK, "zero-grant SA still mints");
+            let issued = last_issued_event(&mocks);
+            assert!(
+                issued.declared_permissions.is_empty(),
+                "zero-grant SA cap has no permissions; got {:?}",
+                issued.declared_permissions
+            );
+        });
+    }
+
+    /// A present RFC 8693 `scope` narrows the snapshot: `scope=read` on
+    /// a read+write-granted SA yields a `[Read]` cap.
+    #[test]
+    fn federation_scope_narrows_grants_snapshot() {
+        rt().block_on(async {
+            let (router, validator, sas, mocks) = build_federation_router_with_grants(vec![
+                sa_user_grant(None, Permission::Read),
+                sa_user_grant(None, Permission::Write),
+            ]);
+            let sa = sample_sa();
+            seed_sa_user(&mocks, &sa);
+            sas.insert(sa.clone());
+            validator.register_token("ok-jwt", sample_validated_claims(600));
+            let resp = post_form(router, federation_form_with_scope("ok-jwt", "read")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                last_issued_event(&mocks).declared_permissions,
+                vec![Permission::Read],
+                "scope=read narrows the read+write snapshot to [Read]"
+            );
+        });
+    }
+
+    /// A requested scope of which the SA holds nothing is denied with
+    /// the CliSession branch's empty-footprint semantics: 403
+    /// `access_denied`, result `cap_exceeds_authority`.
+    #[test]
+    fn federation_scope_exceeding_grants_is_denied() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, validator, sas, mocks) =
+                    build_federation_router_with_grants(vec![sa_user_grant(
+                        None,
+                        Permission::Read,
+                    )]);
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa.clone());
+                validator.register_token("ok-jwt", sample_validated_claims(600));
+                let resp = post_form(router, federation_form_with_scope("ok-jwt", "write")).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "access_denied");
+                // No token minted — no ApiTokenIssued on the stream.
+                assert!(
+                    !mocks.events.appended_batches().iter().any(|b| matches!(
+                        b.events.first().map(|e| &e.event),
+                        Some(hort_domain::events::DomainEvent::ApiTokenIssued(_))
+                    )),
+                    "denied exchange must not mint"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value_kind_result(
+                &snap,
+                metrics::COUNTER,
+                "federated_jwt",
+                "cap_exceeds_authority"
+            ),
+            1,
+        );
+    }
+
+    /// An unknown permission name in `scope` is a wire-shape error on
+    /// the federation branch too: 400 `invalid_request`, result
+    /// `bad_request` under `kind=federated_jwt`.
+    #[test]
+    fn federation_scope_unknown_permission_rejected() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, _validator, _sas, _mocks) = build_federation_router();
+                let resp = post_form(router, federation_form_with_scope("any-jwt", "teapot")).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "invalid_request");
+            });
+        });
+        assert_eq!(
+            counter_value_kind_result(&snap, metrics::COUNTER, "federated_jwt", "bad_request"),
+            1,
+        );
     }
 
     /// Composition-bug guard: if the federation ports are wired as
@@ -4341,6 +4536,52 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                 let idp = Arc::new(MockIdentityProvider::new());
                 let (router, _) = build_router_with_idp(&base, &mocks, idp);
                 let resp = post_form(router, federation_form("any-jwt")).await;
+                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "temporarily_unavailable");
+            });
+        });
+        assert_eq!(
+            counter_value_kind_result(&snap, metrics::COUNTER, "federated_jwt", "internal_error"),
+            1,
+        );
+    }
+
+    /// Composition-bug guard: federation ports wired but no auth
+    /// context (`AuthContext::Disabled` ⇒ no RBAC evaluator for the
+    /// grants-snapshot cap) → 503 + internal_error, the same fail-closed
+    /// shape as the unwired-port arms.
+    #[test]
+    fn federation_503_when_rbac_evaluator_unwired() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+                let (base, mocks) = build_mock_ctx(metrics_handle);
+                let validator =
+                    Arc::new(hort_app::use_cases::test_support::MockFederatedJwtValidator::new());
+                let sas = Arc::new(
+                    hort_app::use_cases::test_support::MockServiceAccountRepository::new(),
+                );
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa);
+                validator.register_token("ok-jwt", sample_validated_claims(600));
+                // Federation ports on a Disabled-auth base ctx —
+                // `ctx.auth.rbac()` is `None` at cap-derivation time.
+                let ctx = crate::test_support::with_federation_ports(
+                    &base,
+                    validator.clone()
+                        as Arc<
+                            dyn hort_domain::ports::federated_jwt_validator::FederatedJwtValidator,
+                        >,
+                    sas as Arc<
+                        dyn hort_domain::ports::service_account_repository::ServiceAccountRepository,
+                    >,
+                );
+                let router = Router::new()
+                    .nest("/api/v1", token_exchange_routes())
+                    .with_state(ctx);
+                let resp = post_form(router, federation_form("ok-jwt")).await;
                 assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
                 let v = body_json(resp).await;
                 assert_eq!(v["error"], "temporarily_unavailable");

@@ -1,0 +1,15 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-release-read-hort-oci
+spec:
+  # Per-repo serviceAccount-subject grant: gha-release reads hort-oci.
+  # The release workflow cosign-signs the images it pushes, and the
+  # signing step resolves the just-pushed manifest back from the
+  # registry — write does not imply read, so the read is granted
+  # explicitly.
+  subject:
+    kind: serviceAccount
+    name: gha-release
+  permission: read
+  repository: hort-oci

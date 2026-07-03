@@ -1456,48 +1456,6 @@ impl ApplyConfigUseCase {
             })
             .collect();
         let sa_entities = self.service_accounts.list().await?;
-        // Compute the SA-owned permission-grant
-        // digest set BEFORE we drop the full SA aggregates. Each SA
-        // contributes exactly one digest (the canonical form is
-        // `sha256("sa-grant|{sa.id}|{role}|{permission}|{sorted_repos}")`,
-        // identical to `reconcile_service_account_grants` / `delete_
-        // service_account_grants` so the set matches every row those
-        // helpers wrote). The set covers every snapshot SA — including
-        // SAs about to be deleted — because their rows are in the DB
-        // until `apply_service_accounts` removes them; the PG-sweep
-        // must skip them throughout the apply.
-        let sa_owned_grant_digests: HashSet<[u8; 32]> = sa_entities
-            .iter()
-            .filter_map(|sa| {
-                // `service_account_permission_for_role` is fallible —
-                // a stored row with a corrupt role lands here. Skip
-                // it: the PG-sweep won't see a digest for the corrupt
-                // SA, so it falls back to the default delete sweep,
-                // which is harmless because the apply pipeline will
-                // also fail downstream (`reconcile_service_account_
-                // grants` raises the same error). Logging the skip is
-                // worth it though.
-                let Ok(permission) = service_account_permission_for_role(&sa.role) else {
-                    tracing::warn!(
-                        service_account = %sa.name,
-                        role = %sa.role,
-                        "build_snapshot: invalid role on stored service account; \
-                         excluded from sa_owned_grant_digests"
-                    );
-                    return None;
-                };
-                let mut sorted: Vec<&str> = sa.repositories.iter().map(String::as_str).collect();
-                sorted.sort_unstable();
-                let canonical = format!(
-                    "sa-grant|{}|{}|{}|{}",
-                    sa.id,
-                    sa.role,
-                    permission,
-                    sorted.join(",")
-                );
-                Some(sha256_of(&canonical))
-            })
-            .collect();
         // `ServiceAccount.name → backing-user UUID (stringified)` for
         // every SA whose aggregate (and therefore backing `users` row)
         // already exists. The diff layer uses it to resolve a
@@ -1528,7 +1486,6 @@ impl ApplyConfigUseCase {
             upstream_mappings,
             oidc_issuers: oidc_issuers_snapshot,
             service_accounts: service_accounts_snapshot,
-            sa_owned_grant_digests,
             sa_backing_user_ids_by_name,
         })
     }
@@ -1539,19 +1496,6 @@ fn emit_unchanged(kind: &'static str, count: usize, report: &mut ApplyReport) {
         emit_gitops_object(kind, GitopsObjectResult::Unchanged);
     }
     report.unchanged += count;
-}
-
-/// SHA-256 of an arbitrary string, returned as a 32-byte digest.
-/// Used by `reconcile_service_account_grants` to tag grants with a
-/// stable identity-of-the-source-SA digest.
-pub(super) fn sha256_of(s: &str) -> [u8; 32] {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(s.as_bytes());
-    let result = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
 }
 
 /// Subject-dependent diff/upsert identity for a
@@ -1764,11 +1708,6 @@ mod scan_policies;
 mod service_accounts;
 mod upstream_mappings;
 mod virtual_members;
-
-// Re-exported at the `apply_config_use_case` path it has always lived at,
-// for the cross-crate callers (`lint::static_validate`, the `hort-http-core`
-// federation `/api/v1/token/exchange` handler) that import it from here.
-pub use permission_grants::service_account_permission_for_role;
 
 #[cfg(test)]
 mod tests {
@@ -5774,15 +5713,11 @@ mod tests {
         s3_repo.spec.storage.as_mut().unwrap().backend = "s3".into();
 
         let cases = vec![
-            // Row 2 — SA references an undeclared issuer (the repository it
-            // references IS declared so row 1 `validate_against` passes and
-            // the abort is exactly the row-2 FK check).
+            // Row 2 — SA references an undeclared issuer.
             Case {
                 desired: DesiredState {
-                    repositories: vec![repo_env("pypi-internal", "hosted")],
                     service_accounts: vec![service_account_env_for_apply(
                         "ci",
-                        &["pypi-internal"],
                         Some("missing-idp"),
                     )],
                     ..Default::default()
@@ -6728,7 +6663,6 @@ mod tests {
 
     pub(in crate::use_cases::apply_config_use_case) fn service_account_env_for_apply(
         sa_name: &str,
-        repos: &[&str],
         issuer: Option<&str>,
     ) -> Envelope<ServiceAccountSpec> {
         let federated_identities = match issuer {
@@ -6749,116 +6683,10 @@ mod tests {
                 name: sa_name.into(),
             },
             spec: ServiceAccountSpec {
-                role: "developer".into(),
-                repositories: repos.iter().map(|s| (*s).into()).collect(),
                 federated_identities,
                 fallback_rotation: None,
             },
         }
-    }
-
-    /// The SA apply path does no
-    /// `RoleRepository::find_by_name(&sa.role)` lookup — the role-name
-    /// bundle is code-expanded by `service_account_permission_for_role`
-    /// over the fixed `developer`/`reader` enum, never a `roles` table
-    /// or `claim_mappings` consultation. There is therefore nothing to
-    /// seed; this is a behaviour-preserving no-op kept so the SA test
-    /// call sites read unchanged (returns a throwaway id the callers
-    /// previously used only as a placeholder).
-    pub(in crate::use_cases::apply_config_use_case) fn seed_developer_role(_h: &Harness) -> Uuid {
-        Uuid::new_v4()
-    }
-
-    #[tokio::test]
-    async fn apply_permission_grants_sweep_does_not_touch_sa_owned_grants() {
-        // Regression guard for
-        // the consolidated reconcile. `apply_permission_grants`
-        // materialises envelope grants AND SA-owned
-        // `GrantSubject::User(backing_user_id)` grants in a single
-        // whole-partition `save_managed` call. Re-applying the SAME SA
-        // with no `PermissionGrant` envelopes must NOT revoke the
-        // SA-owned grants — the User-subject diff key
-        // `(user_id, repository_id, permission)` keeps them in the
-        // desired set across re-applies, so the managed set is stable
-        // and no PermissionGrantRevoked is emitted for them.
-        let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "pypi-internal".into(),
-            ..sample_repository_for_test("pypi-internal")
-        });
-        h.repos.insert(Repository {
-            key: "npm-internal".into(),
-            ..sample_repository_for_test("npm-internal")
-        });
-
-        // First apply: seed the SA + its two SA-owned permission grants.
-        let mut desired = DesiredState::default();
-        desired.service_accounts.push(service_account_env_for_apply(
-            "ci-pusher",
-            &["pypi-internal", "npm-internal"],
-            None,
-        ));
-        h.uc.apply(desired, env_oidc()).await.unwrap();
-        // Two repos → two SA-owned User-subject grants.
-        let managed_after_seed = h.grant_repo.managed_snapshot();
-        assert_eq!(
-            managed_after_seed.len(),
-            2,
-            "SA with two repos materialises two User-subject grants"
-        );
-        assert!(
-            managed_after_seed
-                .iter()
-                .all(|g| matches!(g.subject, GrantSubject::User(_))),
-            "SA-owned grants must be User-subject"
-        );
-        let revoked_after_seed = h
-            .events
-            .appended()
-            .into_iter()
-            .flat_map(|b| b.events)
-            .filter(|e| matches!(e.event, DomainEvent::PermissionGrantRevoked(_)))
-            .count();
-
-        // Second apply: same SA, no PermissionGrant envelopes — this is
-        // the scenario the prior agent reported as buggy. The PG sweep
-        // would previously schedule the SA-owned grants for delete (their
-        // digests carry `managed_by = GitOps`, no mirror envelope in
-        // desired). The PG planner must short-circuit this by excluding
-        // SA-owned digests from the PG delete plan.
-        let mut desired_b = DesiredState::default();
-        desired_b
-            .service_accounts
-            .push(service_account_env_for_apply(
-                "ci-pusher",
-                &["pypi-internal", "npm-internal"],
-                None,
-            ));
-        h.uc.apply(desired_b, env_oidc()).await.unwrap();
-
-        // The SA-owned grants survive the re-apply unchanged …
-        let managed_after_reapply = h.grant_repo.managed_snapshot();
-        assert_eq!(
-            managed_after_reapply.len(),
-            2,
-            "SA-owned grants must persist across the re-apply"
-        );
-        // … and no PermissionGrantRevoked was emitted for them
-        // (the consolidated reconcile keeps SA-owned
-        // User-subject rows in the desired set, so the whole-partition
-        // diff never marks them absent).
-        let revoked_after_reapply = h
-            .events
-            .appended()
-            .into_iter()
-            .flat_map(|b| b.events)
-            .filter(|e| matches!(e.event, DomainEvent::PermissionGrantRevoked(_)))
-            .count();
-        assert_eq!(
-            revoked_after_reapply, revoked_after_seed,
-            "re-applying the same SA must not revoke its own grants"
-        );
     }
 
     /// Lightweight helper for these tests; the project's

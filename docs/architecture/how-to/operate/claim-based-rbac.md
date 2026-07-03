@@ -152,11 +152,13 @@ the evaluator.
 
 ## 3. ServiceAccounts under claim-based RBAC
 
-ServiceAccounts declared via `kind: ServiceAccount`
+A `kind: ServiceAccount` envelope
 (see [`../federate-ci-oidc.md`](../federate-ci-oidc.md) and
 [`../federate-k8s-workload-identity.md`](../federate-k8s-workload-identity.md))
-are declared with `role:` and
-`repositories:`:
+is **identity + federation binding only** — it carries no authority
+fields ([ADR 0044](../../../adr/0044-service-accounts-identity-only.md)).
+The SA's authority is its explicit `serviceAccount`-subject
+`PermissionGrant`s, declared alongside:
 
 ```yaml
 apiVersion: project-hort.de/v1beta1
@@ -164,38 +166,60 @@ kind: ServiceAccount
 metadata:
   name: ci-deployer
 spec:
-  role: developer            # fixed enum: developer | reader
-  repositories: [pypi-internal, npm-internal]
   federatedIdentities:
     - issuer: github-actions
       claims:
         repository: my-org/my-repo
         ref: refs/heads/main
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: ci-deployer-write-pypi-internal
+spec:
+  subject:
+    kind: serviceAccount
+    name: ci-deployer
+  permission: write
+  repository: pypi-internal
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: ci-deployer-read-pypi-internal
+spec:
+  subject:
+    kind: serviceAccount
+    name: ci-deployer
+  permission: read
+  repository: pypi-internal
 ```
 
 What happens *underneath*:
 
-- The SA's authority is materialised as **`User`-subject permission
-  grants** bound to the SA's backing user (`is_service_account=true`,
-  `username = "sa:" || name`). It is **not** a `claim_mappings`
-  entry, and `sa.role` is **not** an operator claim-taxonomy name.
-- `sa.role` (`developer` / `reader`) is expanded to a concrete
-  `Permission` by a code-level function
-  (`service_account_permission_for_role`) over the fixed two-value
-  enum — the only sanctioned role-name→permission mapping, exempt
-  from the "no runtime-invented claims" invariant.
+- A `serviceAccount`-subject grant resolves at apply to a
+  **`User`-subject permission grant** bound to the SA's backing user
+  (`is_service_account=true`, `username = "sa:" || name`;
+  [ADR 0037](../../../adr/0037-gitops-service-account-grant.md)). It
+  is **not** a `claim_mappings` entry — the SA never resolves claims.
+- **The issued token's cap is a snapshot of those grants at
+  issuance** (the federation exchange intersects it with the
+  RFC 8693 `scope` parameter when present). An SA with no grants
+  holds a token that authorizes nothing; a revoked grant bites
+  outstanding tokens immediately through the live grants leg.
 - **Federated and fallback-rotated SA bearers carry `claims: []`.**
   A federated workload's foreign-JWT
-  `groups` claim is **never** run through `claim_mappings`. An admin
-  ServiceAccount is forbidden at apply time, so SA `claims`
+  `groups` claim is **never** run through `claim_mappings`. A
+  `serviceAccount`-subject grant with `permission: admin` is
+  rejected at apply time, so SA `claims`
   is always exactly `[]`.
 
-Operator takeaway: **grant ServiceAccount authority via the SA CRD's
-`role` / `repositories`, never via `claim_mappings`.** Adding a
-`claim_mappings` row in an attempt to widen an SA's authority does
-nothing — the SA bearer never resolves claims. To change what a
-ServiceAccount can do, edit its `role` / `repositories` in the
-`kind: ServiceAccount` envelope.
+Operator takeaway: **grant ServiceAccount authority via
+`serviceAccount`-subject `PermissionGrant`s, never via
+`claim_mappings`.** Adding a `claim_mappings` row in an attempt to
+widen an SA's authority does nothing — the SA bearer never resolves
+claims. To change what a ServiceAccount can do, add or remove its
+`PermissionGrant`s.
 
 ### 3.1 Prefer a durable `User`-subject Admin grant for `HORT_TOKEN_ALLOW_ADMIN` deployments
 

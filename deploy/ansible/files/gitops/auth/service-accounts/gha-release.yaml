@@ -2,13 +2,17 @@ apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount
 metadata:
   name: gha-release
+# Release-publishing identity for the GitHub Actions release workflow:
+# pushes first-party images to hort-oci and crates to hort-crates.
+#
+# The envelope is identity + federation binding only. The authority is
+# the serviceAccount-subject PermissionGrants in
+# `auth/grants/gha-release-write-hort-oci.yaml`,
+# `auth/grants/gha-release-write-hort-crates.yaml`, and
+# `auth/grants/gha-release-read-hort-oci.yaml` (the workflow
+# cosign-signs the images it pushes; signing reads the just-pushed
+# manifest back from hort-oci, and write does not imply read).
 spec:
-  # Push access for the release workflow: publishes first-party images to
-  # hort-oci and crates to hort-crates.
-  role: developer
-  repositories:
-    - hort-oci
-    - hort-crates
   federatedIdentities:
     - issuer: github-actions          # references OidcIssuer metadata.name
       claims:

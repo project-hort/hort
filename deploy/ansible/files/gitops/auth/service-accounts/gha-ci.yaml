@@ -2,22 +2,21 @@ apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount
 metadata:
   name: gha-ci
+# CI pull identity for GitHub Actions builds in project-hort/hort:
+# cargo fetch / docker pull through the proxies, and cargo resolution
+# via cargo-virtual.
+#
+# The envelope is identity + federation binding only. The read
+# authority is the per-repo serviceAccount-subject PermissionGrants in
+# `auth/grants/gha-ci-read-*.yaml` (one per repo: cargo-virtual,
+# crates-proxy, dockerhub-proxy, quay-proxy, npm-proxy).
 spec:
-  # Pull access for CI builds: cargo fetch / docker pull from the four
-  # proxies, and cargo add / resolution via cargo-virtual.
-  role: reader
-  repositories:
-    - cargo-virtual
-    - crates-proxy
-    - dockerhub-proxy
-    - quay-proxy
-    - npm-proxy
   federatedIdentities:
     - issuer: github-actions          # references OidcIssuer metadata.name
       claims:
         repository: project-hort/hort # scope-narrowing: any workflow in this repo
         # NOTE: this is intentionally repo-scope only (no environment/ref pin).
-        # Any workflow in project-hort/hort can assume reader on these proxies.
-        # This is acceptable: the proxies are pull-through caches; read access
-        # confers no publish power. Add `environment:` or `ref:` here if the
-        # threat model later tightens.
+        # Any workflow in project-hort/hort can assume this SA. This is
+        # acceptable: its grants are per-repo read on pull-through caches;
+        # read access confers no publish power. Add `environment:` or `ref:`
+        # here if the threat model later tightens.

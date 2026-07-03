@@ -1,15 +1,15 @@
 # 0029 — Operator-config renames are hard renames
 
 - **Status:** Accepted
-- **Enforced by:** `crates/hort-app/tests/no_retired_config_names.rs` (whole-token,
-  breadcrumb-aware source scan over `crates/` + `deploy/` + `scripts/` +
-  `docs/architecture/` that fails on any retired `HORT_*` env-var name or retired
-  Helm `values` key on a live surface; pre-push gate + CI) **and** the strict
+- **Enforced by:** `Config::from_env` reading only canonical names (a retired
+  env-var name has no parse site) **and** the strict
   `deploy/helm/hort-server/values.schema.json` (`additionalProperties: false` on
   the top-level object and every chart-owned nested block, so a retired or
   mistyped key fails `helm install`/`helm template`; regression-pinned by the
   deliberate-retired-key fixture `test-values-strict-schema-typo.yaml` in
-  `scripts/test-helm-templates.sh`).
+  `scripts/test-helm-templates.sh`). The "no live surface still names the old
+  key" acceptance check is a rename-PR review step (grep the old name → the
+  upgrade note is its only allowed home).
 - **Supersedes:** —
 
 ## Context
@@ -20,8 +20,7 @@ conventions before the v1.0 surface freeze: subsystem-first names, booleans by
 intent (`*_ENABLED` for on/off, `<SUB>_ALLOW_*` / `<SUB>_REQUIRE_*` for policy),
 `_SECS` durations, and human-readable size strings (`"64Mi"` via
 `parse_byte_size`, names ending `_MAX_SIZE`/`_SIZE`) for byte caps. The
-authoritative OLD→NEW mapping is enforced by
-`crates/hort-app/tests/no_retired_config_names.rs` (the retired-name guard test).
+authoritative OLD→NEW mapping lives in the upgrade note.
 
 Renaming an operator knob has a failure mode unlike renaming code: **a retired
 env-var name is silently ignored at boot.** `Config::from_env` reads only the
@@ -45,12 +44,10 @@ old and new names, no deprecation shims.
 
 1. **Env vars:** the binary reads only the canonical name. A retired name has
    no parse site. Because the runtime therefore *cannot* warn about a retired
-   name (it is simply ignored), the guard test exists: every rename **must**
-   add the retired names to `RETIRED_ENV_VARS` (or `RETIRED_HELM_KEYS`) in
-   `crates/hort-app/tests/no_retired_config_names.rs`, which converts the
-   "grep for the old name → 0 hits" acceptance check into a permanent red
-   test. Removing an entry from those lists to make a reintroduced name pass
-   is a blocking review finding, not a fix.
+   name (it is simply ignored), every rename PR carries the "grep for the old
+   name → 0 hits on live surfaces" acceptance check at review time; the
+   upgrade note is the only allowed home for the old names. Reintroducing a
+   retired name on a live surface is a blocking review finding.
 2. **Helm keys:** a retired key fails validation at `helm install` /
    `helm template`, because `values.schema.json` sets
    `additionalProperties: false` on the top-level object and every nested
@@ -118,9 +115,6 @@ old and new names, no deprecation shims.
 
 ## References
 
-- `crates/hort-app/tests/no_retired_config_names.rs` — the retired-name guard
-  (retired-name lists, whole-token matcher, breadcrumb discipline, sanctioned
-  exclusions); registered in the CLAUDE.md pre-push quality checklist.
 - `deploy/helm/hort-server/values.schema.json` — strict schema
   (`additionalProperties: false` top-level and on every chart-owned block).
 - `deploy/helm/hort-server/test-values-strict-schema-typo.yaml` +

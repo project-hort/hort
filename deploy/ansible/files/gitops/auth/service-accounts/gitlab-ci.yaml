@@ -2,16 +2,14 @@ apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount
 metadata:
   name: gitlab-ci
+# CI pull identity for GitLab CI builds (gitlab.kdp.kloni.cloud) — same
+# scope as the GitHub gha-ci SA.
+#
+# The envelope is identity + federation binding only. The read
+# authority is the per-repo serviceAccount-subject PermissionGrants in
+# `auth/grants/gitlab-ci-read-*.yaml` (one per repo: cargo-virtual,
+# crates-proxy, dockerhub-proxy, quay-proxy, npm-proxy).
 spec:
-  # Pull access for GitLab CI builds (gitlab.kdp.kloni.cloud) — same scope as
-  # the GitHub gha-ci SA: read on the pull-through proxies + the cargo virtual.
-  role: reader
-  repositories:
-    - cargo-virtual
-    - crates-proxy
-    - dockerhub-proxy
-    - quay-proxy
-    - npm-proxy
   federatedIdentities:
     - issuer: gitlab                       # OidcIssuer metadata.name (auth/issuers/gitlab.yaml)
       claims:

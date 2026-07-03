@@ -5,9 +5,8 @@ metadata:
 spec:
   # Standalone serviceAccount-subject grant. Resolves at apply to
   # GrantSubject::User(<maintainer-curator backing user>), so the
-  # maintainer-curator SA gets global CURATE without admin. `curate` is not
-  # expressible on the SA envelope (the role confers only read/write), so
-  # this standalone grant is the sole carrier of the curator authority.
+  # maintainer-curator SA gets global CURATE without admin. This
+  # standalone grant is the sole carrier of the curator authority.
   subject:
     kind: serviceAccount
     name: maintainer-curator

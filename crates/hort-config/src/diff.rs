@@ -60,24 +60,6 @@ pub struct CurrentSnapshot {
     pub oidc_issuers: Vec<CurrentOidcIssuer>,
     /// Declared service accounts.
     pub service_accounts: Vec<CurrentServiceAccount>,
-    /// Set of `managed_by_digest` values
-    /// owned by `ServiceAccount` aggregates. The PG-sweep in
-    /// [`diff_permission_grants`] consults this set to skip rows whose
-    /// digest belongs to an SA (snapshot-side); those rows are
-    /// reconciled by `reconcile_service_account_grants` /
-    /// `delete_service_account_grants` in the apply use case, NOT by
-    /// the PG delete plan.
-    ///
-    /// The set is computed by the snapshot builder (in
-    /// `hort-app::apply_config_use_case::build_snapshot`) over the full
-    /// SA aggregates loaded from the SA repository — the diff layer is
-    /// pure and accepts the already-computed set. The canonical digest
-    /// scheme (`sha256("sa-grant|{sa.id}|{role}|{permission}|{sorted_repos}")`)
-    /// uses the SA's UUID, so the set is keyed off the SAs in the
-    /// snapshot — including SAs about to be deleted (whose SA-owned
-    /// grants must continue to be excluded from the PG sweep until
-    /// `apply_service_accounts` cleans them up).
-    pub sa_owned_grant_digests: HashSet<[u8; 32]>,
     /// `ServiceAccount.metadata.name` → backing-user UUID (stringified),
     /// for every SA whose backing `users` row already exists. The diff
     /// layer uses it to resolve a `GrantSubjectSpec::ServiceAccount`
@@ -476,32 +458,6 @@ fn diff_permission_grants(
         if cur.managed_by != ManagedBy::GitOps {
             continue;
         }
-        // SA-owned grants are tagged with a digest computed by
-        // `reconcile_service_account_grants`; their lifecycle belongs
-        // to the SA, not to any `PermissionGrant` envelope. Excluding
-        // them here keeps the PG-sweep from over-deleting SA-owned rows
-        // on an apply that declares the SA but no mirror
-        // `PermissionGrant`, and routes the SA-delete cleanup through
-        // `delete_service_account_grants` (the only path that should
-        // touch these rows).
-        //
-        // Why a digest and NOT `users.is_service_account = true`?
-        // An SA's authority is materialised as
-        // `GrantSubject::User(backing_user_id)` rows. A human admin can
-        // independently create a `User`-subject grant for that same
-        // backing user on an unrelated repo (operationally legitimate).
-        // The digest is per-SA-spec, so it identifies the rows the SA
-        // aggregate owns without trampling admin-created grants on the
-        // shared backing user. The is_service_account predicate would
-        // over-collapse: every grant on the SA's backing user would be
-        // exempt from the PG sweep, which is wrong because
-        // admin-created ones should remain admin-managed (no
-        // `managed_by_digest`).
-        if let Some(digest) = cur.managed_by_digest {
-            if current.sa_owned_grant_digests.contains(&digest) {
-                continue;
-            }
-        }
         match current_grant_identity(cur) {
             Some(ident) if !desired_identities.contains(&ident) => {
                 plan.delete.push(cur.id);
@@ -726,13 +682,12 @@ pub fn spec_digest_oidc_issuer(spec: &OidcIssuerSpec) -> [u8; 32] {
 
 /// SHA-256 over the canonicalised JSON of a `ServiceAccountSpec`.
 ///
-/// `repositories` and `federated_identities` are sorted before
-/// hashing so re-ordering in YAML doesn't flip the digest. The
-/// `claims` map inside each `FederatedIdentitySpec` is already a
-/// `BTreeMap` (key-sorted), so no extra normalisation there.
+/// `federated_identities` is sorted before hashing so re-ordering in
+/// YAML doesn't flip the digest. The `claims` map inside each
+/// `FederatedIdentitySpec` is already a `BTreeMap` (key-sorted), so no
+/// extra normalisation there.
 pub fn spec_digest_service_account(spec: &ServiceAccountSpec) -> [u8; 32] {
     let mut normalised = spec.clone();
-    normalised.repositories.sort();
     // Sort by `(issuer, claims)` for stability — two envelopes
     // declaring the same SA with the same trust policy but the
     // identities listed in a different order must digest the same.
@@ -1693,8 +1648,6 @@ mod tests {
         let mut claims = BTreeMap::new();
         claims.insert("repository".into(), "my-org/my-repo".into());
         ServiceAccountSpec {
-            role: "developer".into(),
-            repositories: vec!["pypi-internal".into()],
             federated_identities: vec![FederatedIdentitySpec {
                 issuer: "github-actions".into(),
                 claims,
@@ -1842,22 +1795,10 @@ mod tests {
     }
 
     #[test]
-    fn service_account_digest_insensitive_to_repository_ordering() {
-        let mut a = sa_spec();
-        a.repositories = vec!["a".into(), "b".into()];
-        let mut b = a.clone();
-        b.repositories = vec!["b".into(), "a".into()];
-        assert_eq!(
-            spec_digest_service_account(&a),
-            spec_digest_service_account(&b)
-        );
-    }
-
-    #[test]
-    fn service_account_digest_changes_when_role_changes() {
+    fn service_account_digest_changes_when_federated_identity_changes() {
         let a = sa_spec();
         let mut b = a.clone();
-        b.role = "reader".into();
+        b.federated_identities[0].issuer = "gitlab-ci".into();
         assert_ne!(
             spec_digest_service_account(&a),
             spec_digest_service_account(&b)

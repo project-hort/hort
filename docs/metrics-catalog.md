@@ -775,7 +775,7 @@ labels — same anti-pattern discipline as the counter.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, mint_failed, internal_error, bad_request}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success` and `bad_request` (shared wire-shape errors). |
+| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, mint_failed, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). |
 | `hort_token_exchange_duration_seconds` | histogram | `kind`, `result` | seconds | same set as the counter |
 | `hort_session_admin_issuance_total` | counter | `result` | — | `granted`, `denied_flag`, `denied_authority`, `denied_lifetime` |
 | `hort_fed_sa_match_total` | counter | `result` | — | `matched`, `denied_audience`, `denied_empty_claims` |
@@ -876,15 +876,14 @@ duration sample AND increments the counter on the way out. RFC
   collapsed into this bucket — doing so generates false
   positives on outage dashboards. Reviewer-checked invariant.
 
-Cardinality: 2 `kind` values (`cli_session`, `federated_jwt`) × ~14
-distinct `result` values per kind (10 unique to `cli_session`,
-14 unique to `federated_jwt`, with `success` and `bad_request`
-shared) ≈ **~24 series per metric**, ~48 series
+Cardinality: 2 `kind` values (`cli_session`, `federated_jwt`) × ~15
+distinct `result` values per kind (with `success`, `bad_request`, and
+`cap_exceeds_authority` shared) ≈ **~25 series per metric**, ~50 series
 total across the two metrics. Closed taxonomy. (Operator dashboards
 keyed on the historical label-less form of this metric stopped
 incrementing when the `kind` label landed; add `kind=~".+"` filters
-when upgrading. The disjoint-except-for-`success`-and-`bad_request`
-rule keeps cardinality sub-linear in the number of kinds.)
+when upgrading. The mostly-disjoint per-kind sets keep cardinality
+sub-linear in the number of kinds.)
 
 A future refresh-token phase extends the `kind` label with `refresh` —
 its `result` variants land alongside the emitting change (ADR 0013
@@ -931,13 +930,22 @@ branch — the foreign-IdP JWT exchange path that mints a
   an unexpected error, SA listing failed, the federation ports are
   unwired (composition bug). Maps to HTTP 500 / 503.
 - `bad_request` — RFC 6749 wire-shape rejection on the federation
-  branch (typically `requested_token_type ≠ access_token`). Shared
+  branch (typically `requested_token_type ≠ access_token`, or an
+  unknown permission name in the RFC 8693 `scope` parameter). Shared
   label with the `cli_session` branch — distinguished by the `kind`
   label.
+- `cap_exceeds_authority` — the RFC 8693 `scope` requested a
+  permission set of which the matched SA's effective grants hold
+  nothing. The grants-snapshot cap would be empty for an explicitly
+  requested scope, so the exchange denies 403 `access_denied` instead
+  of minting — the same empty-footprint semantics as the
+  `cli_session` branch's label. Distinguished by the `kind` label.
+  (An ABSENT scope with a zero-grant SA mints normally with an
+  empty-permissions cap and emits `success`.)
 
 The federation branch never emits the `cli_session` branch's labels
 (`source_token_invalid`, `source_token_pat_rejected`, `idp_unavailable`,
-`subject_not_authorised`, `cap_exceeds_authority`, `validation_error`,
+`subject_not_authorised`, `validation_error`,
 `infrastructure_error`) and vice versa — `kind` is the discriminator.
 
 **`hort_fed_sa_match_total{result}`**:

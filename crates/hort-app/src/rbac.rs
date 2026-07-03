@@ -505,6 +505,58 @@ impl RbacEvaluator {
             repository_ids: Some(repos),
         })
     }
+
+    /// Derive the unattended service-account issuance cap: the distinct
+    /// permission set of the SA's backing user's effective grants,
+    /// optionally narrowed to a requested scope.
+    ///
+    /// Both unattended issuance sites — the `/exchange` federation mint
+    /// and the fallback-rotation reconciler mint — call this, so the
+    /// issued token's `declared_permissions` cap is a snapshot of
+    /// exactly what the backing user holds at issuance. The footprint
+    /// comes from [`Self::effective_grants`] (the ONE shared
+    /// subject-match + repo-scope enumeration), so the cap cannot drift
+    /// from the request-time gate. The repository dimension is
+    /// deliberately flattened: per-repo scoping is enforced by the live
+    /// grants leg at request time, and both callers leave the cap's
+    /// `repository_ids` unset.
+    ///
+    /// - `requested_scope` empty ⇒ no narrowing: the full held set, in
+    ///   grant-enumeration order.
+    /// - `requested_scope` non-empty ⇒ the held subset of the requested
+    ///   permissions, deduped in request order — the same held-subset
+    ///   narrowing as [`Self::derive_cli_session_cap`]'s permission
+    ///   axis. The caller decides what an empty narrowed result means
+    ///   (the federation exchange denies it, mirroring the CliSession
+    ///   branch's `cap_exceeds_authority` semantics).
+    /// - A backing user with no grants yields an empty vec: the caller
+    ///   mints an empty-permissions cap that authorizes nothing —
+    ///   fail-closed by intersection at use time
+    ///   (`cap_allows_optional_repo` requires
+    ///   `cap.permissions.contains(&requested)`).
+    ///
+    /// The enumeration runs with `claims: []` and `is_admin: false`: a
+    /// service-account principal carries no claims and service accounts
+    /// are strictly non-admin, so only
+    /// [`GrantSubject::User`]`(backing_user_id)` grants — nothing
+    /// ambient — enter the cap.
+    #[must_use]
+    pub fn service_account_cap_permissions(
+        &self,
+        backing_user_id: Uuid,
+        requested_scope: &[Permission],
+    ) -> Vec<Permission> {
+        let footprint = self.effective_grants(&[], Some(backing_user_id), false);
+        let all: Vec<Permission> = footprint.cells.iter().map(|&(_, p)| p).collect();
+        let held = dedup_preserving_order(&all);
+        if requested_scope.is_empty() {
+            return held;
+        }
+        dedup_preserving_order(requested_scope)
+            .into_iter()
+            .filter(|p| held.contains(p))
+            .collect()
+    }
 }
 
 /// The distinct repository ids appearing on the per-repo cells of an
@@ -560,9 +612,11 @@ pub(crate) fn subject_matches(
 }
 
 /// De-duplicate a permission slice, preserving first-seen order. Used by
-/// the admin branch of [`RbacEvaluator::derive_cli_session_cap`] so a
-/// caller repeating a permission in the requested scope does not produce
-/// a cap with duplicate entries.
+/// the admin branch of [`RbacEvaluator::derive_cli_session_cap`] and by
+/// [`RbacEvaluator::service_account_cap_permissions`] so a caller
+/// repeating a permission in the requested scope — or a footprint holding
+/// the same permission on several repositories — does not produce a cap
+/// with duplicate entries.
 fn dedup_preserving_order(perms: &[Permission]) -> Vec<Permission> {
     let mut out: Vec<Permission> = Vec::new();
     for &p in perms {
@@ -1687,6 +1741,93 @@ mod tests {
             .expect("user-subject grantee derives a cap");
         assert_eq!(cap.permissions, vec![Permission::Write]);
         assert_eq!(cap.repository_ids, Some(vec![repo]));
+    }
+
+    // -- service_account_cap_permissions --------------------------------------
+    //
+    // The unattended-issuance cap snapshot: distinct permission set of the
+    // backing user's grants (repo dimension flattened), ∩ the requested
+    // scope when one is supplied. Shared by the `/exchange` federation
+    // mint and the fallback-rotation mint.
+
+    #[test]
+    fn sa_cap_flattens_repo_dimension_and_dedups() {
+        // Read held on two repos + Write held globally → the flat cap is
+        // the distinct permission set in grant-enumeration order.
+        let uid = Uuid::new_v4();
+        let (repo_a, repo_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let eval = RbacEvaluator::new(vec![
+            user_grant(uid, Some(repo_a), Permission::Read),
+            user_grant(uid, None, Permission::Write),
+            user_grant(uid, Some(repo_b), Permission::Read),
+        ]);
+        assert_eq!(
+            eval.service_account_cap_permissions(uid, &[]),
+            vec![Permission::Read, Permission::Write],
+        );
+    }
+
+    #[test]
+    fn sa_cap_zero_grant_backing_user_yields_empty() {
+        // Fail-closed by intersection: the caller mints an
+        // empty-permissions cap that authorizes nothing.
+        let eval = RbacEvaluator::new(vec![user_grant(Uuid::new_v4(), None, Permission::Write)]);
+        assert!(eval
+            .service_account_cap_permissions(Uuid::new_v4(), &[])
+            .is_empty());
+    }
+
+    #[test]
+    fn sa_cap_scope_narrows_to_held_subset_in_request_order() {
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![
+            user_grant(uid, None, Permission::Read),
+            user_grant(uid, None, Permission::Write),
+        ]);
+        // Requested order wins; the unheld `Delete` is dropped; the
+        // repeated `Read` is deduped.
+        assert_eq!(
+            eval.service_account_cap_permissions(
+                uid,
+                &[
+                    Permission::Write,
+                    Permission::Delete,
+                    Permission::Read,
+                    Permission::Read,
+                ],
+            ),
+            vec![Permission::Write, Permission::Read],
+        );
+    }
+
+    #[test]
+    fn sa_cap_scope_with_no_held_permission_yields_empty() {
+        // The caller decides what an empty narrowed result means (the
+        // federation exchange denies it); the derivation itself only
+        // reports the intersection.
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(uid, None, Permission::Read)]);
+        assert!(eval
+            .service_account_cap_permissions(uid, &[Permission::Write])
+            .is_empty());
+    }
+
+    #[test]
+    fn sa_cap_ignores_claims_grants_and_admin_ambient() {
+        // The enumeration runs with `claims: []`, `is_admin: false`: a
+        // claims-subject grant never enters the cap, and there is no
+        // admin short-circuit — only `User(backing_user_id)` grants
+        // count.
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![
+            claims_grant(&["developer"], None, Permission::Write),
+            claims_grant(&["admin"], None, Permission::Delete),
+            user_grant(uid, None, Permission::Read),
+        ]);
+        assert_eq!(
+            eval.service_account_cap_permissions(uid, &[]),
+            vec![Permission::Read],
+        );
     }
 
     // -- effective_grants ----------------------------------------------------

@@ -13,7 +13,9 @@
 //!
 //! Per-tick flow:
 //!
-//! 1. List all `ServiceAccount` rows with `fallback_rotation` set.
+//! 1. List all `ServiceAccount` rows with `fallback_rotation` set, and
+//!    take one effective-grants snapshot for the tick (the minted
+//!    tokens' `declared_permissions` cap).
 //! 2. For each SA, apply the decide-branch logic:
 //!    - If `target_secret_namespace` is NOT in the worker's authorized
 //!      `rotation_namespaces` set → warn + metric, skip.
@@ -57,11 +59,13 @@ use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, E
 use hort_domain::ports::kubernetes_secret_writer::{
     KubernetesSecretWriter, ManagedSecret, ManagedSecretSpec,
 };
+use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 
 use crate::metrics::{emit_rotation_result, set_rotation_lag_seconds, RotationResult};
+use crate::rbac::RbacEvaluator;
 use crate::use_cases::api_token_use_case::{ApiTokenUseCase, IssueTokenRequest};
 
 // ---------------------------------------------------------------------------
@@ -89,8 +93,7 @@ const TOKEN_DESCRIPTION_PREFIX: &str = "fallback rotation for service account ";
 // ---------------------------------------------------------------------------
 
 /// [`TaskHandler`] for the fallback PAT-rotation reconciler. Constructed
-/// at composition time with the five ports + three config values it
-/// touches.
+/// at composition time with the ports + config values it touches.
 ///
 /// Stateless: no per-tick local state survives a `run` call. The
 /// freshness check is driven entirely by the k8s Secret's
@@ -100,6 +103,14 @@ pub struct ServiceAccountRotationHandler {
     secret_writer: Arc<dyn KubernetesSecretWriter>,
     api_tokens: Arc<ApiTokenUseCase>,
     events: Arc<dyn EventStore>,
+    /// Source of the per-tick effective-grants snapshot. Each rotated
+    /// token's `declared_permissions` cap is the distinct permission
+    /// set the SA's backing user holds at issuance (the same
+    /// enumeration the request-time gate walks, via
+    /// [`RbacEvaluator::service_account_cap_permissions`]). One
+    /// `list_all` per tick; staleness is bounded by the SA's
+    /// `rotationInterval` — the next tick re-reads.
+    grants: Arc<dyn PermissionGrantRepository>,
     /// Set of k8s namespaces the worker is permitted to write Secrets
     /// in. Defence-in-depth against an SA pointing at an out-of-policy
     /// namespace (the chart wires this from
@@ -125,6 +136,7 @@ impl ServiceAccountRotationHandler {
         secret_writer: Arc<dyn KubernetesSecretWriter>,
         api_tokens: Arc<ApiTokenUseCase>,
         events: Arc<dyn EventStore>,
+        grants: Arc<dyn PermissionGrantRepository>,
         rotation_namespaces: HashSet<String>,
         public_registry_host: String,
     ) -> Self {
@@ -133,6 +145,7 @@ impl ServiceAccountRotationHandler {
             secret_writer,
             api_tokens,
             events,
+            grants,
             rotation_namespaces,
             public_registry_host,
             // Default-`true` keeps existing call sites
@@ -179,6 +192,25 @@ impl TaskHandler for ServiceAccountRotationHandler {
                         "service account rotation: list failed; will retry on next tick",
                     );
                     return Ok(TaskOutcome::fail(format!("list failed: {err}"), true));
+                }
+            };
+
+            // 1b. Effective-grants snapshot for the tick. Every token
+            //     minted this tick carries a `declared_permissions` cap
+            //     equal to the distinct permission set its SA's backing
+            //     user holds right now; a grant list that cannot be read
+            //     fails the tick (retry next tick) — minting no-authority
+            //     caps for every SA on a transient read failure would
+            //     silently strand consumers until the following rotation.
+            let evaluator = match self.grants.list_all().await {
+                Ok(rows) => RbacEvaluator::new(rows),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "service account rotation: permission-grant list failed; \
+                         will retry on next tick",
+                    );
+                    return Ok(TaskOutcome::fail(format!("grant list failed: {err}"), true));
                 }
             };
 
@@ -280,10 +312,21 @@ impl TaskHandler for ServiceAccountRotationHandler {
                 // `validity ≥ 2 × rotation_interval ≥ 2 h` so the
                 // value is well-bounded.
                 let validity_secs = rotation.validity.as_secs();
+                // The cap is a snapshot of the SA's effective grants at
+                // issuance: the distinct permission set the backing user
+                // holds, no scope narrowing on this path (there is no
+                // requester to narrow for — the snapshot IS the cap). A
+                // zero-grant SA mints an empty-permissions cap: the
+                // token authorizes nothing until a grant lands and the
+                // next rotation picks it up. Per-repo scoping stays on
+                // the live User-subject grants; `repository_ids = None`
+                // so a grant change never strands an outstanding token
+                // with a stale repo cap.
                 let issue_request = IssueTokenRequest {
                     name: sa.name.clone(),
                     description: Some(format!("{TOKEN_DESCRIPTION_PREFIX}{}", sa.name)),
-                    declared_permissions: Vec::new(),
+                    declared_permissions: evaluator
+                        .service_account_cap_permissions(sa.backing_user_id, &[]),
                     repository_ids: None,
                     expires_in_days: None,
                     expires_in_seconds: Some(validity_secs),
@@ -564,11 +607,10 @@ mod tests {
     use hort_domain::ports::api_token_repository::ApiTokenRepository;
     use hort_domain::ports::user_repository::UserRepository;
 
-    use crate::rbac::RbacEvaluator;
     use crate::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
     use crate::use_cases::test_support::{
         MockApiTokenRepository, MockEventStore, MockKubernetesSecretWriter,
-        MockServiceAccountRepository, MockUserRepository,
+        MockPermissionGrantRepository, MockServiceAccountRepository, MockUserRepository,
     };
 
     // ---------- helpers ---------------------------------------------------
@@ -605,8 +647,6 @@ mod tests {
             id: Uuid::new_v4(),
             name: name.into(),
             backing_user_id: fixed_user_id(),
-            role: "developer".into(),
-            repositories: vec!["pypi-internal".into()],
             federated_identities: vec![],
             fallback_rotation: Some(sample_rotation()),
             created_at: Utc::now(),
@@ -666,12 +706,32 @@ mod tests {
         Arc<MockApiTokenRepository>,
         Arc<MockEventStore>,
     ) {
+        make_handler_with_grants(
+            sa_repo,
+            writer,
+            ns,
+            Arc::new(MockPermissionGrantRepository::new()),
+        )
+    }
+
+    fn make_handler_with_grants(
+        sa_repo: Arc<MockServiceAccountRepository>,
+        writer: Arc<MockKubernetesSecretWriter>,
+        ns: HashSet<String>,
+        grants: Arc<MockPermissionGrantRepository>,
+    ) -> (
+        ServiceAccountRotationHandler,
+        Arc<ApiTokenUseCase>,
+        Arc<MockApiTokenRepository>,
+        Arc<MockEventStore>,
+    ) {
         let (uc, tokens, _users, events) = make_use_case();
         let handler = ServiceAccountRotationHandler::new(
             sa_repo as Arc<dyn ServiceAccountRepository>,
             writer as Arc<dyn KubernetesSecretWriter>,
             uc.clone(),
             events.clone() as Arc<dyn EventStore>,
+            grants as Arc<dyn PermissionGrantRepository>,
             ns,
             registry_host(),
         );
@@ -939,6 +999,7 @@ mod tests {
             foreign_writer.clone() as Arc<dyn KubernetesSecretWriter>,
             uc,
             events.clone() as Arc<dyn EventStore>,
+            Arc::new(MockPermissionGrantRepository::new()),
             ns_set(&["ci-system"]),
             registry_host(),
         );
@@ -1126,6 +1187,157 @@ mod tests {
     }
 
     // =====================================================================
+    // Cap snapshot — the minted token's declared_permissions equal the
+    // backing user's effective grants at issuance
+    // =====================================================================
+
+    #[tokio::test]
+    async fn rotated_token_cap_is_snapshot_of_backing_user_grants() {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+
+        let writer = Arc::new(MockKubernetesSecretWriter::new());
+        let sa = sample_sa("ci-pusher");
+        let sa_repo = Arc::new(MockServiceAccountRepository::new());
+        sa_repo.insert(sa);
+
+        // Backing user holds Read (per-repo) + Write (global); an
+        // unrelated user's Delete grant must not leak in.
+        let grant = |subject_uid: Uuid, repo: Option<Uuid>, permission| PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::User(subject_uid),
+            repository_id: repo,
+            permission,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        };
+        let grants = Arc::new(MockPermissionGrantRepository::new());
+        grants.seed(vec![
+            grant(fixed_user_id(), Some(Uuid::new_v4()), Permission::Read),
+            grant(fixed_user_id(), None, Permission::Write),
+            grant(Uuid::new_v4(), None, Permission::Delete),
+        ]);
+
+        let (handler, _, tokens, _events) =
+            make_handler_with_grants(sa_repo, writer.clone(), ns_set(&["ci-system"]), grants);
+
+        handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        let snapshot = tokens.inserted();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].declared_permissions,
+            vec![Permission::Read, Permission::Write],
+            "the rotation mint's cap is the distinct permission set of the \
+             backing user's grants at issuance",
+        );
+        assert!(
+            snapshot[0].repository_ids.is_none(),
+            "per-repo scoping stays on the live User-subject grants; the cap's \
+             repo axis stays unset",
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_token_cap_is_empty_for_zero_grant_sa() {
+        let writer = Arc::new(MockKubernetesSecretWriter::new());
+        let sa = sample_sa("ci-pusher");
+        let sa_repo = Arc::new(MockServiceAccountRepository::new());
+        sa_repo.insert(sa);
+
+        // No grants seeded: the mint proceeds — the cap is empty and the
+        // token authorizes nothing (fail-closed by intersection at use
+        // time), never an issuance error.
+        let (handler, _, tokens, _events) =
+            make_handler(sa_repo, writer.clone(), ns_set(&["ci-system"]));
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["rotated"], 1);
+                assert_eq!(result_summary["mint_failed"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let snapshot = tokens.inserted();
+        assert_eq!(snapshot.len(), 1);
+        assert!(
+            snapshot[0].declared_permissions.is_empty(),
+            "zero-grant SA mints an empty-permissions cap",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_tick_when_grant_list_fails() {
+        // A grant set that cannot be read fails the whole tick
+        // (retryable) — the cap source is unavailable, and minting
+        // no-authority caps for every SA on a transient read failure
+        // would strand consumers until the following rotation.
+        struct FailingGrantsRepo;
+        impl PermissionGrantRepository for FailingGrantsRepo {
+            fn list_all(
+                &self,
+            ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::rbac::PermissionGrant>>>
+            {
+                Box::pin(async {
+                    Err(DomainError::Invariant(
+                        "simulated grant list failure".into(),
+                    ))
+                })
+            }
+            fn list_managed_by_gitops(
+                &self,
+            ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::rbac::PermissionGrant>>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn save_managed(
+                &self,
+                _items: &[hort_domain::entities::rbac::PermissionGrant],
+            ) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let writer = Arc::new(MockKubernetesSecretWriter::new());
+        let sa_repo = Arc::new(MockServiceAccountRepository::new());
+        sa_repo.insert(sample_sa("ci-pusher"));
+
+        let (uc, tokens, _users, events) = make_use_case();
+        let handler = ServiceAccountRotationHandler::new(
+            sa_repo as Arc<dyn ServiceAccountRepository>,
+            writer.clone() as Arc<dyn KubernetesSecretWriter>,
+            uc,
+            events.clone() as Arc<dyn EventStore>,
+            Arc::new(FailingGrantsRepo),
+            ns_set(&["ci-system"]),
+            registry_host(),
+        );
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok-wrapped fail outcome");
+        match outcome {
+            TaskOutcome::Failed { reason, retry } => {
+                assert!(reason.contains("grant list failed"));
+                assert!(retry, "grant-list failure retries on the next tick");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Nothing minted, nothing written.
+        assert_eq!(tokens.inserted().len(), 0);
+        assert_eq!(writer.upsert_call_count(), 0);
+    }
+
+    // =====================================================================
     // Mint failure path — continue to next SA
     // =====================================================================
 
@@ -1165,6 +1377,7 @@ mod tests {
             writer.clone() as Arc<dyn KubernetesSecretWriter>,
             uc,
             events.clone() as Arc<dyn EventStore>,
+            Arc::new(MockPermissionGrantRepository::new()),
             ns_set(&["ci-system"]),
             registry_host(),
         );
@@ -1207,6 +1420,7 @@ mod tests {
             writer.clone() as Arc<dyn KubernetesSecretWriter>,
             uc,
             events.clone() as Arc<dyn EventStore>,
+            Arc::new(MockPermissionGrantRepository::new()),
             ns_set(&["ci-system"]),
             registry_host(),
         );
@@ -1537,6 +1751,7 @@ mod tests {
             writer.clone() as Arc<dyn KubernetesSecretWriter>,
             uc,
             events.clone() as Arc<dyn EventStore>,
+            Arc::new(MockPermissionGrantRepository::new()),
             ns_set(&["ci-system"]),
             registry_host(),
         );
@@ -1596,6 +1811,7 @@ mod tests {
             writer.clone() as Arc<dyn KubernetesSecretWriter>,
             uc,
             events.clone() as Arc<dyn EventStore>,
+            Arc::new(MockPermissionGrantRepository::new()),
             ns_set(&["ci-system"]),
             registry_host(),
         )

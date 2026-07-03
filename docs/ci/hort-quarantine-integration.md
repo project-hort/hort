@@ -50,11 +50,12 @@ the PR head). Controls, in order of load-bearing-ness:
    only). GitHub also withholds secrets and caps permissions for fork-PR runs.
    **Enable the belt-and-suspenders repo setting** so an edited fork workflow does
    not even run unapproved — see the checklist below.
-2. **The token is low-blast-radius.** Federation mints a **short-lived, reader +
-   prefetch-only, non-admin `ServiceAccount` bearer** (service accounts cannot be
-   admin — ADR 0038). Even if a same-repo PR's run leaked it, it buys "pull deps +
-   prefetch" for minutes, and it is audited (`hort_fed_sa_match_total`, the
-   federation log).
+2. **The token is low-blast-radius.** Federation mints a **short-lived,
+   read + prefetch-only, non-admin `ServiceAccount` bearer** — its cap
+   snapshots the SA's grants at exchange (ADR 0044); service accounts cannot
+   be admin (ADR 0038). Even if a same-repo PR's run leaked it, it buys "pull
+   deps + prefetch" for minutes, and it is audited
+   (`hort_fed_sa_match_total`, the federation log).
 3. **`push`-only prefetch.** The write-ish prefetch capability runs only on `push`
    (trusted members; forks cannot push here) — never a `pull_request` /
    `pull_request_target` trigger.
@@ -72,44 +73,56 @@ the PR head). Controls, in order of load-bearing-ness:
 - [ ] Keep third-party actions **SHA-pinned**.
 - [ ] (Optional, closes the same-repo-rogue case) a **GitHub Environment with a required reviewer** on the token-minting jobs.
 
-## The hort side — a reader + prefetch ServiceAccount (gitops)
+## The hort side — a read + prefetch ServiceAccount (gitops)
 
-Declare a **reader** service account for GitHub Actions, federated on the GitHub
-OIDC issuer, constrained by a **discriminating claim** (`repository` alone is
-flagged by hort's under-constrained-FI linter — see
-`docs/architecture/how-to/federate-ci-oidc.md`):
+Declare an identity-only service account for GitHub Actions, federated on the
+GitHub OIDC issuer, constrained by a **discriminating claim** (`repository`
+alone is flagged by hort's under-constrained-FI linter — see
+`docs/architecture/how-to/federate-ci-oidc.md`), with its authority as
+explicit grants alongside:
 
 ```yaml
-apiVersion: hort.rs/v1
+apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount
 metadata:
   name: github-ci
 spec:
-  role: reader
   federatedIdentities:
-    - issuer: https://token.actions.githubusercontent.com
+    - issuer: github-actions          # OidcIssuer metadata.name
       # repository + a discriminator (aud is server-config, not attacker-set).
       claims:
         repository: project-hort/hort
         aud: hort-server
 ---
-apiVersion: hort.rs/v1
+apiVersion: project-hort.de/v1beta1
 kind: PermissionGrant
 metadata:
   name: github-ci-read
 spec:
   subject:
-    serviceAccount: { name: github-ci }   # → GrantSubject::User(backing_user_id) at apply (ADR 0037)
-  permission: read                         # pull + discovery + prefetch; no curate/admin
-  # scope: repository/global per your layout
+    kind: serviceAccount
+    name: github-ci        # → GrantSubject::User(backing_user_id) at apply (ADR 0037)
+  permission: read         # pull + discovery; no curate/admin
+  # repository omitted = global; scope per-repo per your layout
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: github-ci-prefetch
+spec:
+  subject:
+    kind: serviceAccount
+    name: github-ci
+  permission: prefetch     # permissions are flat — read does not imply prefetch
 ```
 
 Audience `hort-server` is mandatory (`OidcIssuer.audiences` validates it; the CI
 mints the OIDC token with `core.getIDToken('hort-server')`).
 
-**The `PermissionGrant` is load-bearing, not optional.** `spec.role: reader` is a
-*cap* (a ceiling), not a grant — effective authority = the service account's
-grants **∩** cap (ADR 0036). Without the `read` grant above, discovery + prefetch
-fail **closed** with a `403` that does **not** name the missing capability (the
-same footgun from the open-items register: "a cap is a ceiling, not a grant").
-Apply the SA **and** its grant together.
+**The `PermissionGrant`s are the SA's entire authority.** The envelope declares
+only who may assume the account; the exchanged bearer's cap is a snapshot of
+the SA's effective grants at exchange time (ADR 0044), and effective authority
+= grants **∩** cap (ADR 0036). Without the grants above, the exchange mints a
+bearer that authorizes nothing — discovery + prefetch fail **closed** with a
+`403` that does **not** name the missing capability. Apply the SA **and** its
+grants together.
