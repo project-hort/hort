@@ -124,6 +124,7 @@ mod tests {
                 san: "san".into(),
             },
             predicate_type: None,
+            cascaded_from: None,
         })
     }
 

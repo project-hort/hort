@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OCI image-index / manifest-list (multi-arch) support.** Hosted OCI repos
+  accept `application/vnd.oci.image.index.v1+json` and Docker manifest-list
+  PUTs (previously rejected `MANIFEST_INVALID`), so `skopeo copy --all`,
+  buildah/podman multi-arch pushes, and cosign signing of the index digest
+  work. An index is stored as a generic manifest artifact riding the normal
+  quarantine/scan/release/provenance lifecycle; each child manifest is
+  validated to exist in-repo on PUT, the declared media type is cross-checked
+  against the manifest shape, and index→child membership keeps every child's
+  content alive under GC. (issue #15, ADR 0043)
+- A `hort-sweep-ticker` sidecar in the reference compose deployment enqueues
+  the quarantine-release sweep periodically — compose's stand-in for the Helm
+  `scheduledTasks` CronJobs / native `hort_timers`, so release and expiry
+  decisions happen without a surrounding scheduler. (issue #14)
+
+### Changed
+
+- A **write-authorized** caller may now `GET` (not just `HEAD`) a held
+  manifest: keyed `cosign sign` resolves the subject manifest by GET before
+  attaching a signature, so the HEAD-only exemption blocked in-place
+  push-then-sign. A manifest is a routing document — layer blobs stay gated
+  (503) for every caller while held, and non-writers still receive 503 for
+  both verbs. (issue #14, ADR 0039)
+
+### Fixed
+
+- **cosign v3 keyed signatures now verify.** `cosign sign --key
+  --registry-referrers-mode=oci-1-1` (cosign v3) emits a Sigstore v0.3 bundle
+  referrer carrying a DSSE envelope, not the legacy `simplesigning` layer the
+  `cosign-key` backend consumed — a validly keyed-signed image was judged
+  `NoAttestation` and rejected `Unsigned`. The keyed verifier now extracts the
+  DSSE PAE signing input, signature, and subject-digest binding from a keyed
+  bundle (no Fulcio chain) and verifies it against the pinned P-256 key,
+  rejecting a signature over a different digest. The legacy `simplesigning`
+  carriage and keyless (Fulcio-chain) bundle routing are unchanged.
+  (issue #14, ADR 0039)
+
+- **A validly signed image is now consumable under `provenanceMode: required`
+  (provenance-clearance cascade).** cosign signs only the top-level digest, so
+  the per-artifact provenance gate terminally rejected every constituent of a
+  signed image — child manifests and config/layer blobs can never carry their
+  own signature — leaving a released multi-arch index unpullable (child GETs
+  404). A verified signature now cascades the provenance clearance to the
+  constituents bound by the verified content: the index's signed bytes carry
+  the child-manifest digests and each manifest's bytes carry its config/layer
+  digests, so the signature over the root covers exactly that tree. The
+  cascade is repository-scoped, applies only to held artifacts (a terminally
+  rejected constituent stays rejected), clears only the provenance gate (scan
+  and quarantine-window gates remain per-artifact), and records each cascaded
+  clearance as a `ProvenanceVerified` attributed to the root digest via
+  `cascaded_from`. A never-signed image and its constituents still reject
+  `Unsigned` at window expiry. (ADR 0039 §11, ADR 0043)
+
 ## [0.9.8] - 2026-07-02
 
 Headlines: OCI **chunked blob-upload push** (buildah / podman / skopeo stream

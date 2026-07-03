@@ -2537,6 +2537,7 @@ dependencies = [
 name = "hort-domain"
 version = "0.9.8-beta.2"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "chrono",

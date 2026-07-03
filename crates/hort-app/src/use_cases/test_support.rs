@@ -1864,6 +1864,13 @@ pub struct MockEventStore {
     /// path (e.g. the CliSession JWT mint, which appends
     /// `ApiTokenIssued` but persists no row).
     fail_next_append: Mutex<Option<DomainError>>,
+    /// Per-stream one-shot replacement installed AFTER the next
+    /// `read_stream` of that stream serves the current content —
+    /// models a concurrent append landing between two reads (the
+    /// provenance cascade's conflict-retry re-read observing a
+    /// `ProvenanceVerified` that appeared mid-flight). Seeded via
+    /// [`set_stream_after_next_read`](Self::set_stream_after_next_read).
+    stream_after_next_read: Mutex<HashMap<String, Vec<PersistedEvent>>>,
 }
 
 impl MockEventStore {
@@ -1874,6 +1881,7 @@ impl MockEventStore {
             category_events: Mutex::new(HashMap::new()),
             category_error_positions: Mutex::new(Vec::new()),
             fail_next_append: Mutex::new(None),
+            stream_after_next_read: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1888,6 +1896,19 @@ impl MockEventStore {
 
     pub fn set_stream(&self, stream_id: &StreamId, events: Vec<PersistedEvent>) {
         self.streams
+            .lock()
+            .unwrap()
+            .insert(stream_id.to_string(), events);
+    }
+
+    /// Arm a one-shot stream replacement: the NEXT `read_stream` of
+    /// `stream_id` serves the CURRENT content, then `events` replaces it
+    /// so every subsequent read sees the new state. Models a concurrent
+    /// append landing between two reads (the provenance cascade's
+    /// conflict-retry path re-reading and finding a `ProvenanceVerified`
+    /// that appeared mid-flight).
+    pub fn set_stream_after_next_read(&self, stream_id: &StreamId, events: Vec<PersistedEvent>) {
+        self.stream_after_next_read
             .lock()
             .unwrap()
             .insert(stream_id.to_string(), events);
@@ -1949,6 +1970,12 @@ impl EventStore for MockEventStore {
             .get(&key)
             .cloned()
             .unwrap_or_default();
+        // One-shot post-read swap (see `set_stream_after_next_read`):
+        // this read serves the current content; subsequent reads see
+        // the armed replacement — a concurrent append between reads.
+        if let Some(next) = self.stream_after_next_read.lock().unwrap().remove(&key) {
+            self.streams.lock().unwrap().insert(key, next);
+        }
         let truncated: Vec<PersistedEvent> = events.into_iter().take(max_count as usize).collect();
         Box::pin(async move { Ok(truncated) })
     }
@@ -2083,12 +2110,15 @@ pub struct MockArtifactLifecycle {
     /// use this snapshot — the enqueues no longer flow through the `jobs`
     /// mock, they ride the lifecycle call so they commit atomically.
     ingest_enqueues: Mutex<Vec<(Uuid, Vec<IngestEnqueue>)>>,
-    /// When set, `commit_transition` returns this error verbatim without
-    /// recording the transition. Used by tests exercising error-path
-    /// metric emission (e.g. `register_by_hash` must
-    /// tick `hort_ingest_total{result="internal"}` when the lifecycle
-    /// port fails to commit the artifact + event atomically).
-    next_error: Mutex<Option<DomainError>>,
+    /// FIFO of injected errors: each `commit_transition` call pops the
+    /// front and returns it verbatim without recording the transition.
+    /// Used by tests exercising error-path metric emission (e.g.
+    /// `register_by_hash` must tick `hort_ingest_total{result="internal"}`
+    /// when the lifecycle port fails to commit the artifact + event
+    /// atomically). A queue rather than a single slot so tests can arm
+    /// N consecutive failures (the provenance cascade's
+    /// conflict-retry-conflict path needs two).
+    next_error: Mutex<std::collections::VecDeque<DomainError>>,
 }
 
 impl MockArtifactLifecycle {
@@ -2103,7 +2133,7 @@ impl MockArtifactLifecycle {
             score_deltas: Mutex::new(Vec::new()),
             sbom_replace_calls: Mutex::new(Vec::new()),
             ingest_enqueues: Mutex::new(Vec::new()),
-            next_error: Mutex::new(None),
+            next_error: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -2218,10 +2248,12 @@ impl MockArtifactLifecycle {
             .collect()
     }
 
-    /// Seed a single failure — the next `commit_transition` call returns
-    /// `Err(err)` and records no transition. Cleared after the call.
+    /// Queue a failure — the next `commit_transition` call pops it,
+    /// returns `Err(err)`, and records no transition. FIFO: call N
+    /// times to arm N consecutive failures (the provenance cascade's
+    /// conflict-retry-conflict path arms two); each is consumed once.
     pub fn fail_next_commit(&self, err: DomainError) {
-        *self.next_error.lock().unwrap() = Some(err);
+        self.next_error.lock().unwrap().push_back(err);
     }
 }
 
@@ -2232,7 +2264,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
     ) -> BoxFut<'_, DomainResult<AppendResult>> {
-        if let Some(err) = self.next_error.lock().unwrap().take() {
+        if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
         let count = events.events.len() as u64;
@@ -2274,7 +2306,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         Box::pin(async move {
             // Failure-injection up front (mirrors `commit_transition`), before
             // recording anything, so a forced error leaves no stray enqueue.
-            if let Some(err) = self.next_error.lock().unwrap().take() {
+            if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
             self.ingest_enqueues
@@ -2316,7 +2348,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         Box::pin(async move {
             // Replicate the failure check up front (mirrors the
             // legacy `commit_transition` path).
-            if let Some(err) = self.next_error.lock().unwrap().take() {
+            if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
             if let Some((repo_id, delta)) = score_delta {
@@ -2364,7 +2396,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         // Failure injection guard. Mirrors the `commit_transition`
         // path: the failure fires BEFORE any state is recorded, so a
         // forced error doesn't leave a stray entry in the snapshot.
-        if let Some(err) = self.next_error.lock().unwrap().take() {
+        if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
 
@@ -2619,6 +2651,11 @@ pub struct MockStoragePort {
     /// attempt rather than recovering on the second. Used to drive the
     /// post-proxy bundle re-read failure arm.
     inject_get_error: Mutex<std::collections::HashSet<ContentHash>>,
+    /// Counter incremented on every `get` call — regardless of hit or
+    /// miss. Tests that assert "this code path never reads CAS" (e.g.
+    /// the provenance cascade re-drive gate: a cascaded constituent's
+    /// skip-verify must not re-walk bytes) use [`get_call_count`].
+    get_calls: AtomicUsize,
     /// Counter incremented on every `delete` call — used by the
     /// declared-hash rollback tests to assert the
     /// rollback happened when no other row references the hash, and
@@ -2646,6 +2683,7 @@ impl MockStoragePort {
             tampered: Mutex::new(HashMap::new()),
             shard_truncations: Mutex::new(Vec::new()),
             put_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             deleted_hashes: Mutex::new(Vec::new()),
             backend_label: Mutex::new("memory"),
@@ -2768,6 +2806,14 @@ impl MockStoragePort {
         self.put_calls.load(Ordering::Relaxed)
     }
 
+    /// Number of times `get` has been invoked (hit or miss). Used by
+    /// tests asserting a code path performed NO CAS read — e.g. the
+    /// provenance cascade re-drive gate, where a cascaded constituent's
+    /// skip-verify must not re-walk its bytes.
+    pub fn get_call_count(&self) -> usize {
+        self.get_calls.load(Ordering::Relaxed)
+    }
+
     /// Number of times `delete` has been invoked. Used by declared-hash
     /// rollback tests to assert both positive
     /// (rollback happened) and negative (blob shared — rollback
@@ -2849,6 +2895,7 @@ impl StoragePort for MockStoragePort {
         &self,
         hash: &ContentHash,
     ) -> BoxFut<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
+        self.get_calls.fetch_add(1, Ordering::Relaxed);
         // A persistent get failure: when `hash`
         // is registered via `fail_get_persistent`, EVERY `get` for it
         // resolves `Err(NotFound)` (never consumed). This fails a

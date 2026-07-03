@@ -9,9 +9,10 @@
 # index-shaped push, so the gap shipped. This scenario is that missing gate:
 # it pushes a genuine multi-arch OCI image index and asserts the index PUT is
 # ACCEPTED, HEAD-by-index-digest works, the index is SERVED with the correct
-# index Content-Type, and — under a quarantine hold — the write-authorized
-# manifest HEAD is exempted (200) while the content GET stays held (503) and an
-# anonymous HEAD is held (503).
+# index Content-Type, and — under a quarantine hold — a write-authorized
+# manifest HEAD AND GET serve the held index (200, so keyed cosign can resolve
+# the index digest and sign it) while a held child LAYER BLOB stays 503 (the
+# real content gate) and an anonymous HEAD is held (503).
 #
 # Two hosted OCI repos, two phases:
 #
@@ -32,11 +33,14 @@
 #             Docker-Content-Digest header (a GET is 503 under the hold, so we
 #             cannot skopeo-inspect it — mirror the header trick the #14
 #             push-then-sign scenario uses).
-#        [B3] write-authorized HEAD-by-index-digest -> 200 (the existence-probe
+#        [B3] write-authorized HEAD-by-index-digest -> 200 (the hold-read
 #             exemption, so a signer's cosign preflight can resolve the index
 #             digest and attach a signature).
-#        [B4] write-authorized GET-by-index-digest -> 503 (the content hold is
-#             intact; the exemption released only the existence probe).
+#        [B4] write-authorized GET-by-index-digest -> 200 (ADR 0039 §10: keyed
+#             cosign resolves the subject by GET, so a write-authorized GET of a
+#             held index SERVES the index — it is metadata, not runnable bytes),
+#             AND a write-authorized GET of a held child LAYER BLOB -> 503 (the
+#             preserved content gate: layer bytes never leave quarantine).
 #        [B5] anonymous HEAD-by-index-digest -> 503 (the exemption is
 #             write-authorized only).
 #
@@ -204,8 +208,9 @@ else
 fi
 
 # ---- [B2] resolve the index digest via the write-authorized HEAD-by-tag ----
-# A GET/inspect is 503 under the hold, so use the Docker-Content-Digest of the
-# write-authorized HEAD-by-tag (the existence-probe exemption serves it).
+# Use the Docker-Content-Digest of the write-authorized HEAD-by-tag (the
+# hold-read exemption serves it). An anonymous GET/inspect is still 503 under
+# the hold; the HEAD-by-tag avoids depending on the write-auth GET here.
 HOLD_DIGEST="$(head_digest "$DEV_TOKEN" \
     "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/v0")"
 [ -n "$HOLD_DIGEST" ] || { fail "resolve index digest (${REPO_HOLD})" \
@@ -222,14 +227,69 @@ else
          "got HTTP ${B3_CODE} (the write-authorized manifest-HEAD exemption must report exists on a held INDEX, exactly as for a single manifest — the issue-#13 exemption on an index)"
 fi
 
-# ---- [B4] write-authorized GET-by-index-digest -> 503 (content hold) ----
-B4_CODE="$(code_of GET "$DEV_TOKEN" \
-    "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${HOLD_DIGEST}")"
-if [ "$B4_CODE" = "503" ]; then
-    pass "write-authorized GET /manifests/<index-digest> on HELD index -> 503 (content hold intact; only the existence probe was exempted)"
+# ---- [B4] write-authorized GET-by-index-digest -> 200 (hold-read exemption) ----
+# ADR 0039 §10: keyed cosign resolves the subject manifest by GET (not only
+# HEAD) before attaching the signature, so a write-authorized GET of a HELD
+# manifest/index now SERVES — the index is metadata (child digests), not
+# runnable content. The real content gate is the child LAYER BLOBS (checked
+# next), which stay HEAD-only.
+B4_HDRS="$(curl -sSI -H "Authorization: Bearer ${DEV_TOKEN}" \
+    -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
+    "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${HOLD_DIGEST}" 2>/dev/null | tr -d '\r')"
+B4_CODE="$(printf '%s\n' "$B4_HDRS" | awk 'NR==1{print $2}')"
+B4_CT="$(printf '%s\n' "$B4_HDRS" | awk -F': ' 'tolower($1)=="content-type"{print $2}')"
+if [ "$B4_CODE" = "200" ]; then
+    pass "write-authorized GET /manifests/<index-digest> on HELD index -> 200 (ADR 0039 §10 hold-read exemption; keyed cosign resolves the subject by GET, so a held index is signable)"
 else
-    fail "write-authorized GET on held index -> 503" \
-         "got HTTP ${B4_CODE} (the HEAD existence exemption must NEVER extend to the content GET, even for the write-authorized principal)"
+    fail "write-authorized GET on held index -> 200" \
+         "got HTTP ${B4_CODE} (ADR 0039 §10: a write-authorized GET of a held manifest/index must SERVE so keyed cosign can resolve the subject — the manifest is metadata, not runnable content)"
+fi
+case "$B4_CT" in
+    "$OCI_INDEX_MEDIA"|"$DOCKER_LIST_MEDIA")
+        pass "held index served to the write-authorized GET with the index Content-Type: ${B4_CT}" ;;
+    *)
+        fail "held index GET Content-Type" \
+             "served Content-Type '${B4_CT:-<none>}' is not an image-index media-type on the held-index GET (expected ${OCI_INDEX_MEDIA} or ${DOCKER_LIST_MEDIA})" ;;
+esac
+
+# ---- [B4b] write-authorized GET of a held child LAYER BLOB -> 503 (content gate) ----
+# The preserved safety boundary: serving the held index (metadata) must NEVER
+# extend to serving a held layer's bytes. Resolve a child manifest digest from
+# the served index, then a layer-blob digest from that child manifest (both are
+# served to the write-authorized GET under the exemption), then GET the blob —
+# which must stay 503 (blobs keep their HEAD-only probe, ADR 0039 §10).
+INDEX_JSON="$(curl -sS -H "Authorization: Bearer ${DEV_TOKEN}" \
+    -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
+    "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${HOLD_DIGEST}" 2>/dev/null || true)"
+CHILD_DIGEST="$(printf '%s' "$INDEX_JSON" | jq -r '.manifests[0].digest // empty' 2>/dev/null || true)"
+if [ -z "$CHILD_DIGEST" ]; then
+    fail "resolve child manifest digest from held index" \
+         "the served held-index body carried no .manifests[0].digest — cannot check the layer-blob content gate"
+    summary
+fi
+log "[B4b] child manifest digest = ${CHILD_DIGEST}"
+
+CHILD_MANIFEST_MEDIA="application/vnd.oci.image.manifest.v1+json"
+DOCKER_MANIFEST_MEDIA="application/vnd.docker.distribution.manifest.v2+json"
+CHILD_JSON="$(curl -sS -H "Authorization: Bearer ${DEV_TOKEN}" \
+    -H "Accept: ${CHILD_MANIFEST_MEDIA}, ${DOCKER_MANIFEST_MEDIA}" \
+    "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${CHILD_DIGEST}" 2>/dev/null || true)"
+# Prefer a layer blob; fall back to the config blob (both are held CAS bytes).
+BLOB_DIGEST="$(printf '%s' "$CHILD_JSON" | jq -r '(.layers[0].digest // .config.digest) // empty' 2>/dev/null || true)"
+if [ -z "$BLOB_DIGEST" ]; then
+    fail "resolve child layer/config blob digest" \
+         "the served child manifest carried no .layers[0].digest or .config.digest — cannot check the layer-blob content gate"
+    summary
+fi
+log "[B4b] child layer/config blob digest = ${BLOB_DIGEST}"
+
+B4B_CODE="$(code_of GET "$DEV_TOKEN" \
+    "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/blobs/${BLOB_DIGEST}")"
+if [ "$B4B_CODE" = "503" ]; then
+    pass "write-authorized GET /blobs/<child-layer-digest> on HELD image -> 503 (the layer-blob content gate holds; no runnable bytes leave quarantine)"
+else
+    fail "write-authorized GET of held child layer blob -> 503" \
+         "got HTTP ${B4B_CODE} (the manifest hold-read exemption must NEVER extend to a layer blob — layer bytes stay HEAD-only and held for every caller, ADR 0039 §10)"
 fi
 
 # ---- [B5] anonymous HEAD-by-index-digest -> 503 (exemption is write-only) ----

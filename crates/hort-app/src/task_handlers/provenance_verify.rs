@@ -123,6 +123,7 @@ fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
     match outcome {
         ProvenanceRunOutcome::SkippedOff => "skipped:off".to_string(),
         ProvenanceRunOutcome::SkippedNoVerifier => "skipped:no_verifier".to_string(),
+        ProvenanceRunOutcome::SkippedAlreadyCleared => "skipped:already_cleared".to_string(),
         ProvenanceRunOutcome::Applied { verdict, .. } => match verdict {
             ProvenanceVerdictSummary::Verified => "verified".to_string(),
             ProvenanceVerdictSummary::Rejected(reason) => {
@@ -409,6 +410,20 @@ mod tests {
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         };
         assert_eq!(result_summary_label(&outcome), "held_pending_signature");
+    }
+
+    /// An already-cleared artifact (its own earlier verification or a
+    /// cascaded clearance, ADR 0039 cascade) maps to the distinct
+    /// `skipped:already_cleared` label — the no-op the S4 expiry backstop
+    /// records instead of re-judging a cleared constituent. Pure-mapper
+    /// assertion; the skip path itself is covered by the orchestration
+    /// use-case tests.
+    #[test]
+    fn skipped_already_cleared_maps_to_result_summary_label() {
+        assert_eq!(
+            result_summary_label(&ProvenanceRunOutcome::SkippedAlreadyCleared),
+            "skipped:already_cleared"
+        );
     }
 
     /// Under `Off` the handler records `skipped:off` (defensive — the ingest

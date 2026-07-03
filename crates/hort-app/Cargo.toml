@@ -89,10 +89,9 @@ dashmap = { workspace = true }
 # graceful shutdown signalling and per-kind Semaphore for concurrency limits.
 tokio-util = { workspace = true }
 # `SecurityScoreUseCase` encodes the opaque
-# pagination cursor as URL-safe-no-pad base64 of a Uuid's 16 bytes.
-# Same major version `hort-http-cargo` pins for its sparse-index cache
-# envelope.
-base64 = "0.22"
+# pagination cursor as URL-safe-no-pad base64 of a Uuid's 16 bytes; the
+# provenance carriage decodes the keyed `simplesigning` signature annotation.
+base64 = { workspace = true }
 # The `MockKubernetesSecretWriter` constructs
 # `ManagedSecretSpec` instances, which carry the plaintext PAT in a
 # `Zeroizing<String>`. Both production callers (the rotation handler)

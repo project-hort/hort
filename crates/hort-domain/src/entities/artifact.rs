@@ -13,7 +13,9 @@ use crate::events::{
     ProvenanceRejected, ProvenanceVerified, RejectionReason, ReleaseReason, ScanIndeterminate,
 };
 use crate::policy::ScanOutcome;
-use crate::ports::provenance::{ProvenanceOutcome, ProvenanceRejectReason, ProvenanceVerdict};
+use crate::ports::provenance::{
+    ProvenanceOutcome, ProvenanceRejectReason, ProvenanceVerdict, SignerIdentity,
+};
 use crate::types::ContentHash;
 
 // ---------------------------------------------------------------------------
@@ -799,6 +801,10 @@ impl Artifact {
                     backend: backend.into(),
                     signer,
                     predicate_type,
+                    // A direct verification of this artifact's own
+                    // attestation — never a cascade (see
+                    // `cascade_provenance_clearance`).
+                    cascaded_from: None,
                 })))
             }
             ProvenanceOutcome::Rejected(reason) => {
@@ -840,6 +846,54 @@ impl Artifact {
                 ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => Ok(None),
             },
         }
+    }
+
+    /// Record a **cascaded** provenance clearance: this artifact is a
+    /// constituent of a verified subject whose signed bytes bind this
+    /// artifact's digest (ADR 0039 provenance-clearance cascade). cosign
+    /// signs only the top-level digest, but that digest cryptographically
+    /// covers the whole tree — an index's `manifests[]` digests are inside
+    /// the signed index bytes and a manifest's config/layer digests are
+    /// inside its bytes — so the signature over `cascaded_from` attests
+    /// exactly this artifact's content too.
+    ///
+    /// Returns the [`ProvenanceVerified`] event to append, carrying the
+    /// verified subject's hash in `cascaded_from` (the audit attribution:
+    /// "cleared via signature over `cascaded_from`") and the subject's
+    /// verified `signer`. Like the Verified arm of
+    /// [`Self::complete_provenance`], this is a **success record only** —
+    /// status is unchanged (`&self`, no mutation); the release sweep reads
+    /// the event's existence under `Required` and every other gate (scan,
+    /// observation window) stays per-artifact.
+    ///
+    /// Valid **only** from [`QuarantineStatus::Quarantined`] — the held,
+    /// pending-provenance state. Every other state refuses
+    /// (`Err(Invariant)`), fail-closed:
+    /// - `Rejected` / `ScanIndeterminate` — terminal is terminal; a
+    ///   cascade never resurrects a rejected constituent (the operator
+    ///   re-pushes instead);
+    /// - `Released` / `None` — outside the hold, nothing to clear.
+    pub fn cascade_provenance_clearance(
+        &self,
+        cascaded_from: ContentHash,
+        signer: SignerIdentity,
+        predicate_type: Option<String>,
+        backend: &str,
+    ) -> DomainResult<ProvenanceVerified> {
+        if self.quarantine_status != QuarantineStatus::Quarantined {
+            return Err(DomainError::Invariant(format!(
+                "cannot cascade provenance clearance to artifact in state {}",
+                self.quarantine_status
+            )));
+        }
+        Ok(ProvenanceVerified {
+            artifact_id: self.id,
+            content_hash: self.sha256_checksum.clone(),
+            backend: backend.into(),
+            signer,
+            predicate_type,
+            cascaded_from: Some(cascaded_from),
+        })
     }
 
     /// Terminal scan failure: the scanner could not decide. Fail-closed
@@ -2096,7 +2150,7 @@ mod tests {
         // release-sweep `Cleared` computation.
         for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Required] {
             let mut a = quarantined_artifact();
-            let signer = crate::ports::provenance::SignerIdentity {
+            let signer = SignerIdentity {
                 issuer: "https://token.actions.githubusercontent.com".into(),
                 san: "https://github.com/acme/repo/.github/workflows/release.yml@refs/heads/main"
                     .into(),
@@ -2280,13 +2334,95 @@ mod tests {
         }
     }
 
+    // -- cascade_provenance_clearance (ADR 0039 cascade) ---------------------
+
+    #[test]
+    fn cascade_provenance_clearance_from_quarantined_emits_attributed_event() {
+        // A held constituent takes the cascaded clearance: the returned
+        // ProvenanceVerified carries THIS artifact's identity/hash, the
+        // subject's verified signer, and the subject hash in
+        // `cascaded_from` (the "cleared via signature over <root>" audit
+        // attribution). `&self` — status untouched (success record only;
+        // the scan/window gates stay per-artifact).
+        let a = quarantined_artifact();
+        let subject: ContentHash =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        let signer = SignerIdentity {
+            issuer: "operator-pinned-key".into(),
+            san: "cosign-key".into(),
+        };
+        let ev = a
+            .cascade_provenance_clearance(
+                subject.clone(),
+                signer.clone(),
+                Some("https://sigstore.dev/cosign/sign/v1".into()),
+                "cosign-key",
+            )
+            .expect("Quarantined constituent takes the cascade");
+        assert_eq!(ev.artifact_id, a.id);
+        assert_eq!(ev.content_hash, a.sha256_checksum);
+        assert_eq!(ev.backend, "cosign-key");
+        assert_eq!(ev.signer, signer);
+        assert_eq!(
+            ev.predicate_type.as_deref(),
+            Some("https://sigstore.dev/cosign/sign/v1")
+        );
+        assert_eq!(
+            ev.cascaded_from,
+            Some(subject),
+            "the cascaded event must attribute the clearance to the verified subject digest"
+        );
+        assert_eq!(
+            a.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "a cascaded clearance is a success record only — status unchanged"
+        );
+    }
+
+    #[test]
+    fn cascade_provenance_clearance_refuses_every_non_quarantined_state() {
+        // Fail-closed edges: terminal states stay terminal (Rejected /
+        // ScanIndeterminate are never resurrected by a cascade) and
+        // Released / None are outside the hold — all four refuse.
+        let subject: ContentHash =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        let signer = SignerIdentity {
+            issuer: "iss".into(),
+            san: "san".into(),
+        };
+        for status in [
+            QuarantineStatus::None,
+            QuarantineStatus::Released,
+            QuarantineStatus::Rejected,
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let mut a = sample_artifact();
+            a.quarantine_status = status;
+            let err = a
+                .cascade_provenance_clearance(subject.clone(), signer.clone(), None, "cosign-key")
+                .expect_err("only a held (Quarantined) constituent takes a cascaded clearance");
+            assert!(
+                matches!(err, DomainError::Invariant(_)),
+                "expected Invariant for {status}, got {err:?}"
+            );
+            assert_eq!(
+                a.quarantine_status, status,
+                "the refusal must not mutate state"
+            );
+        }
+    }
+
     #[test]
     fn complete_provenance_verified_from_none_permissive_mode_status_unchanged() {
         // Permissive (quarantineDuration:0) ingest sits at None; a Verified
         // verdict is a success record that does not move state.
         let mut a = sample_artifact();
         assert_eq!(a.quarantine_status, QuarantineStatus::None);
-        let signer = crate::ports::provenance::SignerIdentity {
+        let signer = SignerIdentity {
             issuer: "iss".into(),
             san: "san".into(),
         };

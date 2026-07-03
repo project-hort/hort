@@ -17,5 +17,6 @@ pub mod events;
 pub mod oci;
 pub mod policy;
 pub mod ports;
+pub mod provenance_bundle;
 pub mod retention;
 pub mod types;

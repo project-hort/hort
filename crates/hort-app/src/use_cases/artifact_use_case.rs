@@ -670,6 +670,51 @@ impl ArtifactUseCase {
         Ok((artifact, stream))
     }
 
+    /// Stream a **quarantined** artifact's CAS bytes for an authorized
+    /// hold-read (the push-then-sign manifest-GET exemption, ADR 0039 §10).
+    ///
+    /// [`Self::download`] refuses a non-[`is_downloadable`](Artifact::is_downloadable)
+    /// artifact (a held `Quarantined` manifest fails that gate), so it cannot
+    /// serve the held subject a keyed `cosign sign` resolves by `GET` before
+    /// attaching the signature. This method streams the CAS bytes for a
+    /// `Quarantined` artifact **only** — every other status (including
+    /// `Rejected`) is `Forbidden`, so a rejected manifest is never served and
+    /// a released artifact goes through the audited [`Self::download`] path.
+    ///
+    /// The caller (the OCI manifest handler) has already proven the read is
+    /// write-authorized and the artifact is a manifest, not a layer blob; this
+    /// method is the CAS-read half of that exemption and does not itself
+    /// re-authorize. It emits no download-audit event: a hold-read for signing
+    /// is a signer's metadata resolve, not a served download.
+    #[tracing::instrument(skip(self))]
+    pub async fn download_hold_read(
+        &self,
+        artifact_id: Uuid,
+    ) -> AppResult<(Artifact, Box<dyn AsyncRead + Send + Unpin>)> {
+        let artifact = self.artifacts.find_by_id(artifact_id).await?;
+        if !matches!(artifact.quarantine_status, QuarantineStatus::Quarantined) {
+            return Err(AppError::Domain(DomainError::Forbidden(format!(
+                "artifact {} is not a held manifest hold-read (status: {})",
+                artifact_id, artifact.quarantine_status
+            ))));
+        }
+        let stream = self
+            .storage
+            .get(&artifact.sha256_checksum)
+            .await
+            .map_err(|e| AppError::Storage(e.to_string()))?;
+        // Security-relevant audit signal: a quarantined manifest's bytes
+        // left the hold under the write-authorized exemption. `info!`
+        // (not an event) — the documented no-`ArtifactDownloaded` choice
+        // stands: a hold-read for signing is a signer's metadata resolve,
+        // not a served download.
+        tracing::info!(
+            artifact_id = %artifact.id,
+            "held manifest served under write-authorized hold-read",
+        );
+        Ok((artifact, stream))
+    }
+
     /// Visible variant of [`Self::list_by_raw_name_limited`]. Resolves
     /// the repo with Read visibility first, then runs the same drift-
     /// resilient raw-name lookup. npm packument is the primary caller
@@ -2949,6 +2994,116 @@ mod visibility_extension_tests {
 
         let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
         match uc.download_range(a_id, ByteRange::From { start: 0 }).await {
+            Err(AppError::Storage(_)) => {}
+            Err(other) => panic!("expected Storage, got: {other:?}"),
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    // -- download_hold_read (push-then-sign manifest-GET exemption) --------
+
+    /// A `Quarantined` artifact streams its CAS bytes — this is the whole
+    /// point of the exemption: keyed `cosign sign` resolves the held subject
+    /// manifest by GET, and `download` refuses it (`is_downloadable()` is
+    /// false), so `download_hold_read` is the CAS-read half that serves it.
+    #[tokio::test]
+    async fn download_hold_read_quarantined_serves_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let hash: ContentHash = VALID_SHA256.parse().unwrap();
+        storage.insert_content(hash, b"held manifest bytes".to_vec());
+
+        let mut a = artifact_in_repo(Uuid::new_v4(), "manifests/sha256:x", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(Utc::now());
+        let a_id = a.id;
+        artifacts.insert(a);
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        let (got_a, mut stream) = uc.download_hold_read(a_id).await.unwrap();
+        assert_eq!(got_a.id, a_id);
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"held manifest bytes");
+    }
+
+    /// Fail-closed: a non-`Quarantined` status is `Forbidden` on the hold-read
+    /// path. `None` / `Released` artifacts go through the audited `download`;
+    /// a `Rejected` manifest must NEVER be served — the exemption is strictly a
+    /// held-manifest-signing read.
+    #[tokio::test]
+    async fn download_hold_read_non_quarantined_is_forbidden() {
+        for status in [
+            QuarantineStatus::None,
+            QuarantineStatus::Released,
+            QuarantineStatus::Rejected,
+        ] {
+            let artifacts = Arc::new(MockArtifactRepository::new());
+            let storage = Arc::new(MockStoragePort::new());
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+            let hash: ContentHash = VALID_SHA256.parse().unwrap();
+            storage.insert_content(hash, b"bytes".to_vec());
+
+            let mut a = artifact_in_repo(Uuid::new_v4(), "p", VALID_SHA256);
+            a.quarantine_status = status;
+            if status == QuarantineStatus::Rejected {
+                a.quarantine_window_start = Some(Utc::now());
+            }
+            let a_id = a.id;
+            artifacts.insert(a);
+
+            let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+            match uc.download_hold_read(a_id).await {
+                Err(AppError::Domain(DomainError::Forbidden(_))) => {}
+                Err(other) => panic!("expected Forbidden for {status:?}, got: {other:?}"),
+                Ok(_) => panic!("expected Err for {status:?}, got Ok"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn download_hold_read_missing_artifact_is_not_found() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        match uc.download_hold_read(Uuid::new_v4()).await {
+            Err(AppError::Domain(DomainError::NotFound {
+                entity: "Artifact", ..
+            })) => {}
+            Err(other) => panic!("expected NotFound(Artifact), got: {other:?}"),
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    /// A quarantined artifact whose CAS bytes are absent surfaces the
+    /// storage-port error as [`AppError::Storage`] — covers the `.map_err`
+    /// arm on the `get` call.
+    #[tokio::test]
+    async fn download_hold_read_storage_error_surfaces_as_storage() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        // No content seeded — `get` returns NotFound.
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let mut a = artifact_in_repo(Uuid::new_v4(), "p", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(Utc::now());
+        let a_id = a.id;
+        artifacts.insert(a);
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        match uc.download_hold_read(a_id).await {
             Err(AppError::Storage(_)) => {}
             Err(other) => panic!("expected Storage, got: {other:?}"),
             Ok(_) => panic!("expected Err"),

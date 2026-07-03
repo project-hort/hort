@@ -4,8 +4,9 @@
 - **Relates to:** [0007](0007-fail-closed-quarantine-release-predicate.md) (the
   fail-closed release predicate the layer-level-safety rationale rests on),
   [0027](0027-artifact-provenance-verification.md) /
-  [0039](0039-keyed-provenance-verification.md) (the issue-#13 hold + the
-  write-authorized-HEAD exemption the push-then-sign payoff reuses),
+  [0039](0039-keyed-provenance-verification.md) (the provenance hold + the
+  write-authorized manifest HEAD-and-GET exemption the push-then-sign payoff
+  reuses),
   [0008](0008-per-format-adapter-free-http-crates.md) (the index PUT writes its
   membership rows through the content-reference use case, adapter-free).
 - **Closes:** issue #15 — accept, store, quarantine, serve, and sign OCI image
@@ -88,6 +89,23 @@ at the index. The ADR 0007 fail-closed release predicate is satisfied **per
 artifact** — the index's own release still requires its own scan success /
 waiver (plus provenance clearance under `required`), exactly like any manifest.
 
+**Provenance-cascade interaction (ADR 0039 §11).** The per-artifact model has
+one deliberate exception on the *provenance* axis: cosign signs only the index
+digest, so a child manifest or config/layer blob can never carry its own
+signature — under `provenanceMode: required` the per-artifact provenance gate
+alone would terminally reject every constituent of a validly signed image and
+leave the released index unpullable. When the index's signature **verifies**,
+the provenance clearance therefore cascades to the constituents derived from
+the verified index bytes (the child digests are inside the signed index bytes;
+each child's config/layer digests are inside its manifest bytes — the signature
+over the root covers them all), recorded per constituent as a
+`ProvenanceVerified` attributed via `cascaded_from` to the root digest. **Only
+the provenance conjunct cascades**: each child and blob still needs its own
+scan success / waiver and its own observation window to release, so the
+layer-level-safety model above is unchanged — a scan-rejected layer under a
+signed, released index still 404s, and a never-signed index's constituents
+still reject `Unsigned` at window expiry.
+
 ## Consequences
 
 - **`content_references` is now the proper many-to-many.** The four existing
@@ -104,12 +122,16 @@ waiver (plus provenance clearance under `required`), exactly like any manifest.
 - **Push-then-sign works for index-shaped images.** cosign signs the **index**
   digest → the signature manifest's `subject.digest` is the index digest → the
   existing `oci_subject` + provenance-verify path targets the index artifact
-  unchanged. Under a quarantine hold, the write-authorized-HEAD exemption (issue
-  #13, `write_authorized_existence_probe` in `manifests.rs`) makes the held index
-  **signable**: a `Write`-authorized `HEAD` on the index digest returns 200 so a
-  signer's cosign preflight resolves the digest and attaches the signature, while
-  the content `GET` stays 503 and an anonymous `HEAD` stays 503. This is what
-  actually unblocks the operator's real flow for multi-arch pushes.
+  unchanged. Under a quarantine hold, the write-authorized manifest hold-read
+  exemption (ADR 0039 §10, `write_authorized_hold_read` in `manifests.rs`) makes
+  the held index **signable**: a `Write`-authorized `HEAD` *and* `GET` on the
+  index digest return 200/serve so a signer's keyed cosign resolves the index
+  digest (cosign resolves the subject by GET, not only HEAD) and attaches the
+  signature, while the child layer blobs stay 503 (HEAD-only probe in
+  `blobs.rs`) and a non-writer / anonymous read stays 503. An index is metadata
+  (child digests), not runnable content, so serving it to the signer leaks no
+  runnable bytes. This is what actually unblocks the operator's real flow for
+  multi-arch pushes.
 
 - **Deferred enhancement — child-status rollup:** v1 does **not** gate the
   index's served visibility on its children's quarantine state (layer-level
@@ -163,13 +185,14 @@ waiver (plus provenance clearance under `required`), exactly like any manifest.
 - [ADR 0007](0007-fail-closed-quarantine-release-predicate.md) — the fail-closed
   release predicate satisfied per-artifact.
 - [ADR 0027](0027-artifact-provenance-verification.md) /
-  [ADR 0039](0039-keyed-provenance-verification.md) — the issue-#13 hold +
-  write-authorized-HEAD exemption the push-then-sign payoff reuses.
+  [ADR 0039](0039-keyed-provenance-verification.md) — the provenance hold +
+  write-authorized manifest HEAD-and-GET exemption (§10) the push-then-sign
+  payoff reuses.
 - Migration `013_content_references_multivalue_pk.sql` — the widened PK.
 - The `oci_index_member` kind vocabulary in
   `crates/hort-domain/src/ports/content_reference_index.rs`.
 - E2E regression gate:
   `scripts/native-tests/scenarios/quarantine/oci-image-index.sh` (multi-arch
   push accepted, index served with the index Content-Type, and — under a hold —
-  the write-authorized manifest HEAD exempted while content GET / anonymous HEAD
-  stay 503).
+  a write-authorized manifest HEAD and GET serve the held index while a held
+  child layer blob and an anonymous HEAD stay 503).

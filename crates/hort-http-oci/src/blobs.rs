@@ -1605,10 +1605,15 @@ mod tests {
         );
     }
 
-    /// Security scope guard: the exception is HEAD-only. A write-authorized
-    /// caller's content GET of a quarantined blob still 503s — the quarantine
-    /// DOWNLOAD block (invariant #1) holds even for the pusher; only the
-    /// existence probe is released, never the held bytes.
+    /// Security scope guard — the load-bearing content gate (ADR 0039). A
+    /// write-authorized caller's content GET of a quarantined LAYER BLOB still
+    /// 503s: the blob existence probe is HEAD-only. This is the safety boundary
+    /// the widened manifest exemption relies on — `manifests.rs` now serves a
+    /// held MANIFEST to a write-authorized GET (so keyed cosign can sign it),
+    /// but a manifest is only metadata (config + layer digests). The runnable
+    /// bytes are these layer blobs, and they stay held for every caller —
+    /// including the write-authorized pusher — so no runnable content ever
+    /// leaves quarantine and the image cannot be pulled or run while held.
     #[test]
     fn get_blob_quarantined_write_authorized_caller_still_returns_503() {
         let status = quarantined_blob_serve_status(/* head = */ false, Some("ci-pusher"));
