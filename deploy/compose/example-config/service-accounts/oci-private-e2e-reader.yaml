@@ -1,0 +1,22 @@
+# ServiceAccount (e2e): the native-token-mode reader for the challenge-flow
+# assertions in scripts/native-tests/scenarios/clients/oci-private-pull.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation): under the
+# native-tokens compose overlay, the scenario admin-mints an hort_svc_* token
+# for this SA (`POST /api/v1/admin/users/:id/tokens`) and drives the REAL OCI
+# `/v2/auth` token dance with it (Basic <svc-token> -> Bearer <jwt> -> 200).
+# A native token needs this dedicated serviceAccount-subject grant because the
+# existing reader-user's authority (auth/reader-read-oci-private-e2e.yaml) is
+# a claims subject: the OCI capability-token surface resolves User-subject
+# grants only (claims stay empty for a PAT-authenticated principal, ADR
+# 0036), so that claims-based grant can never back a native-token principal
+# (mirrors the provenance-ci SA's rationale). Inert in legacy (no-overlay)
+# runs: the SA row exists, nothing mints for it — the scenario's Basic-mode
+# branch reuses the existing reader-user OIDC credential instead, because the
+# native /v2/auth mint validates the Basic password strictly as a PAT and an
+# IdP JWT can never complete it either way.
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: oci-private-e2e-reader
+spec: {}

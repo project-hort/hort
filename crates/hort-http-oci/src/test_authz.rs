@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use axum::http::{header, StatusCode};
+use axum::response::Response;
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -95,6 +97,140 @@ pub(crate) fn user_grant_ctx(
         })
         .collect();
     rbac_grant_ctx(base, repositories, grants)
+}
+
+/// RBAC-enabled context with **no** grants: every actor — anonymous OR
+/// authenticated — is denied `Read`, so a repo resolve collapses to
+/// `NotFound`. The read-denial cutover suites use it to exercise both
+/// branches of `read_denied_response` (anonymous → 401 challenge,
+/// authenticated → `NAME_UNKNOWN` 404). No OCI signing key is wired, so
+/// the anonymous challenge is the legacy `Basic realm="hort"` form.
+pub(crate) fn denied_ctx(
+    base: &Arc<AppContext>,
+    repositories: Arc<MockRepositoryRepository>,
+) -> Arc<AppContext> {
+    rbac_grant_ctx(base, repositories, Vec::new())
+}
+
+/// [`denied_ctx`] with the OCI signing key + public base URL wired, so
+/// the anonymous challenge selector emits the native-token Bearer form
+/// (`realm="https://registry.example.com/v2/auth"`).
+pub(crate) fn denied_ctx_bearer(
+    base: &Arc<AppContext>,
+    repositories: Arc<MockRepositoryRepository>,
+) -> Arc<AppContext> {
+    use hort_app::oci_token_signing::OciTokenSigningKey;
+    use hort_http_core::test_support::{with_oci_public_base_url, with_oci_signing_key};
+
+    let ctx = denied_ctx(base, repositories);
+    let sk = OciTokenSigningKey::new(
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+        None,
+    );
+    let ctx = with_oci_signing_key(&ctx, Some(Arc::new(sk)));
+    with_oci_public_base_url(&ctx, Some("https://registry.example.com".to_string()))
+}
+
+/// An authenticated principal with no backing grants — denied `Read`
+/// under [`denied_ctx`], so a repo resolve `NotFound`s and the handler
+/// takes the authenticated (`NAME_UNKNOWN` 404) branch rather than the
+/// anonymous-challenge branch.
+pub(crate) fn grantless_principal() -> CallerPrincipal {
+    CallerPrincipal {
+        user_id: Uuid::new_v4(),
+        external_id: "test:denied".into(),
+        username: "denied-user".into(),
+        email: "denied@example.com".into(),
+        claims: Vec::new(),
+        token_kind: None,
+        issued_at: Utc::now(),
+        token_cap: None,
+    }
+}
+
+/// Assert a repo-level read-denial response is the anonymous legacy-Basic
+/// challenge: 401 + `Basic realm="hort"` + the `Docker-Distribution-API-Version`
+/// header (Basic-branch parity). Header-only, so the body stays available.
+pub(crate) fn assert_basic_challenge(resp: &Response) {
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        r#"Basic realm="hort""#
+    );
+    assert_eq!(
+        resp.headers()
+            .get("docker-distribution-api-version")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "registry/2.0"
+    );
+}
+
+/// Assert a repo-level read-denial response is the anonymous native-token
+/// Bearer challenge (`realm=…/v2/auth`, path-derived `scope=`) with the
+/// API-version header. `expected_scope` is the full `scope="…"` fragment.
+pub(crate) fn assert_bearer_challenge(resp: &Response, expected_scope: &str) {
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let www = resp
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(www.starts_with("Bearer "), "{www}");
+    assert!(
+        www.contains(r#"realm="https://registry.example.com/v2/auth""#),
+        "{www}"
+    );
+    assert!(www.contains(expected_scope), "{www}");
+    assert_eq!(
+        resp.headers()
+            .get("docker-distribution-api-version")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "registry/2.0"
+    );
+}
+
+/// Assert an authenticated-denial response is the unchanged
+/// `NAME_UNKNOWN` 404 anti-enumeration envelope (no challenge). Consumes
+/// the response body.
+pub(crate) async fn assert_name_unknown_404(resp: Response) {
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
+    let body = axum::body::to_bytes(resp.into_body(), 8 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+}
+
+/// Byte-comparable snapshot of a denial response — (status, challenge,
+/// API-version, body) — for the anti-enumeration uniformity assertion
+/// (nonexistent vs existing-private must be byte-identical).
+pub(crate) async fn denial_snapshot(
+    resp: Response,
+) -> (StatusCode, Option<String>, Option<String>, Vec<u8>) {
+    let status = resp.status();
+    let www = resp
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .map(|v| v.to_str().unwrap().to_string());
+    let api = resp
+        .headers()
+        .get("docker-distribution-api-version")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = axum::body::to_bytes(resp.into_body(), 8 * 1024)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, www, api, body)
 }
 
 /// A capability-token-shaped principal: the shape

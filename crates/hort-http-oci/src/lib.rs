@@ -787,9 +787,16 @@ mod tests {
         assert!(link.contains("last=b"));
     }
 
+    /// Missing repo, ANONYMOUS caller through the real bearer middleware
+    /// under `AuthContext::Disabled` (harness default, no signing key) → the
+    /// `NAME_UNKNOWN` 404 anti-enum envelope with NO challenge. Disabled mode
+    /// suppresses the unsatisfiable `/v2/auth` challenge (see
+    /// `read_denied_response`'s Disabled carve-out, mirroring the `GET /v2/`
+    /// probe); the production-mode 401 challenge is pinned by the `Enabled`
+    /// `denied_ctx`/`denied_ctx_bearer` suites (tags/manifests/blobs/etc.).
     #[test]
-    fn tags_list_missing_repo_returns_404_name_unknown() {
-        let (status, body) = run(async {
+    fn tags_list_missing_repo_anonymous_disabled_mode_returns_404() {
+        let (status, www) = run(async {
             let h = harness();
             let router =
                 oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
@@ -802,12 +809,14 @@ mod tests {
                 .await
                 .unwrap();
             let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            let www = resp
+                .headers()
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap().to_string());
+            (status, www)
         });
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+        assert_eq!(www, None, "Disabled denial carries no challenge");
     }
 
     /// Build an `Arc<AppContext>` whose auth+access use case are flipped
@@ -860,11 +869,14 @@ mod tests {
         with_repository_access(&ctx, access)
     }
 
-    /// Visibility regression guard (ADR 0008): anonymous tags-list on a
-    /// private repo MUST be 404 NAME_UNKNOWN.
+    /// Read-denial challenge (D1/D2, ADR 0021): anonymous tags-list on a
+    /// private repo through the real bearer middleware (`Enabled` auth,
+    /// empty RBAC, no signing key) → 401 + legacy Basic challenge. Private
+    /// and nonexistent are indistinguishable to the anonymous prober — both
+    /// now 401 (the pre-challenge behavior was a uniform 404).
     #[test]
-    fn anonymous_tags_list_on_private_repo_returns_404_name_unknown() {
-        let (status, body) = run(async {
+    fn anonymous_tags_list_on_private_repo_challenges_basic() {
+        let (status, www) = run(async {
             let h = harness();
             let repo = oci_repo("private-repo", false);
             h.repositories.insert(repo);
@@ -880,26 +892,29 @@ mod tests {
                 .await
                 .unwrap();
             let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            let www = resp
+                .headers()
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap().to_string());
+            (status, www)
         });
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "anonymous tags list on private OCI repo MUST be 404"
+            StatusCode::UNAUTHORIZED,
+            "anonymous tags list on private OCI repo must be challenged, not anti-enumerated"
         );
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+        assert_eq!(www.as_deref(), Some(r#"Basic realm="hort""#));
     }
 
-    /// Visibility regression guard (ADR 0008): anonymous referrers query
-    /// on a private repo MUST be 404 NAME_UNKNOWN. Without the visibility
-    /// check, the existing referrers spec rule "empty result returns 200"
-    /// would leak the existence of the repo to anonymous probers.
+    /// Read-denial challenge (D1/D2, ADR 0021): anonymous referrers query
+    /// on a private repo → 401 + Basic challenge. Without the repo-level
+    /// visibility gate the referrers "empty result returns 200" rule would
+    /// leak the repo's existence to an anonymous prober; the challenge keeps
+    /// private and nonexistent indistinguishable (both 401).
     #[test]
-    fn anonymous_referrers_on_private_repo_returns_404_name_unknown() {
+    fn anonymous_referrers_on_private_repo_challenges_basic() {
         let valid_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let (status, body) = run(async {
+        let (status, www) = run(async {
             let h = harness();
             let repo = oci_repo("private-repo", false);
             h.repositories.insert(repo);
@@ -912,26 +927,30 @@ mod tests {
                 .await
                 .unwrap();
             let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            let www = resp
+                .headers()
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap().to_string());
+            (status, www)
         });
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "anonymous referrers on private OCI repo MUST be 404"
+            StatusCode::UNAUTHORIZED,
+            "anonymous referrers on private OCI repo must be challenged, not anti-enumerated"
         );
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+        assert_eq!(www.as_deref(), Some(r#"Basic realm="hort""#));
     }
 
-    /// Visibility regression guard (ADR 0008): anonymous referrers on a
-    /// private repo MUST still be 404 NAME_UNKNOWN through the
-    /// `find_by_visible_target` use-case path. Pins that the composition
-    /// didn't open a new anti-enumeration gap.
+    /// Read-denial challenge (D1/D2, ADR 0021): anonymous referrers on a
+    /// private repo with a seeded content-reference row is still denied
+    /// through the `find_by_visible_target` use-case path — now 401 +
+    /// Basic challenge, byte-identical to the missing-repo case (the
+    /// visibility gate fires before any row is returned). Pins that the
+    /// composition didn't open a new anti-enumeration gap.
     #[test]
-    fn anonymous_referrers_on_private_repo_returns_404_after_use_case_migration() {
+    fn anonymous_referrers_on_private_repo_challenges_basic_after_use_case_migration() {
         let valid_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let (status, body) = run(async {
+        let (status, www, body) = run(async {
             let h = harness();
             let repo = oci_repo("private-repo", false);
             let repo_id = repo.id;
@@ -965,21 +984,24 @@ mod tests {
                 .await
                 .unwrap();
             let status = resp.status();
+            let www = resp
+                .headers()
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap().to_string());
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            (status, www, body)
         });
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "anonymous referrers on private OCI repo MUST be 404 even with seeded rows (ADR 0008)"
+            StatusCode::UNAUTHORIZED,
+            "anonymous referrers on private OCI repo must be challenged even with seeded rows (ADR 0021)"
         );
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+        assert_eq!(www.as_deref(), Some(r#"Basic realm="hort""#));
         // The handler's emitted body MUST be byte-identical to the
         // missing-repo case — that is what an enumeration probe would
         // diff against.
         let body_text = String::from_utf8_lossy(&body);
-        assert!(body_text.contains("NAME_UNKNOWN"));
+        assert!(body_text.contains("UNAUTHORIZED"));
     }
 
     // ---------------- Per-repo catalog ----------------

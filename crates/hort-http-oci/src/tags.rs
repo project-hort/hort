@@ -19,7 +19,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use serde::Deserialize;
 use urlencoding::encode as urlencode;
 
@@ -28,7 +28,6 @@ use hort_app::use_cases::repository_access::AccessLevel;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 
-use super::error::OciError;
 use hort_http_core::context::AppContext;
 
 /// Query parameters for tags list + catalog endpoints. Both surfaces
@@ -68,10 +67,17 @@ pub async fn serve(
     {
         Ok(r) => r,
         Err(AppError::Domain(DomainError::NotFound { .. })) => {
-            return OciError::NameUnknown {
-                repository: repo_key.to_string(),
-            }
-            .into_response();
+            // Repo-level read denial: 401 + mode-aware challenge for an
+            // anonymous caller, NAME_UNKNOWN 404 anti-enumeration for an
+            // authenticated one (D1/D2, ADR 0021).
+            let path = format!("/v2/{repo_key}/{name}/tags/list");
+            return crate::middleware::oci_auth::read_denied_response(
+                &ctx,
+                actor,
+                &axum::http::Method::GET,
+                &path,
+                repo_key,
+            );
         }
         Err(e) => {
             tracing::error!(
@@ -185,10 +191,118 @@ mod tests {
 
     // ---------------- Handler-level ----------------
     //
-    // The handler-level tests (happy path, saturated Link header,
-    // missing repo → NAME_UNKNOWN) live alongside the router-level
-    // tests in `handlers/oci/mod.rs::tests` after the dispatcher is
-    // wired — they drive the `/v2/:repo_key/*tail` route end-to-end
-    // via `oneshot`. Keeping them there prevents re-building the
-    // `AppContext` harness in every submodule.
+    // The happy-path / saturated-Link-header / router-level tests live
+    // alongside the dispatcher in `lib.rs::tests` (they drive the
+    // `/v2/:repo_key/*tail` route end-to-end via `oneshot`). The
+    // read-denial representation (D1/D2) is exercised here by calling
+    // `serve` directly with an explicit `actor`.
+
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    use hort_app::use_cases::test_support::sample_repository;
+    use hort_domain::entities::repository::{Repository, RepositoryFormat};
+    use hort_http_core::test_support::build_mock_ctx;
+
+    fn run<F, T>(f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn oci_repo(key: &str) -> Repository {
+        let mut r = sample_repository();
+        r.key = key.into();
+        r.format = RepositoryFormat::Oci;
+        r
+    }
+
+    /// Repo-level read denial (D1/D2, ADR 0021): an anonymous tags-list on
+    /// a denied repo is challenged with 401 + the mode-aware
+    /// `WWW-Authenticate` in BOTH signing-key states; an
+    /// authenticated-but-unauthorized caller keeps the `NAME_UNKNOWN` 404
+    /// anti-enumeration envelope.
+    #[test]
+    fn tags_read_denial_challenges_anonymous_and_404s_authenticated() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (base, mocks) = build_mock_ctx(handle);
+            // (1) anonymous, signing key UNWIRED → 401 Basic.
+            crate::test_authz::assert_basic_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx(&base, mocks.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    PageQuery::default(),
+                    None,
+                )
+                .await,
+            );
+            // (2) anonymous, signing key WIRED → 401 Bearer /v2/auth.
+            crate::test_authz::assert_bearer_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx_bearer(&base, mocks.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    PageQuery::default(),
+                    None,
+                )
+                .await,
+                r#"scope="repository:ghost/library/nginx:pull""#,
+            );
+            // (3) authenticated but unauthorized → 404 NAME_UNKNOWN.
+            let principal = crate::test_authz::grantless_principal();
+            crate::test_authz::assert_name_unknown_404(
+                serve(
+                    crate::test_authz::denied_ctx(&base, mocks.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    PageQuery::default(),
+                    Some(&principal),
+                )
+                .await,
+            )
+            .await;
+        });
+    }
+
+    /// Anti-enumeration equivalence (ADR 0021): anonymous denial for a
+    /// NONEXISTENT repo is byte-identical to one for an EXISTING PRIVATE
+    /// repo (Basic mode → no `scope=`).
+    #[test]
+    fn tags_anonymous_denial_uniform_nonexistent_vs_private() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (base, mocks) = build_mock_ctx(handle);
+            let mut priv_repo = oci_repo("private-repo");
+            priv_repo.is_public = false;
+            mocks.repositories.insert(priv_repo);
+            let ctx = crate::test_authz::denied_ctx(&base, mocks.repositories.clone());
+            let nonexistent = serve(
+                ctx.clone(),
+                "ghost",
+                "library/nginx",
+                PageQuery::default(),
+                None,
+            )
+            .await;
+            let private = serve(
+                ctx,
+                "private-repo",
+                "library/nginx",
+                PageQuery::default(),
+                None,
+            )
+            .await;
+            assert_eq!(
+                crate::test_authz::denial_snapshot(nonexistent).await,
+                crate::test_authz::denial_snapshot(private).await,
+                "anonymous nonexistent vs existing-private must be byte-identical"
+            );
+        });
+    }
 }

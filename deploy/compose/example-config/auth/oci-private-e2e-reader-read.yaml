@@ -1,0 +1,17 @@
+# PermissionGrant: serviceAccount oci-private-e2e-reader -> read oci-private-e2e.
+#
+# Backs the native-tokens-overlay branch of the challenge-flow assertions in
+# scripts/native-tests/scenarios/clients/oci-private-pull.sh: without this
+# grant the SA's admin-minted hort_svc_* token would carry an empty access[]
+# on a pull-scoped /v2/auth request (the repo is isPublic: false). Read-only
+# by design — the scenario never pushes with this identity.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: oci-private-e2e-reader-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-private-e2e-reader
+  permission: read
+  repository: oci-private-e2e
