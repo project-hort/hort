@@ -7,19 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- The OCI quarantine hold-read exemption (held-manifest HEAD/GET, held-blob
-  HEAD existence probe) keys on the principal's granted write authority — the
-  grants leg alone — rather than the presented token's cap. Standard OCI
-  clients scope a subject read as `pull`, so under native tokens cosign's
-  subject read rides a read-only capability JWT; that read now serves the held
-  subject instead of 503-aborting the signing flow. The read itself stays
-  cap-gated; a bounded, documented exception to the ADR 0036 cap-intersection
-  invariant (ADR 0039 §10). The push-then-sign E2E gains a native-token-mode
-  run where cosign's subject read rides a pull-scoped capability token.
-  (issue #13)
-
 ## [0.9.8] - 2026-07-03
 
 Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
@@ -82,6 +69,18 @@ per-`(repo, principal)` OCI **upload-session cap**.
 
 ### Fixed
 
+- **The quarantine hold-read exemption keys on the principal's granted write
+  authority, so native-token cosign signing completes.** The exemption
+  (held-manifest HEAD/GET, held-blob HEAD existence probe) resolved `Write`
+  through the grants leg **and** the presented token's cap. Standard OCI
+  clients scope a subject read as `pull`, so under native tokens cosign's
+  subject read rides a read-only capability token and the cap leg failed the
+  exemption's `Write` check — the held-manifest GET `503`d and `cosign sign`
+  aborted. The exemption now consults the grants leg alone (the read itself
+  stays cap-gated); a bounded, documented exception to the ADR 0036
+  cap-intersection invariant (ADR 0039 §10), with the fail-closed admin-claim
+  guard preserved. The push-then-sign E2E gains a native-token-mode run where
+  cosign's subject read rides a pull-scoped capability token. (issue #13)
 - **The `GET /v2/` auth-discovery probe advertises the Bearer `/v2/auth`
   challenge when native tokens are enabled.** The probe hardcoded
   `WWW-Authenticate: Basic realm="hort"`, so OCI clients (skopeo, docker,
