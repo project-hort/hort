@@ -71,7 +71,11 @@ public URL needs no such override.
 - `--scenario <n>` (repeatable) — a bare name (`pypi`) or `group/name`
   (`clients/pypi`).
 - `--compose-overlay <o>` (repeatable) — layer `deploy/compose/docker-compose.<o>.yml`
-  and provide its token (`federation`).
+  and provide its token (`federation`, `native-tokens`). The runner also exports
+  the active overlay names to scenarios as `HORT_COMPOSE_OVERLAYS`, so a
+  scenario can adapt to a reconfigured stack (the provenance push-then-sign
+  scenario switches to the real `/v2/auth` token dance under `native-tokens`;
+  external mode sets the variable in the environment to match the stack).
 - `--list` — print the inventory with per-mode availability; runs nothing.
 - `--keep` — don't tear the compose stack down at the end (debugging).
 
@@ -104,7 +108,7 @@ Each scenario is `scenarios/<group>/<name>.sh`:
 | `db` | compose always; external only if `HORT_DB_DSN` is set |
 | `compose` | compose mode only (the runner-managed stack + its mounted gitops config) |
 | `worker`, `scanner` | compose mode — the runner starts `--profile worker` on demand |
-| `compose:<o>` / bare `<o>` | the matching `--compose-overlay <o>` (`federation`) |
+| `compose:<o>` / bare `<o>` | the matching `--compose-overlay <o>` (`federation`, `native-tokens`) |
 
 A scenario whose `requires` aren't all provided is reported **SKIP (needs: …)**,
 never a failure.

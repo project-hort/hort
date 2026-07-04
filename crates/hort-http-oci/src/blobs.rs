@@ -330,28 +330,37 @@ pub(super) async fn serve(
     //    Rejected stays inline because the hidden-404 envelope is
     //    format-specific (`BLOB_UNKNOWN`).
     //
-    //    Push-dedup exception: a write-authorized caller's blob-EXISTENCE
-    //    check (`HEAD`) must report 200 (exists) so an OCI push can dedup
-    //    and complete. The pre-flight HEAD every pusher (skopeo,
-    //    `docker push`) issues is a write-path precondition, NOT a download
-    //    — quarantine invariant #1 gates *downloads*, not the existence
-    //    probe. The 503 hold stays in force for: the content GET (every
-    //    caller, `head == false`), and pull/read HEADs (non-writers). So
-    //    the download block and the transparent-proxy contract (invariant
-    //    #5) are untouched; only the write-authorized existence probe is
-    //    released. Fail closed: ONLY a definitive `Write` authorization
-    //    skips the 503 — a denied or errored resolve keeps it. The extra
-    //    resolve fires solely on the narrow quarantined-blob-HEAD path (the
-    //    `matches!` short-circuits first), so the hot read path is unaffected.
+    //    Push-dedup exception (ADR 0039 §10): a write-granted caller's
+    //    blob-EXISTENCE check (`HEAD`) must report 200 (exists) so an OCI
+    //    push can dedup and complete. The pre-flight HEAD every pusher
+    //    (skopeo, `docker push`) issues is a write-path precondition, NOT
+    //    a download — quarantine invariant #1 gates *downloads*, not the
+    //    existence probe.
+    //
+    //    The predicate keys on GRANTED write authority
+    //    (`resolve_granted_write`: the grants leg alone, cap ignored),
+    //    the same basis as the manifest hold-read exemption: standard
+    //    OCI clients scope read transports as `pull`, so under native
+    //    tokens the presented capability JWT can carry a read-only cap
+    //    while the principal's grants carry Write. The read itself stays
+    //    cap-gated on the normal `resolve(Read)` path; only the
+    //    held-visibility decision consults identity-level authority
+    //    (bounded ADR 0036 exception, recorded in ADR 0039 §10).
+    //
+    //    The 503 hold stays in force for: the content GET (every caller,
+    //    `head == false`), and pull/read HEADs (identities without the
+    //    Write grant). So the download block and the transparent-proxy
+    //    contract (invariant #5) are untouched; only the write-granted
+    //    existence probe is released. Fail closed: ONLY a definitive
+    //    granted-Write authorization skips the 503 — a denied or errored
+    //    resolve keeps it. The extra resolve fires solely on the narrow
+    //    quarantined-blob-HEAD path (the `matches!` short-circuits
+    //    first), so the hot read path is unaffected.
     let write_authorized_existence_probe = head
         && matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
         && ctx
             .repository_access_use_case
-            .resolve(
-                repo_key,
-                actor,
-                hort_app::use_cases::repository_access::AccessLevel::Write,
-            )
+            .resolve_granted_write(repo_key, actor)
             .await
             .is_ok();
     if !write_authorized_existence_probe {
@@ -1460,57 +1469,9 @@ mod tests {
         );
     }
 
-    /// Build an RBAC-enabled context that grants `claim` repo-wide `Write`,
-    /// reusing the harness's `repositories` mock so seeded repos resolve.
-    /// Mirror of lib.rs `enabled_empty_rbac_ctx`, with one grant added.
-    fn write_grant_ctx(
-        base: &Arc<AppContext>,
-        repositories: Arc<MockRepositoryRepository>,
-        claim: &str,
-    ) -> Arc<AppContext> {
-        use hort_app::rbac::RbacEvaluator;
-        use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
-        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
-        use hort_app::use_cases::test_support::{MockIdentityProvider, MockUserRepository};
-        use hort_domain::entities::managed_by::ManagedBy;
-        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
-        use hort_domain::ports::identity_provider::IdentityProvider;
-        use hort_domain::ports::user_repository::UserRepository;
-        use hort_http_core::context::AuthContext;
-        use hort_http_core::test_support::{with_auth, with_repository_access};
-
-        let grant = PermissionGrant {
-            id: Uuid::new_v4(),
-            subject: GrantSubject::Claims(vec![claim.to_string()]),
-            repository_id: None,
-            permission: Permission::Write,
-            created_at: Utc::now(),
-            managed_by: ManagedBy::Local,
-            managed_by_digest: None,
-        };
-        let rbac_swap = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
-            grant,
-        ])));
-        let authenticate = Arc::new(AuthenticateUseCase::new(
-            Arc::new(MockIdentityProvider::new()) as Arc<dyn IdentityProvider>,
-            Arc::new(MockUserRepository::new()) as Arc<dyn UserRepository>,
-            Vec::new(),
-        ));
-        let ctx = with_auth(
-            base,
-            AuthContext::Enabled {
-                authenticate,
-                rbac: rbac_swap.clone(),
-                issuer_url: None,
-            },
-        );
-        let access = Arc::new(RepositoryAccessUseCase::new(
-            repositories,
-            RbacAccess::Enabled(rbac_swap),
-            true,
-        ));
-        with_repository_access(&ctx, access)
-    }
+    // RBAC-enabled ctx builders + the capability-token principal shape
+    // are shared with the manifest suite via `crate::test_authz`.
+    use crate::test_authz::{pull_scoped_cap_principal, user_grant_ctx, write_grant_ctx};
 
     /// A `CallerPrincipal` carrying exactly `claim`.
     fn principal_with_claim(claim: &str) -> CallerPrincipal {
@@ -1622,6 +1583,107 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "write-authorized GET of a quarantined blob must stay 503 — only the \
              HEAD existence probe is released; content download stays held"
+        );
+    }
+
+    // -- Capability-token matrix: the existence-probe exemption keys on
+    //    GRANTED write authority (ADR 0039 §10) — same basis as the
+    //    manifest hold-read; the content GET stays held for every
+    //    caller.
+
+    /// Drive `serve()` for the quarantined blob under a User-subject
+    /// grant set attached to `principal.user_id`.
+    fn quarantined_blob_cap_status(
+        head: bool,
+        granted: &[hort_domain::entities::rbac::Permission],
+        principal: &CallerPrincipal,
+    ) -> StatusCode {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+            );
+            let ctx = user_grant_ctx(&h.ctx, h.repositories.clone(), principal.user_id, granted);
+            serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                Some(principal),
+            )
+            .await
+            .status()
+        })
+    }
+
+    /// A pull-scoped capability principal whose identity holds Write
+    /// (the push-dedup preflight under native tokens): the held-blob
+    /// existence HEAD reports 200 — the read-only cap does not veto
+    /// held-visibility; the grants leg decides it.
+    #[test]
+    fn head_blob_quarantined_pull_scoped_cap_with_write_grant_reports_exists() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCB1);
+        let p = pull_scoped_cap_principal(uid);
+        assert_eq!(
+            quarantined_blob_cap_status(
+                /* head = */ true,
+                &[Permission::Read, Permission::Write],
+                &p
+            ),
+            StatusCode::OK,
+            "held-blob HEAD by a pull-scoped cap principal with a Write grant must \
+             report exists — the exemption keys on granted authority, not the cap"
+        );
+    }
+
+    /// The content gate is untouched by the granted-authority basis: a
+    /// write-granted pull-scoped cap principal's GET of the held blob
+    /// stays 503 — only the HEAD existence probe is released.
+    #[test]
+    fn get_blob_quarantined_pull_scoped_cap_with_write_grant_still_returns_503() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCB2);
+        let p = pull_scoped_cap_principal(uid);
+        assert_eq!(
+            quarantined_blob_cap_status(
+                /* head = */ false,
+                &[Permission::Read, Permission::Write],
+                &p
+            ),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "held-blob content GET must stay 503 for every caller — the layer bytes \
+             never leave quarantine"
+        );
+    }
+
+    /// Scope guard: a pull-scoped cap principal whose identity holds
+    /// only Read gets no existence probe — granted WRITE authority keys
+    /// the exemption.
+    #[test]
+    fn head_blob_quarantined_pull_scoped_cap_read_only_grantee_stays_503() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCB3);
+        let p = pull_scoped_cap_principal(uid);
+        assert_eq!(
+            quarantined_blob_cap_status(/* head = */ true, &[Permission::Read], &p),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a read-only grantee's held-blob HEAD must stay 503"
         );
     }
 

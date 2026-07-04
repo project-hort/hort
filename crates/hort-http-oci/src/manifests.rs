@@ -246,35 +246,44 @@ pub(super) async fn serve(
     //    as MANIFEST_UNKNOWN (format-specific envelope, so inline here
     //    rather than in the helper).
     //
-    //    Push-then-sign exception (ADR 0039): a write-authorized caller
-    //    may read a held MANIFEST — the existence check (`HEAD`) AND the
-    //    body (`GET`) — so a held subject image can be signed. Under
+    //    Push-then-sign exception (ADR 0039 §10): a caller whose
+    //    identity holds *granted* Write authority may read a held
+    //    MANIFEST — the existence check (`HEAD`) AND the body (`GET`) —
+    //    so a held subject image can be signed. Under
     //    `provenance_mode: Required` the subject is held `Quarantined`
     //    until a signature arrives, and keyed `cosign sign` resolves the
-    //    subject manifest by `GET` before attaching the signature. A
-    //    manifest is a routing document (config + layer digests), not
+    //    subject manifest by `GET` before attaching the signature.
+    //
+    //    The predicate keys on GRANTED write authority
+    //    (`resolve_granted_write`: the grants leg alone, cap ignored),
+    //    not the presented token's cap: standard OCI clients scope a
+    //    subject read as `pull`, so under native tokens the capability
+    //    JWT carries a read-only cap while the principal's grants carry
+    //    Write. The read itself stays cap-gated — a pull-scoped token
+    //    satisfies the step-1 `resolve(Read)` normally; only the
+    //    held-visibility decision consults identity-level authority
+    //    (bounded ADR 0036 exception, recorded in ADR 0039 §10).
+    //
+    //    A manifest is a routing document (config + layer digests), not
     //    runnable content; the real bytes are the layer blobs, and
     //    `blobs.rs` keeps its existence probe `HEAD`-only, so a held
     //    layer's bytes are never served — the image cannot be pulled or
-    //    run. The 503 hold stays in force for every read caller WITHOUT
-    //    `Write` (non-writers / anonymous / proxy read scopes) and for
-    //    every layer blob. So no runnable content leaves quarantine (only
-    //    the metadata manifest, only to a write-authorized caller), the
-    //    transparent-proxy contract (quarantine invariant #5) is untouched,
-    //    and a `Rejected` manifest is still hidden below. Fail closed:
-    //    ONLY a definitive `Write` authorization skips the 503 — a denied
-    //    or errored resolve keeps it. The resolve fires solely on the
-    //    narrow quarantined-manifest path (the `matches!` short-circuits
+    //    run. The 503 hold stays in force for every read caller whose
+    //    identity lacks the Write grant (non-writers / anonymous / proxy
+    //    read scopes) and for every layer blob. So no runnable content
+    //    leaves quarantine (only the metadata manifest, only to a
+    //    write-granted principal), the transparent-proxy contract
+    //    (quarantine invariant #5) is untouched, and a `Rejected`
+    //    manifest is still hidden below. Fail closed: ONLY a definitive
+    //    granted-Write authorization skips the 503 — a denied or errored
+    //    resolve keeps it. The resolve fires solely on the narrow
+    //    quarantined-manifest path (the `matches!` short-circuits
     //    first), so the hot read path is unaffected.
     let write_authorized_hold_read =
         matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
             && ctx
                 .repository_access_use_case
-                .resolve(
-                    repo_key,
-                    actor,
-                    hort_app::use_cases::repository_access::AccessLevel::Write,
-                )
+                .resolve_granted_write(repo_key, actor)
                 .await
                 .is_ok();
     if !write_authorized_hold_read {
@@ -2239,57 +2248,9 @@ mod tests {
     // manifest never serves a held layer. Non-writers / anonymous callers stay
     // 503 on every read.
 
-    /// Build an RBAC-enabled context that grants `claim` repo-wide `Write`,
-    /// reusing the harness's `repositories` mock so seeded repos resolve.
-    /// Byte-for-byte mirror of the blob test's `write_grant_ctx`.
-    fn write_grant_ctx(
-        base: &Arc<AppContext>,
-        repositories: Arc<MockRepositoryRepository>,
-        claim: &str,
-    ) -> Arc<AppContext> {
-        use hort_app::rbac::RbacEvaluator;
-        use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
-        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
-        use hort_app::use_cases::test_support::{MockIdentityProvider, MockUserRepository};
-        use hort_domain::entities::managed_by::ManagedBy;
-        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
-        use hort_domain::ports::identity_provider::IdentityProvider;
-        use hort_domain::ports::user_repository::UserRepository;
-        use hort_http_core::context::AuthContext;
-        use hort_http_core::test_support::{with_auth, with_repository_access};
-
-        let grant = PermissionGrant {
-            id: Uuid::new_v4(),
-            subject: GrantSubject::Claims(vec![claim.to_string()]),
-            repository_id: None,
-            permission: Permission::Write,
-            created_at: Utc::now(),
-            managed_by: ManagedBy::Local,
-            managed_by_digest: None,
-        };
-        let rbac_swap = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
-            grant,
-        ])));
-        let authenticate = Arc::new(AuthenticateUseCase::new(
-            Arc::new(MockIdentityProvider::new()) as Arc<dyn IdentityProvider>,
-            Arc::new(MockUserRepository::new()) as Arc<dyn UserRepository>,
-            Vec::new(),
-        ));
-        let ctx = with_auth(
-            base,
-            AuthContext::Enabled {
-                authenticate,
-                rbac: rbac_swap.clone(),
-                issuer_url: None,
-            },
-        );
-        let access = Arc::new(RepositoryAccessUseCase::new(
-            repositories,
-            RbacAccess::Enabled(rbac_swap),
-            true,
-        ));
-        with_repository_access(&ctx, access)
-    }
+    // RBAC-enabled ctx builders + the capability-token principal shape
+    // are shared with the blob suite via `crate::test_authz`.
+    use crate::test_authz::{pull_scoped_cap_principal, user_grant_ctx, write_grant_ctx};
 
     /// A `CallerPrincipal` carrying exactly `claim`.
     fn principal_with_claim(claim: &str) -> CallerPrincipal {
@@ -2432,6 +2393,169 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a non-writer GET of a quarantined manifest must stay 503 — the widened hold \
              read exemption is write-authorized only, never open to read/proxy callers"
+        );
+    }
+
+    // -- Capability-token matrix: the hold exemption keys on GRANTED
+    //    write authority (ADR 0039 §10). A `/v2/auth` capability
+    //    principal presents a pull-scoped cap on its subject read —
+    //    standard client behavior — while its identity's grants carry
+    //    Write; held-visibility follows the grants leg, the cap keeps
+    //    gating the read itself.
+
+    /// Drive `serve()` for the quarantined manifest under a
+    /// User-subject grant set attached to `principal.user_id`.
+    fn quarantined_manifest_cap_status(
+        head: bool,
+        granted: &[hort_domain::entities::rbac::Permission],
+        principal: &CallerPrincipal,
+    ) -> StatusCode {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Quarantined,
+            );
+            let ctx = user_grant_ctx(&h.ctx, h.repositories.clone(), principal.user_id, granted);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                Some(principal),
+            )
+            .await
+            .status()
+        })
+    }
+
+    /// A pull-scoped capability principal whose identity holds Write
+    /// (the canonical `cosign sign` subject read, ADR 0039 §10): held
+    /// manifest HEAD reports exists AND GET serves — the read-only cap
+    /// does not veto held-visibility; the grants leg decides it.
+    #[test]
+    fn quarantined_manifest_pull_scoped_cap_with_write_grant_serves() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCA9);
+        let p = pull_scoped_cap_principal(uid);
+        let granted = [Permission::Read, Permission::Write];
+        assert_eq!(
+            quarantined_manifest_cap_status(/* head = */ true, &granted, &p),
+            StatusCode::OK,
+            "held-manifest HEAD by a pull-scoped cap principal with a Write grant must \
+             report exists — the exemption keys on granted authority, not the cap"
+        );
+        assert_eq!(
+            quarantined_manifest_cap_status(/* head = */ false, &granted, &p),
+            StatusCode::OK,
+            "held-manifest GET by a pull-scoped cap principal with a Write grant must \
+             serve so keyed cosign can resolve the subject it is signing"
+        );
+    }
+
+    /// Scope guard: the exemption does NOT leak to mere readers. A
+    /// pull-scoped cap principal whose identity holds only Read stays
+    /// 503 on both HEAD and GET of the held manifest.
+    #[test]
+    fn quarantined_manifest_pull_scoped_cap_read_only_grantee_stays_503() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCA10);
+        let p = pull_scoped_cap_principal(uid);
+        let granted = [Permission::Read];
+        for head in [true, false] {
+            assert_eq!(
+                quarantined_manifest_cap_status(head, &granted, &p),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a read-only grantee (head={head}) must stay 503 — granted WRITE \
+                 authority, not mere read authority, keys the hold exemption"
+            );
+        }
+    }
+
+    /// B1 fail-closed parity (ADR 0036): an anomalous claims-admin
+    /// Pat/ServiceAccount principal with `token_cap = None` gains no
+    /// held-visibility through the grants-only basis either.
+    #[test]
+    fn quarantined_manifest_b1_admin_claim_no_cap_stays_503() {
+        use hort_domain::entities::api_token::TokenKind;
+        for kind in [TokenKind::Pat, TokenKind::ServiceAccount] {
+            let mut p = principal_with_claim("admin");
+            p.token_kind = Some(kind);
+            assert_eq!(
+                quarantined_manifest_cap_status(/* head = */ false, &[], &p),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "claims-admin {kind:?} with None cap must fail closed on held reads"
+            );
+        }
+    }
+
+    /// Rejected stays terminal for the capability shape too: a
+    /// write-granted pull-scoped cap principal's GET of a `Rejected`
+    /// manifest is still hidden as 404 (`MANIFEST_UNKNOWN`).
+    #[test]
+    fn rejected_manifest_pull_scoped_cap_write_grant_still_hidden_as_404() {
+        use hort_domain::entities::rbac::Permission;
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let uid = Uuid::from_u128(0xCA11);
+        let status = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Rejected,
+            );
+            let ctx = user_grant_ctx(
+                &h.ctx,
+                h.repositories.clone(),
+                uid,
+                &[Permission::Read, Permission::Write],
+            );
+            let principal = pull_scoped_cap_principal(uid);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await
+            .status()
+        });
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the hold exemption covers Quarantined only — Rejected stays hidden \
+             regardless of grants or cap shape"
         );
     }
 

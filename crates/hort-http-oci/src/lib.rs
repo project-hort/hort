@@ -46,6 +46,11 @@ pub mod referrers;
 pub(crate) mod tag;
 pub mod tags;
 pub(crate) mod tail;
+// Shared test-only authz harness (RBAC-enabled ctx builders + the
+// capability-token principal shape) for the quarantine hold-exemption
+// suites in `manifests` and `blobs`.
+#[cfg(test)]
+pub(crate) mod test_authz;
 pub mod upload_session;
 pub mod uploads;
 // Distribution-Spec `/v2/auth` token-exchange handler + the

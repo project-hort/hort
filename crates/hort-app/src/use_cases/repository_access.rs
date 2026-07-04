@@ -67,6 +67,21 @@ pub enum AccessLevel {
     Write,
 }
 
+/// Which evaluation basis [`RepositoryAccessUseCase::enforce`] consults
+/// on the RBAC evaluator. Internal — callers select it through the
+/// public method they invoke.
+#[derive(Clone, Copy)]
+enum AuthorityBasis {
+    /// Grants leg ∧ cap leg ([`RbacEvaluator::authorize`]) — every
+    /// standard resolve.
+    CapIntersected,
+    /// Grants leg only ([`RbacEvaluator::authorize_granted`]) — the
+    /// hold-exemption predicate
+    /// ([`RepositoryAccessUseCase::resolve_granted_write`],
+    /// ADR 0039 §10).
+    GrantedOnly,
+}
+
 // ---------------------------------------------------------------------------
 // RbacAccess
 // ---------------------------------------------------------------------------
@@ -146,14 +161,45 @@ impl RepositoryAccessUseCase {
         actor: Option<&CallerPrincipal>,
         level: AccessLevel,
     ) -> AppResult<Repository> {
-        let repo = match self.repositories.find_by_key(repo_key).await {
-            Ok(r) => r,
-            Err(DomainError::NotFound { .. }) => {
-                return Err(AppError::Domain(not_found_repo(repo_key)));
-            }
-            Err(other) => return Err(AppError::Domain(other)),
-        };
-        self.enforce(&repo, actor, level)
+        let repo = self.load_by_key(repo_key).await?;
+        self.enforce(&repo, actor, level, AuthorityBasis::CapIntersected)
+    }
+
+    /// The quarantine hold-exemption predicate: resolve `repo_key` and
+    /// enforce the actor's **granted** Write authority, ignoring the
+    /// presented token's cap (ADR 0039 §10).
+    ///
+    /// The two OCI hold-exemption sites (held-manifest HEAD/GET in
+    /// `manifests.rs`, the held-blob HEAD existence probe in `blobs.rs`)
+    /// key held-visibility on the principal's identity-level write
+    /// authority: standard OCI clients scope a subject read as `pull`,
+    /// so the presented capability token legitimately carries a
+    /// read-only cap while the identity's grants carry Write. The read
+    /// being exempted stays fully cap-gated through the ordinary
+    /// [`resolve`](Self::resolve) `Read` path; only the held-visibility
+    /// decision evaluates the grants leg alone
+    /// ([`RbacEvaluator::authorize_granted`], which preserves the B1
+    /// fail-closed admin-claim/no-cap arm). A deliberate, bounded
+    /// exception to the ADR 0036 cap-intersection invariant, recorded
+    /// in ADR 0039 §10 — not for use by any other decision.
+    ///
+    /// Same repo-resolution and anti-enumeration error shapes as
+    /// [`resolve`] with [`AccessLevel::Write`]: missing/invisible repo
+    /// collapses to `NotFound`; Read-visible-but-not-write-granted
+    /// returns `Forbidden`.
+    #[tracing::instrument(skip(self))]
+    pub async fn resolve_granted_write(
+        &self,
+        repo_key: &str,
+        actor: Option<&CallerPrincipal>,
+    ) -> AppResult<Repository> {
+        let repo = self.load_by_key(repo_key).await?;
+        self.enforce(
+            &repo,
+            actor,
+            AccessLevel::Write,
+            AuthorityBasis::GrantedOnly,
+        )
     }
 
     /// Same shape as [`resolve`](Self::resolve), but keyed by id.
@@ -171,7 +217,7 @@ impl RepositoryAccessUseCase {
             }
             Err(other) => return Err(AppError::Domain(other)),
         };
-        self.enforce(&repo, actor, level)
+        self.enforce(&repo, actor, level, AuthorityBasis::CapIntersected)
     }
 
     /// Page through every Read-visible repository for `actor`.
@@ -292,12 +338,24 @@ impl RepositoryAccessUseCase {
 
     // -- internals ---------------------------------------------------------
 
+    /// Key-based repo load with the canonical anti-enumeration
+    /// `NotFound` envelope. Shared by [`Self::resolve`] and
+    /// [`Self::resolve_granted_write`].
+    async fn load_by_key(&self, repo_key: &str) -> AppResult<Repository> {
+        match self.repositories.find_by_key(repo_key).await {
+            Ok(r) => Ok(r),
+            Err(DomainError::NotFound { .. }) => Err(AppError::Domain(not_found_repo(repo_key))),
+            Err(other) => Err(AppError::Domain(other)),
+        }
+    }
+
     /// Apply the level-specific authz check. Logs at the right level.
     fn enforce(
         &self,
         repo: &Repository,
         actor: Option<&CallerPrincipal>,
         level: AccessLevel,
+        basis: AuthorityBasis,
     ) -> AppResult<Repository> {
         // Disabled = admit everything (dev / single-node bootstrap).
         let rbac = match &self.auth {
@@ -305,10 +363,16 @@ impl RepositoryAccessUseCase {
             RbacAccess::Enabled(rbac) => rbac.load(),
         };
 
-        let can_read = repo.is_public
-            || actor
-                .map(|p| rbac.authorize(p, Permission::Read, Some(repo.id)))
-                .unwrap_or(false);
+        // Basis-selected authorization primitive: the standard
+        // grants-∧-cap `authorize`, or the grants-leg-only
+        // `authorize_granted` for the hold-exemption predicate.
+        let allows = |p: &CallerPrincipal, permission: Permission| match basis {
+            AuthorityBasis::CapIntersected => rbac.authorize(p, permission, Some(repo.id)),
+            AuthorityBasis::GrantedOnly => rbac.authorize_granted(p, permission, Some(repo.id)),
+        };
+
+        let can_read =
+            repo.is_public || actor.map(|p| allows(p, Permission::Read)).unwrap_or(false);
 
         match level {
             AccessLevel::Read => {
@@ -326,9 +390,7 @@ impl RepositoryAccessUseCase {
                 }
             }
             AccessLevel::Write => {
-                let can_write = actor
-                    .map(|p| rbac.authorize(p, Permission::Write, Some(repo.id)))
-                    .unwrap_or(false);
+                let can_write = actor.map(|p| allows(p, Permission::Write)).unwrap_or(false);
                 if can_write {
                     return Ok(repo.clone());
                 }
@@ -706,6 +768,182 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.key, "public-pkg");
+    }
+
+    // -- resolve_granted_write (hold-exemption predicate, ADR 0039 §10) ----
+
+    /// A capability-token-shaped principal: the shape
+    /// `synthesize_principal_from_jwt` builds for a pull-scoped
+    /// `/v2/auth` JWT — claims empty, `token_cap = Some([Read])`,
+    /// authority carried by User-subject grants of `uid`.
+    fn pull_scoped_cap_principal(uid: Uuid) -> CallerPrincipal {
+        use hort_domain::entities::api_token::TokenCap;
+        let mut p = principal(&[]);
+        p.user_id = uid;
+        p.token_cap = Some(TokenCap {
+            permissions: vec![Permission::Read],
+            repository_ids: None,
+        });
+        p
+    }
+
+    /// Evaluator where `uid` holds `perms` on `repo_id` via User-subject
+    /// grants — the authority shape /v2/auth-minted principals resolve
+    /// against (their claims stay empty on that surface).
+    fn rbac_with_user_grants(uid: Uuid, repo_id: Uuid, perms: &[Permission]) -> RbacEvaluator {
+        RbacEvaluator::new(
+            perms
+                .iter()
+                .map(|&permission| PermissionGrant {
+                    id: Uuid::new_v4(),
+                    subject: GrantSubject::User(uid),
+                    repository_id: Some(repo_id),
+                    permission,
+                    created_at: Utc::now(),
+                    managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+                    managed_by_digest: None,
+                })
+                .collect(),
+        )
+    }
+
+    /// The issue-#13 shape: a pull-scoped capability principal whose
+    /// identity holds Write. `resolve(Write)` denies on the cap leg;
+    /// `resolve_granted_write` — the hold-exemption predicate — allows.
+    #[tokio::test]
+    async fn resolve_granted_write_ignores_read_only_cap_when_grants_hold_write() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let repo = public_repo("oci");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        let uid = Uuid::new_v4();
+        let uc = RepositoryAccessUseCase::new(
+            repos,
+            enabled(rbac_with_user_grants(
+                uid,
+                repo_id,
+                &[Permission::Read, Permission::Write],
+            )),
+            true,
+        );
+        let p = pull_scoped_cap_principal(uid);
+        let err = uc
+            .resolve("oci", Some(&p), AccessLevel::Write)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Forbidden(_))),
+            "cap-intersected Write resolve must deny a pull-scoped cap"
+        );
+        let resolved = uc.resolve_granted_write("oci", Some(&p)).await.unwrap();
+        assert_eq!(resolved.key, "oci");
+    }
+
+    /// The exemption does not leak to mere readers: a pull-scoped cap
+    /// principal whose identity holds only Read stays `Forbidden`.
+    #[tokio::test]
+    async fn resolve_granted_write_read_only_grantee_is_forbidden() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let repo = private_repo("vault");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        let uid = Uuid::new_v4();
+        let uc = RepositoryAccessUseCase::new(
+            repos,
+            enabled(rbac_with_user_grants(uid, repo_id, &[Permission::Read])),
+            true,
+        );
+        let p = pull_scoped_cap_principal(uid);
+        let err = uc
+            .resolve_granted_write("vault", Some(&p))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Domain(DomainError::Forbidden(_))));
+    }
+
+    /// Anti-enumeration parity with `resolve(Write)`: no Read authority
+    /// on a private repo collapses to `NotFound`; a missing repo too.
+    #[tokio::test]
+    async fn resolve_granted_write_invisible_and_missing_are_not_found() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(private_repo("vault"));
+        let uc = RepositoryAccessUseCase::new(repos, enabled(RbacEvaluator::new(Vec::new())), true);
+        for key in ["vault", "ghost"] {
+            let err = uc.resolve_granted_write(key, None).await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    AppError::Domain(DomainError::NotFound {
+                        entity: "Repository",
+                        ..
+                    })
+                ),
+                "expected NotFound for {key}"
+            );
+        }
+    }
+
+    /// `None`-cap principal with a Write grant resolves — the granted
+    /// basis is a superset of the cap-intersected one for cap-less
+    /// callers (regression pin for the OIDC/CliSession shape).
+    #[tokio::test]
+    async fn resolve_granted_write_none_cap_writer_is_ok() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let repo = public_repo("public-pkg");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        let uc =
+            RepositoryAccessUseCase::new(repos, enabled(rbac_with_read_and_write(repo_id)), true);
+        let dev = principal(&["developer"]);
+        let resolved = uc
+            .resolve_granted_write("public-pkg", Some(&dev))
+            .await
+            .unwrap();
+        assert_eq!(resolved.key, "public-pkg");
+    }
+
+    /// B1 fail-closed parity: a claims-admin Pat/ServiceAccount
+    /// principal with `token_cap = None` gains no granted authority —
+    /// the anomalous construction cannot obtain held-visibility through
+    /// the grants-only variant.
+    #[tokio::test]
+    async fn resolve_granted_write_b1_admin_claim_no_cap_fails_closed() {
+        use hort_domain::entities::api_token::TokenKind;
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(public_repo("oci"));
+        let uc = RepositoryAccessUseCase::new(repos, enabled(RbacEvaluator::new(Vec::new())), true);
+        for kind in [TokenKind::Pat, TokenKind::ServiceAccount] {
+            let mut p = principal(&["admin"]);
+            p.token_kind = Some(kind);
+            let err = uc.resolve_granted_write("oci", Some(&p)).await.unwrap_err();
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Forbidden(_))),
+                "claims-admin {kind:?} with None cap must fail closed"
+            );
+        }
+    }
+
+    /// Disabled RBAC admits everything, mirroring `resolve`.
+    #[tokio::test]
+    async fn resolve_granted_write_under_disabled_admits() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(private_repo("vault"));
+        let uc = RepositoryAccessUseCase::new(repos, RbacAccess::Disabled, true);
+        let resolved = uc.resolve_granted_write("vault", None).await.unwrap();
+        assert_eq!(resolved.key, "vault");
+    }
+
+    /// Port errors propagate verbatim, mirroring `resolve`.
+    #[tokio::test]
+    async fn resolve_granted_write_propagates_port_error() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.fail_next_find_by_key(DomainError::Invariant("connection reset".into()));
+        let uc = RepositoryAccessUseCase::new(repos, enabled(RbacEvaluator::new(Vec::new())), true);
+        let err = uc
+            .resolve_granted_write("anything", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("connection reset"));
     }
 
     // -- Write-grant denial log assertion (acceptance bullet) --------------
