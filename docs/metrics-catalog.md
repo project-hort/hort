@@ -1523,7 +1523,10 @@ today is the OCI handler — hence the `format="oci"` label value.
   attributes "an empty response" to a successful query, not a
   not-found one.
 - `not_found` — the repository lookup returned
-  `DomainError::NotFound`. The handler emits 404 `NAME_UNKNOWN`. The
+  `DomainError::NotFound`. The handler emits 404 `NAME_UNKNOWN` for an
+  authenticated caller, or 401 + a `WWW-Authenticate` challenge for an
+  anonymous one (ADR 0045) — the label tracks repository-*resolution*
+  failure, not the HTTP representation, so it is unchanged either way. The
   `repository` label carries the requested key the operator asked
   for (cardinality stays bounded by operator-controlled repo keys
   even on misses; no client-supplied unbounded value reaches the

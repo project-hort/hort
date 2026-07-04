@@ -425,6 +425,13 @@ fn extract_principal(
 /// Build a 401 response with `WWW-Authenticate: Basic` for OCI
 /// anonymous-write callers.
 ///
+/// NOTE: for the OCI `/v2/*` surface this backstop is no longer reached on
+/// anonymous writes — `hort-http-oci`'s `oci_bearer_auth` middleware now
+/// challenges anonymous non-safe-method requests up front with a mode-aware
+/// `WWW-Authenticate` (Bearer when native tokens are wired, Basic
+/// otherwise). This function stays the generic backstop for the non-OCI
+/// formats that share this extractor and is correct for them.
+///
 /// We emit `Basic` here, NOT `Bearer realm=/v2/token`. The OCI
 /// subtree's canonical write flow is:
 ///

@@ -116,13 +116,23 @@ pub async fn serve(
             // but doesn't resolve to a visible row. Use the `unknown`
             // sentinel here (subject to the toggle) so a flood of
             // made-up or invisible-private keys can't inflate the
-            // metric series cardinality. The HTTP response still
-            // carries the requested key in the OCI envelope.
+            // metric series cardinality.
+            //
+            // The metric keeps its `not_found` result label: it tracks
+            // repo-*resolution* failure (`DomainError::NotFound`), not the
+            // HTTP status, and that outcome is identical whether the caller
+            // is anonymous (now 401 + challenge) or authenticated (404).
+            // The emission stays at the caller — the shared helper is pure
+            // response construction (D6: no new metric labels).
             emit_metric(&repo_label(&ctx, None), "not_found");
-            return OciError::NameUnknown {
-                repository: repo_key.to_string(),
-            }
-            .into_response();
+            let path = format!("/v2/{repo_key}/{name}/referrers/{digest_str}");
+            return crate::middleware::oci_auth::read_denied_response(
+                &ctx,
+                actor,
+                &axum::http::Method::GET,
+                &path,
+                repo_key,
+            );
         }
         Err(e) => {
             tracing::error!(
@@ -178,12 +188,19 @@ pub async fn serve(
             // Defensive: the step-1 resolve above already drained the
             // visibility-miss path, so this branch only fires under a
             // race where the repo was deleted between our two calls.
-            // Treat the same as the original step-1 NotFound mapping.
+            // Treat the same as the step-1 read-denial mapping (challenge
+            // anonymous, NAME_UNKNOWN for authenticated). The metric keeps
+            // its `not_found` label (repo-resolution failure, not HTTP
+            // status) and stays at the caller.
             emit_metric(&repo_label(&ctx, Some(&repo.key)), "not_found");
-            return OciError::NameUnknown {
-                repository: repo_key.to_string(),
-            }
-            .into_response();
+            let path = format!("/v2/{repo_key}/{name}/referrers/{digest_str}");
+            return crate::middleware::oci_auth::read_denied_response(
+                &ctx,
+                actor,
+                &axum::http::Method::GET,
+                &path,
+                repo_key,
+            );
         }
         Err(e) => {
             tracing::error!(
@@ -695,11 +712,24 @@ mod tests {
         assert_eq!(manifests[0]["artifactType"], "application/vnd.spdx+json");
     }
 
-    // -------------------- 4. Repo missing → 404 NAME_UNKNOWN --------------------
+    // -------------- 4. Repo missing (anonymous, Disabled) → 404 + not_found metric --------------
 
+    /// Missing repo, ANONYMOUS caller under `AuthContext::Disabled` (the
+    /// harness default) → the `NAME_UNKNOWN` 404 anti-enum envelope, NOT the
+    /// 401 challenge: Disabled mode never emits the unsatisfiable `/v2/auth`
+    /// challenge (see `read_denied_response`'s Disabled carve-out, mirroring
+    /// the `GET /v2/` probe). The production-mode 401 challenge is pinned by
+    /// the `denied_ctx`/`denied_ctx_bearer` (`Enabled`) suites below.
+    ///
+    /// The `not_found` result metric still fires (emitted at the caller,
+    /// before the shared helper): it tracks repo-*resolution* failure, not
+    /// the HTTP status, so the label is unchanged whether the outcome is the
+    /// Disabled 404, the anonymous 401, or the authenticated 404. The
+    /// `repository` label stays the `unknown` sentinel to bound cardinality
+    /// against made-up keys.
     #[test]
-    fn missing_repo_returns_404_name_unknown_and_increments_not_found_metric() {
-        let (snapshot, (status, body)) = capture(|| {
+    fn missing_repo_anonymous_disabled_mode_returns_404_and_increments_not_found_metric() {
+        let (snapshot, (status, www)) = capture(|| {
             run(async {
                 let h = harness();
                 // No repository inserted — find_by_key misses.
@@ -713,23 +743,17 @@ mod tests {
                 )
                 .await;
                 let status = resp.status();
-                let body = axum::body::to_bytes(resp.into_body(), 4 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec();
-                (status, body)
+                let www = resp
+                    .headers()
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .map(|v| v.to_str().unwrap().to_string());
+                (status, www)
             })
         });
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+        assert_eq!(www, None, "Disabled denial carries no challenge");
 
         let entries: Vec<MetricEntry> = snapshot.into_vec();
-        // The `repository` label is the `unknown` sentinel — NOT the
-        // requested key. The toggle is on by default, but a flood of
-        // made-up repo_keys would inflate cardinality without bound,
-        // so an unresolved-repo emission collapses to the
-        // `REPOSITORY_UNKNOWN` sentinel.
         let counter = find_counter(
             &entries,
             "hort_content_reference_queries_total",
@@ -741,6 +765,82 @@ mod tests {
         )
         .expect("hort_content_reference_queries_total{result=not_found} must fire on missing repo");
         assert_eq!(*counter, DebugValue::Counter(1));
+    }
+
+    /// Missing repo, AUTHENTICATED-but-unauthorized caller → the unchanged
+    /// `NAME_UNKNOWN` 404 anti-enumeration envelope, with the same
+    /// `not_found` metric.
+    #[test]
+    fn missing_repo_authenticated_returns_404_name_unknown() {
+        let (status, body) = run(async {
+            let h = harness();
+            let ctx = crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone());
+            let principal = crate::test_authz::grantless_principal();
+            let resp = serve(
+                ctx,
+                "ghost",
+                "library/nginx",
+                &format!("sha256:{SUBJECT_HEX}"),
+                None,
+                Some(&principal),
+            )
+            .await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+    }
+
+    /// Anonymous denial with the signing key WIRED → 401 + Bearer
+    /// `/v2/auth` challenge (path-derived `scope=`).
+    #[test]
+    fn missing_repo_anonymous_challenges_bearer_when_key_wired() {
+        run(async {
+            let h = harness();
+            let ctx = crate::test_authz::denied_ctx_bearer(&h.ctx, h.repositories.clone());
+            let resp = serve(
+                ctx,
+                "ghost",
+                "library/nginx",
+                &format!("sha256:{SUBJECT_HEX}"),
+                None,
+                None,
+            )
+            .await;
+            crate::test_authz::assert_bearer_challenge(
+                &resp,
+                r#"scope="repository:ghost/library/nginx:pull""#,
+            );
+        });
+    }
+
+    /// Anti-enumeration equivalence (ADR 0021): anonymous denial for a
+    /// NONEXISTENT repo is byte-identical to one for an EXISTING PRIVATE
+    /// repo (Basic mode → no `scope=`).
+    #[test]
+    fn referrers_anonymous_denial_uniform_nonexistent_vs_private() {
+        run(async {
+            let h = harness();
+            let mut priv_repo = oci_repo("private-repo");
+            priv_repo.is_public = false;
+            h.repositories.insert(priv_repo);
+            let ctx = crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone());
+            let digest = format!("sha256:{SUBJECT_HEX}");
+            let nonexistent =
+                serve(ctx.clone(), "ghost", "library/nginx", &digest, None, None).await;
+            let private = serve(ctx, "private-repo", "library/nginx", &digest, None, None).await;
+            assert_eq!(
+                crate::test_authz::denial_snapshot(nonexistent).await,
+                crate::test_authz::denial_snapshot(private).await,
+                "anonymous nonexistent vs existing-private must be byte-identical"
+            );
+        });
     }
 
     // -------------------- 5. Digest malformed → 400 DIGEST_INVALID --------------------

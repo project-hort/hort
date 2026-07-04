@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An anonymous OCI read denied at the repository level now returns `401` +
+  a mode-appropriate `WWW-Authenticate` challenge instead of a bare `404`.**
+  A standard `docker pull` / kubelet pull of a private image presents no
+  credential on its first request and only retries with its
+  `imagePullSecrets` credential when challenged; a `404` gave it nothing to
+  react to, so the pull failed even with a correctly configured Secret. The
+  new challenge is byte-identical (modulo the request's own echoed scope)
+  whether the repository is private or does not exist at all, so no new
+  existence oracle opens; an authenticated caller without read access still
+  gets the unchanged `404 NAME_UNKNOWN` anti-enumeration response. Anonymous
+  writes on `/v2/*` now advertise the same mode-appropriate challenge scheme
+  instead of a hardcoded legacy one.
+- **A native `hort_pat_*` / `hort_svc_*` token presented directly on `/v2/*`
+  now validates under `HORT_AUTH_PROVIDER=disabled` +
+  `HORT_NATIVE_TOKENS_ENABLED=true` deployments, matching behavior already
+  in place when an IdP is configured.** Such a token was previously rejected
+  at the OCI auth middleware before it ever reached token validation.
+
 ## [0.9.8] - 2026-07-03
 
 Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working

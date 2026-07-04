@@ -120,10 +120,18 @@ pub(super) async fn serve(
     {
         Ok(r) => r,
         Err(AppError::Domain(DomainError::NotFound { .. })) => {
-            return OciError::NameUnknown {
-                repository: repo_key.to_string(),
-            }
-            .into_response();
+            // Repo-level read denial: challenge an anonymous caller (401 +
+            // mode-aware WWW-Authenticate), anti-enumerate an authenticated
+            // one to NAME_UNKNOWN 404 (D1/D2, ADR 0021).
+            let method = if head {
+                axum::http::Method::HEAD
+            } else {
+                axum::http::Method::GET
+            };
+            let path = format!("/v2/{repo_key}/{name}/manifests/{reference}");
+            return crate::middleware::oci_auth::read_denied_response(
+                &ctx, actor, &method, &path, repo_key,
+            );
         }
         Err(e) => {
             tracing::error!(
@@ -2762,78 +2770,94 @@ mod tests {
         assert_eq!(content_type.as_deref(), Some(media));
     }
 
-    /// Visibility regression guard (ADR 0008): anonymous
-    /// `GET /v2/<private-repo>/<name>/manifests/<ref>` MUST return
-    /// `404 NAME_UNKNOWN` (anti-enumeration). `RepositoryAccessUseCase`
-    /// enforces Read at the resolve site and collapses invisible-private
-    /// to NotFound.
+    /// Repo-level read denial (D1/D2, ADR 0021): an anonymous manifest
+    /// pull on a denied repo (missing OR invisible-private,
+    /// indistinguishable) is challenged with 401 + the mode-aware
+    /// `WWW-Authenticate` in BOTH signing-key states; an
+    /// authenticated-but-unauthorized caller keeps the `NAME_UNKNOWN` 404
+    /// anti-enumeration envelope. Supersedes the pre-challenge
+    /// anonymous-private-repo → 404 guard: anonymous private now moves to
+    /// 401 alongside anonymous nonexistent (see the uniformity test).
     #[test]
-    fn anonymous_get_on_private_repo_returns_404_name_unknown() {
-        use hort_app::rbac::RbacEvaluator;
-        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
-        use hort_http_core::test_support::with_repository_access;
-
-        let content = b"private manifest body".to_vec();
-        let hex = {
-            use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
-        };
-        let (status, body) = run(async {
+    fn manifest_read_denial_challenges_anonymous_and_404s_authenticated() {
+        run(async {
             let h = harness();
-            let mut repo = oci_repo("private-repo");
-            repo.is_public = false;
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let (_id, hash) = seed_manifest(
-                &h.artifacts,
-                &h.storage,
-                &h.metadata,
-                repo_id,
-                &hex,
-                &content,
-                Some("application/vnd.oci.image.manifest.v1+json"),
-                QuarantineStatus::None,
+            let hm = HeaderMap::new();
+            // (1) anonymous, signing key UNWIRED → 401 Basic.
+            crate::test_authz::assert_basic_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    "v1",
+                    &hm,
+                    false,
+                    None,
+                )
+                .await,
             );
-
-            // Flip access use case to Enabled; anonymous = NotFound
-            // (ADR 0008). `ctx.repositories` is `pub(crate)` so pull the
-            // `Arc<MockRepositoryRepository>` off the harness handle.
-            let access = Arc::new(RepositoryAccessUseCase::new(
-                h.repositories.clone(),
-                RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
-                    RbacEvaluator::new(Vec::new()),
-                ))),
-                true,
-            ));
-            let ctx = with_repository_access(&h.ctx, access);
-
-            let router = manifest_router(ctx);
-            // Pull by digest reference; the path's tail-parser routes
-            // to manifests::serve.
-            let uri = format!(
-                "/v2/private-repo/library/nginx/manifests/sha256:{}",
-                hash.as_ref()
+            // (2) anonymous, signing key WIRED → 401 Bearer /v2/auth.
+            crate::test_authz::assert_bearer_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx_bearer(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    "v1",
+                    &hm,
+                    false,
+                    None,
+                )
+                .await,
+                r#"scope="repository:ghost/library/nginx:pull""#,
             );
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            // (3) authenticated but unauthorized → 404 NAME_UNKNOWN.
+            let principal = crate::test_authz::grantless_principal();
+            crate::test_authz::assert_name_unknown_404(
+                serve(
+                    crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    "v1",
+                    &hm,
+                    false,
+                    Some(&principal),
+                )
+                .await,
+            )
+            .await;
         });
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "anonymous read on private OCI manifest MUST be 404 (ADR 0008)"
-        );
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Anti-enumeration: NAME_UNKNOWN (the visible miss collapses
-        // at the repo resolve before the manifest lookup ever runs).
-        assert_eq!(
-            parsed["errors"][0]["code"], "NAME_UNKNOWN",
-            "envelope must match the missing-repo case to defeat probing"
-        );
+    }
+
+    /// Anti-enumeration equivalence (ADR 0021): an anonymous denial for a
+    /// NONEXISTENT repo is byte-identical to one for an EXISTING PRIVATE
+    /// repo (Basic mode carries no `scope=`, so the entire response — status,
+    /// challenge, body — matches). This is what an enumeration probe diffs.
+    #[test]
+    fn manifest_anonymous_denial_uniform_nonexistent_vs_private() {
+        run(async {
+            let h = harness();
+            let mut priv_repo = oci_repo("private-repo");
+            priv_repo.is_public = false;
+            h.repositories.insert(priv_repo);
+            let ctx = crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone());
+            let hm = HeaderMap::new();
+            let nonexistent = serve(
+                ctx.clone(),
+                "ghost",
+                "library/nginx",
+                "v1",
+                &hm,
+                false,
+                None,
+            )
+            .await;
+            let private = serve(ctx, "private-repo", "library/nginx", "v1", &hm, false, None).await;
+            assert_eq!(
+                crate::test_authz::denial_snapshot(nonexistent).await,
+                crate::test_authz::denial_snapshot(private).await,
+                "anonymous nonexistent vs existing-private must be byte-identical"
+            );
+        });
     }
 
     // ---------------------------------------------------------------------

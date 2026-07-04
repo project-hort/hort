@@ -1,0 +1,22 @@
+# ServiceAccount (e2e): the native-token-mode pusher for
+# scripts/native-tests/scenarios/clients/oci-private-pull.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation): under the
+# native-tokens compose overlay the scenario admin-mints an hort_svc_* token
+# for this SA (`POST /api/v1/admin/users/:id/tokens`) and uses it as the
+# skopeo `--dest-creds` for the seed push. A native credential is required
+# here (not the existing dev-user OIDC token) because the `/v2/auth` mint
+# validates the Basic password strictly as a PAT: a claims-subject OIDC
+# identity (dev-user's grant, auth/dev-write-oci-private-e2e.yaml) can never
+# complete it, and every unauthenticated `/v2/*` request — including the
+# anonymous ping skopeo issues before an authenticated push — gets the Bearer
+# challenge once native tokens are on (mirrors the provenance-ci SA's
+# rationale). Authority is the sibling serviceAccount-subject PermissionGrant
+# in auth/oci-private-e2e-writer-write.yaml. Inert in legacy (no-overlay)
+# runs: the SA row exists, nothing mints for it — the scenario's Basic-mode
+# branch keeps using dev-user's OIDC token instead.
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: oci-private-e2e-writer
+spec: {}
