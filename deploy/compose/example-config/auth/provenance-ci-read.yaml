@@ -1,0 +1,16 @@
+# PermissionGrant: serviceAccount provenance-ci -> read oci-provenance-e2e.
+# Granted alongside write (write does not imply read; permissions are flat):
+# the /v2/auth mint narrows a requested `pull` scope to the held read
+# authority, so without this grant the SA's capability JWTs would carry an
+# empty access[] on pull-scoped requests. Mirrors the host federation smoke's
+# read+write SA grant pair.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: provenance-ci-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: provenance-ci
+  permission: read
+  repository: oci-provenance-e2e

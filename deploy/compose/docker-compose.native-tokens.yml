@@ -1,0 +1,44 @@
+# Native-tokens e2e overlay — layered on top of docker-compose.yml.
+#
+#   docker compose -f deploy/compose/docker-compose.yml \
+#                   -f deploy/compose/docker-compose.native-tokens.yml up -d
+#
+# Driven by the native-tests runner:
+#
+#   ./scripts/native-tests/run.sh --hort=compose --compose-overlay=native-tokens
+#
+# Flips the stack into the native-token OCI posture: `/v2/auth` mints
+# short-lived Ed25519 capability JWTs, unauthenticated `/v2/*` requests get the
+# `WWW-Authenticate: Bearer realm=…/v2/auth` challenge, and OCI clients
+# (skopeo, cosign/go-containerregistry, docker) run the real Distribution-Spec
+# token dance — a subject read rides a *pull-scoped* capability JWT while the
+# principal's grants may carry write, which is exactly the shape the
+# quarantine hold-read exemption (ADR 0039 §10) keys on. The
+# provenance-push-then-sign scenario detects this overlay (via
+# `HORT_COMPOSE_OVERLAYS`, exported by the runner) and switches its
+# credentials to the `provenance-ci` PAT-only service account seeded in
+# `example-config/`.
+#
+# Why an overlay and not edits to docker-compose.yml: the base stack is the
+# shared dev/smoke surface for every other native test; those run the legacy
+# Basic / IdP-JWT flow, which must stay covered too (same rationale as the
+# federation overlay). Unlike that overlay, this one changes ONLY the token
+# posture — no token-exchange route, no extra issuer container, and the base
+# gitops config mount stays as-is (the mount targets below are additive).
+
+services:
+  hort-server:
+    environment:
+      HORT_NATIVE_TOKENS_ENABLED: "true"
+      # Test-only committed Ed25519 key (see native-tokens/README.md) — the
+      # `/v2/auth` mint half of the native-token boot gate. `iss`/`aud`/realm
+      # derive from the base file's HORT_PUBLIC_BASE_URL
+      # (http://hort-server:8080 → service/aud "hort-server:8080").
+      HORT_OCI_TOKEN_SIGNING_KEY_FILE: "/etc/hort/sign/oci-signing-key.pem"
+      # The stack is plaintext HTTP (dev/CI only); native tokens are refused
+      # over unencrypted connections without this documented override — the
+      # loopback/in-network smoke is the intended case (same rationale as the
+      # federation overlay).
+      HORT_BEARER_ALLOW_OVER_HTTP: "true"
+    volumes:
+      - ./native-tokens/oci-signing-key.pem:/etc/hort/sign/oci-signing-key.pem:ro

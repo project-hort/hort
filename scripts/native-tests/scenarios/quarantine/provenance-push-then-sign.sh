@@ -138,14 +138,69 @@ command -v cosign >/dev/null 2>&1 || \
 
 trap 'rm -f "$PULLED_ARCHIVE"' EXIT
 
-# dev-user is the write-authorized pusher/signer (mirrors the other OCI
-# scenarios). The public half of COSIGN_KEY must match the worker's registered
-# key or step [2] will Reject instead of Verify.
-DEV_TOKEN="$(fetch_token dev-user dev)"
-[ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
-[ -n "$DEV_TOKEN" ] || summary
-DEST_CREDS="dev-user:${DEV_TOKEN}"
-log "[auth] fetched DEV_TOKEN from Keycloak (dev-user write-authorized for ${REPO_KEY})"
+# -----------------------------------------------------------------------------
+# Credential mode: legacy (Basic / IdP-JWT) vs native tokens.
+# -----------------------------------------------------------------------------
+# Under the `native-tokens` compose overlay (HORT_COMPOSE_OVERLAYS carries the
+# runner's --compose-overlay list; export it yourself in external mode) the
+# stack advertises the `WWW-Authenticate: Bearer realm=…/v2/auth` challenge and
+# every OCI client runs the real Distribution-Spec token dance. The /v2/auth
+# handler validates the Basic password strictly as a NATIVE token
+# (PatValidationUseCase) — a Keycloak JWT in that slot 401s — and the OCI
+# capability surface resolves User-subject grants only (claims stay empty,
+# ADR 0036), so the pusher/signer is the `provenance-ci` PAT-only service
+# account (gitops example-config), admin-minted here via the REST surface.
+# The decisive property this mode exercises: cosign scopes its subject read as
+# `pull`, so the presented capability JWT carries a READ-ONLY cap while the
+# SA's grants carry write — the exact shape the granted-authority hold-read
+# exemption (ADR 0039 §10, issue #13) keys on. The hold probes below ride a
+# pull-scoped capability JWT explicitly, so a cap-keyed regression 503s them.
+#
+# Legacy (no overlay): dev-user's Keycloak JWT as the Basic password / bearer
+# (mirrors the other OCI scenarios) — this mode must stay green too.
+NATIVE_TOKENS=0
+case " ${HORT_COMPOSE_OVERLAYS:-} " in
+    *" native-tokens "*) NATIVE_TOKENS=1 ;;
+esac
+
+# mint_pull_cap_jwt — mint a capability JWT scoped to pull-only on the signed
+# image via the real /v2/auth exchange (Basic <svc-token>). Prints the JWT.
+mint_pull_cap_jwt() {
+    curl -sS -u "provenance-ci:${SVC_TOKEN}" \
+        "${HORT_URL}/v2/auth?service=${REGISTRY_HOST}&scope=repository:${REPO_KEY}/${SIGNED_NAME}:pull" \
+        2>/dev/null | jq -r '.token // empty'
+}
+
+if [ "$NATIVE_TOKENS" = "1" ]; then
+    log "[auth] native-token mode: admin-minting an hort_svc_* token for service account provenance-ci"
+    ADMIN_TOKEN="$(fetch_token admin admin)"
+    [ -n "$ADMIN_TOKEN" ] || { fail "fetch admin token" "empty response from Keycloak"; summary; }
+    SA_UID="$(psql_one "SELECT id FROM users WHERE username='sa:provenance-ci';")"
+    [ -n "$SA_UID" ] || { fail "resolve provenance-ci backing user" \
+        "no users row 'sa:provenance-ci' — gitops service-accounts/provenance-ci.yaml not applied?"; summary; }
+    SVC_TOKEN="$(curl -sS -X POST \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+        -d "{\"name\":\"provenance-e2e-$(date +%s)\",\"declared_permissions\":[\"read\",\"write\"],\"expires_in_days\":1}" \
+        "${HORT_URL}/api/v1/admin/users/${SA_UID}/tokens" 2>/dev/null | jq -r '.token // empty')"
+    [ -n "$SVC_TOKEN" ] || { fail "admin-mint provenance-ci svc token" \
+        "POST /api/v1/admin/users/${SA_UID}/tokens returned no token"; summary; }
+    PUSH_USER="provenance-ci"; PUSH_SECRET="$SVC_TOKEN"
+    # The hold probes ([2/6]) ride a PULL-scoped capability JWT — the
+    # issue-#13 shape: read-only cap, write-granted identity.
+    HOLD_BEARER="$(mint_pull_cap_jwt)"
+    [ -n "$HOLD_BEARER" ] || { fail "mint pull-scoped capability JWT" \
+        "GET /v2/auth (Basic <svc-token>, scope …:pull) returned no token"; summary; }
+    log "[auth] svc token minted; hold probes ride a pull-scoped /v2/auth capability JWT"
+else
+    # The public half of COSIGN_KEY must match the worker's registered key or
+    # step [3] will Reject instead of Verify.
+    DEV_TOKEN="$(fetch_token dev-user dev)"
+    [ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
+    [ -n "$DEV_TOKEN" ] || summary
+    PUSH_USER="dev-user"; PUSH_SECRET="$DEV_TOKEN"; HOLD_BEARER="$DEV_TOKEN"
+    log "[auth] legacy mode: fetched DEV_TOKEN from Keycloak (dev-user write-authorized for ${REPO_KEY})"
+fi
+DEST_CREDS="${PUSH_USER}:${PUSH_SECRET}"
 
 # push_source_index <dest-ref> [<src-ref>] — `skopeo copy --all` a multi-arch
 # source (default SOURCE_IMAGE) to a hosted dest, with a bounded retry. The
@@ -197,7 +252,7 @@ DIGEST="$(skopeo inspect --tls-verify=false --creds "$DEST_CREDS" \
 if [ -z "$DIGEST" ]; then
     # Fall back to the Docker-Content-Digest header of a write-authorized HEAD,
     # which the existence-probe exemption serves (200) even under the hold.
-    DIGEST="$(curl -sSI -H "Authorization: Bearer ${DEV_TOKEN}" \
+    DIGEST="$(curl -sSI -H "Authorization: Bearer ${HOLD_BEARER}" \
         "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/v1" 2>/dev/null \
         | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' || true)"
 fi
@@ -217,28 +272,32 @@ else
     fail "anonymous manifest GET -> 503" "got HTTP ${ANON_GET_CODE} (a held required image must 503 to pullers)"
 fi
 
+# In native-token mode HOLD_BEARER is a PULL-scoped capability JWT of the
+# write-granted provenance-ci SA — the exemption must key on the identity's
+# granted write authority, not the token's read-only cap (ADR 0039 §10,
+# issue #13). In legacy mode it is dev-user's IdP JWT (None-cap principal).
 WRITE_HEAD_CODE="$(curl -s -o /dev/null -w '%{http_code}' -I \
-    -H "Authorization: Bearer ${DEV_TOKEN}" \
+    -H "Authorization: Bearer ${HOLD_BEARER}" \
     "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/${DIGEST}" 2>/dev/null || echo 000)"
 if [ "$WRITE_HEAD_CODE" = "200" ]; then
-    pass "write-authorized manifest HEAD on held image -> 200/exists (hold-read exemption; signer can preflight)"
+    pass "write-granted manifest HEAD on held image -> 200/exists (hold-read exemption; signer can preflight)"
 else
-    fail "write-authorized manifest HEAD -> 200" \
-         "got HTTP ${WRITE_HEAD_CODE} (the write-authorized manifest hold-read exemption must report exists so cosign can preflight)"
+    fail "write-granted manifest HEAD -> 200" \
+         "got HTTP ${WRITE_HEAD_CODE} (the granted-write manifest hold-read exemption must report exists so cosign can preflight; under native tokens a pull-scoped cap must not veto it)"
 fi
 
-# Keyed cosign resolves the subject by GET too (ADR 0039 §10): a write-authorized
+# Keyed cosign resolves the subject by GET too (ADR 0039 §10): a write-granted
 # manifest GET of the held subject SERVES (200), so the sign in [3] can resolve
 # the subject. The manifest is metadata, not runnable content; layer bytes stay
 # held (anonymous GET above is 503, layer blobs stay HEAD-only).
 WRITE_GET_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer ${DEV_TOKEN}" \
+    -H "Authorization: Bearer ${HOLD_BEARER}" \
     "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/${DIGEST}" 2>/dev/null || echo 000)"
 if [ "$WRITE_GET_CODE" = "200" ]; then
-    pass "write-authorized manifest GET on held image -> 200/serves (hold-read exemption; keyed cosign resolves the subject by GET)"
+    pass "write-granted manifest GET on held image -> 200/serves (hold-read exemption; keyed cosign resolves the subject by GET)"
 else
-    fail "write-authorized manifest GET -> 200" \
-         "got HTTP ${WRITE_GET_CODE} (ADR 0039 §10: a write-authorized GET of a held manifest must SERVE so keyed cosign can resolve the subject before signing)"
+    fail "write-granted manifest GET -> 200" \
+         "got HTTP ${WRITE_GET_CODE} (ADR 0039 §10: a write-granted GET of a held manifest must SERVE so keyed cosign can resolve the subject before signing; under native tokens the pull-scoped cap must not veto held-visibility)"
 fi
 
 # =============================================================================
@@ -260,8 +319,8 @@ SIGN_RC=0
 SIGN_OUT="$(cosign sign --yes \
     --key "$COSIGN_KEY" \
     --registry-referrers-mode=oci-1-1 \
-    --registry-username=dev-user \
-    --registry-password="$DEV_TOKEN" \
+    --registry-username="$PUSH_USER" \
+    --registry-password="$PUSH_SECRET" \
     --allow-insecure-registry \
     --allow-http-registry \
     "${REGISTRY_HOST}/${REPO_KEY}/${SIGNED_NAME}@${DIGEST}" 2>&1)" || SIGN_RC=$?

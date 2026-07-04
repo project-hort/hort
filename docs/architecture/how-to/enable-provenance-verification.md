@@ -325,8 +325,9 @@ quarantine window and re-verifies when the signature arrives (issue #13).
 > its child manifests are pushed first, then the index. cosign signs the
 > **index** digest (`cosign sign …@<index-digest>`), and the whole flow
 > above holds unchanged: the held index is signable via the
-> write-authorized-HEAD exemption, and the index rides the same
-> quarantine/scan/release/provenance lifecycle as any manifest. See
+> write-granted hold-read exemption (manifest HEAD **and** GET), and the
+> index rides the same quarantine/scan/release/provenance lifecycle as
+> any manifest. See
 > [ADR 0043](../../adr/0043-oci-image-index-support.md).
 
 > **The signing principal needs `read` AND `write` grants on a private
@@ -361,10 +362,14 @@ window:
 
 - A **pull** (anonymous or read-only manifest `GET`, and any layer blob)
   returns **503** — the image is not yet consumable.
-- A **write-authorized `HEAD`** on the manifest **succeeds** (200, headers,
-  empty body) — so the signer's cosign preflight resolves the digest and
-  can **attach** the signature. Only a `Write`-authorized caller sees this;
-  a non-writer's `HEAD` stays 503.
+- A **write-granted caller's `HEAD` and `GET`** on the manifest **succeed**
+  (200) — so the signer's cosign preflight resolves the digest, reads the
+  subject back, and can **attach** the signature. The decision keys on the
+  identity's **granted** write authority, not the presented token's scope:
+  under native tokens cosign's subject read rides a *pull-scoped*
+  capability JWT, and that read still serves when the identity's grants
+  carry `write` (ADR 0039 §10). A caller whose identity lacks the write
+  grant stays 503 on every read.
 - When the **signature arrives** (a subject-linked referrer via
   `--registry-referrers-mode=oci-1-1`), hort **re-verifies** the subject image;
   a valid signature emits `ProvenanceVerified` and the image **clears** and
@@ -384,8 +389,8 @@ missing signature is time-dependent; a wrong one is already wrong).
 > (e.g. the legacy tag mode). See `docs/metrics-catalog.md`.
 
 For the design rationale — provenance as an AND-precondition on the timer
-release arm, the fail-closed hold, and the write-authorized-HEAD
-existence-probe exemption — see
+release arm, the fail-closed hold, and the granted-write hold-read
+exemption — see
 [ADR 0027](../../adr/0027-artifact-provenance-verification.md) and
 [ADR 0039](../../adr/0039-keyed-provenance-verification.md).
 

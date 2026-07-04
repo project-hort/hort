@@ -817,11 +817,24 @@ fn derive_oci_token_endpoint_strings(
     public_base_url: Option<&url::Url>,
 ) -> Result<(String, String), ConfigError> {
     let url = public_base_url.ok_or(ConfigError::OciPublicBaseUrlMissing)?;
-    let host_str = url
+    let host = url
         .host_str()
         .filter(|s| !s.is_empty())
-        .ok_or(ConfigError::OciPublicBaseUrlMissing)?
-        .to_string();
+        .ok_or(ConfigError::OciPublicBaseUrlMissing)?;
+    // The audience keeps a non-default port (`host:port`): OCI clients
+    // echo the `service=` value from the `WWW-Authenticate` challenge
+    // VERBATIM, and the challenge derives its `service=` from the same
+    // public URL with the port intact (`hort-http-oci`'s `host_of`).
+    // The mint-side Step-0 gate compares the echoed value against this
+    // audience, so the two derivations must agree — a ported public URL
+    // (e.g. `http://hort-server:8080`) otherwise 400s every
+    // client-driven token exchange. `url.port()` is `None` for the
+    // scheme-default port, which the URL serialisation also drops, so
+    // portless and default-port URLs keep the bare-hostname audience.
+    let host_str = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
     let trimmed = url.as_str().trim_end_matches('/');
     let issuer = format!("{trimmed}/v2/auth");
     Ok((issuer, host_str))
@@ -3791,15 +3804,28 @@ mod tests {
     }
 
     /// HTTP scheme is accepted (operator may run behind a TLS-terminating
-    /// proxy with `http://internal-host` as the canonical URL).
+    /// proxy with `http://internal-host` as the canonical URL). A
+    /// non-default port stays in the audience: clients echo the
+    /// challenge's `service=` verbatim, and the challenge (`host_of` in
+    /// `hort-http-oci`) derives it from the same URL with the port
+    /// intact — the mint-side gate must expect the identical value.
     #[test]
     fn derive_oci_token_endpoint_strings_accepts_http_scheme() {
         let url: url::Url = "http://internal-host:8080".parse().unwrap();
         let (issuer, aud) = derive_oci_token_endpoint_strings(Some(&url)).expect("ok");
         assert_eq!(issuer, "http://internal-host:8080/v2/auth");
-        // `host_str` strips the port, which is the spec-correct shape:
-        // OCI clients echo `service=<hostname>`, never `service=<hostname:port>`.
-        assert_eq!(aud, "internal-host");
+        assert_eq!(aud, "internal-host:8080");
+    }
+
+    /// A scheme-default port is normalised away by the URL type and the
+    /// audience stays the bare hostname — matching the challenge side,
+    /// whose serialised URL drops the default port too.
+    #[test]
+    fn derive_oci_token_endpoint_strings_default_port_keeps_bare_hostname() {
+        let url: url::Url = "https://hort.example.com:443".parse().unwrap();
+        let (issuer, aud) = derive_oci_token_endpoint_strings(Some(&url)).expect("ok");
+        assert_eq!(issuer, "https://hort.example.com/v2/auth");
+        assert_eq!(aud, "hort.example.com");
     }
 
     /// **Boot-fail trigger.** `public_base_url = None` MUST surface

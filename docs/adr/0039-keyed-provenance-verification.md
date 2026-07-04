@@ -266,7 +266,8 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    the supported carriage).
 
 10. **The hold-read exemption covers a write-authorized manifest HEAD *and*
-    GET.** Under `provenance_mode: Required` the subject image is held
+    GET, and it keys on the principal's *granted* write authority.** Under
+    `provenance_mode: Required` the subject image is held
     `Quarantined` (ADR 0027 hold-until-signed amendment) until a signature
     arrives, so the signer needs a way to resolve the subject *before* the
     manifest is released. Keyed `cosign sign` resolves the subject manifest by a
@@ -278,10 +279,37 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
     bytes, and `crates/hort-http-oci/src/blobs.rs` keeps its existence probe
     **HEAD-only**, so a held layer's bytes are never served and the image cannot
     be pulled or run while held. The exemption is `Write`-only: every read
-    caller without `Write` (non-writer / anonymous / proxy read scope) and every
-    layer blob stay 503, so no runnable content leaves quarantine (only the
-    metadata manifest, only to a write-authorized caller) and the
-    transparent-proxy contract (quarantine invariant #5) is untouched.
+    caller whose identity lacks the Write grant (non-writer / anonymous / proxy
+    read scope) and every layer blob stay 503, so no runnable content leaves
+    quarantine (only the metadata manifest, only to a write-granted principal)
+    and the transparent-proxy contract (quarantine invariant #5) is untouched.
+
+    **"Write-authorized" means granted write authority — the grants leg alone,
+    not the presented token's cap.** Standard OCI clients
+    (cosign / go-containerregistry, skopeo, docker) scope a subject read as
+    `pull` — spec-correct, least-privilege — so under native tokens
+    (ADR 0036) the capability JWT presented on the subject read synthesizes a
+    read-only cap even when the principal's grants carry Write. A hold
+    exemption keyed on the full cap-intersected `Write` resolve therefore
+    never engages for a correctly-behaving signer: the held-manifest GET 503s,
+    `cosign sign` aborts, and the artifact expires `Rejected{Unsigned}`. The
+    two exemption sites — the held-manifest HEAD/GET predicate in
+    `manifests.rs` and the held-blob HEAD existence probe in `blobs.rs` —
+    evaluate `RepositoryAccessUseCase::resolve_granted_write`, which runs
+    `RbacEvaluator::authorize_granted` (the grants leg only, including the B1
+    fail-closed admin-claim/no-cap arm) instead of the grants ∧ cap
+    `authorize`. The read being exempted stays fully cap-gated: a pull-scoped
+    token satisfies the ordinary `resolve(Read)` path normally; only the
+    *held-visibility* decision consults identity-level authority.
+
+    **Bounded ADR 0036 exception + blast radius.** This is a deliberate,
+    narrow exception to the ADR 0036 cap-intersection invariant, bounded to
+    exactly these two exemption sites; every other authorization decision
+    keeps the two-leg AND. Blast radius of the exception: a stolen pull-scoped
+    token of a write-granted principal can read *held manifests* (and observe
+    held-blob existence) in repositories that principal can write —
+    metadata-only, principal-bound, layer bytes still gated. The same stolen
+    token could not push, and a stolen token of a non-writer gains nothing.
 
 11. **A verified subject's clearance cascades to its signed constituents.**
     cosign signs only the **top-level digest** — the index for a multi-arch

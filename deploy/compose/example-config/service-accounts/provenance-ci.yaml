@@ -1,0 +1,19 @@
+# ServiceAccount (e2e): the native-token-mode pusher/signer for
+# scripts/native-tests/scenarios/quarantine/provenance-push-then-sign.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation): under the
+# native-tokens compose overlay the scenario admin-mints an hort_svc_* token
+# for this SA (`POST /api/v1/admin/users/:id/tokens`) and runs the real OCI
+# `/v2/auth` token dance with it — cosign's subject read then rides a
+# pull-scoped capability JWT while this identity's grants carry write, the
+# exact shape the quarantine hold-read exemption (ADR 0039 §10) keys on.
+# Authority is the sibling serviceAccount-subject PermissionGrants in
+# auth/provenance-ci-{read,write}.yaml — the OCI capability-token surface
+# resolves User-subject grants only (claims stay empty there, ADR 0036), so
+# the claims-based dev-user grants cannot back a native-token principal.
+# Inert in legacy (no-overlay) runs: the SA row exists, nothing mints for it.
+apiVersion: project-hort.de/v1beta1
+kind: ServiceAccount
+metadata:
+  name: provenance-ci
+spec: {}
