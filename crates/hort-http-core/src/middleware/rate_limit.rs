@@ -70,6 +70,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{MatchedPath, Request};
 use axum::http::{Method, Request as HttpRequest, StatusCode};
@@ -184,11 +185,27 @@ impl KeyExtractor for TrustAwareKeyExtractor {
 // Governor layer construction
 // ---------------------------------------------------------------------------
 
-/// Build a [`GovernorConfig`] for N requests per 60s window, keyed by
-/// [`TrustAwareKeyExtractor`]. "N per minute" is encoded as burst = N,
-/// replenishment = 60s (1 token per minute, up to N tokens buffered). The
-/// first N requests within a 60s window pass through; N+1 is rejected with
-/// 429 + `Retry-After`.
+/// GCRA emission interval for a "`per_min` requests per minute" cap: one
+/// token replenished every `60s / per_min`, so the bucket sustains exactly
+/// `per_min` tokens per minute (with a burst of `per_min`).
+///
+/// This is the load-bearing detail behind the `*_PER_MIN` caps. tower_governor's
+/// `per_second(n)` / `governor`'s `Quota::with_period(d)` set the interval to
+/// replenish ONE token — so a fixed 60s interval sustains 1 token/min regardless
+/// of the cap. Dividing 60s by the cap restores the intended per-minute rate.
+///
+/// `per_min` is guaranteed non-zero by `Config::from_env` (and the
+/// `build_governor_config` assert), so the division never panics.
+fn emission_period(per_min: u32) -> Duration {
+    Duration::from_secs(60) / per_min
+}
+
+/// Build a [`GovernorConfig`] for `burst` requests per minute (sustained),
+/// keyed by [`TrustAwareKeyExtractor`]. Encoded as a token bucket: capacity
+/// = `burst`, one token replenished every [`emission_period`]`(burst)` =
+/// `60s / burst`. A burst of `burst` is admitted immediately; sustained
+/// traffic is capped at `burst`/minute; over-cap requests get 429 +
+/// `Retry-After`.
 ///
 /// Panics on `burst == 0` — operator would have fat-fingered the env var,
 /// and `Config::from_env` in `hort-server` should have already rejected zero
@@ -201,10 +218,11 @@ fn build_governor_config(
         burst > 0,
         "rate_limit burst must be > 0 — Config::from_env should have rejected zero"
     );
-    // `per_second(60)` here names the REPLENISHMENT INTERVAL (one token per
-    // 60 seconds), not "per-second rate". tower_governor's API is the
-    // `governor` crate's token-bucket: burst is the bucket capacity,
-    // period is the cadence at which the bucket refills by one.
+    // The token bucket is `burst` = capacity and one token replenished every
+    // `emission_period(burst)` = `60s / burst`. That makes the SUSTAINED rate
+    // exactly `burst` tokens per minute — matching the `*_PER_MIN` semantics
+    // the caps carry — with a burst of `burst`. (A fixed 60s period would
+    // sustain only 1 token/min regardless of the cap.)
     //
     // `methods`: when set, the governor layer ONLY limits the listed
     // methods; everything else passes through. This is how we express
@@ -217,7 +235,7 @@ fn build_governor_config(
     // `methods(...)` call (which takes `&mut Self`) lands on the right
     // generic instantiation.
     let mut builder = GovernorConfigBuilder::default()
-        .per_second(60)
+        .period(emission_period(burst))
         .burst_size(burst)
         .key_extractor(TrustAwareKeyExtractor);
     if let Some(methods) = methods {
@@ -425,6 +443,55 @@ mod tests {
         RequestTrust {
             client_ip: ip.parse().unwrap(),
             public_url: url::Url::parse("http://hort-server/").unwrap(),
+        }
+    }
+
+    // --- Root-cause regression: a `*_PER_MIN` cap must SUSTAIN that many
+    // requests per minute, not collapse to 1/min after the initial burst.
+    // The pre-fix `.per_second(60)` set a fixed 60s replenish interval,
+    // sustaining 1 token/min regardless of the cap (~60-300x too tight). ---
+
+    #[test]
+    fn emission_period_encodes_per_minute_rate() {
+        // One token every 60s/cap → `cap` tokens replenished per minute.
+        assert_eq!(emission_period(60), Duration::from_secs(1));
+        assert_eq!(emission_period(300), Duration::from_millis(200));
+        // The degenerate cap=1 is the ONLY value for which a fixed 60s
+        // interval was ever correct — proving the old constant was a
+        // cap=1 special case, not the general rule.
+        assert_eq!(emission_period(1), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn governor_config_sustains_cap_per_minute() {
+        use governor::clock::FakeRelativeClock;
+        use governor::{Quota, RateLimiter};
+        use std::num::NonZeroU32;
+
+        for cap in [60u32, 300] {
+            let clock = FakeRelativeClock::default();
+            // Same quota shape `build_governor_config` produces:
+            // tower_governor's `finish()` is `Quota::with_period(period)
+            // .allow_burst(burst)`.
+            let quota = Quota::with_period(emission_period(cap))
+                .expect("non-zero period")
+                .allow_burst(NonZeroU32::new(cap).expect("non-zero cap"));
+            let lim = RateLimiter::direct_with_clock(quota, clock.clone());
+
+            // Burst of `cap` admitted immediately; burst+1 rejects.
+            let burst_ok = (0..cap).filter(|_| lim.check().is_ok()).count() as u32;
+            assert_eq!(burst_ok, cap, "cap={cap}: full burst should pass");
+            assert!(lim.check().is_err(), "cap={cap}: burst+1 must reject");
+
+            // After one minute the bucket admits ~cap MORE (sustained
+            // cap/min). The pre-fix fixed-60s-period bug refilled only 1.
+            clock.advance(Duration::from_secs(60));
+            let refilled = (0..cap * 2).filter(|_| lim.check().is_ok()).count() as u32;
+            assert!(
+                refilled >= cap - 1,
+                "cap={cap}: expected ~{cap}/min sustained, only {refilled} refilled \
+                 in a minute (the fixed-60s-period bug sustains 1/min)"
+            );
         }
     }
 
