@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The inbound rate limiter now sustains its configured per-minute rate.** The
+  auth (`HORT_RATELIMIT_AUTH_PER_MIN`, default 60) and write
+  (`HORT_RATELIMIT_WRITE_PER_MIN`, default 300) token buckets replenished one
+  token per minute regardless of the cap, so after the initial burst, sustained
+  traffic was throttled to ~1 request/minute — roughly 60×/300× tighter than
+  documented — which persistently `429`'d automated writers such as CI pushing
+  multi-layer images. Tokens now replenish at the configured per-minute rate.
+
 ## [0.9.8] - 2026-07-05
 
 Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
