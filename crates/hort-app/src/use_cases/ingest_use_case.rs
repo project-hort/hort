@@ -1357,6 +1357,18 @@ impl IngestUseCase {
     /// declared-digest disagreement). The CAS hash is the OCI digest, so the
     /// Origin-pillar checksum invariant holds without the verification
     /// pipeline.
+    /// `subject_content_hash` is the manifest's `subject.digest` — the
+    /// content hash of the **subject image** this referrer signs, within
+    /// the same repository (`Some` iff the manifest carried a `subject`;
+    /// always `Some` on the hosted keyed-signing push path since OCI
+    /// referrers mode sets it, ADR 0039 §8 / design §2 S3). When present,
+    /// the S3 hook (design §2 S3) resolves that subject artifact and
+    /// enqueues a best-effort `provenance-verify` for it so a held image
+    /// can reach `Cleared` within seconds of `cosign sign`, rather than
+    /// waiting for the expiry backstop (S4). A `None`, an unresolvable
+    /// subject, or an enqueue failure is a warn-and-continue no-op — the
+    /// signature manifest ingest itself never fails on the hook, and the
+    /// S4 expiry backstop covers a lost enqueue.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, payload_metadata, stream))]
     pub async fn ingest_signature_manifest(
@@ -1367,6 +1379,7 @@ impl IngestUseCase {
         actor: ApiActor,
         payload_metadata: serde_json::Value,
         declared_digest: ContentHash,
+        subject_content_hash: Option<ContentHash>,
         stream: Box<dyn AsyncRead + Send + Unpin>,
     ) -> AppResult<IngestOutcome> {
         // 1. Store the manifest bytes in CAS. `put` returns the SHA-256 of
@@ -1464,6 +1477,78 @@ impl IngestUseCase {
             )
             .await
             .map_err(AppError::Domain)?;
+
+        // S3 — re-verify the subject on signature arrival (design §2 S3).
+        //
+        // A subject-based signature referrer just landed. Resolve the
+        // subject image (repo + `subject.digest` content hash → its
+        // artifact UUID) and enqueue a `provenance-verify` for THAT
+        // artifact so, if it is held `Pending` under `provenance_mode:
+        // Required`, the just-arrived signature clears it promptly rather
+        // than waiting for the S4 expiry backstop.
+        //
+        // Best-effort, NON-gating (mirrors the prefetch-cascade posture,
+        // NOT the release-gating atomic ingest enqueues): it rides the
+        // raw `jobs` handle, runs strictly AFTER the signature-manifest
+        // commit, and warn-and-continues on any failure — a lost enqueue
+        // strands nothing because the S4 expiry backstop
+        // (`QuarantineUseCase::release_expired`) re-drives the terminal
+        // decision at the window edge. A signature with no resolvable
+        // subject artifact (upstream-only subject, cross-repo, or a
+        // manifest with no `subject`) is a no-op, not an error.
+        if let Some(subject_hash) = subject_content_hash {
+            match self
+                .artifacts
+                .find_by_repo_and_checksum(repository_id, &subject_hash)
+                .await
+            {
+                Ok(Some(subject)) => {
+                    let params = serde_json::json!({ "artifact_id": subject.id });
+                    match self
+                        .jobs
+                        .enqueue_task(
+                            "provenance-verify",
+                            &params,
+                            None, // actor_id: system-driven signature-arrival hook
+                            0i16, // default tier (matches the ingest-time verify enqueue)
+                            "ingest",
+                            None, // no idempotency key — a re-verify is harmless (idempotent verdict)
+                        )
+                        .await
+                    {
+                        Ok(outcome) => tracing::info!(
+                            signature_artifact_id = %artifact_id,
+                            subject_artifact_id = %subject.id,
+                            repository_id = %repository_id,
+                            ?outcome,
+                            "signature arrival: enqueued provenance-verify for subject artifact",
+                        ),
+                        Err(e) => tracing::warn!(
+                            signature_artifact_id = %artifact_id,
+                            subject_artifact_id = %subject.id,
+                            repository_id = %repository_id,
+                            error = %e,
+                            "signature arrival: subject provenance-verify enqueue failed \
+                             (best-effort — the S4 expiry backstop re-drives the decision)",
+                        ),
+                    }
+                }
+                Ok(None) => tracing::warn!(
+                    signature_artifact_id = %artifact_id,
+                    repository_id = %repository_id,
+                    subject_hash = %subject_hash,
+                    "signature arrival: no subject artifact resolves for subject.digest \
+                     in this repository; skipping re-verify (no-op)",
+                ),
+                Err(e) => tracing::warn!(
+                    signature_artifact_id = %artifact_id,
+                    repository_id = %repository_id,
+                    error = %e,
+                    "signature arrival: subject artifact lookup failed; \
+                     skipping re-verify (best-effort — S4 backstop covers it)",
+                ),
+            }
+        }
 
         Ok(IngestOutcome {
             artifact,
@@ -12034,7 +12119,8 @@ mod tests {
             // ProvenanceMode (VerifyIfPresent) would BOTH fire on the
             // generic path — proving the narrow path actively suppresses
             // all three.
-            let (uc, lifecycle, _storage, repos, _projections, jobs) = sig_make_use_case();
+            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts) =
+                sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -12047,6 +12133,7 @@ mod tests {
                     sample_actor(),
                     serde_json::Value::Null,
                     upstream_digest.clone(),
+                    None, // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
                 )
                 .await
@@ -12105,7 +12192,7 @@ mod tests {
         let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, lifecycle, _storage, repos, _projections, jobs) =
+            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts) =
                 sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
@@ -12119,6 +12206,7 @@ mod tests {
                     sample_actor(),
                     serde_json::Value::Null,
                     upstream_digest,
+                    None, // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
                 )
                 .await
@@ -12166,7 +12254,8 @@ mod tests {
         let wrong_digest: ContentHash = ("a".repeat(64)).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, lifecycle, _storage, repos, _projections, jobs) = sig_make_use_case();
+            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts) =
+                sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -12179,6 +12268,7 @@ mod tests {
                     sample_actor(),
                     serde_json::Value::Null,
                     wrong_digest,
+                    None, // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
                 )
                 .await
@@ -12195,10 +12285,172 @@ mod tests {
         });
     }
 
+    // =====================================================================
+    // S3 — re-verify the subject on signature arrival (design §2 S3).
+    // A subject-based signature referrer, on ingest, enqueues exactly ONE
+    // best-effort `provenance-verify` for the SUBJECT artifact (resolved
+    // from repo + subject.digest content hash). Best-effort / non-gating:
+    // an unresolvable subject or an enqueue failure is a warn, never an
+    // ingest error.
+    // =====================================================================
+
+    /// S3 happy path: a signature referrer whose `subject.digest`
+    /// resolves to a seeded subject artifact enqueues exactly one
+    /// `provenance-verify` carrying the SUBJECT's `artifact_id` (not the
+    /// signature manifest's own id).
+    #[test]
+    fn ingest_signature_manifest_enqueues_subject_provenance_verify() {
+        let content: &[u8] = b"cosign bundle referrer manifest bytes (s3)";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+        // The subject image's content hash — a distinct, valid sha256.
+        let subject_hash: ContentHash = ("b".repeat(64)).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _lifecycle, _storage, repos, _projections, jobs, artifacts) =
+                sig_make_use_case();
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+
+            // Seed the SUBJECT artifact in the same repo with the subject
+            // content hash so `find_by_repo_and_checksum` resolves it.
+            let mut subject = sample_artifact(QuarantineStatus::Quarantined);
+            subject.repository_id = repo_id;
+            subject.sha256_checksum = subject_hash.clone();
+            let subject_id = subject.id;
+            artifacts.insert(subject);
+
+            uc.ingest_signature_manifest(
+                repo_id,
+                oci_coords(),
+                "application/vnd.oci.image.manifest.v1+json".into(),
+                sample_actor(),
+                serde_json::Value::Null,
+                upstream_digest,
+                Some(subject_hash),
+                content_stream(content),
+            )
+            .await
+            .expect("signature-manifest ingest must succeed");
+
+            // Exactly ONE generic enqueue: a provenance-verify for the
+            // SUBJECT artifact id (system-driven, actor_id None).
+            let calls = jobs.enqueue_calls();
+            assert_eq!(
+                calls.len(),
+                1,
+                "S3 enqueues exactly one provenance-verify for the subject"
+            );
+            let (kind, params, actor_id) = &calls[0];
+            assert_eq!(kind, "provenance-verify");
+            assert_eq!(
+                params.get("artifact_id").and_then(|v| v.as_str()),
+                Some(subject_id.to_string().as_str()),
+                "the enqueue must carry the SUBJECT artifact id, not the signature manifest's"
+            );
+            assert!(
+                actor_id.is_none(),
+                "the signature-arrival hook is system-driven (no actor_id)"
+            );
+            // No idempotency key — a re-verify is a harmless idempotent
+            // verdict.
+            assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
+        });
+    }
+
+    /// S3 no-op: a signature referrer whose `subject.digest` resolves to
+    /// NO artifact in this repository enqueues nothing (warn, not an
+    /// error — the ingest still succeeds).
+    #[test]
+    fn ingest_signature_manifest_unresolvable_subject_is_noop_not_error() {
+        let content: &[u8] = b"cosign bundle referrer manifest bytes (s3 noop)";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+        // A subject hash that matches no seeded artifact.
+        let subject_hash: ContentHash = ("c".repeat(64)).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _lifecycle, _storage, repos, _projections, jobs, _artifacts) =
+                sig_make_use_case();
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+            // Deliberately seed NO subject artifact.
+
+            let outcome = uc
+                .ingest_signature_manifest(
+                    repo_id,
+                    oci_coords(),
+                    "application/vnd.oci.image.manifest.v1+json".into(),
+                    sample_actor(),
+                    serde_json::Value::Null,
+                    upstream_digest,
+                    Some(subject_hash),
+                    content_stream(content),
+                )
+                .await
+                .expect("an unresolvable subject is a no-op, not an ingest error");
+
+            assert_eq!(outcome.artifact.quarantine_status, QuarantineStatus::None);
+            assert!(
+                jobs.enqueue_calls().is_empty(),
+                "an unresolvable subject enqueues NOTHING (warn-and-continue no-op)"
+            );
+        });
+    }
+
+    /// S3 best-effort: a subject resolves but the enqueue itself fails —
+    /// the ingest STILL succeeds (warn-and-continue; the S4 expiry
+    /// backstop covers the lost enqueue).
+    #[test]
+    fn ingest_signature_manifest_subject_enqueue_failure_does_not_fail_ingest() {
+        let content: &[u8] = b"cosign bundle referrer manifest bytes (s3 enqueue-fail)";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+        let subject_hash: ContentHash = ("d".repeat(64)).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _lifecycle, _storage, repos, _projections, jobs, artifacts) =
+                sig_make_use_case();
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+
+            let mut subject = sample_artifact(QuarantineStatus::Quarantined);
+            subject.repository_id = repo_id;
+            subject.sha256_checksum = subject_hash.clone();
+            artifacts.insert(subject);
+
+            // The subject resolves, but the enqueue port errors.
+            jobs.fail_next_enqueue(DomainError::Invariant("boom".into()));
+
+            let outcome = uc
+                .ingest_signature_manifest(
+                    repo_id,
+                    oci_coords(),
+                    "application/vnd.oci.image.manifest.v1+json".into(),
+                    sample_actor(),
+                    serde_json::Value::Null,
+                    upstream_digest,
+                    Some(subject_hash),
+                    content_stream(content),
+                )
+                .await
+                .expect("a best-effort enqueue failure must NOT fail the ingest");
+
+            assert_eq!(outcome.artifact.quarantine_status, QuarantineStatus::None);
+            // The enqueue was attempted exactly once (and failed).
+            assert_eq!(
+                jobs.enqueue_calls().len(),
+                1,
+                "the enqueue is attempted once even though it fails"
+            );
+        });
+    }
+
     /// `sig_make_use_case` — empty policy + provenance-capable {"oci"}, so
     /// the DEFAULT policy (24h quarantine + Trivy) and default
     /// ProvenanceMode would BOTH fire on the generic path; the narrow path
-    /// must suppress them. Hands back the lifecycle + jobs mocks.
+    /// must suppress them. Hands back the lifecycle + jobs + artifacts
+    /// mocks.
     #[allow(clippy::type_complexity)]
     fn sig_make_use_case() -> (
         IngestUseCase,
@@ -12207,6 +12459,7 @@ mod tests {
         Arc<MockRepositoryRepository>,
         Arc<MockPolicyProjectionRepository>,
         Arc<MockJobsRepository>,
+        Arc<MockArtifactRepository>,
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
@@ -12224,7 +12477,7 @@ mod tests {
         let uc = IngestUseCase::new(
             storage.clone(),
             lifecycle.clone(),
-            artifacts,
+            artifacts.clone(),
             repos.clone(),
             crate::event_store_publisher::wrap_for_test(events),
             curation_rules,
@@ -12238,6 +12491,14 @@ mod tests {
         )
         .with_provenance_capable_formats(["oci".to_string()]);
 
-        (uc, lifecycle, storage, repos, policy_projections, jobs)
+        (
+            uc,
+            lifecycle,
+            storage,
+            repos,
+            policy_projections,
+            jobs,
+            artifacts,
+        )
     }
 }

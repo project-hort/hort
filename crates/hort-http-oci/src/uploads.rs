@@ -52,7 +52,9 @@ use super::coords::oci_blob_coords;
 use super::digest::{parse_digest, DigestParse};
 use super::error::OciError;
 use super::name::validate_oci_name;
-use super::upload_session::{append_chunk, finalize, ContentRange, InitiateResult};
+use super::upload_session::{
+    append_chunk, append_chunk_streaming, finalize, ContentRange, InitiateResult, TrailingBody,
+};
 use super::OciHttpConfig;
 
 // ---------------------------------------------------------------------------
@@ -88,9 +90,24 @@ pub fn router() -> Router<Arc<AppContext>> {
             "/v2/:repo_key/*tail",
             axum::routing::post(post_upload_dispatch)
                 .patch(patch_upload_dispatch)
-                .put(put_upload_dispatch),
+                .put(put_upload_dispatch)
+                .delete(delete_upload_route),
         )
         .layer(Extension(OciHttpConfig::default()))
+}
+
+/// Thin route wrapper over [`delete_upload_dispatch`] for the standalone
+/// [`router`]. The production route tree dispatches DELETE through
+/// [`super::delete_dispatch`] (which shares the wildcard with manifest
+/// delete); this standalone router carries only the upload surface, so
+/// the wildcard DELETE maps straight to the upload-cancel handler.
+async fn delete_upload_route(
+    access: WriteRepoAccess,
+    State(ctx): State<Arc<AppContext>>,
+    oci_cfg: Extension<OciHttpConfig>,
+    BoundedPath((repo_key, tail)): BoundedPath<(String, String)>,
+) -> Response {
+    delete_upload_dispatch(access, State(ctx), oci_cfg, &repo_key, &tail).await
 }
 
 /// Tail-parse output specialised for blob upload routes.
@@ -203,6 +220,7 @@ pub(crate) async fn post_upload_dispatch(
                 actor,
                 &principal,
                 oci_cfg.max_sessions_per_principal,
+                oci_cfg.session_max_age(),
             )
             .await
         }
@@ -221,6 +239,7 @@ pub(crate) async fn post_upload_dispatch(
                 repo_id,
                 actor,
                 oci_cfg.max_sessions_per_principal,
+                oci_cfg.session_max_age(),
             )
             .await
         }
@@ -265,6 +284,7 @@ async fn handle_cross_mount(
     // source repo collapses to standard initiate semantics. The per-`(repo,
     // principal)` cap still applies on that fall-through.
     max_sessions_per_principal: u32,
+    session_max_age: std::time::Duration,
 ) -> Response {
     let hash = match parse_digest(mount_digest) {
         DigestParse::Ok(h) => h,
@@ -302,6 +322,7 @@ async fn handle_cross_mount(
                 target_repo_id,
                 actor,
                 max_sessions_per_principal,
+                session_max_age,
             )
             .await;
         }
@@ -494,7 +515,7 @@ fn parse_content_range(value: &str) -> Result<ContentRange, ContentRangeParseErr
 }
 
 /// Tail-parse output for PATCH requests.  `<name>/blobs/uploads/<session_id>`.
-enum PatchTail<'a> {
+pub(crate) enum PatchTail<'a> {
     AppendChunk { name: &'a str, session_id: Uuid },
 }
 
@@ -502,7 +523,14 @@ enum PatchTail<'a> {
 /// not match the `<name>/blobs/uploads/<uuid>` shape — the caller
 /// maps that to `NAME_UNKNOWN` (consistent with the POST branch's
 /// wrong-suffix handling).
-fn parse_patch_tail(tail: &str) -> Option<PatchTail<'_>> {
+///
+/// `pub(crate)` so the top-level DELETE dispatcher can use
+/// `parse_patch_tail(tail).is_some()` as its upload-cancel branch
+/// predicate — a precise upload-tail match, rather than an unanchored
+/// `tail.contains("/blobs/uploads/")` substring test that a
+/// pathological manifest name (`x/blobs/uploads/y/manifests/latest`)
+/// could spoof into the wrong (Write-gated cancel) branch.
+pub(crate) fn parse_patch_tail(tail: &str) -> Option<PatchTail<'_>> {
     // Find the last occurrence of `/blobs/uploads/` and split there.
     let idx = tail.rfind("/blobs/uploads/")?;
     let name = &tail[..idx];
@@ -527,6 +555,7 @@ fn parse_patch_tail(tail: &str) -> Option<PatchTail<'_>> {
 pub(crate) async fn patch_upload_dispatch(
     access: WriteRepoAccess,
     State(ctx): State<Arc<AppContext>>,
+    Extension(oci_cfg): Extension<OciHttpConfig>,
     BoundedPath((repo_key, tail)): BoundedPath<(String, String)>,
     request: Request<Body>,
 ) -> Response {
@@ -582,27 +611,33 @@ pub(crate) async fn patch_upload_dispatch(
         }
     };
 
-    // `Content-Length` is required per the spec.  We trust it as the
-    // declared body length; `append_chunk` cross-checks that the
-    // content-range span matches and that the staging append actually
-    // landed `body_length` bytes.
-    let Some(content_length) = headers.get(CONTENT_LENGTH) else {
-        return OciError::BlobUploadInvalid {
-            message: "missing Content-Length header".into(),
+    // `Content-Length` is OPTIONAL on PATCH — same as `Content-Range`
+    // above. The dominant client (containers/image — skopeo, podman,
+    // buildah) streams the blob via `Transfer-Encoding: chunked`, which
+    // per RFC 7230 §3.3.2 MUST NOT carry a `Content-Length`; the Docker
+    // Registry V2 reference implementation and zot accept it. When
+    // present we trust it as the declared body length and `append_chunk`
+    // cross-checks it; when absent `append_chunk_streaming` streams the
+    // body bounded by `publish_body_limit_bytes` and treats the actual
+    // bytes landed as authoritative. A present-but-malformed value is
+    // still rejected.
+    let body_length: Option<u64> = match headers.get(CONTENT_LENGTH) {
+        None => None,
+        Some(content_length) => {
+            let Ok(content_length_str) = content_length.to_str() else {
+                return OciError::BlobUploadInvalid {
+                    message: "Content-Length header is not valid ASCII".into(),
+                }
+                .into_response();
+            };
+            let Ok(parsed) = content_length_str.trim().parse::<u64>() else {
+                return OciError::BlobUploadInvalid {
+                    message: "Content-Length is not a u64".into(),
+                }
+                .into_response();
+            };
+            Some(parsed)
         }
-        .into_response();
-    };
-    let Ok(content_length_str) = content_length.to_str() else {
-        return OciError::BlobUploadInvalid {
-            message: "Content-Length header is not valid ASCII".into(),
-        }
-        .into_response();
-    };
-    let Ok(body_length) = content_length_str.trim().parse::<u64>() else {
-        return OciError::BlobUploadInvalid {
-            message: "Content-Length is not a u64".into(),
-        }
-        .into_response();
     };
 
     let max_bytes: u64 = ctx
@@ -617,17 +652,36 @@ pub(crate) async fn patch_upload_dispatch(
     let reader = StreamReader::new(body_stream.map_err(std::io::Error::other));
     let stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(reader);
 
-    match append_chunk(
-        &ctx,
-        session_id,
-        content_range,
-        stream,
-        body_length,
-        max_bytes,
-        repo_id,
-    )
-    .await
-    {
+    // Content-Length present → declared-length path; absent (streaming
+    // Transfer-Encoding: chunked) → the read is bounded in-stream by the cap.
+    let result = match body_length {
+        Some(len) => {
+            append_chunk(
+                &ctx,
+                session_id,
+                content_range,
+                stream,
+                len,
+                max_bytes,
+                repo_id,
+                oci_cfg.session_max_age(),
+            )
+            .await
+        }
+        None => {
+            append_chunk_streaming(
+                &ctx,
+                session_id,
+                content_range,
+                stream,
+                max_bytes,
+                repo_id,
+                oci_cfg.session_max_age(),
+            )
+            .await
+        }
+    };
+    match result {
         Ok(new_record) => {
             patch_success_response(&repo_key, &name, session_id, new_record.bytes_received)
         }
@@ -743,6 +797,7 @@ pub struct PutQuery {
 pub(crate) async fn put_upload_dispatch(
     access: WriteRepoAccess,
     State(ctx): State<Arc<AppContext>>,
+    Extension(oci_cfg): Extension<OciHttpConfig>,
     BoundedPath((repo_key, tail)): BoundedPath<(String, String)>,
     Query(query): Query<PutQuery>,
     request: Request<Body>,
@@ -803,34 +858,27 @@ pub(crate) async fn put_upload_dispatch(
 
     // Extract headers before moving `request` into the body reader.
     let headers = request.headers().clone();
-    let body_length = headers
+    // Content-Length is OPTIONAL on the finalize PUT (mirrors the PATCH path).
+    // `None` = `Transfer-Encoding: chunked` (RFC 7230 §3.3.2 forbids a
+    // Content-Length alongside chunked TE); `Some(0)` = the dominant empty PUT
+    // that closes a session whose PATCH carried all bytes; `Some(n>0)` = the
+    // two-phase POST→PUT that folds the whole blob into the finalize request.
+    let content_length: Option<u64> = headers
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+        .and_then(|s| s.trim().parse::<u64>().ok());
 
-    // Construct the trailing-body tuple if the client sent one.  A
-    // zero-length PUT is the dominant path for the three-phase
-    // protocol (the final PATCH carried all bytes); a length > 0 is
-    // the two-phase POST→PUT pattern (skopeo, docker, podman,
-    // containers/image) where the client folds the entire blob into
-    // the finalize request.
+    // A trailing body is present unless the client explicitly declared it empty
+    // (`Content-Length: 0`). An absent Content-Length is a streaming (chunked)
+    // body, which may itself be empty — a zero-byte streamed append is a no-op.
     //
-    // `Content-Range` is OPTIONAL on a non-empty PUT body. The OCI
-    // The OCI distribution spec requires `Content-Range` on chunked
-    // PATCH but not on the two-phase finalize PUT — and in
-    // practice none of the major clients send it. When absent the
-    // server treats the body as a chunk anchored at the session's
-    // current `bytes_received`; `upload_session::finalize_core`
-    // performs that synthesis once it has loaded the session record.
-    // When present, we still parse + validate strictly and pass the
-    // parsed range through, so chunk-aware clients keep getting the
-    // tight invariant check.
-    let trailing_body: Option<(
-        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        Option<ContentRange>,
-        u64,
-    )> = if body_length > 0 {
+    // `Content-Range` is OPTIONAL on a non-empty PUT body: the OCI spec requires
+    // it on chunked PATCH but not on the two-phase finalize PUT, and no major
+    // client sends it. When absent, `finalize_core` anchors the body at the
+    // session's current `bytes_received`; when present it is parsed + validated
+    // strictly and threaded through for chunk-aware clients.
+    let has_trailing_body = !matches!(content_length, Some(0));
+    let trailing_body: Option<TrailingBody> = if has_trailing_body {
         let content_range = match headers.get("Content-Range") {
             None => None,
             Some(range_header) => {
@@ -851,7 +899,7 @@ pub(crate) async fn put_upload_dispatch(
         let body_stream = request.into_body().into_data_stream();
         let reader = StreamReader::new(body_stream.map_err(std::io::Error::other));
         let stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(reader);
-        Some((stream, content_range, body_length))
+        Some((stream, content_range, content_length))
     } else {
         // No body — drop the `Request` explicitly to drain any
         // unread stream state so a pathological client that sent
@@ -870,6 +918,7 @@ pub(crate) async fn put_upload_dispatch(
         repo_id,
         &name,
         max_bytes,
+        oci_cfg.session_max_age(),
     )
     .await
     {
@@ -919,6 +968,66 @@ fn map_put_error(err: AppError, session_id: Uuid) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// DELETE (cancel upload)
+// ---------------------------------------------------------------------------
+
+/// Cancel an in-flight OCI blob upload session
+/// (`DELETE /v2/:repo_key/*tail` where the tail is
+/// `<name>/blobs/uploads/<uuid>`).
+///
+/// Per the OCI Distribution Spec ("Canceling an Upload"): "Clients
+/// SHOULD send this request when aborting a blob upload, releasing
+/// server resources … If successful, the response SHOULD be a
+/// `204 No Content`." This releases the per-`(repo, principal)`
+/// live-session set member and the staging bytes via the shared
+/// [`upload_session::cancel`] path, giving a well-behaved client an
+/// immediate slot release instead of waiting for the session to age
+/// out.
+///
+/// The tail is parsed with [`parse_patch_tail`] (PATCH / PUT / DELETE
+/// share the `<name>/blobs/uploads/<uuid>` shape). A tail that does not
+/// match maps to `NAME_UNKNOWN`; an unknown / TTL-expired / foreign-repo
+/// session maps to `BLOB_UPLOAD_UNKNOWN` (anti-enumeration — never
+/// leaking that a session for that UUID lives in another repo). Access
+/// is `WriteRepoAccess`, extracted by the [`super::delete_dispatch`]
+/// method dispatcher before this handler runs.
+pub(crate) async fn delete_upload_dispatch(
+    access: WriteRepoAccess,
+    State(ctx): State<Arc<AppContext>>,
+    Extension(oci_cfg): Extension<OciHttpConfig>,
+    repo_key: &str,
+    tail: &str,
+) -> Response {
+    let (name, session_id) = match parse_patch_tail(tail) {
+        Some(PatchTail::AppendChunk { name, session_id }) => (name.to_string(), session_id),
+        None => {
+            return OciError::NameUnknown {
+                repository: format!("{repo_key}/{tail}"),
+            }
+            .into_response();
+        }
+    };
+    if let Err(e) = validate_oci_name(&name) {
+        return super::name_invalid_response(e);
+    }
+
+    let repo_id = access.repository.id;
+
+    match super::upload_session::cancel(&ctx, session_id, repo_id, oci_cfg.session_max_age()).await
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, Body::empty()).into_response(),
+        Err(AppError::Domain(DomainError::NotFound { .. })) => OciError::BlobUploadUnknown {
+            session_id: session_id.to_string(),
+        }
+        .into_response(),
+        Err(other) => {
+            tracing::error!(error = %other, "OCI upload-session cancel failed");
+            OciError::Internal.into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Three-phase initiate
 // ---------------------------------------------------------------------------
 
@@ -929,11 +1038,15 @@ fn map_put_error(err: AppError, session_id: Uuid) -> Response {
 /// [`super::upload_session::initiate`]. A
 /// [`InitiateResult::CapExceeded`] surfaces as `429 Too Many Requests`
 /// with the spec's `TOOMANYREQUESTS` envelope and an advisory
-/// `Retry-After` header. Cap rejections do NOT leak the cap value or
-/// the principal's identity in the response — the caller already
-/// knows their own session count via 4xx-rate observation, and
-/// disclosing the cap value to an attacker provides them a precise
-/// abuse budget.
+/// `Retry-After` header. A [`InitiateResult::Contended`] (the cap
+/// reconcile CAS loop lost every race in its bounded window — transient
+/// contention, not a cap breach) surfaces as `503 Service Unavailable`
+/// with the SAME short advisory `Retry-After`. Cap rejections do NOT
+/// leak the cap value or the principal's identity in the response — the
+/// caller already knows their own session count via 4xx-rate
+/// observation, and disclosing the cap value to an attacker provides
+/// them a precise abuse budget.
+#[allow(clippy::too_many_arguments)]
 async fn handle_initiate(
     ctx: Arc<AppContext>,
     repo_key: &str,
@@ -941,17 +1054,39 @@ async fn handle_initiate(
     repo_id: Uuid,
     actor: ApiActor,
     max_sessions_per_principal: u32,
+    session_max_age: std::time::Duration,
 ) -> Response {
-    match super::upload_session::initiate(&ctx, repo_id, actor, max_sessions_per_principal).await {
+    match super::upload_session::initiate(
+        &ctx,
+        repo_id,
+        actor,
+        max_sessions_per_principal,
+        session_max_age,
+    )
+    .await
+    {
         Ok(InitiateResult::Created(outcome)) => {
             initiate_response(repo_key, name, outcome.session_id)
         }
         Ok(InitiateResult::CapExceeded) => {
-            // 429 + advisory `Retry-After`. Use the OCI session TTL
-            // (3600s) as the hint — it's the upper bound on how long
-            // the slot can stay occupied without being released.
+            // 429 + a SHORT bounded advisory `Retry-After`. The cap is
+            // a transient live-count — abandoned members age out on the
+            // next admit — so the client should retry soon, NOT wait the
+            // full session max-age. See `OCI_CAP_RETRY_AFTER_SECS`.
             OciError::TooManyRequests {
-                retry_after_seconds: super::upload_session::OCI_SESSION_TTL.as_secs() as i64,
+                retry_after_seconds: super::upload_session::OCI_CAP_RETRY_AFTER_SECS,
+            }
+            .into_response()
+        }
+        Ok(InitiateResult::Contended) => {
+            // 503 + the SAME short `Retry-After` as the 429 path. The
+            // cap reconcile lost every CAS race in its bounded window —
+            // transient contention, not a cap breach and not an infra
+            // failure — so the client should retry soon. `warn!` was
+            // already emitted in `initiate_inner`; the envelope carries
+            // no per-request detail beyond the advisory retry hint.
+            OciError::Unavailable {
+                retry_after_seconds: super::upload_session::OCI_CAP_RETRY_AFTER_SECS,
             }
             .into_response()
         }
@@ -1255,6 +1390,7 @@ mod tests {
             let cfg = OciHttpConfig {
                 legacy_catalog_enabled: false,
                 max_sessions_per_principal: 1,
+                ..OciHttpConfig::default()
             };
             // Build a fresh router with the small-cap Extension layer.
             // `Router::layer` re-attaches; the post-merge ordering
@@ -1317,11 +1453,110 @@ mod tests {
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(code, "TOOMANYREQUESTS");
         let retry = retry_after.expect("Retry-After header MUST be set on 429");
-        // The header value is delta-seconds; matches the configured
-        // `OCI_SESSION_TTL` (3600).
-        assert!(
-            retry.parse::<u64>().is_ok(),
-            "Retry-After must be an integer delta-seconds value, got {retry:?}"
+        // The header value is a SHORT bounded delta-seconds — the cap
+        // is a transient live-count (abandoned members age out on the
+        // next admit), NOT a per-session hold, so the client should
+        // retry soon. It MUST be the short `OCI_CAP_RETRY_AFTER_SECS`
+        // (15), NOT the full session max-age (3600).
+        assert_eq!(
+            retry,
+            upload_session::OCI_CAP_RETRY_AFTER_SECS.to_string(),
+            "cap-exceeded Retry-After must be the short bounded value (15), not the session max-age"
+        );
+    }
+
+    /// M1 regression (router-level): when the cap-set reconcile CAS loop
+    /// exhausts its retry budget under pathological contention, the OCI
+    /// initiate handler must return `503 Service Unavailable` + the SAME
+    /// short advisory `Retry-After` as the 429 path — NOT a 500. Drives
+    /// the full router so the `handle_initiate` → `OciError::Unavailable`
+    /// mapping (and its 503 + Retry-After envelope) is exercised
+    /// end-to-end.
+    #[test]
+    fn three_phase_initiate_returns_503_with_retry_after_on_cap_reconcile_contention() {
+        use bytes::Bytes;
+        use hort_domain::error::DomainResult;
+        use hort_domain::ports::ephemeral_store::EphemeralStore;
+        use hort_domain::ports::BoxFuture;
+        use std::time::Duration;
+
+        // Cap admit that never wins its create race → retry budget
+        // exhausts → `AdmitOutcome::Contended`.
+        struct AlwaysContendedEphemeral;
+        impl EphemeralStore for AlwaysContendedEphemeral {
+            fn get(&self, _k: &str) -> BoxFuture<'_, DomainResult<Option<Bytes>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn put(&self, _k: &str, _v: Bytes, _t: Duration) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn put_if_absent(
+                &self,
+                _k: &str,
+                _v: Bytes,
+                _t: Duration,
+            ) -> BoxFuture<'_, DomainResult<bool>> {
+                Box::pin(async { Ok(false) })
+            }
+            fn compare_and_swap(
+                &self,
+                _k: &str,
+                _e: u64,
+                _v: Bytes,
+                _t: Duration,
+            ) -> BoxFuture<'_, DomainResult<Option<u64>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn delete(&self, _k: &str) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn extend_ttl(&self, _k: &str, _t: Duration) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let (status, retry_after, code) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            // Swap the durable ephemeral store for the contention stub.
+            // `build_mock_ctx` returns a sole Arc owner; the port mocks
+            // (repositories, etc.) are separate Arc clones, so
+            // `try_unwrap` succeeds and the repo lookup keeps working.
+            let mut base = Arc::try_unwrap(h.ctx)
+                .unwrap_or_else(|_| panic!("harness must return a sole Arc owner"));
+            base.ephemeral_durable = Arc::new(AlwaysContendedEphemeral);
+            let ctx = Arc::new(base);
+
+            let router = router().with_state(ctx);
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::post("/v2/myrepo/library/nginx/blobs/uploads/")
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = parsed["errors"][0]["code"].as_str().unwrap().to_string();
+            (status, retry_after, code)
+        });
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cap-reconcile contention must be a transient 503, not a 500"
+        );
+        assert_eq!(code, "UNAVAILABLE");
+        let retry = retry_after.expect("Retry-After header MUST be set on the 503 contention path");
+        assert_eq!(
+            retry,
+            upload_session::OCI_CAP_RETRY_AFTER_SECS.to_string(),
+            "contention Retry-After must be the short bounded value (15)"
         );
     }
 
@@ -1355,6 +1590,75 @@ mod tests {
         )
         .expect("created metric absent");
         assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    // -------------------- DELETE — cancel upload (router-level) -----------
+
+    /// A DELETE on `/blobs/uploads/<uuid>` cancels the session: the OCI
+    /// spec mandates `204 No Content`, and the session row is dropped
+    /// from `EphemeralStore` (a subsequent PATCH/PUT would see
+    /// BLOB_UPLOAD_UNKNOWN).
+    #[test]
+    fn delete_cancel_returns_204_and_drops_session() {
+        let (status, present_after) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+
+            // Seed a session via initiate.
+            let sid = initiate_for(&h.ctx, repo_id).await;
+            let key = upload_session::session_key("oci", sid);
+            assert!(h.ctx.ephemeral_durable.get(&key).await.unwrap().is_some());
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::delete(format!("/v2/myrepo/library/nginx/blobs/uploads/{sid}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let present_after = h.ctx.ephemeral_durable.get(&key).await.unwrap().is_some();
+            (status, present_after)
+        });
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "OCI cancel-upload must return 204 No Content"
+        );
+        assert!(
+            !present_after,
+            "cancel must drop the session row from EphemeralStore"
+        );
+    }
+
+    /// DELETE on an unknown session UUID must be 404 BLOB_UPLOAD_UNKNOWN.
+    #[test]
+    fn delete_unknown_session_returns_404_blob_upload_unknown() {
+        let (status, code) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let router = router().with_state(h.ctx);
+            let sid = Uuid::new_v4();
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::delete(format!("/v2/myrepo/library/nginx/blobs/uploads/{sid}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = parsed["errors"][0]["code"].as_str().unwrap().to_string();
+            (status, code)
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "BLOB_UPLOAD_UNKNOWN");
     }
 
     // -------------------- Missing / invalid tail --------------------
@@ -1972,6 +2276,7 @@ mod tests {
                 user_id: Uuid::new_v4(),
             },
             10_000,
+            OciHttpConfig::default().session_max_age(),
         )
         .await
         .unwrap();
@@ -1979,6 +2284,9 @@ mod tests {
             InitiateResult::Created(o) => o.session_id,
             InitiateResult::CapExceeded => {
                 panic!("test helper: cap exceeded on initiate — high cap should never reject")
+            }
+            InitiateResult::Contended => {
+                panic!("test helper: cap-reconcile contended on initiate — mock never contends")
             }
         }
     }
@@ -2236,7 +2544,7 @@ mod tests {
             // Overwrite unchanged to bump the store's version by one.
             h.ctx
                 .ephemeral_durable
-                .put(&key, current, upload_session::OCI_SESSION_TTL)
+                .put(&key, current, std::time::Duration::from_secs(3600))
                 .await
                 .unwrap();
 
@@ -2407,7 +2715,12 @@ mod tests {
     }
 
     #[test]
-    fn patch_missing_content_length_returns_400() {
+    fn patch_without_content_length_streams_accepted() {
+        // A PATCH with no Content-Length is buildah / podman / skopeo's
+        // `Transfer-Encoding: chunked` streaming upload — RFC 7230 §3.3.2
+        // forbids a Content-Length alongside chunked TE. It must STREAM,
+        // not 400. The harness auto-adds `content-length` from the body,
+        // so remove it to reproduce the chunked-transfer shape.
         let status = run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
@@ -2415,22 +2728,49 @@ mod tests {
             h.repositories.insert(repo);
             let session_id = initiate_for(&h.ctx, repo_id).await;
             let router = router().with_state(h.ctx);
-            // axum's test harness adds Content-Length automatically from
-            // the body — skirt that by using Body::empty() and hardcoding
-            // Content-Range.  Length-zero bodies still require a
-            // Content-Length header for the PATCH contract; the harness
-            // will auto-emit `content-length: 0`, so build a request with
-            // a removed header.
             let mut req =
                 HttpRequest::patch(format!("/v2/myrepo/nginx/blobs/uploads/{session_id}"))
-                    .header("Content-Range", "bytes 0-0")
-                    .body(Body::empty())
+                    .body(Body::from(&b"chunk-bytes"[..]))
                     .unwrap();
+            req.headers_mut().remove(CONTENT_LENGTH);
+            let resp = router.oneshot(with_principal(req)).await.unwrap();
+            // The 11 streamed bytes ("chunk-bytes") flowed through the handler:
+            // the 202's Range advertises the new offset, 0-(n-1).
+            assert_eq!(
+                resp.headers().get("Range").and_then(|v| v.to_str().ok()),
+                Some("0-10")
+            );
+            resp.status()
+        });
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn put_finalize_with_chunked_trailing_body_no_content_length_finalizes() {
+        // Two-phase POST→PUT where the PUT folds the whole blob in via
+        // `Transfer-Encoding: chunked` (no Content-Length). Previously the PUT
+        // read Content-Length as 0, dropped the body, and finalised over zero
+        // staged bytes → digest mismatch → DIGEST_INVALID. Now it streams the
+        // trailing body and the declared digest matches → 201.
+        let content = b"put-streamed-blob".to_vec();
+        let hex = hex_of(&content);
+        let status = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let router = router().with_state(h.ctx);
+            let uri =
+                format!("/v2/myrepo/library/nginx/blobs/uploads/{session_id}?digest=sha256:{hex}");
+            let mut req = HttpRequest::put(&uri)
+                .body(Body::from(content.clone()))
+                .unwrap();
             req.headers_mut().remove(CONTENT_LENGTH);
             let resp = router.oneshot(with_principal(req)).await.unwrap();
             resp.status()
         });
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     #[test]

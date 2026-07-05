@@ -1,0 +1,15 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-ci-read-crates-proxy
+spec:
+  # Per-repo serviceAccount-subject grant: gha-ci (GitHub Actions CI pull identity)
+  # reads crates-proxy. Resolves at apply to
+  # GrantSubject::User(<gha-ci backing user>). The CI pull scope is
+  # per-repo — read on exactly the five pull/proxy repos, not a global
+  # read.
+  subject:
+    kind: serviceAccount
+    name: gha-ci
+  permission: read
+  repository: crates-proxy

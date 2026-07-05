@@ -163,9 +163,15 @@ run_one() {  # group name path
   # --add-host lets external-mode clients reach a host-mapped hort via
   # host.docker.internal (Linux needs the explicit host-gateway mapping; it is a
   # harmless no-op in compose mode, where NET_ARGS attaches the compose network).
+  # HORT_COMPOSE_OVERLAYS: the active --compose-overlay names (space-separated)
+  # so a scenario can adapt to an overlay-reconfigured stack (e.g. the
+  # provenance scenario switches to the /v2/auth token dance under
+  # `native-tokens`). External mode: set it in the environment to match the
+  # external stack's posture.
   docker run --rm --add-host=host.docker.internal:host-gateway "${NET_ARGS[@]}" \
     -e HORT_URL="$IN_HORT" -e KEYCLOAK_URL="$IN_KC" -e METRICS_URL="$IN_METRICS" \
     -e HORT_DB_DSN="$DB_DSN" \
+    -e HORT_COMPOSE_OVERLAYS="${OVERLAYS[*]:-${HORT_COMPOSE_OVERLAYS:-}}" \
     -v "$SCRIPT_DIR":/work:ro -e FIXTURES=/work/fixtures \
     "$IMAGE" bash "/work/$rel"
 }

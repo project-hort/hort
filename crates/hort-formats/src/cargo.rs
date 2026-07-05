@@ -136,12 +136,10 @@ pub fn cargo_collision_key(name: &str) -> String {
 /// or wildcards. Returns [`DomainError::Validation`] tagged with
 /// `cargo.version`.
 ///
-/// Note: this is intentionally stricter than semver.org §9 — hyphens
-/// inside prerelease/build segments are rejected. Cargo itself emits
-/// dotted forms (e.g. `-rc.1`, not `-rc-1`) and the tighter charset
-/// reduces parser surface. If a real-world cargo version ever fails
-/// this validator, loosen the rule deliberately rather than as a
-/// "bug fix".
+/// Prerelease and build-metadata identifiers follow SemVer §9/§10:
+/// ASCII alphanumerics, `.`, and `-`. crates.io ships hyphenated build
+/// metadata (e.g. `0.11.1+wasi-snapshot-preview1`), so the hyphen is
+/// load-bearing for pull-through of real crates.
 ///
 /// Visibility: `pub` so the cargo HTTP adapter (`hort-http-cargo`) can
 /// reuse the same validator on the publish path before any storage write.
@@ -190,7 +188,7 @@ pub fn validate_cargo_version(version: &str) -> DomainResult<()> {
     }
 
     // Prerelease and build, when present, are non-empty and limited to
-    // ASCII alnum + `.` (matching the regex above).
+    // the SemVer §9/§10 identifier charset [a-zA-Z0-9.-].
     for (label, suffix) in [("prerelease", prerelease), ("build", build)] {
         if let Some(s) = suffix {
             if s.is_empty() {
@@ -198,9 +196,12 @@ pub fn validate_cargo_version(version: &str) -> DomainResult<()> {
                     "cargo.version: {label} segment is empty"
                 )));
             }
-            if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.') {
+            if !s
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            {
                 return Err(DomainError::Validation(format!(
-                    "cargo.version: {label} segment contains a byte outside [a-zA-Z0-9.]"
+                    "cargo.version: {label} segment contains a byte outside [a-zA-Z0-9.-]"
                 )));
             }
         }
@@ -1063,6 +1064,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_download_path_preserves_hyphenated_build_metadata() {
+        // crates.io ships hyphenated build metadata (wasi, the toml family);
+        // the version segment must survive verbatim to the crates.io URL and
+        // the sparse-index `vers` match.
+        let coords = handler()
+            .parse_download_path("api/v1/crates/wasi/0.11.1+wasi-snapshot-preview1/download")
+            .unwrap();
+        assert_eq!(
+            coords.version.as_deref(),
+            Some("0.11.1+wasi-snapshot-preview1")
+        );
+    }
+
     // -- build_artifact_logical_path ------------------------------------------
 
     /// `crates/{n}/{version}/{n}-{version}.crate` with `n` lowercased.
@@ -1289,6 +1304,28 @@ mod tests {
     #[test]
     fn validate_cargo_version_accepts_build_metadata() {
         validate_cargo_version("1.2.3+sha.abc").expect("build metadata must pass");
+    }
+
+    #[test]
+    fn validate_cargo_version_accepts_hyphenated_build_and_prerelease() {
+        // SemVer §9/§10 permit `-` in prerelease/build identifiers, and
+        // crates.io ships them (wasi, the toml family) — pull-through must
+        // accept these to serve real crates.
+        for v in [
+            "0.11.1+wasi-snapshot-preview1",
+            "1.0.3+wasi-0.2.9",
+            "0.4.0+wasi-0.3.0-rc-2026-01-06",
+            "1.1.2+spec-1.1.0",
+            "1.0.0-alpha-1",
+        ] {
+            validate_cargo_version(v).unwrap_or_else(|e| panic!("{v} must pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_cargo_version_rejects_wildcard() {
+        // The wider `[a-zA-Z0-9.-]` charset still excludes wildcards.
+        assert!(validate_cargo_version("1.0.0-*").is_err());
     }
 
     #[test]

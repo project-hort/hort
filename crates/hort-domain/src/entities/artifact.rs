@@ -13,7 +13,9 @@ use crate::events::{
     ProvenanceRejected, ProvenanceVerified, RejectionReason, ReleaseReason, ScanIndeterminate,
 };
 use crate::policy::ScanOutcome;
-use crate::ports::provenance::{ProvenanceOutcome, ProvenanceRejectReason, ProvenanceVerdict};
+use crate::ports::provenance::{
+    ProvenanceOutcome, ProvenanceRejectReason, ProvenanceVerdict, SignerIdentity,
+};
 use crate::types::ContentHash;
 
 // ---------------------------------------------------------------------------
@@ -744,13 +746,30 @@ impl Artifact {
     /// - [`ProvenanceOutcome::NoAttestation`] (the unsigned case):
     ///   - under [`ProvenanceMode::VerifyIfPresent`] → `Ok(None)` (no
     ///     event, status unchanged — unsigned is allowed);
-    ///   - under [`ProvenanceMode::Required`] → emit
-    ///     [`ProvenanceRejected`] with reason
-    ///     [`ProvenanceRejectReason::Unsigned`]; status → `Rejected`
-    ///     (unsigned IS a rejection there).
+    ///   - under [`ProvenanceMode::Required`] → **window-aware** (issue #13,
+    ///     the push-then-sign round-trip): a missing signature is
+    ///     *time-dependent* (the artifact may yet be signed), so it is
+    ///     **held** over the same observation window quarantine already
+    ///     provides rather than being collapsed into a terminal rejection at
+    ///     the first verify:
+    ///     - `window_open == true` → `Ok(None)` (no event, status stays
+    ///       `Quarantined` → the release gate reads it as
+    ///       [`ProvenanceClearance::Pending`], fail-closed / held);
+    ///     - `window_open == false` → emit [`ProvenanceRejected`] with reason
+    ///       [`ProvenanceRejectReason::Unsigned`]; status → `Rejected`
+    ///       (unsigned-at-expiry IS a terminal rejection there).
     ///   - under [`ProvenanceMode::Off`] → `Ok(None)` (provenance is
     ///     inert; the orchestrator does not run a verifier in `Off`, but
     ///     the method is total over the mode for safety).
+    ///
+    /// `window_open` gates **only** the `NoAttestation × Required` arm. A
+    /// *bad* signature is *time-independent* (already wrong), so the
+    /// [`ProvenanceOutcome::Verified`] and [`ProvenanceOutcome::Rejected`]
+    /// arms never consult `window_open` — a valid or a forged/untrusted/
+    /// digest-mismatch signature is decided immediately, even mid-window.
+    /// The domain stays I/O-free: the application layer computes
+    /// `window_open` (`effective_quarantine_deadline(window_start, duration)
+    /// > now`) and threads it in.
     ///
     /// `backend` is the id of the verifier that produced the verdict
     /// (`port.name()`, e.g. `"cosign"`) — recorded on the event for audit
@@ -766,6 +785,7 @@ impl Artifact {
         verdict: ProvenanceVerdict,
         mode: ProvenanceMode,
         backend: &str,
+        window_open: bool,
     ) -> DomainResult<Option<DomainEvent>> {
         match verdict.outcome {
             ProvenanceOutcome::Verified {
@@ -781,6 +801,10 @@ impl Artifact {
                     backend: backend.into(),
                     signer,
                     predicate_type,
+                    // A direct verification of this artifact's own
+                    // attestation — never a cascade (see
+                    // `cascade_provenance_clearance`).
+                    cascaded_from: None,
                 })))
             }
             ProvenanceOutcome::Rejected(reason) => {
@@ -799,8 +823,14 @@ impl Artifact {
                 })))
             }
             ProvenanceOutcome::NoAttestation => match mode {
+                // Window-aware hold under Required (issue #13). A missing
+                // signature is time-dependent: while the observation window
+                // is still open the artifact is HELD (no event, status stays
+                // Quarantined → Pending), exactly like an incomplete scan.
+                ProvenanceMode::Required if window_open => Ok(None),
                 ProvenanceMode::Required => {
-                    // Unsigned IS a rejection under Required (ADR 0027).
+                    // Window closed → unsigned-at-expiry IS a terminal
+                    // rejection under Required (ADR 0027).
                     self.quarantine_status = QuarantineStatus::Rejected;
                     // Not scan-clearable — see the `Rejected` arm above.
                     self.rejection_reason = None;
@@ -816,6 +846,54 @@ impl Artifact {
                 ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => Ok(None),
             },
         }
+    }
+
+    /// Record a **cascaded** provenance clearance: this artifact is a
+    /// constituent of a verified subject whose signed bytes bind this
+    /// artifact's digest (ADR 0039 provenance-clearance cascade). cosign
+    /// signs only the top-level digest, but that digest cryptographically
+    /// covers the whole tree — an index's `manifests[]` digests are inside
+    /// the signed index bytes and a manifest's config/layer digests are
+    /// inside its bytes — so the signature over `cascaded_from` attests
+    /// exactly this artifact's content too.
+    ///
+    /// Returns the [`ProvenanceVerified`] event to append, carrying the
+    /// verified subject's hash in `cascaded_from` (the audit attribution:
+    /// "cleared via signature over `cascaded_from`") and the subject's
+    /// verified `signer`. Like the Verified arm of
+    /// [`Self::complete_provenance`], this is a **success record only** —
+    /// status is unchanged (`&self`, no mutation); the release sweep reads
+    /// the event's existence under `Required` and every other gate (scan,
+    /// observation window) stays per-artifact.
+    ///
+    /// Valid **only** from [`QuarantineStatus::Quarantined`] — the held,
+    /// pending-provenance state. Every other state refuses
+    /// (`Err(Invariant)`), fail-closed:
+    /// - `Rejected` / `ScanIndeterminate` — terminal is terminal; a
+    ///   cascade never resurrects a rejected constituent (the operator
+    ///   re-pushes instead);
+    /// - `Released` / `None` — outside the hold, nothing to clear.
+    pub fn cascade_provenance_clearance(
+        &self,
+        cascaded_from: ContentHash,
+        signer: SignerIdentity,
+        predicate_type: Option<String>,
+        backend: &str,
+    ) -> DomainResult<ProvenanceVerified> {
+        if self.quarantine_status != QuarantineStatus::Quarantined {
+            return Err(DomainError::Invariant(format!(
+                "cannot cascade provenance clearance to artifact in state {}",
+                self.quarantine_status
+            )));
+        }
+        Ok(ProvenanceVerified {
+            artifact_id: self.id,
+            content_hash: self.sha256_checksum.clone(),
+            backend: backend.into(),
+            signer,
+            predicate_type,
+            cascaded_from: Some(cascaded_from),
+        })
     }
 
     /// Terminal scan failure: the scanner could not decide. Fail-closed
@@ -2072,7 +2150,7 @@ mod tests {
         // release-sweep `Cleared` computation.
         for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Required] {
             let mut a = quarantined_artifact();
-            let signer = crate::ports::provenance::SignerIdentity {
+            let signer = SignerIdentity {
                 issuer: "https://token.actions.githubusercontent.com".into(),
                 san: "https://github.com/acme/repo/.github/workflows/release.yml@refs/heads/main"
                     .into(),
@@ -2084,8 +2162,10 @@ mod tests {
             let ev = a
                 // A deliberately non-"cosign" backend proves the id is
                 // threaded from the running verifier, not hardcoded
-                // (Tier-2 readiness).
-                .complete_provenance(verdict, mode, "pgp")
+                // (Tier-2 readiness). `window_open = true` proves a Verified
+                // verdict is decided immediately even mid-window (it never
+                // consults the window flag).
+                .complete_provenance(verdict, mode, "pgp", true)
                 .expect("Ok")
                 .expect("Verified emits an event");
             assert_eq!(
@@ -2116,6 +2196,10 @@ mod tests {
     fn complete_provenance_rejected_drives_status_to_rejected() {
         // Every reject reason drives Quarantined -> Rejected and emits a
         // ProvenanceRejected carrying the typed reason. Independent of mode.
+        // `window_open = true` proves a bad signature is time-independent:
+        // the Rejected arm decides terminally IMMEDIATELY, even mid-window
+        // (it never consults `window_open`, unlike the NoAttestation×Required
+        // hold).
         let reasons = [
             ProvenanceRejectReason::Unsigned,
             ProvenanceRejectReason::UntrustedIdentity,
@@ -2127,7 +2211,7 @@ mod tests {
             for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Required] {
                 let mut a = quarantined_artifact();
                 let ev = a
-                    .complete_provenance(ProvenanceVerdict::rejected(reason), mode, "cosign")
+                    .complete_provenance(ProvenanceVerdict::rejected(reason), mode, "cosign", true)
                     .expect("Ok")
                     .expect("Rejected emits an event");
                 assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
@@ -2155,6 +2239,10 @@ mod tests {
                 ProvenanceVerdict::no_attestation(),
                 ProvenanceMode::VerifyIfPresent,
                 "cosign",
+                // window_open is irrelevant to VerifyIfPresent (the flag gates
+                // only NoAttestation×Required); pass false to prove it never
+                // leaks into this arm.
+                false,
             )
             .expect("Ok");
         assert!(
@@ -2175,6 +2263,9 @@ mod tests {
                 ProvenanceVerdict::no_attestation(),
                 ProvenanceMode::Off,
                 "cosign",
+                // window_open is irrelevant to Off (inert mode); pass false to
+                // prove the flag never leaks into this arm.
+                false,
             )
             .expect("Ok");
         assert!(out.is_none());
@@ -2182,9 +2273,39 @@ mod tests {
     }
 
     #[test]
-    fn complete_provenance_no_attestation_under_required_rejects_unsigned() {
-        // Unsigned IS a rejection under Required: emit
-        // ProvenanceRejected{Unsigned}, status -> Rejected.
+    fn complete_provenance_no_attestation_under_required_window_open_holds() {
+        // Issue #13 — the push-then-sign round-trip. A missing signature is
+        // time-dependent: while the observation window is still open, an
+        // unsigned Required artifact is HELD (no event, status stays
+        // Quarantined → the release gate reads it as `Pending`), NOT rejected.
+        let mut a = quarantined_artifact();
+        let out = a
+            .complete_provenance(
+                ProvenanceVerdict::no_attestation(),
+                ProvenanceMode::Required,
+                "cosign",
+                true, // window still open → hold
+            )
+            .expect("Ok");
+        assert!(
+            out.is_none(),
+            "Required NoAttestation mid-window must hold (no event)"
+        );
+        assert_eq!(
+            a.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "held artifact stays Quarantined (Pending), not Rejected"
+        );
+        // The hold must not touch rejection_reason (it is not a rejection).
+        assert_eq!(a.rejection_reason, None);
+    }
+
+    #[test]
+    fn complete_provenance_no_attestation_under_required_window_closed_rejects_unsigned() {
+        // Window closed (issue #13): unsigned-at-expiry IS a terminal
+        // rejection under Required — emit ProvenanceRejected{Unsigned},
+        // status -> Rejected. Byte-for-byte the pre-#13 mapping, incl. the
+        // "(policy)" synthetic backend.
         let mut a = quarantined_artifact();
         let ev = a
             .complete_provenance(
@@ -2193,10 +2314,13 @@ mod tests {
                 // Passed backend is intentionally ignored on the synthesized
                 // unsigned arm — the event records the "(policy)" sentinel.
                 "cosign",
+                false, // window closed → terminal rejection
             )
             .expect("Ok")
-            .expect("Required NoAttestation emits a rejection");
+            .expect("Required NoAttestation at expiry emits a rejection");
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        // ADR 0041: a provenance rejection is not scan-clearable.
+        assert_eq!(a.rejection_reason, None);
         match ev {
             DomainEvent::ProvenanceRejected(e) => {
                 assert_eq!(e.artifact_id, a.id);
@@ -2210,13 +2334,95 @@ mod tests {
         }
     }
 
+    // -- cascade_provenance_clearance (ADR 0039 cascade) ---------------------
+
+    #[test]
+    fn cascade_provenance_clearance_from_quarantined_emits_attributed_event() {
+        // A held constituent takes the cascaded clearance: the returned
+        // ProvenanceVerified carries THIS artifact's identity/hash, the
+        // subject's verified signer, and the subject hash in
+        // `cascaded_from` (the "cleared via signature over <root>" audit
+        // attribution). `&self` — status untouched (success record only;
+        // the scan/window gates stay per-artifact).
+        let a = quarantined_artifact();
+        let subject: ContentHash =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        let signer = SignerIdentity {
+            issuer: "operator-pinned-key".into(),
+            san: "cosign-key".into(),
+        };
+        let ev = a
+            .cascade_provenance_clearance(
+                subject.clone(),
+                signer.clone(),
+                Some("https://sigstore.dev/cosign/sign/v1".into()),
+                "cosign-key",
+            )
+            .expect("Quarantined constituent takes the cascade");
+        assert_eq!(ev.artifact_id, a.id);
+        assert_eq!(ev.content_hash, a.sha256_checksum);
+        assert_eq!(ev.backend, "cosign-key");
+        assert_eq!(ev.signer, signer);
+        assert_eq!(
+            ev.predicate_type.as_deref(),
+            Some("https://sigstore.dev/cosign/sign/v1")
+        );
+        assert_eq!(
+            ev.cascaded_from,
+            Some(subject),
+            "the cascaded event must attribute the clearance to the verified subject digest"
+        );
+        assert_eq!(
+            a.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "a cascaded clearance is a success record only — status unchanged"
+        );
+    }
+
+    #[test]
+    fn cascade_provenance_clearance_refuses_every_non_quarantined_state() {
+        // Fail-closed edges: terminal states stay terminal (Rejected /
+        // ScanIndeterminate are never resurrected by a cascade) and
+        // Released / None are outside the hold — all four refuse.
+        let subject: ContentHash =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        let signer = SignerIdentity {
+            issuer: "iss".into(),
+            san: "san".into(),
+        };
+        for status in [
+            QuarantineStatus::None,
+            QuarantineStatus::Released,
+            QuarantineStatus::Rejected,
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let mut a = sample_artifact();
+            a.quarantine_status = status;
+            let err = a
+                .cascade_provenance_clearance(subject.clone(), signer.clone(), None, "cosign-key")
+                .expect_err("only a held (Quarantined) constituent takes a cascaded clearance");
+            assert!(
+                matches!(err, DomainError::Invariant(_)),
+                "expected Invariant for {status}, got {err:?}"
+            );
+            assert_eq!(
+                a.quarantine_status, status,
+                "the refusal must not mutate state"
+            );
+        }
+    }
+
     #[test]
     fn complete_provenance_verified_from_none_permissive_mode_status_unchanged() {
         // Permissive (quarantineDuration:0) ingest sits at None; a Verified
         // verdict is a success record that does not move state.
         let mut a = sample_artifact();
         assert_eq!(a.quarantine_status, QuarantineStatus::None);
-        let signer = crate::ports::provenance::SignerIdentity {
+        let signer = SignerIdentity {
             issuer: "iss".into(),
             san: "san".into(),
         };
@@ -2225,6 +2431,9 @@ mod tests {
                 ProvenanceVerdict::verified(signer, None),
                 ProvenanceMode::Required,
                 "cosign",
+                // Verified never consults window_open; false proves the arm
+                // decides regardless of the flag.
+                false,
             )
             .expect("Ok")
             .expect("emits event");

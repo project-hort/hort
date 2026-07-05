@@ -6,8 +6,8 @@ gitops controller) who want their k8s workloads to authenticate to
 workload's pod fetches a projected ServiceAccount token from the
 cluster's API server, exchanges it at
 `POST /api/v1/auth/exchange`, and gets back a short-lived bearer
-scoped to the repositories its `kind: ServiceAccount` envelope
-permits.
+whose cap snapshots the matched `kind: ServiceAccount`'s
+`PermissionGrant`s at exchange time.
 
 For the design rationale see
 [ADR 0018](../../adr/0018-auth-catalog-canonical.md) and the
@@ -39,8 +39,10 @@ The two artefacts that change in your gitops repository:
 1. **`kind: OidcIssuer`** — names the trusted cluster and binds the
    audience the projected token must carry.
 2. **`kind: ServiceAccount`** — declares the non-human identity in
-   hort-server, scopes it to repositories, and lists which JWT claim
-   shapes are allowed to assume it.
+   hort-server and lists which JWT claim shapes are allowed to
+   assume it. Its authority is the `PermissionGrant`s declared
+   alongside
+   ([ADR 0044](../../adr/0044-service-accounts-identity-only.md)).
 
 Existing PATs continue to work — federation is additive. Operators
 adopt this path workload-by-workload at their own pace.
@@ -127,18 +129,31 @@ block lists which `(issuer, claims)` shapes may assume this SA.
 Multiple shapes are an OR — any single match suffices; multiple
 matches across SAs are a `multiple_sa_match` deny.
 
+The envelope binds the identity; the `PermissionGrant`(s) beside it
+are the SA's authority — the exchanged bearer's cap snapshots them
+at exchange time:
+
 ```yaml
 apiVersion: project-hort.de/v1beta1
 kind: ServiceAccount
 metadata:
   name: prod-pypi-pusher
 spec:
-  role: developer
-  repositories: [pypi-internal]
   federatedIdentities:
     - issuer: cluster-prod
       claims:
         sub: system:serviceaccount:apps:pypi-publisher
+---
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: prod-pypi-pusher-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: prod-pypi-pusher
+  permission: write
+  repository: pypi-internal
 ```
 
 The `claims:` map is exact-match — every `(key, value)` in the map
@@ -152,10 +167,11 @@ specificity.
 
 Validation rules the apply pipeline enforces:
 
-- `role` ∈ `{developer, reader}`. `admin` is explicitly forbidden
-  — admin authority is reserved for short-lived interactive
-  sessions ([ADR 0013](../../adr/0013-idp-authoritative-cli-sessions.md)).
-- `repositories` non-empty (no global service-account grants).
+- The envelope carries **no authority fields** — `role:` /
+  `repositories:` fail apply at parse. A `serviceAccount`-subject
+  grant with `permission: admin` is rejected — service accounts are
+  strictly non-admin
+  ([ADR 0038](../../adr/0038-admin-identity-model.md)).
 - `federatedIdentities[].issuer` must reference a declared
   `OidcIssuer`. Apply-time foreign key.
 - `federatedIdentities[].claims` non-empty. Empty claims means

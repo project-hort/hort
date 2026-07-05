@@ -1864,6 +1864,13 @@ pub struct MockEventStore {
     /// path (e.g. the CliSession JWT mint, which appends
     /// `ApiTokenIssued` but persists no row).
     fail_next_append: Mutex<Option<DomainError>>,
+    /// Per-stream one-shot replacement installed AFTER the next
+    /// `read_stream` of that stream serves the current content —
+    /// models a concurrent append landing between two reads (the
+    /// provenance cascade's conflict-retry re-read observing a
+    /// `ProvenanceVerified` that appeared mid-flight). Seeded via
+    /// [`set_stream_after_next_read`](Self::set_stream_after_next_read).
+    stream_after_next_read: Mutex<HashMap<String, Vec<PersistedEvent>>>,
 }
 
 impl MockEventStore {
@@ -1874,6 +1881,7 @@ impl MockEventStore {
             category_events: Mutex::new(HashMap::new()),
             category_error_positions: Mutex::new(Vec::new()),
             fail_next_append: Mutex::new(None),
+            stream_after_next_read: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1888,6 +1896,19 @@ impl MockEventStore {
 
     pub fn set_stream(&self, stream_id: &StreamId, events: Vec<PersistedEvent>) {
         self.streams
+            .lock()
+            .unwrap()
+            .insert(stream_id.to_string(), events);
+    }
+
+    /// Arm a one-shot stream replacement: the NEXT `read_stream` of
+    /// `stream_id` serves the CURRENT content, then `events` replaces it
+    /// so every subsequent read sees the new state. Models a concurrent
+    /// append landing between two reads (the provenance cascade's
+    /// conflict-retry path re-reading and finding a `ProvenanceVerified`
+    /// that appeared mid-flight).
+    pub fn set_stream_after_next_read(&self, stream_id: &StreamId, events: Vec<PersistedEvent>) {
+        self.stream_after_next_read
             .lock()
             .unwrap()
             .insert(stream_id.to_string(), events);
@@ -1949,6 +1970,12 @@ impl EventStore for MockEventStore {
             .get(&key)
             .cloned()
             .unwrap_or_default();
+        // One-shot post-read swap (see `set_stream_after_next_read`):
+        // this read serves the current content; subsequent reads see
+        // the armed replacement — a concurrent append between reads.
+        if let Some(next) = self.stream_after_next_read.lock().unwrap().remove(&key) {
+            self.streams.lock().unwrap().insert(key, next);
+        }
         let truncated: Vec<PersistedEvent> = events.into_iter().take(max_count as usize).collect();
         Box::pin(async move { Ok(truncated) })
     }
@@ -2083,12 +2110,15 @@ pub struct MockArtifactLifecycle {
     /// use this snapshot — the enqueues no longer flow through the `jobs`
     /// mock, they ride the lifecycle call so they commit atomically.
     ingest_enqueues: Mutex<Vec<(Uuid, Vec<IngestEnqueue>)>>,
-    /// When set, `commit_transition` returns this error verbatim without
-    /// recording the transition. Used by tests exercising error-path
-    /// metric emission (e.g. `register_by_hash` must
-    /// tick `hort_ingest_total{result="internal"}` when the lifecycle
-    /// port fails to commit the artifact + event atomically).
-    next_error: Mutex<Option<DomainError>>,
+    /// FIFO of injected errors: each `commit_transition` call pops the
+    /// front and returns it verbatim without recording the transition.
+    /// Used by tests exercising error-path metric emission (e.g.
+    /// `register_by_hash` must tick `hort_ingest_total{result="internal"}`
+    /// when the lifecycle port fails to commit the artifact + event
+    /// atomically). A queue rather than a single slot so tests can arm
+    /// N consecutive failures (the provenance cascade's
+    /// conflict-retry-conflict path needs two).
+    next_error: Mutex<std::collections::VecDeque<DomainError>>,
 }
 
 impl MockArtifactLifecycle {
@@ -2103,7 +2133,7 @@ impl MockArtifactLifecycle {
             score_deltas: Mutex::new(Vec::new()),
             sbom_replace_calls: Mutex::new(Vec::new()),
             ingest_enqueues: Mutex::new(Vec::new()),
-            next_error: Mutex::new(None),
+            next_error: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -2218,10 +2248,12 @@ impl MockArtifactLifecycle {
             .collect()
     }
 
-    /// Seed a single failure — the next `commit_transition` call returns
-    /// `Err(err)` and records no transition. Cleared after the call.
+    /// Queue a failure — the next `commit_transition` call pops it,
+    /// returns `Err(err)`, and records no transition. FIFO: call N
+    /// times to arm N consecutive failures (the provenance cascade's
+    /// conflict-retry-conflict path arms two); each is consumed once.
     pub fn fail_next_commit(&self, err: DomainError) {
-        *self.next_error.lock().unwrap() = Some(err);
+        self.next_error.lock().unwrap().push_back(err);
     }
 }
 
@@ -2232,7 +2264,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
     ) -> BoxFut<'_, DomainResult<AppendResult>> {
-        if let Some(err) = self.next_error.lock().unwrap().take() {
+        if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
         let count = events.events.len() as u64;
@@ -2274,7 +2306,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         Box::pin(async move {
             // Failure-injection up front (mirrors `commit_transition`), before
             // recording anything, so a forced error leaves no stray enqueue.
-            if let Some(err) = self.next_error.lock().unwrap().take() {
+            if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
             self.ingest_enqueues
@@ -2316,7 +2348,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         Box::pin(async move {
             // Replicate the failure check up front (mirrors the
             // legacy `commit_transition` path).
-            if let Some(err) = self.next_error.lock().unwrap().take() {
+            if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
             if let Some((repo_id, delta)) = score_delta {
@@ -2364,7 +2396,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         // Failure injection guard. Mirrors the `commit_transition`
         // path: the failure fires BEFORE any state is recorded, so a
         // forced error doesn't leave a stray entry in the snapshot.
-        if let Some(err) = self.next_error.lock().unwrap().take() {
+        if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
 
@@ -2619,6 +2651,11 @@ pub struct MockStoragePort {
     /// attempt rather than recovering on the second. Used to drive the
     /// post-proxy bundle re-read failure arm.
     inject_get_error: Mutex<std::collections::HashSet<ContentHash>>,
+    /// Counter incremented on every `get` call — regardless of hit or
+    /// miss. Tests that assert "this code path never reads CAS" (e.g.
+    /// the provenance cascade re-drive gate: a cascaded constituent's
+    /// skip-verify must not re-walk bytes) use [`get_call_count`].
+    get_calls: AtomicUsize,
     /// Counter incremented on every `delete` call — used by the
     /// declared-hash rollback tests to assert the
     /// rollback happened when no other row references the hash, and
@@ -2646,6 +2683,7 @@ impl MockStoragePort {
             tampered: Mutex::new(HashMap::new()),
             shard_truncations: Mutex::new(Vec::new()),
             put_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             deleted_hashes: Mutex::new(Vec::new()),
             backend_label: Mutex::new("memory"),
@@ -2768,6 +2806,14 @@ impl MockStoragePort {
         self.put_calls.load(Ordering::Relaxed)
     }
 
+    /// Number of times `get` has been invoked (hit or miss). Used by
+    /// tests asserting a code path performed NO CAS read — e.g. the
+    /// provenance cascade re-drive gate, where a cascaded constituent's
+    /// skip-verify must not re-walk its bytes.
+    pub fn get_call_count(&self) -> usize {
+        self.get_calls.load(Ordering::Relaxed)
+    }
+
     /// Number of times `delete` has been invoked. Used by declared-hash
     /// rollback tests to assert both positive
     /// (rollback happened) and negative (blob shared — rollback
@@ -2849,6 +2895,7 @@ impl StoragePort for MockStoragePort {
         &self,
         hash: &ContentHash,
     ) -> BoxFut<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
+        self.get_calls.fetch_add(1, Ordering::Relaxed);
         // A persistent get failure: when `hash`
         // is registered via `fail_get_persistent`, EVERY `get` for it
         // resolves `Err(NotFound)` (never consumed). This fails a
@@ -4061,26 +4108,32 @@ impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
 // generalized content-reference projection (widened to a
 // refcount projection).
 //
-// Keyed by (repository_id, source_artifact_id, kind) to match the
-// Postgres adapter's PK shape exactly — upsert semantics fall out of
-// `HashMap::insert`, which overwrites within a single key. The same
-// source under a different `kind` is a sibling row, NOT a replacement
-// (a single `ArtifactIngested` writes a `primary_content`
+// Keyed by (repository_id, source_artifact_id, target_content_hash,
+// kind) to match the Postgres adapter's widened PK shape exactly —
+// upsert semantics fall out of `HashMap::insert`, which overwrites
+// within a single key. The same source under a different `kind` is a
+// sibling row (a single `ArtifactIngested` writes a `primary_content`
 // row; an OCI manifest with `subject.digest` adds an `oci_subject`
 // sibling row; an ingest with a HashReference-strategy metadata blob
-// adds a `metadata_blob` sibling). A `Vec<ContentReference>` would
-// force the mock to re-implement PK uniqueness in application code
-// and quietly diverge from the adapter on that behaviour.
+// adds a `metadata_blob` sibling), AND — because `target_content_hash`
+// is part of the key — the same `(source, kind)` under a *different*
+// target is ALSO a sibling row (an OCI image index carries N
+// `oci_index_member` rows, one per child manifest hash). A narrower key
+// would collapse those N members to one and quietly diverge from the
+// adapter. A `Vec<ContentReference>` would force the mock to
+// re-implement PK uniqueness in application code.
 // ---------------------------------------------------------------------------
 
 /// In-memory mock for [`ContentReferenceIndex`]. Entries live in a
-/// `HashMap<(Uuid, Uuid, String), ContentReference>` keyed by
-/// `(repository_id, source_artifact_id, kind)`, matching the shape of
-/// the Postgres table's PRIMARY KEY. `insert` is upsert on the full
-/// key (so the same source can hold multiple sibling rows under
-/// different kinds simultaneously); `find_by_target` optionally
-/// filters by `kind`; `delete_by_source` sweeps every entry whose
-/// source matches, regardless of kind.
+/// `HashMap<(Uuid, Uuid, String, String), ContentReference>` keyed by
+/// `(repository_id, source_artifact_id, target_content_hash, kind)`,
+/// matching the shape of the Postgres table's widened PRIMARY KEY.
+/// `insert` is upsert on the full key (so the same source can hold
+/// multiple sibling rows under different kinds — and N members under one
+/// `(source, kind)` distinguished by target — simultaneously);
+/// `find_by_target` optionally filters by `kind`; `delete_by_source`
+/// sweeps every entry whose source matches, regardless of kind or
+/// target.
 ///
 /// Failure-injection hooks (`fail_next_insert`, `fail_next_insert_for_kind`,
 /// `fail_next_delete`) cover the warn-on-fail arms in
@@ -4098,7 +4151,7 @@ impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
 /// `metadata_blob` arm) without also failing the preceding
 /// `primary_content` arm.
 pub struct MockContentReferenceIndex {
-    entries: Mutex<HashMap<(Uuid, Uuid, String), ContentReference>>,
+    entries: Mutex<HashMap<(Uuid, Uuid, String, String), ContentReference>>,
     next_insert_error: Mutex<Option<DomainError>>,
     next_insert_error_for_kind: Mutex<Option<(String, DomainError)>>,
     next_delete_error: Mutex<Option<DomainError>>,
@@ -4176,10 +4229,11 @@ impl MockContentReferenceIndex {
 
 impl ContentReferenceIndex for MockContentReferenceIndex {
     fn insert(&self, reference: ContentReference) -> BoxFuture<'_, DomainResult<()>> {
-        // Upsert via `HashMap::insert` — the existing entry (if any)
-        // for the SAME `(repo, source, kind)` key is replaced, matching
-        // the adapter's `ON CONFLICT DO UPDATE` shape. A different
-        // `kind` is a different key — a sibling row, not a replacement.
+        // Upsert via `HashMap::insert` — the existing entry (if any) for
+        // the SAME `(repo, source, target, kind)` key is replaced,
+        // matching the adapter's `ON CONFLICT DO UPDATE` shape. A
+        // different `kind` OR a different `target_content_hash` is a
+        // different key — a sibling row, not a replacement.
         if let Some(err) = self.next_insert_error.lock().unwrap().take() {
             return Box::pin(async move { Err(err) });
         }
@@ -4197,6 +4251,7 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         let key = (
             reference.repository_id,
             reference.source_artifact_id,
+            reference.target_content_hash.as_ref().to_owned(),
             reference.kind.clone(),
         );
         self.entries.lock().unwrap().insert(key, reference);
@@ -4245,7 +4300,7 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         self.entries
             .lock()
             .unwrap()
-            .retain(|(_repo, src, _kind), _| *src != source);
+            .retain(|(_repo, src, _target, _kind), _| *src != source);
         Box::pin(async move { Ok(()) })
     }
 
@@ -4255,14 +4310,20 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         source: Uuid,
         kind: &str,
     ) -> BoxFuture<'_, DomainResult<Option<ContentReference>>> {
-        // PK lookup — `(repo, source, kind)` is unique by the
-        // adapter contract; the mock keys its `HashMap` on exactly
-        // that tuple so this is a one-shot get.
+        // Single-target-kind lookup — every caller of this method passes
+        // a single-target kind (`wheel_metadata`, `metadata_blob`,
+        // `oci_subject`), so at most one entry matches `(repo, source,
+        // kind)` regardless of the widened key including
+        // `target_content_hash` (mirrors the adapter's
+        // `fetch_optional` contract for single-target kinds). Scan the
+        // values rather than a direct `get`, since the mock's key now
+        // carries the target hash the caller does not supply.
         let entry = self
             .entries
             .lock()
             .unwrap()
-            .get(&(repo, source, kind.to_string()))
+            .values()
+            .find(|e| e.repository_id == repo && e.source_artifact_id == source && e.kind == kind)
             .cloned();
         Box::pin(async move { Ok(entry) })
     }
@@ -4279,7 +4340,7 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         let sources_set: std::collections::HashSet<Uuid> = sources.iter().copied().collect();
         let kind = kind.to_string();
         let mut out: HashMap<Uuid, ContentReference> = HashMap::new();
-        for ((entry_repo, entry_source, entry_kind), reference) in
+        for ((entry_repo, entry_source, _entry_target, entry_kind), reference) in
             self.entries.lock().unwrap().iter()
         {
             if *entry_repo == repo && entry_kind == &kind && sources_set.contains(entry_source) {
@@ -5347,6 +5408,11 @@ pub struct MockJobsRepository {
     /// Empty by default (the manual-rescan use case sees "no in-flight
     /// scan" and proceeds to enqueue).
     active_scans: Mutex<HashMap<Uuid, Uuid>>,
+    /// Seed map returned by
+    /// `find_active_provenance_for_artifact`. `(artifact_id) -> existing
+    /// job_id`. Empty by default (the expiry backstop sees "no in-flight
+    /// provenance-verify" and proceeds to enqueue).
+    active_provenance: Mutex<HashMap<Uuid, Uuid>>,
     /// Recorded calls to `enqueue_scan`.
     enqueue_scan_calls: Mutex<Vec<EnqueueScanCall>>,
     /// When `Some`, `enqueue_scan` returns this error instead of Ok.
@@ -5401,6 +5467,7 @@ impl Default for MockJobsRepository {
             reschedule_calls: Mutex::new(Vec::new()),
             mark_failed_calls: Mutex::new(Vec::new()),
             active_scans: Mutex::new(HashMap::new()),
+            active_provenance: Mutex::new(HashMap::new()),
             enqueue_scan_calls: Mutex::new(Vec::new()),
             enqueue_scan_error: Mutex::new(None),
             prefetch_batch_calls: Mutex::new(Vec::new()),
@@ -5485,6 +5552,18 @@ impl MockJobsRepository {
     /// conflict-detection tests.
     pub fn seed_active_scan(&self, artifact_id: Uuid, job_id: Uuid) {
         self.active_scans
+            .lock()
+            .unwrap()
+            .insert(artifact_id, job_id);
+    }
+
+    /// Seed an in-flight `provenance-verify` job for
+    /// an artifact so `find_active_provenance_for_artifact(artifact_id)`
+    /// returns `Ok(Some(existing_job_id))`. Used by the expiry-backstop
+    /// idempotency test to prove a second tick does not re-enqueue while
+    /// a verify is already in-flight.
+    pub fn seed_active_provenance(&self, artifact_id: Uuid, job_id: Uuid) {
+        self.active_provenance
             .lock()
             .unwrap()
             .insert(artifact_id, job_id);
@@ -5630,6 +5709,19 @@ impl JobsRepository for MockJobsRepository {
         artifact_id: Uuid,
     ) -> BoxFuture<'a, DomainResult<Option<Uuid>>> {
         let res = self.active_scans.lock().unwrap().get(&artifact_id).copied();
+        Box::pin(async move { Ok(res) })
+    }
+
+    fn find_active_provenance_for_artifact<'a>(
+        &'a self,
+        artifact_id: Uuid,
+    ) -> BoxFuture<'a, DomainResult<Option<Uuid>>> {
+        let res = self
+            .active_provenance
+            .lock()
+            .unwrap()
+            .get(&artifact_id)
+            .copied();
         Box::pin(async move { Ok(res) })
     }
 
@@ -6625,6 +6717,54 @@ mod tests {
         // None filter → both rows.
         let all = idx.find_by_target(repo, &target, None).await.unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// Mirrors the adapter's
+    /// `insert_same_source_kind_distinct_targets_coexist` /
+    /// `index_writes_n_member_rows_under_one_source_kind` DB-gated tests:
+    /// with the widened key `(repo, source, target, kind)`, N
+    /// `oci_index_member` rows under ONE `(source, kind)` — distinct only
+    /// by target — coexist rather than collapsing to one. Guards the mock
+    /// against silently diverging from the adapter's widened PK.
+    #[tokio::test]
+    async fn mock_references_same_source_kind_distinct_targets_coexist() {
+        let idx = MockContentReferenceIndex::new();
+        let repo = Uuid::new_v4();
+        let index_source = Uuid::new_v4();
+
+        // Three children under one (source = index, kind =
+        // "oci_index_member"), distinct only by target hash.
+        for child_hex in [VALID_SHA256_A, VALID_SHA256_B, VALID_SHA256_C] {
+            idx.insert(sample_reference(
+                repo,
+                index_source,
+                child_hex,
+                "oci_index_member",
+                serde_json::json!({"child_digest": format!("sha256:{child_hex}")}),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // All three coexist — a narrow (repo, source, kind) key would
+        // have collapsed them to the last child.
+        assert_eq!(idx.entry_count(), 3);
+
+        // Each child target is independently resolvable under the one
+        // (source, kind).
+        for child_hex in [VALID_SHA256_A, VALID_SHA256_B, VALID_SHA256_C] {
+            let target: ContentHash = child_hex.parse().unwrap();
+            let rows = idx
+                .find_by_target(repo, &target, Some("oci_index_member"))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "each member target survives");
+            assert_eq!(rows[0].source_artifact_id, index_source);
+        }
+
+        // Sweeping the index source frees every member.
+        idx.delete_by_source(index_source).await.unwrap();
+        assert_eq!(idx.entry_count(), 0);
     }
 
     #[tokio::test]

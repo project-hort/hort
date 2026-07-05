@@ -71,6 +71,19 @@ RUN curl -fsSL -o /tmp/gradle.zip \
     && unzip -q /tmp/gradle.zip -d /opt \
     && ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
     && rm -f /tmp/gradle.zip
+# cosign — the keyed-provenance signer for the push-then-sign round-trip
+# (scenarios/quarantine/provenance-push-then-sign.sh). Pulled from a PINNED,
+# CHECKSUM-VERIFIED GitHub release (same idiom as Maven/Gradle above), NOT the
+# Debian repo (which has no cosign package). v3.x matches the operator's
+# `cosign v3.0.4` (ADR 0039 §9 requires `--registry-referrers-mode=oci-1-1`,
+# a v2+/v3 flag). skopeo does the push/pull; cosign does only sign + the test
+# `generate-key-pair` — buildah is NOT needed.
+ARG COSIGN_VERSION=3.0.4
+ARG COSIGN_SHA256=10dab2fd2170b5aa0d5c0673a9a2793304960220b314f6a873bf39c2f08287aa
+RUN curl -fsSL -o /usr/local/bin/cosign \
+      "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64" \
+    && echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c - \
+    && chmod +x /usr/local/bin/cosign
 # The hort-cli admin client (built in stage 1) — used by the quarantine +
 # scanning scenarios that drive admin/release/rescan flows over HTTP.
 COPY --from=cli-builder /usr/local/bin/hort-cli /usr/local/bin/hort-cli

@@ -226,16 +226,24 @@ pub(super) async fn serve(
         .await
     {
         Ok((r, a)) => (r, a),
-        // Repository missing OR invisible to actor → NAME_UNKNOWN.
-        // Anti-enumeration: the two cases share the same envelope.
+        // Repository missing OR invisible to actor → repo-level read
+        // denial. Anonymous callers get a 401 + mode-aware challenge; an
+        // authenticated caller gets the NAME_UNKNOWN 404 anti-enumeration
+        // envelope. Both cases share one representation per caller class
+        // (D1/D2, ADR 0021).
         Err(AppError::Domain(DomainError::NotFound {
             entity: "Repository",
             ..
         })) => {
-            return OciError::NameUnknown {
-                repository: repo_key.to_string(),
-            }
-            .into_response();
+            let method = if head {
+                axum::http::Method::HEAD
+            } else {
+                axum::http::Method::GET
+            };
+            let path = format!("/v2/{repo_key}/{name}/blobs/{digest_str}");
+            return crate::middleware::oci_auth::read_denied_response(
+                &ctx, actor, &method, &path, repo_key,
+            );
         }
         // Repo visible, artifact missing → fall through to upstream
         // pull-through. The visibility check has succeeded; we still
@@ -250,8 +258,9 @@ pub(super) async fn serve(
             // pull-through path. Use the access use case so the call
             // stays inside the visibility-checked surface.
             // Race: repo deleted between the find_visible_by_path
-            // call and this re-resolve. Surface as NAME_UNKNOWN to
-            // match the original behaviour.
+            // call and this re-resolve. Same repo-level read-denial
+            // representation as the primary arm — challenge anonymous,
+            // NAME_UNKNOWN for authenticated (D1/D2, ADR 0021).
             let Ok(repo) = ctx
                 .repository_access_use_case
                 .resolve(
@@ -261,10 +270,15 @@ pub(super) async fn serve(
                 )
                 .await
             else {
-                return OciError::NameUnknown {
-                    repository: repo_key.to_string(),
-                }
-                .into_response();
+                let method = if head {
+                    axum::http::Method::HEAD
+                } else {
+                    axum::http::Method::GET
+                };
+                let path = format!("/v2/{repo_key}/{name}/blobs/{digest_str}");
+                return crate::middleware::oci_auth::read_denied_response(
+                    &ctx, actor, &method, &path, repo_key,
+                );
             };
 
             // Pull-through on miss (see docs/architecture/how-to/oci-pull-through.md).
@@ -330,28 +344,37 @@ pub(super) async fn serve(
     //    Rejected stays inline because the hidden-404 envelope is
     //    format-specific (`BLOB_UNKNOWN`).
     //
-    //    Push-dedup exception: a write-authorized caller's blob-EXISTENCE
-    //    check (`HEAD`) must report 200 (exists) so an OCI push can dedup
-    //    and complete. The pre-flight HEAD every pusher (skopeo,
-    //    `docker push`) issues is a write-path precondition, NOT a download
-    //    — quarantine invariant #1 gates *downloads*, not the existence
-    //    probe. The 503 hold stays in force for: the content GET (every
-    //    caller, `head == false`), and pull/read HEADs (non-writers). So
-    //    the download block and the transparent-proxy contract (invariant
-    //    #5) are untouched; only the write-authorized existence probe is
-    //    released. Fail closed: ONLY a definitive `Write` authorization
-    //    skips the 503 — a denied or errored resolve keeps it. The extra
-    //    resolve fires solely on the narrow quarantined-blob-HEAD path (the
-    //    `matches!` short-circuits first), so the hot read path is unaffected.
+    //    Push-dedup exception (ADR 0039 §10): a write-granted caller's
+    //    blob-EXISTENCE check (`HEAD`) must report 200 (exists) so an OCI
+    //    push can dedup and complete. The pre-flight HEAD every pusher
+    //    (skopeo, `docker push`) issues is a write-path precondition, NOT
+    //    a download — quarantine invariant #1 gates *downloads*, not the
+    //    existence probe.
+    //
+    //    The predicate keys on GRANTED write authority
+    //    (`resolve_granted_write`: the grants leg alone, cap ignored),
+    //    the same basis as the manifest hold-read exemption: standard
+    //    OCI clients scope read transports as `pull`, so under native
+    //    tokens the presented capability JWT can carry a read-only cap
+    //    while the principal's grants carry Write. The read itself stays
+    //    cap-gated on the normal `resolve(Read)` path; only the
+    //    held-visibility decision consults identity-level authority
+    //    (bounded ADR 0036 exception, recorded in ADR 0039 §10).
+    //
+    //    The 503 hold stays in force for: the content GET (every caller,
+    //    `head == false`), and pull/read HEADs (identities without the
+    //    Write grant). So the download block and the transparent-proxy
+    //    contract (invariant #5) are untouched; only the write-granted
+    //    existence probe is released. Fail closed: ONLY a definitive
+    //    granted-Write authorization skips the 503 — a denied or errored
+    //    resolve keeps it. The extra resolve fires solely on the narrow
+    //    quarantined-blob-HEAD path (the `matches!` short-circuits
+    //    first), so the hot read path is unaffected.
     let write_authorized_existence_probe = head
         && matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
         && ctx
             .repository_access_use_case
-            .resolve(
-                repo_key,
-                actor,
-                hort_app::use_cases::repository_access::AccessLevel::Write,
-            )
+            .resolve_granted_write(repo_key, actor)
             .await
             .is_ok();
     if !write_authorized_existence_probe {
@@ -1174,17 +1197,24 @@ mod tests {
 
     // -- Handler: missing repo / blob / digest -----------------------------
 
+    /// Missing repo, AUTHENTICATED caller → `NAME_UNKNOWN` 404 through the
+    /// full router. Post-D1/D2 the anonymous path challenges with 401
+    /// (covered by `blob_read_denial_challenges_anonymous_and_404s_authenticated`);
+    /// this pins the authenticated anti-enum 404 end-to-end. A principal is
+    /// injected directly because `blob_router` omits the bearer middleware.
     #[test]
-    fn get_blob_missing_repo_returns_404_name_unknown() {
+    fn get_blob_missing_repo_authenticated_returns_404_name_unknown() {
         let (status, body) = run(async {
             let h = harness();
             // No repo insert — `find_by_key("missing-repo")` misses.
             let router = blob_router(h.ctx);
             let uri = format!("/v2/missing-repo/nginx/blobs/sha256:{}", valid_hex());
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
+            let mut req = Request::get(&uri).body(Body::empty()).unwrap();
+            hort_http_core::middleware::auth::test_support::inject_optional_principal_some(
+                &mut req,
+                crate::test_authz::grantless_principal(),
+            );
+            let resp = router.oneshot(req).await.unwrap();
             let status = resp.status();
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body)
@@ -1460,57 +1490,9 @@ mod tests {
         );
     }
 
-    /// Build an RBAC-enabled context that grants `claim` repo-wide `Write`,
-    /// reusing the harness's `repositories` mock so seeded repos resolve.
-    /// Mirror of lib.rs `enabled_empty_rbac_ctx`, with one grant added.
-    fn write_grant_ctx(
-        base: &Arc<AppContext>,
-        repositories: Arc<MockRepositoryRepository>,
-        claim: &str,
-    ) -> Arc<AppContext> {
-        use hort_app::rbac::RbacEvaluator;
-        use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
-        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
-        use hort_app::use_cases::test_support::{MockIdentityProvider, MockUserRepository};
-        use hort_domain::entities::managed_by::ManagedBy;
-        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
-        use hort_domain::ports::identity_provider::IdentityProvider;
-        use hort_domain::ports::user_repository::UserRepository;
-        use hort_http_core::context::AuthContext;
-        use hort_http_core::test_support::{with_auth, with_repository_access};
-
-        let grant = PermissionGrant {
-            id: Uuid::new_v4(),
-            subject: GrantSubject::Claims(vec![claim.to_string()]),
-            repository_id: None,
-            permission: Permission::Write,
-            created_at: Utc::now(),
-            managed_by: ManagedBy::Local,
-            managed_by_digest: None,
-        };
-        let rbac_swap = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
-            grant,
-        ])));
-        let authenticate = Arc::new(AuthenticateUseCase::new(
-            Arc::new(MockIdentityProvider::new()) as Arc<dyn IdentityProvider>,
-            Arc::new(MockUserRepository::new()) as Arc<dyn UserRepository>,
-            Vec::new(),
-        ));
-        let ctx = with_auth(
-            base,
-            AuthContext::Enabled {
-                authenticate,
-                rbac: rbac_swap.clone(),
-                issuer_url: None,
-            },
-        );
-        let access = Arc::new(RepositoryAccessUseCase::new(
-            repositories,
-            RbacAccess::Enabled(rbac_swap),
-            true,
-        ));
-        with_repository_access(&ctx, access)
-    }
+    // RBAC-enabled ctx builders + the capability-token principal shape
+    // are shared with the manifest suite via `crate::test_authz`.
+    use crate::test_authz::{pull_scoped_cap_principal, user_grant_ctx, write_grant_ctx};
 
     /// A `CallerPrincipal` carrying exactly `claim`.
     fn principal_with_claim(claim: &str) -> CallerPrincipal {
@@ -1605,10 +1587,15 @@ mod tests {
         );
     }
 
-    /// Security scope guard: the exception is HEAD-only. A write-authorized
-    /// caller's content GET of a quarantined blob still 503s — the quarantine
-    /// DOWNLOAD block (invariant #1) holds even for the pusher; only the
-    /// existence probe is released, never the held bytes.
+    /// Security scope guard — the load-bearing content gate (ADR 0039). A
+    /// write-authorized caller's content GET of a quarantined LAYER BLOB still
+    /// 503s: the blob existence probe is HEAD-only. This is the safety boundary
+    /// the widened manifest exemption relies on — `manifests.rs` now serves a
+    /// held MANIFEST to a write-authorized GET (so keyed cosign can sign it),
+    /// but a manifest is only metadata (config + layer digests). The runnable
+    /// bytes are these layer blobs, and they stay held for every caller —
+    /// including the write-authorized pusher — so no runnable content ever
+    /// leaves quarantine and the image cannot be pulled or run while held.
     #[test]
     fn get_blob_quarantined_write_authorized_caller_still_returns_503() {
         let status = quarantined_blob_serve_status(/* head = */ false, Some("ci-pusher"));
@@ -1617,6 +1604,107 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "write-authorized GET of a quarantined blob must stay 503 — only the \
              HEAD existence probe is released; content download stays held"
+        );
+    }
+
+    // -- Capability-token matrix: the existence-probe exemption keys on
+    //    GRANTED write authority (ADR 0039 §10) — same basis as the
+    //    manifest hold-read; the content GET stays held for every
+    //    caller.
+
+    /// Drive `serve()` for the quarantined blob under a User-subject
+    /// grant set attached to `principal.user_id`.
+    fn quarantined_blob_cap_status(
+        head: bool,
+        granted: &[hort_domain::entities::rbac::Permission],
+        principal: &CallerPrincipal,
+    ) -> StatusCode {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+            );
+            let ctx = user_grant_ctx(&h.ctx, h.repositories.clone(), principal.user_id, granted);
+            serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                Some(principal),
+            )
+            .await
+            .status()
+        })
+    }
+
+    /// A pull-scoped capability principal whose identity holds Write
+    /// (the push-dedup preflight under native tokens): the held-blob
+    /// existence HEAD reports 200 — the read-only cap does not veto
+    /// held-visibility; the grants leg decides it.
+    #[test]
+    fn head_blob_quarantined_pull_scoped_cap_with_write_grant_reports_exists() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCB1);
+        let p = pull_scoped_cap_principal(uid);
+        assert_eq!(
+            quarantined_blob_cap_status(
+                /* head = */ true,
+                &[Permission::Read, Permission::Write],
+                &p
+            ),
+            StatusCode::OK,
+            "held-blob HEAD by a pull-scoped cap principal with a Write grant must \
+             report exists — the exemption keys on granted authority, not the cap"
+        );
+    }
+
+    /// The content gate is untouched by the granted-authority basis: a
+    /// write-granted pull-scoped cap principal's GET of the held blob
+    /// stays 503 — only the HEAD existence probe is released.
+    #[test]
+    fn get_blob_quarantined_pull_scoped_cap_with_write_grant_still_returns_503() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCB2);
+        let p = pull_scoped_cap_principal(uid);
+        assert_eq!(
+            quarantined_blob_cap_status(
+                /* head = */ false,
+                &[Permission::Read, Permission::Write],
+                &p
+            ),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "held-blob content GET must stay 503 for every caller — the layer bytes \
+             never leave quarantine"
+        );
+    }
+
+    /// Scope guard: a pull-scoped cap principal whose identity holds
+    /// only Read gets no existence probe — granted WRITE authority keys
+    /// the exemption.
+    #[test]
+    fn head_blob_quarantined_pull_scoped_cap_read_only_grantee_stays_503() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCB3);
+        let p = pull_scoped_cap_principal(uid);
+        assert_eq!(
+            quarantined_blob_cap_status(/* head = */ true, &[Permission::Read], &p),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a read-only grantee's held-blob HEAD must stay 503"
         );
     }
 
@@ -2834,83 +2922,104 @@ mod tests {
         );
     }
 
-    /// Visibility regression guard (ADR 0008).
-    ///
-    /// Anonymous `GET /v2/<private-repo>/.../blobs/sha256:<hex>` MUST
-    /// return `404 BLOB_UNKNOWN` — NOT 200 + body. The handler routes
-    /// through `ArtifactUseCase::find_visible_by_path` whose
-    /// `RepositoryAccessUseCase::resolve(_, None, Read)` collapses
-    /// invisible-private to NotFound (anti-enumeration).
-    ///
-    /// Test runs under `RbacAccess::Enabled` with an empty evaluator
-    /// (the harness default `Disabled` admits everything). Actor =
-    /// None: no `Option<CallerPrincipal>` extension on the request
-    /// since this test bypasses the bearer middleware (the simple
-    /// `blob_router` in this module doesn't attach it).
+    /// Repo-level read denial (D1/D2, ADR 0021): an anonymous blob pull
+    /// on a denied repo (missing OR invisible-private, indistinguishable)
+    /// is challenged with 401 + the mode-aware `WWW-Authenticate` in BOTH
+    /// signing-key states; an authenticated-but-unauthorized caller keeps
+    /// the `NAME_UNKNOWN` 404 anti-enumeration envelope. Supersedes the
+    /// pre-challenge anonymous-private-repo → 404 guard (anonymous private
+    /// now 401, alongside anonymous nonexistent — see the uniformity test).
     #[test]
-    fn anonymous_get_on_private_repo_returns_404_name_unknown() {
-        use hort_app::rbac::RbacEvaluator;
-        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
-        use hort_http_core::test_support::with_repository_access;
-
-        let content = b"private blob bytes".to_vec();
-        let hex = {
-            use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
-        };
-        let (status, body) = run(async {
+    fn blob_read_denial_challenges_anonymous_and_404s_authenticated() {
+        let digest = format!("sha256:{}", valid_hex());
+        run(async {
             let h = harness();
-            let mut repo = oci_repo("private-repo");
-            repo.is_public = false;
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            seed_blob(
-                &h.artifacts,
-                &h.storage,
-                repo_id,
-                &hex,
-                &content,
-                QuarantineStatus::None,
+            let hm = HeaderMap::new();
+            // (1) anonymous, signing key UNWIRED → 401 Basic.
+            crate::test_authz::assert_basic_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    &digest,
+                    &hm,
+                    false,
+                    None,
+                )
+                .await,
             );
-
-            // Flip RbacAccess to Enabled so anonymous + private
-            // collapses to invisible (the Disabled default admits
-            // everything for dev parity).
-            //
-            // `ctx.repositories` is `pub(crate)` (ADR 0008); pull the same
-            // `Arc<MockRepositoryRepository>` off the harness's MockPorts
-            // handle (`h.repositories`).
-            let access = Arc::new(RepositoryAccessUseCase::new(
-                h.repositories.clone(),
-                RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
-                    RbacEvaluator::new(Vec::new()),
-                ))),
-                true,
-            ));
-            let ctx = with_repository_access(&h.ctx, access);
-
-            let router = blob_router(ctx);
-            let uri = format!("/v2/private-repo/library/nginx/blobs/sha256:{hex}");
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            // (2) anonymous, signing key WIRED → 401 Bearer /v2/auth.
+            crate::test_authz::assert_bearer_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx_bearer(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    &digest,
+                    &hm,
+                    false,
+                    None,
+                )
+                .await,
+                r#"scope="repository:ghost/library/nginx:pull""#,
+            );
+            // (3) authenticated but unauthorized → 404 NAME_UNKNOWN.
+            let principal = crate::test_authz::grantless_principal();
+            crate::test_authz::assert_name_unknown_404(
+                serve(
+                    crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    &digest,
+                    &hm,
+                    false,
+                    Some(&principal),
+                )
+                .await,
+            )
+            .await;
         });
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "anonymous read on private OCI repo MUST be 404"
-        );
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Anti-enumeration: NAME_UNKNOWN (same envelope as
-        // missing-repo).
-        assert_eq!(
-            parsed["errors"][0]["code"], "NAME_UNKNOWN",
-            "envelope must match the missing-repo case to defeat probing"
-        );
+    }
+
+    /// Anti-enumeration equivalence (ADR 0021): an anonymous denial for a
+    /// NONEXISTENT repo is byte-identical to one for an EXISTING PRIVATE
+    /// repo (Basic mode carries no `scope=` echo, so the whole response
+    /// matches). This is exactly what an enumeration probe would diff.
+    #[test]
+    fn blob_anonymous_denial_uniform_nonexistent_vs_private() {
+        let digest = format!("sha256:{}", valid_hex());
+        run(async {
+            let h = harness();
+            let mut priv_repo = oci_repo("private-repo");
+            priv_repo.is_public = false;
+            h.repositories.insert(priv_repo);
+            let ctx = crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone());
+            let hm = HeaderMap::new();
+            let nonexistent = serve(
+                ctx.clone(),
+                "ghost",
+                "library/nginx",
+                &digest,
+                &hm,
+                false,
+                None,
+            )
+            .await;
+            let private = serve(
+                ctx,
+                "private-repo",
+                "library/nginx",
+                &digest,
+                &hm,
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(
+                crate::test_authz::denial_snapshot(nonexistent).await,
+                crate::test_authz::denial_snapshot(private).await,
+                "anonymous nonexistent vs existing-private must be byte-identical"
+            );
+        });
     }
 
     /// Local miss + NO upstream mapping → BLOB_UNKNOWN. Regression-guard

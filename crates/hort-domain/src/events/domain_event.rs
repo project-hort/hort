@@ -902,6 +902,7 @@ pub(crate) mod tests {
                             .into(),
                 },
                 predicate_type: Some("https://slsa.dev/provenance/v1".into()),
+                cascaded_from: Some(sha256()),
             }),
             DomainEvent::ProvenanceRejected(ProvenanceRejected {
                 artifact_id: Uuid::nil(),
@@ -1375,6 +1376,44 @@ pub(crate) mod tests {
             matches!(err, crate::error::DomainError::Validation(_)),
             "expected the inner predicate validator to reject a 0s TTL through the wrapper, got {err:?}"
         );
+    }
+
+    /// A pre-cascade `ProvenanceVerified` JSON payload (no `cascaded_from`
+    /// key) deserializes with `cascaded_from: None`, and a direct (`None`)
+    /// verification serializes byte-identically to the pre-cascade shape
+    /// (`skip_serializing_if`) — older persisted events and any
+    /// payload-digesting reader are unaffected by the field addition.
+    #[test]
+    fn provenance_verified_cascaded_from_is_backward_compatible() {
+        let direct = ProvenanceVerified {
+            artifact_id: Uuid::nil(),
+            content_hash: sha256(),
+            backend: "cosign-key".into(),
+            signer: SignerIdentity {
+                issuer: "operator-pinned-key".into(),
+                san: "cosign-key".into(),
+            },
+            predicate_type: None,
+            cascaded_from: None,
+        };
+        let json = serde_json::to_value(&direct).unwrap();
+        assert!(
+            json.get("cascaded_from").is_none(),
+            "a direct verification must serialize without the cascaded_from key"
+        );
+
+        // The pre-cascade wire shape (no cascaded_from key) round-trips.
+        let old: ProvenanceVerified = serde_json::from_value(json).unwrap();
+        assert_eq!(old, direct);
+
+        // A cascaded clearance round-trips the subject attribution.
+        let cascaded = ProvenanceVerified {
+            cascaded_from: Some(sha256()),
+            ..direct
+        };
+        let json = serde_json::to_value(&cascaded).unwrap();
+        let back: ProvenanceVerified = serde_json::from_value(json).unwrap();
+        assert_eq!(back.cascaded_from, Some(sha256()));
     }
 
     // -------------------------------------------------------------------

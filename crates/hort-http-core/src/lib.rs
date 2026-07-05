@@ -24,6 +24,10 @@ pub mod handlers;
 pub mod limits;
 pub mod middleware;
 pub mod router;
+/// Generic per-`(repo, principal)` live upload-session cap primitive
+/// shared by every `StatefulUpload` format (OCI, Git LFS, …). See the
+/// module docs.
+pub mod upload_session_cap;
 pub mod url_resolver;
 
 /// Shared mock [`context::AppContext`] construction for router + handler

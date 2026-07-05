@@ -1,0 +1,81 @@
+-- Migration 013 — widen the content_references PK to a many-to-many.
+--
+-- `content_references` is hort's general "an artifact references a
+-- content hash (by `kind`), and that reference keeps the hash alive
+-- under GC" projection (`primary_content`, `oci_subject`,
+-- `metadata_blob`, `wheel_metadata`). Its ONLY limitation was the PK
+-- `(repository_id, source_artifact_id, kind)` — exactly one target per
+-- `(source, kind)`. The OCI image index / manifest list is the first
+-- consumer that needs **N targets per (source, kind)**: an index links
+-- to its 1..N child manifests, all under one fixed
+-- `kind = "oci_index_member"` with `source =` the index artifact and
+-- `target =` each child manifest's own content hash.
+--
+-- Rather than a format-specific side table, this migration fixes the
+-- general model: it widens the primary key to include
+-- `target_content_hash`, making `content_references` the proper
+-- many-to-many it always semantically was. One row per
+-- `(repository_id, source_artifact_id, target_content_hash, kind)`.
+--
+-- Domain / adapter:
+--   crates/hort-domain/src/ports/content_reference_index.rs
+--     (the port + the "oci_index_member" kind)
+--   crates/hort-adapters-postgres/src/pg_content_reference_repo.rs
+--     (the `insert` upsert `ON CONFLICT (…, target_content_hash, kind)`)
+--
+-- Design: docs/plans/oci-image-index.md §2 (D3), §5.
+--
+-- Data-compatible — NO backfill / rewrite. Every existing
+-- `(repository_id, source_artifact_id, kind)` row already carries
+-- exactly one, immutable, target:
+--   * `primary_content`  → the artifact's own SHA-256
+--   * `oci_subject`      → the fixed `subject.digest`
+--   * `metadata_blob`    → the fixed CAS-resident metadata blob
+--   * `wheel_metadata`   → the fixed PEP 658 METADATA blob
+-- so every existing row is already unique under the wider key and the
+-- ALTER re-keys in place without touching a single row's data. The
+-- read-side indexes (`idx_content_references_source`,
+-- `idx_content_references_target`, `idx_content_references_target_kind`)
+-- are unaffected — GC `remaining_refs(hash)` counts by
+-- `target_content_hash` and needs no change.
+--
+-- Widening a PRIMARY KEY drops the old btree and builds a new one over
+-- the wider column tuple; it does NOT rewrite the heap. The two FK
+-- constraints (`…_repository_id_fkey`, `…_source_artifact_id_fkey`) and
+-- their `ON DELETE CASCADE` behaviour are untouched — an index's DELETE
+-- / purge still sweeps every `source = index` row (the whole child set)
+-- exactly as it swept the single `oci_subject` row.
+--
+-- GRANTs / role wiring: no explicit `GRANT` — an `ALTER TABLE` re-keys
+-- an existing table and does not create a new one, so the ADR 0009
+-- `ALTER DEFAULT PRIVILEGES` convention (mirrored from 005..012) is not
+-- exercised here; the existing grants on `content_references` carry over
+-- verbatim.
+--
+-- Reversal: sqlx::migrate! runs UP-only; the project does not maintain
+-- paired *.down.sql files. Manual reversal command if ever needed
+-- (operator runs against the DB directly; note that the narrower PK can
+-- only be restored if no `(source, kind)` carries more than one target
+-- at that time — i.e. after every `oci_index_member` row is gone):
+--
+--   ALTER TABLE public.content_references
+--       DROP CONSTRAINT content_references_pkey;
+--   ALTER TABLE public.content_references
+--       ADD CONSTRAINT content_references_pkey
+--       PRIMARY KEY (repository_id, source_artifact_id, kind);
+--
+-- Pre-v1.0 (per `feedback_pre_release_migrations`): if the schema needs
+-- adjusting before GA, edit THIS file in place rather than appending
+-- 013_content_references_alter_*.sql on top.
+--
+-- Idempotence: this migration runs exactly once via the
+-- `_sqlx_migrations` bookkeeping table. No `IF EXISTS` guard on the DROP
+-- — if the base constraint is missing, the migration must fail fast so
+-- the operator notices the divergence rather than silently masking it.
+
+ALTER TABLE ONLY public.content_references
+    DROP CONSTRAINT content_references_pkey;
+
+ALTER TABLE ONLY public.content_references
+    ADD CONSTRAINT content_references_pkey
+    PRIMARY KEY (repository_id, source_artifact_id, target_content_hash, kind);

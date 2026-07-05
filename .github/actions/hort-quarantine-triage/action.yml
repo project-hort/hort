@@ -1,0 +1,129 @@
+name: Hort quarantine triage
+description: >
+  Diagnose a FAILED hort dependency-resolution gate (`cargo fetch` against hort
+  could not acquire the locked dependency set). Classifies each blocked pin
+  against hort's authoritative status (the discovery endpoint) and posts one
+  explanatory PR comment.
+
+  It does NOT change job status. The resolve step's failure already reds the gate
+  (which is the merge-blocking signal) — this only explains WHY the gate is red
+  and whether a retry is the right move. A green gate always means the code was
+  actually built against a clean dependency set.
+
+inputs:
+  active:
+    description: "'true' only on the same-repo MR gate (never fork PRs)."
+    required: true
+  hort_url:
+    required: false
+    default: 'https://registry.hort.rs'
+  repo_key:
+    required: false
+    default: 'cargo-virtual'
+  hort_token:
+    description: Short-lived hort reader bearer (the `token` output of hort-auth).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Classify blocked dependencies
+      id: classify
+      if: ${{ inputs.active == 'true' }}
+      shell: bash
+      env:
+        HORT_URL: ${{ inputs.hort_url }}
+        REPO: ${{ inputs.repo_key }}
+        HORT_TOKEN: ${{ inputs.hort_token }}
+      run: |
+        set -uo pipefail
+        # `cargo fetch --locked` failed, so some locked dep could not be acquired.
+        # Classify each registry pin via hort's authoritative status. Cargo.lock
+        # is the committed, network-free pinned set; discovery's `status.kind` is
+        # the source of truth. Wire contract —
+        # hort_domain::entities::discovery::DiscoveryVersionStatus,
+        # #[serde(tag="kind", rename_all="snake_case")]:
+        #   released | quarantined{quarantine_until} |
+        #   quarantined_awaiting_release{...} | rejected | scan_indeterminate | unknown
+        rejected=(); quarantined=(); stuck=(); unknown=(); latest_until=""
+        while read -r name ver; do
+          entry=$(curl -sS --max-time 15 -H "Authorization: Bearer ${HORT_TOKEN}" \
+            "${HORT_URL}/api/v1/repositories/${REPO}/discovery/versions/${name}" 2>/dev/null \
+            | jq -c --arg v "$ver" '.versions[]? | select(.version==$v)' 2>/dev/null || true)
+          [ -z "$entry" ] && continue
+          case "$(printf '%s' "$entry" | jq -r '.status.kind // empty')" in
+            rejected|scan_indeterminate)  rejected+=("${name}@${ver}") ;;
+            quarantined_awaiting_release) stuck+=("${name}@${ver}") ;;
+            unknown)                      unknown+=("${name}@${ver}") ;;
+            quarantined)
+              quarantined+=("${name}@${ver}")
+              until=$(printf '%s' "$entry" | jq -r '.status.quarantine_until // empty')
+              # RFC-3339 UTC sorts lexically == chronologically.
+              if [ -n "$until" ] && { [ -z "$latest_until" ] || [ "$until" \> "$latest_until" ]; }; then
+                latest_until="$until"
+              fi
+              ;;
+          esac
+        done < <(awk '
+            /^\[\[package\]\]/    { name=""; ver=""; src=0 }
+            /^name = /            { gsub(/[",]/,""); name=$3 }
+            /^version = /         { gsub(/[",]/,""); ver=$3 }
+            /^source = "registry/ { src=1 }
+            /^$/                  { if (name && ver && src) print name, ver; name=""; ver=""; src=0 }
+            END                   { if (name && ver && src) print name, ver }
+          ' Cargo.lock)
+
+        list() { printf '%s\n' "$@" | sed 's/^/- `/; s/$/`/'; }
+
+        # Dominant diagnosis. `rejected` and `stuck` are the "a retry will not
+        # help" cases and take precedence over a plain quarantine window.
+        if [ ${#rejected[@]} -gt 0 ]; then
+          { echo "verdict=rejected"; echo "body<<HORT_EOF"
+            echo "### 🔴 Blocked: dependency scanned & REJECTED by hort"
+            echo ""
+            echo "A retry will **not** help — this is the supply-chain gate working. Investigate / replace:"
+            echo ""; list "${rejected[@]}"
+            echo "HORT_EOF"; } >> "$GITHUB_OUTPUT"
+        elif [ ${#stuck[@]} -gt 0 ]; then
+          { echo "verdict=stuck"; echo "body<<HORT_EOF"
+            echo "### 🟠 Stuck: past the quarantine window with no release authority (ADR 0007)"
+            echo ""
+            echo "These cleared the quarantine *time* window but no release authority fired, so **a timed retry will not release them.** They need an operator **curator waive** or **admin override**:"
+            echo ""; list "${stuck[@]}"
+            echo "HORT_EOF"; } >> "$GITHUB_OUTPUT"
+        elif [ ${#quarantined[@]} -gt 0 ]; then
+          { echo "verdict=quarantined"; echo "until=${latest_until:-unknown}"; echo "body<<HORT_EOF"
+            echo "### ⏳ Blocked by quarantine (retryable)"
+            echo ""
+            echo "**Not a code failure** — the gate could not source ${#quarantined[@]} dependency(ies) still inside hort's quarantine window. Re-run the gate after they clear."
+            echo ""
+            echo "**Earliest retry:** \`${latest_until:-the quarantine window}\`"
+            echo ""; list "${quarantined[@]}"
+            echo ""
+            echo "_Prefetch on the feature branch normally warms these before the merge build, so this should be rare._"
+            echo "HORT_EOF"; } >> "$GITHUB_OUTPUT"
+        elif [ ${#unknown[@]} -gt 0 ]; then
+          { echo "verdict=unknown"; echo "body<<HORT_EOF"
+            echo "### ❔ Dependencies not yet ingested by hort"
+            echo ""
+            echo "Not in hort yet (prefetch may not have run or cascaded); they will ingest + quarantine on first fetch:"
+            echo ""; list "${unknown[@]}"
+            echo "HORT_EOF"; } >> "$GITHUB_OUTPUT"
+        else
+          echo "verdict=none" >> "$GITHUB_OUTPUT"
+          echo "No pinned dependency is quarantined / rejected / stuck in hort — the resolve failure is unrelated to quarantine (network, lockfile drift, or a genuinely missing crate). Gate stays red; see the job log."
+        fi
+
+    - name: Comment the diagnosis
+      if: ${{ inputs.active == 'true' && steps.classify.outputs.verdict != '' && steps.classify.outputs.verdict != 'none' && github.event_name == 'pull_request' }}
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      env:
+        BODY: ${{ steps.classify.outputs.body }}
+      with:
+        script: |
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.pull_request.number,
+            body: process.env.BODY,
+          });

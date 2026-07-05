@@ -55,15 +55,16 @@
 //! migration strategy is **drain-via-TTL**: bump the
 //! [`session_key`] prefix (currently `stateful_upload:oci_v2:`) to
 //! `oci_v3:` etc. on the next breaking change, and let in-flight
-//! sessions expire via the 1-hour [`OCI_SESSION_TTL`].  No dual-
-//! format reader exists; old keys are unreachable from new code.
+//! sessions expire via the session max-age
+//! ([`OCI_SESSION_MAX_AGE_SECS`]).  No dual-format reader exists; old
+//! keys are unreachable from new code.
 
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -74,24 +75,45 @@ use hort_domain::events::ApiActor;
 use hort_domain::types::ContentHash;
 use hort_formats::oci::OciFormatHandler;
 use hort_http_core::context::AppContext;
+use hort_http_core::upload_session_cap::{self, AdmitOutcome};
 
 use super::coords::oci_blob_coords;
 
+/// The stateful-upload format token this adapter passes to the generic
+/// per-`(repo, principal)` cap primitive
+/// ([`hort_http_core::upload_session_cap`]). It is the cap-set keyspace
+/// segment (`upload_sessions:oci:…`) and the `format` metric label on the
+/// cap-rejection / reconcile-prune counters.
+const OCI_CAP_FORMAT: &str = "oci";
+
 // ---------------------------------------------------------------------------
-// TTL
+// TTL / max-age
 // ---------------------------------------------------------------------------
 
-/// Default upload-session TTL. `HORT_OCI_SESSION_MAX_AGE_SECS` will
-/// thread this through `hort-server::Config` in a future change; until
-/// then the hardcoded one-hour ceiling is
-/// adequate — it matches the Docker Registry v2 reference implementation
-/// and gives humans enough time to retry a multi-gigabyte push over a
-/// flaky link without GC'ing the session out from under them.
+/// Default upload-session max-age, in seconds. Threaded through
+/// `hort-server::Config` as `HORT_OCI_SESSION_MAX_AGE_SECS` onto
+/// [`OciHttpConfig::session_max_age_secs`]; the constant is the fallback
+/// when a caller constructs a bare `OciHttpConfig::default()`.
 ///
-/// TODO(oci-session-max-age): replace with a value threaded from
-/// `AppContext`/`hort-server::Config` and honour
-/// `HORT_OCI_SESSION_MAX_AGE_SECS`.
-pub const OCI_SESSION_TTL: Duration = Duration::from_secs(3600);
+/// The one-hour ceiling matches the Docker Registry v2 reference
+/// implementation and gives humans enough time to retry a
+/// multi-gigabyte push over a flaky link without GC'ing the session out
+/// from under them. It serves a dual role for the live session set:
+///
+/// - the TTL applied on every set write (backstop — the whole
+///   `(repo, principal)` set self-expires if idle for this long);
+/// - the age-prune threshold on admit — a member older than this is
+///   reclaimed on the next admit, so an abandoned session can never pin
+///   the cap past this window.
+pub const OCI_SESSION_MAX_AGE_SECS: u64 = 3600;
+
+/// Bounded `Retry-After` advisory (seconds) returned on a cap-exceeded
+/// `429`. The cap is a transient live-count, not a per-session hold —
+/// abandoned members age out on the next admit — so the client should
+/// retry soon, NOT wait the full session max-age. A short fixed value
+/// keeps a well-behaved client's back-off tight without inviting a
+/// tight-loop retry storm.
+pub const OCI_CAP_RETRY_AFTER_SECS: i64 = 15;
 
 // ---------------------------------------------------------------------------
 // Key
@@ -130,20 +152,6 @@ pub fn format_token(format: &str) -> &str {
     }
 }
 
-/// Build the `EphemeralStore` key for the per-`(repo, principal)`
-/// outstanding-session counter.
-///
-/// Key shape is `oci:session_count:{repo_id}:{principal_id}`. Stable across
-/// process restarts (every component is a UUID's `Display` form), so
-/// counters reseat naturally when a Redis-backed deployment recycles
-/// the registry binary while an attacker's session pool is still in
-/// flight. The `oci:` prefix keeps this counter out of the
-/// `stateful_upload:` namespace consumed by [`session_key`] —
-/// individual session rows and the aggregate counter never collide.
-pub fn session_count_key(repo_id: Uuid, principal_id: Uuid) -> String {
-    format!("oci:session_count:{repo_id}:{principal_id}")
-}
-
 // ---------------------------------------------------------------------------
 // Record
 // ---------------------------------------------------------------------------
@@ -165,13 +173,12 @@ pub fn session_count_key(repo_id: Uuid, principal_id: Uuid) -> String {
 /// version counter is opaque from the caller's point of view and lives
 /// beside the record on the backend.
 ///
-/// `principal_id_bytes` allows finalize / cleanup paths to decrement
-/// the per-`(repo, principal)` outstanding-session counter without
-/// re-querying the originating request. Sessions are TTL-bounded
-/// (1 hour); a deployment that introduces this field handles the
-/// transient deploy-window decode failures via the existing
-/// `Invariant` mapping — the cap counter naturally TTL-cleans even
-/// when a few sessions skip the decrement.
+/// `principal_id_bytes` allows finalize / cleanup paths to release the
+/// per-`(repo, principal)` live-session set member without re-querying
+/// the originating request. Sessions are max-age-bounded; a deployment
+/// that introduces this field handles the transient deploy-window
+/// decode failures via the existing `Invariant` mapping — the session
+/// set naturally age-prunes even when a few sessions skip the release.
 ///
 /// # Wire-format invariant
 ///
@@ -196,8 +203,8 @@ pub(crate) struct UploadSessionRecord {
     /// that matches the store's new counter.
     pub version: u64,
     /// The principal that opened the session. Used by finalize /
-    /// cleanup paths to decrement the per-`(repo, principal)` cap
-    /// counter.
+    /// cleanup paths to release the per-`(repo, principal)` live-session
+    /// set member.
     pub principal_id_bytes: [u8; 16],
 }
 
@@ -312,6 +319,13 @@ pub enum InitiateResult {
     /// Per-`(repo, principal)` cap exceeded. Caller emits 429 with
     /// the OCI `TOOMANYREQUESTS` envelope.
     CapExceeded,
+    /// The cap reconcile CAS loop exhausted its retry budget under
+    /// pathological write contention — a TRANSIENT condition, not a
+    /// cap breach. Caller emits `503 Service Unavailable` + a short
+    /// `Retry-After` (the same `OCI_CAP_RETRY_AFTER_SECS` the 429
+    /// path uses) so the client retries soon. No session was created
+    /// and no cap-rejection metric was emitted.
+    Contended,
 }
 
 /// Initiate a three-phase OCI blob upload.
@@ -344,13 +358,20 @@ pub async fn initiate(
     repo_id: Uuid,
     actor: ApiActor,
     max_sessions_per_principal: u32,
+    session_max_age: Duration,
 ) -> AppResult<InitiateResult> {
-    initiate_inner(ctx, repo_id, actor, max_sessions_per_principal)
-        .instrument(tracing::info_span!(
-            "oci_upload_session_initiate",
-            repository_id = %repo_id,
-        ))
-        .await
+    initiate_inner(
+        ctx,
+        repo_id,
+        actor,
+        max_sessions_per_principal,
+        session_max_age,
+    )
+    .instrument(tracing::info_span!(
+        "oci_upload_session_initiate",
+        repository_id = %repo_id,
+    ))
+    .await
 }
 
 /// Inner body of [`initiate`].  Separate function so the instrument
@@ -363,53 +384,85 @@ async fn initiate_inner(
     repo_id: Uuid,
     actor: ApiActor,
     max_sessions_per_principal: u32,
+    session_max_age: Duration,
 ) -> AppResult<InitiateResult> {
     let principal_id = actor.user_id;
 
-    // Atomic increment-and-cap. The atomic primitive on
-    // `EphemeralStore` closes the TOCTOU race a non-atomic
-    // `get + check + put` would leave open: 33 concurrent open-session
-    // requests for the same `(repo, principal)` against a cap of 32
-    // yield exactly 32 successful increments and 1 `Ok(None)` rejection
-    // — never 33 successes.
-    //
-    // The counter's TTL is `OCI_SESSION_TTL` and is refreshed on
-    // every increment. With this shape the counter naturally drops
-    // when the principal stops creating sessions for a session-TTL
-    // window, bounding leakage if a finalize / cancel path skips a
-    // decrement (the worst case is a counter that floats slightly
-    // high until the next idle period).
-    let counter_key = session_count_key(repo_id, principal_id);
-    let cap_outcome = ctx
-        .ephemeral_durable
-        .try_increment_counter(
-            &counter_key,
-            max_sessions_per_principal as u64,
-            OCI_SESSION_TTL,
-        )
-        .await
-        .map_err(AppError::from)?;
-    if cap_outcome.is_none() {
-        // Cap rejection — info-level (privilege denial), NOT error.
-        // No `actor_id` / `user_id` in the metric labels — both are
-        // forbidden cardinality vectors per the catalog.
-        let repo_label = resolve_repo_label(ctx, repo_id).await;
-        tracing::info!(
-            target: "hort::oci::upload_session",
-            repository_id = %repo_id,
-            cap = max_sessions_per_principal,
-            "OCI upload-session create rejected: per-(repo, principal) cap exceeded",
-        );
-        metrics::counter!(
-            "hort_oci_session_cap_rejections_total",
-            "repo" => repo_label,
-            "result" => "over_cap",
-        )
-        .increment(1);
-        return Ok(InitiateResult::CapExceeded);
+    // Mint the session id first — the reconcile-admit atomically adds
+    // it to the live set. Generating it up front lets the set carry the
+    // real member id rather than a placeholder.
+    let session_id = Uuid::new_v4();
+
+    // Resolve the repository metric label ONCE. It is threaded into the
+    // cap primitive's reconcile-prune metric AND reused below for this
+    // adapter's own cap-rejection / `created` counters — a single
+    // repository lookup per initiate instead of two. Matches
+    // `IngestUseCase::repo_label` semantics: falls back to `_all` when
+    // the lookup fails (operator-disabled label, repo deleted between
+    // the authz extractor and this call, …).
+    let repo_label = resolve_repo_label(ctx, repo_id).await;
+
+    // Reconcile-and-admit against the generic live session-set cap
+    // primitive ([`hort_http_core::upload_session_cap`]). The set is
+    // authoritative for the cap: it age-prunes abandoned members on
+    // every admit, and — critically — a cap rejection performs NO
+    // write, so it never refreshes the set TTL. Those two properties
+    // keep an abandoned-upload retry storm from pinning the cap: an
+    // unfinalized, un-`DELETE`d session ages out of the set and a
+    // rejection cannot extend its lifetime.
+    match upload_session_cap::admit(
+        ctx,
+        OCI_CAP_FORMAT,
+        repo_id,
+        &repo_label,
+        principal_id,
+        session_id,
+        max_sessions_per_principal,
+        session_max_age,
+    )
+    .await?
+    {
+        AdmitOutcome::Admitted => {}
+        AdmitOutcome::OverCap => {
+            // Cap rejection — info-level (privilege denial), NOT error.
+            // No `actor_id` / `user_id` in the metric labels — both are
+            // forbidden cardinality vectors per the catalog. The
+            // primitive returns the outcome; this adapter owns the 429
+            // envelope and the `format="oci"`-labelled rejection metric.
+            tracing::info!(
+                target: "hort::oci::upload_session",
+                repository_id = %repo_id,
+                cap = max_sessions_per_principal,
+                "OCI upload-session create rejected: per-(repo, principal) cap exceeded",
+            );
+            metrics::counter!(
+                "hort_upload_session_cap_rejections_total",
+                "format" => OCI_CAP_FORMAT,
+                "repo" => repo_label.clone(),
+                "result" => "over_cap",
+            )
+            .increment(1);
+            return Ok(InitiateResult::CapExceeded);
+        }
+        AdmitOutcome::Contended => {
+            // Pathological CAS contention exhausted the reconcile retry
+            // budget — a TRANSIENT condition, not a cap breach. Surface
+            // 503 + short Retry-After so the client retries soon; the
+            // cap stays fail-closed (never fail-open). `warn!` (not
+            // `error!`): the request did not succeed, but nothing is
+            // broken and no infra error occurred. Deliberately NO
+            // cap-rejection metric — this is a status, not a rejection,
+            // and the `over_cap` counter must stay a clean cap-pressure
+            // signal.
+            tracing::warn!(
+                target: "hort::oci::upload_session",
+                repository_id = %repo_id,
+                "OCI upload-session create deferred: cap reconcile contended (transient)",
+            );
+            return Ok(InitiateResult::Contended);
+        }
     }
 
-    let session_id = Uuid::new_v4();
     let record =
         UploadSessionRecord::new_initial(repo_id, Utc::now().timestamp_millis(), principal_id);
     let bytes = encode_record(&record).map_err(AppError::from)?;
@@ -417,7 +470,7 @@ async fn initiate_inner(
 
     let created = ctx
         .ephemeral_durable
-        .put_if_absent(&key, bytes, OCI_SESSION_TTL)
+        .put_if_absent(&key, bytes, session_max_age)
         .await
         .map_err(AppError::from)?;
     if !created {
@@ -425,19 +478,22 @@ async fn initiate_inner(
             session_id = %session_id,
             "duplicate upload-session ID — UUID collision or repeated put_if_absent"
         );
-        // Roll back the cap-counter increment we just took — leaving
-        // it would burn a slot without producing a real session.
-        decrement_session_count(ctx, repo_id, principal_id).await;
+        // Roll back the cap-set admit we just took — leaving the member
+        // would burn a slot without producing a real session.
+        upload_session_cap::release(
+            ctx,
+            OCI_CAP_FORMAT,
+            repo_id,
+            principal_id,
+            session_id,
+            session_max_age,
+        )
+        .await;
         return Err(AppError::from(DomainError::Invariant(
             "upload-session key already present".into(),
         )));
     }
 
-    // Resolve the repository key for the metric label.  Matches
-    // `IngestUseCase::repo_label` semantics: fall back to `_all` when
-    // the lookup fails (operator-disabled label, repo deleted between
-    // the authz extractor and this call, …).
-    let repo_label = resolve_repo_label(ctx, repo_id).await;
     metrics::counter!(
         "hort_stateful_upload_sessions_total",
         "format" => "oci",
@@ -450,106 +506,6 @@ async fn initiate_inner(
         session_id,
         initial_version: 1,
     }))
-}
-
-/// Decrement the per-`(repo, principal)` outstanding-session counter.
-///
-/// Best-effort: an infrastructure-level error on the decrement is
-/// logged at `warn!` but does NOT propagate to the caller. The counter
-/// has TTL `OCI_SESSION_TTL` so a leaked slot self-heals after the
-/// longest possible session lifetime.
-///
-/// Underflow guard: when the stored counter is already at 0 (or
-/// absent — the TTL elapsed), the decrement is a no-op and a
-/// `warn!` event is emitted. Underflow indicates a bug (a release
-/// path firing without a matching create), not an attack — but the
-/// counter MUST stay non-negative so future cap checks read a sane
-/// value.
-async fn decrement_session_count(ctx: &AppContext, repo_id: Uuid, principal_id: Uuid) {
-    let key = session_count_key(repo_id, principal_id);
-    let stored = match ctx.ephemeral_durable.get(&key).await {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(
-                target: "hort::oci::upload_session",
-                repository_id = %repo_id,
-                error = %err,
-                "OCI session-cap decrement: ephemeral get failed; counter will TTL out",
-            );
-            return;
-        }
-    };
-    // Counter already dropped (TTL elapsed). Nothing to decrement;
-    // the cap state is consistent with "no outstanding sessions"
-    // already.
-    let Some(value) = stored else {
-        return;
-    };
-    let Ok(s) = std::str::from_utf8(&value) else {
-        tracing::warn!(
-            target: "hort::oci::upload_session",
-            repository_id = %repo_id,
-            "OCI session-cap decrement: counter has non-utf8 bytes; leaving \
-             counter alone (TTL will reap)",
-        );
-        return;
-    };
-    let Ok(current) = s.parse::<u64>() else {
-        tracing::warn!(
-            target: "hort::oci::upload_session",
-            repository_id = %repo_id,
-            "OCI session-cap decrement: counter is non-numeric; leaving \
-             counter alone (TTL will reap)",
-        );
-        return;
-    };
-    if current == 0 {
-        // Underflow: a release path fired without a matching create.
-        // Indicates a bug, not an attack. The counter stays at 0 so
-        // subsequent cap checks see the correct state.
-        tracing::warn!(
-            target: "hort::oci::upload_session",
-            repository_id = %repo_id,
-            "OCI session-cap decrement attempted on zero counter — \
-             release path fired without a matching create (bug, not attack); \
-             counter clamped at 0",
-        );
-        return;
-    }
-    let new_value = current - 1;
-    if new_value == 0 {
-        // Cleanest representation of "no outstanding sessions" is
-        // to drop the key. The next increment recreates it via
-        // `try_increment_counter` taking the absent-key branch.
-        // `delete` is idempotent so a TTL race is harmless.
-        if let Err(err) = ctx.ephemeral_durable.delete(&key).await {
-            tracing::warn!(
-                target: "hort::oci::upload_session",
-                repository_id = %repo_id,
-                error = %err,
-                "OCI session-cap decrement: delete failed; counter will TTL out",
-            );
-        }
-        return;
-    }
-    // Concurrent decrements are rare (cap-bounded) and the
-    // counter's TTL re-anchors on every write. The CAS-based
-    // race-freedom we get on increment is not strictly required on
-    // decrement — a lost decrement just leaves the counter higher
-    // than reality, which TTL repairs.
-    let new_bytes = Bytes::from(format!("{new_value}").into_bytes());
-    if let Err(err) = ctx
-        .ephemeral_durable
-        .put(&key, new_bytes, OCI_SESSION_TTL)
-        .await
-    {
-        tracing::warn!(
-            target: "hort::oci::upload_session",
-            repository_id = %repo_id,
-            error = %err,
-            "OCI session-cap decrement: put failed; counter will TTL out",
-        );
-    }
 }
 
 /// Resolve the `repository` label value for metric emission.
@@ -577,6 +533,16 @@ pub struct ContentRange {
     pub start: u64,
     pub end: u64,
 }
+
+/// An optional trailing body folded into a finalize `PUT` (or a `PATCH`
+/// chunk): the byte stream, an optional `Content-Range`, and an optional
+/// declared length — `None` = `Transfer-Encoding: chunked` (RFC 7230 §3.3.2),
+/// streamed and bounded in-stream by the publish-body cap.
+pub(crate) type TrailingBody = (
+    Box<dyn AsyncRead + Send + Unpin>,
+    Option<ContentRange>,
+    Option<u64>,
+);
 
 impl ContentRange {
     /// Span width — `end - start + 1` because the range is inclusive
@@ -640,6 +606,7 @@ impl ContentRange {
 /// a per-chunk `progressed` variant would inflate cardinality without
 /// useful operator signal.
 #[tracing::instrument(skip(ctx, stream), fields(repository_id = %repo_id))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_chunk(
     ctx: &AppContext,
     session_id: Uuid,
@@ -648,24 +615,65 @@ pub(crate) async fn append_chunk(
     body_length: u64,
     max_bytes: u64,
     repo_id: Uuid,
+    session_max_age: Duration,
 ) -> AppResult<UploadSessionRecord> {
     let key = session_key("oci", session_id);
-
     let result = append_chunk_core(
         ctx,
         session_id,
         &key,
         content_range,
         stream,
-        body_length,
+        Some(body_length),
         max_bytes,
         repo_id,
+        session_max_age,
     )
     .await;
+    emit_abort_on_err(ctx, repo_id, &result).await;
+    result
+}
 
-    // On any unrecoverable error, emit `aborted` exactly once.  Kept
-    // outside the core so every error-producing `?` funnels through the
-    // same metric site.  Success is deliberately silent.
+/// Streaming variant for a PATCH that carries **no** `Content-Length`
+/// (`Transfer-Encoding: chunked` — RFC 7230 §3.3.2 forbids sending both a
+/// `Content-Length` and a `Transfer-Encoding`). The body is bounded
+/// in-stream by `max_bytes` inside [`append_chunk_core`]; the actual bytes
+/// landed are authoritative (no declared length to cross-check).
+#[tracing::instrument(skip(ctx, stream), fields(repository_id = %repo_id))]
+pub(crate) async fn append_chunk_streaming(
+    ctx: &AppContext,
+    session_id: Uuid,
+    content_range: Option<ContentRange>,
+    stream: Box<dyn AsyncRead + Send + Unpin>,
+    max_bytes: u64,
+    repo_id: Uuid,
+    session_max_age: Duration,
+) -> AppResult<UploadSessionRecord> {
+    let key = session_key("oci", session_id);
+    let result = append_chunk_core(
+        ctx,
+        session_id,
+        &key,
+        content_range,
+        stream,
+        None,
+        max_bytes,
+        repo_id,
+        session_max_age,
+    )
+    .await;
+    emit_abort_on_err(ctx, repo_id, &result).await;
+    result
+}
+
+/// On any unrecoverable `append_chunk*` error, emit `aborted` exactly
+/// once. Kept out of the core so every error-producing `?` funnels through
+/// the same metric site. Success is deliberately silent.
+async fn emit_abort_on_err(
+    ctx: &AppContext,
+    repo_id: Uuid,
+    result: &AppResult<UploadSessionRecord>,
+) {
     if result.is_err() {
         let repo_label = resolve_repo_label(ctx, repo_id).await;
         metrics::counter!(
@@ -676,8 +684,6 @@ pub(crate) async fn append_chunk(
         )
         .increment(1);
     }
-
-    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -687,9 +693,10 @@ async fn append_chunk_core(
     key: &str,
     content_range: Option<ContentRange>,
     stream: Box<dyn AsyncRead + Send + Unpin>,
-    body_length: u64,
+    body_length: Option<u64>,
     max_bytes: u64,
     repo_id: Uuid,
+    session_max_age: Duration,
 ) -> AppResult<UploadSessionRecord> {
     // --- Cheap pre-I/O check when the client supplied an explicit range.
     // A width-vs-body-length mismatch fails loud here before we touch
@@ -698,8 +705,8 @@ async fn append_chunk_core(
     // When the range is absent (containers/image, skopeo, podman send
     // chunks without `Content-Range`) we synthesise it after loading
     // the session record below.
-    if let Some(ref range) = content_range {
-        if range.span() != body_length {
+    if let (Some(range), Some(len)) = (content_range.as_ref(), body_length) {
+        if range.span() != len {
             return Err(AppError::BodyLengthMismatch);
         }
     }
@@ -731,68 +738,79 @@ async fn append_chunk_core(
         }));
     }
 
-    // --- Synthesise an absent Content-Range from the session offset.
-    // The OCI v1.1 spec recommends `Content-Range` on chunked PATCH
-    // but the dominant client implementation (containers/image, used
-    // by skopeo, podman, buildah) and the Docker Registry V2 reference
-    // omit it.  Treating an absent range as "append at current offset"
-    // is the unique meaningful interpretation and matches GHCR / Harbor
-    // / zot behaviour.  The strict `start == record.bytes_received`
-    // check below still applies and surfaces as RangeInvalid when an
-    // explicit (and incorrect) range is supplied.
-    let content_range = content_range.unwrap_or_else(|| ContentRange {
-        start: record.bytes_received,
-        end: record
-            .bytes_received
-            .saturating_add(body_length)
-            .saturating_sub(1),
-    });
-
-    // --- Validate Content-Range against session state.
-    if content_range.start != record.bytes_received {
-        return Err(AppError::RangeInvalid {
-            current: record.bytes_received,
-        });
+    // --- Validate the client-supplied range's START against session
+    // state (an append must land at the current offset). The range END is
+    // only meaningful with a declared length; when the length is absent
+    // (streaming) the actual bytes landed define it. An absent range is
+    // "append at current offset" — the unique meaningful interpretation,
+    // matching GHCR / Harbor / zot and the Docker Registry V2 reference.
+    if let Some(ref range) = content_range {
+        if range.start != record.bytes_received {
+            return Err(AppError::RangeInvalid {
+                current: record.bytes_received,
+            });
+        }
     }
 
-    // --- Size cap.  `checked_add` guards a pathological overflow
-    // before the comparison; falling through to a silent wrap would
-    // emit the wrong error code under very adversarial inputs.
-    let projected = record
-        .bytes_received
-        .checked_add(body_length)
-        .ok_or(AppError::SizeExceeded)?;
-    if projected > max_bytes {
-        return Err(AppError::SizeExceeded);
-    }
-
-    // --- Append via staging.  Returns the new TOTAL byte count after
-    // the append (not the chunk length).
-    let new_total = ctx
-        .stateful_upload_staging
-        .append(session_id, stream)
-        .await
-        .map_err(AppError::from)?;
-
-    // Staging-port invariant: the returned total must equal
-    // `bytes_received + body_length`.  A disagreement means either the
-    // body stream short-read (client hung up mid-chunk — the client
-    // lied about Content-Length) or an adapter bug.  Either way the
-    // session state is now inconsistent with the client's declared
-    // Content-Range and the safe response is `Invariant` → 500 via
-    // the OCI `Internal` envelope.  A naive `Conflict` here would
-    // invite clients to retry the same corrupt PATCH indefinitely.
-    if new_total != record.bytes_received + body_length {
-        tracing::warn!(
-            session_id = %session_id,
-            expected = record.bytes_received + body_length,
-            actual = new_total,
-            "staging append byte count disagreed with declared body length"
-        );
-        return Err(AppError::Domain(DomainError::Invariant(
-            "staging append byte count disagreed with declared body length".into(),
-        )));
-    }
+    let new_total = match body_length {
+        // Declared-length path (Content-Length present; the transport
+        // frames the body to exactly `len` bytes). Pre-flight the size cap,
+        // then cross-check staging landed exactly the declared count.
+        Some(len) => {
+            // `checked_add` guards a pathological overflow before the
+            // comparison; a silent wrap would emit the wrong error code.
+            let projected = record
+                .bytes_received
+                .checked_add(len)
+                .ok_or(AppError::SizeExceeded)?;
+            if projected > max_bytes {
+                return Err(AppError::SizeExceeded);
+            }
+            let new_total = ctx
+                .stateful_upload_staging
+                .append(session_id, stream)
+                .await
+                .map_err(AppError::from)?;
+            // Staging-port invariant: a disagreement means the body
+            // short-read (client hung up / lied about Content-Length) or an
+            // adapter bug. Either way the session is inconsistent with the
+            // declared length — `Invariant` → 500. A naive `Conflict` would
+            // invite endless retries of the same corrupt PATCH.
+            if new_total != record.bytes_received + len {
+                tracing::warn!(
+                    session_id = %session_id,
+                    expected = record.bytes_received + len,
+                    actual = new_total,
+                    "staging append byte count disagreed with declared body length"
+                );
+                return Err(AppError::Domain(DomainError::Invariant(
+                    "staging append byte count disagreed with declared body length".into(),
+                )));
+            }
+            new_total
+        }
+        // Streaming path (no Content-Length — `Transfer-Encoding: chunked`).
+        // The transport does not bound the body, so bound the read at the
+        // cap: `take(headroom)` (headroom = remaining cap + 1) truncates, so
+        // staging never grows past `max_bytes + 1`, and a body that reaches
+        // the +1 trips the post-append cap check. Actual bytes landed are
+        // authoritative — there is no declared length to cross-check.
+        None => {
+            let headroom = max_bytes
+                .saturating_sub(record.bytes_received)
+                .saturating_add(1);
+            let bounded: Box<dyn AsyncRead + Send + Unpin> = Box::new(stream.take(headroom));
+            let new_total = ctx
+                .stateful_upload_staging
+                .append(session_id, bounded)
+                .await
+                .map_err(AppError::from)?;
+            if new_total > max_bytes {
+                return Err(AppError::SizeExceeded);
+            }
+            new_total
+        }
+    };
 
     // --- CAS bump.  `new_record.version = record.version + 1` keeps
     // the in-record mirror in lock-step with the store's own counter
@@ -805,7 +823,7 @@ async fn append_chunk_core(
     let new_bytes = encode_record(&new_record).map_err(AppError::from)?;
     let cas_outcome = ctx
         .ephemeral_durable
-        .compare_and_swap(key, record.version, new_bytes, OCI_SESSION_TTL)
+        .compare_and_swap(key, record.version, new_bytes, session_max_age)
         .await
         .map_err(AppError::from)?;
     match cas_outcome {
@@ -894,11 +912,12 @@ pub async fn finalize(
     ctx: &AppContext,
     session_id: Uuid,
     declared_digest: ContentHash,
-    trailing_body: Option<(Box<dyn AsyncRead + Send + Unpin>, Option<ContentRange>, u64)>,
+    trailing_body: Option<TrailingBody>,
     actor: ApiActor,
     repo_id: Uuid,
     name: &str,
     max_bytes: u64,
+    session_max_age: Duration,
 ) -> AppResult<IngestOutcome> {
     let started = Instant::now();
     let result = finalize_core(
@@ -910,6 +929,7 @@ pub async fn finalize(
         repo_id,
         name,
         max_bytes,
+        session_max_age,
     )
     .await;
 
@@ -970,11 +990,12 @@ async fn finalize_core(
     ctx: &AppContext,
     session_id: Uuid,
     declared_digest: ContentHash,
-    trailing_body: Option<(Box<dyn AsyncRead + Send + Unpin>, Option<ContentRange>, u64)>,
+    trailing_body: Option<TrailingBody>,
     actor: ApiActor,
     repo_id: Uuid,
     name: &str,
     max_bytes: u64,
+    session_max_age: Duration,
 ) -> AppResult<IngestOutcome> {
     let key = session_key("oci", session_id);
 
@@ -1009,8 +1030,8 @@ async fn finalize_core(
         }));
     }
     // Capture the principal that owns this session so the cleanup
-    // paths below can decrement the right per-`(repo, principal)` cap
-    // counter.
+    // paths below can release the right per-`(repo, principal)`
+    // live-session set member.
     let session_principal_id = initial_record.principal_id();
 
     // --- Optional trailing body. `append_chunk` re-verifies the
@@ -1022,16 +1043,37 @@ async fn finalize_core(
     // corner case). Propagating the error unchanged lets the handler
     // emit the same 400/413/416 envelope it emits for a raw PATCH.
     if let Some((stream, content_range, body_length)) = trailing_body {
-        append_chunk(
-            ctx,
-            session_id,
-            content_range,
-            stream,
-            body_length,
-            max_bytes,
-            repo_id,
-        )
-        .await?;
+        // Mirror the PATCH path: a declared length takes the cross-checked
+        // `append_chunk`; an absent length (a `Transfer-Encoding: chunked` PUT
+        // body — RFC 7230 §3.3.2 forbids Content-Length alongside chunked TE)
+        // streams via `append_chunk_streaming`, bounded in-stream by the cap.
+        match body_length {
+            Some(len) => {
+                append_chunk(
+                    ctx,
+                    session_id,
+                    content_range,
+                    stream,
+                    len,
+                    max_bytes,
+                    repo_id,
+                    session_max_age,
+                )
+                .await?;
+            }
+            None => {
+                append_chunk_streaming(
+                    ctx,
+                    session_id,
+                    content_range,
+                    stream,
+                    max_bytes,
+                    repo_id,
+                    session_max_age,
+                )
+                .await?;
+            }
+        }
     }
 
     // --- Open staging. If the session exists but staging does not,
@@ -1089,7 +1131,15 @@ async fn finalize_core(
     // `warn!` and return the original result unchanged.
     match ingest_result {
         Ok(outcome) => {
-            cleanup_session_and_staging(ctx, &key, session_id, repo_id, session_principal_id).await;
+            cleanup_session_and_staging(
+                ctx,
+                &key,
+                session_id,
+                repo_id,
+                session_principal_id,
+                session_max_age,
+            )
+            .await;
             Ok(outcome)
         }
         Err(AppError::Domain(DomainError::Conflict(msg))) => {
@@ -1098,7 +1148,15 @@ async fn finalize_core(
             // so a retried PUT with a matching digest starts fresh,
             // then propagate `Conflict` for the handler to map to
             // 400 `DIGEST_INVALID`.
-            cleanup_session_and_staging(ctx, &key, session_id, repo_id, session_principal_id).await;
+            cleanup_session_and_staging(
+                ctx,
+                &key,
+                session_id,
+                repo_id,
+                session_principal_id,
+                session_max_age,
+            )
+            .await;
             Err(AppError::Domain(DomainError::Conflict(msg)))
         }
         Err(other) => {
@@ -1109,7 +1167,15 @@ async fn finalize_core(
             // parameter with a BLOB_UPLOAD_INVALID on the next CAS
             // version bump. If cleanup itself fails, the original
             // error is what the operator needs to see.
-            cleanup_session_and_staging(ctx, &key, session_id, repo_id, session_principal_id).await;
+            cleanup_session_and_staging(
+                ctx,
+                &key,
+                session_id,
+                repo_id,
+                session_principal_id,
+                session_max_age,
+            )
+            .await;
             Err(other)
         }
     }
@@ -1120,14 +1186,14 @@ async fn finalize_core(
 /// first (clients observing a stale session see `BLOB_UPLOAD_UNKNOWN`
 /// immediately), staging second.
 ///
-/// The cleanup is also where the per-`(repo, principal)`
-/// outstanding-session counter is decremented. The decrement is
-/// best-effort: an infrastructure failure on the counter write logs
-/// `warn!` and the counter self-heals via TTL. Three release paths
-/// funnel through here (finalize success, declared-hash Conflict, and
-/// other infra errors); each one corresponds to exactly one prior
-/// increment in `initiate`, so the counter stays balanced across the
-/// realistic hot paths.
+/// The cleanup is also where the per-`(repo, principal)` live-session
+/// set member is released. The release is best-effort: an
+/// infrastructure failure logs `warn!` and the set self-heals via the
+/// next admit's age-prune / TTL. Four release paths funnel through here
+/// (finalize success, declared-hash Conflict, other infra errors, and
+/// the DELETE-cancel route); each corresponds to exactly one prior
+/// admit in `initiate`. A double-release (the member already absent) is
+/// a no-op, so the set stays balanced across the realistic hot paths.
 ///
 /// Each leg logs `warn!` on failure and continues so the caller can
 /// still surface the ingest result (success or Conflict) to the
@@ -1138,6 +1204,7 @@ async fn cleanup_session_and_staging(
     session_id: Uuid,
     repo_id: Uuid,
     principal_id: Uuid,
+    session_max_age: Duration,
 ) {
     if let Err(e) = ctx.ephemeral_durable.delete(key).await {
         tracing::warn!(
@@ -1153,8 +1220,73 @@ async fn cleanup_session_and_staging(
             "OCI finalize: staging delete failed; GC sweep will reap orphan"
         );
     }
-    // Release the per-`(repo, principal)` cap slot.
-    decrement_session_count(ctx, repo_id, principal_id).await;
+    // Release the per-`(repo, principal)` cap slot via the generic
+    // primitive.
+    upload_session_cap::release(
+        ctx,
+        OCI_CAP_FORMAT,
+        repo_id,
+        principal_id,
+        session_id,
+        session_max_age,
+    )
+    .await;
+}
+
+/// Cancel an in-flight OCI blob upload session (DELETE-cancel route).
+///
+/// Loads + tenant-checks the session, then runs the shared
+/// [`cleanup_session_and_staging`] — dropping the session row, the
+/// staging bytes, AND releasing the live-session set member. Gives a
+/// well-behaved client an immediate slot release rather than waiting
+/// for the session to age out.
+///
+/// Tenant isolation mirrors PATCH / PUT: a session bound to a different
+/// repository surfaces as anti-enumeration `NotFound { OciUploadSession }`
+/// (→ 404 `BLOB_UPLOAD_UNKNOWN`), never leaking that a session for that
+/// UUID exists elsewhere. A missing / TTL-expired session is likewise
+/// `NotFound`. `#[tracing::instrument]` without `err` — the handler
+/// owns the error-to-HTTP mapping.
+#[tracing::instrument(skip(ctx), fields(repository_id = %repo_id))]
+pub async fn cancel(
+    ctx: &AppContext,
+    session_id: Uuid,
+    repo_id: Uuid,
+    session_max_age: Duration,
+) -> AppResult<()> {
+    let key = session_key("oci", session_id);
+    let stored = ctx
+        .ephemeral_durable
+        .get(&key)
+        .await
+        .map_err(AppError::from)?
+        .ok_or(AppError::Domain(DomainError::NotFound {
+            entity: "OciUploadSession",
+            id: session_id.to_string(),
+        }))?;
+    let record = decode_record(&stored).map_err(AppError::from)?;
+    if record.repository_id() != repo_id {
+        tracing::info!(
+            session_id = %session_id,
+            requested_repo = %repo_id,
+            session_repo = %record.repository_id(),
+            "OCI upload DELETE rejected: session belongs to a different repository"
+        );
+        return Err(AppError::Domain(DomainError::NotFound {
+            entity: "OciUploadSession",
+            id: session_id.to_string(),
+        }));
+    }
+    cleanup_session_and_staging(
+        ctx,
+        &key,
+        session_id,
+        repo_id,
+        record.principal_id(),
+        session_max_age,
+    )
+    .await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,6 +1310,16 @@ mod tests {
     use metrics_util::{CompositeKey, MetricKind};
 
     // -------------------- Harness --------------------
+
+    /// Default session max-age used across the tests that don't
+    /// exercise age-pruning. One hour matches the production default;
+    /// the age-prune tests pass a short value explicitly.
+    const TEST_MAX_AGE: Duration = Duration::from_secs(OCI_SESSION_MAX_AGE_SECS);
+
+    /// Legacy test alias for the seeding-write TTL. The old code used a
+    /// single hardcoded `OCI_SESSION_TTL`; seeding writes in the tests
+    /// only need *some* live TTL, so the max-age default stands in.
+    const OCI_SESSION_TTL: Duration = TEST_MAX_AGE;
 
     fn api_actor() -> ApiActor {
         ApiActor {
@@ -1285,9 +1427,15 @@ mod tests {
         }
     }
 
-    /// Collision-forcing stub: always returns `Ok(false)` from
-    /// `put_if_absent` to exercise the "duplicate key" branch in
-    /// `initiate_inner` without depending on a real UUID collision.
+    /// Collision-forcing stub for the SESSION-RECORD `put_if_absent`
+    /// branch in `initiate_inner`. The cap-set admit runs first, so the
+    /// stub is key-aware: the `upload_sessions:` cap-set key's
+    /// `put_if_absent` succeeds (`Ok(true)`) on the first iteration so
+    /// the admit is granted, and the `stateful_upload:` session-record
+    /// key's `put_if_absent` always collides (`Ok(false)`) — exercising
+    /// the "duplicate session key" branch without a real UUID collision
+    /// and without the admit loop mistaking the record collision for
+    /// cap contention.
     struct AlwaysCollidingEphemeral;
     impl EphemeralStore for AlwaysCollidingEphemeral {
         fn get(&self, _key: &str) -> BoxFuture<'_, DomainResult<Option<Bytes>>> {
@@ -1303,11 +1451,15 @@ mod tests {
         }
         fn put_if_absent(
             &self,
-            _key: &str,
+            key: &str,
             _value: Bytes,
             _ttl: Duration,
         ) -> BoxFuture<'_, DomainResult<bool>> {
-            Box::pin(async { Ok(false) })
+            // Cap-set key is granted so the admit succeeds first-try;
+            // the session-record key collides so `initiate_inner` hits
+            // its duplicate-key Invariant branch.
+            let granted = key.starts_with("upload_sessions:");
+            Box::pin(async move { Ok(granted) })
         }
         fn compare_and_swap(
             &self,
@@ -1326,13 +1478,55 @@ mod tests {
         }
     }
 
+    /// Contention-forcing stub for the cap-admit reconcile loop. `get`
+    /// always presents an empty set (`None`) and `put_if_absent` on the
+    /// cap-set key always loses the create race (`Ok(false)`), so the
+    /// admit re-reads → re-puts → loses forever until the bounded retry
+    /// budget exhausts → [`AdmitOutcome::Contended`] →
+    /// [`InitiateResult::Contended`]. Distinct from
+    /// `AlwaysCollidingEphemeral` (which GRANTS the cap-set key): this
+    /// stub never lets the admit succeed.
+    struct AlwaysContendedEphemeral;
+    impl EphemeralStore for AlwaysContendedEphemeral {
+        fn get(&self, _key: &str) -> BoxFuture<'_, DomainResult<Option<Bytes>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn put(&self, _k: &str, _v: Bytes, _t: Duration) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn put_if_absent(
+            &self,
+            _k: &str,
+            _v: Bytes,
+            _t: Duration,
+        ) -> BoxFuture<'_, DomainResult<bool>> {
+            // Perpetual create-race loss — never admitted.
+            Box::pin(async { Ok(false) })
+        }
+        fn compare_and_swap(
+            &self,
+            _k: &str,
+            _e: u64,
+            _v: Bytes,
+            _t: Duration,
+        ) -> BoxFuture<'_, DomainResult<Option<u64>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn delete(&self, _k: &str) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn extend_ttl(&self, _k: &str, _t: Duration) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     /// Build an `AppContext` whose `ephemeral_durable` field is
     /// swapped for `replacement`. Local to this test module — the
     /// stable `hort-http-core::test_support` helpers don't (yet) expose
     /// a `with_ephemeral` because no production caller needs it.
     ///
     /// OCI upload-session machinery reads from `ephemeral_durable`
-    /// (the `stateful_upload:` and `oci:session_count:` keyspaces are
+    /// (the `stateful_upload:` and `upload_sessions:` keyspaces are
     /// registered as Durable; see the `ephemeral_keyspace_exhaustive`
     /// guard). The test stub is wired into the durable slot only; the
     /// evictable slot retains the default in-memory mock from
@@ -1509,6 +1703,9 @@ mod tests {
             Ok(InitiateResult::CapExceeded) => {
                 panic!("expected Created, got CapExceeded — test misconfigured the cap");
             }
+            Ok(InitiateResult::Contended) => {
+                panic!("expected Created, got Contended — test induced cap-reconcile contention");
+            }
             Err(e) => panic!("expected Created, got Err({e:?})"),
         }
     }
@@ -1523,7 +1720,9 @@ mod tests {
             repo.key = "myrepo".into();
             mocks.repositories.insert(repo);
 
-            let outcome = unwrap_created(initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP).await);
+            let outcome = unwrap_created(
+                initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP, TEST_MAX_AGE).await,
+            );
             assert_eq!(outcome.initial_version, 1);
 
             // Seeded record must be retrievable via the port.
@@ -1559,7 +1758,9 @@ mod tests {
                 repo.key = "myrepo".into();
                 mocks.repositories.insert(repo);
 
-                unwrap_created(initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP).await)
+                unwrap_created(
+                    initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP, TEST_MAX_AGE).await,
+                )
             })
         });
         let entries = snap.into_vec();
@@ -1588,7 +1789,14 @@ mod tests {
         let (snap, result) = capture(|| {
             run(async {
                 let ctx = ctx_with_ephemeral(failing_trait);
-                initiate(&ctx, Uuid::new_v4(), api_actor(), TEST_HIGH_CAP).await
+                initiate(
+                    &ctx,
+                    Uuid::new_v4(),
+                    api_actor(),
+                    TEST_HIGH_CAP,
+                    TEST_MAX_AGE,
+                )
+                .await
             })
         });
         let err = result.expect_err("failing ephemeral must surface an error");
@@ -1618,7 +1826,14 @@ mod tests {
         let (snap, result) = capture(|| {
             run(async {
                 let ctx = ctx_with_ephemeral(Arc::new(AlwaysCollidingEphemeral));
-                initiate(&ctx, Uuid::new_v4(), api_actor(), TEST_HIGH_CAP).await
+                initiate(
+                    &ctx,
+                    Uuid::new_v4(),
+                    api_actor(),
+                    TEST_HIGH_CAP,
+                    TEST_MAX_AGE,
+                )
+                .await
             })
         });
         let err = result.expect_err("collision must surface as Invariant");
@@ -1635,6 +1850,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initiate_returns_contended_when_cap_reconcile_exhausts_retry_budget() {
+        // M1 regression: pathological cap-set CAS contention (every
+        // create race lost) must surface as `InitiateResult::Contended`
+        // — a TRANSIENT status the handler maps to 503 + short
+        // Retry-After — NOT an `Err` (which the handler maps to 500),
+        // and NOT a `CapExceeded` (429, a real cap breach). No
+        // cap-rejection metric fires for contention.
+        let (snap, result) = capture(|| {
+            run(async {
+                let ctx = ctx_with_ephemeral(Arc::new(AlwaysContendedEphemeral));
+                initiate(
+                    &ctx,
+                    Uuid::new_v4(),
+                    api_actor(),
+                    TEST_HIGH_CAP,
+                    TEST_MAX_AGE,
+                )
+                .await
+            })
+        });
+        let out = result.expect("cap-reconcile contention is a transient outcome, never an Err");
+        assert!(
+            matches!(out, InitiateResult::Contended),
+            "perpetual cap-set CAS contention must surface as Contended, got {out:?}"
+        );
+        // Contention is a status, not a cap rejection — the over_cap
+        // counter must stay clean.
+        let entries = snap.into_vec();
+        assert!(
+            find_counter(
+                &entries,
+                "hort_upload_session_cap_rejections_total",
+                &[("result", "over_cap")]
+            )
+            .is_none(),
+            "Contended must NOT emit the cap-rejection metric"
+        );
+    }
+
     // -------------------- initiate — label-flag off --------------------
 
     #[test]
@@ -1648,7 +1903,9 @@ mod tests {
                 let repo_id = repo.id;
                 repo.key = "myrepo".into();
                 mocks.repositories.insert(repo);
-                unwrap_created(initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP).await)
+                unwrap_created(
+                    initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP, TEST_MAX_AGE).await,
+                )
             })
         });
         let entries = snap.into_vec();
@@ -1686,9 +1943,15 @@ mod tests {
         let mut created = 0usize;
         let mut rejected = 0usize;
         for _ in 0..n {
-            match initiate(ctx, repo_id, actor.clone(), cap).await.unwrap() {
+            match initiate(ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
                 InitiateResult::Created(_) => created += 1,
                 InitiateResult::CapExceeded => rejected += 1,
+                InitiateResult::Contended => {
+                    panic!("open_n_sessions saw Contended — the harness never induces contention")
+                }
             }
         }
         (created, rejected)
@@ -1712,7 +1975,9 @@ mod tests {
             assert_eq!(created, cap as usize);
             assert_eq!(rejected, 0);
             // The next attempt must be rejected with CapExceeded.
-            let next = initiate(&ctx, repo_id, actor, cap).await.unwrap();
+            let next = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+                .await
+                .unwrap();
             assert!(
                 matches!(next, InitiateResult::CapExceeded),
                 "33rd request must surface as CapExceeded, got {next:?}",
@@ -1721,10 +1986,12 @@ mod tests {
     }
 
     #[test]
-    fn initiate_emits_over_cap_metric_with_repo_label() {
-        // The cap-rejection metric MUST carry only `repo` and
-        // `result` labels — no `principal_id`, no `actor_id` (the
-        // architect catalog forbids them as cardinality vectors).
+    fn initiate_emits_over_cap_metric_with_format_and_repo_label() {
+        // The OCI adapter emits the RENAMED generic cap-rejection metric
+        // `hort_upload_session_cap_rejections_total` carrying the
+        // `format="oci"` label alongside `repo` + `result`. No
+        // `principal_id` / `actor_id` (the architect catalog forbids
+        // them as cardinality vectors).
         let (snap, _) = capture(|| {
             run(async {
                 let handle = PrometheusBuilder::new().build_recorder().handle();
@@ -1739,17 +2006,24 @@ mod tests {
                 // Fill the cap then attempt once more to force a
                 // single rejection.
                 let _ = open_n_sessions(&ctx, repo_id, &actor, cap, cap as usize).await;
-                let _ = initiate(&ctx, repo_id, actor, cap).await.unwrap();
+                let _ = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap();
             })
         });
         let entries = snap.into_vec();
         let v = find_counter(
             &entries,
-            "hort_oci_session_cap_rejections_total",
-            &[("repo", "myrepo"), ("result", "over_cap")],
+            "hort_upload_session_cap_rejections_total",
+            &[
+                ("format", "oci"),
+                ("repo", "myrepo"),
+                ("result", "over_cap"),
+            ],
         )
         .expect(
-            "hort_oci_session_cap_rejections_total{repo=myrepo,result=over_cap} absent on rejection",
+            "hort_upload_session_cap_rejections_total{format=oci,repo=myrepo,result=over_cap} \
+             absent on rejection",
         );
         assert!(matches!(v, DebugValue::Counter(n) if *n >= 1));
     }
@@ -1759,7 +2033,7 @@ mod tests {
         // Hard guard: the architect catalog forbids `principal_id` /
         // `user_id` / `actor_id` as metric labels (cardinality bomb).
         // This test asserts the absence by scanning every
-        // `hort_oci_session_cap_rejections_total` series's label keys.
+        // `hort_upload_session_cap_rejections_total` series's label keys.
         let (snap, _) = capture(|| {
             run(async {
                 let handle = PrometheusBuilder::new().build_recorder().handle();
@@ -1770,13 +2044,15 @@ mod tests {
                 mocks.repositories.insert(repo);
                 let actor = principal_actor(Uuid::new_v4());
                 let _ = open_n_sessions(&ctx, repo_id, &actor, 1, 1).await;
-                let _ = initiate(&ctx, repo_id, actor, 1).await.unwrap();
+                let _ = initiate(&ctx, repo_id, actor, 1, TEST_MAX_AGE)
+                    .await
+                    .unwrap();
             })
         });
         let entries = snap.into_vec();
         for (ck, _, _, _) in &entries {
             if ck.kind() == MetricKind::Counter
-                && ck.key().name() == "hort_oci_session_cap_rejections_total"
+                && ck.key().name() == "hort_upload_session_cap_rejections_total"
             {
                 for label in ck.key().labels() {
                     assert_ne!(
@@ -1814,18 +2090,26 @@ mod tests {
             let cap: u32 = 2;
 
             // Fill the cap.
-            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap).await.unwrap() {
+            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
             };
-            let _s2 = match initiate(&ctx, repo_id, actor.clone(), cap).await.unwrap() {
+            let _s2 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
             };
 
             // Cap reached — next is rejected.
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap).await.unwrap(),
+                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
@@ -1845,6 +2129,7 @@ mod tests {
                 payload.len() as u64,
                 10 * 1024 * 1024,
                 repo_id,
+                TEST_MAX_AGE,
             )
             .await
             .expect("append_chunk must succeed");
@@ -1857,12 +2142,15 @@ mod tests {
                 repo_id,
                 "library/nginx",
                 10 * 1024 * 1024,
+                TEST_MAX_AGE,
             )
             .await
             .expect("finalize must succeed and free a cap slot");
 
             // After freeing one slot, a fresh initiate must succeed.
-            let next = initiate(&ctx, repo_id, actor, cap).await.unwrap();
+            let next = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+                .await
+                .unwrap();
             assert!(
                 matches!(next, InitiateResult::Created(_)),
                 "freeing one session via finalize must unblock the next initiate"
@@ -1889,13 +2177,18 @@ mod tests {
             let cap: u32 = 1;
 
             // Fill the cap.
-            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap).await.unwrap() {
+            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
             };
             // Cap is full — next initiate is rejected.
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap).await.unwrap(),
+                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
@@ -1910,6 +2203,7 @@ mod tests {
                 payload.len() as u64,
                 10 * 1024 * 1024,
                 repo_id,
+                TEST_MAX_AGE,
             )
             .await
             .unwrap();
@@ -1926,6 +2220,7 @@ mod tests {
                 repo_id,
                 "library/nginx",
                 10 * 1024 * 1024,
+                TEST_MAX_AGE,
             )
             .await
             .expect_err("digest mismatch must surface as Conflict");
@@ -1933,7 +2228,9 @@ mod tests {
 
             // After the Conflict-path cleanup, the cap slot is free
             // again — the next initiate must succeed.
-            let next = initiate(&ctx, repo_id, actor, cap).await.unwrap();
+            let next = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+                .await
+                .unwrap();
             assert!(
                 matches!(next, InitiateResult::Created(_)),
                 "Conflict cleanup must decrement the cap counter"
@@ -1958,12 +2255,16 @@ mod tests {
             // A fills its cap.
             let _ = open_n_sessions(&ctx, repo_id, &actor_a, cap, cap as usize).await;
             assert!(matches!(
-                initiate(&ctx, repo_id, actor_a, cap).await.unwrap(),
+                initiate(&ctx, repo_id, actor_a, cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
             // B is unaffected.
-            let result = initiate(&ctx, repo_id, actor_b, cap).await.unwrap();
+            let result = initiate(&ctx, repo_id, actor_b, cap, TEST_MAX_AGE)
+                .await
+                .unwrap();
             assert!(
                 matches!(result, InitiateResult::Created(_)),
                 "principal A at cap MUST NOT block principal B"
@@ -1991,12 +2292,16 @@ mod tests {
             // Fill cap on repo X.
             let _ = open_n_sessions(&ctx, repo_x_id, &actor, cap, cap as usize).await;
             assert!(matches!(
-                initiate(&ctx, repo_x_id, actor.clone(), cap).await.unwrap(),
+                initiate(&ctx, repo_x_id, actor.clone(), cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
             // Same principal in repo Y is unaffected.
-            let result = initiate(&ctx, repo_y_id, actor, cap).await.unwrap();
+            let result = initiate(&ctx, repo_y_id, actor, cap, TEST_MAX_AGE)
+                .await
+                .unwrap();
             assert!(
                 matches!(result, InitiateResult::Created(_)),
                 "principal at cap in repo X MUST NOT block them in repo Y"
@@ -2004,66 +2309,443 @@ mod tests {
         });
     }
 
+    // -------------------- session-set age-prune (leak reclaim) --------------
+    //
+    // The generic cap primitive's own unit tests (admit / release /
+    // age-prune / CAS-race / over-cap / per-format keyspace isolation)
+    // live in `hort-http-core::upload_session_cap`. The tests here
+    // exercise the OCI adapter's INTEGRATION with the primitive — that
+    // `initiate` admits, and `finalize` / `cancel` release — through the
+    // public OCI entry points, observing the cap set only via its
+    // public key ([`upload_session_cap::session_set_key`]) so no private
+    // decoder is touched from this crate.
+
+    /// Cap-format string this adapter uses with the generic primitive.
+    const CAP_FORMAT: &str = "oci";
+
+    /// True when the per-`(oci, repo, principal)` cap set key is present
+    /// (i.e. at least one live member). The primitive drops the key when
+    /// the set empties, so absence == zero live members. Test-only
+    /// observability that stays on the primitive's PUBLIC key surface.
+    async fn cap_set_present(ctx: &AppContext, repo_id: Uuid, principal_id: Uuid) -> bool {
+        let key = upload_session_cap::session_set_key(CAP_FORMAT, repo_id, principal_id);
+        ctx.ephemeral_durable.get(&key).await.unwrap().is_some()
+    }
+
     #[test]
-    fn extra_decrement_clamps_at_zero_without_panicking() {
-        // Underflow guard: a release path fires without a matching
-        // create. The counter must clamp at 0 — never underflow into
-        // a high `u64::MAX`.
+    fn abandoned_sessions_age_out_and_reclaim_to_zero() {
+        // Acceptance: abandoned sessions (opened, never finalized, no
+        // DELETE) are reclaimed once they exceed the session max-age —
+        // the next admit prunes them and the live count returns toward
+        // 0. Driven via a tiny max-age + a real sleep so the abandoned
+        // members are genuinely past the age threshold.
         run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
-            let (ctx, _mocks) = build_mock_ctx(handle);
-            let repo_id = Uuid::new_v4();
-            let principal_id = Uuid::new_v4();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            let repo_id = repo.id;
+            repo.key = "myrepo".into();
+            mocks.repositories.insert(repo);
 
-            // No prior increments — counter is absent.
-            decrement_session_count(&ctx, repo_id, principal_id).await;
+            let actor = principal_actor(Uuid::new_v4());
+            let principal_id = actor.user_id;
+            let cap: u32 = 3;
+            // Very short max-age so abandoned members age out quickly.
+            let short = Duration::from_millis(40);
 
-            // Increment to 1, then decrement twice. The second is
-            // the underflow case. After it, the counter must read as
-            // "absent" (or 0) — never as `u64::MAX`.
-            let key = session_count_key(repo_id, principal_id);
-            let _ = ctx
-                .ephemeral_durable
-                .try_increment_counter(&key, 32, OCI_SESSION_TTL)
-                .await
-                .unwrap();
-            decrement_session_count(&ctx, repo_id, principal_id).await; // 0 → key dropped
-            decrement_session_count(&ctx, repo_id, principal_id).await; // attempted underflow
+            // Fill the cap with abandoned sessions (initiate only — no
+            // finalize, no DELETE).
+            let (created, rejected) = {
+                let mut c = 0;
+                let mut r = 0;
+                for _ in 0..cap {
+                    match initiate(&ctx, repo_id, actor.clone(), cap, short)
+                        .await
+                        .unwrap()
+                    {
+                        InitiateResult::Created(_) => c += 1,
+                        InitiateResult::CapExceeded => r += 1,
+                        InitiateResult::Contended => panic!("unexpected Contended in cap fill"),
+                    }
+                }
+                (c, r)
+            };
+            assert_eq!(created, cap as usize);
+            assert_eq!(rejected, 0);
+            let _ = principal_id; // (cap state observed behaviourally below)
+                                  // Cap is full — a fresh admit is rejected right now.
+            assert!(matches!(
+                initiate(&ctx, repo_id, actor.clone(), cap, short)
+                    .await
+                    .unwrap(),
+                InitiateResult::CapExceeded
+            ));
 
-            // The counter is absent — `get` returns None, NOT a
-            // u64::MAX representation.
-            assert!(ctx.ephemeral_durable.get(&key).await.unwrap().is_none());
+            // Let the abandoned members age past the max-age.
+            tokio::time::sleep(Duration::from_millis(80)).await;
 
-            // Subsequent cap checks see the correct state — the cap
-            // is fully available.
-            let actor = principal_actor(principal_id);
-            // Need a repo for the metric label; mock the bare
-            // counter-key path is enough since `initiate` only reads
-            // the repo via the metric helper.
-            // The cap of 1 means the first initiate must succeed.
-            let result = initiate(&ctx, repo_id, actor, 1).await.unwrap();
+            // The next admit prunes ALL aged-out members and succeeds —
+            // the abandoned-session leak is reclaimed on the next admit.
+            let next = initiate(&ctx, repo_id, actor, cap, short).await.unwrap();
             assert!(
-                matches!(result, InitiateResult::Created(_)),
-                "after underflow clamp, the cap state is healthy: \
-                 first initiate must succeed",
+                matches!(next, InitiateResult::Created(_)),
+                "aged-out abandoned sessions must be reclaimed on the next admit"
             );
         });
     }
 
     #[test]
-    fn concurrent_initiates_race_free_at_cap_boundary() {
-        // 33 concurrent attempts against a cap of 32 yield exactly
-        // 32 successes and 1 rejection — never 33, never fewer than
-        // 32. The atomic `try_increment_counter` primitive in the
-        // memory adapter holds the read-check-write window under a
-        // per-key mutex; the default trait impl's CAS-loop also
-        // converges, but the memory adapter's override is what
-        // production sees on `Memory` deployments and what the
-        // contract test below pins.
+    fn retry_storm_of_abandoned_admits_does_not_permanently_pin_the_cap() {
+        // Acceptance: a retry storm of abandoned admits must NOT
+        // monotonically pin the cap. The old counter refreshed its TTL
+        // on every increment and never idled out; the set model prunes
+        // by member age, so once members age past the max-age, admits
+        // succeed again even under continuous retry pressure.
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            let repo_id = repo.id;
+            repo.key = "myrepo".into();
+            mocks.repositories.insert(repo);
+
+            let actor = principal_actor(Uuid::new_v4());
+            let cap: u32 = 2;
+            let short = Duration::from_millis(30);
+
+            // Storm: keep hammering initiate. Early attempts fill the
+            // cap, later ones are rejected — and crucially, a rejection
+            // performs NO write, so it never refreshes the set TTL / the
+            // members' age. (This is the structural leak fix.)
+            let mut saw_rejection = false;
+            for _ in 0..cap * 4 {
+                if let InitiateResult::CapExceeded =
+                    initiate(&ctx, repo_id, actor.clone(), cap, short)
+                        .await
+                        .unwrap()
+                {
+                    saw_rejection = true;
+                }
+            }
+            assert!(
+                saw_rejection,
+                "the storm must have hit the cap at least once"
+            );
+
+            // Wait past the max-age — the abandoned members age out.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+
+            // Admits succeed again: the cap was NOT permanently pinned.
+            let after = initiate(&ctx, repo_id, actor, cap, short).await.unwrap();
+            assert!(
+                matches!(after, InitiateResult::Created(_)),
+                "after the abandoned members age out, admits must succeed again — \
+                 a retry storm must not permanently pin the cap"
+            );
+        });
+    }
+
+    // -------------------- DELETE-cancel release --------------------
+
+    #[test]
+    fn cancel_releases_session_set_member_and_cleans_staging() {
+        // Explicit DELETE-cancel releases the set member (immediate slot
+        // free) and drops the session row + staging bytes.
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.format = hort_domain::entities::repository::RepositoryFormat::Oci;
+            let repo_id = repo.id;
+            repo.key = "myrepo".into();
+            mocks.repositories.insert(repo);
+
+            let actor = principal_actor(Uuid::new_v4());
+            let principal_id = actor.user_id;
+            let cap: u32 = 1;
+
+            // Fill the cap, PATCH a byte so staging exists.
+            let sid = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
+                InitiateResult::Created(o) => o.session_id,
+                _ => panic!(),
+            };
+            let payload = b"z".to_vec();
+            append_chunk(
+                &ctx,
+                sid,
+                Some(ContentRange { start: 0, end: 0 }),
+                cursor_of(&payload),
+                1,
+                10 * 1024 * 1024,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap();
+            assert!(
+                cap_set_present(&ctx, repo_id, principal_id).await,
+                "the cap set must hold the live member before cancel"
+            );
+            // Cap full — next initiate rejected.
+            assert!(matches!(
+                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
+                InitiateResult::CapExceeded
+            ));
+
+            // Cancel — releases exactly one member, drops session + staging.
+            cancel(&ctx, sid, repo_id, TEST_MAX_AGE).await.unwrap();
+            assert!(
+                !cap_set_present(&ctx, repo_id, principal_id).await,
+                "cancel must release the set member (set drops when empty)"
+            );
+            assert!(
+                ctx.ephemeral_durable
+                    .get(&session_key("oci", sid))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "cancel must drop the session row"
+            );
+            assert!(
+                mocks.stateful_upload_staging.bytes_for(sid).is_none(),
+                "cancel must drop the staging bytes"
+            );
+
+            // Slot is free again.
+            assert!(matches!(
+                initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
+                InitiateResult::Created(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn cancel_unknown_session_is_not_found() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, _mocks) = build_mock_ctx(handle);
+            let err = cancel(&ctx, Uuid::new_v4(), Uuid::new_v4(), TEST_MAX_AGE)
+                .await
+                .expect_err("unknown session must error");
+            assert!(matches!(
+                err,
+                AppError::Domain(DomainError::NotFound {
+                    entity: "OciUploadSession",
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn cancel_wrong_repo_is_not_found_for_tenant_isolation() {
+        // Anti-enumeration: cancelling a session bound to a different
+        // repo surfaces as NotFound, never leaking that it exists.
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, _mocks) = build_mock_ctx(handle);
+            let repo_a = Uuid::new_v4();
+            let repo_b = Uuid::new_v4();
+            let sid = Uuid::new_v4();
+            seed_session(&ctx, sid, repo_a, 0, 1).await;
+
+            let err = cancel(&ctx, sid, repo_b, TEST_MAX_AGE)
+                .await
+                .expect_err("tenant mismatch must error");
+            assert!(matches!(
+                err,
+                AppError::Domain(DomainError::NotFound {
+                    entity: "OciUploadSession",
+                    ..
+                })
+            ));
+            // The session row for repo_a MUST still exist (we refused
+            // before cleanup).
+            assert!(ctx
+                .ephemeral_durable
+                .get(&session_key("oci", sid))
+                .await
+                .unwrap()
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn finalize_and_cancel_each_release_exactly_once() {
+        // Finalize success and explicit DELETE-cancel each release
+        // exactly one slot — no double-release / underflow across the
+        // finalize + cancel mix. Proven behaviourally against a cap of
+        // 2: filling the cap, releasing via finalize, and confirming
+        // EXACTLY one slot reopens (not zero, not two) each time.
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.format = hort_domain::entities::repository::RepositoryFormat::Oci;
+            let repo_id = repo.id;
+            repo.key = "myrepo".into();
+            mocks.repositories.insert(repo);
+
+            let actor = principal_actor(Uuid::new_v4());
+            let principal_id = actor.user_id;
+            let cap: u32 = 2;
+
+            // Open two sessions — the cap is now full.
+            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
+                InitiateResult::Created(o) => o.session_id,
+                _ => panic!(),
+            };
+            let s2 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
+                InitiateResult::Created(o) => o.session_id,
+                _ => panic!(),
+            };
+            assert!(cap_set_present(&ctx, repo_id, principal_id).await);
+            assert!(matches!(
+                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
+                InitiateResult::CapExceeded
+            ));
+
+            // Finalize s1. Exactly one slot must reopen: the next initiate
+            // succeeds (proves ≥1 freed), but a SECOND one must be
+            // rejected (proves EXACTLY 1 freed, since s2 is still live).
+            let payload = b"x".to_vec();
+            let hash: ContentHash = sha256_hex(&payload).parse().unwrap();
+            append_chunk(
+                &ctx,
+                s1,
+                Some(ContentRange { start: 0, end: 0 }),
+                cursor_of(&payload),
+                1,
+                10 * 1024 * 1024,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap();
+            finalize(
+                &ctx,
+                s1,
+                hash,
+                None,
+                actor.clone(),
+                repo_id,
+                "library/nginx",
+                10 * 1024 * 1024,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap();
+            let s3 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                .await
+                .unwrap()
+            {
+                InitiateResult::Created(o) => o.session_id,
+                other => panic!("finalize must free exactly one slot, got {other:?}"),
+            };
+            assert!(
+                matches!(
+                    initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                        .await
+                        .unwrap(),
+                    InitiateResult::CapExceeded
+                ),
+                "finalize must free EXACTLY one slot — cap is full again (s2 + s3)"
+            );
+
+            // Cancel s2 (the last of the original pair) — one slot reopens.
+            cancel(&ctx, s2, repo_id, TEST_MAX_AGE).await.unwrap();
+            assert!(matches!(
+                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
+                    .await
+                    .unwrap(),
+                InitiateResult::Created(_)
+            ));
+
+            // Re-cancel s1 (finalized, row gone) and s2 (already
+            // cancelled) — both surface NotFound; neither underflows the
+            // set. s3 is still live, so the set key must persist.
+            cancel(&ctx, s1, repo_id, TEST_MAX_AGE)
+                .await
+                .expect_err("re-cancel of a finalized session is NotFound (row gone)");
+            cancel(&ctx, s2, repo_id, TEST_MAX_AGE)
+                .await
+                .expect_err("re-cancel of a cancelled session is NotFound (row gone)");
+            let _ = s3;
+            assert!(
+                cap_set_present(&ctx, repo_id, principal_id).await,
+                "double-cancel must not underflow / drop the set while s3 + the last \
+                 admit are still live"
+            );
+        });
+    }
+
+    // -------------------- reconcile-prune metric (adapter integration) ---
+    //
+    // The primitive's own prune-metric unit tests (pruned / none result,
+    // format label, cardinality guard) live in
+    // `hort-http-core::upload_session_cap`. This adapter-level test only
+    // confirms that a routine OCI `initiate` propagates the renamed
+    // generic metric with the `format="oci"` label attached.
+
+    #[test]
+    fn initiate_emits_reconcile_metric_with_format_and_repo_label() {
+        // A clean admit (no aged-out members) emits the renamed generic
+        // reconcile-prune metric with `result=none` and the OCI format
+        // label.
+        let (snap, _) = capture(|| {
+            run(async {
+                let handle = PrometheusBuilder::new().build_recorder().handle();
+                let (ctx, mocks) = build_mock_ctx(handle);
+                let mut repo = sample_repository();
+                let repo_id = repo.id;
+                repo.key = "myrepo".into();
+                mocks.repositories.insert(repo);
+                let actor = principal_actor(Uuid::new_v4());
+                let _ = initiate(&ctx, repo_id, actor, 4, TEST_MAX_AGE)
+                    .await
+                    .unwrap();
+            })
+        });
+        let entries = snap.into_vec();
+        assert!(
+            find_counter(
+                &entries,
+                "hort_upload_session_reconcile_pruned_total",
+                &[("format", "oci"), ("repo", "myrepo"), ("result", "none")],
+            )
+            .is_some(),
+            "a clean OCI admit must emit the renamed reconcile metric with format=oci"
+        );
+    }
+
+    #[test]
+    fn concurrent_initiates_never_over_admit_past_cap() {
+        // The CAS-race SAFETY invariant (concurrent admits never
+        // over-admit past the cap under single-key contention) is a
+        // property of the generic primitive and is proven directly at
+        // that layer in
+        // `hort-http-core::upload_session_cap::concurrent_admits_never_over_admit_past_cap`.
+        // At the OCI adapter level we assert the same behaviour through
+        // the public `initiate` entry point, without reaching into the
+        // primitive's private set decoder.
         //
-        // Multi-thread runtime so the spawned tasks genuinely run in
-        // parallel and can race on the per-key mutex.
-        let outcome = tokio::runtime::Builder::new_multi_thread()
+        // Multi-thread runtime so the spawned tasks genuinely race.
+        let (created, rejected, errored) = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .build()
@@ -2076,29 +2758,48 @@ mod tests {
                 repo.key = "myrepo".into();
                 mocks.repositories.insert(repo);
                 let actor = principal_actor(Uuid::new_v4());
-                let cap: u32 = 32;
-                let mut handles = Vec::with_capacity((cap + 1) as usize);
-                for _ in 0..(cap + 1) {
+                let cap: u32 = 8;
+                let contenders = 12u32; // > cap so some are rejected
+                let mut handles = Vec::with_capacity(contenders as usize);
+                for _ in 0..contenders {
                     let ctx_ref = ctx.clone();
                     let actor_clone = actor.clone();
                     handles.push(tokio::spawn(async move {
-                        initiate(&ctx_ref, repo_id, actor_clone, cap).await
+                        initiate(&ctx_ref, repo_id, actor_clone, cap, TEST_MAX_AGE).await
                     }));
                 }
                 let mut created = 0usize;
                 let mut rejected = 0usize;
+                // Transient non-admits: an infra `Err` OR an
+                // `InitiateResult::Contended` (retry-budget exhaustion).
+                let mut errored = 0usize;
                 for h in handles {
-                    match h.await.unwrap().unwrap() {
-                        InitiateResult::Created(_) => created += 1,
-                        InitiateResult::CapExceeded => rejected += 1,
+                    match h.await.unwrap() {
+                        Ok(InitiateResult::Created(_)) => created += 1,
+                        Ok(InitiateResult::CapExceeded) => rejected += 1,
+                        Ok(InitiateResult::Contended) | Err(_) => errored += 1,
                     }
                 }
-                (created, rejected)
+                (created, rejected, errored)
             });
+        // SAFETY: never over-admit past the cap.
+        assert!(
+            created <= 8,
+            "must never admit more than the cap, got {created}"
+        );
+        // Every attempt is accounted for (created / rejected / transient).
         assert_eq!(
-            outcome,
-            (32, 1),
-            "33 concurrent initiates against cap 32 must yield exactly 32 successes + 1 rejection",
+            created + rejected + errored,
+            12,
+            "every attempt must resolve"
+        );
+        // At least the cap-many admits succeed (moderate contention is
+        // comfortably within the retry budget — no transient errors
+        // expected here, but the assertion tolerates them if the CI box
+        // is pathologically slow).
+        assert_eq!(
+            created, 8,
+            "cap-many admits must succeed under moderate contention"
         );
     }
 
@@ -2145,6 +2846,81 @@ mod tests {
     }
 
     #[test]
+    fn append_chunk_streaming_no_length_appends_actual_bytes() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            let session_id = Uuid::new_v4();
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+
+            // No declared length (Transfer-Encoding: chunked) and no range —
+            // exactly buildah's streaming PATCH shape.
+            let content = b"hello world".to_vec();
+            let out = append_chunk_streaming(
+                &ctx,
+                session_id,
+                None,
+                cursor_of(&content),
+                1_000_000,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .expect("streaming append must succeed without Content-Length");
+            assert_eq!(out.bytes_received, content.len() as u64);
+            assert_eq!(out.version, 2);
+            let staged = mocks.stateful_upload_staging.bytes_for(session_id).unwrap();
+            assert_eq!(staged, content);
+        });
+    }
+
+    #[test]
+    fn append_chunk_streaming_over_cap_rejects_and_bounds_staging() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            let session_id = Uuid::new_v4();
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+
+            // A streaming body over the cap: the bounded `take(max_bytes+1)`
+            // truncates and the post-append check rejects — staging never
+            // grows unbounded even though no length was declared.
+            let content = vec![0u8; 100];
+            let err = append_chunk_streaming(
+                &ctx,
+                session_id,
+                None,
+                cursor_of(&content),
+                16,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .expect_err("a streaming body over the cap must be rejected");
+            assert!(matches!(err, AppError::SizeExceeded));
+            let staged = mocks
+                .stateful_upload_staging
+                .bytes_for(session_id)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            assert!(
+                staged <= 17,
+                "staging must be bounded to max_bytes+1, got {staged}"
+            );
+        });
+    }
+
+    #[test]
     fn append_chunk_happy_path_bumps_version_and_appends_bytes() {
         run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
@@ -2170,6 +2946,7 @@ mod tests {
                 content.len() as u64,
                 1_000_000,
                 repo_id,
+                TEST_MAX_AGE,
             )
             .await
             .expect("happy-path append must succeed");
@@ -2209,6 +2986,7 @@ mod tests {
                     1,
                     1_000_000,
                     Uuid::new_v4(),
+                    TEST_MAX_AGE,
                 )
                 .await
             })
@@ -2257,6 +3035,7 @@ mod tests {
                     1,
                     1_000_000,
                     repo_b_id,
+                    TEST_MAX_AGE,
                 )
                 .await
             })
@@ -2306,6 +3085,7 @@ mod tests {
                     50,
                     1_000_000,
                     repo_id,
+                    TEST_MAX_AGE,
                 )
                 .await
             })
@@ -2349,6 +3129,7 @@ mod tests {
                     99,
                     1_000_000,
                     repo_id,
+                    TEST_MAX_AGE,
                 )
                 .await
             })
@@ -2389,6 +3170,7 @@ mod tests {
                     60,
                     100,
                     repo_id,
+                    TEST_MAX_AGE,
                 )
                 .await
             })
@@ -2448,6 +3230,7 @@ mod tests {
                     3,
                     1_000_000,
                     repo_id,
+                    TEST_MAX_AGE,
                 )
                 .await
             })
@@ -2495,6 +3278,7 @@ mod tests {
                     3,
                     1_000_000,
                     Uuid::new_v4(),
+                    TEST_MAX_AGE,
                 )
                 .await
             })
@@ -2540,6 +3324,7 @@ mod tests {
                     3,
                     1_000_000,
                     repo_id,
+                    TEST_MAX_AGE,
                 )
                 .await
                 .unwrap();
@@ -2604,6 +3389,7 @@ mod tests {
             chunks.len() as u64,
             10 * 1024 * 1024,
             repo_id,
+            TEST_MAX_AGE,
         )
         .await
         .unwrap();
@@ -2634,6 +3420,7 @@ mod tests {
                 repo_id,
                 "library/nginx",
                 10 * 1024 * 1024,
+                TEST_MAX_AGE,
             )
             .await
             .expect("clean finalize must succeed");
@@ -2678,6 +3465,7 @@ mod tests {
                 other_repo,
                 "x",
                 10 * 1024 * 1024,
+                TEST_MAX_AGE,
             )
             .await
             .expect_err("tenant mismatch must error");
@@ -2739,6 +3527,7 @@ mod tests {
                     repo_id,
                     "library/nginx",
                     10 * 1024 * 1024,
+                    TEST_MAX_AGE,
                 )
                 .await
                 .expect_err("digest mismatch must error");
@@ -2814,6 +3603,7 @@ mod tests {
                     repo_id,
                     "library/nginx",
                     10 * 1024 * 1024,
+                    TEST_MAX_AGE,
                 )
                 .await
                 .unwrap();
@@ -2892,11 +3682,16 @@ mod tests {
                 &ctx,
                 session_id,
                 hash.clone(),
-                Some((cursor_of(&trailing), Some(range), trailing.len() as u64)),
+                Some((
+                    cursor_of(&trailing),
+                    Some(range),
+                    Some(trailing.len() as u64),
+                )),
                 api_actor(),
                 repo_id,
                 "library/nginx",
                 10 * 1024 * 1024,
+                TEST_MAX_AGE,
             )
             .await
             .expect("finalize with trailing body must succeed");
@@ -2924,6 +3719,7 @@ mod tests {
                 Uuid::new_v4(),
                 "library/nginx",
                 10 * 1024 * 1024,
+                TEST_MAX_AGE,
             )
             .await
             .expect_err("unknown session must error");
@@ -2972,6 +3768,7 @@ mod tests {
                 repo_id,
                 "x",
                 10 * 1024 * 1024,
+                TEST_MAX_AGE,
             )
             .await
             .expect_err("session+missing-staging must error");

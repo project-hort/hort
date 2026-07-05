@@ -21,6 +21,7 @@ use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ReadFrom};
+use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
 
@@ -170,6 +171,18 @@ pub struct QuarantineUseCase {
     /// block site's `upstream_index_cache_invalidator` field on
     /// `CurationUseCase` for the design rationale (mirror).
     upstream_index_cache_invalidator: Option<Arc<dyn UpstreamIndexCacheInvalidator>>,
+    /// Jobs port for the **expiry backstop** (design §2 S4). At window
+    /// expiry, a `provenance_mode: Required` + `ProvenanceClearance::
+    /// Pending` candidate can neither release (fail-closed — `Pending`
+    /// denies the timer arm) nor stay held forever; the sweep enqueues a
+    /// **final** `provenance-verify` for it (which runs `window_open =
+    /// false` via Item 2 and either clears a just-in-time signature or
+    /// emits terminal `ProvenanceRejected{Unsigned}`). The enqueue is
+    /// best-effort, non-gating (warn-and-continue) and idempotent per
+    /// tick via [`JobsRepository::find_active_provenance_for_artifact`] —
+    /// it never blocks the sweep and never releases a `Pending`
+    /// candidate.
+    jobs: Arc<dyn JobsRepository>,
 }
 
 impl QuarantineUseCase {
@@ -196,6 +209,7 @@ impl QuarantineUseCase {
         policy_projections: Arc<dyn PolicyProjectionRepository>,
         content_references: Arc<dyn ContentReferenceIndex>,
         storage: Arc<dyn StoragePort>,
+        jobs: Arc<dyn JobsRepository>,
     ) -> Self {
         Self {
             artifacts,
@@ -207,6 +221,7 @@ impl QuarantineUseCase {
             storage,
             include_repository_label: true,
             upstream_index_cache_invalidator: None,
+            jobs,
         }
     }
 
@@ -1316,6 +1331,30 @@ impl QuarantineUseCase {
                 .resolve_provenance_clearance(artifact_id, repository_id)
                 .await?;
 
+            // S4 — terminal decision at window expiry (design §2 S4).
+            //
+            // The candidates handed to this sweep are already past their
+            // computed deadline (the adapter's candidacy filter). A
+            // `Required` + `Pending` candidate can neither release
+            // (fail-closed — `Pending` denies the timer arm below) nor
+            // stay held forever. Enqueue a FINAL `provenance-verify` for
+            // it: it runs with `window_open = false` (Item 2), so
+            // `complete_provenance` either CLEARS a signature that landed
+            // just before expiry or emits terminal
+            // `ProvenanceRejected{Unsigned}`. This is also the backstop if
+            // the S3 signature-arrival enqueue was lost.
+            //
+            // The enqueue does NOT change the release decision — the
+            // sweep still never releases a `Pending` candidate (the domain
+            // predicate below refuses it). It is best-effort
+            // (warn-and-continue) and idempotent per tick (guarded on an
+            // already-in-flight `provenance-verify` job for this
+            // artifact), so repeated ticks between the enqueue and the
+            // worker running it do not pile up duplicate open rows.
+            if matches!(provenance, ProvenanceClearance::Pending) {
+                self.enqueue_final_provenance_verify(artifact_id).await;
+            }
+
             match artifact.release(ReleaseReason::Timer, authz, provenance) {
                 Ok(event_payload) => {
                     let score_delta =
@@ -1365,6 +1404,79 @@ impl QuarantineUseCase {
         }
 
         Ok(released)
+    }
+
+    /// Enqueue a FINAL `provenance-verify` for an expired `Required` +
+    /// `Pending` candidate (design §2 S4).
+    ///
+    /// Best-effort, non-gating: any failure logs `warn!` and the sweep
+    /// continues. Idempotent per tick — if a `provenance-verify` job is
+    /// already in-flight (`pending`/`running`) for this artifact, the
+    /// enqueue is skipped so repeated sweep ticks between the enqueue and
+    /// the worker running it do not pile up duplicate open rows
+    /// (mechanism: [`JobsRepository::find_active_provenance_for_artifact`],
+    /// mirroring the manual-rescan in-flight guard). `params.artifact_id`
+    /// matches the shape the `provenance-verify` handler parses; the job
+    /// runs with `window_open = false` (Item 2) because the candidate is
+    /// past its deadline by construction (the sweep's candidacy filter).
+    #[tracing::instrument(skip(self))]
+    async fn enqueue_final_provenance_verify(&self, artifact_id: Uuid) {
+        // Idempotency guard: skip if a verify is already in-flight for
+        // this artifact.
+        match self
+            .jobs
+            .find_active_provenance_for_artifact(artifact_id)
+            .await
+        {
+            Ok(Some(existing)) => {
+                tracing::debug!(
+                    artifact_id = %artifact_id,
+                    existing_job_id = %existing,
+                    "expiry backstop: provenance-verify already in-flight; skipping re-enqueue"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // A lookup failure is best-effort — warn and skip this
+                // tick rather than risk a duplicate; the next sweep tick
+                // re-drives it (the candidate stays Pending).
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "expiry backstop: in-flight provenance-verify lookup failed; \
+                     skipping re-enqueue this tick"
+                );
+                return;
+            }
+        }
+
+        let params = serde_json::json!({ "artifact_id": artifact_id });
+        match self
+            .jobs
+            .enqueue_task(
+                "provenance-verify",
+                &params,
+                None,     // actor_id: system-driven expiry backstop
+                0i16,     // default tier
+                "ingest", // reuse the ingest-time verify trigger source (CHECK-valid)
+                None,     // no idempotency key — the in-flight guard above is the dedup
+            )
+            .await
+        {
+            Ok(outcome) => tracing::info!(
+                artifact_id = %artifact_id,
+                ?outcome,
+                "expiry backstop: enqueued final provenance-verify (window_open=false) \
+                 for Required + Pending candidate at deadline"
+            ),
+            Err(e) => tracing::warn!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "expiry backstop: final provenance-verify enqueue failed \
+                 (best-effort — next sweep tick re-drives it)"
+            ),
+        }
     }
 
     /// Record a terminal scan failure: the scan job
@@ -1678,6 +1790,7 @@ mod tests {
         // `with_scan_result_paired_mocks`) so tests can assert on
         // `inserted_batches()`.
         let _ = scan_findings;
+        let jobs = Arc::new(MockJobsRepository::new());
         let uc = QuarantineUseCase::new(
             artifacts.clone(),
             crate::event_store_publisher::wrap_for_test(events.clone()),
@@ -1686,6 +1799,7 @@ mod tests {
             projections.clone(),
             content_references.clone(),
             storage.clone(),
+            jobs,
         );
         (
             uc,
@@ -1696,6 +1810,55 @@ mod tests {
             projections,
             content_references,
             storage,
+        )
+    }
+
+    /// Fixture that also exposes the [`MockJobsRepository`] handle so the
+    /// S4 expiry-backstop tests can assert on / seed `provenance-verify`
+    /// enqueues. Builds the use case with the shared `jobs` mock wired
+    /// (rather than routing through [`make_use_case_with_storage`], whose
+    /// return tuple deliberately omits `jobs`).
+    #[allow(clippy::type_complexity)]
+    fn make_use_case_with_jobs() -> (
+        QuarantineUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockEventStore>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+        Arc<MockJobsRepository>,
+    ) {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let events = Arc::new(MockEventStore::new());
+        let scan_findings = Arc::new(MockScanFindingsRepository::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_scan_result_paired_mocks(events.clone(), scan_findings.clone()),
+        );
+        let repositories = Arc::new(MockRepositoryRepository::new());
+        let projections = Arc::new(MockPolicyProjectionRepository::new());
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let _ = scan_findings;
+        let jobs = Arc::new(MockJobsRepository::new());
+        let uc = QuarantineUseCase::new(
+            artifacts.clone(),
+            crate::event_store_publisher::wrap_for_test(events.clone()),
+            lifecycle.clone(),
+            repositories.clone(),
+            projections.clone(),
+            content_references.clone(),
+            storage.clone(),
+            jobs.clone(),
+        );
+        (
+            uc,
+            artifacts,
+            events,
+            lifecycle,
+            repositories,
+            projections,
+            jobs,
         )
     }
 
@@ -3532,6 +3695,51 @@ mod tests {
         assert_eq!(ev.released_by, ReleaseReason::Timer);
     }
 
+    /// Item 4 (issue #15) — an image-INDEX artifact rides the generic
+    /// quarantine/release sweep. The release path (`release_expired`) keys on
+    /// the artifact id + the stream's `ScanCompleted`, never on manifest
+    /// shape: an index's degenerate scan (it has no layers of its own — the
+    /// scanner scans its harmless routing JSON) produces a clean
+    /// `ScanCompleted` exactly like a single-image manifest, so the timer arm
+    /// releases it identically. Design §2 D4: the index rides the generic
+    /// manifest lifecycle unchanged; releasing it releases no runnable bytes.
+    #[tokio::test]
+    async fn release_expired_releases_an_image_index_via_scan_succeeded() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        // Seed a quarantined artifact whose declared content_type is the OCI
+        // image-index media-type — i.e. this artifact IS a stored index.
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        artifact.content_type = hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string();
+        let mut repo = sample_repository();
+        repo.format = hort_domain::entities::repository::RepositoryFormat::Oci;
+        repo.id = artifact.repository_id;
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        repositories.insert(repo);
+        // Degenerate clean scan on the index's own bytes → ScanCompleted.
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "a clean-scanned index must release on the generic timer/scan sweep"
+        );
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Released,
+            "the index rides the same Quarantined → Released transition as any manifest"
+        );
+        let DomainEvent::ArtifactReleased(ev) = &batch.events[0].event else {
+            panic!("ArtifactReleased expected");
+        };
+        assert_eq!(ev.released_by, ReleaseReason::Timer);
+    }
+
     /// Seed a repo-scoped policy with
     /// `provenance_mode = Required` (+ a valid identity so the apply-time
     /// linter would accept it; the projection
@@ -3613,6 +3821,7 @@ mod tests {
                             .into(),
                 },
                 predicate_type: None,
+                cascaded_from: None,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -3681,6 +3890,142 @@ mod tests {
             panic!("ArtifactReleased expected");
         };
         assert_eq!(ev.released_by, ReleaseReason::Timer);
+    }
+
+    // =====================================================================
+    // S4 — terminal decision at window expiry (design §2 S4). A Required +
+    // Pending + past-deadline candidate enqueues a FINAL provenance-verify
+    // (running window_open=false via Item 2) that either clears a
+    // just-in-time signature or emits terminal Rejected{Unsigned}. The
+    // sweep STILL never releases a Pending candidate; the enqueue is
+    // idempotent per tick.
+    // =====================================================================
+
+    /// S4: a `Required` + `Pending` (scan gate passing, NO
+    /// `ProvenanceVerified`) + past-deadline candidate enqueues exactly
+    /// one final `provenance-verify` for itself — and is STILL not
+    /// released (Pending denies the timer arm; the enqueue is additive,
+    /// not a release).
+    #[tokio::test]
+    async fn release_expired_required_pending_enqueues_final_provenance_verify() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // Scan gate passes (ScanCompleted on stream) but there is NO
+        // ProvenanceVerified → clearance is Pending.
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        // The sweep NEVER releases a Pending candidate.
+        assert!(
+            released.is_empty(),
+            "S4: a Pending candidate is never released by the sweep"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "S4: no release transition committed for a Pending candidate"
+        );
+
+        // Exactly one final provenance-verify enqueued, carrying THIS
+        // artifact's id, system-driven, no idempotency key.
+        let calls = jobs.enqueue_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "S4 enqueues exactly one final provenance-verify at expiry"
+        );
+        let (kind, params, actor_id) = &calls[0];
+        assert_eq!(kind, "provenance-verify");
+        assert_eq!(
+            params.get("artifact_id").and_then(|v| v.as_str()),
+            Some(artifact_id.to_string().as_str())
+        );
+        assert!(actor_id.is_none(), "expiry backstop is system-driven");
+        assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
+    }
+
+    /// S4 idempotency: a second sweep tick, while a `provenance-verify`
+    /// is already in-flight for the same Pending candidate, does NOT
+    /// re-enqueue (guarded on `find_active_provenance_for_artifact`).
+    #[tokio::test]
+    async fn release_expired_required_pending_idempotent_when_verify_already_in_flight() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+
+        // Simulate a first-tick enqueue that is now in-flight.
+        jobs.seed_active_provenance(artifact_id, Uuid::new_v4());
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(released.is_empty(), "Pending candidate still not released");
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "S4 is idempotent per tick: no re-enqueue while a verify is in-flight"
+        );
+    }
+
+    /// S4 negative: a `Required` + `Cleared` (a `ProvenanceVerified` on
+    /// the stream) candidate releases normally and enqueues NO final
+    /// verify (the S4 arm fires only for `Pending`).
+    #[tokio::test]
+    async fn release_expired_required_cleared_does_not_enqueue_final_verify() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "Required + Cleared ⇒ released (no S4 backstop needed)"
+        );
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "S4 fires only for Pending — a Cleared candidate enqueues nothing"
+        );
+    }
+
+    /// S4 negative: a non-`Required` (`VerifyIfPresent`) candidate
+    /// releases normally (clearance `NotRequired`) and enqueues NO final
+    /// verify — the S4 arm never fires outside `Required` + `Pending`.
+    #[tokio::test]
+    async fn release_expired_verify_if_present_does_not_enqueue_final_verify() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        // Default projection() carries provenance_mode = VerifyIfPresent →
+        // clearance NotRequired.
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(released, vec![artifact_id]);
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "VerifyIfPresent (NotRequired) never triggers the S4 backstop"
+        );
     }
 
     /// A `VerifyIfPresent`-mode artifact timer-releases

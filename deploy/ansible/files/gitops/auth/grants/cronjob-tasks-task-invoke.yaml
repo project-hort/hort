@@ -7,8 +7,7 @@ spec:
   # GrantSubject::User(<cronjob-tasks backing user>), so the cronjob-tasks
   # SA can enqueue non-destructive admin tasks without admin.
   # `admin_task_invoke` is the narrow "may enqueue an admin task" cap, not
-  # the `admin` bit, and is not expressible on the SA envelope — this
-  # standalone grant is the sole carrier.
+  # the `admin` bit — this standalone grant is the sole carrier.
   #
   # This does not confer the `task:destructive` claim, so the cronjob-tasks
   # token cannot run retention-evaluate / retention-purge / eventstore-archive

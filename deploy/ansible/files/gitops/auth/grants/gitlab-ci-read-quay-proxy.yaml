@@ -1,0 +1,15 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gitlab-ci-read-quay-proxy
+spec:
+  # Per-repo serviceAccount-subject grant: gitlab-ci (GitLab CI pull identity)
+  # reads quay-proxy. Resolves at apply to
+  # GrantSubject::User(<gitlab-ci backing user>). The CI pull scope is
+  # per-repo — read on exactly the five pull/proxy repos, not a global
+  # read.
+  subject:
+    kind: serviceAccount
+    name: gitlab-ci
+  permission: read
+  repository: quay-proxy

@@ -2015,7 +2015,7 @@ pub fn emit_policy_violations(
 // ---------------------------------------------------------------------------
 
 /// `result` label value for `hort_provenance_verify_total`. Closed
-/// taxonomy of 3. String values are normative — they appear
+/// taxonomy of 4. String values are normative — they appear
 /// verbatim in `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceVerifyResult {
@@ -2025,11 +2025,17 @@ pub enum ProvenanceVerifyResult {
     /// breakdown lives on the companion `hort_provenance_reject_total`.
     Rejected,
     /// No bundle was found / passed and the mode allowed it
-    /// (`VerifyIfPresent` no-op, no event). Under `Required` an unsigned
-    /// artifact is mapped to `Rejected{Unsigned}` upstream and ticks
-    /// `rejected` here instead — so `no_attestation` is strictly the
-    /// allowed-unsigned case.
+    /// (`VerifyIfPresent`/`Off` no-op, no event) — the allowed-unsigned
+    /// case. Distinct from `HeldPendingSignature`: here the mode does not
+    /// require a signature, so the artifact is not held.
     NoAttestation,
+    /// A `Required`-mode artifact was found unsigned while its quarantine
+    /// observation window is still open (issue #13): `complete_provenance`
+    /// returns `Ok(None)` and the artifact is HELD `Quarantined` (read as
+    /// `Pending` / fail-closed by the release gate) so it can still be
+    /// signed. Separable from `no_attestation` so operators can see images
+    /// *waiting to be signed* distinctly from *allowed unsigned*.
+    HeldPendingSignature,
 }
 
 impl ProvenanceVerifyResult {
@@ -2040,6 +2046,7 @@ impl ProvenanceVerifyResult {
             Self::Verified => "verified",
             Self::Rejected => "rejected",
             Self::NoAttestation => "no_attestation",
+            Self::HeldPendingSignature => "held_pending_signature",
         }
     }
 }

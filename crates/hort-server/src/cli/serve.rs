@@ -949,6 +949,8 @@ async fn run_async() -> anyhow::Result<()> {
             // Per-`(repo,
             // principal)` outstanding-session cap.
             max_sessions_per_principal: cfg.oci_max_sessions_per_principal,
+            // Session max-age — set TTL + admit age-prune threshold.
+            session_max_age_secs: cfg.oci_session_max_age_secs,
         };
         // Metrics auth posture. The flag
         // is the same one threaded into the main listener below; the
@@ -1035,6 +1037,8 @@ async fn run_async() -> anyhow::Result<()> {
             // Per-`(repo,
             // principal)` outstanding-session cap.
             max_sessions_per_principal: cfg.oci_max_sessions_per_principal,
+            // Session max-age — set TTL + admit age-prune threshold.
+            session_max_age_secs: cfg.oci_session_max_age_secs,
         };
         // Single-listener mode still
         // honours the metrics-auth posture: the auth dispatch carves

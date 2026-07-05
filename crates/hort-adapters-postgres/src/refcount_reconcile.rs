@@ -36,14 +36,22 @@
 //!    one `DeleteRejectedSourceRows` per source (the repair sweeps
 //!    every kind for that source).
 //!
-//! # Repair: idempotent upsert / sweep
+//! # Repair: idempotent delete-then-insert / sweep
 //!
-//! `apply_repair` is idempotent — create/repair is the same
-//! `ON CONFLICT (repository_id, source_artifact_id, kind) DO UPDATE`
-//! upsert the shipped `PgContentReferenceRepo::insert` uses; the
+//! `apply_repair` is idempotent. The `content_references` PK is
+//! `(repository_id, source_artifact_id, target_content_hash, kind)`, so
+//! `target_content_hash` cannot be updated in place — a mis-targeted
+//! repair cannot `ON CONFLICT … DO UPDATE SET target_content_hash`
+//! (that would insert a second row and leave the wrong one). The
+//! reconcile manages **single-target kinds only** (`primary_content`,
+//! `metadata_blob`) — exactly one row per `(source, kind)` must exist —
+//! so create/repair is a **delete-then-insert** inside a transaction:
+//! `DELETE … WHERE (repo, source, kind)` then `INSERT`. This replaces a
+//! mis-targeted row, creates a missing one, and is a no-op-equivalent on
+//! an already-correct one (delete + re-insert the same tuple). The
 //! rejected-source delete is `DELETE … WHERE source_artifact_id = $1`
-//! (every kind). Re-applying an already-applied repair is a no-op, so
-//! the sweep is re-runnable and converges to zero drift.
+//! (every kind). Re-applying an already-applied repair converges, so the
+//! sweep is re-runnable and converges to zero drift.
 //!
 //! `metadata_blob` is stored as `character(64)` (blank-padded) on
 //! `artifact_metadata`; it is trimmed at the boundary before parsing,
@@ -321,12 +329,33 @@ impl RefcountReconcilePort for PgRefcountReconcile {
 }
 
 impl PgRefcountReconcile {
-    /// Idempotent upsert of one refcount row, identical in shape to
-    /// `PgContentReferenceRepo::insert`'s `ON CONFLICT … DO UPDATE`
-    /// (so create and repair are the same statement and re-running is
-    /// a no-op). `metadata` is the empty object — the reconcile sweep
-    /// does not synthesise sidecar metadata (the ingest path owns
-    /// that; reconcile only restores the refcount itself).
+    /// Idempotent restore of one **single-target-kind** refcount row
+    /// (`primary_content` / `metadata_blob`), as a delete-then-insert
+    /// inside one transaction.
+    ///
+    /// The `content_references` PK is `(repository_id, source_artifact_id,
+    /// target_content_hash, kind)` — `target_content_hash` is part of the
+    /// key, so a mis-targeted row cannot be corrected with `ON CONFLICT …
+    /// DO UPDATE SET target_content_hash` (that would insert a *second*
+    /// row and leave the wrong one behind). Instead the transaction
+    /// deletes any row under `(repo, source, kind)` — regardless of its
+    /// current target — then inserts the correct one. This:
+    ///   * replaces a mis-targeted row (`RepairPrimaryContent`),
+    ///   * creates a missing one (`CreatePrimaryContent`,
+    ///     `UpsertMetadataBlob`), and
+    ///   * is idempotent on an already-correct row (delete + re-insert of
+    ///     the same tuple leaves exactly one correct row).
+    ///
+    /// This is safe **only** for single-target kinds — kinds where exactly
+    /// one row per `(source, kind)` is the invariant. The N-target kinds
+    /// (`oci_index_member`, `oci_subject`) are never restored through here
+    /// (the reconcile only ever calls this with `"primary_content"` /
+    /// `"metadata_blob"`); a `(repo, source, kind)`-wide delete would wrongly
+    /// clobber their siblings.
+    ///
+    /// `metadata` is the empty object — the reconcile sweep does not
+    /// synthesise sidecar metadata (the ingest path owns that; reconcile
+    /// only restores the refcount itself).
     async fn upsert_row(
         &self,
         repo_id: Uuid,
@@ -334,28 +363,47 @@ impl PgRefcountReconcile {
         kind: &str,
         target: &ContentHash,
     ) -> DomainResult<()> {
+        let ctx = || format!("{repo_id}/{source_artifact_id}/{kind}");
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", &ctx()))?;
+
+        // Delete any existing row under this single-target `(repo, source,
+        // kind)` — whatever its current target — so the re-insert replaces
+        // a mis-targeted row rather than colliding with it on the widened
+        // PK.
+        sqlx::query(
+            r#"DELETE FROM content_references
+               WHERE repository_id = $1
+                 AND source_artifact_id = $2
+                 AND kind = $3"#,
+        )
+        .bind(repo_id)
+        .bind(source_artifact_id)
+        .bind(kind)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", &ctx()))?;
+
         sqlx::query(
             r#"INSERT INTO content_references (
                    source_artifact_id, target_content_hash, kind, metadata,
                    repository_id, recorded_at
-               ) VALUES ($1, $2, $3, '{}'::jsonb, $4, now())
-               ON CONFLICT (repository_id, source_artifact_id, kind) DO UPDATE SET
-                   target_content_hash = EXCLUDED.target_content_hash,
-                   recorded_at         = EXCLUDED.recorded_at"#,
+               ) VALUES ($1, $2, $3, '{}'::jsonb, $4, now())"#,
         )
         .bind(source_artifact_id)
         .bind(target.as_ref())
         .bind(kind)
         .bind(repo_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| {
-            map_sqlx_error(
-                &e,
-                "refcount_reconcile",
-                &format!("{repo_id}/{source_artifact_id}/{kind}"),
-            )
-        })?;
+        .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", &ctx()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", &ctx()))?;
         Ok(())
     }
 }

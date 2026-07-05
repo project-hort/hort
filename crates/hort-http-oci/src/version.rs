@@ -3,14 +3,25 @@
 //! Every conformant OCI client begins a session with this request. The
 //! response signals which auth scheme the server expects:
 //!
-//! - **Auth enabled, no credentials** → `401 Unauthorized` +
-//!   `WWW-Authenticate: Basic realm="hort"`. Skopeo /
-//!   docker / podman cache this auth scheme for the registry and
-//!   send `Authorization: Basic ...` preemptively on every
-//!   subsequent request to that host. Without this challenge,
-//!   skopeo would treat the registry as anonymous and not retry
-//!   when later endpoints challenge — which broke the e2e push
-//!   path before this fix landed.
+//! - **Auth enabled, no credentials** → `401 Unauthorized` + the
+//!   mode-appropriate challenge, matching the `/v2/*` middleware's
+//!   selector (`oci_auth::unauthorized_response`):
+//!   - native tokens on (`ctx.oci_signing_key` present) →
+//!     `WWW-Authenticate: Bearer realm="<base>/v2/auth",service="<host>"`.
+//!     Clients follow the realm to `/v2/auth`, mint a capability JWT
+//!     with their Basic credentials (native PAT / `hort_svc_*` are
+//!     validated there), and present it as `Bearer` from then on.
+//!   - native tokens off → `WWW-Authenticate: Basic realm="hort"`
+//!     (legacy IdP-JWT-in-the-password-slot flow).
+//!
+//!   Clients cache the scheme this probe advertises for the whole
+//!   session (skopeo / docker / podman / cosign's
+//!   go-containerregistry), so the probe IS the auth-discovery
+//!   handshake: advertising `Basic` while native tokens are on makes
+//!   clients embed their opaque `hort_svc_*` token in the Basic
+//!   password slot — which no read-path validator accepts — instead
+//!   of minting at `/v2/auth`, silently degrading every read to
+//!   anonymous (private repos then anti-enumerate to 404).
 //! - **Auth enabled, valid credentials** → `200 OK` +
 //!   `Docker-Distribution-API-Version: registry/2.0`.
 //! - **Auth disabled** → `200 OK` (anonymous flow; no challenge).
@@ -76,8 +87,10 @@ pub async fn get_version(State(ctx): State<Arc<AppContext>>, req: Request) -> Re
     // Auth enabled. The OCI bearer middleware ran upstream and either
     // inserted an `AuthenticatedPrincipal` (token presented and
     // validated) or `Option<AuthenticatedPrincipal>::None` (anonymous).
-    // Anonymous → 401 with the Basic challenge so clients know how to
-    // authenticate. Authenticated → 200.
+    // Anonymous → 401 with the mode-appropriate challenge (Bearer →
+    // `/v2/auth` when native tokens are on, legacy Basic otherwise —
+    // see the module docs) so clients know how to authenticate.
+    // Authenticated → 200.
     //
     // The `AuthenticatedPrincipal` newtype slot is the only signal
     // consulted; a future middleware that injects a bare
@@ -86,7 +99,7 @@ pub async fn get_version(State(ctx): State<Arc<AppContext>>, req: Request) -> Re
     if req.extensions().get::<AuthenticatedPrincipal>().is_some() {
         ok_response()
     } else {
-        unauthorized_response()
+        unauthorized_response(&ctx)
     }
 }
 
@@ -102,13 +115,33 @@ fn ok_response() -> Response {
         .into_response()
 }
 
-fn unauthorized_response() -> Response {
+/// 401 with the challenge matching the deployment's token mode. The
+/// probe advertises the same scheme the `/v2/*` middleware enforces:
+/// Bearer → `/v2/auth` when the OCI signing key is wired (native
+/// capability-token flow), legacy Basic otherwise. No `scope=` hint —
+/// the root probe is not repository-scoped; clients echo the realm +
+/// `service=` and supply scope on the per-repository token request.
+fn unauthorized_response(ctx: &AppContext) -> Response {
+    let challenge = if ctx.oci_signing_key.is_some() {
+        crate::middleware::oci_auth::v2_auth_challenge_value(
+            ctx.oci_public_base_url.as_deref(),
+            ctx.oci_public_base_url
+                .as_deref()
+                .map(crate::middleware::oci_auth::host_of),
+            None,
+        )
+    } else {
+        r#"Basic realm="hort""#.to_string()
+    };
     (
         StatusCode::UNAUTHORIZED,
         [
-            (CONTENT_TYPE, "application/json"),
-            (WWW_AUTHENTICATE, r#"Basic realm="hort""#),
-            (DOCKER_API_VERSION_HEADER, DOCKER_API_VERSION_VALUE),
+            (CONTENT_TYPE, "application/json".to_string()),
+            (WWW_AUTHENTICATE, challenge),
+            (
+                DOCKER_API_VERSION_HEADER,
+                DOCKER_API_VERSION_VALUE.to_string(),
+            ),
         ],
         r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#,
     )
@@ -197,8 +230,10 @@ mod tests {
         assert_eq!(header, DOCKER_API_VERSION_VALUE);
     }
 
+    /// Legacy mode (no OCI signing key): the probe challenges Basic —
+    /// the IdP-JWT-in-the-password-slot flow.
     #[tokio::test]
-    async fn enabled_auth_anonymous_returns_401_with_basic_challenge() {
+    async fn enabled_auth_anonymous_without_signing_key_challenges_basic() {
         let ctx = enabled_ctx();
         let response = get_version(State(ctx), req_with_principal(None)).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -209,6 +244,44 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(www.starts_with("Basic"), "got: {www}");
+    }
+
+    /// Native-token mode (OCI signing key wired): the probe challenges
+    /// Bearer with the `/v2/auth` realm + `service=` host, matching the
+    /// `/v2/*` middleware's selector. Clients cache the scheme this
+    /// probe advertises, so a Basic challenge here would keep them from
+    /// ever minting at `/v2/auth` — an opaque `hort_svc_*` credential
+    /// would ride the Basic password slot, fail every read-path
+    /// validator, and degrade all reads to anonymous.
+    #[tokio::test]
+    async fn enabled_auth_anonymous_with_signing_key_challenges_bearer_v2_auth() {
+        use hort_http_core::test_support::{with_oci_public_base_url, with_oci_signing_key};
+
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = hort_app::oci_token_signing::OciTokenSigningKey::new(sk, None);
+        let ctx = with_oci_signing_key(&enabled_ctx(), Some(Arc::new(key)));
+        let ctx = with_oci_public_base_url(&ctx, Some("https://registry.example.com".into()));
+
+        let response = get_version(State(ctx), req_with_principal(None)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let www = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            www.starts_with(r#"Bearer realm="https://registry.example.com/v2/auth""#),
+            "got: {www}"
+        );
+        assert!(
+            www.contains(r#"service="registry.example.com""#),
+            "got: {www}"
+        );
+        assert!(
+            !www.contains("scope="),
+            "root probe carries no scope: {www}"
+        );
     }
 
     #[tokio::test]

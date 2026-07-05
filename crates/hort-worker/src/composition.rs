@@ -48,6 +48,7 @@ use hort_adapters_postgres::curation_rule_repo::PgCurationRuleRepository;
 use hort_adapters_postgres::event_chain_head_reader::PgEventChainHeadReader;
 use hort_adapters_postgres::event_store::PgEventStore;
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
+use hort_adapters_postgres::permission_grant_repo::PgPermissionGrantRepository;
 use hort_adapters_postgres::pg_content_reference_repo::PgContentReferenceRepo;
 use hort_adapters_postgres::policy_projection_repo::PgPolicyProjectionRepository;
 // Release-sweep candidacy query adapter.
@@ -110,6 +111,7 @@ use hort_domain::ports::event_store::EventStore;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::kubernetes_secret_writer::KubernetesSecretWriter;
+use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 // The cosign/Sigstore provenance verifier port.
 use hort_domain::ports::provenance::ProvenancePort;
@@ -470,6 +472,10 @@ pub async fn build_app_context(
         policy_projections.clone(),
         content_references.clone(),
         storage.clone(),
+        // S4 provenance expiry backstop: `release_expired` enqueues a
+        // final `provenance-verify` for Required + Pending + expired
+        // candidates via the shared `jobs` adapter.
+        jobs.clone(),
     ));
 
     // -----------------------------------------------------------------
@@ -1858,11 +1864,17 @@ async fn register_service_account_rotation(
     let api_tokens_repo: Arc<dyn ApiTokenRepository> =
         Arc::new(PgApiTokenRepository::new(pool.clone()));
     let users_repo: Arc<dyn UserRepository> = Arc::new(PgUserRepository::new(pool.clone()));
+    // The handler reads the live grant set once per tick and derives
+    // each minted token's `declared_permissions` cap from it (the
+    // effective-grants snapshot at issuance).
+    let grants_repo: Arc<dyn PermissionGrantRepository> =
+        Arc::new(PgPermissionGrantRepository::new(pool.clone()));
 
     // The system-mint path on `ApiTokenUseCase` skips the
     // cap-vs-authority gate, so the evaluator is structurally
     // required by the constructor but never consulted on the
-    // rotation tick. An empty evaluator keeps the wiring honest
+    // rotation tick (the handler builds its own per-tick evaluator
+    // from `grants_repo`). An empty evaluator keeps the wiring honest
     // (any future use case that landed on the same `Arc` would
     // see a correctly-typed but-empty RBAC view).
     let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(Vec::new())));
@@ -1883,6 +1895,7 @@ async fn register_service_account_rotation(
         secret_writer,
         api_tokens,
         event_store.clone(),
+        grants_repo,
         cfg.rotation_namespaces.clone(),
         registry_host,
     )

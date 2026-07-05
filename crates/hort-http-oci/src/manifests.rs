@@ -120,10 +120,18 @@ pub(super) async fn serve(
     {
         Ok(r) => r,
         Err(AppError::Domain(DomainError::NotFound { .. })) => {
-            return OciError::NameUnknown {
-                repository: repo_key.to_string(),
-            }
-            .into_response();
+            // Repo-level read denial: challenge an anonymous caller (401 +
+            // mode-aware WWW-Authenticate), anti-enumerate an authenticated
+            // one to NAME_UNKNOWN 404 (D1/D2, ADR 0021).
+            let method = if head {
+                axum::http::Method::HEAD
+            } else {
+                axum::http::Method::GET
+            };
+            let path = format!("/v2/{repo_key}/{name}/manifests/{reference}");
+            return crate::middleware::oci_auth::read_denied_response(
+                &ctx, actor, &method, &path, repo_key,
+            );
         }
         Err(e) => {
             tracing::error!(
@@ -245,8 +253,51 @@ pub(super) async fn serve(
     //    → 503 + Retry-After via the shared helper; rejected is hidden
     //    as MANIFEST_UNKNOWN (format-specific envelope, so inline here
     //    rather than in the helper).
-    if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
-        return resp;
+    //
+    //    Push-then-sign exception (ADR 0039 §10): a caller whose
+    //    identity holds *granted* Write authority may read a held
+    //    MANIFEST — the existence check (`HEAD`) AND the body (`GET`) —
+    //    so a held subject image can be signed. Under
+    //    `provenance_mode: Required` the subject is held `Quarantined`
+    //    until a signature arrives, and keyed `cosign sign` resolves the
+    //    subject manifest by `GET` before attaching the signature.
+    //
+    //    The predicate keys on GRANTED write authority
+    //    (`resolve_granted_write`: the grants leg alone, cap ignored),
+    //    not the presented token's cap: standard OCI clients scope a
+    //    subject read as `pull`, so under native tokens the capability
+    //    JWT carries a read-only cap while the principal's grants carry
+    //    Write. The read itself stays cap-gated — a pull-scoped token
+    //    satisfies the step-1 `resolve(Read)` normally; only the
+    //    held-visibility decision consults identity-level authority
+    //    (bounded ADR 0036 exception, recorded in ADR 0039 §10).
+    //
+    //    A manifest is a routing document (config + layer digests), not
+    //    runnable content; the real bytes are the layer blobs, and
+    //    `blobs.rs` keeps its existence probe `HEAD`-only, so a held
+    //    layer's bytes are never served — the image cannot be pulled or
+    //    run. The 503 hold stays in force for every read caller whose
+    //    identity lacks the Write grant (non-writers / anonymous / proxy
+    //    read scopes) and for every layer blob. So no runnable content
+    //    leaves quarantine (only the metadata manifest, only to a
+    //    write-granted principal), the transparent-proxy contract
+    //    (quarantine invariant #5) is untouched, and a `Rejected`
+    //    manifest is still hidden below. Fail closed: ONLY a definitive
+    //    granted-Write authorization skips the 503 — a denied or errored
+    //    resolve keeps it. The resolve fires solely on the narrow
+    //    quarantined-manifest path (the `matches!` short-circuits
+    //    first), so the hot read path is unaffected.
+    let write_authorized_hold_read =
+        matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
+            && ctx
+                .repository_access_use_case
+                .resolve_granted_write(repo_key, actor)
+                .await
+                .is_ok();
+    if !write_authorized_hold_read {
+        if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
+            return resp;
+        }
     }
     if matches!(artifact.quarantine_status, QuarantineStatus::Rejected) {
         return OciError::ManifestUnknown {
@@ -283,9 +334,19 @@ pub(super) async fn serve(
         return build_response(&artifact, &hash, &media_type, /* body = */ None);
     }
 
-    // Thread the resolved principal for opt-in download-audit attribution
+    // A held manifest served under the write-authorized hold-read exemption
+    // (ADR 0039 §10) streams via `download_hold_read`: the audited `download`
+    // path refuses a `Quarantined` artifact (`is_downloadable()` is false),
+    // so it cannot serve the held subject keyed `cosign sign` resolves by GET.
+    // Otherwise (a released / `None` artifact) thread the resolved principal
+    // through the audited `download` for opt-in download-audit attribution
     // (ADR 0020). No per-handler auth code.
-    let (_a, stream) = match ctx.artifact_use_case.download(artifact.id, actor).await {
+    let download_result = if write_authorized_hold_read {
+        ctx.artifact_use_case.download_hold_read(artifact.id).await
+    } else {
+        ctx.artifact_use_case.download(artifact.id, actor).await
+    };
+    let (_a, stream) = match download_result {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
@@ -1266,6 +1327,45 @@ fn map_manifest_tag_pull_error(
     }
 }
 
+/// Resolve the media-type a coalesced follower should stamp on its own
+/// per-repo manifest row, given the already-CAS-present `content_hash`.
+///
+/// The manifest bytes are content-addressed, so the leader's row (in
+/// whatever repo it ingested into) carries the authoritative
+/// `oci_media_type` for exactly these bytes. `find_by_checksum` is
+/// cross-repo (ADR 0026), so it locates that leader row even when the
+/// follower serves a DIFFERENT repo; its stored `oci_media_type` is
+/// read back verbatim. This preserves the real shape — an image index
+/// keeps `application/vnd.oci.image.index.v1+json`, a Docker manifest
+/// list keeps its list type, a single-image manifest keeps the
+/// single-image type — instead of collapsing every follower re-register
+/// to [`DEFAULT_MEDIA_TYPE`].
+///
+/// Falls back to [`DEFAULT_MEDIA_TYPE`] only when the type is genuinely
+/// unknown: no cross-repo row yet, that row has no metadata /
+/// `oci_media_type` field (e.g. a pre-metadata-migration artifact), or
+/// the lookup errors. Degrading to the established OCI single-image
+/// fallback here is safe — the byte-identical row it would have found is
+/// what `resolve_media_type` also defaults, and it is strictly better
+/// than the previous unconditional single-image label.
+async fn follower_media_type_for_hash(ctx: &Arc<AppContext>, content_hash: &ContentHash) -> String {
+    let source = match ctx.artifact_use_case.find_by_checksum(content_hash).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return DEFAULT_MEDIA_TYPE.to_string(),
+        Err(e) => {
+            tracing::warn!(
+                hash = %content_hash,
+                error = %e,
+                "coalesced-follower media-type resolve: cross-repo artifact lookup failed; \
+                 falling back to default media type"
+            );
+            return DEFAULT_MEDIA_TYPE.to_string();
+        }
+    };
+    // Reuse the exact stored-type read the serve path uses.
+    resolve_media_type(ctx, source.id).await
+}
+
 /// Final post-coalesce step: recover the artifact row via
 /// `find_in_repo_by_hash`. Both leader and
 /// follower take this path; the leader's `ingest_verified` (inside
@@ -1280,11 +1380,16 @@ fn map_manifest_tag_pull_error(
 /// `register_existing_cas_blob` rather than failing closed. Coords are
 /// reconstructed deterministically from `(name, content_hash)` —
 /// `oci_manifest_coords` is exactly what the leader's closure used.
-/// `DEFAULT_MEDIA_TYPE` is the follower's content_type: the upstream
-/// `fetch.media_type` is only observable inside the leader's closure
-/// (the follower never made the upstream call — the point of
-/// coalescing), and `DEFAULT_MEDIA_TYPE` is the established OCI
-/// fallback used elsewhere in this module for an unknown media type.
+///
+/// The follower's content_type is resolved via
+/// [`follower_media_type_for_hash`] — the leader's cross-repo row carries
+/// the authoritative `oci_media_type` for these content-addressed bytes,
+/// so a re-registered image index keeps
+/// `application/vnd.oci.image.index.v1+json` (and a Docker manifest list
+/// keeps its list type) rather than being mislabeled single-image. The
+/// resolved type is also written into `payload_metadata.oci_media_type`
+/// so the follower row's own serve path echoes it. Only a genuinely
+/// unknown type falls back to [`DEFAULT_MEDIA_TYPE`].
 async fn finalise_manifest_pull(
     ctx: &Arc<AppContext>,
     repo: &Repository,
@@ -1303,18 +1408,20 @@ async fn finalise_manifest_pull(
             artifact: Box::new(artifact),
         },
         Ok(None) => {
+            let media_type = follower_media_type_for_hash(ctx, &content_hash).await;
             match ctx
                 .ingest_use_case
                 .register_existing_cas_blob(
                     RegisterExistingCasBlobRequest {
                         repository_id: repo.id,
                         coords: oci_manifest_coords(name, &content_hash),
-                        content_type: DEFAULT_MEDIA_TYPE.to_string(),
+                        content_type: media_type.clone(),
                         actor: ApiActor {
                             user_id: Uuid::nil(),
                         },
                         payload_metadata: serde_json::json!({
                             "oci_source": "upstream_coalesced_follower",
+                            "oci_media_type": media_type,
                         }),
                         content_hash: content_hash.clone(),
                         // Coalesced-follower path is not a seed-import;
@@ -2092,12 +2199,24 @@ mod tests {
                 None,
                 QuarantineStatus::Quarantined,
             );
-            let router = manifest_router(h.ctx);
-            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
+            // Anonymous read of a held manifest. Route through an
+            // RBAC-ENABLED context (not the admit-everything mock default)
+            // so the anonymous caller genuinely lacks `Write` — otherwise
+            // the widened hold-read exemption (ADR 0039) would admit the
+            // admit-everything mock's anonymous "Write" and serve the body.
+            // In production an anonymous caller's Write resolve fails, so
+            // the 503 hold stands; this exercises that path faithfully.
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                /* anonymous */ None,
+            )
+            .await;
             let status = resp.status();
             let retry_after = resp
                 .headers()
@@ -2122,6 +2241,329 @@ mod tests {
         assert!(
             parsed["errors"][0]["detail"]["retry_after_seconds"].is_i64(),
             "detail.retry_after_seconds must be a number"
+        );
+    }
+
+    // -- Write-authorized manifest hold-read exemption (ADR 0039) --
+    //
+    // Under `provenance_mode: Required` the subject image is held
+    // `Quarantined` until a signature arrives; keyed `cosign sign` resolves
+    // the subject manifest by both `HEAD` and `GET manifests/<digest>` before
+    // attaching the signature, so a write-authorized HEAD *and* GET on a held
+    // manifest must serve (200) rather than 503 — else the signature can never
+    // attach. A manifest is metadata (config + layer digests), not runnable
+    // content; the layer blobs stay HEAD-only in `blobs.rs`, so serving a held
+    // manifest never serves a held layer. Non-writers / anonymous callers stay
+    // 503 on every read.
+
+    // RBAC-enabled ctx builders + the capability-token principal shape
+    // are shared with the blob suite via `crate::test_authz`.
+    use crate::test_authz::{pull_scoped_cap_principal, user_grant_ctx, write_grant_ctx};
+
+    /// A `CallerPrincipal` carrying exactly `claim`.
+    fn principal_with_claim(claim: &str) -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: Uuid::from_u128(0xC1),
+            external_id: "kc:ci".into(),
+            username: "ci".into(),
+            email: "ci@example.com".into(),
+            claims: vec![claim.to_string()],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        }
+    }
+
+    /// Drive `serve()` for a digest-referenced *quarantined* manifest in a
+    /// public OCI repo, returning the response status. The repo is public
+    /// (anonymous Read is free) so the `Write` grant is the sole
+    /// discriminator the quarantine gate sees — matching the blob helper.
+    fn quarantined_manifest_serve_status(head: bool, actor_claim: Option<&str>) -> StatusCode {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Quarantined,
+            );
+            // A `ci-pusher` Write grant always exists in the system; whether
+            // the *caller* carries it is the variable under test.
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = actor_claim.map(principal_with_claim);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                principal.as_ref(),
+            )
+            .await
+            .status()
+        })
+    }
+
+    /// Push-then-sign regression: a write-authorized caller's
+    /// `HEAD /v2/<repo>/<name>/manifests/<digest>` is cosign's sign
+    /// preflight. It MUST report the manifest EXISTS (200) so a held
+    /// subject can be signed — even while the manifest is `Quarantined`
+    /// under a provenance hold. Returning 503 here aborts `cosign sign`
+    /// and the signature can never attach (issue #13).
+    #[test]
+    fn head_manifest_quarantined_by_write_authorized_caller_reports_exists_not_503() {
+        let status = quarantined_manifest_serve_status(/* head = */ true, Some("ci-pusher"));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a write-authorized caller's manifest-existence HEAD on a quarantined \
+             manifest must report 200 (exists) so cosign can sign the held subject — \
+             not 503, which aborts the sign"
+        );
+    }
+
+    /// Security scope guard: the existence-probe exemption is gated on WRITE
+    /// authorization. An anonymous (read-only) caller's HEAD on a quarantined
+    /// manifest still 503s, so the exemption never leaks a held manifest's
+    /// existence to a non-writer or to the transparent-proxy pull path
+    /// (quarantine invariant #5).
+    #[test]
+    fn head_manifest_quarantined_anonymous_caller_still_returns_503() {
+        let status =
+            quarantined_manifest_serve_status(/* head = */ true, /* anonymous */ None);
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "anonymous HEAD on a quarantined manifest must stay 503 — the existence-probe \
+             exemption is write-authorized only, never open to pull/read/proxy callers"
+        );
+    }
+
+    /// Security scope guard: fail-closed. A caller whose claim does NOT carry
+    /// the `Write` grant (the resolve denies) gets 503 on a HEAD of a
+    /// quarantined manifest — only a definitive `Write` authorization skips
+    /// the hold.
+    #[test]
+    fn head_manifest_quarantined_non_writer_denied_resolve_returns_503() {
+        let status = quarantined_manifest_serve_status(/* head = */ true, Some("some-reader"));
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a HEAD by a caller without the Write grant must stay 503 — fail-closed: \
+             only a definitive Write authorization releases the existence probe"
+        );
+    }
+
+    /// Push-then-sign (ADR 0039 §9): keyed `cosign sign` resolves the subject
+    /// manifest by GET before attaching the signature, so the hold exemption
+    /// covers a write-authorized manifest GET as well as HEAD. A held manifest
+    /// is a routing document (config + layer digests), not runnable content —
+    /// the real bytes are the layer blobs, and `blobs.rs` keeps its existence
+    /// probe HEAD-only, so serving a held manifest never serves a held layer.
+    /// A write-authorized caller's GET of a quarantined manifest therefore
+    /// SERVES (200) — earlier this test asserted 503; the exemption widened.
+    /// The non-writer / anonymous GET path stays 503 (asserted below).
+    #[test]
+    fn get_manifest_quarantined_write_authorized_caller_now_serves() {
+        let status = quarantined_manifest_serve_status(/* head = */ false, Some("ci-pusher"));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "write-authorized GET of a quarantined manifest now serves (200) so keyed cosign \
+             can resolve the subject and sign it — the manifest is metadata, not runnable \
+             content; the layer blobs stay HEAD-only, so no runnable bytes leave quarantine"
+        );
+    }
+
+    /// Security scope guard: the widened hold exemption is WRITE-only. A
+    /// non-writer's GET of a quarantined manifest still 503s — only a
+    /// definitive `Write` authorization releases the hold read, so the held
+    /// manifest never leaks to a read/proxy caller (quarantine invariant #5).
+    #[test]
+    fn get_manifest_quarantined_non_writer_still_returns_503() {
+        let status =
+            quarantined_manifest_serve_status(/* head = */ false, Some("some-reader"));
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a non-writer GET of a quarantined manifest must stay 503 — the widened hold \
+             read exemption is write-authorized only, never open to read/proxy callers"
+        );
+    }
+
+    // -- Capability-token matrix: the hold exemption keys on GRANTED
+    //    write authority (ADR 0039 §10). A `/v2/auth` capability
+    //    principal presents a pull-scoped cap on its subject read —
+    //    standard client behavior — while its identity's grants carry
+    //    Write; held-visibility follows the grants leg, the cap keeps
+    //    gating the read itself.
+
+    /// Drive `serve()` for the quarantined manifest under a
+    /// User-subject grant set attached to `principal.user_id`.
+    fn quarantined_manifest_cap_status(
+        head: bool,
+        granted: &[hort_domain::entities::rbac::Permission],
+        principal: &CallerPrincipal,
+    ) -> StatusCode {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Quarantined,
+            );
+            let ctx = user_grant_ctx(&h.ctx, h.repositories.clone(), principal.user_id, granted);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                Some(principal),
+            )
+            .await
+            .status()
+        })
+    }
+
+    /// A pull-scoped capability principal whose identity holds Write
+    /// (the canonical `cosign sign` subject read, ADR 0039 §10): held
+    /// manifest HEAD reports exists AND GET serves — the read-only cap
+    /// does not veto held-visibility; the grants leg decides it.
+    #[test]
+    fn quarantined_manifest_pull_scoped_cap_with_write_grant_serves() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCA9);
+        let p = pull_scoped_cap_principal(uid);
+        let granted = [Permission::Read, Permission::Write];
+        assert_eq!(
+            quarantined_manifest_cap_status(/* head = */ true, &granted, &p),
+            StatusCode::OK,
+            "held-manifest HEAD by a pull-scoped cap principal with a Write grant must \
+             report exists — the exemption keys on granted authority, not the cap"
+        );
+        assert_eq!(
+            quarantined_manifest_cap_status(/* head = */ false, &granted, &p),
+            StatusCode::OK,
+            "held-manifest GET by a pull-scoped cap principal with a Write grant must \
+             serve so keyed cosign can resolve the subject it is signing"
+        );
+    }
+
+    /// Scope guard: the exemption does NOT leak to mere readers. A
+    /// pull-scoped cap principal whose identity holds only Read stays
+    /// 503 on both HEAD and GET of the held manifest.
+    #[test]
+    fn quarantined_manifest_pull_scoped_cap_read_only_grantee_stays_503() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCA10);
+        let p = pull_scoped_cap_principal(uid);
+        let granted = [Permission::Read];
+        for head in [true, false] {
+            assert_eq!(
+                quarantined_manifest_cap_status(head, &granted, &p),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a read-only grantee (head={head}) must stay 503 — granted WRITE \
+                 authority, not mere read authority, keys the hold exemption"
+            );
+        }
+    }
+
+    /// B1 fail-closed parity (ADR 0036): an anomalous claims-admin
+    /// Pat/ServiceAccount principal with `token_cap = None` gains no
+    /// held-visibility through the grants-only basis either.
+    #[test]
+    fn quarantined_manifest_b1_admin_claim_no_cap_stays_503() {
+        use hort_domain::entities::api_token::TokenKind;
+        for kind in [TokenKind::Pat, TokenKind::ServiceAccount] {
+            let mut p = principal_with_claim("admin");
+            p.token_kind = Some(kind);
+            assert_eq!(
+                quarantined_manifest_cap_status(/* head = */ false, &[], &p),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "claims-admin {kind:?} with None cap must fail closed on held reads"
+            );
+        }
+    }
+
+    /// Rejected stays terminal for the capability shape too: a
+    /// write-granted pull-scoped cap principal's GET of a `Rejected`
+    /// manifest is still hidden as 404 (`MANIFEST_UNKNOWN`).
+    #[test]
+    fn rejected_manifest_pull_scoped_cap_write_grant_still_hidden_as_404() {
+        use hort_domain::entities::rbac::Permission;
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let uid = Uuid::from_u128(0xCA11);
+        let status = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Rejected,
+            );
+            let ctx = user_grant_ctx(
+                &h.ctx,
+                h.repositories.clone(),
+                uid,
+                &[Permission::Read, Permission::Write],
+            );
+            let principal = pull_scoped_cap_principal(uid);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await
+            .status()
+        });
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the hold exemption covers Quarantined only — Rejected stays hidden \
+             regardless of grants or cap shape"
         );
     }
 
@@ -2158,6 +2600,60 @@ mod tests {
             (status, body)
         });
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+    }
+
+    /// Security scope guard, RBAC-enabled mirror of the test above: the
+    /// hold-read exemption is `Quarantined`-only, so even a WRITE-authorized
+    /// caller's GET of a `Rejected` manifest stays hidden as 404
+    /// (`MANIFEST_UNKNOWN`) — a Write grant never resurrects a rejected
+    /// manifest. Pins the property under the same `write_grant_ctx` harness
+    /// the Quarantined suite uses, not just the RBAC-disabled ctx.
+    #[test]
+    fn rejected_manifest_write_authorized_get_still_hidden_as_404() {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let (status, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Rejected,
+            );
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = principal_with_claim("ci-pusher");
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await;
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a write-authorized GET of a Rejected manifest must stay hidden — \
+             the hold-read exemption covers Quarantined only"
+        );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
     }
@@ -2274,78 +2770,94 @@ mod tests {
         assert_eq!(content_type.as_deref(), Some(media));
     }
 
-    /// Visibility regression guard (ADR 0008): anonymous
-    /// `GET /v2/<private-repo>/<name>/manifests/<ref>` MUST return
-    /// `404 NAME_UNKNOWN` (anti-enumeration). `RepositoryAccessUseCase`
-    /// enforces Read at the resolve site and collapses invisible-private
-    /// to NotFound.
+    /// Repo-level read denial (D1/D2, ADR 0021): an anonymous manifest
+    /// pull on a denied repo (missing OR invisible-private,
+    /// indistinguishable) is challenged with 401 + the mode-aware
+    /// `WWW-Authenticate` in BOTH signing-key states; an
+    /// authenticated-but-unauthorized caller keeps the `NAME_UNKNOWN` 404
+    /// anti-enumeration envelope. Supersedes the pre-challenge
+    /// anonymous-private-repo → 404 guard: anonymous private now moves to
+    /// 401 alongside anonymous nonexistent (see the uniformity test).
     #[test]
-    fn anonymous_get_on_private_repo_returns_404_name_unknown() {
-        use hort_app::rbac::RbacEvaluator;
-        use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
-        use hort_http_core::test_support::with_repository_access;
-
-        let content = b"private manifest body".to_vec();
-        let hex = {
-            use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
-        };
-        let (status, body) = run(async {
+    fn manifest_read_denial_challenges_anonymous_and_404s_authenticated() {
+        run(async {
             let h = harness();
-            let mut repo = oci_repo("private-repo");
-            repo.is_public = false;
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let (_id, hash) = seed_manifest(
-                &h.artifacts,
-                &h.storage,
-                &h.metadata,
-                repo_id,
-                &hex,
-                &content,
-                Some("application/vnd.oci.image.manifest.v1+json"),
-                QuarantineStatus::None,
+            let hm = HeaderMap::new();
+            // (1) anonymous, signing key UNWIRED → 401 Basic.
+            crate::test_authz::assert_basic_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    "v1",
+                    &hm,
+                    false,
+                    None,
+                )
+                .await,
             );
-
-            // Flip access use case to Enabled; anonymous = NotFound
-            // (ADR 0008). `ctx.repositories` is `pub(crate)` so pull the
-            // `Arc<MockRepositoryRepository>` off the harness handle.
-            let access = Arc::new(RepositoryAccessUseCase::new(
-                h.repositories.clone(),
-                RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
-                    RbacEvaluator::new(Vec::new()),
-                ))),
-                true,
-            ));
-            let ctx = with_repository_access(&h.ctx, access);
-
-            let router = manifest_router(ctx);
-            // Pull by digest reference; the path's tail-parser routes
-            // to manifests::serve.
-            let uri = format!(
-                "/v2/private-repo/library/nginx/manifests/sha256:{}",
-                hash.as_ref()
+            // (2) anonymous, signing key WIRED → 401 Bearer /v2/auth.
+            crate::test_authz::assert_bearer_challenge(
+                &serve(
+                    crate::test_authz::denied_ctx_bearer(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    "v1",
+                    &hm,
+                    false,
+                    None,
+                )
+                .await,
+                r#"scope="repository:ghost/library/nginx:pull""#,
             );
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
+            // (3) authenticated but unauthorized → 404 NAME_UNKNOWN.
+            let principal = crate::test_authz::grantless_principal();
+            crate::test_authz::assert_name_unknown_404(
+                serve(
+                    crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone()),
+                    "ghost",
+                    "library/nginx",
+                    "v1",
+                    &hm,
+                    false,
+                    Some(&principal),
+                )
+                .await,
+            )
+            .await;
         });
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "anonymous read on private OCI manifest MUST be 404 (ADR 0008)"
-        );
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Anti-enumeration: NAME_UNKNOWN (the visible miss collapses
-        // at the repo resolve before the manifest lookup ever runs).
-        assert_eq!(
-            parsed["errors"][0]["code"], "NAME_UNKNOWN",
-            "envelope must match the missing-repo case to defeat probing"
-        );
+    }
+
+    /// Anti-enumeration equivalence (ADR 0021): an anonymous denial for a
+    /// NONEXISTENT repo is byte-identical to one for an EXISTING PRIVATE
+    /// repo (Basic mode carries no `scope=`, so the entire response — status,
+    /// challenge, body — matches). This is what an enumeration probe diffs.
+    #[test]
+    fn manifest_anonymous_denial_uniform_nonexistent_vs_private() {
+        run(async {
+            let h = harness();
+            let mut priv_repo = oci_repo("private-repo");
+            priv_repo.is_public = false;
+            h.repositories.insert(priv_repo);
+            let ctx = crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone());
+            let hm = HeaderMap::new();
+            let nonexistent = serve(
+                ctx.clone(),
+                "ghost",
+                "library/nginx",
+                "v1",
+                &hm,
+                false,
+                None,
+            )
+            .await;
+            let private = serve(ctx, "private-repo", "library/nginx", "v1", &hm, false, None).await;
+            assert_eq!(
+                crate::test_authz::denial_snapshot(nonexistent).await,
+                crate::test_authz::denial_snapshot(private).await,
+                "anonymous nonexistent vs existing-private must be byte-identical"
+            );
+        });
     }
 
     // ---------------------------------------------------------------------
@@ -3339,6 +3851,178 @@ mod tests {
         }
     }
 
+    // ---------------- finalise_manifest_pull: follower media-type ----------------
+
+    /// Drive `finalise_manifest_pull` directly through its cross-repo
+    /// follower branch (`find_in_repo_by_hash(repo) → None`) with the
+    /// leader's row + `oci_media_type` metadata pre-seeded in a DIFFERENT
+    /// repo, and return the media-type stamped on the follower's
+    /// re-registered row.
+    ///
+    /// This is the exact shape a coalesced follower hits when the leader
+    /// ingested into another repo (`DedupKey::blob_by_hash` is cross-repo,
+    /// ADR 0026): the follower registers its own per-repo row from the
+    /// already-CAS-present bytes.
+    fn follower_reregister_media_type(leader_media: &str) -> String {
+        run(async {
+            let h = harness();
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            // Distinct repos are the whole point — the follower serves a
+            // repo the leader never ingested into.
+            assert_ne!(leader_repo.id, follower_repo.id);
+            h.repositories.insert(leader_repo.clone());
+            h.repositories.insert(follower_repo.clone());
+
+            // Manifest bytes are content-addressed; the leader's stored
+            // `oci_media_type` is authoritative for exactly these bytes.
+            let content = format!(r#"{{"schemaVersion":2,"mt":"{leader_media}"}}"#).into_bytes();
+            let hex = {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(&content))
+            };
+            // Seed ONLY the leader's row + metadata (in leader_repo). The
+            // follower_repo has no row → the Ok(None) branch fires.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                Some(leader_media),
+                QuarantineStatus::None,
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &h.ctx,
+                &follower_repo,
+                "library/app",
+                &format!("sha256:{hex}"),
+                content_hash,
+                /*write_tag=*/ false,
+            )
+            .await;
+
+            match outcome {
+                UpstreamManifestPullOutcome::Ingested { artifact, .. } => {
+                    // The follower re-registered a NEW per-repo row.
+                    assert_eq!(
+                        artifact.repository_id, follower_repo.id,
+                        "follower must register its own per-repo row"
+                    );
+                    artifact.content_type
+                }
+                other => panic!(
+                    "expected Ingested from cross-repo follower re-register; got {}",
+                    manifest_outcome_variant_name(&other)
+                ),
+            }
+        })
+    }
+
+    /// Regression (issue #15, Item 5): a cross-repo / coalesced follower
+    /// re-registering an image INDEX must keep
+    /// `application/vnd.oci.image.index.v1+json`, NOT collapse to the
+    /// single-image `DEFAULT_MEDIA_TYPE`. This is the mislabel the fix
+    /// closes: the follower reads the leader's authoritative stored type
+    /// rather than hardcoding single-image.
+    #[test]
+    fn follower_reregister_preserves_oci_index_media_type() {
+        let mt = follower_reregister_media_type(OCI_INDEX);
+        assert_eq!(
+            mt, OCI_INDEX,
+            "cross-repo follower re-register must preserve the image-index \
+             media-type, not the single-image default"
+        );
+        assert_ne!(
+            mt, DEFAULT_MEDIA_TYPE,
+            "an index must NOT be mislabeled single-image on follower re-register"
+        );
+    }
+
+    /// Companion to the index case: a Docker manifest LIST keeps its list
+    /// type through the same follower re-register path.
+    #[test]
+    fn follower_reregister_preserves_docker_manifest_list_media_type() {
+        let mt = follower_reregister_media_type(DOCKER_V2_MANIFEST_LIST);
+        assert_eq!(
+            mt, DOCKER_V2_MANIFEST_LIST,
+            "cross-repo follower re-register must preserve the Docker \
+             manifest-list media-type"
+        );
+    }
+
+    /// Companion guard: single-image re-register behaviour is UNCHANGED —
+    /// a re-registered single-image manifest still carries the
+    /// single-image type. This proves the fix is a no-op for the common
+    /// case (it only stops mislabeling indexes; it does not relabel
+    /// single-image manifests).
+    #[test]
+    fn follower_reregister_single_image_is_unchanged() {
+        let mt = follower_reregister_media_type(DEFAULT_MEDIA_TYPE);
+        assert_eq!(
+            mt, DEFAULT_MEDIA_TYPE,
+            "single-image follower re-register must stay single-image"
+        );
+    }
+
+    /// When the leader's cross-repo row has no `oci_media_type` metadata
+    /// (e.g. a pre-metadata-migration artifact) the follower degrades to
+    /// the established single-image default — the same fallback
+    /// `resolve_media_type` applies. Covers the None-metadata branch of
+    /// `follower_media_type_for_hash`.
+    #[test]
+    fn follower_reregister_falls_back_to_default_when_type_unknown() {
+        let mt = run(async {
+            let h = harness();
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            h.repositories.insert(leader_repo.clone());
+            h.repositories.insert(follower_repo.clone());
+
+            let content = br#"{"schemaVersion":2,"no-metadata":true}"#.to_vec();
+            let hex = {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(&content))
+            };
+            // `None` media_type → no metadata row for the leader's artifact.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::None,
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            match finalise_manifest_pull(
+                &h.ctx,
+                &follower_repo,
+                "library/app",
+                &format!("sha256:{hex}"),
+                content_hash,
+                false,
+            )
+            .await
+            {
+                UpstreamManifestPullOutcome::Ingested { artifact, .. } => artifact.content_type,
+                other => panic!(
+                    "expected Ingested; got {}",
+                    manifest_outcome_variant_name(&other)
+                ),
+            }
+        });
+        assert_eq!(
+            mt, DEFAULT_MEDIA_TYPE,
+            "unknown stored type must fall back to the single-image default"
+        );
+    }
+
     /// Concurrent-coalesce test (tag-ref path): spawn two
     /// `tokio::spawn` requests against the same OCI manifest tag.
     /// The wrapped `coalesce_to_hash` call site at the manifest
@@ -3658,5 +4342,439 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ================================================================
+    // Item 4 (issue #15) — a STORED image-index rides the generic
+    // manifest lifecycle on the HOSTED write path.
+    //
+    // The existing `pull_through_*` tests above cover a proxied index
+    // (upstream fetch → ingest → serve). These tests cover the
+    // complementary case the initiative is really about: an index that
+    // was PUT / stored locally (not proxied) serves generically by
+    // digest and by tag, and the layer-level safety invariant holds
+    // (a released index does NOT unhold a held child manifest).
+    //
+    // No index-specific serve code exists or is needed: the serve path
+    // is bytes-by-hash/tag, reads `oci_media_type` from the metadata
+    // row, and echoes it verbatim in `build_response` — an index is a
+    // manifest artifact like any other (design §2 D4/D5).
+    // ================================================================
+
+    /// OCI image-index media-type (design §2 D2 / `hort_domain::oci`).
+    const INDEX_MEDIA: &str = "application/vnd.oci.image.index.v1+json";
+
+    /// A realistic OCI image-index body carrying one child platform
+    /// descriptor. The child hash is arbitrary — the serve path never
+    /// parses `manifests[]`, so any well-formed JSON exercises the same
+    /// generic bytes-by-hash path. `is_image_index` (Item 1) is `true`
+    /// for this body, which is asserted below so a future serve-path
+    /// change that started keying on shape would be caught.
+    fn sample_index_body(child_hex: &str) -> Vec<u8> {
+        format!(
+            "{{\"schemaVersion\":2,\
+             \"mediaType\":\"{INDEX_MEDIA}\",\
+             \"manifests\":[{{\
+             \"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+             \"digest\":\"sha256:{child_hex}\",\
+             \"size\":528,\
+             \"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}}}}]}}"
+        )
+        .into_bytes()
+    }
+
+    /// The index fixture is genuinely an image-index (guards against a
+    /// fixture that silently degenerated into a single-image manifest,
+    /// which would make the "rides the generic path" claim vacuous).
+    #[test]
+    fn item4_index_fixture_is_an_image_index() {
+        let child = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(
+            hort_domain::oci::is_image_index(&sample_index_body(child)),
+            "the Item-4 index fixture must be recognised as an image index"
+        );
+    }
+
+    /// (a) A stored index serves by DIGEST with the verbatim index
+    /// Content-Type, the `Docker-Content-Digest` header, and the
+    /// streamed index body. Proves the read path needs no index-specific
+    /// code — it is generic bytes-by-hash.
+    #[test]
+    fn item4_stored_index_served_by_digest_verbatim_media_type() {
+        let child = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, headers, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            let router = manifest_router(h.ctx);
+            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, headers, body)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            INDEX_MEDIA,
+            "the stored index media-type must be echoed verbatim, not the single-image default"
+        );
+        assert_eq!(
+            headers
+                .get("docker-content-digest")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("sha256:{hex}"),
+        );
+        assert_eq!(body, content, "the full index body must stream back");
+    }
+
+    /// (a) The same stored index serves by TAG. The tag resolves to the
+    /// index digest via the generic `RefUseCase` lookup — no index-aware
+    /// branch. A `HEAD` of the same tag returns the identical headers
+    /// with an empty body (HEAD-before-GET parity), which is the shape a
+    /// multi-arch client uses to discover the index before pulling it.
+    #[test]
+    fn item4_stored_index_served_by_tag_and_head() {
+        let child = "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+        let content = sample_index_body(child);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (get, head) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (_id, hash) = seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            seed_tag(&h.refs, repo_id, "library/nginx", "multi", &hash);
+            let router = manifest_router(h.ctx);
+            let uri = "/v2/myrepo/library/nginx/manifests/multi";
+
+            let get_resp = router
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let get_status = get_resp.status();
+            let get_ct = get_resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let get_digest = get_resp
+                .headers()
+                .get("docker-content-digest")
+                .map(|v| v.to_str().unwrap().to_string());
+            let get_body = to_bytes(get_resp.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+
+            let head_resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let head_status = head_resp.status();
+            let head_ct = head_resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let head_digest = head_resp
+                .headers()
+                .get("docker-content-digest")
+                .map(|v| v.to_str().unwrap().to_string());
+            let head_body = to_bytes(head_resp.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+
+            (
+                (get_status, get_ct, get_digest, get_body),
+                (head_status, head_ct, head_digest, head_body),
+            )
+        });
+
+        let expected_digest = Some(format!("sha256:{hex}"));
+        assert_eq!(get.0, StatusCode::OK);
+        assert_eq!(get.1.as_deref(), Some(INDEX_MEDIA));
+        assert_eq!(get.2, expected_digest);
+        assert_eq!(get.3, content, "tag GET streams the full index body");
+
+        assert_eq!(head.0, StatusCode::OK);
+        assert_eq!(
+            head.1.as_deref(),
+            Some(INDEX_MEDIA),
+            "HEAD echoes the same verbatim index media-type as GET"
+        );
+        assert_eq!(head.2, expected_digest, "HEAD-before-GET digest parity");
+        assert!(head.3.is_empty(), "HEAD must carry an empty body");
+    }
+
+    /// (c) Provenance hold-read exemption for an INDEX subject. Under a
+    /// provenance hold the index is `Quarantined`; keyed cosign resolves the
+    /// subject index by both `HEAD` and `GET manifests/<index-digest>`. A
+    /// write-authorized HEAD *and* GET must serve 200 (the ADR 0039
+    /// `write_authorized_hold_read` exemption — NOT index-specific), so the
+    /// held index is signable. A non-writer HEAD and an anonymous HEAD stay
+    /// 503.
+    ///
+    /// Byte-for-byte reuse of the `quarantined_manifest_serve_status`
+    /// RBAC harness above, with the seeded manifest's bytes + media-type
+    /// swapped to an index. The exemption keys on `Write` authorization,
+    /// never on manifest shape — proving the payoff (a held INDEX can be
+    /// signed) rides the same generic gate. An index carries only child
+    /// digests, not runnable bytes; the child layer blobs stay HEAD-only.
+    fn quarantined_index_serve_status(head: bool, actor_claim: Option<&str>) -> StatusCode {
+        let child = "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
+        let content = sample_index_body(child);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::Quarantined,
+            );
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = actor_claim.map(principal_with_claim);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                principal.as_ref(),
+            )
+            .await
+            .status()
+        })
+    }
+
+    #[test]
+    fn item4_head_quarantined_index_write_authorized_reports_200() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ true, Some("ci-pusher")),
+            StatusCode::OK,
+            "a write-authorized HEAD on a held INDEX must report 200 so cosign can sign the \
+             index digest — this is the issue-#13 existence probe applied to an index, no \
+             index-specific code path"
+        );
+    }
+
+    #[test]
+    fn item4_get_quarantined_index_write_authorized_now_serves() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ false, Some("ci-pusher")),
+            StatusCode::OK,
+            "a write-authorized GET of a held index now serves (200) so keyed cosign can \
+             resolve the index digest and sign it — the index is metadata (child digests), \
+             not runnable content; the child layer blobs stay HEAD-only, so serving the \
+             held index leaks no runnable bytes"
+        );
+    }
+
+    #[test]
+    fn item4_get_quarantined_index_non_writer_still_503() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ false, Some("some-reader")),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a non-writer GET of a held index stays 503 — the widened hold read exemption \
+             is write-authorized only"
+        );
+    }
+
+    #[test]
+    fn item4_head_quarantined_index_non_writer_and_anonymous_still_503() {
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ true, Some("some-reader")),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a non-writer HEAD on a held index stays 503 (fail-closed)"
+        );
+        assert_eq!(
+            quarantined_index_serve_status(/* head = */ true, /* anonymous */ None),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an anonymous HEAD on a held index stays 503 — the exemption never leaks a \
+             held index to a read/proxy caller (quarantine invariant #5)"
+        );
+    }
+
+    /// (d) The load-bearing D4 safety invariant: releasing an index does
+    /// NOT release its children. A RELEASED index (`QuarantineStatus::None`)
+    /// references a still-HELD child manifest; a non-writer `GET` of the held
+    /// child stays 503. Each artifact is independently gated by its own
+    /// quarantine status — an index carries no runnable bytes, so serving it
+    /// never serves the held child. This is why v1 needs no child-status
+    /// rollup into the index release gate (design §2 D4).
+    ///
+    /// Routed through an RBAC-ENABLED context with an anonymous caller: the
+    /// widened hold-read exemption (ADR 0039) serves a held manifest to a
+    /// write-authorized caller, so the held-child 503 must be exercised via a
+    /// caller that genuinely lacks `Write` (the admit-everything mock default
+    /// would admit anonymous "Write" and serve the child).
+    #[test]
+    fn item4_released_index_does_not_release_held_child() {
+        // The child manifest bytes (single-image) and the index that
+        // references it. The child is Quarantined (held); the index is
+        // None (released).
+        let child_body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#.to_vec();
+        let child_hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&child_body))
+        };
+        let index_body = sample_index_body(&child_hex);
+        let index_hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&index_body))
+        };
+        let single_media = "application/vnd.oci.image.manifest.v1+json";
+
+        let (index_status, child_get) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            // Released index.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &index_hex,
+                &index_body,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            // Held child manifest.
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &child_hex,
+                &child_body,
+                Some(single_media),
+                QuarantineStatus::Quarantined,
+            );
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let index_accept = {
+                let mut m = HeaderMap::new();
+                m.insert(ACCEPT, HeaderValue::from_static(INDEX_MEDIA));
+                m
+            };
+            let single_accept = {
+                let mut m = HeaderMap::new();
+                m.insert(ACCEPT, HeaderValue::from_static(single_media));
+                m
+            };
+
+            // The released index itself serves (routing document) — to an
+            // anonymous caller, since it is no longer held.
+            let index_status = serve(
+                ctx.clone(),
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{index_hex}"),
+                &index_accept,
+                /* head = */ false,
+                /* anonymous */ None,
+            )
+            .await
+            .status();
+
+            // The held child manifest 503s on a non-writer GET: the child is
+            // independently gated by its own quarantine status, and the
+            // hold-read exemption is write-authorized only. The
+            // caller-and-shape-independent content gate is the layer blobs
+            // (HEAD-only, `blobs.rs`); here the non-writer GET is the proof
+            // the held child is not served to a reader.
+            let child_get = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{child_hex}"),
+                &single_accept,
+                /* head = */ false,
+                /* anonymous */ None,
+            )
+            .await
+            .status();
+
+            (index_status, child_get)
+        });
+
+        assert_eq!(
+            index_status,
+            StatusCode::OK,
+            "the released index serves — it is a routing document with no runnable bytes"
+        );
+        assert_eq!(
+            child_get,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "releasing the index must NOT release its held child manifest — the child stays \
+             503 on a non-writer GET, independently gated by its own quarantine status \
+             (design §2 D4)"
+        );
     }
 }

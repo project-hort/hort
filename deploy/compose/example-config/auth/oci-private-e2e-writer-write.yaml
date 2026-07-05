@@ -1,0 +1,21 @@
+# PermissionGrant: serviceAccount oci-private-e2e-writer -> write oci-private-e2e.
+#
+# Backs the native-tokens-overlay seed-push leg of
+# scripts/native-tests/scenarios/clients/oci-private-pull.sh: without this
+# grant the SA's admin-minted hort_svc_* token would carry an empty access[]
+# on a push-scoped /v2/auth request. Write-only by design — mirrors
+# dev-user's role split with reader-user (auth/dev-write-oci-private-e2e.yaml
+# vs auth/reader-read-oci-private-e2e.yaml): a distinct write-only principal
+# from the read-only oci-private-e2e-reader SA, so the native-mode run
+# exercises the SAME "Read grant != Write grant" capability-precision split
+# the legacy-mode run does with dev-user/reader-user.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: oci-private-e2e-writer-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-private-e2e-writer
+  permission: write
+  repository: oci-private-e2e

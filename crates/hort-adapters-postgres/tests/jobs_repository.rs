@@ -20,6 +20,9 @@
 //! - `reschedule_resets_lock_and_records_error`
 //! - `mark_failed_terminal_status`
 //! - `enqueue_scan_rejects_duplicate_artifact`
+//! - `find_active_provenance_surfaces_pending_and_ignores_completed`
+//! - `find_active_provenance_isolates_by_artifact_id`
+//! - `find_active_provenance_returns_none_when_only_completed_row_exists`
 
 #![allow(clippy::expect_used)]
 
@@ -648,5 +651,139 @@ async fn find_active_scan_ignores_non_scan_kinds() {
     assert_eq!(
         active, None,
         "non-scan kinds must not surface in the scan-specific lookup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `find_active_provenance_for_artifact` — params->>'artifact_id' match
+// ---------------------------------------------------------------------------
+//
+// Sibling of `find_active_scan_for_artifact`, but `provenance-verify`
+// rows carry `artifact_id` inside the `params` JSONB (`{"artifact_id":
+// …}`), NOT the scan-typed `artifact_id` column (see
+// `enqueue_provenance_verify_in_tx`). So the adapter matches on
+// `params->>'artifact_id'`. The S4 expiry-backstop idempotency guard
+// (`QuarantineUseCase::release_expired`) relies on this: it enqueues a
+// final verify only when none is already in-flight, so repeated sweep
+// ticks between the enqueue and the worker running it do not pile up
+// duplicate open rows.
+//
+// Serialization note: like every test in this binary, these acquire the
+// per-binary `lock_serial()` async-mutex gate (see `serial_lock`), which
+// serialises ALL tests here against the shared `public.jobs` table. This
+// is the sibling scan tests' convention and satisfies the crate-wide
+// "DB-backed tests must serialise" contract (stricter than a keyed
+// `#[serial(hort_pg_db)]` group, which the `serial_test` attribute would
+// otherwise provide).
+
+/// Insert a `kind='provenance-verify'` row at an arbitrary status with
+/// `artifact_id` embedded in the `params` JSONB, mirroring
+/// `enqueue_provenance_verify_in_tx`. Returns the inserted job id.
+async fn seed_provenance_job_with_status(pool: &PgPool, artifact_id: Uuid, status: &str) -> Uuid {
+    let params = serde_json::json!({ "artifact_id": artifact_id });
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO public.jobs \
+            (kind, params, priority, status) \
+         VALUES ('provenance-verify', $1, 0, $2) \
+         RETURNING id",
+    )
+    .bind(params)
+    .bind(status)
+    .fetch_one(pool)
+    .await
+    .expect("seed provenance-verify job row at custom status")
+}
+
+/// 1. A `pending` provenance-verify row for artifact A is surfaced
+///    (returns its id); a `completed` row for the same artifact is NOT
+///    (active-status filter — status IN ('pending','running')).
+#[tokio::test]
+async fn find_active_provenance_surfaces_pending_and_ignores_completed() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = PgJobsRepository::new(pool.clone());
+
+    let artifact_a = Uuid::new_v4();
+    // A completed verify for A must not count as in-flight.
+    let completed_id = seed_provenance_job_with_status(&pool, artifact_a, "completed").await;
+    // A pending verify for A is the in-flight row.
+    let pending_id = seed_provenance_job_with_status(&pool, artifact_a, "pending").await;
+
+    let active = repo
+        .find_active_provenance_for_artifact(artifact_a)
+        .await
+        .expect("find_active_provenance_for_artifact");
+    assert_eq!(
+        active,
+        Some(pending_id),
+        "find_active_provenance_for_artifact must surface the pending row"
+    );
+    assert_ne!(
+        active,
+        Some(completed_id),
+        "completed provenance-verify rows must not be reported as in-flight"
+    );
+}
+
+/// 2. Isolation: a provenance-verify for artifact B is not returned when
+///    querying for artifact A (the `params->>'artifact_id'` match is
+///    exact).
+#[tokio::test]
+async fn find_active_provenance_isolates_by_artifact_id() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = PgJobsRepository::new(pool.clone());
+
+    let artifact_a = Uuid::new_v4();
+    let artifact_b = Uuid::new_v4();
+    // Only B has a pending verify.
+    let b_id = seed_provenance_job_with_status(&pool, artifact_b, "pending").await;
+
+    // Querying for A must not surface B's row.
+    let active_a = repo
+        .find_active_provenance_for_artifact(artifact_a)
+        .await
+        .expect("find_active_provenance_for_artifact(A)");
+    assert_eq!(
+        active_a, None,
+        "a verify for artifact B must not surface when querying artifact A"
+    );
+
+    // And querying for B surfaces exactly B's row (sanity that the seed
+    // is discoverable at all).
+    let active_b = repo
+        .find_active_provenance_for_artifact(artifact_b)
+        .await
+        .expect("find_active_provenance_for_artifact(B)");
+    assert_eq!(
+        active_b,
+        Some(b_id),
+        "the params->>'artifact_id' match must find B's own row"
+    );
+}
+
+/// 3. No active job → returns `None` (only a completed row exists).
+#[tokio::test]
+async fn find_active_provenance_returns_none_when_only_completed_row_exists() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = PgJobsRepository::new(pool.clone());
+
+    let artifact_id = Uuid::new_v4();
+    let _completed = seed_provenance_job_with_status(&pool, artifact_id, "completed").await;
+
+    let active = repo
+        .find_active_provenance_for_artifact(artifact_id)
+        .await
+        .expect("find_active_provenance_for_artifact");
+    assert_eq!(
+        active, None,
+        "completed-only history must not surface as in-flight"
     );
 }

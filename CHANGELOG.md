@@ -7,6 +7,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-07-05
+
+Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
+push-then-sign under `provenance_mode: Required`** end to end — an unsigned
+image (index-shaped included) is held for the quarantine window, keyed cosign
+v3 signatures verify against the pinned key, and a verified signature clears
+the signed tree so the released image pulls (issues #13, #14, #15);
+**identity-only service accounts** — authority comes exclusively from explicit
+`PermissionGrant`s and issued-token caps snapshot the effective grants
+(ADR 0044); OCI **chunked blob-upload push** (buildah / podman / skopeo stream
+layers via HTTP `Transfer-Encoding: chunked`, no `Content-Length`, streamed and
+bounded by the publish-body limit); and an authoritative, self-pruning
+per-`(repo, principal)` OCI **upload-session cap**.
+
+### Added
+
+- **OCI image-index / manifest-list (multi-arch) support.** Hosted OCI repos
+  accept `application/vnd.oci.image.index.v1+json` and Docker manifest-list
+  PUTs (previously rejected `MANIFEST_INVALID`), so `skopeo copy --all`,
+  buildah/podman multi-arch pushes, and cosign signing of the index digest
+  work. An index is stored as a generic manifest artifact riding the normal
+  quarantine/scan/release/provenance lifecycle; each child manifest is
+  validated to exist in-repo on PUT, the declared media type is cross-checked
+  against the manifest shape, and index→child membership keeps every child's
+  content alive under GC. (issue #15, ADR 0043)
+- A `hort-sweep-ticker` sidecar in the reference compose deployment enqueues
+  the quarantine-release sweep periodically — compose's stand-in for the Helm
+  `scheduledTasks` CronJobs / native `hort_timers`, so release and expiry
+  decisions happen without a surrounding scheduler. (issue #14)
+
+### Changed
+
+- **The `ServiceAccount` gitops envelope is identity-only** — it declares who
+  may assume the account (`federatedIdentities[].claims`, `fallbackRotation`)
+  and confers no authority. A service account's authority is exclusively its
+  explicit `PermissionGrant`s (`serviceAccount`-subject grants, ADR 0037), and
+  the two unattended issuance sites — the federation `/exchange` and the
+  fallback-rotation mint — derive the issued token's cap as a snapshot of the
+  effective grants at issuance (the exchange additionally intersects the
+  RFC 8693 `scope` parameter; rotated fallback tokens now carry the SA's real
+  granted authority instead of an empty, deny-all cap). Grants added apply at
+  the next exchange or rotation; revocations bite outstanding tokens
+  immediately through the live grants leg. (issue #13, ADR 0044)
+- A **write-authorized** caller may now `GET` (not just `HEAD`) a held
+  manifest: keyed `cosign sign` resolves the subject manifest by GET before
+  attaching a signature, so the HEAD-only exemption blocked in-place
+  push-then-sign. A manifest is a routing document — layer blobs stay gated
+  (503) for every caller while held, and non-writers still receive 503 for
+  both verbs. (issue #14, ADR 0039)
+- **Keyed cosign signing against a hosted repo must use
+  `--registry-referrers-mode=oci-1-1`** (subject-based referrers); the legacy
+  `sha256-<hex>.sig` tag mode is not linked to its subject on the push path, so
+  a signature pushed that way stays invisible to the verifier.
+
+### Removed
+
+- The `role:` and `repositories:` fields of the `ServiceAccount` gitops
+  envelope. An envelope still declaring them fails apply at parse; migration
+  014 drops the columns. (ADR 0044)
+
+### Fixed
+
+- **An anonymous OCI read denied at the repository level now returns `401` +
+  a mode-appropriate `WWW-Authenticate` challenge instead of a bare `404`.**
+  A standard `docker pull` / kubelet pull of a private image presents no
+  credential on its first request and only retries with its
+  `imagePullSecrets` credential when challenged; a `404` gave it nothing to
+  react to, so the pull failed even with a correctly configured Secret. The
+  new challenge is byte-identical (modulo the request's own echoed scope)
+  whether the repository is private or does not exist at all, so no new
+  existence oracle opens; an authenticated caller without read access still
+  gets the unchanged `404 NAME_UNKNOWN` anti-enumeration response. Anonymous
+  writes on `/v2/*` now advertise the same mode-appropriate challenge scheme
+  instead of a hardcoded legacy one.
+- **A native `hort_pat_*` / `hort_svc_*` token presented directly on `/v2/*`
+  now validates under `HORT_AUTH_PROVIDER=disabled` +
+  `HORT_NATIVE_TOKENS_ENABLED=true` deployments, matching behavior already
+  in place when an IdP is configured.** Such a token was previously rejected
+  at the OCI auth middleware before it ever reached token validation.
+- **The quarantine hold-read exemption keys on the principal's granted write
+  authority, so native-token cosign signing completes.** The exemption
+  (held-manifest HEAD/GET, held-blob HEAD existence probe) resolved `Write`
+  through the grants leg **and** the presented token's cap. Standard OCI
+  clients scope a subject read as `pull`, so under native tokens cosign's
+  subject read rides a read-only capability token and the cap leg failed the
+  exemption's `Write` check — the held-manifest GET `503`d and `cosign sign`
+  aborted. The exemption now consults the grants leg alone (the read itself
+  stays cap-gated); a bounded, documented exception to the ADR 0036
+  cap-intersection invariant (ADR 0039 §10), with the fail-closed admin-claim
+  guard preserved. The push-then-sign E2E gains a native-token-mode run where
+  cosign's subject read rides a pull-scoped capability token. (issue #13)
+- **The `GET /v2/` auth-discovery probe advertises the Bearer `/v2/auth`
+  challenge when native tokens are enabled.** The probe hardcoded
+  `WWW-Authenticate: Basic realm="hort"`, so OCI clients (skopeo, docker,
+  podman, cosign) cached Basic for the session and never minted a capability
+  token at `/v2/auth` — an opaque `hort_pat_*`/`hort_svc_*` credential then
+  rode the Basic password slot, which no read-path validator accepts, and
+  every read degraded to anonymous (private repos anti-enumerate to 404:
+  pushes succeeded, the pushed image could not be read back or signed). The
+  probe now emits the same challenge the `/v2/*` middleware selects: `Bearer
+  realm="<base>/v2/auth",service="<host>"` with the signing key wired, legacy
+  Basic otherwise. (issues #13, #16)
+- **cosign v3 keyed signatures now verify.** `cosign sign --key
+  --registry-referrers-mode=oci-1-1` (cosign v3) emits a Sigstore v0.3 bundle
+  referrer carrying a DSSE envelope, not the legacy `simplesigning` layer the
+  `cosign-key` backend consumed — a validly keyed-signed image was judged
+  `NoAttestation` and rejected `Unsigned`. The keyed verifier now extracts the
+  DSSE PAE signing input, signature, and subject-digest binding from a keyed
+  bundle (no Fulcio chain) and verifies it against the pinned P-256 key,
+  rejecting a signature over a different digest. The legacy `simplesigning`
+  carriage and keyless (Fulcio-chain) bundle routing are unchanged.
+  (issue #14, ADR 0039)
+- **A validly signed image is now consumable under `provenanceMode: required`
+  (provenance-clearance cascade).** cosign signs only the top-level digest, so
+  the per-artifact provenance gate terminally rejected every constituent of a
+  signed image — child manifests and config/layer blobs can never carry their
+  own signature — leaving a released multi-arch index unpullable (child GETs
+  404). A verified signature now cascades the provenance clearance to the
+  constituents bound by the verified content: the index's signed bytes carry
+  the child-manifest digests and each manifest's bytes carry its config/layer
+  digests, so the signature over the root covers exactly that tree. The
+  cascade is repository-scoped, applies only to held artifacts (a terminally
+  rejected constituent stays rejected), clears only the provenance gate (scan
+  and quarantine-window gates remain per-artifact), and records each cascaded
+  clearance as a `ProvenanceVerified` attributed to the root digest via
+  `cascaded_from`; the cascade append retries once on a version conflict and a
+  re-verify of a directly-cleared subject re-drives it, so re-signing heals a
+  partial cascade. A never-signed image and its constituents still reject
+  `Unsigned` at window expiry. (ADR 0039 §11, ADR 0043)
+- **`provenance_mode: Required` supports the push-then-sign CI flow.** An
+  unsigned artifact is held for its quarantine window and re-verified when the
+  cosign signature arrives; it is rejected `Unsigned` only if still unsigned at
+  window expiry (issue #13).
+- **OCI chunked blob-upload push now works (buildah / podman / skopeo).** The OCI
+  blob-upload `PATCH` and finalize `PUT` handlers hard-required a `Content-Length`
+  header and rejected its absence with `BLOB_UPLOAD_INVALID`. Clients that stream a
+  layer via HTTP `Transfer-Encoding: chunked` send no `Content-Length` (RFC 7230
+  §3.3.2 forbids it alongside chunked TE), so every such push failed
+  deterministically. `Content-Length` is now optional on both handlers: when absent
+  the body is streamed and bounded in-stream by the publish-body limit (an
+  over-limit body is rejected `SIZE_INVALID` with staging capped), and the actual
+  bytes staged are authoritative; when present the declared-length cross-check is
+  unchanged. (issues 11, 12)
+- **OCI blob-upload-session cap no longer leaks (issue 9).** The
+  per-`(repo, principal)` cap on concurrent OCI upload sessions was a
+  free-floating counter that only decremented on explicit release: an abandoned
+  upload (POST with no final PUT and no DELETE) never decremented it, and its TTL
+  refreshed on every increment, so a retry storm could pin the counter at the cap
+  and raising the cap could not clear it. The cap is now an authoritative,
+  self-pruning live-session **set**, keyed per `(format, repo, principal)` and
+  reconciled on every admit: it age-prunes members older than the session max-age
+  (catching both POST-only and PATCHed abandons), rejects at cap with no write
+  (so a rejection never refreshes the TTL — the leak is structurally gone), and
+  fails closed on CAS-loop exhaustion. Pathological write contention now surfaces
+  as a transient `503 Service Unavailable` + short `Retry-After` (never a `500`).
+  Adds the `HORT_OCI_SESSION_MAX_AGE_SECS` config knob (1..=604800 s, default
+  3600; previously a hardcoded constant), a bounded cap-exceeded `Retry-After`
+  (15 s), and the OCI-spec `DELETE /v2/<name>/blobs/uploads/<uuid>` cancel route.
+
+### Security
+
+- **`quick-xml` DoS advisories RUSTSEC-2026-0194 / -0195 accepted as a bounded
+  risk.** `quick-xml` (transitive via `object_store`) has no `object_store`-
+  compatible fixed release. It is reachable only through `object_store` parsing
+  XML from the TLS-verified, operator-configured S3/Azure backend, not the
+  artifact push/pull path. Ignored in `.cargo/audit.toml` + `deny.toml`; revisit
+  when `object_store` adopts `quick-xml >= 0.41.0`.
+
 ## [0.9.7] - 2026-06-30
 
 Headlines: ingest now commits the scan and

@@ -23,8 +23,7 @@ use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use crate::mappers::{FallbackRotationRow, FederatedIdentityRow, ServiceAccountRow};
 use crate::{map_sqlx_error, BoxFuture};
 
-const SA_SELECT_COLS: &str = "id, name, backing_user_id, role, repositories, \
-                              created_at, updated_at";
+const SA_SELECT_COLS: &str = "id, name, backing_user_id, created_at, updated_at";
 const FI_SELECT_COLS: &str = "id, service_account_id, issuer_name, claims, position";
 const FR_SELECT_COLS: &str = "service_account_id, target_namespace, target_name, format, \
      rotation_interval, validity";
@@ -195,8 +194,6 @@ impl ServiceAccountRepository for PgServiceAccountRepository {
         let id = sa.id;
         let name = sa.name.clone();
         let backing_user_id = sa.backing_user_id;
-        let role = sa.role.clone();
-        let repositories = sa.repositories.clone();
         let federated_identities = sa.federated_identities.clone();
         let fallback_rotation = sa.fallback_rotation.clone();
 
@@ -213,20 +210,16 @@ impl ServiceAccountRepository for PgServiceAccountRepository {
             // even if the caller-supplied id differs.
             let row: (Uuid,) = sqlx::query_as(
                 r#"INSERT INTO service_accounts
-                       (id, name, backing_user_id, role, repositories)
-                   VALUES ($1, $2, $3, $4, $5)
+                       (id, name, backing_user_id)
+                   VALUES ($1, $2, $3)
                    ON CONFLICT (name) DO UPDATE SET
                        backing_user_id = EXCLUDED.backing_user_id,
-                       role            = EXCLUDED.role,
-                       repositories    = EXCLUDED.repositories,
                        updated_at      = NOW()
                    RETURNING id"#,
             )
             .bind(id)
             .bind(&name)
             .bind(backing_user_id)
-            .bind(&role)
-            .bind(&repositories)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;

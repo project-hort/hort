@@ -403,6 +403,7 @@ fn make_uc_with_policy_repo_and_handlers(
         policy_projections.clone(),
         content_refs.clone(),
         storage.clone(),
+        jobs.clone(),
     ));
 
     let config = ScanOrchestrationConfig::defaults_for_worker("test-worker");
@@ -1511,6 +1512,7 @@ fn make_uc_with_lifecycle(
         policy_projections.clone(),
         content_refs.clone(),
         storage.clone(),
+        jobs.clone(),
     ));
 
     let config = ScanOrchestrationConfig::defaults_for_worker("test-worker");
@@ -2784,6 +2786,7 @@ mod metrics_emission_tests {
                 policy_projections.clone(),
                 content_refs.clone(),
                 storage.clone(),
+                jobs.clone(),
             )
             .with_include_repository_label(false),
         );

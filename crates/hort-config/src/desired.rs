@@ -1726,7 +1726,7 @@ spec:
         // global read / curate / admin_task_invoke for an SA.
         let files = vec![
             (p("repo.yaml"), repo_yaml("npm-public", "hosted", None)),
-            (p("sa.yaml"), sa_yaml("maintainer-dev", "npm-public", None)),
+            (p("sa.yaml"), sa_yaml("maintainer-dev", None)),
             (
                 p("g.yaml"),
                 pg_sa_yaml("maintainer-dev-global-read", "maintainer-dev", "read", None),
@@ -1743,10 +1743,7 @@ spec:
     fn validate_accepts_repo_scoped_service_account_curate_grant() {
         let files = vec![
             (p("repo.yaml"), repo_yaml("oci-prod", "hosted", None)),
-            (
-                p("sa.yaml"),
-                sa_yaml("maintainer-curator", "oci-prod", None),
-            ),
+            (p("sa.yaml"), sa_yaml("maintainer-curator", None)),
             (
                 p("g.yaml"),
                 pg_sa_yaml(
@@ -2262,11 +2259,12 @@ spec:
         .into_bytes()
     }
 
-    fn sa_yaml(name: &str, repo: &str, issuer: Option<&str>) -> Vec<u8> {
-        let federated = match issuer {
-            None => String::new(),
+    fn sa_yaml(name: &str, issuer: Option<&str>) -> Vec<u8> {
+        let spec = match issuer {
+            None => "spec: {}\n".to_string(),
             Some(i) => format!(
-                "  federatedIdentities:
+                "spec:
+  federatedIdentities:
     - issuer: {i}
       claims:
         repository: my-org/my-repo
@@ -2278,10 +2276,7 @@ spec:
 kind: ServiceAccount
 metadata:
   name: {name}
-spec:
-  role: developer
-  repositories: [{repo}]
-{federated}"
+{spec}"
         )
         .into_bytes()
     }
@@ -2357,7 +2352,7 @@ spec:
                 p("issuer.yaml"),
                 oidc_yaml("github-actions", "https://example.com"),
             ),
-            (p("sa.yaml"), sa_yaml("ci-pusher", "pypi-internal", None)),
+            (p("sa.yaml"), sa_yaml("ci-pusher", None)),
         ];
         let state = DesiredState::parse_files(files).unwrap();
         assert_eq!(state.oidc_issuers.len(), 1);
@@ -2384,7 +2379,7 @@ spec:
             ),
             (
                 p("sa.yaml"),
-                sa_yaml("ci-pypi-pusher", "pypi-internal", Some("github-actions")),
+                sa_yaml("ci-pypi-pusher", Some("github-actions")),
             ),
             (
                 p("grant.yaml"),
@@ -2419,8 +2414,8 @@ spec:
     #[test]
     fn validate_catches_duplicate_service_account_names() {
         let files = vec![
-            (p("a.yaml"), sa_yaml("dup", "r", None)),
-            (p("b.yaml"), sa_yaml("dup", "r", None)),
+            (p("a.yaml"), sa_yaml("dup", None)),
+            (p("b.yaml"), sa_yaml("dup", None)),
         ];
         let state = DesiredState::parse_files(files).unwrap();
         let err = state.validate().unwrap_err();

@@ -192,9 +192,48 @@ impl RbacEvaluator {
         user_leg && cap_leg
     }
 
-    /// User-grants leg of [`Self::authorize`]. Pure scan over the
+    /// Grants-leg-only authorization — the quarantine hold-exemption
+    /// evaluation basis (ADR 0039 §10).
+    ///
+    /// Evaluates the principal's *granted* authority — the admin
+    /// short-circuit (including its B1 fail-closed Pat/ServiceAccount
+    /// no-cap arm, ADR 0036) plus the subject-model grant scan — while
+    /// ignoring `principal.token_cap` entirely. This is a deliberate,
+    /// bounded exception to the ADR 0036 cap-intersection invariant:
+    /// the OCI quarantine hold exemptions key *held-visibility* on the
+    /// principal's identity-level write authority because standard OCI
+    /// clients scope a subject read as `pull`, so the presented
+    /// capability token legitimately carries a read-only cap while the
+    /// identity holds Write. The read being exempted stays fully
+    /// cap-gated through [`Self::authorize`]; only the held-visibility
+    /// decision consults this method.
+    ///
+    /// **Exemption-only surface.** The sole intended caller is
+    /// `RepositoryAccessUseCase::resolve_granted_write` (which the two
+    /// OCI hold-exemption predicates use). Every other authorization
+    /// decision goes through [`Self::authorize`] so the cap leg
+    /// composes via AND.
+    ///
+    /// The B1 backstop is preserved by construction: it lives inside
+    /// the shared grants-leg scan, so an anomalous claims-admin
+    /// Pat/ServiceAccount principal with `token_cap = None` fails
+    /// closed here exactly as it does in [`Self::authorize`] — it
+    /// cannot gain held-visibility through this side door.
+    #[must_use]
+    pub fn authorize_granted(
+        &self,
+        principal: &CallerPrincipal,
+        permission: Permission,
+        repository_id: Option<Uuid>,
+    ) -> bool {
+        self.user_grants_authorize(principal, permission, repository_id)
+    }
+
+    /// User-grants leg of [`Self::authorize`] and the whole of
+    /// [`Self::authorize_granted`]. Pure scan over the
     /// evaluator's flat grant set applying the subject
-    /// match, with the lowercase-`"admin"` claim short-circuit. Extracted
+    /// match, with the lowercase-`"admin"` claim short-circuit (and its
+    /// B1 fail-closed Pat/ServiceAccount no-cap arm). Extracted
     /// into its own method so the `authorize` body composes the user leg
     /// + cap leg uniformly via AND.
     fn user_grants_authorize(
@@ -505,6 +544,58 @@ impl RbacEvaluator {
             repository_ids: Some(repos),
         })
     }
+
+    /// Derive the unattended service-account issuance cap: the distinct
+    /// permission set of the SA's backing user's effective grants,
+    /// optionally narrowed to a requested scope.
+    ///
+    /// Both unattended issuance sites — the `/exchange` federation mint
+    /// and the fallback-rotation reconciler mint — call this, so the
+    /// issued token's `declared_permissions` cap is a snapshot of
+    /// exactly what the backing user holds at issuance. The footprint
+    /// comes from [`Self::effective_grants`] (the ONE shared
+    /// subject-match + repo-scope enumeration), so the cap cannot drift
+    /// from the request-time gate. The repository dimension is
+    /// deliberately flattened: per-repo scoping is enforced by the live
+    /// grants leg at request time, and both callers leave the cap's
+    /// `repository_ids` unset.
+    ///
+    /// - `requested_scope` empty ⇒ no narrowing: the full held set, in
+    ///   grant-enumeration order.
+    /// - `requested_scope` non-empty ⇒ the held subset of the requested
+    ///   permissions, deduped in request order — the same held-subset
+    ///   narrowing as [`Self::derive_cli_session_cap`]'s permission
+    ///   axis. The caller decides what an empty narrowed result means
+    ///   (the federation exchange denies it, mirroring the CliSession
+    ///   branch's `cap_exceeds_authority` semantics).
+    /// - A backing user with no grants yields an empty vec: the caller
+    ///   mints an empty-permissions cap that authorizes nothing —
+    ///   fail-closed by intersection at use time
+    ///   (`cap_allows_optional_repo` requires
+    ///   `cap.permissions.contains(&requested)`).
+    ///
+    /// The enumeration runs with `claims: []` and `is_admin: false`: a
+    /// service-account principal carries no claims and service accounts
+    /// are strictly non-admin, so only
+    /// [`GrantSubject::User`]`(backing_user_id)` grants — nothing
+    /// ambient — enter the cap.
+    #[must_use]
+    pub fn service_account_cap_permissions(
+        &self,
+        backing_user_id: Uuid,
+        requested_scope: &[Permission],
+    ) -> Vec<Permission> {
+        let footprint = self.effective_grants(&[], Some(backing_user_id), false);
+        let all: Vec<Permission> = footprint.cells.iter().map(|&(_, p)| p).collect();
+        let held = dedup_preserving_order(&all);
+        if requested_scope.is_empty() {
+            return held;
+        }
+        dedup_preserving_order(requested_scope)
+            .into_iter()
+            .filter(|p| held.contains(p))
+            .collect()
+    }
 }
 
 /// The distinct repository ids appearing on the per-repo cells of an
@@ -560,9 +651,11 @@ pub(crate) fn subject_matches(
 }
 
 /// De-duplicate a permission slice, preserving first-seen order. Used by
-/// the admin branch of [`RbacEvaluator::derive_cli_session_cap`] so a
-/// caller repeating a permission in the requested scope does not produce
-/// a cap with duplicate entries.
+/// the admin branch of [`RbacEvaluator::derive_cli_session_cap`] and by
+/// [`RbacEvaluator::service_account_cap_permissions`] so a caller
+/// repeating a permission in the requested scope — or a footprint holding
+/// the same permission on several repositories — does not produce a cap
+/// with duplicate entries.
 fn dedup_preserving_order(perms: &[Permission]) -> Vec<Permission> {
     let mut out: Vec<Permission> = Vec::new();
     for &p in perms {
@@ -872,6 +965,72 @@ mod tests {
         let p = principal_kind_cap(&["admin"], Some(TokenKind::Pat), Some(token_cap));
         assert!(eval.authorize(&p, Permission::Write, None));
         assert!(eval.authorize(&p, Permission::Read, Some(Uuid::new_v4())));
+    }
+
+    // -- authorize_granted: grants-leg-only exemption basis (ADR 0039 §10) --
+
+    #[test]
+    fn authorize_granted_ignores_read_only_cap_when_grants_hold_write() {
+        // The issue-#13 shape: a /v2/auth capability principal (claims
+        // empty, cap = [Read]) whose identity holds Write via a
+        // User-subject grant. `authorize` denies on the cap leg;
+        // `authorize_granted` — the hold-exemption basis — allows.
+        let uid = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(uid, Some(repo), Permission::Write)]);
+        let mut p = principal_with_cap(&[], cap(vec![Permission::Read], None));
+        p.user_id = uid;
+        assert!(!eval.authorize(&p, Permission::Write, Some(repo)));
+        assert!(eval.authorize_granted(&p, Permission::Write, Some(repo)));
+    }
+
+    #[test]
+    fn authorize_granted_still_requires_the_grant() {
+        // No Write grant anywhere → the grants leg denies, cap or not.
+        let eval = RbacEvaluator::new(vec![claims_grant(&["reader"], None, Permission::Read)]);
+        let p = principal_with_cap(&["reader"], cap(vec![Permission::Read], None));
+        assert!(!eval.authorize_granted(&p, Permission::Write, Some(Uuid::new_v4())));
+        // The held grant still authorizes its own permission.
+        assert!(eval.authorize_granted(&p, Permission::Read, None));
+    }
+
+    #[test]
+    fn authorize_granted_respects_repository_scoping() {
+        let uid = Uuid::new_v4();
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(uid, Some(repo_a), Permission::Write)]);
+        let p = principal_with_id(uid, &[]);
+        assert!(eval.authorize_granted(&p, Permission::Write, Some(repo_a)));
+        assert!(!eval.authorize_granted(&p, Permission::Write, Some(repo_b)));
+        assert!(!eval.authorize_granted(&p, Permission::Write, None));
+    }
+
+    #[test]
+    fn authorize_granted_b1_admin_claim_pat_or_sa_with_none_cap_fails_closed() {
+        // The B1 backstop lives inside the shared grants leg, so the
+        // grants-only variant fails closed identically: an anomalous
+        // claims-admin Pat/ServiceAccount principal without a cap gains
+        // no authority — and therefore no held-visibility — here.
+        let eval = RbacEvaluator::new(Vec::new());
+        for kind in [TokenKind::Pat, TokenKind::ServiceAccount] {
+            let p = principal_kind_cap(&["admin"], Some(kind), None);
+            assert!(
+                !eval.authorize_granted(&p, Permission::Write, Some(Uuid::new_v4())),
+                "claims-admin {kind:?} with None cap must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn authorize_granted_admin_claim_oidc_and_cli_session_short_circuit() {
+        // OIDC (token_kind None) and CliSession admins legitimately
+        // carry a `None` cap — the admin short-circuit grants.
+        let eval = RbacEvaluator::new(Vec::new());
+        let oidc = principal_kind_cap(&["admin"], None, None);
+        assert!(eval.authorize_granted(&oidc, Permission::Write, Some(Uuid::new_v4())));
+        let cli = principal_kind_cap(&["admin"], Some(TokenKind::CliSession), None);
+        assert!(eval.authorize_granted(&cli, Permission::Write, None));
     }
 
     // -- authorize: GrantSubject::Claims arm -------------------------------
@@ -1687,6 +1846,93 @@ mod tests {
             .expect("user-subject grantee derives a cap");
         assert_eq!(cap.permissions, vec![Permission::Write]);
         assert_eq!(cap.repository_ids, Some(vec![repo]));
+    }
+
+    // -- service_account_cap_permissions --------------------------------------
+    //
+    // The unattended-issuance cap snapshot: distinct permission set of the
+    // backing user's grants (repo dimension flattened), ∩ the requested
+    // scope when one is supplied. Shared by the `/exchange` federation
+    // mint and the fallback-rotation mint.
+
+    #[test]
+    fn sa_cap_flattens_repo_dimension_and_dedups() {
+        // Read held on two repos + Write held globally → the flat cap is
+        // the distinct permission set in grant-enumeration order.
+        let uid = Uuid::new_v4();
+        let (repo_a, repo_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let eval = RbacEvaluator::new(vec![
+            user_grant(uid, Some(repo_a), Permission::Read),
+            user_grant(uid, None, Permission::Write),
+            user_grant(uid, Some(repo_b), Permission::Read),
+        ]);
+        assert_eq!(
+            eval.service_account_cap_permissions(uid, &[]),
+            vec![Permission::Read, Permission::Write],
+        );
+    }
+
+    #[test]
+    fn sa_cap_zero_grant_backing_user_yields_empty() {
+        // Fail-closed by intersection: the caller mints an
+        // empty-permissions cap that authorizes nothing.
+        let eval = RbacEvaluator::new(vec![user_grant(Uuid::new_v4(), None, Permission::Write)]);
+        assert!(eval
+            .service_account_cap_permissions(Uuid::new_v4(), &[])
+            .is_empty());
+    }
+
+    #[test]
+    fn sa_cap_scope_narrows_to_held_subset_in_request_order() {
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![
+            user_grant(uid, None, Permission::Read),
+            user_grant(uid, None, Permission::Write),
+        ]);
+        // Requested order wins; the unheld `Delete` is dropped; the
+        // repeated `Read` is deduped.
+        assert_eq!(
+            eval.service_account_cap_permissions(
+                uid,
+                &[
+                    Permission::Write,
+                    Permission::Delete,
+                    Permission::Read,
+                    Permission::Read,
+                ],
+            ),
+            vec![Permission::Write, Permission::Read],
+        );
+    }
+
+    #[test]
+    fn sa_cap_scope_with_no_held_permission_yields_empty() {
+        // The caller decides what an empty narrowed result means (the
+        // federation exchange denies it); the derivation itself only
+        // reports the intersection.
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(uid, None, Permission::Read)]);
+        assert!(eval
+            .service_account_cap_permissions(uid, &[Permission::Write])
+            .is_empty());
+    }
+
+    #[test]
+    fn sa_cap_ignores_claims_grants_and_admin_ambient() {
+        // The enumeration runs with `claims: []`, `is_admin: false`: a
+        // claims-subject grant never enters the cap, and there is no
+        // admin short-circuit — only `User(backing_user_id)` grants
+        // count.
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![
+            claims_grant(&["developer"], None, Permission::Write),
+            claims_grant(&["admin"], None, Permission::Delete),
+            user_grant(uid, None, Permission::Read),
+        ]);
+        assert_eq!(
+            eval.service_account_cap_permissions(uid, &[]),
+            vec![Permission::Read],
+        );
     }
 
     // -- effective_grants ----------------------------------------------------

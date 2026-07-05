@@ -29,9 +29,10 @@ verifiers slot in as additional `provenance_backends` entries behind the same
 
 The excluded class is the **sovereign, internal-audience operator who signs
 first-party artifacts with a long-lived key** (`cosign sign --key`, the
-`simplesigning` shape — the live signer here additionally uses
-`--registry-referrers-mode=legacy`). For that operator the keyless path is not
-merely inconvenient, it is unreachable:
+`simplesigning` shape). Hosted keyed signing on Hort **requires OCI referrers
+mode** (`cosign sign --registry-referrers-mode=oci-1-1`); see §9 — the canary
+signer must use `oci-1-1`, **not** `--registry-referrers-mode=legacy`. For that
+operator the keyless path is not merely inconvenient, it is unreachable:
 
 1. **No public Fulcio will issue for the signing identity.** Public Fulcio
    trusts a fixed set of OIDC issuers; a self-hosted GitLab is not one. The
@@ -184,36 +185,210 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    eventually — **not a current blocker** (the immediate first-party surface is
    OCI images).
 
-8. **Carriage: the legacy `.sig` needs a simplesigning-aware path (the original
-   "no carriage work" framing was wrong).** `hort_domain::oci` defines only
-   `SIGSTORE_BUNDLE_MEDIA_TYPE` (`application/vnd.dev.sigstore.bundle.v0.3+json`)
-   and `sigstore_bundle_layers` keeps *only* layers of that media type, so the
-   three carriage sites — `fetch_bundles_once`, `land_one_referrer`, and
-   `fetch_and_land_upstream_referrers` (`provenance_orchestration.rs`) —
-   **discover but then drop** a legacy cosign `simplesigning` `.sig` (layer media
-   type `application/vnd.dev.cosign.simplesigning.v1+json`; signature in the layer
-   annotation `dev.cosignproject.cosign/signature`). With the carriage unchanged a
-   `cosign-key` verifier receives an empty bundle set → always `NoAttestation`
-   (dead code). The keyed path therefore adds, in `hort-domain` + `hort-app`:
-   - a simplesigning media-type constant + a `simplesigning_signature_layers`
-     helper in `hort_domain::oci` returning, per signature layer, the **payload
-     layer digest** and the **`dev.cosignproject.cosign/signature` annotation**
-     (the base64 signature); and
-   - a keyed branch at the three carriage sites that collects/lands the
-     simplesigning referrer (payload blob + manifest) alongside the bundle path.
+8. **The keyed carriage covers TWO shapes: the legacy `simplesigning` `.sig`
+   AND the cosign v3 keyed Sigstore v0.3 bundle.** The keyed backend consumes
+   both carriages a keyed `cosign sign --key` can emit; the earlier "keyed ⟺
+   simplesigning" framing held only for cosign v2 / `--registry-referrers-mode=legacy`:
+
+   - **Legacy `simplesigning`** (layer media type
+     `application/vnd.dev.cosign.simplesigning.v1+json`; signature in the layer
+     annotation `dev.cosignproject.cosign/signature`). `hort_domain::oci`'s
+     `sigstore_bundle_layers` keeps *only* `SIGSTORE_BUNDLE_MEDIA_TYPE` layers,
+     so the three carriage sites — `fetch_bundles_once`, `land_one_referrer`,
+     `fetch_and_land_upstream_referrers` (`provenance_orchestration.rs`) —
+     would otherwise **drop** this `.sig`. The keyed path adds a
+     `simplesigning_signature_layers` helper + media-type constant returning,
+     per signature layer, the **payload layer digest** + the base64
+     **`dev.cosignproject.cosign/signature` annotation**, and a keyed branch at
+     the three sites that collects/lands the simplesigning referrer.
+
+   - **cosign v3 keyed Sigstore v0.3 bundle** — the shape
+     `cosign sign --key --registry-referrers-mode=oci-1-1` actually emits (cosign
+     v3, the ADR §9-required mode). It is a v0.3 bundle referrer
+     (`artifactType = application/vnd.dev.sigstore.bundle.v0.3+json`, layer media
+     type the same) carrying a **DSSE envelope** over an in-toto Statement — the
+     *same wire shape* as a keyless bundle. It is already collected by the
+     existing `sigstore_bundle_layers` bundle path; the keyed/keyless split is
+     the bundle's `verificationMaterial`: **keyed = a bare `publicKey` (no Fulcio
+     cert); keyless = a `certificate` / `x509CertificateChain`.** A pure
+     `hort_domain::provenance_bundle::extract_keyed_dsse_signature` helper parses
+     the bundle bytes and, iff keyed (no cert), returns the DSSE **PAE** signing
+     input (`DSSEv1 SP len(type) SP type SP len(payload) SP payload` — the
+     signature is over the PAE, **not** the raw payload), the raw signature, and
+     the in-toto `subject[].digest.sha256` to bind. The orchestrator's
+     `build_bundle` routes a keyed bundle as `signature = Some(raw DSSE sig)`
+     (the keyed verifier's) and a keyless one as `signature = None`
+     (the Sigstore verifier's, byte-for-byte unchanged).
 
    **`AttestationBundle` gains one optional field (option b):** the verifier lives
    in an adapter with **no `StoragePort`**, so it cannot read the payload layer
    itself — the orchestrator must hand it both halves. `AttestationBundle` becomes
-   `{ bytes, signature: Option<Vec<u8>> }`: for a keyless v0.3 bundle `signature =
-   None` and `bytes` is the bundle blob (unchanged); for a keyed `.sig` the
-   orchestrator reads the simplesigning **payload layer blob** into `bytes` and the
-   **annotation** into `signature`. The keyed verifier requires `signature.is_some()`,
-   verifies it over `bytes` against the pinned key, and binds
-   `bytes.critical.image.docker-manifest-digest == "sha256:" + subject.content_hash`;
-   the keyless verifier ignores `signature` and parses `bytes` as a v0.3 bundle (a
-   simplesigning `bytes` is not one → `NoAttestation`). One bundle list thus carries
-   both shapes and each verifier self-selects (§6).
+   `{ bytes, signature: Option<Vec<u8>> }`. For a **keyed simplesigning** `.sig`
+   the orchestrator reads the simplesigning payload-layer blob into `bytes` and the
+   decoded annotation into `signature`, and the keyed verifier binds
+   `bytes.critical.image.docker-manifest-digest`. For a **keyed v0.3 bundle**
+   `bytes` is the bundle blob and `signature` is the raw DSSE signature, and the
+   keyed verifier re-derives the DSSE PAE + in-toto subject digest from `bytes`.
+   For a **keyless v0.3 bundle** `signature = None` and `bytes` is the bundle blob
+   (unchanged). The keyed verifier requires `signature.is_some()` and self-selects
+   on the `bytes` shape (a v0.3 bundle → DSSE PAE path; else → simplesigning
+   payload path); the keyless verifier ignores `signature` and parses `bytes` as a
+   v0.3 bundle. One bundle list thus carries every shape and each verifier
+   self-selects (§6).
+
+9. **Keyed hosted signing requires OCI referrers mode.** The keyed carriage
+   (§8) collects a keyed signature from a subject-linked **referrer** manifest —
+   the `oci_subject` content-reference row that push writes
+   (`crates/hort-http-oci/src/manifests_write.rs`) is what binds the signature to
+   the image the verifier is judging, and what S3's signature-arrival re-verify
+   (ADR 0027 amendment) resolves. Under `--registry-referrers-mode=oci-1-1`,
+   cosign v3 emits a keyed **Sigstore v0.3 bundle** referrer (a DSSE envelope
+   whose `verificationMaterial` is a bare `publicKey`), **not** a legacy
+   `simplesigning` layer — the keyed backend consumes that bundle shape too (§8).
+   The legacy cosign
+   `sha256-<hex>.sig` **tag scheme** is honored only on the **upstream-proxy
+   fetch** path (`UpstreamProxy::fetch_referrers`'s tag-scheme fallback, ADR
+   0027 §8 / `provenance_orchestration.rs`), **not** on the hosted push path: a
+   signature pushed to a `sha256-<hex>.sig` tag carries no `subject` and so is
+   never subject-linked into local carriage, stays invisible to the verifier,
+   and — under `provenance_mode: Required` with the hold-until-signed amendment
+   — the subject image is never cleared and rejects `Unsigned` at window expiry.
+   Therefore **first-party hosted keyed signing MUST use
+   `cosign sign --registry-referrers-mode=oci-1-1`** (subject-based referrers,
+   already handled by carriage), and the enablement how-to states this. Legacy
+   tag-scheme support on the hosted push path is deliberately **not built**
+   (recorded operator intent: if it is ever needed, it is a follow-on that
+   mirrors the proxy-side tag-scheme fallback onto push — `manifests_write`
+   recognition + `oci_subject` linkage — not part of this decision). The canary
+   / test signer must accordingly use `--registry-referrers-mode=oci-1-1`, not
+   `legacy`. This is the one operator-facing behaviour change; it is a
+   documentation requirement, not new code (the OCI-referrers path was already
+   the supported carriage).
+
+10. **The hold-read exemption covers a write-authorized manifest HEAD *and*
+    GET, and it keys on the principal's *granted* write authority.** Under
+    `provenance_mode: Required` the subject image is held
+    `Quarantined` (ADR 0027 hold-until-signed amendment) until a signature
+    arrives, so the signer needs a way to resolve the subject *before* the
+    manifest is released. Keyed `cosign sign` resolves the subject manifest by a
+    `GET manifests/<digest>`, not only a `HEAD`, before it attaches the
+    signature — so the manifest hold exemption in `crates/hort-http-oci/src/
+    manifests.rs` (`serve`, `write_authorized_hold_read`) covers a
+    write-authorized manifest **HEAD and GET**. A manifest is a routing document
+    (config + layer digests), not runnable content; the layer blobs are the real
+    bytes, and `crates/hort-http-oci/src/blobs.rs` keeps its existence probe
+    **HEAD-only**, so a held layer's bytes are never served and the image cannot
+    be pulled or run while held. The exemption is `Write`-only: every read
+    caller whose identity lacks the Write grant (non-writer / anonymous / proxy
+    read scope) and every layer blob stay 503, so no runnable content leaves
+    quarantine (only the metadata manifest, only to a write-granted principal)
+    and the transparent-proxy contract (quarantine invariant #5) is untouched.
+
+    **"Write-authorized" means granted write authority — the grants leg alone,
+    not the presented token's cap.** Standard OCI clients
+    (cosign / go-containerregistry, skopeo, docker) scope a subject read as
+    `pull` — spec-correct, least-privilege — so under native tokens
+    (ADR 0036) the capability JWT presented on the subject read synthesizes a
+    read-only cap even when the principal's grants carry Write. A hold
+    exemption keyed on the full cap-intersected `Write` resolve therefore
+    never engages for a correctly-behaving signer: the held-manifest GET 503s,
+    `cosign sign` aborts, and the artifact expires `Rejected{Unsigned}`. The
+    two exemption sites — the held-manifest HEAD/GET predicate in
+    `manifests.rs` and the held-blob HEAD existence probe in `blobs.rs` —
+    evaluate `RepositoryAccessUseCase::resolve_granted_write`, which runs
+    `RbacEvaluator::authorize_granted` (the grants leg only, including the B1
+    fail-closed admin-claim/no-cap arm) instead of the grants ∧ cap
+    `authorize`. The read being exempted stays fully cap-gated: a pull-scoped
+    token satisfies the ordinary `resolve(Read)` path normally; only the
+    *held-visibility* decision consults identity-level authority.
+
+    **Bounded ADR 0036 exception + blast radius.** This is a deliberate,
+    narrow exception to the ADR 0036 cap-intersection invariant, bounded to
+    exactly these two exemption sites; every other authorization decision
+    keeps the two-leg AND. Blast radius of the exception: a stolen pull-scoped
+    token of a write-granted principal can read *held manifests* (and observe
+    held-blob existence) in repositories that principal can write —
+    metadata-only, principal-bound, layer bytes still gated. The same stolen
+    token could not push, and a stolen token of a non-writer gains nothing.
+
+11. **A verified subject's clearance cascades to its signed constituents.**
+    cosign signs only the **top-level digest** — the index for a multi-arch
+    image, the manifest for a single-arch one. Under `provenance_mode:
+    Required` the per-artifact gate alone therefore structurally rejects
+    every constituent of a validly signed image: the subject verifies and
+    releases, but its child manifests and config/layer blobs can never carry
+    a signature of their own and terminally reject `Unsigned` at window
+    expiry, leaving the released index unpullable (each child GET → 404).
+
+    **Cryptographic justification.** The signed top-level digest binds the
+    whole tree: an index's `manifests[]` child digests are inside the signed
+    index bytes, and each manifest's `config`/`layers[]` digests are inside
+    that manifest's bytes — a Merkle-like chain, so the signature over the
+    root digest covers the exact bytes of every constituent. Clearing the
+    constituents on the subject's `Verified` verdict extends the *same*
+    attestation to the *same* bytes; it widens no trust.
+
+    **Mechanism.** When the orchestrator's folded verdict is `Verified`
+    under `Required`, it derives the constituent set **from the verified
+    subject's CAS bytes** (`is_image_index` → `index_child_digests`, then
+    per child manifest read back from CAS — and for a single-image subject,
+    the subject bytes themselves — `manifest_blob_digests` for the
+    `config` + `layers[]` digests), resolves each digest to an artifact row
+    **in the same repository**, and appends a `ProvenanceVerified` to each
+    held constituent's stream via the domain's
+    `Artifact::cascade_provenance_clearance` + the same
+    `commit_transition` the subject's own clearance uses. The event carries
+    the subject's verified `signer` and a `cascaded_from: <root digest>`
+    field, so the audit trail reads "cleared via signature over `<root>`"
+    and a cascaded clearance is always distinguishable from a direct one.
+
+    **Fail-closed edges (all load-bearing):**
+    - The set derives from the **signed CAS bytes only** — never from
+      `content_references` / `oci_index_member` DB edges or the name-keyed
+      group model, which are broader and mutable; deriving from them would
+      cascade clearance to content the signature does not cover.
+    - **Same repository only** (`find_by_repo_and_checksum`); a same-digest
+      artifact in another repo is never touched.
+    - **Held (`Quarantined`) constituents only.** A terminally rejected or
+      scan-indeterminate constituent stays terminal (the operator
+      re-pushes); `Released`/status-`None` rows need no clearance. The
+      domain guard refuses every non-`Quarantined` state.
+    - **Only the provenance authority cascades.** The constituent stays
+      held: its own scan success / waiver and the observation window still
+      gate its release per-artifact (ADR 0007's fail-closed predicate,
+      ADR 0043's layer-level-safety model are unchanged).
+    - **Bounded** by the existing parse caps (`MAX_INDEX_CHILDREN`,
+      `MAX_MANIFEST_BLOBS` mirroring the write path's
+      `MAX_BLOB_REFERENCES`); a subject whose bytes fail to parse cascades
+      to nothing (warn), and no cascade failure can retract or block the
+      subject's own already-committed clearance (best-effort, warn +
+      continue per constituent).
+    - **One level of index nesting.** The cascade walks exactly one level:
+      index → child manifests → their `config`/`layers` blobs. A child that
+      is itself an index contributes only its own digest — its children are
+      never read — so grandchildren of an index-of-indexes remain
+      provenance-gated and terminally reject under `Required` (fail-closed;
+      such nesting is not supported for pull under `Required` today).
+    - **Idempotent**: a constituent already carrying a `ProvenanceVerified`
+      takes no duplicate. A per-constituent append that loses a version
+      race (a concurrent event on the constituent's stream) retries once
+      with a fresh read before falling back to warn + skip.
+
+    **The already-cleared verify no-op.** A cleared artifact — most
+    importantly a cascade-cleared constituent whose S4 expiry-backstop
+    verify was enqueued while it was still `Pending` — has no referrer
+    surface of its own, so a window-closed re-verify would re-judge it to
+    `Rejected{Unsigned}`. The orchestrator therefore skips the verify
+    (`SkippedAlreadyCleared`, `result_summary: skipped:already_cleared`)
+    whenever a `Required`-mode artifact's stream already carries a
+    `ProvenanceVerified`. When the stored clearance is a **direct**
+    verification (`cascaded_from: None` — the artifact is a signed
+    subject), the skip first re-drives the idempotent cascade with the
+    stored event's signer, so re-signing heals a constituent whose
+    cascaded append was lost; a cascaded clearance never re-walks bytes.
+    The never-signed path is unchanged: an unsigned
+    root cascades nothing, and it and its constituents reject `Unsigned` at
+    expiry exactly as before.
 
 ## Consequences
 
@@ -242,12 +417,27 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
 - Two cross-cutting edits, not one. (1) The apply-linter: per-backend
   identity-requirement checks in **both** directions (require a key for keyed;
   reject inert identities on keyed) — a tightening, not a relaxation (every
-  previously-rejected config still rejects). (2) The simplesigning carriage (§8):
-  `AttestationBundle` gains an optional `signature` field and the three referrer
-  sites stop filtering the legacy `.sig` out — additive (the keyless v0.3 path is
+  previously-rejected config still rejects). (2) The keyed carriage (§8):
+  `AttestationBundle` gains an optional `signature` field, the three referrer
+  sites collect the legacy `simplesigning` `.sig`, and `build_bundle` routes a
+  keyed cosign v3 Sigstore v0.3 bundle (bare `publicKey`, no Fulcio cert) to the
+  keyed verifier `signature`-populated — additive (the keyless v0.3 path is
   byte-for-byte unchanged: `signature = None`, same `bytes`).
 - The `backend` metric label gains the `cosign-key` value (catalog update in
   the implementing PR — §5).
+- Under `provenance_mode: Required` a validly signed multi-arch image is
+  actually consumable end to end: the signature over the index digest clears
+  the index **and** — via the §11 cascade — its child manifests and
+  config/layer blobs, each still gated by its own scan + window. The cascaded
+  clearances are individually audited (`ProvenanceVerified` with
+  `cascaded_from: <root digest>` per constituent), and a terminally rejected
+  constituent is never resurrected by a later signature.
+- Hosted keyed signing has one operator requirement: sign with
+  `--registry-referrers-mode=oci-1-1` (§9). A legacy `sha256-<hex>.sig`-tagged
+  signature pushed to Hort is not subject-linked and stays invisible to the
+  verifier — under `Required` (with the ADR 0027 hold-until-signed amendment)
+  the image then rejects `Unsigned` at window expiry. The legacy tag scheme
+  remains honored only on the upstream-proxy fetch path.
 
 ## Alternatives considered
 
@@ -295,6 +485,11 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
 - `crates/hort-adapters-provenance-sigstore/src/{verifier.rs,lib.rs}` — the
   subject-digest binding (`## Digest binding`, the `sha256(payload) ==
   content_hash` invariant) the keyed verifier mirrors for step 2.2.
+- `crates/hort-domain/src/provenance_bundle.rs` —
+  `extract_keyed_dsse_signature`, the pure zero-I/O helper that parses a cosign
+  v3 keyed Sigstore v0.3 bundle (bare `publicKey`, DSSE envelope) into the PAE
+  signing input + raw signature + in-toto subject digest (§8), and the
+  keyed/keyless discriminator (no Fulcio cert ⟺ keyed).
 - `crates/hort-app/src/use_cases/apply_config_use_case.rs` — the backend→format
   capability map (Tier-1 `{"oci"}` for cosign) and the fail-closed config lints
   to make backend-aware.
@@ -302,5 +497,8 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
   single-verifier `applicable[0]` selection, the `backend` metric label, and the
   verdict fold this ADR makes the first multi-verifier user of.
 - `crates/hort-domain/src/entities/artifact.rs` — `ProvenanceClearance` /
-  `complete_provenance` / the release timer-arm AND-precondition, reused
-  unchanged.
+  `complete_provenance` (now window-aware — ADR 0027 hold-until-signed
+  amendment) / the release timer-arm AND-precondition, reused unchanged.
+- `crates/hort-http-oci/src/manifests_write.rs` — the `oci_subject`
+  content-reference row that subject-links a pushed referrer (why §9 requires
+  `--registry-referrers-mode=oci-1-1` for hosted keyed signing).

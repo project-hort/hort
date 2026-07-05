@@ -817,11 +817,24 @@ fn derive_oci_token_endpoint_strings(
     public_base_url: Option<&url::Url>,
 ) -> Result<(String, String), ConfigError> {
     let url = public_base_url.ok_or(ConfigError::OciPublicBaseUrlMissing)?;
-    let host_str = url
+    let host = url
         .host_str()
         .filter(|s| !s.is_empty())
-        .ok_or(ConfigError::OciPublicBaseUrlMissing)?
-        .to_string();
+        .ok_or(ConfigError::OciPublicBaseUrlMissing)?;
+    // The audience keeps a non-default port (`host:port`): OCI clients
+    // echo the `service=` value from the `WWW-Authenticate` challenge
+    // VERBATIM, and the challenge derives its `service=` from the same
+    // public URL with the port intact (`hort-http-oci`'s `host_of`).
+    // The mint-side Step-0 gate compares the echoed value against this
+    // audience, so the two derivations must agree — a ported public URL
+    // (e.g. `http://hort-server:8080`) otherwise 400s every
+    // client-driven token exchange. `url.port()` is `None` for the
+    // scheme-default port, which the URL serialisation also drops, so
+    // portless and default-port URLs keep the bare-hostname audience.
+    let host_str = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
     let trimmed = url.as_str().trim_end_matches('/');
     let issuer = format!("{trimmed}/v2/auth");
     Ok((issuer, host_str))
@@ -1445,6 +1458,14 @@ pub async fn build_app_context(
     // `commit_scan_result_with_score` SQL transaction; hort-server
     // itself does not need a separate `ScanFindingsRepository`
     // handle.
+    // The `jobs` table adapter is needed earlier
+    // than its later use site (`TaskUseCase`) because `IngestUseCase`
+    // calls `enqueue_scan` on it for the ingest-time scan auto-enqueue
+    // (when a `ScanPolicy` matches the inbound repository), and
+    // `QuarantineUseCase::release_expired` uses it for the S4 provenance
+    // expiry backstop. Single Arc shared with `IngestUseCase` +
+    // `TaskUseCase` + `ManualRescanUseCase` below.
+    let jobs_repo = Arc::new(PgJobsRepository::new(db.clone()));
     let quarantine_use_case = Arc::new(
         QuarantineUseCase::new(
             artifact_repo.clone(),
@@ -1458,6 +1479,10 @@ pub async fn build_app_context(
             // use case writes through; both observe the same projection.
             content_references.clone(),
             storage.clone(),
+            // S4 provenance expiry backstop: `release_expired` enqueues a
+            // final `provenance-verify` for Required + Pending + expired
+            // candidates via this handle.
+            jobs_repo.clone(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`record_scan_result` Reject-branch
@@ -1480,12 +1505,6 @@ pub async fn build_app_context(
         artifact_group_lifecycle.clone(),
         include_repository_label,
     ));
-    // The `jobs` table adapter is needed earlier
-    // than its later use site (`TaskUseCase`) because `IngestUseCase`
-    // calls `enqueue_scan` on it for the ingest-time scan auto-enqueue
-    // (when a `ScanPolicy` matches the inbound repository). Single
-    // Arc shared with `TaskUseCase` + `ManualRescanUseCase` below.
-    let jobs_repo = Arc::new(PgJobsRepository::new(db.clone()));
     let ingest_use_case = Arc::new(
         IngestUseCase::new(
             storage.clone(),
@@ -3785,15 +3804,28 @@ mod tests {
     }
 
     /// HTTP scheme is accepted (operator may run behind a TLS-terminating
-    /// proxy with `http://internal-host` as the canonical URL).
+    /// proxy with `http://internal-host` as the canonical URL). A
+    /// non-default port stays in the audience: clients echo the
+    /// challenge's `service=` verbatim, and the challenge (`host_of` in
+    /// `hort-http-oci`) derives it from the same URL with the port
+    /// intact — the mint-side gate must expect the identical value.
     #[test]
     fn derive_oci_token_endpoint_strings_accepts_http_scheme() {
         let url: url::Url = "http://internal-host:8080".parse().unwrap();
         let (issuer, aud) = derive_oci_token_endpoint_strings(Some(&url)).expect("ok");
         assert_eq!(issuer, "http://internal-host:8080/v2/auth");
-        // `host_str` strips the port, which is the spec-correct shape:
-        // OCI clients echo `service=<hostname>`, never `service=<hostname:port>`.
-        assert_eq!(aud, "internal-host");
+        assert_eq!(aud, "internal-host:8080");
+    }
+
+    /// A scheme-default port is normalised away by the URL type and the
+    /// audience stays the bare hostname — matching the challenge side,
+    /// whose serialised URL drops the default port too.
+    #[test]
+    fn derive_oci_token_endpoint_strings_default_port_keeps_bare_hostname() {
+        let url: url::Url = "https://hort.example.com:443".parse().unwrap();
+        let (issuer, aud) = derive_oci_token_endpoint_strings(Some(&url)).expect("ok");
+        assert_eq!(issuer, "https://hort.example.com/v2/auth");
+        assert_eq!(aud, "hort.example.com");
     }
 
     /// **Boot-fail trigger.** `public_base_url = None` MUST surface

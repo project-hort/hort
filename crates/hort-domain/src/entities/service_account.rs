@@ -152,6 +152,11 @@ pub struct FallbackRotation {
 
 /// A non-human identity (ADR 0018 + `docs/auth-catalog.md`).
 ///
+/// Identity + federation binding only — the aggregate carries no
+/// authority. Authority comes exclusively from explicit
+/// `PermissionGrant` rows targeting the backing user
+/// (`GrantSubject::User(backing_user_id)`, ADR 0037).
+///
 /// Construction is restricted to the adapter row mapper and the apply
 /// use case — see the module-level invariants on `Deserialize`.
 ///
@@ -162,11 +167,6 @@ pub struct FallbackRotation {
 ///   `is_service_account = true`. Authz evaluation flows through the
 ///   same `RbacEvaluator::authorize` path as human users — the SA's
 ///   grants are regular `permission_grants` rows.
-/// - `role` constrained to {`developer`, `reader`} at apply time.
-///   Admin SAs are forbidden by design — admin authority is reserved
-///   for short-lived interactive sessions (ADR 0013).
-/// - `repositories` is the per-repo grant scope. Non-empty at apply
-///   time — no global service-account grants.
 /// - `federated_identities` and `fallback_rotation` are optional and
 ///   independent. The "neither" case is a PAT-only SA an operator
 ///   manages with `hort-cli admin token issue`.
@@ -186,8 +186,6 @@ pub struct ServiceAccount {
     /// writer) is documented here so a future caller doesn't reach for
     /// a side door.
     pub backing_user_id: Uuid,
-    pub role: String,
-    pub repositories: Vec<String>,
     pub federated_identities: Vec<FederatedIdentity>,
     pub fallback_rotation: Option<FallbackRotation>,
     pub created_at: DateTime<Utc>,
@@ -333,8 +331,6 @@ mod tests {
             id: Uuid::nil(),
             name: "ci-pypi-pusher".into(),
             backing_user_id: Uuid::from_u128(1),
-            role: "developer".into(),
-            repositories: vec!["pypi-internal".into()],
             federated_identities: vec![sample_federated()],
             fallback_rotation: Some(sample_rotation()),
             created_at: Utc::now(),

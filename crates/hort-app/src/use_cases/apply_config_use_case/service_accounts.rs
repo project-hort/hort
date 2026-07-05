@@ -12,15 +12,14 @@ impl ApplyConfigUseCase {
     ///    federated_identities + fallback_rotation) and calls
     ///    `service_accounts.upsert`, which runs the whole shape in a
     ///    single transaction.
-    /// 3. Manages the role/repo grants — one `permission_grants` row
-    ///    per `(role, repo)` pair (Permission::Write is the read+write
-    ///    surface for developer SAs; reader SAs get Permission::Read).
-    ///    Idempotent: re-applying the same SA does not produce
-    ///    duplicate grant rows because each grant is upserted by
-    ///    `(role_id, repository_id, permission)` triple.
     ///
-    /// Delete path: removes the SA aggregate (CASCADE drops sub-rows)
-    /// and the permission grants. The backing `users` row stays.
+    /// The aggregate is identity + federation binding only — this pass
+    /// materialises no permission grants. SA authority is declared as
+    /// explicit `serviceAccount`-subject `PermissionGrant` envelopes
+    /// and reconciled by `apply_permission_grants` (ADR 0037).
+    ///
+    /// Delete path: removes the SA aggregate (CASCADE drops sub-rows).
+    /// The backing `users` row stays.
     pub(super) async fn apply_service_accounts(
         &self,
         plan: &KindPlan<ServiceAccountSpec, String>,
@@ -239,8 +238,6 @@ fn build_service_account_from_spec(
         id,
         name: env.metadata.name.clone(),
         backing_user_id,
-        role: spec.role.clone(),
-        repositories: spec.repositories.clone(),
         federated_identities,
         fallback_rotation,
         created_at: Utc::now(),
@@ -263,17 +260,10 @@ mod tests {
     #[tokio::test]
     async fn apply_service_account_creates_backing_user_and_sa_row() {
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "pypi-internal".into(),
-            ..sample_repository_for_test("pypi-internal")
-        });
         let mut desired = DesiredState::default();
-        desired.service_accounts.push(service_account_env_for_apply(
-            "ci-pypi-pusher",
-            &["pypi-internal"],
-            None,
-        ));
+        desired
+            .service_accounts
+            .push(service_account_env_for_apply("ci-pypi-pusher", None));
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
         assert_eq!(report.created, 1, "exactly one SA created");
         // Backing user exists.
@@ -291,15 +281,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_service_account_reapply_is_idempotent_no_duplicate_user_or_grants() {
+    async fn apply_service_account_reapply_is_idempotent_and_materialises_no_grants() {
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "pypi-internal".into(),
-            ..sample_repository_for_test("pypi-internal")
-        });
 
-        let env = service_account_env_for_apply("ci-pypi-pusher", &["pypi-internal"], None);
+        let env = service_account_env_for_apply("ci-pypi-pusher", None);
         let mut desired_a = DesiredState::default();
         desired_a.service_accounts.push(env.clone());
         h.uc.apply(desired_a, env_oidc()).await.unwrap();
@@ -308,8 +293,8 @@ mod tests {
         desired_b.service_accounts.push(env);
         h.uc.apply(desired_b, env_oidc()).await.unwrap();
 
-        // Exactly one backing user, exactly one SA row, exactly one
-        // permission grant — re-applying must not duplicate any of them.
+        // Exactly one backing user and one SA row — re-applying must
+        // not duplicate either.
         let users_page = h.users.list(PageRequest::new(0, 100)).await.unwrap();
         let sa_users: Vec<_> = users_page
             .items
@@ -318,94 +303,14 @@ mod tests {
             .collect();
         assert_eq!(sa_users.len(), 1, "exactly one SA backing user");
         assert_eq!(h.service_accounts.snapshot().len(), 1, "exactly one SA row");
-        // SA authority is a `GrantSubject::User(backing
-        // _user_id)` grant materialised through the consolidated
-        // whole-partition `permission_grants.save_managed` reconcile.
-        // Re-applying the identical SA env must not duplicate the
-        // grant — the User-subject diff key
-        // `(user_id, repository_id, permission)` makes the replay a
-        // no-op, so exactly one managed grant survives.
+        // The envelope is identity + federation binding only: with no
+        // `PermissionGrant` envelopes in the desired set, the managed
+        // grant partition stays empty — no authority is materialised
+        // from the SA declaration itself.
         let managed = h.grant_repo.managed_snapshot();
-        assert_eq!(managed.len(), 1, "exactly one SA-owned grant after reapply");
-        assert_eq!(managed[0].subject, GrantSubject::User(sa_users[0].id));
-    }
-
-    /// Closure proof — replay the operator's rc.20 bundle
-    /// (`glci-supply-chain-security` SA + `developer` claim grants
-    /// covered by a `singleClaimAllowlist: [developer]` lint config +
-    /// `gitlab-kdp` OidcIssuer) and assert the SA-derived User-subject
-    /// grant lands in the managed partition. The operator's "no
-    /// User-subject grant persisted" observation must be reproducible
-    /// here if it is a code bug; a green test rules code out and pins
-    /// the contract that future changes must preserve.
-    #[tokio::test]
-    async fn apply_operator_f9_bundle_persists_sa_owned_user_subject_grant() {
-        use hort_config::lint_config::RuleOverridesSpec;
-        let h = build_harness();
-        // Operator's bundle declares the ArtifactRepository as well; let
-        // the apply path create it (no harness pre-seed — that would
-        // collide with the managed_by=gitops upsert).
-        let mut desired = DesiredState::default();
-        desired
-            .repositories
-            .push(repo_env("supply-chain-security", "hosted"));
-        desired
-            .oidc_issuers
-            .push(oidc_issuer_env_for_apply("gitlab-kdp"));
-        desired
-            .claim_mappings
-            .push(cm_env("admins", "platform-admins", "admin"));
-        desired
-            .claim_mappings
-            .push(cm_env("developers", "developers", "developer"));
-        desired.permission_grants.push(grant_env(
-            "developer-write-supply-chain-security",
-            &["developer"],
-            "write",
-            Some("supply-chain-security"),
-        ));
-        desired.permission_grants.push(grant_env(
-            "developer-read-supply-chain-security",
-            &["developer"],
-            "read",
-            Some("supply-chain-security"),
-        ));
-        put_lint_config(
-            &mut desired,
-            "rbac-lint",
-            &["developer"],
-            RuleOverridesSpec::default(),
-        );
-        desired.service_accounts.push(service_account_env_for_apply(
-            "glci-supply-chain-security",
-            &["supply-chain-security"],
-            Some("gitlab-kdp"),
-        ));
-
-        h.uc.apply(desired, env_oidc())
-            .await
-            .expect("operator bundle must apply cleanly");
-
-        let sa_user = h
-            .users
-            .find_by_username("sa:glci-supply-chain-security")
-            .await
-            .unwrap()
-            .expect("SA backing user must exist after apply");
-        let managed = h.grant_repo.managed_snapshot();
-        // Operator's "no User-subject grant persisted" assertion fails
-        // if the harness disagrees — this is the load-bearing assert.
-        let sa_grant = managed
-            .iter()
-            .find(|g| matches!(&g.subject, GrantSubject::User(uid) if *uid == sa_user.id))
-            .expect(
-                "SA-derived `GrantSubject::User(backing_user_id)` grant for \
-                 supply-chain-security must be in the managed partition",
-            );
-        assert_eq!(sa_grant.permission, Permission::Write);
         assert!(
-            sa_grant.repository_id.is_some(),
-            "SA-derived grant must be repo-scoped, not global"
+            managed.is_empty(),
+            "an SA envelope must materialise no grants: {managed:?}"
         );
     }
 
@@ -418,17 +323,10 @@ mod tests {
         // with `repository_id: None` — the global authority an SA envelope
         // (always repo-scoped) cannot express.
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "npm-public".into(),
-            ..sample_repository_for_test("npm-public")
-        });
         let mut desired = DesiredState::default();
-        desired.service_accounts.push(service_account_env_for_apply(
-            "maintainer-dev",
-            &["npm-public"],
-            None,
-        ));
+        desired
+            .service_accounts
+            .push(service_account_env_for_apply("maintainer-dev", None));
         desired.permission_grants.push(sa_grant_env(
             "maintainer-dev-global-read",
             "maintainer-dev",
@@ -467,18 +365,10 @@ mod tests {
         // partition — the SA-name resolves to the same backing_user_id and
         // the resolved User(uuid) row diffs identically across applies.
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "npm-public".into(),
-            ..sample_repository_for_test("npm-public")
-        });
         let build = || {
             let mut d = DesiredState::default();
-            d.service_accounts.push(service_account_env_for_apply(
-                "maintainer-dev",
-                &["npm-public"],
-                None,
-            ));
+            d.service_accounts
+                .push(service_account_env_for_apply("maintainer-dev", None));
             d.permission_grants.push(sa_grant_env(
                 "maintainer-dev-global-read",
                 "maintainer-dev",
@@ -489,14 +379,11 @@ mod tests {
         };
 
         h.uc.apply(build(), env_oidc()).await.unwrap();
-        // Managed set after first apply: the SA-role-derived repo-scoped
-        // grant + the standalone global grant = 2.
+        // Managed set after first apply: exactly the standalone global
+        // grant — the SA envelope itself materialises nothing.
         let first = h.grant_repo.managed_snapshot();
         let first_count = first.len();
-        assert_eq!(
-            first_count, 2,
-            "SA role-derived repo grant + standalone global grant = 2"
-        );
+        assert_eq!(first_count, 1, "exactly the standalone global grant");
         // Capture surrogate ids so we can prove they carry through.
         let mut first_ids: Vec<Uuid> = first.iter().map(|g| g.id).collect();
         first_ids.sort();
@@ -520,20 +407,17 @@ mod tests {
 
     #[tokio::test]
     async fn apply_repo_scoped_service_account_curate_grant_resolves() {
-        // Repo-scoped `curate` — non-read/write authority an SA role
-        // bundle cannot grant. Resolves to User(backing) scoped to the repo.
+        // Repo-scoped `curate` resolves to User(backing) scoped to the
+        // repo.
         let h = build_harness();
-        seed_developer_role(&h);
         // Declare the repo in the bundle (let the apply create it) so the
         // grant's `spec.repository` cross-spec reference resolves; a
         // pre-seeded harness row would collide with the managed upsert.
         let mut desired = DesiredState::default();
         desired.repositories.push(repo_env("oci-prod", "hosted"));
-        desired.service_accounts.push(service_account_env_for_apply(
-            "maintainer-curator",
-            &["oci-prod"],
-            None,
-        ));
+        desired
+            .service_accounts
+            .push(service_account_env_for_apply("maintainer-curator", None));
         desired.permission_grants.push(sa_grant_env(
             "curator-grant",
             "maintainer-curator",
@@ -570,19 +454,13 @@ mod tests {
         // The audited operator path: a GLOBAL serviceAccount grant under
         // the SECURE-BY-DEFAULT linter (no downgrade). It must NOT trip
         // the `direct-user-grant-without-justification` reject arm — the
-        // resolved backing user is SA-owned (provenance-justified), so the
-        // linter exempts it exactly like an SA role-derived grant.
+        // resolved backing user is SA-owned (provenance-justified), so
+        // the linter exempts it.
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
-        h.repos.insert(Repository {
-            key: "npm-public".into(),
-            ..sample_repository_for_test("npm-public")
-        });
         let mut desired = DesiredState::default();
-        desired.service_accounts.push(service_account_env_for_apply(
-            "maintainer-dev",
-            &["npm-public"],
-            None,
-        ));
+        desired
+            .service_accounts
+            .push(service_account_env_for_apply("maintainer-dev", None));
         desired.permission_grants.push(sa_grant_env(
             "maintainer-dev-global-read",
             "maintainer-dev",
@@ -600,10 +478,6 @@ mod tests {
         // A serviceAccount-subject grant naming an undeclared SA is a
         // cross-spec DanglingReference — apply must fail before any write.
         let h = build_harness();
-        h.repos.insert(Repository {
-            key: "npm-public".into(),
-            ..sample_repository_for_test("npm-public")
-        });
         let mut desired = DesiredState::default();
         desired
             .permission_grants
@@ -621,15 +495,9 @@ mod tests {
     #[tokio::test]
     async fn apply_service_account_with_unknown_issuer_fails_validation() {
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "pypi-internal".into(),
-            ..sample_repository_for_test("pypi-internal")
-        });
         let mut desired = DesiredState::default();
         desired.service_accounts.push(service_account_env_for_apply(
             "ci-pypi-pusher",
-            &["pypi-internal"],
             Some("ghost-issuer"), // not declared!
         ));
         let err = h.uc.apply(desired, env_oidc()).await.unwrap_err();
@@ -647,11 +515,6 @@ mod tests {
     #[tokio::test]
     async fn apply_service_account_with_declared_issuer_in_same_pass_succeeds() {
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "pypi-internal".into(),
-            ..sample_repository_for_test("pypi-internal")
-        });
         // OidcIssuer declared in the same apply — the FK check accepts
         // either snapshot or desired, with desired winning.
         let mut desired = DesiredState::default();
@@ -660,7 +523,6 @@ mod tests {
             .push(oidc_issuer_env_for_apply("github-actions"));
         desired.service_accounts.push(service_account_env_for_apply(
             "ci-pypi-pusher",
-            &["pypi-internal"],
             Some("github-actions"),
         ));
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
@@ -737,7 +599,6 @@ mod tests {
     /// `environment` claim ⇒ the detector must stay silent.
     fn service_account_env_well_constrained(
         sa_name: &str,
-        repos: &[&str],
         issuer: &str,
     ) -> Envelope<ServiceAccountSpec> {
         let mut claims = BTreeMap::new();
@@ -750,8 +611,6 @@ mod tests {
                 name: sa_name.into(),
             },
             spec: ServiceAccountSpec {
-                role: "developer".into(),
-                repositories: repos.iter().map(|s| (*s).into()).collect(),
                 federated_identities: vec![FederatedIdentitySpec {
                     issuer: issuer.into(),
                     claims,
@@ -788,11 +647,6 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let h = build_harness();
-            seed_developer_role(&h);
-            h.repos.insert(Repository {
-                key: "pypi-internal".into(),
-                ..sample_repository_for_test("pypi-internal")
-            });
             let mut desired = DesiredState::default();
             desired
                 .oidc_issuers
@@ -802,7 +656,6 @@ mod tests {
             // (no ref/environment/workflow/aud discriminator).
             desired.service_accounts.push(service_account_env_for_apply(
                 "ci-loose",
-                &["pypi-internal"],
                 Some("github-actions"),
             ));
 
@@ -859,11 +712,6 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let h = build_harness();
-            seed_developer_role(&h);
-            h.repos.insert(Repository {
-                key: "pypi-internal".into(),
-                ..sample_repository_for_test("pypi-internal")
-            });
             let mut desired = DesiredState::default();
             desired
                 .oidc_issuers
@@ -872,7 +720,6 @@ mod tests {
                 .service_accounts
                 .push(service_account_env_well_constrained(
                     "ci-tight",
-                    &["pypi-internal"],
                     "github-actions",
                 ));
 
@@ -910,11 +757,6 @@ mod tests {
         // Expected: apply fails with a validation error naming both the
         //           SA and the missing issuer.
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "pypi-internal".into(),
-            ..sample_repository_for_test("pypi-internal")
-        });
         // Seed the snapshot: an OidcIssuer that the desired state will
         // delete by omission.
         let snapshot_issuer = OidcIssuer {
@@ -935,7 +777,6 @@ mod tests {
         let mut desired = DesiredState::default();
         desired.service_accounts.push(service_account_env_for_apply(
             "legacy-sa",
-            &["pypi-internal"],
             Some("legacy-idp"),
         ));
         let err = h.uc.apply(desired, env_oidc()).await.unwrap_err();
@@ -955,12 +796,7 @@ mod tests {
         // Invariant: the backing user is shared infrastructure
         // — deleting the SA must NOT delete the user.
         let h = build_harness();
-        seed_developer_role(&h);
-        h.repos.insert(Repository {
-            key: "pypi-internal".into(),
-            ..sample_repository_for_test("pypi-internal")
-        });
-        let env = service_account_env_for_apply("ci-pypi-pusher", &["pypi-internal"], None);
+        let env = service_account_env_for_apply("ci-pypi-pusher", None);
         let mut desired = DesiredState::default();
         desired.service_accounts.push(env);
         h.uc.apply(desired, env_oidc()).await.unwrap();
@@ -971,22 +807,15 @@ mod tests {
             .unwrap()
             .is_some());
 
-        // Re-apply with no SA — delete sweep runs.
-        // The PG sweep skips SA-owned grants (their digests are computed
-        // from the snapshot SAs and excluded from the PG delete plan), so
-        // `report.deleted` is exactly the SA row count. The SA-owned
-        // permission grant is removed by `delete_service_account_grants`
-        // and is NOT counted in `report.deleted` (the SA-sweep bumps
-        // `report.deleted` once per SA, not once per grant).
+        // Re-apply with no SA — the delete sweep removes exactly the
+        // SA row.
         let report =
             h.uc.apply(DesiredState::default(), env_oidc())
                 .await
                 .unwrap();
         assert_eq!(
             report.deleted, 1,
-            "SA-owned grants are deleted by \
-             delete_service_account_grants, not by the PG sweep; \
-             only the SA row contributes to report.deleted"
+            "only the SA row contributes to report.deleted"
         );
         assert!(h.service_accounts.snapshot().is_empty());
         // The backing user row stays.

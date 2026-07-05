@@ -1,20 +1,22 @@
 //! Walk `deploy/ansible/files/gitops/` and assert every YAML envelope
 //! parses, validates (per-spec), and cross-references correctly.
 //!
-//! This is the deferred Task-1 fixture test (plan 2026-06-19 §Task 2,
-//! deferred from Task 1's commit). It covers the production-intended
-//! gitops tree for `registry.hort.rs`, including the OIDC issuers and
-//! federated-CI ServiceAccounts added in Task 2.
+//! Covers the production-intended gitops tree for `registry.hort.rs`:
+//! repositories, upstreams, policies, OIDC issuers, identity-only
+//! ServiceAccounts, and the serviceAccount-subject PermissionGrants
+//! that carry each SA's authority.
 //!
 //! Cross-kind FK checks performed here (tree-level, not apply-level):
 //! - Every `ServiceAccount.federatedIdentities[].issuer` references a
 //!   declared `OidcIssuer.metadata.name`.
-//! - Every `ServiceAccount.spec.repositories[]` references a declared
-//!   `ArtifactRepository.metadata.name`.
 //! - Every `UpstreamMapping.spec.repository` references a declared
 //!   `ArtifactRepository.metadata.name`.
 //! - Every `ScanPolicy` (scoped) `spec.scope.repository` references a
 //!   declared `ArtifactRepository.metadata.name`.
+//! - Every `PermissionGrant.spec.repository` (when set) references a
+//!   declared `ArtifactRepository.metadata.name`.
+//! - Every `PermissionGrant` serviceAccount subject references a
+//!   declared `ServiceAccount.metadata.name`.
 //!
 //! Cross-kind FK checks that live in the apply use case (`hort-app`),
 //! NOT duplicated here:
@@ -101,26 +103,12 @@ fn public_deploy_gitops_tree_parses_and_cross_validates() {
         }
     }
 
-    // -- Tree-level FK: SA.repositories[] → declared ArtifactRepository.name --
+    // -- Tree-level FK: UpstreamMapping.repository → declared repo -------------
     let declared_repos: HashSet<&str> = state
         .repositories
         .iter()
         .map(|e| e.metadata.name.as_str())
         .collect();
-    for sa in &state.service_accounts {
-        for repo_ref in &sa.spec.repositories {
-            assert!(
-                declared_repos.contains(repo_ref.as_str()),
-                "ServiceAccount `{}` spec.repositories entry `{}` does not match \
-                 any declared ArtifactRepository name (declared: {:?})",
-                sa.metadata.name,
-                repo_ref,
-                declared_repos,
-            );
-        }
-    }
-
-    // -- Tree-level FK: UpstreamMapping.repository → declared repo -------------
     // (Belt-and-suspenders for this tree; DesiredState::validate already checks
     //  this via push_upstream_mapping_reference_errors, but an explicit assert
     //  makes the intent readable.)
@@ -145,6 +133,42 @@ fn public_deploy_gitops_tree_parses_and_cross_validates() {
                 sp.metadata.name,
                 repo_ref,
                 declared_repos,
+            );
+        }
+    }
+
+    // -- Tree-level FK: PermissionGrant.repository → declared repo -------------
+    // (Belt-and-suspenders for this tree; DesiredState::validate already
+    //  reports both grant references as DanglingReference errors, but the
+    //  explicit asserts make the intent readable.)
+    for pg in &state.permission_grants {
+        if let Some(repo_ref) = pg.spec.repository.as_ref() {
+            assert!(
+                declared_repos.contains(repo_ref.as_str()),
+                "PermissionGrant `{}` spec.repository `{}` does not match \
+                 any declared ArtifactRepository name (declared: {:?})",
+                pg.metadata.name,
+                repo_ref,
+                declared_repos,
+            );
+        }
+    }
+
+    // -- Tree-level FK: PermissionGrant serviceAccount subject → declared SA --
+    let declared_sas: HashSet<&str> = state
+        .service_accounts
+        .iter()
+        .map(|e| e.metadata.name.as_str())
+        .collect();
+    for pg in &state.permission_grants {
+        if let hort_config::GrantSubjectSpec::ServiceAccount { name } = &pg.spec.subject {
+            assert!(
+                declared_sas.contains(name.as_str()),
+                "PermissionGrant `{}` subject.name `{}` does not match \
+                 any declared ServiceAccount name (declared: {:?})",
+                pg.metadata.name,
+                name,
+                declared_sas,
             );
         }
     }

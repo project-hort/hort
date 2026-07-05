@@ -425,6 +425,13 @@ fn extract_principal(
 /// Build a 401 response with `WWW-Authenticate: Basic` for OCI
 /// anonymous-write callers.
 ///
+/// NOTE: for the OCI `/v2/*` surface this backstop is no longer reached on
+/// anonymous writes — `hort-http-oci`'s `oci_bearer_auth` middleware now
+/// challenges anonymous non-safe-method requests up front with a mode-aware
+/// `WWW-Authenticate` (Bearer when native tokens are wired, Basic
+/// otherwise). This function stays the generic backstop for the non-OCI
+/// formats that share this extractor and is correct for them.
+///
 /// We emit `Basic` here, NOT `Bearer realm=/v2/token`. The OCI
 /// subtree's canonical write flow is:
 ///
@@ -579,17 +586,18 @@ fn deny_hint(principal: &CallerPrincipal) -> &'static str {
     // claim_mappings). Routing them through the generic "verify
     // ClaimMapping" branch actively misleads the operator. Branch on
     // the typed `token_kind` carrier first so SAs land on a hint that
-    // names the right remediation surfaces (the SA's `repositories`
-    // list, the consolidated User-subject grant from `apply_permission_
-    // grants`, and the role-derived cap from the federation mint).
+    // names the right remediation surfaces (the explicit
+    // `serviceAccount`-subject PermissionGrant and the grants-snapshot
+    // cap on the issued token).
     if principal.token_kind == Some(TokenKind::ServiceAccount) {
         "principal is a ServiceAccount token (SAs never consume \
-         ClaimMappings). Verify (a) `kind: ServiceAccount` declares this repository in \
-         `spec.repositories` and the gitops apply succeeded; (b) the apply log shows the \
-         consolidated `permission_grant audit events committed` line — the SA-derived \
-         `GrantSubject::User(backing_user_id)` grant lands there; and \
-         (c) the token's role-derived cap (developer ⇒ write, reader ⇒ read) covers the \
-         requested permission (federation mint)."
+         ClaimMappings). Verify (a) a `kind: PermissionGrant` with `subject: serviceAccount` \
+         covers this repository + permission and the gitops apply succeeded; (b) the apply \
+         log shows the consolidated `permission_grant audit events committed` line — the \
+         resolved `GrantSubject::User(backing_user_id)` grant lands there; and (c) the \
+         token's cap (the SA's effective grants snapshotted at issuance) covers the \
+         requested permission — a grant added after issuance enters the cap on the next \
+         exchange or rotation."
     } else if principal.claims.is_empty() && principal.token_kind != Some(TokenKind::CliSession) {
         "principal has no claims — verify the IdP group claim and `kind: ClaimMapping` bindings"
     } else if principal.token_kind == Some(TokenKind::CliSession)
@@ -2056,8 +2064,8 @@ mod tests {
     /// `claims == []` must NOT receive the misleading "verify the IdP
     /// group claim and `kind: ClaimMapping` bindings" hint; SAs never
     /// consume claim_mappings (ADR 0012). The
-    /// SA-specific branch must point at the `kind: ServiceAccount` /
-    /// User-subject grant surface. The hint may
+    /// SA-specific branch must point at the explicit
+    /// `serviceAccount`-subject PermissionGrant surface. The hint may
     /// reference ClaimMapping as a *disclaimer* ("SAs never consume…"),
     /// but it must not steer the operator at that surface as the
     /// remediation.
@@ -2075,9 +2083,9 @@ mod tests {
             "SA deny hint should reference the ServiceAccount surface; got: {hint}"
         );
         assert!(
-            hint.contains("spec.repositories") || hint.contains("User-subject"),
-            "SA deny hint should mention SA repositories or the SA-derived User-subject \
-             grant — the two operator-actionable surfaces; got: {hint}"
+            hint.contains("PermissionGrant") && hint.contains("serviceAccount"),
+            "SA deny hint should point at the explicit serviceAccount-subject \
+             PermissionGrant — the operator-actionable surface; got: {hint}"
         );
     }
 

@@ -775,7 +775,7 @@ labels — same anti-pattern discipline as the counter.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, mint_failed, internal_error, bad_request}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success` and `bad_request` (shared wire-shape errors). |
+| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, mint_failed, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). |
 | `hort_token_exchange_duration_seconds` | histogram | `kind`, `result` | seconds | same set as the counter |
 | `hort_session_admin_issuance_total` | counter | `result` | — | `granted`, `denied_flag`, `denied_authority`, `denied_lifetime` |
 | `hort_fed_sa_match_total` | counter | `result` | — | `matched`, `denied_audience`, `denied_empty_claims` |
@@ -876,15 +876,14 @@ duration sample AND increments the counter on the way out. RFC
   collapsed into this bucket — doing so generates false
   positives on outage dashboards. Reviewer-checked invariant.
 
-Cardinality: 2 `kind` values (`cli_session`, `federated_jwt`) × ~14
-distinct `result` values per kind (10 unique to `cli_session`,
-14 unique to `federated_jwt`, with `success` and `bad_request`
-shared) ≈ **~24 series per metric**, ~48 series
+Cardinality: 2 `kind` values (`cli_session`, `federated_jwt`) × ~15
+distinct `result` values per kind (with `success`, `bad_request`, and
+`cap_exceeds_authority` shared) ≈ **~25 series per metric**, ~50 series
 total across the two metrics. Closed taxonomy. (Operator dashboards
 keyed on the historical label-less form of this metric stopped
 incrementing when the `kind` label landed; add `kind=~".+"` filters
-when upgrading. The disjoint-except-for-`success`-and-`bad_request`
-rule keeps cardinality sub-linear in the number of kinds.)
+when upgrading. The mostly-disjoint per-kind sets keep cardinality
+sub-linear in the number of kinds.)
 
 A future refresh-token phase extends the `kind` label with `refresh` —
 its `result` variants land alongside the emitting change (ADR 0013
@@ -931,13 +930,22 @@ branch — the foreign-IdP JWT exchange path that mints a
   an unexpected error, SA listing failed, the federation ports are
   unwired (composition bug). Maps to HTTP 500 / 503.
 - `bad_request` — RFC 6749 wire-shape rejection on the federation
-  branch (typically `requested_token_type ≠ access_token`). Shared
+  branch (typically `requested_token_type ≠ access_token`, or an
+  unknown permission name in the RFC 8693 `scope` parameter). Shared
   label with the `cli_session` branch — distinguished by the `kind`
   label.
+- `cap_exceeds_authority` — the RFC 8693 `scope` requested a
+  permission set of which the matched SA's effective grants hold
+  nothing. The grants-snapshot cap would be empty for an explicitly
+  requested scope, so the exchange denies 403 `access_denied` instead
+  of minting — the same empty-footprint semantics as the
+  `cli_session` branch's label. Distinguished by the `kind` label.
+  (An ABSENT scope with a zero-grant SA mints normally with an
+  empty-permissions cap and emits `success`.)
 
 The federation branch never emits the `cli_session` branch's labels
 (`source_token_invalid`, `source_token_pat_rejected`, `idp_unavailable`,
-`subject_not_authorised`, `cap_exceeds_authority`, `validation_error`,
+`subject_not_authorised`, `validation_error`,
 `infrastructure_error`) and vice versa — `kind` is the discriminator.
 
 **`hort_fed_sa_match_total{result}`**:
@@ -1515,7 +1523,10 @@ today is the OCI handler — hence the `format="oci"` label value.
   attributes "an empty response" to a successful query, not a
   not-found one.
 - `not_found` — the repository lookup returned
-  `DomainError::NotFound`. The handler emits 404 `NAME_UNKNOWN`. The
+  `DomainError::NotFound`. The handler emits 404 `NAME_UNKNOWN` for an
+  authenticated caller, or 401 + a `WWW-Authenticate` challenge for an
+  anonymous one (ADR 0045) — the label tracks repository-*resolution*
+  failure, not the HTTP representation, so it is unchanged either way. The
   `repository` label carries the requested key the operator asked
   for (cardinality stays bounded by operator-controlled repo keys
   even on misses; no client-supplied unbounded value reaches the
@@ -1634,18 +1645,29 @@ emit a parallel OCI-specific push counter; the combination
 (session-level lifecycle) covers the dashboard space without
 splitting the `format="oci"` attention across three metrics.
 
-### OCI session-cap rejections
+### Stateful-upload session-cap rejections
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_oci_session_cap_rejections_total` | counter | `repo`, `result` | — | `over_cap` |
+| `hort_upload_session_cap_rejections_total` | counter | `format`, `repo`, `result` | — | `over_cap` |
 
-Emitted by `hort-http-oci::upload_session::initiate` when the
-per-`(repo, principal)` outstanding-session counter would exceed the
-cap configured via `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` (default 32).
-The handler maps the rejection to `429 Too Many Requests` with the
-OCI `TOOMANYREQUESTS` envelope; the cap counter naturally TTL-cleans
-on the same window as `OCI_SESSION_TTL`.
+Emitted by a `StatefulUpload` format adapter when it maps
+[`upload_session_cap::AdmitOutcome::OverCap`](../crates/hort-http-core/src/upload_session_cap.rs)
+to a rejection — i.e. the per-`(format, repo, principal)` live session
+set is at the cap after age-pruning. Renamed from the OCI-specific
+`hort_oci_session_cap_rejections_total`; the cap is now a shared,
+format-parameterized primitive in `hort-http-core`, so the metric
+carries a `format` label (`oci`, and future formats such as `lfs`) and
+lives under a generic name. OCI is the first (today the only) consumer:
+`hort-http-oci::upload_session::initiate` emits `format="oci"` when the
+per-`(repo, principal)` cap configured via
+`HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` (default 32) is exceeded, and the
+handler maps the rejection to `429 Too Many Requests` with the OCI
+`TOOMANYREQUESTS` envelope.
+
+**`format` cardinality.** One series per stateful-upload format the
+registry serves — a tiny, closed set (`oci`; `lfs`/`maven` when those
+land). Not operator-influenced, so it cannot blow up cardinality.
 
 **`repo` cardinality.** Same shape as the workspace-wide
 `repository` label — bounded by the registry's repo count. Honours
@@ -1662,9 +1684,45 @@ cap currently produces.
 
 **No `principal_id` / `user_id` / `actor_id` label.** The architect
 catalog forbids these as cardinality vectors. Per-principal abuse
-investigation goes through tracing spans (`upload_session_initiate`
+investigation goes through tracing spans (`oci_upload_session_initiate`
 carries `repository_id` and the principal id is in the tracing
 context) and the audit-event log, not the metrics surface.
+
+### Stateful-upload session-set reconcile prunes
+
+| Metric | Type | Labels | Unit | `result` values |
+|--------|------|--------|------|-----------------|
+| `hort_upload_session_reconcile_pruned_total` | counter | `format`, `repo`, `result` | — | `pruned`, `none` |
+
+Emitted by the shared cap primitive
+([`upload_session_cap::admit`](../crates/hort-http-core/src/upload_session_cap.rs))
+once per successful admit (session created). Renamed from the
+OCI-specific `hort_oci_session_reconcile_pruned_total` and carrying the
+same `format` label as the cap-rejection counter above. The
+per-`(format, repo, principal)` cap is a live, self-pruning session set
+stored as one serialized value; on every admit the reconcile drops
+members older than the caller's configured session max-age (for OCI,
+`HORT_OCI_SESSION_MAX_AGE_SECS`, default 3600) before checking the cap.
+`result=pruned` when the admit reclaimed one or more aged-out
+(abandoned) sessions; `result=none` when nothing aged out. This is the
+first leak-visibility signal — a rising `pruned` rate means clients are
+abandoning upload sessions (`POST .../blobs/uploads/` with no final
+`PUT` and no `DELETE`) faster than they finalize / cancel them. On a
+prune the reconcile also logs a `debug!` carrying the pruned **count
+only** (never a principal or session id).
+
+**`format` / `repo` cardinality.** Same shape and toggle as
+`hort_upload_session_cap_rejections_total` above — `format` is the
+closed stateful-upload-format set; `repo` is bounded by the registry's
+repo count and honours `METRICS_INCLUDE_REPOSITORY_LABEL` (`_all` when
+disabled, `unknown` on lookup failure). Named `repo` (not `repository`),
+matching the sibling cap-rejection metric.
+
+**No `principal_id` / `user_id` / `actor_id` label.** Same cardinality
+rule as the cap-rejection metric; per-principal investigation goes
+through tracing / audit, not this counter. A cap rejection performs NO
+write and therefore does NOT emit this metric — it never refreshes the
+set (that is the structural fix for the old counter's TTL-refresh leak).
 
 ### Staging-orphan sweep
 
@@ -2921,7 +2979,7 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation` |
+| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
 
 Both counters are emitted at exactly **one layer** — the orchestration
@@ -2942,7 +3000,8 @@ labels carry repo names, so operators **must** restrict it with a
 NetworkPolicy (see the how-to
 `docs/architecture/how-to/enable-provenance-verification.md` → *Worker
 metrics*). The companion per-job `result_summary`
-(`verified` / `rejected:<reason>` / `no_attestation` / `skipped:<why>`) is
+(`verified` / `rejected:<reason>` / `no_attestation` /
+`held_pending_signature` / `skipped:<why>`) is
 the per-artifact trail and is **not** a metric.
 
 The verify counter ticks on every applied verdict;
@@ -2993,7 +3052,15 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   `Required`-mode fetch-exhaustion fail-closed (`Rejected{RekorNotFound}`).
 - `no_attestation` — no bundle was found/passed and the mode allowed it
   (`VerifyIfPresent` no-op, no event). Strictly the allowed-unsigned
-  case: an unsigned artifact under `Required` ticks `rejected` instead.
+  case: an unsigned artifact under `Required` within its window ticks
+  `held_pending_signature`, and past its window ticks `rejected`.
+- `held_pending_signature` — Required-mode unsigned artifact held pending
+  signature within its quarantine window (issue #13). No event;
+  `complete_provenance` returns `Ok(None)` and the artifact stays
+  `Quarantined` (read as `Pending`/fail-closed by the release gate) so it
+  can still be signed. Separates images *waiting to be signed* from the
+  allowed-unsigned `no_attestation` no-op; at window expiry the terminal
+  decision ticks `verified` (a signature landed) or `rejected` (`Unsigned`).
 
 **`reason` semantics** (`hort_provenance_reject_total`) — one per
 `ProvenanceRejectReason` variant:
@@ -3020,7 +3087,7 @@ accompanying `info!` audit line on the `ProvenanceVerified` /
 not `err`).
 
 Cardinality: `hort_provenance_verify_total` ≤ `backend` (~few) × `mode`
-(3) × `result` (3); `hort_provenance_reject_total` ≤ `backend` × `reason`
+(3) × `result` (4); `hort_provenance_reject_total` ≤ `backend` × `reason`
 (5). Both are tiny in Tier 1 (one backend).
 
 ### Admin task dispatcher
