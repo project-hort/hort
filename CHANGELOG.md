@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`HORT_RATELIMIT_EXEMPT_CIDRS`** (Helm `rateLimitExemptCidrs`) — source CIDRs
+  whose resolved client IP bypasses both rate-limit buckets. For first-party CI
+  that shares one egress IP (or sits behind one ingress) and would otherwise
+  collapse into a single per-IP bucket and `429` on legitimate publish bursts.
+  Keyed on the trust-resolved client IP (not a spoofable header). Note: this
+  also removes the per-IP anti-credential-stuffing limit on the token-mint
+  paths for that range — list only fully trusted CI egress ranges.
+
 ### Fixed
 
 - **The inbound rate limiter now sustains its configured per-minute rate.** The
@@ -16,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic was throttled to ~1 request/minute — roughly 60×/300× tighter than
   documented — which persistently `429`'d automated writers such as CI pushing
   multi-layer images. Tokens now replenish at the configured per-minute rate.
+- **Rate-limit `429` responses no longer advertise `Retry-After: 0`.** A
+  sub-second wait is rounded up to at least 1 second, so a throttled client
+  backs off for a beat instead of hot-looping on an immediate retry.
 
 ## [0.9.8] - 2026-07-05
 
