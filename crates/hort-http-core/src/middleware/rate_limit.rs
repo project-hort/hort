@@ -1,9 +1,10 @@
 //! Per-IP rate limiting (see `docs/auth-catalog.md` for the auth-surface
 //! rate-limit/lockout posture).
 //!
-//! Two tower layer builders, both backed by [`tower_governor`] with a
-//! custom [`KeyExtractor`] that reads [`RequestTrust::client_ip`] out of
-//! request extensions (populated by [`request_trust_layer`]):
+//! Two [`axum::middleware::from_fn_with_state`] layer builders, both
+//! backed by a [`governor`] keyed rate limiter keyed on
+//! [`RequestTrust::client_ip`] (read out of request extensions, populated
+//! by [`request_trust_layer`]):
 //!
 //! - [`auth_rate_limit_layer`] — wraps [`require_principal`]. Per-IP
 //!   token-bucket limiting auth attempts; bucket cap via
@@ -11,6 +12,15 @@
 //! - [`write_rate_limit_layer`] — wraps the POST/PUT/DELETE sub-router.
 //!   Per-IP token-bucket limiting write throughput; bucket cap via
 //!   `HORT_RATELIMIT_WRITE_PER_MIN` (default 300).
+//!
+//! # CIDR exemption
+//!
+//! Traffic whose resolved `client_ip` is in `HORT_RATELIMIT_EXEMPT_CIDRS`
+//! bypasses BOTH buckets entirely. First-party CI shares an egress IP (or
+//! sits behind one ingress), so it collapses into a single per-IP bucket
+//! and would otherwise 429 on legitimate publish bursts. The exemption is
+//! an operator-declared allowlist of trusted source ranges; every other
+//! IP stays per-IP limited.
 //!
 //! # Scope overlap (read before tuning defaults)
 //!
@@ -45,43 +55,44 @@
 //! endpoints from format endpoints (different auth caps per surface),
 //! revisit the attach points then.
 //!
-//! # Why not `SmartIpKeyExtractor`?
+//! # Why key on `RequestTrust::client_ip`, not forwarded headers?
 //!
-//! `tower_governor` ships a `SmartIpKeyExtractor` that sniffs
-//! `X-Forwarded-For` / `X-Real-IP` / `Forwarded` without consulting a
-//! trusted-proxy allowlist. Using it here would silently bypass the
-//! trust policy: an unauthenticated client could set
+//! Sniffing `X-Forwarded-For` / `X-Real-IP` / `Forwarded` directly —
+//! without consulting a trusted-proxy allowlist — would silently bypass
+//! the trust policy: an unauthenticated client could set
 //! `X-Forwarded-For: 1.2.3.4` and escape their bucket. All peer-IP
 //! evaluation lives in [`crate::middleware::trust`]; this module consumes
-//! its output and never looks at raw headers.
+//! its [`RequestTrust::client_ip`] output and never looks at raw headers.
+//! A request that reaches the limiter without `RequestTrust` in
+//! extensions (router-wiring bug) surfaces `500` — never a silent
+//! bucket-bypass.
 //!
 //! # Observability
 //!
-//! On reject: `429 Too Many Requests` with `Retry-After` (governor
-//! builds the headers). The accompanying metric is
-//! [`HORT_RATE_LIMIT_REJECTS_TOTAL`] with `scope ∈ {auth, write}` and
-//! `path` = route template from [`axum::extract::MatchedPath`] — NOT the
-//! concrete URI. Unmatched routes (404 path) surface as `path="<unmatched>"`.
+//! On reject: `429 Too Many Requests` with `Retry-After` (whole seconds,
+//! floored at 1 so a client never hot-loops on `Retry-After: 0`), a
+//! `Content-Type: application/json` `{"error":"too many requests"}` body,
+//! plus the [`HORT_RATE_LIMIT_REJECTS_TOTAL`] metric with
+//! `scope ∈ {auth, write}` and `path` = route template from
+//! [`axum::extract::MatchedPath`] — NOT the concrete URI. Unmatched routes
+//! (404 path) surface as `path="<unmatched>"`.
 //!
 //! [`RequestTrust::client_ip`]: crate::middleware::trust::RequestTrust::client_ip
 //! [`request_trust_layer`]: crate::middleware::trust::request_trust_layer
 //! [`require_principal`]: crate::middleware::auth::require_principal
-//! [`KeyExtractor`]: tower_governor::key_extractor::KeyExtractor
 
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::{MatchedPath, Request};
-use axum::http::{Method, Request as HttpRequest, StatusCode};
+use axum::extract::{MatchedPath, Request, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
-use tower::layer::util::Stack;
-use tower::ServiceBuilder;
-use tower_governor::governor::{GovernorConfig, GovernorConfigBuilder};
-use tower_governor::key_extractor::KeyExtractor;
-use tower_governor::{GovernorError, GovernorLayer};
+use axum::response::{IntoResponse, Response};
+use ipnet::IpNet;
 
-use crate::middleware::trust::RequestTrust;
+use crate::middleware::trust::{cidr_contains, RequestTrust};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -110,121 +121,92 @@ pub const DEFAULT_WRITE_PER_MIN: u32 = 300;
 // Config
 // ---------------------------------------------------------------------------
 
-/// Per-scope rate-limit caps. Sourced from `hort-server::Config` so operators
-/// tune without rebuilding. `u32` matches `tower_governor`'s
-/// `burst_size` type — larger caps would overflow the underlying
-/// `NonZeroU32`; validation at parse-time in `Config::from_env` ensures
-/// the values here are non-zero.
-#[derive(Debug, Clone, Copy)]
+/// Per-scope rate-limit caps plus the shared CIDR exemption. Sourced from
+/// `hort-server::Config` so operators tune without rebuilding. `u32`
+/// matches `governor`'s burst type — larger caps would overflow the
+/// underlying `NonZeroU32`; validation at parse-time in `Config::from_env`
+/// ensures the values here are non-zero.
+///
+/// Not `Copy`: `exempt_cidrs` holds an `Arc<Vec<IpNet>>` so both layer
+/// builders share one allocation of the operator's allowlist.
+#[derive(Debug, Clone)]
 pub struct RateLimitConfig {
     /// Auth attempts per IP per minute. Wraps `require_principal`.
     pub auth_per_min: u32,
     /// Writes per IP per minute. Wraps POST/PUT/DELETE routes.
     pub write_per_min: u32,
+    /// Source ranges exempt from BOTH buckets. Parsed from
+    /// `HORT_RATELIMIT_EXEMPT_CIDRS`; empty when unset. A resolved
+    /// `client_ip` inside any of these ranges bypasses rate limiting.
+    pub exempt_cidrs: Arc<Vec<IpNet>>,
 }
 
 impl RateLimitConfig {
-    /// New config with explicit caps. Callers (production `hort-server::Config`,
-    /// tests) supply values; non-zero invariant enforced by the builder at
-    /// `finish()` time — zero would cause `GovernorConfigBuilder::finish`
-    /// to return `None` and this module's `build_governor_config` to panic
-    /// at startup. Treat zero as an operator misconfiguration.
-    pub fn new(auth_per_min: u32, write_per_min: u32) -> Self {
+    /// New config with explicit caps and exemption ranges. Callers
+    /// (production `hort-server::Config`, tests) supply values; the
+    /// non-zero cap invariant is enforced by [`build_keyed_limiter`]'s
+    /// assert at construction time — zero would make `Quota` reject the
+    /// burst and the builder panic at startup. Treat zero as an operator
+    /// misconfiguration.
+    pub fn new(auth_per_min: u32, write_per_min: u32, exempt_cidrs: Vec<IpNet>) -> Self {
         Self {
             auth_per_min,
             write_per_min,
+            exempt_cidrs: Arc::new(exempt_cidrs),
         }
     }
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        Self::new(DEFAULT_AUTH_PER_MIN, DEFAULT_WRITE_PER_MIN)
+        Self::new(DEFAULT_AUTH_PER_MIN, DEFAULT_WRITE_PER_MIN, Vec::new())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Key extractor
+// Keyed rate limiter construction
 // ---------------------------------------------------------------------------
 
-/// Custom [`KeyExtractor`] that pulls [`RequestTrust::client_ip`] out of
-/// request extensions (populated by `request_trust_layer`); if the
-/// extension is missing the extractor surfaces
-/// [`GovernorError::UnableToExtractKey`] → `500 Internal Server Error`.
+/// GCRA emission interval for a "`per_min` requests per minute" cap: one
+/// token replenished every `60s / per_min`, so the bucket sustains exactly
+/// `per_min` tokens per minute (with a burst of `per_min`).
 ///
-/// Why 500 instead of falling back to `ConnectInfo<SocketAddr>`: a
-/// ConnectInfo fallback would silently bypass the trust policy whenever
-/// the router is composed incorrectly (rate-limit layer attached before
-/// the trust layer). 500 is the conservative failure — it surfaces the
-/// composition bug immediately rather than hiding it behind a subtly-
-/// different rate-limit behaviour. Tower-governor's default `From`
-/// conversion maps `UnableToExtractKey` to 500.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TrustAwareKeyExtractor;
-
-impl KeyExtractor for TrustAwareKeyExtractor {
-    type Key = IpAddr;
-
-    // NOTE: `name()` / `key_name()` on `KeyExtractor` are gated by
-    // tower_governor's `tracing` cargo feature, which we do NOT enable
-    // (see `hort-http-core`'s Cargo.toml: `default-features = false`). With that
-    // feature off, the trait has no `name()` / `key_name()` method to
-    // implement — adding stubs would fail to compile. Our own `tracing`
-    // call site lives in [`observe_rejects`] instead.
-
-    fn extract<T>(&self, req: &HttpRequest<T>) -> Result<Self::Key, GovernorError> {
-        req.extensions()
-            .get::<RequestTrust>()
-            .map(|trust| trust.client_ip)
-            .ok_or(GovernorError::UnableToExtractKey)
-    }
+/// This is the load-bearing detail behind the `*_PER_MIN` caps. `governor`'s
+/// `Quota::with_period(d)` sets the interval to replenish ONE token — so a fixed
+/// 60s interval sustains 1 token/min regardless of the cap. Dividing 60s by the
+/// cap restores the intended per-minute rate.
+///
+/// `per_min` is guaranteed non-zero by `Config::from_env` (and the
+/// [`build_keyed_limiter`] assert), so the division never panics.
+fn emission_period(per_min: u32) -> Duration {
+    Duration::from_secs(60) / per_min
 }
 
-// ---------------------------------------------------------------------------
-// Governor layer construction
-// ---------------------------------------------------------------------------
-
-/// Build a [`GovernorConfig`] for N requests per 60s window, keyed by
-/// [`TrustAwareKeyExtractor`]. "N per minute" is encoded as burst = N,
-/// replenishment = 60s (1 token per minute, up to N tokens buffered). The
-/// first N requests within a 60s window pass through; N+1 is rejected with
-/// 429 + `Retry-After`.
+/// Build a per-IP keyed [`governor`] rate limiter for `per_min` requests
+/// per minute (sustained). Encoded as a token bucket: capacity = `per_min`,
+/// one token replenished every [`emission_period`]`(per_min)` =
+/// `60s / per_min`. A burst of `per_min` is admitted immediately;
+/// sustained traffic is capped at `per_min`/minute; over-cap requests get
+/// 429 + `Retry-After` in [`rate_limit_middleware`].
 ///
-/// Panics on `burst == 0` — operator would have fat-fingered the env var,
-/// and `Config::from_env` in `hort-server` should have already rejected zero
-/// values. Defensive panic here catches any accidental bypass.
-fn build_governor_config(
-    burst: u32,
-    methods: Option<Vec<Method>>,
-) -> Arc<GovernorConfig<TrustAwareKeyExtractor, governor::middleware::NoOpMiddleware>> {
+/// Panics on `per_min == 0` — operator would have fat-fingered the env var,
+/// and `Config::from_env` in `hort-server` should have already rejected
+/// zero values. Defensive panic here catches any accidental bypass.
+fn build_keyed_limiter(per_min: u32) -> governor::DefaultKeyedRateLimiter<IpAddr> {
     assert!(
-        burst > 0,
-        "rate_limit burst must be > 0 — Config::from_env should have rejected zero"
+        per_min > 0,
+        "rate_limit per_min must be > 0 — Config::from_env should have rejected zero"
     );
-    // `per_second(60)` here names the REPLENISHMENT INTERVAL (one token per
-    // 60 seconds), not "per-second rate". tower_governor's API is the
-    // `governor` crate's token-bucket: burst is the bucket capacity,
-    // period is the cadence at which the bucket refills by one.
-    //
-    // `methods`: when set, the governor layer ONLY limits the listed
-    // methods; everything else passes through. This is how we express
-    // "write rate-limit applies only to POST/PUT/DELETE/PATCH" without
-    // carving up the router into sibling sub-routers. Mirrors the
-    // tower_governor `GovernorConfigBuilder::methods` API.
-    // `key_extractor(...)` CONSUMES the PeerIp-typed builder and returns
-    // a fresh builder parameterised on the new key type. Chain on that
-    // return value — stashing it in a `mut` binding so the subsequent
-    // `methods(...)` call (which takes `&mut Self`) lands on the right
-    // generic instantiation.
-    let mut builder = GovernorConfigBuilder::default()
-        .per_second(60)
-        .burst_size(burst)
-        .key_extractor(TrustAwareKeyExtractor);
-    if let Some(methods) = methods {
-        builder.methods(methods);
-    }
-    let config = builder.finish().expect("non-zero burst and period");
-    Arc::new(config)
+    // The token bucket is `per_min` = capacity and one token replenished
+    // every `emission_period(per_min)` = `60s / per_min`. That makes the
+    // SUSTAINED rate exactly `per_min` tokens per minute — matching the
+    // `*_PER_MIN` semantics the caps carry — with a burst of `per_min`.
+    // (A fixed 60s period would sustain only 1 token/min regardless of the
+    // cap.)
+    let quota = governor::Quota::with_period(emission_period(per_min))
+        .expect("non-zero emission period")
+        .allow_burst(NonZeroU32::new(per_min).expect("non-zero per_min"));
+    governor::RateLimiter::keyed(quota)
 }
 
 // ---------------------------------------------------------------------------
@@ -259,41 +241,116 @@ fn resolve_matched_path(req: &Request) -> String {
         .unwrap_or_else(|| PATH_UNMATCHED.to_owned())
 }
 
-/// Middleware that runs OUTSIDE the `GovernorLayer`: captures the matched
-/// route template and the trust-evaluated `client_ip` on the way in,
-/// detects a 429 on the way out, and emits the
-/// [`HORT_RATE_LIMIT_REJECTS_TOTAL`] metric + a structured `info!` audit log.
+/// Canonical 429 JSON body. Mirrors the `{"error": …}` envelope the rest
+/// of `hort-http-core` returns (see `crate::error`).
+const RATE_LIMIT_BODY: &str = r#"{"error":"too many requests"}"#;
+
+// ---------------------------------------------------------------------------
+// Middleware state + entry point
+// ---------------------------------------------------------------------------
+
+/// Per-layer state shared across requests. Cheap to clone — the keyed
+/// limiter and the exemption list are both behind an `Arc`. Public only
+/// because it appears in the [`RateLimitLayer`] type alias returned by the
+/// pub builders; its fields stay private, so callers can't construct it.
+#[derive(Clone)]
+pub struct RateLimitState {
+    /// Keyed token bucket, one bucket per resolved `client_ip`.
+    limiter: Arc<governor::DefaultKeyedRateLimiter<IpAddr>>,
+    /// Source ranges exempt from this bucket (shared with the sibling
+    /// scope's state via `Arc`).
+    exempt_cidrs: Arc<Vec<IpNet>>,
+    /// Metric/log label for this scope — [`SCOPE_AUTH`] or [`SCOPE_WRITE`].
+    scope: &'static str,
+}
+
+/// Rate-limit middleware. Runs only on write methods; keys the bucket on
+/// [`RequestTrust::client_ip`]; exempts operator-listed CIDRs; on reject
+/// returns `429` with a floored `Retry-After` and the
+/// [`HORT_RATE_LIMIT_REJECTS_TOTAL`] metric + audit log.
 ///
-/// Why out-of-band instead of inside `GovernorLayer::error_handler`:
-/// the error handler closure only sees [`GovernorError`] — it doesn't
-/// have access to the request (and thus no `MatchedPath`). The
-/// per-scope closures below thread the `scope` label via a `&'static str`
-/// captured by the closure; the per-scope layer pair is defined in
-/// [`auth_rate_limit_layer`] / [`write_rate_limit_layer`].
-async fn observe_rejects(req: Request, next: Next, scope: &'static str) -> Response {
-    // Capture metadata pre-flight — on 429 the governor layer short-
-    // circuits and `req` would no longer be readable from inside
-    // `next.run(req)`'s body.
-    let path = resolve_matched_path(&req);
-    let client_ip = req
-        .extensions()
-        .get::<RequestTrust>()
-        .map(|t| t.client_ip.to_string());
+/// Boxed-future `fn` wrapper (not a bare `async fn`) so the
+/// [`RateLimitLayer`] type alias can name the middleware function
+/// pointer — same pattern as [`crate::middleware::trust`].
+fn rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    req: Request,
+    next: Next,
+) -> RateLimitFuture {
+    Box::pin(rate_limit_middleware_impl(state, req, next))
+}
 
-    let response = next.run(req).await;
-
-    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-        // Audit evidence, not an error — info! lets fail2ban / SIEM
-        // consume the line without triggering error-rate alerts.
-        tracing::info!(
-            client_ip = client_ip.as_deref().unwrap_or("<unknown>"),
-            scope,
-            path = %path,
-            "rate limit rejection"
-        );
-        emit_reject_metric(path, scope);
+/// Policy body for [`rate_limit_middleware`]. Split out so the entry
+/// point stays a nameable `fn` while the logic reads as a normal
+/// `async fn`.
+async fn rate_limit_middleware_impl(state: RateLimitState, req: Request, next: Next) -> Response {
+    // (a) Method filter — GET/HEAD/OPTIONS are never rate-limited so
+    // proxy-path reads (PyPI simple index, npm packuments, OCI blob
+    // GETs) pass through untouched.
+    if !write_methods().contains(req.method()) {
+        return next.run(req).await;
     }
 
+    // (b) Client IP. A missing `RequestTrust` means the trust layer did
+    // not run before us (router-wiring bug). Surface 500 — never a
+    // silent bucket-bypass. A `ConnectInfo` fallback would quietly defeat
+    // the trust policy.
+    let Some(client_ip) = req.extensions().get::<RequestTrust>().map(|t| t.client_ip) else {
+        tracing::error!(
+            scope = state.scope,
+            "rate limit: RequestTrust missing from extensions; router-wiring bug — \
+             refusing to bypass bucket"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+
+    // (c) Exemption — operator-declared trusted ranges (e.g. first-party
+    // CI egress) bypass BOTH buckets entirely.
+    if cidr_contains(client_ip, &state.exempt_cidrs) {
+        return next.run(req).await;
+    }
+
+    // (d) Limit.
+    match state.limiter.check_key(&client_ip) {
+        Ok(_) => next.run(req).await,
+        Err(not_until) => {
+            let wait = not_until.wait_time_from(governor::clock::Clock::now(
+                &governor::clock::DefaultClock::default(),
+            ));
+            // Whole seconds, rounded up, floored at 1 so a client that
+            // reads `Retry-After` never hot-loops on `Retry-After: 0`.
+            let secs = (wait.as_millis().div_ceil(1000)).max(1) as u64;
+
+            let path = resolve_matched_path(&req);
+            // Audit evidence, not an error — info! lets fail2ban / SIEM
+            // consume the line without triggering error-rate alerts.
+            tracing::info!(
+                client_ip = %client_ip,
+                scope = state.scope,
+                path = %path,
+                "rate limit rejection"
+            );
+            emit_reject_metric(path, state.scope);
+            rate_limit_response(secs)
+        }
+    }
+}
+
+/// Build the canonical 429 response: floored `Retry-After`,
+/// `Content-Type: application/json`, and the [`RATE_LIMIT_BODY`] envelope.
+fn rate_limit_response(retry_after_secs: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        RATE_LIMIT_BODY,
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
     response
 }
 
@@ -301,51 +358,25 @@ async fn observe_rejects(req: Request, next: Next, scope: &'static str) -> Respo
 // Public layer builders
 // ---------------------------------------------------------------------------
 
-/// Scope-bound observer for auth rate-limit rejects. `async fn` — axum's
-/// `from_fn` does the FromRequest-tuple inference directly from the
-/// signature; no function-pointer cast required.
-async fn auth_observer(req: Request, next: Next) -> Response {
-    observe_rejects(req, next, SCOPE_AUTH).await
-}
-
-/// Scope-bound observer for write-path rate-limit rejects.
-async fn write_observer(req: Request, next: Next) -> Response {
-    observe_rejects(req, next, SCOPE_WRITE).await
-}
-
-/// Composed layer type returned by the public builders. Stacks an
-/// [`axum::middleware::from_fn`] observer OUTSIDE a [`GovernorLayer`] so
-/// the observer sees the 429 response produced by the inner governor.
-///
-/// The extractor tuple `(Request,)` in the middle of the
-/// `FromFnLayer` generics matches axum's convention: the last tuple
-/// element is the axum extractor (`Request` here, since the observer
-/// takes the full request body), preceding elements are
-/// `FromRequestParts` — none in our case.
-pub type RateLimitLayer = Stack<
-    GovernorLayer<TrustAwareKeyExtractor, governor::middleware::NoOpMiddleware>,
-    Stack<
-        axum::middleware::FromFnLayer<fn(Request, Next) -> ObserverFuture, (), (Request,)>,
-        tower::layer::util::Identity,
-    >,
->;
-
-/// Future type for the observer `fn` pointers baked into the
-/// [`RateLimitLayer`] alias. Boxed + pinned so the `fn` signatures the
-/// stack type-alias references are nameable.
-pub type ObserverFuture =
+/// Future returned by [`rate_limit_middleware`]. Boxed + pinned so the
+/// `fn` pointer in [`RateLimitMiddlewareFn`] is nameable.
+pub type RateLimitFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'static>>;
 
-/// Fn-pointer wrappers that hand `from_fn` a nameable function type. The
-/// underlying `async fn` observers desugar to anonymous futures; casting
-/// the wrappers to `fn(Request, Next) -> ObserverFuture` gives the type
-/// alias [`RateLimitLayer`] a concrete middleware function type to quote.
-fn auth_observer_fn(req: Request, next: Next) -> ObserverFuture {
-    Box::pin(auth_observer(req, next))
-}
-fn write_observer_fn(req: Request, next: Next) -> ObserverFuture {
-    Box::pin(write_observer(req, next))
-}
+/// Signature of [`rate_limit_middleware`]. Captured as a type alias so the
+/// `FromFnLayer` generics in [`RateLimitLayer`] stay legible. Mirrors the
+/// `TrustMiddlewareFn` pattern in [`crate::middleware::trust`].
+pub type RateLimitMiddlewareFn = fn(State<RateLimitState>, Request, Next) -> RateLimitFuture;
+
+/// Axum tracks the middleware extractor tuple WITHOUT the trailing `Next`.
+/// For `fn(State<_>, Request, Next)` the tuple is `(State<_>, Request)`.
+pub type RateLimitMiddlewareArgs = (State<RateLimitState>, Request);
+
+/// Layer type returned by the public builders — an
+/// [`axum::middleware::from_fn_with_state`] wrapping
+/// [`rate_limit_middleware`].
+pub type RateLimitLayer =
+    axum::middleware::FromFnLayer<RateLimitMiddlewareFn, RateLimitState, RateLimitMiddlewareArgs>;
 
 /// Build the auth-scope rate-limit layer. Wraps the `require_principal`
 /// middleware: a flood of failing auth attempts from one IP trips this
@@ -354,39 +385,29 @@ fn write_observer_fn(req: Request, next: Next) -> ObserverFuture {
 /// `.layer()` this onto the route subtree that carries
 /// [`crate::middleware::auth::require_principal`] — in the current
 /// composition, that's wherever the method-dispatched auth layer attaches.
+/// The middleware's own method filter skips GET/HEAD/OPTIONS, so only
+/// write methods (which exercise the credential-validation path) tick the
+/// bucket — a GET under an Enabled auth context is not an "auth attempt".
 pub fn auth_rate_limit_layer(config: &RateLimitConfig) -> RateLimitLayer {
-    // Auth-scope limit wraps `require_principal`. The existing
-    // `method_based_auth_dispatch` already routes GET/HEAD/OPTIONS through
-    // `extract_optional_principal` (never 401s), so only write methods
-    // exercise the credential-validation path this layer defends.
-    // Mirroring that shape keeps the auth-rate-limit metric bounded to
-    // credential-stuffing traffic; a GET hitting the router under an
-    // Enabled auth context is not an "auth attempt" — don't tick the
-    // bucket for it.
-    let governor = GovernorLayer {
-        config: build_governor_config(config.auth_per_min, Some(write_methods())),
+    let state = RateLimitState {
+        limiter: Arc::new(build_keyed_limiter(config.auth_per_min)),
+        exempt_cidrs: config.exempt_cidrs.clone(),
+        scope: SCOPE_AUTH,
     };
-    let observer: fn(Request, Next) -> ObserverFuture = auth_observer_fn;
-    ServiceBuilder::new()
-        .layer(axum::middleware::from_fn(observer))
-        .layer(governor)
-        .into_inner()
+    axum::middleware::from_fn_with_state(state, rate_limit_middleware as RateLimitMiddlewareFn)
 }
 
-/// Build the write-scope rate-limit layer. Applied globally but
-/// tower_governor's `methods` filter skips GET/HEAD/OPTIONS —
-/// mutating methods only. Reads stay unlimited so proxy-path GET
-/// traffic, PyPI simple index lookups, and npm packument fetches are
-/// unaffected.
+/// Build the write-scope rate-limit layer. Applied globally but the
+/// middleware's method filter skips GET/HEAD/OPTIONS — mutating methods
+/// only. Reads stay unlimited so proxy-path GET traffic, PyPI simple index
+/// lookups, and npm packument fetches are unaffected.
 pub fn write_rate_limit_layer(config: &RateLimitConfig) -> RateLimitLayer {
-    let governor = GovernorLayer {
-        config: build_governor_config(config.write_per_min, Some(write_methods())),
+    let state = RateLimitState {
+        limiter: Arc::new(build_keyed_limiter(config.write_per_min)),
+        exempt_cidrs: config.exempt_cidrs.clone(),
+        scope: SCOPE_WRITE,
     };
-    let observer: fn(Request, Next) -> ObserverFuture = write_observer_fn;
-    ServiceBuilder::new()
-        .layer(axum::middleware::from_fn(observer))
-        .layer(governor)
-        .into_inner()
+    axum::middleware::from_fn_with_state(state, rate_limit_middleware as RateLimitMiddlewareFn)
 }
 
 /// HTTP methods the rate-limit layers engage on. Mirrors
@@ -403,8 +424,6 @@ fn write_methods() -> Vec<Method> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::net::Ipv4Addr;
 
     use axum::body::Body;
     use axum::http::{header, Request as HttpRequest, StatusCode};
@@ -425,6 +444,54 @@ mod tests {
         RequestTrust {
             client_ip: ip.parse().unwrap(),
             public_url: url::Url::parse("http://hort-server/").unwrap(),
+        }
+    }
+
+    // --- Root-cause regression: a `*_PER_MIN` cap must SUSTAIN that many
+    // requests per minute, not collapse to 1/min after the initial burst.
+    // The pre-fix `.per_second(60)` set a fixed 60s replenish interval,
+    // sustaining 1 token/min regardless of the cap (~60-300x too tight). ---
+
+    #[test]
+    fn emission_period_encodes_per_minute_rate() {
+        // One token every 60s/cap → `cap` tokens replenished per minute.
+        assert_eq!(emission_period(60), Duration::from_secs(1));
+        assert_eq!(emission_period(300), Duration::from_millis(200));
+        // The degenerate cap=1 is the ONLY value for which a fixed 60s
+        // interval was ever correct — proving the old constant was a
+        // cap=1 special case, not the general rule.
+        assert_eq!(emission_period(1), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn governor_config_sustains_cap_per_minute() {
+        use governor::clock::FakeRelativeClock;
+        use governor::{Quota, RateLimiter};
+        use std::num::NonZeroU32;
+
+        for cap in [60u32, 300] {
+            let clock = FakeRelativeClock::default();
+            // Same quota shape `build_keyed_limiter` produces:
+            // `Quota::with_period(period).allow_burst(burst)`.
+            let quota = Quota::with_period(emission_period(cap))
+                .expect("non-zero period")
+                .allow_burst(NonZeroU32::new(cap).expect("non-zero cap"));
+            let lim = RateLimiter::direct_with_clock(quota, clock.clone());
+
+            // Burst of `cap` admitted immediately; burst+1 rejects.
+            let burst_ok = (0..cap).filter(|_| lim.check().is_ok()).count() as u32;
+            assert_eq!(burst_ok, cap, "cap={cap}: full burst should pass");
+            assert!(lim.check().is_err(), "cap={cap}: burst+1 must reject");
+
+            // After one minute the bucket admits ~cap MORE (sustained
+            // cap/min). The pre-fix fixed-60s-period bug refilled only 1.
+            clock.advance(Duration::from_secs(60));
+            let refilled = (0..cap * 2).filter(|_| lim.check().is_ok()).count() as u32;
+            assert!(
+                refilled >= cap - 1,
+                "cap={cap}: expected ~{cap}/min sustained, only {refilled} refilled \
+                 in a minute (the fixed-60s-period bug sustains 1/min)"
+            );
         }
     }
 
@@ -486,25 +553,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // TrustAwareKeyExtractor — contract
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn key_extractor_returns_client_ip_from_request_trust() {
-        let req = req_with_trust("/x", trust("10.0.0.5"));
-        let key = TrustAwareKeyExtractor.extract(&req).unwrap();
-        assert_eq!(key, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
-    }
-
-    #[test]
-    fn key_extractor_errors_when_trust_missing_from_extensions() {
-        // No RequestTrust in extensions → router-wiring bug → 500.
-        let req = HttpRequest::get("/x").body(Body::empty()).unwrap();
-        let err = TrustAwareKeyExtractor.extract(&req).unwrap_err();
-        assert!(matches!(err, GovernorError::UnableToExtractKey));
-    }
-
-    // ------------------------------------------------------------------
     // resolve_matched_path — tested independently of axum routing
     // ------------------------------------------------------------------
 
@@ -527,7 +575,7 @@ mod tests {
 
     #[test]
     fn config_new_stores_explicit_values() {
-        let cfg = RateLimitConfig::new(10, 50);
+        let cfg = RateLimitConfig::new(10, 50, vec![]);
         assert_eq!(cfg.auth_per_min, 10);
         assert_eq!(cfg.write_per_min, 50);
     }
@@ -545,44 +593,57 @@ mod tests {
         // GET/HEAD/OPTIONS (credential stuffing only exercises write
         // methods via `require_principal`). A GET would bypass the bucket
         // entirely and never 429.
-        let cfg = RateLimitConfig::new(2, 10);
-        let (snap, (status_1, status_2, status_3, retry_after)) = capture(|| {
-            rt(async {
-                let router = Router::new()
-                    .route("/protected", post(ok_handler))
-                    .layer(auth_rate_limit_layer(&cfg));
-                let s1 = router
-                    .clone()
-                    .oneshot(post_with_trust("/protected", trust("10.0.0.1")))
-                    .await
-                    .unwrap()
-                    .status();
-                let s2 = router
-                    .clone()
-                    .oneshot(post_with_trust("/protected", trust("10.0.0.1")))
-                    .await
-                    .unwrap()
-                    .status();
-                let r3 = router
-                    .oneshot(post_with_trust("/protected", trust("10.0.0.1")))
-                    .await
-                    .unwrap();
-                let s3 = r3.status();
-                let retry_after = r3
-                    .headers()
-                    .get(header::RETRY_AFTER)
-                    .map(|v| v.to_str().unwrap().to_owned());
-                (s1, s2, s3, retry_after)
-            })
-        });
+        let cfg = RateLimitConfig::new(2, 10, vec![]);
+        let (snap, (status_1, status_2, status_3, retry_after, content_type, body)) =
+            capture(|| {
+                rt(async {
+                    let router = Router::new()
+                        .route("/protected", post(ok_handler))
+                        .layer(auth_rate_limit_layer(&cfg));
+                    let s1 = router
+                        .clone()
+                        .oneshot(post_with_trust("/protected", trust("10.0.0.1")))
+                        .await
+                        .unwrap()
+                        .status();
+                    let s2 = router
+                        .clone()
+                        .oneshot(post_with_trust("/protected", trust("10.0.0.1")))
+                        .await
+                        .unwrap()
+                        .status();
+                    let r3 = router
+                        .oneshot(post_with_trust("/protected", trust("10.0.0.1")))
+                        .await
+                        .unwrap();
+                    let s3 = r3.status();
+                    let retry_after = r3
+                        .headers()
+                        .get(header::RETRY_AFTER)
+                        .map(|v| v.to_str().unwrap().to_owned());
+                    let content_type = r3
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .map(|v| v.to_str().unwrap().to_owned());
+                    let body = axum::body::to_bytes(r3.into_body(), 1024).await.unwrap();
+                    (s1, s2, s3, retry_after, content_type, body)
+                })
+            });
         assert_eq!(status_1, StatusCode::OK);
         assert_eq!(status_2, StatusCode::OK);
         assert_eq!(status_3, StatusCode::TOO_MANY_REQUESTS);
-        // tower_governor always sets Retry-After on 429.
+        // The limiter always sets Retry-After on 429, floored at 1s.
+        let retry_after = retry_after.expect("Retry-After header missing on 429 response");
+        let retry_secs: u64 = retry_after
+            .parse()
+            .expect("Retry-After must be integer seconds");
         assert!(
-            retry_after.is_some(),
-            "Retry-After header missing on 429 response"
+            retry_secs >= 1,
+            "Retry-After must be floored at 1s, got {retry_secs}"
         );
+        // The new response construction: JSON envelope + content-type.
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        assert_eq!(&body[..], br#"{"error":"too many requests"}"#);
 
         // Metric assertion — exactly one increment for `scope=auth` on the
         // matched route template.
@@ -601,7 +662,7 @@ mod tests {
     // auth-rate-limit filter mirrors that split.
     #[test]
     fn auth_layer_skips_get_requests_regardless_of_burst() {
-        let cfg = RateLimitConfig::new(1, 10);
+        let cfg = RateLimitConfig::new(1, 10, vec![]);
         let statuses = rt(async {
             let router = Router::new()
                 .route("/open", get(ok_handler))
@@ -631,7 +692,7 @@ mod tests {
 
     #[test]
     fn write_layer_emits_429_and_metric_on_burst_exceeded() {
-        let cfg = RateLimitConfig::new(10, 1);
+        let cfg = RateLimitConfig::new(10, 1, vec![]);
         let (snap, (status_1, status_2)) = capture(|| {
             rt(async {
                 let router = Router::new()
@@ -670,7 +731,7 @@ mod tests {
 
     #[test]
     fn distinct_client_ips_have_independent_buckets() {
-        let cfg = RateLimitConfig::new(1, 1);
+        let cfg = RateLimitConfig::new(1, 1, vec![]);
         let statuses = rt(async {
             let router = Router::new()
                 .route("/protected", post(ok_handler))
@@ -716,7 +777,7 @@ mod tests {
         // against a route that does NOT have the layer attached stays 200
         // for >> burst requests from the same IP. Mirrors the production
         // sub-router split: reads live outside the write-layer scope.
-        let cfg = RateLimitConfig::new(10, 1);
+        let cfg = RateLimitConfig::new(10, 1, vec![]);
         let all_200 = rt(async {
             let write_scope = Router::new()
                 .route("/upload", post(ok_handler))
@@ -755,7 +816,7 @@ mod tests {
         //
         // Uses POST because the methods filter skips GETs (see
         // `auth_layer_skips_get_requests_regardless_of_burst`).
-        let cfg = RateLimitConfig::new(1, 10);
+        let cfg = RateLimitConfig::new(1, 10, vec![]);
         let snap = capture(|| {
             rt(async {
                 let router = Router::new()
@@ -814,7 +875,7 @@ mod tests {
         //
         // POST to reach the rate-limiter's method filter; a GET would
         // bypass the limiter entirely and succeed with 200.
-        let cfg = RateLimitConfig::new(1, 1);
+        let cfg = RateLimitConfig::new(1, 1, vec![]);
         let status = rt(async {
             let router = Router::new()
                 .route("/protected", post(ok_handler))
@@ -824,5 +885,94 @@ mod tests {
             router.oneshot(req).await.unwrap().status()
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ------------------------------------------------------------------
+    // CIDR exemption — an exempt client_ip bypasses BOTH buckets
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn exempt_cidr_bypasses_write_bucket() {
+        // write cap = 1, but the caller's IP is in the exempt set →
+        // every POST is admitted (200), no 429 regardless of burst.
+        let cfg = RateLimitConfig::new(10, 1, vec!["10.0.0.0/8".parse().unwrap()]);
+        let statuses = rt(async {
+            let router = Router::new()
+                .route("/upload", post(ok_handler))
+                .layer(write_rate_limit_layer(&cfg));
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                let s = router
+                    .clone()
+                    .oneshot(post_with_trust("/upload", trust("10.1.2.3")))
+                    .await
+                    .unwrap()
+                    .status();
+                seen.push(s);
+            }
+            seen
+        });
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::OK),
+            "exempt IP must bypass the write bucket: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn exempt_cidr_bypasses_auth_bucket() {
+        // auth cap = 1, caller in the exempt set → every POST 200.
+        let cfg = RateLimitConfig::new(1, 10, vec!["10.0.0.0/8".parse().unwrap()]);
+        let statuses = rt(async {
+            let router = Router::new()
+                .route("/protected", post(ok_handler))
+                .layer(auth_rate_limit_layer(&cfg));
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                let s = router
+                    .clone()
+                    .oneshot(post_with_trust("/protected", trust("10.9.9.9")))
+                    .await
+                    .unwrap()
+                    .status();
+                seen.push(s);
+            }
+            seen
+        });
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::OK),
+            "exempt IP must bypass the auth bucket: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn non_exempt_ip_still_limited_when_exempt_set_nonempty() {
+        // Exempt set covers 10.0.0.0/8; a caller from 203.0.113.7 is NOT
+        // exempt and must still trip the burst=1 auth cap on its second
+        // request. Proves the exemption is a targeted allowlist, not a
+        // global off-switch.
+        let cfg = RateLimitConfig::new(1, 10, vec!["10.0.0.0/8".parse().unwrap()]);
+        let (s1, s2) = rt(async {
+            let router = Router::new()
+                .route("/protected", post(ok_handler))
+                .layer(auth_rate_limit_layer(&cfg));
+            let s1 = router
+                .clone()
+                .oneshot(post_with_trust("/protected", trust("203.0.113.7")))
+                .await
+                .unwrap()
+                .status();
+            let s2 = router
+                .oneshot(post_with_trust("/protected", trust("203.0.113.7")))
+                .await
+                .unwrap()
+                .status();
+            (s1, s2)
+        });
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(
+            s2,
+            StatusCode::TOO_MANY_REQUESTS,
+            "non-exempt IP must still be limited when an exempt set is configured"
+        );
     }
 }

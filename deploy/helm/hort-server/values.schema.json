@@ -624,6 +624,7 @@
     },
     "requireHttps": {"type": "boolean"},
     "trustedProxyCidrs": {"type": "array", "items": {"type": "string"}},
+    "rateLimitExemptCidrs": {"type": "array", "items": {"type": "string"}},
     "http": {
       "type": "object",
       "additionalProperties": false,

@@ -39,6 +39,13 @@ hort_api_port: 8080
 # Metrics listener port (internal; NOT exposed to the internet).
 hort_metrics_port: 9090
 
+# HORT_RATELIMIT_EXEMPT_CIDRS — comma-separated source CIDRs whose resolved
+# client IP bypasses BOTH the auth and write rate-limit buckets. The escape
+# hatch for first-party CI that shares one egress IP and would otherwise
+# collapse into a single per-IP bucket and 429 on legitimate publish bursts.
+# Empty (default) = every IP is rate-limited. Only list source ranges you trust.
+hort_ratelimit_exempt_cidrs: ""
+
 # ── Dex IdP sidecar (optional, shared by both flavors) ────────────────────────
 # Minimal OIDC IdP for the human-admin path: human admin is OIDC (Dex) ->
 # CliSession, not a static service-account token. Default OFF — the base deploy

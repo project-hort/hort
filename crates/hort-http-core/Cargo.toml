@@ -36,7 +36,6 @@ hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory", o
 axum                        = { workspace = true }
 tower                       = { workspace = true }
 tower-http                  = { workspace = true }
-tower_governor              = { version = "=0.5.0", default-features = false, features = ["axum"] }
 governor                    = "0.8"
 tokio                       = { workspace = true }
 tokio-util                  = { workspace = true }

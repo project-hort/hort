@@ -1,0 +1,19 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "baseBranches": ["develop"],
+  "labels": ["dependencies"],
+  "commitMessagePrefix": "chore:",
+  "description": [
+    "github-actions manager disabled: GitHub Dependabot manages hort's .github/workflows; Renovate handles the cargo / docker / gitlab-ci deps and targets develop. NOTE: Renovate reads this from the default branch (main), so it takes effect once this reaches main via a develop->main promotion."
+  ],
+  "github-actions": { "enabled": false },
+  "packageRules": [
+    {
+      "description": "RustCrypto digest 0.10->0.11 migration is mid-flight; hold sha2/hmac/md-5/sha1 until a coordinated bump. Mirrors the ignore in .github/dependabot.yml.",
+      "matchPackageNames": ["sha2", "hmac", "md-5", "sha1"],
+      "matchUpdateTypes": ["minor", "major"],
+      "enabled": false
+    }
+  ]
+}

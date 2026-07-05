@@ -1659,7 +1659,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         include_service_account_label: base.include_service_account_label,
         url_resolver: base.url_resolver,
         trust_config: base.trust_config.clone(),
-        rate_limit_config: base.rate_limit_config,
+        rate_limit_config: base.rate_limit_config.clone(),
         concurrency_limit_config: base.concurrency_limit_config,
         http_timeout_config: base.http_timeout_config,
         publish_body_limit_bytes: base.publish_body_limit_bytes,

@@ -142,6 +142,10 @@ other helper.
 - name: HORT_TRUSTED_PROXY_CIDRS
   value: {{ join "," .Values.trustedProxyCidrs | quote }}
 {{- end }}
+{{- if .Values.rateLimitExemptCidrs }}
+- name: HORT_RATELIMIT_EXEMPT_CIDRS
+  value: {{ join "," .Values.rateLimitExemptCidrs | quote }}
+{{- end }}
 # ----- Auth -----
 - name: HORT_AUTH_PROVIDER
   value: {{ .Values.auth.provider | quote }}
