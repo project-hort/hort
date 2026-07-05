@@ -1,0 +1,15 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "baseBranches": ["develop"],
+  "labels": ["dependencies"],
+  "commitMessagePrefix": "chore:",
+  "packageRules": [
+    {
+      "description": "RustCrypto digest 0.10->0.11 migration is mid-flight; hold sha2/hmac/md-5/sha1 until a coordinated bump. Mirrors the ignore in .github/dependabot.yml.",
+      "matchPackageNames": ["sha2", "hmac", "md-5", "sha1"],
+      "matchUpdateTypes": ["minor", "major"],
+      "enabled": false
+    }
+  ]
+}
