@@ -549,11 +549,15 @@ async fn run_async() -> anyhow::Result<()> {
     // Rate-limit config. Parsed in
     // `Config::from_env`; assembled into `RateLimitConfig` here and
     // threaded into `AppContext` the same way as `TrustConfig`.
-    let rate_limit_config =
-        RateLimitConfig::new(cfg.ratelimit_auth_per_min, cfg.ratelimit_write_per_min);
+    let rate_limit_config = RateLimitConfig::new(
+        cfg.ratelimit_auth_per_min,
+        cfg.ratelimit_write_per_min,
+        cfg.ratelimit_exempt_cidrs.clone(),
+    );
     info!(
         auth_per_min = rate_limit_config.auth_per_min,
         write_per_min = rate_limit_config.write_per_min,
+        exempt_cidr_count = rate_limit_config.exempt_cidrs.len(),
         "rate-limit configuration loaded"
     );
 

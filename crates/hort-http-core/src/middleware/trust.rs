@@ -371,7 +371,7 @@ fn resolve_public_url(
     config.bind_addr_default.clone()
 }
 
-fn cidr_contains(ip: IpAddr, cidrs: &[IpNet]) -> bool {
+pub(crate) fn cidr_contains(ip: IpAddr, cidrs: &[IpNet]) -> bool {
     // Dual-stack peers that arrive as
     // `::ffff:a.b.c.d` (IPv4-mapped IPv6, RFC 4291 §2.5.5) must match
     // operator-configured IPv4 CIDRs (e.g. `10.0.0.0/8`). Without

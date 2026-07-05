@@ -15,8 +15,9 @@
 //!   in-flight per IP (`HORT_MAX_INFLIGHT_PER_IP`). Reads
 //!   [`RequestTrust::client_ip`] from request extensions (populated by
 //!   the request trust layer); a missing trust extension surfaces as a 500
-//!   rather than silently bypassing the cap (mirrors
-//!   [`crate::middleware::rate_limit::TrustAwareKeyExtractor`]).
+//!   rather than silently bypassing the cap (same "missing trust → 500,
+//!   never bucket-bypass" invariant the rate-limit middleware enforces —
+//!   see [`crate::middleware::rate_limit`]).
 //!
 //! # Threat model
 //!
@@ -319,7 +320,8 @@ pub async fn global_load_shed_middleware(
 ///
 /// Reads `client_ip` from [`RequestTrust`] (populated by the request
 /// trust layer). On a missing extension surfaces 500 — same conservative
-/// failure mode as [`crate::middleware::rate_limit::TrustAwareKeyExtractor`].
+/// failure mode the rate-limit middleware uses (see
+/// [`crate::middleware::rate_limit`]).
 /// Get-or-inserts an `Arc<Semaphore>` for that IP and try-acquires one
 /// permit; failure sheds with 503 and the
 /// `result=per_ip_shed` metric label.

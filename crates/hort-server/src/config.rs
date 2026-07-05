@@ -306,7 +306,7 @@ pub struct Config {
     /// Applied by [`hort_http_core::middleware::rate_limit::auth_rate_limit_layer`]
     /// wrapping `require_principal`. Zero surfaces as
     /// [`ConfigError::ValueNotPositive`] — a zero burst would reject every
-    /// request and the layer's `build_governor_config` asserts non-zero.
+    /// request and the layer's `build_keyed_limiter` asserts non-zero.
     pub ratelimit_auth_per_min: u32,
     /// Per-IP write-path rate-limit cap,
     /// in requests per minute. Parsed from `HORT_RATELIMIT_WRITE_PER_MIN`;
@@ -316,6 +316,17 @@ pub struct Config {
     /// wrapping the POST/PUT/DELETE sub-router. Zero surfaces as
     /// [`ConfigError::ValueNotPositive`].
     pub ratelimit_write_per_min: u32,
+    /// Source ranges exempt from BOTH rate-limit
+    /// buckets. Parsed from `HORT_RATELIMIT_EXEMPT_CIDRS` (comma-separated
+    /// CIDRs, e.g. `10.0.0.0/8,192.168.1.0/24`); empty when unset.
+    ///
+    /// Threaded into both rate-limit layers via `RateLimitConfig`. A
+    /// resolved `client_ip` inside any listed range bypasses rate
+    /// limiting entirely — the escape hatch for first-party CI that shares
+    /// one egress IP and would otherwise collapse into a single per-IP
+    /// bucket. Individual malformed entries surface as
+    /// [`ConfigError::InvalidCidr`].
+    pub ratelimit_exempt_cidrs: Vec<IpNet>,
     /// Workspace-wide concurrent-request
     /// cap. Parsed from `HORT_MAX_INFLIGHT`; defaults to `512`.
     ///
@@ -867,6 +878,7 @@ impl std::fmt::Debug for Config {
             jwks_resp_body_max_bytes,
             ratelimit_auth_per_min,
             ratelimit_write_per_min,
+            ratelimit_exempt_cidrs,
             max_inflight,
             max_inflight_per_ip,
             rbac_refresh_secs,
@@ -944,6 +956,7 @@ impl std::fmt::Debug for Config {
             .field("jwks_resp_body_max_bytes", jwks_resp_body_max_bytes)
             .field("ratelimit_auth_per_min", ratelimit_auth_per_min)
             .field("ratelimit_write_per_min", ratelimit_write_per_min)
+            .field("ratelimit_exempt_cidrs", ratelimit_exempt_cidrs)
             .field("max_inflight", max_inflight)
             .field("max_inflight_per_ip", max_inflight_per_ip)
             .field("rbac_refresh_secs", rbac_refresh_secs)
@@ -1936,6 +1949,8 @@ impl Config {
 
         let ratelimit_write_per_min = parse_ratelimit_write_per_min()?;
 
+        let ratelimit_exempt_cidrs = parse_ratelimit_exempt_cidrs()?;
+
         // Workspace-wide + per-IP concurrency caps. Defaults: 512 / 32.
         let max_inflight = parse_max_inflight()?;
         let max_inflight_per_ip = parse_max_inflight_per_ip()?;
@@ -2397,6 +2412,7 @@ impl Config {
             jwks_resp_body_max_bytes,
             ratelimit_auth_per_min,
             ratelimit_write_per_min,
+            ratelimit_exempt_cidrs,
             max_inflight,
             max_inflight_per_ip,
             rbac_refresh_secs,
@@ -2570,9 +2586,9 @@ fn parse_stateful_upload_staging_dir(storage: &StorageConfig) -> Result<PathBuf,
 ///
 /// Absent or empty env var → the 60-request/minute default. Non-integer
 /// values surface as [`ConfigError::InvalidInt`]; zero surfaces as
-/// [`ConfigError::ValueNotPositive`] — `tower_governor`'s `finish()`
-/// returns `None` on `burst_size == 0`, and our layer builder panics on
-/// that path (defensive; should never fire because of this check).
+/// [`ConfigError::ValueNotPositive`] — a zero burst would make `governor`'s
+/// `Quota` reject the cap, and our layer builder (`build_keyed_limiter`)
+/// asserts non-zero (defensive; should never fire because of this check).
 fn parse_ratelimit_auth_per_min() -> Result<u32, ConfigError> {
     parse_positive::<u32>("HORT_RATELIMIT_AUTH_PER_MIN", 60)
 }
@@ -3045,8 +3061,30 @@ fn parse_upstream_allowlist() -> hort_app::use_cases::apply_config_use_case::Ups
 }
 
 fn parse_trusted_proxy_cidrs() -> Result<Vec<IpNet>, ConfigError> {
-    const VAR: &str = "HORT_TRUSTED_PROXY_CIDRS";
-    let raw = match std::env::var(VAR) {
+    parse_cidr_list("HORT_TRUSTED_PROXY_CIDRS")
+}
+
+/// Parse `HORT_RATELIMIT_EXEMPT_CIDRS`.
+///
+/// Absent or empty env var → empty `Vec` (no exemptions). Comma-separated
+/// list of CIDRs, e.g. `10.0.0.0/8,192.168.1.0/24`. Whitespace around
+/// entries is trimmed and empty entries are skipped, same shape as
+/// [`parse_trusted_proxy_cidrs`]. Any entry that fails to parse as an
+/// `IpNet` surfaces as [`ConfigError::InvalidCidr`] naming the offending
+/// string. A resolved `client_ip` in any listed range bypasses BOTH
+/// rate-limit buckets (see [`Config::ratelimit_exempt_cidrs`]).
+fn parse_ratelimit_exempt_cidrs() -> Result<Vec<IpNet>, ConfigError> {
+    parse_cidr_list("HORT_RATELIMIT_EXEMPT_CIDRS")
+}
+
+/// Shared comma-separated CIDR-list parser for the trust and rate-limit
+/// exemption env vars. Absent or empty → empty `Vec`. Whitespace around
+/// each entry is trimmed; empty entries (double/trailing comma) are
+/// skipped so `foo,,bar` doesn't surprise operators. Any entry that fails
+/// to parse as an `IpNet` surfaces as [`ConfigError::InvalidCidr`] naming
+/// `var` and the offending string.
+fn parse_cidr_list(var: &'static str) -> Result<Vec<IpNet>, ConfigError> {
+    let raw = match std::env::var(var) {
         Ok(v) if !v.is_empty() => v,
         _ => return Ok(Vec::new()),
     };
@@ -3059,7 +3097,7 @@ fn parse_trusted_proxy_cidrs() -> Result<Vec<IpNet>, ConfigError> {
         let net = trimmed
             .parse::<IpNet>()
             .map_err(|source| ConfigError::InvalidCidr {
-                var: VAR,
+                var,
                 entry: trimmed.to_string(),
                 source,
             })?;
@@ -3787,6 +3825,7 @@ mod tests {
             jwks_resp_body_max_bytes: 1024 * 1024,
             ratelimit_auth_per_min: 60,
             ratelimit_write_per_min: 300,
+            ratelimit_exempt_cidrs: Vec::new(),
             max_inflight: 512,
             max_inflight_per_ip: 32,
             rbac_refresh_secs: 30,
@@ -3908,6 +3947,7 @@ mod tests {
             jwks_resp_body_max_bytes: 1024 * 1024,
             ratelimit_auth_per_min: 60,
             ratelimit_write_per_min: 300,
+            ratelimit_exempt_cidrs: Vec::new(),
             max_inflight: 512,
             max_inflight_per_ip: 32,
             rbac_refresh_secs: 30,
@@ -4242,6 +4282,11 @@ mod tests {
             // `set_ratelimit_auth_per_min` / `set_ratelimit_write_per_min`.
             ("HORT_RATELIMIT_AUTH_PER_MIN", None),
             ("HORT_RATELIMIT_WRITE_PER_MIN", None),
+            // Rate-limit CIDR exemption. Absent in
+            // the default test env so `ratelimit_exempt_cidrs` falls
+            // through to an empty vec (no exemptions). Tests that exercise
+            // exemptions override this slot explicitly.
+            ("HORT_RATELIMIT_EXEMPT_CIDRS", None),
             // Concurrency caps. Absent in the
             // default test env so they fall through to 512 (workspace)
             // and 32 (per-IP). Tests override via `set_max_inflight` /
@@ -7150,6 +7195,63 @@ mod tests {
         temp_env::with_vars(env, || {
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.ratelimit_auth_per_min, 60);
+        });
+    }
+
+    // -- HORT_RATELIMIT_EXEMPT_CIDRS -------------------------------------------
+
+    #[test]
+    fn ratelimit_exempt_cidrs_unset_yields_empty_vec() {
+        temp_env::with_vars(fs_env(), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.ratelimit_exempt_cidrs.is_empty());
+        });
+    }
+
+    #[test]
+    fn ratelimit_exempt_cidrs_empty_env_yields_empty_vec() {
+        let mut env = fs_env();
+        set_env_slot(&mut env, "HORT_RATELIMIT_EXEMPT_CIDRS", Some(""));
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.ratelimit_exempt_cidrs.is_empty());
+        });
+    }
+
+    #[test]
+    fn ratelimit_exempt_cidrs_parses_multiple_entries() {
+        let mut env = fs_env();
+        set_env_slot(
+            &mut env,
+            "HORT_RATELIMIT_EXEMPT_CIDRS",
+            Some(" 10.0.0.0/8 , , 192.168.1.0/24 "),
+        );
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().unwrap();
+            // Whitespace trimmed, empty entry skipped.
+            assert_eq!(cfg.ratelimit_exempt_cidrs.len(), 2);
+            assert_eq!(cfg.ratelimit_exempt_cidrs[0], "10.0.0.0/8".parse().unwrap());
+            assert_eq!(
+                cfg.ratelimit_exempt_cidrs[1],
+                "192.168.1.0/24".parse().unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn ratelimit_exempt_cidrs_malformed_entry_rejected() {
+        let mut env = fs_env();
+        set_env_slot(
+            &mut env,
+            "HORT_RATELIMIT_EXEMPT_CIDRS",
+            Some("10.0.0.0/8,not-a-cidr"),
+        );
+        temp_env::with_vars(env, || match Config::from_env() {
+            Err(ConfigError::InvalidCidr { var, entry, .. }) => {
+                assert_eq!(var, "HORT_RATELIMIT_EXEMPT_CIDRS");
+                assert_eq!(entry, "not-a-cidr");
+            }
+            other => panic!("expected InvalidCidr, got {other:?}"),
         });
     }
 

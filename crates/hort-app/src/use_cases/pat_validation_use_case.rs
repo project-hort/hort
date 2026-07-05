@@ -154,7 +154,7 @@ struct ApiTokenUsedGate {
 ///
 /// Defaults: **30 misses / 5 min triggers a 15-min
 /// lockout**. Argon2id at OWASP-2024 cost is ~50–80 ms per verify, so
-/// an attacker botnet of N IPs × 60/min through `tower_governor`
+/// an attacker botnet of N IPs × 60/min through the per-IP rate limiter
 /// would otherwise pin N×80 CPU-cores at no auth cost — this
 /// gate caps the verify rate per IP-bucket regardless of where the
 /// global rate-limiter is.

@@ -5,7 +5,7 @@
 //! result is that a single attacker can hold a slowloris connection
 //! open until the OS socket timer fires (typically minutes), pinning a
 //! hyper accept worker per byte trickled through. The layer's
-//! [`tower_governor`]-based rate-limit only fires AFTER header parsing
+//! `governor`-based rate-limit only fires AFTER header parsing
 //! completes, so it does not bound this surface.
 //!
 //! This module replaces the `axum::serve(...)` call with an explicit
