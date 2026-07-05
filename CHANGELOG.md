@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-07-05
+
 Headlines: OCI **image-index / manifest-list (multi-arch) push**; **working
 push-then-sign under `provenance_mode: Required`** end to end — an unsigned
 image (index-shaped included) is held for the quarantine window, keyed cosign
