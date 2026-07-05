@@ -130,6 +130,17 @@ variables:
   - apt-get install -y -qq --no-install-recommends
       protobuf-compiler pkg-config libssl-dev ca-certificates curl git
 
+# Fetch the PREBUILT cargo-binstall (a single static binary) into
+# $CARGO_HOME/bin, so tool installs (`cargo binstall <tool>`) download a
+# prebuilt release instead of compiling the tool from source every pipeline.
+# Best-effort (`|| true`): if the fetch is unreachable, the per-tool install
+# lines fall back to `cargo install` (source), so binstall is a pure
+# accelerator and never a hard dependency of a gate. Requires curl on PATH.
+.install-binstall: &install-binstall
+  - curl -L --proto '=https' --tlsv1.2 -sSf
+      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh
+      | bash || true
+
 # Conditional internal-PKI CA trust. Two trust-store flavours: RHEL-family
 # (the buildah image) and Debian/Alpine (rust:slim, alpine/helm). Both are
 # no-ops when PLATFORM_CA_PATH is unset or the file is absent, so a public-CA
@@ -335,7 +346,9 @@ test:coverage:
     - *platform-ca-deb
     - *hort-auth-steps
     - rustup component add llvm-tools-preview
-    - cargo install --locked cargo-llvm-cov || true
+    - *install-binstall
+    - cargo binstall --no-confirm --locked cargo-llvm-cov
+      || cargo install --locked cargo-llvm-cov || true
   script:
     - cargo llvm-cov --workspace --lib
         --lcov --output-path lcov.info
@@ -405,13 +418,16 @@ test:integration:
 security:cargo-audit:
   stage: security
   image: ${RUST_IMAGE}
-  needs:
-    - job: test:unit
-      artifacts: false
+  # No workspace compile — `cargo audit` reads Cargo.lock and the tool is a
+  # prebuilt binstall download — so this runs from pipeline start rather than
+  # queuing behind the serialized test-compile chain.
+  needs: []
   before_script:
     - apt-get update -qq
-    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev
-    - cargo install --locked cargo-audit || true
+    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
+    - *install-binstall
+    - cargo binstall --no-confirm --locked cargo-audit
+      || cargo install --locked cargo-audit || true
   script:
     # Diagnostic JSON artefact captured first; failure-tolerant (||
     # true) so a non-zero exit still produces the upload below.
@@ -489,13 +505,16 @@ quality:no-plans-on-default-branch:
 security:cargo-deny:
   stage: security
   image: ${RUST_IMAGE}
-  needs:
-    - job: test:unit
-      artifacts: false
+  # No workspace compile — `cargo deny check` reads `cargo metadata` and the
+  # tool is a prebuilt binstall download — so this runs from pipeline start
+  # rather than queuing behind the serialized test-compile chain.
+  needs: []
   before_script:
     - apt-get update -qq
-    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev
-    - cargo install --locked cargo-deny || true
+    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
+    - *install-binstall
+    - cargo binstall --no-confirm --locked cargo-deny
+      || cargo install --locked cargo-deny || true
   script:
     - cargo deny --workspace check
 
@@ -986,7 +1005,9 @@ release:sbom:
     # already pulls curl + ca-certificates; add jq explicitly so the
     # Vault-token + key fetch in cosign-setup.sh succeeds.
     - apt-get install -y -qq --no-install-recommends jq
-    - cargo install --locked cargo-cyclonedx || true
+    - *install-binstall
+    - cargo binstall --no-confirm --locked cargo-cyclonedx
+      || cargo install --locked cargo-cyclonedx || true
     # Trust the platform CA (internal PKI) BEFORE cosign-setup.sh runs: in
     # vault-key mode its HTTPS call to ${VAULT_ADDR} (OpenBao) must verify
     # against an internal CA not in the public bundle. No-op when
