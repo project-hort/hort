@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A gitops boot-apply with an upstream host outside
+  `HORT_UPSTREAM_ALLOWLIST_HOSTS` now parks the pod not-ready (`/readyz` 503)
+  with a clear reason instead of writing some rows and then crashlooping.** The
+  allowlist was enforced only in the write stage (after repository rows were
+  already persisted), so a config gap left the config half-applied and the pod
+  in `CrashLoopBackOff`. The check now runs in the pre-write validation pass, so
+  the same violation is caught before any write and fails closed — the
+  documented apply-time scope (create/update only; deletes and unchanged rows
+  exempt) is unchanged.
+
 - **The inbound rate limiter now sustains its configured per-minute rate.** The
   auth (`HORT_RATELIMIT_AUTH_PER_MIN`, default 60) and write
   (`HORT_RATELIMIT_WRITE_PER_MIN`, default 300) token buckets replenished one
@@ -29,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Rate-limit `429` responses no longer advertise `Retry-After: 0`.** A
   sub-second wait is rounded up to at least 1 second, so a throttled client
   backs off for a beat instead of hot-looping on an immediate retry.
+
+### Security
+
+- Bumped `crossbeam-epoch` to 0.9.20 (transitive, via the Prometheus metrics
+  exporter) to clear RUSTSEC-2026-0204 (invalid pointer dereference in the
+  `fmt::Pointer` impl for `Atomic`/`Shared`). Bumped the `serial_test`
+  dev-dependency to 3.5.0, which drops the unsound `scc` (RUSTSEC-2026-0205);
+  `scc` was test-only and never shipped.
 
 ## [0.9.8] - 2026-07-05
 
