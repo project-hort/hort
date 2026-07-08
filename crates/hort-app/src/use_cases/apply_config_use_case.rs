@@ -1121,6 +1121,18 @@ impl ApplyConfigUseCase {
             }
         }
 
+        // ----- upstream-host allowlist (pre-write park gate) -----
+        // Enforce HORT_UPSTREAM_ALLOWLIST_HOSTS BEFORE any DB write, so an
+        // un-allowlisted upstream host parks boot not-ready
+        // (`GitopsBootError::PreflightValidate`, a `DomainError::Validation`)
+        // instead of writing Stage-1/2 rows and then crashlooping. The check
+        // is diff-scoped (create+update) to match the write-time enforcement
+        // in `apply_upstream_mappings`, so `delete`/unchanged rows stay
+        // exempt. `diff` is pure; `apply` recomputes it after this pass with
+        // the same snapshot, so the two plans agree.
+        let plan = diff(snapshot, desired);
+        self.check_upstream_allowlist_for_plan(&plan.upstream_mappings)?;
+
         Ok(())
     }
 
@@ -4926,6 +4938,79 @@ mod tests {
             0,
             "no mapping must persist after rejection"
         );
+    }
+
+    /// Issue #8 regression (boot park). An un-allowlisted upstream host is
+    /// caught in the PRE-WRITE `preflight_validate` pass and surfaces as a
+    /// `DomainError::Validation`, which `gitops_boot` maps to the
+    /// park-eligible `GitopsBootError::PreflightValidate` — so the pod parks
+    /// not-ready instead of writing Stage-1/2 rows and crashlooping.
+    #[tokio::test]
+    async fn preflight_validate_parks_on_un_allowlisted_upstream_host() {
+        let h = build_harness_with_allowlist(UpstreamHostAllowlist::Hosts(vec![
+            "registry.npmjs.org".to_string(),
+        ]));
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-mirror", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror",
+                "dockerhub/",
+                "https://registry-1.docker.io",
+            )],
+            ..Default::default()
+        };
+        let err =
+            h.uc.preflight_validate(&desired, &env_oidc())
+                .await
+                .expect_err("preflight must reject an un-allowlisted upstream host pre-write");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("registry-1.docker.io"),
+                    "preflight error must name the rejected host, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+    }
+
+    /// Issue #8 regression (no partial write). When an upstream host is not
+    /// allowlisted, `apply` aborts in the pre-write pass, so NO repository
+    /// row is written. The pre-fix path wrote Stage-2 repositories and then
+    /// failed the Stage-3 allowlist check, leaving a half-applied config that
+    /// crashlooped (a non-park `Apply` error) — this asserts zero repo writes.
+    #[tokio::test]
+    async fn apply_rejects_un_allowlisted_host_without_writing_repository_rows() {
+        let h = build_harness_with_allowlist(UpstreamHostAllowlist::Hosts(vec![
+            "registry.npmjs.org".to_string(),
+        ]));
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-mirror", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror",
+                "dockerhub/",
+                "https://registry-1.docker.io",
+            )],
+            ..Default::default()
+        };
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect_err("apply must reject an un-allowlisted upstream host");
+        let repo_writes = h
+            .repos
+            .call_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| matches!(c, MockCall::SaveManaged(..)))
+            .count();
+        assert_eq!(
+            repo_writes, 0,
+            "no repository row must be written when apply is rejected pre-write (issue #8)"
+        );
+        assert_eq!(h.upstream.entry_count(), 0, "no mapping persisted");
     }
 
     /// Allowlist with the host present accepts the mapping.
