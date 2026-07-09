@@ -14,14 +14,17 @@
 # and gives false confidence — that the index PUT never failed — which is the
 # exact gap issue #15 closed. The digest cosign signs is the index digest.
 #
-#   [1] PUSH (unsigned)      — a keyed `required` image is HELD, not rejected:
-#                               * an anonymous manifest GET/pull -> 503 (held,
-#                                 not consumable);
+#   [1] PUSH (unsigned)      — a keyed `required` image is HELD, not rejected.
+#                               The repo is PRIVATE (isPublic:false), so read
+#                               visibility gates BEFORE the artifact-level hold:
+#                               * an anonymous manifest GET/pull -> 401 + a
+#                                 `WWW-Authenticate` challenge (denied by
+#                                 visibility, ADR 0045); the hold's 503 is never
+#                                 observable anonymously on a private repo;
 #                               * a WRITE-authorized manifest HEAD -> 200/exists
 #                                 (the hold-read exemption, so the signer's
 #                                 cosign preflight can resolve the digest and
-#                                 ATTACH the signature). An anonymous GET stays
-#                                 503.
+#                                 ATTACH the signature).
 #   [2] SIGN                  — `cosign sign --key <keyed> --registry-referrers-mode=oci-1-1
 #                               <ref>@<digest>` attaches a subject-linked referrer.
 #                               hort re-verifies the SUBJECT image (S3), emits
@@ -32,9 +35,14 @@
 #                               would CAS-dedup to the signed artifact) is
 #                               pushed and never signed; at `quarantineDuration`
 #                               expiry the backstop (S4) makes the TERMINAL
-#                               decision -> `ProvenanceRejected{Unsigned}`; an
-#                               anonymous manifest GET transitions 503 (held)
-#                               -> 404 (MANIFEST_UNKNOWN).
+#                               decision -> `ProvenanceRejected{Unsigned}`.
+#                               On a PRIVATE repo an anonymous manifest GET is
+#                               401 throughout (visibility, not the hold), so
+#                               held and terminal are indistinguishable
+#                               anonymously; the terminal decision is observed
+#                               via the emitted `ProvenanceRejected` domain
+#                               event, exactly as [4/6] observes
+#                               `ProvenanceVerified`.
 #
 # -----------------------------------------------------------------------------
 # COSIGN RESOLVES THE SUBJECT BY GET (ADR 0039 §10).
@@ -163,12 +171,47 @@ case " ${HORT_COMPOSE_OVERLAYS:-} " in
     *" native-tokens "*) NATIVE_TOKENS=1 ;;
 esac
 
-# mint_pull_cap_jwt — mint a capability JWT scoped to pull-only on the signed
-# image via the real /v2/auth exchange (Basic <svc-token>). Prints the JWT.
-mint_pull_cap_jwt() {
+# mint_cap_jwt <image-name> <actions> — mint a capability JWT scoped to
+# <actions> on one image via the real /v2/auth exchange (Basic <svc-token>).
+# Prints the JWT. The pull-scoped caps carry the issue-#13 shape (read-only
+# cap, write-granted identity).
+mint_cap_jwt() {
     curl -sS -u "provenance-ci:${SVC_TOKEN}" \
-        "${HORT_URL}/v2/auth?service=${REGISTRY_HOST}&scope=repository:${REPO_KEY}/${SIGNED_NAME}:pull" \
+        "${HORT_URL}/v2/auth?service=${REGISTRY_HOST}&scope=repository:${REPO_KEY}/$1:$2" \
         2>/dev/null | jq -r '.token // empty'
+}
+
+# assert_pull_cap_grants_pull <jwt> <image-name> — the issue-#5 core. Decode the
+# capability JWT payload (middle segment, base64url) and assert its access[]
+# carries {type:repository, name:REPO_KEY/<image>, actions ⊇ [pull]}. On this
+# PRIVATE repo the provenance-ci read grant is LOAD-BEARING: without it the
+# /v2/auth mint would narrow the requested `pull` scope to an EMPTY access[]
+# (write does not imply read; permissions are flat), and cosign's subject
+# preflight would have nothing to authorize against. An empty/pull-less access[]
+# is the regression this closes — fail loudly with the decoded access[].
+assert_pull_cap_grants_pull() {
+    local jwt="$1" image="$2" payload json has_pull
+    payload="$(printf '%s' "$jwt" | cut -d. -f2)"
+    json="$(printf '%s' "$payload" | python3 -c '
+import base64, sys
+seg = sys.stdin.read().strip()
+seg += "=" * (-len(seg) % 4)
+sys.stdout.write(base64.urlsafe_b64decode(seg).decode("utf-8"))
+' 2>/dev/null || true)"
+    if [ -z "$json" ]; then
+        fail "decode /v2/auth capability JWT access[]" \
+             "could not base64url-decode the JWT payload segment of the pull-scoped mint"
+        return
+    fi
+    has_pull="$(printf '%s' "$json" | jq -r --arg n "${REPO_KEY}/${image}" \
+        '[.access[]? | select(.type=="repository" and .name==$n) | .actions[]?] | index("pull") // empty' \
+        2>/dev/null || true)"
+    if [ -n "$has_pull" ]; then
+        pass "/v2/auth pull-scoped mint carries access[] {repository ${REPO_KEY}/${image} : pull} — the private-repo read grant is load-bearing (issue #5)"
+    else
+        fail "/v2/auth pull-scoped access[] grants pull on the PRIVATE repo (issue #5)" \
+             "decoded access[] lacked a repository/${REPO_KEY}/${image}:pull entry — the read grant is not backing the cap. access[] = $(printf '%s' "$json" | jq -c '.access // []' 2>/dev/null || echo '<undecodable>')"
+    fi
 }
 
 if [ "$NATIVE_TOKENS" = "1" ]; then
@@ -187,9 +230,12 @@ if [ "$NATIVE_TOKENS" = "1" ]; then
     PUSH_USER="provenance-ci"; PUSH_SECRET="$SVC_TOKEN"
     # The hold probes ([2/6]) ride a PULL-scoped capability JWT — the
     # issue-#13 shape: read-only cap, write-granted identity.
-    HOLD_BEARER="$(mint_pull_cap_jwt)"
+    HOLD_BEARER="$(mint_cap_jwt "$SIGNED_NAME" pull)"
     [ -n "$HOLD_BEARER" ] || { fail "mint pull-scoped capability JWT" \
         "GET /v2/auth (Basic <svc-token>, scope …:pull) returned no token"; summary; }
+    # issue-#5 core: on the PRIVATE repo the minted pull-scoped cap must actually
+    # GRANT pull (the read grant is load-bearing). Assert its access[] here.
+    assert_pull_cap_grants_pull "$HOLD_BEARER" "$SIGNED_NAME"
     log "[auth] svc token minted; hold probes ride a pull-scoped /v2/auth capability JWT"
 else
     # The public half of COSIGN_KEY must match the worker's registered key or
@@ -260,16 +306,33 @@ fi
 log "[digest] pushed manifest digest = ${DIGEST}"
 
 # =============================================================================
-# [2/6] HELD — anonymous manifest pull 503; write-authorized manifest HEAD 200
+# [2/6] HELD (PRIVATE) — anonymous manifest read 401; write-authorized HEAD 200
 # =============================================================================
-log "==> [2/6] Assert HELD: anonymous manifest GET -> 503, write-authorized HEAD -> exists"
+log "==> [2/6] Assert PRIVATE+HELD: anonymous manifest GET -> 401 challenge, write-authorized HEAD/GET -> exists"
 
-ANON_GET_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
-    "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/${DIGEST}" 2>/dev/null || echo 000)"
-if [ "$ANON_GET_CODE" = "503" ]; then
-    pass "anonymous manifest GET on held image -> 503 (not consumable)"
+# PRIVATE repo (isPublic:false): an anonymous (no-credential) read is denied by
+# VISIBILITY before any artifact-level hold check, so it never observes the
+# hold's 503 — it gets 401 + a `WWW-Authenticate` challenge (ADR 0045). Native
+# tokens advertise `Bearer realm=…/v2/auth`; legacy (Basic) advertises
+# `Basic realm="hort"`. The status is 401 either way; the challenge SCHEME is
+# the mode-aware bit (asserted for native mode below).
+ANON_HDRS="$(curl -sS -o /dev/null -D - \
+    "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/${DIGEST}" 2>/dev/null || true)"
+ANON_GET_CODE="$(printf '%s' "$ANON_HDRS" | tr -d '\r' | awk 'toupper($1) ~ /^HTTP/ {print $2; exit}')"
+[ -n "$ANON_GET_CODE" ] || ANON_GET_CODE=000
+if [ "$ANON_GET_CODE" = "401" ]; then
+    pass "anonymous manifest GET on held PRIVATE image -> 401 (denied by visibility, ADR 0045 challenge; the hold's 503 is not observable anonymously)"
 else
-    fail "anonymous manifest GET -> 503" "got HTTP ${ANON_GET_CODE} (a held required image must 503 to pullers)"
+    fail "anonymous manifest GET -> 401 (private repo)" \
+         "got HTTP ${ANON_GET_CODE} (a private repo must deny an anonymous read with 401 + a challenge before the hold check, ADR 0045)"
+fi
+if [ "$NATIVE_TOKENS" = "1" ]; then
+    if printf '%s' "$ANON_HDRS" | tr -d '\r' | grep -qiE '^WWW-Authenticate:.*Bearer'; then
+        pass "anonymous denial advertises a Bearer challenge (native-token mode, ADR 0045 D1)"
+    else
+        fail "anonymous 401 advertises Bearer (native mode)" \
+             "no 'WWW-Authenticate: Bearer' header on the anonymous denial (ADR 0045 D1 mode-aware challenge selector)"
+    fi
 fi
 
 # In native-token mode HOLD_BEARER is a PULL-scoped capability JWT of the
@@ -289,7 +352,8 @@ fi
 # Keyed cosign resolves the subject by GET too (ADR 0039 §10): a write-granted
 # manifest GET of the held subject SERVES (200), so the sign in [3] can resolve
 # the subject. The manifest is metadata, not runnable content; layer bytes stay
-# held (anonymous GET above is 503, layer blobs stay HEAD-only).
+# held (the anonymous read above is denied 401 by visibility, layer blobs stay
+# HEAD-only for a credentialed reader).
 WRITE_GET_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer ${HOLD_BEARER}" \
     "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/${DIGEST}" 2>/dev/null || echo 000)"
@@ -303,6 +367,53 @@ fi
 # =============================================================================
 # [3/6] SIGN — cosign sign --key --registry-referrers-mode=oci-1-1 <ref>@<digest>
 # =============================================================================
+# hort ships its OWN reference keyed-signing script at .gitlab/ci/cosign-sign.sh
+# (bundled into the client image as /usr/local/bin/hort-cosign-sign.sh). Its
+# vault-key branch is the exact `cosign sign` invocation hort's CI signs
+# releases with; issue #18 fixed that flag set (oci-1-1 referrers + the default
+# Sigstore v0.3 DSSE bundle, dropping the legacy `--registry-referrers-mode=legacy`
+# / `--new-bundle-format=false`). This step proves that flag set produces a
+# signature hort's OWN provenance gate accepts.
+#
+# The sign runs the flags INLINE rather than shelling out to the reference
+# script, because that script is intentionally transport-agnostic: it carries NO
+# `--allow-http-registry` / `--allow-insecure-registry` / `--registry-username|
+# password`. In real CI those are handled out of band (a valid-cert HTTPS
+# registry + `cosign login` in cosign-setup.sh). The compose harness registry is
+# plaintext HTTP over a PRIVATE repo, so the sign MUST add `--allow-http-registry`
+# + explicit creds — and adding an HTTP/insecure-registry toggle to the
+# production signing script would reintroduce exactly the `*_INSECURE_TLS`-shaped
+# knob the project forbids (ADR 0010; the supported internal-cert path is CA
+# trust, not skip-verify). So the harness carries ONLY those transport flags
+# inline while pinning the SECURITY-relevant flags to the reference script by
+# EQUIVALENCE (asserted just below), and `shellcheck` covers the script itself.
+REF_SIGNER="/usr/local/bin/hort-cosign-sign.sh"
+if [ -x "$REF_SIGNER" ]; then
+    # Extract the vault-key case body, dropping COMMENT lines — the branch's
+    # explanatory comments name the removed legacy flags ("NOT …
+    # --new-bundle-format=false"), which would false-positive the regression
+    # grep below; only the actual `cosign sign` invocation must be checked.
+    REF_VAULT_BLOCK="$(awk '/vault-key\)/{f=1} f && $1 !~ /^#/{print} /;;/{if(f)exit}' "$REF_SIGNER")"
+    REF_OK=1
+    for flag in '--registry-referrers-mode=oci-1-1' '--use-signing-config=false' \
+                '--tlog-upload=false' '--key /tmp/cosign.key'; do
+        printf '%s' "$REF_VAULT_BLOCK" | grep -qF -- "$flag" || REF_OK=0
+    done
+    # The issue-#18 regression flags must be GONE from the reference script.
+    if printf '%s' "$REF_VAULT_BLOCK" | grep -qE -- '--new-bundle-format=false|--registry-referrers-mode=legacy'; then
+        REF_OK=0
+    fi
+    if [ "$REF_OK" = "1" ]; then
+        pass "reference signer ${REF_SIGNER} vault-key flags match the keyed-sign flags hort's gate accepts (issue #18: oci-1-1 referrers + default v0.3 bundle, no legacy flags)"
+    else
+        fail "reference signer flag set (issue #18)" \
+             "vault-key branch of ${REF_SIGNER} lacks an expected keyed-sign flag (oci-1-1 referrers, --use-signing-config=false, --tlog-upload=false, --key /tmp/cosign.key) or still carries a removed legacy flag"
+    fi
+else
+    fail "reference signer bundled in client image" \
+         "${REF_SIGNER} missing/not executable (Dockerfile.client must COPY .gitlab/ci/cosign-sign.sh)"
+fi
+
 # Keyed cosign resolves the subject by GET (ADR 0039 §10); the widened manifest
 # hold-read exemption serves that GET to the write-authorized signer, so the
 # sign must COMPLETE against the held subject. Capture cosign's output so a
@@ -384,40 +495,49 @@ else
     summary
 fi
 
-# At window expiry the release sweep enqueues a final provenance-verify with
-# window_open=false; complete_provenance then emits ProvenanceRejected{Unsigned}
-# and the manifest transitions from 503 (held) to 404 (MANIFEST_UNKNOWN).
-#
-# Poll ANONYMOUSLY: the hold-read exemption (ADR 0039 §10) legitimately serves
-# 200 to a WRITE-authorized manifest GET while held, so a credentialed poll
-# cannot observe the held state at all. The anonymous view is the puller's
-# view and traverses the exact transition the lifecycle promises: 503 (held)
-# -> 404 (terminal Rejected{Unsigned}).
-ANON_UNSIGNED_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+# Resolve the never-signed image's digest via a WRITE-authorized manifest HEAD
+# (the hold-read exemption serves it while held) so the terminal decision can be
+# observed by content hash below. In native-token mode the write authority rides
+# a fresh pull-scoped capability JWT for THIS image (the SIGNED-image HOLD_BEARER
+# is scoped to a different name); in legacy mode dev-user's repo-wide grant
+# covers it directly.
+UNSIGNED_HOLD_BEARER="$HOLD_BEARER"
+[ "$NATIVE_TOKENS" = "1" ] && UNSIGNED_HOLD_BEARER="$(mint_cap_jwt "$UNSIGNED_NAME" pull)"
+UNSIGNED_DIGEST="$(curl -sSI -H "Authorization: Bearer ${UNSIGNED_HOLD_BEARER}" \
+    "${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1" 2>/dev/null \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' || true)"
+[ -n "$UNSIGNED_DIGEST" ] || { fail "resolve never-signed digest" \
+    "write-authorized HEAD of ${UNSIGNED_NAME} returned no Docker-Content-Digest (needed to observe its terminal ProvenanceRejected)"; summary; }
+UNSIGNED_DIGEST_HEX="${UNSIGNED_DIGEST#sha256:}"
+log "[digest] never-signed manifest digest = ${UNSIGNED_DIGEST}"
+
+# PRIVATE repo: an anonymous read is denied by VISIBILITY (401), whether the
+# image is HELD or terminally Rejected — the 503->404 transition the public
+# variant watched is not observable anonymously. Assert the visibility denial…
+ANON_UNSIGNED_CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
     "${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1" 2>/dev/null || echo 000)"
-if [ "$ANON_UNSIGNED_CODE" = "503" ]; then
-    pass "never-signed image starts HELD (anonymous manifest GET -> 503)"
-elif [ "$ANON_UNSIGNED_CODE" = "404" ]; then
-    # The window (30s in the compose fixture) can expire before this probe
-    # runs — e.g. the [5/6] poll above consumed it. Already-terminal is the
-    # SAME correct end state, just observed late; only a non-{503,404} code
-    # (200 = released-unsigned!) is a real failure.
-    pass "never-signed image already terminal at first probe (anonymous GET -> 404; window expired during [5/6])"
+if [ "$ANON_UNSIGNED_CODE" = "401" ]; then
+    pass "never-signed PRIVATE image denies anonymous reads with 401 (visibility, ADR 0045 — held and terminal are indistinguishable anonymously on a private repo)"
 else
-    fail "never-signed image held (anonymous GET -> 503)" \
-         "got HTTP ${ANON_UNSIGNED_CODE} (a held required image must 503 anonymously; 200 would mean an unsigned image is being served)"
+    fail "never-signed image anonymous read -> 401 (private repo)" \
+         "got HTTP ${ANON_UNSIGNED_CODE} (a private repo must 401 an anonymous read before the hold/terminal check, ADR 0045; 200 would mean an unsigned image is being served)"
 fi
+
+# …and observe the TERMINAL Rejected{Unsigned} decision via the emitted domain
+# event, exactly as [4/6] observes ProvenanceVerified. At window expiry the
+# release sweep enqueues a final provenance-verify with window_open=false and
+# complete_provenance emits ProvenanceRejected{Unsigned}. The event is the
+# authoritative, mode-independent signal (no token-expiry window, and no
+# anonymous 503->404 transition to watch on a private repo).
 if bounded_poll \
-        "never-signed manifest -> 404 (terminal Rejected{Unsigned})" \
+        "never-signed manifest -> terminal ProvenanceRejected{Unsigned}" \
         "$WINDOW_WAIT_SECS" \
-        "[ \"\$(curl -s -o /dev/null -w '%{http_code}' '${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1' 2>/dev/null)\" = '404' ]" \
+        "[ -n \"\$(psql_one \"SELECT 1 FROM events e JOIN artifacts a ON e.stream_id = 'artifact-' || a.id::text WHERE a.checksum_sha256 = '${UNSIGNED_DIGEST_HEX}' AND e.event_type = 'ProvenanceRejected' LIMIT 1;\")\" ]" \
         5; then
-    pass "never-signed image is terminally Rejected{Unsigned} at window expiry (anonymous manifest 503 -> 404, not released)"
+    pass "never-signed image is terminally Rejected{Unsigned} at window expiry (ProvenanceRejected event emitted, not released)"
 else
-    LAST_CODE="$(curl -s -o /dev/null -w '%{http_code}' \
-        "${HORT_URL}/v2/${REPO_KEY}/${UNSIGNED_NAME}/manifests/v1" 2>/dev/null || echo 000)"
     fail "never-signed image -> terminal Rejected{Unsigned}" \
-         "anonymous manifest GET still HTTP ${LAST_CODE} after ${WINDOW_WAIT_SECS}s (expected 404; the expiry backstop should have made the terminal Unsigned decision)"
+         "no ProvenanceRejected event for checksum ${UNSIGNED_DIGEST_HEX} within ${WINDOW_WAIT_SECS}s (the expiry backstop should have made the terminal Unsigned decision)"
 fi
 
 summary
