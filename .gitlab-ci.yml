@@ -622,7 +622,13 @@ quality:g1-attestation-gate:
 # `grep -E \b`, `find -print0`) which busybox lacks.
 quality:helm-template-test:
   stage: quality
-  image: alpine/helm:3.17.1
+  # entrypoint: [""] overrides the alpine/helm image's ENTRYPOINT ["helm"] so
+  # the executor runs the job's shell directly. Without it, a podman-executor
+  # runner launches the script as `helm sh …` → `unknown command "sh"`; only
+  # the docker executor overrides the entrypoint implicitly. Matches quality:sonar.
+  image:
+    name: alpine/helm:3.17.1
+    entrypoint: [""]
   needs: []
   before_script:
     - apk add --no-cache bash grep findutils sed
@@ -899,7 +905,12 @@ build-images:hort-worker:
 
 helm:lint-and-publish:
   stage: helm
-  image: alpine/helm:3.17.1
+  # entrypoint: [""] — see quality:helm-template-test; the alpine/helm image's
+  # ENTRYPOINT ["helm"] must be overridden so a podman-executor runner runs the
+  # job shell instead of `helm sh`.
+  image:
+    name: alpine/helm:3.17.1
+    entrypoint: [""]
   needs:
     - job: build-images:hort-server
       artifacts: true
