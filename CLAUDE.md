@@ -373,14 +373,21 @@ Images are built and published **only on `v*` release tags** (and manual
 
 ### Releases
 
-**Pre-releases are tagged on `develop`; final releases are tagged on `main`.**
-See **`RELEASING.md`** for the exact step-by-step of each. In short:
+**Pre-releases are throwaway-branch tags cut off `develop`; final releases are
+tagged on `main`.** See **`RELEASING.md`** for the exact step-by-step of each.
+In short:
 
-- A **pre-release** (`vX.Y.Z-beta.N` / `-rc.N`) is a **version bump only** —
-  `Cargo.toml` workspace version + `Cargo.lock` + `deploy/helm/hort-server/Chart.yaml`
-  (`version`/`appVersion`) — on a `chore/release-X.Y.Z-beta.N` branch, merged
-  to `develop` and tagged on the merge commit. **It does not touch
-  `CHANGELOG.md`.**
+- **`develop` carries an `X.Y.Z-dev` marker** (bumped once per cycle via a normal
+  MR, so a build off `develop` reports the honest unreleased-next version). A
+  **pre-release** (`vX.Y.Z-beta.N` / `-rc.N`) is a **version-bump commit cut off
+  `develop` on a throwaway local branch, tagged, and NOT merged back** — push
+  only the tag (its one commit rides along; no branch left on the remote). The
+  bump touches `Cargo.toml` workspace version + `Cargo.lock` +
+  `deploy/helm/hort-server/Chart.yaml` (`version`/`appVersion`) and **does not
+  touch `CHANGELOG.md`**. This keeps `develop` free of per-beta bumps while the
+  tagged commit stays version-honest (binary + chart both report the
+  pre-release version). Trade-off: beta tags are off `develop`'s line, so
+  `git describe` from `develop` won't find them — fine for ephemeral betas.
 - A **final** release (`vX.Y.Z`, no suffix) is the **`develop → main`
   promotion**. That single promotion MR is where the changelog is stamped, the
   version drops the `-beta`/`-rc` suffix, and the `Closes #…` keywords ride.

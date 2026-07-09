@@ -3,9 +3,20 @@
 Two release shapes: **pre-releases** (`-beta` / `-rc`) and **final** releases.
 One rule drives everything:
 
-> **Pre-releases are cut from and tagged on `develop`. A final release is the
-> `develop → main` promotion and is tagged on `main`. `CHANGELOG.md` is stamped
-> exactly once — at the final promotion.**
+> **`develop` always carries an `X.Y.Z-dev` marker for the version being cooked.
+> A pre-release (`-beta`/`-rc`) is a *throwaway-branch tag* cut off `develop` —
+> its version bump never lands on `develop`. A final release is the
+> `develop → main` promotion, tagged on `main`. `CHANGELOG.md` is stamped
+> exactly once, at that promotion.**
+
+Why throwaway-branch pre-releases: `develop` stays free of per-beta version-bump
+commits, yet the tagged commit is fully honest — the binary (`CARGO_PKG_VERSION`)
+and the chart (`version`/`appVersion`) both report the pre-release version, and
+the tag-pipeline invariant that `Chart.yaml` equals the tag version is satisfied
+on the tagged commit. The trade-off is that beta tags are off `develop`'s line
+(the beta's *code* is exactly `develop`'s; only the one bump commit sits off it),
+so `git describe` from `develop` won't find them — acceptable for ephemeral
+pre-releases, since the final always lands linearly on `main`.
 
 Every push in this doc is preceded by the full local gate in
 `CLAUDE.md` → *Pre-push Quality Checklist* (`fmt`, `clippy`, `test --workspace`,
@@ -20,24 +31,47 @@ A version bump touches exactly these three (one source of truth each):
   crate versions; dependencies are untouched)
 - `deploy/helm/hort-server/Chart.yaml` — `version` **and** `appVersion`
 
-## Pre-release — `vX.Y.Z-beta.N` / `-rc.N` (on `develop`)
+## Open a version cycle (once, right after a final ships)
 
-Version bump only. **Do not touch `CHANGELOG.md`** — `[Unreleased]` keeps
-accumulating and is the running record of what the eventual `X.Y.Z` final ships.
+`develop` carries a `-dev` marker so a build off `develop` reports the honest
+"unreleased next version", not the last release. When a new cycle starts (right
+after `X.Y.(Z-1)` ships, or when opening a new minor), bump `develop` to the next
+`X.Y.Z-dev` with a normal MR:
 
 ```bash
-git checkout -b chore/release-X.Y.Z-beta.N origin/develop
-# bump Cargo.toml + Chart.yaml (version + appVersion)
+git checkout -b chore/open-X.Y.Z-dev origin/develop
+# bump Cargo.toml + Chart.yaml (version + appVersion) → X.Y.Z-dev
+cargo check --workspace                     # rewrites Cargo.lock member versions
+# … run the full local gate …
+git commit -am "chore: open X.Y.Z-dev cycle"
+git push -u origin chore/open-X.Y.Z-dev
+# open an MR into develop (squash); auto-merge on green is fine
+```
+
+## Pre-release — `vX.Y.Z-beta.N` / `-rc.N` (throwaway-branch tag)
+
+A single version-bump commit cut off `develop`, tagged, and **not merged back**.
+Push **only the tag** — its commit rides along and the tag anchors it, so no
+branch is left on the remote. **Do not touch `CHANGELOG.md`** — `[Unreleased]`
+keeps accumulating and is the running record of what the eventual `X.Y.Z` final
+ships.
+
+```bash
+git fetch origin
+git checkout -b chore/release-X.Y.Z-beta.N origin/develop   # LOCAL only — never pushed, discarded below
+# bump Cargo.toml + Chart.yaml (version + appVersion) X.Y.Z-dev → X.Y.Z-beta.N
 cargo check --workspace                     # rewrites Cargo.lock member versions
 # … run the full local gate …
 git commit -am "chore(release): X.Y.Z-beta.N"
-git push -u origin chore/release-X.Y.Z-beta.N
-# open an MR into develop; auto-merge on green is fine
-# after it merges, tag the DEVELOP MERGE COMMIT (lightweight, matching prior betas):
-git fetch origin
-git tag vX.Y.Z-beta.N <develop-merge-commit-sha>
-git push origin vX.Y.Z-beta.N
+git tag vX.Y.Z-beta.N                        # lightweight tag on the bump commit
+git push origin vX.Y.Z-beta.N                # pushes the tag + its one commit only
+git checkout develop && git branch -D chore/release-X.Y.Z-beta.N   # discard the local branch
 ```
+
+The tag pipeline (GitLab `.gitlab-ci.yml` + GitHub `release.yml` /
+`docker-publish.yml` on `v*` tags) builds and publishes `:X.Y.Z-beta.N`. The
+`§3.4` chart-version invariant (`Chart.yaml` `version` + `appVersion` == the tag)
+holds because the bump is on the tagged commit.
 
 ## Final release — `vX.Y.Z` (promote `develop → main`)
 
@@ -46,7 +80,7 @@ final on `main`.
 
 ```bash
 git checkout -b chore/release-X.Y.Z origin/develop
-# 1. bump Cargo.toml + Chart.yaml to FINAL X.Y.Z (drop -beta/-rc); cargo check --workspace
+# 1. bump Cargo.toml + Chart.yaml → FINAL X.Y.Z (drop the -dev suffix); cargo check --workspace
 # 2. stamp CHANGELOG.md:
 #      rename `## [Unreleased]`  →  `## [X.Y.Z] - <YYYY-MM-DD>`
 #      add a fresh empty `## [Unreleased]` above it
@@ -54,13 +88,16 @@ git checkout -b chore/release-X.Y.Z origin/develop
 git commit -am "chore(release): X.Y.Z"
 git push -u origin chore/release-X.Y.Z
 # open the PROMOTION MR targeting `main`; put `Closes #… #…` in the body
-#   (issues auto-close only on merges to the default branch, main)
+#   (issues auto-close only on merges to the default branch, main); preserve
+#   the merge commit (do NOT squash the promotion MR)
 # after it merges, tag the MAIN MERGE COMMIT:
 git fetch origin
 git tag vX.Y.Z <main-merge-commit-sha>
 git push origin vX.Y.Z            # triggers release.yml + docker-publish (:latest for a stable tag)
-# back-merge so develop carries the stamp and the next cycle starts clean:
-#   open an MR main → develop (fast-forward where possible)
+# back-merge so develop carries the changelog stamp:
+#   open an MR main → develop
+# then OPEN THE NEXT CYCLE: bump develop to the next X.Y.(Z+1)-dev
+#   (see "Open a version cycle" above)
 ```
 
 ## Docker tags (`docker-publish.yml`, on `v*` tags)
