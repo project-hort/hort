@@ -25,14 +25,23 @@ case "${SIGNING_MODE}" in
     exit 0
     ;;
   keyless)
-    cosign sign --yes --registry-referrers-mode=legacy \
+    # oci-1-1 referrers (not legacy .sig tags): a hosted hort repo resolves
+    # signatures via the OCI 1.1 referrers API. cosign v3 already emits the
+    # Sigstore v0.3 bundle by default here (no --new-bundle-format=false).
+    cosign sign --yes --registry-referrers-mode=oci-1-1 \
       -a "ci.commit=${CI_COMMIT_SHA}" -a "ci.project=${CI_PROJECT_PATH}" \
       "${IMAGE}@${DIGEST}"
     ;;
   vault-key)
+    # Keyed, offline (no transparency log) signature that hort's Tier-1
+    # verifier accepts: cosign v3 emits the Sigstore v0.3 bundle by default
+    # (NOT the legacy simplesigning of --new-bundle-format=false), and
+    # oci-1-1 referrers are required for hosted repos (hort resolves the
+    # signature via the referrers API, not a legacy .sig tag).
+    # --use-signing-config=false + --tlog-upload=false keep it offline/no-Rekor.
     cosign sign --key /tmp/cosign.key --yes \
-      --new-bundle-format=false --use-signing-config=false \
-      --tlog-upload=false --registry-referrers-mode=legacy \
+      --use-signing-config=false --tlog-upload=false \
+      --registry-referrers-mode=oci-1-1 \
       -a "ci.commit=${CI_COMMIT_SHA}" -a "ci.project=${CI_PROJECT_PATH}" \
       "${IMAGE}@${DIGEST}"
     ;;
