@@ -43,7 +43,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use hort_adapters_postgres::{
-    api_token_repo::PgApiTokenRepository, event_store::PgEventStore, user_repo::PgUserRepository,
+    api_token_repo::PgApiTokenRepository, event_store::PgEventStore,
+    permission_grant_repo::PgPermissionGrantRepository, user_repo::PgUserRepository,
 };
 use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::rbac::RbacEvaluator;
@@ -52,11 +53,13 @@ use hort_app::use_cases::api_token_use_case::{
 };
 use hort_app::use_cases::user_use_case::{CreateUser, UserPrivileges, UserUseCase};
 use hort_domain::entities::api_token::ApiToken;
+use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::events::ApiActor;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::ports::event_store::EventStore;
+use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::types::PageRequest;
 
@@ -162,6 +165,18 @@ pub struct IssueSvcTokenArgs {
     /// keeping the CLI default in lock-step avoids per-tool drift.
     #[arg(long = "expires-in-days", default_value_t = DEFAULT_SVC_EXPIRY_DAYS)]
     pub expires_in_days: u32,
+
+    /// Verify each `--permission` is backed by a live `PermissionGrant` on
+    /// the service account before minting; fail with actionable guidance
+    /// if not.
+    ///
+    /// Default `false`: unchanged behaviour — no grant read, matching
+    /// every prior release (other callers may legitimately mint a cap
+    /// before applying the grant). The Helm bootstrap Job sets this so a
+    /// missing grant fails the install loudly instead of 403-ing silently
+    /// at every CronJob tick (issue #21).
+    #[arg(long, default_value_t = false)]
+    pub require_authority: bool,
 }
 
 /// Arguments to `admin bootstrap-session`.
@@ -261,6 +276,94 @@ fn resolve_svc_user(found: Option<User>, username: &str, svc_name: &str) -> anyh
     }
 }
 
+/// Evaluator-backed authority check for `--require-authority` (design §4,
+/// issue #21).
+///
+/// Verifies each permission in `permissions` is backed by a live grant on
+/// `svc_user_id` at **global** scope (`repository_id = None`), using
+/// [`RbacEvaluator::authorize_granted`] — the SAME grants-leg-only
+/// evaluation the runtime already uses for the quarantine hold-exemption
+/// basis (ADR 0039 §10), rather than a hand-rolled grants query that
+/// could drift from the request-time gate. `authorize_granted` ignores
+/// `token_cap` entirely, which is exactly right here: the probe principal
+/// built below always carries `token_cap: None`, so there is no cap leg
+/// that could mask a missing grant — the decision is 100% the grants
+/// leg.
+///
+/// A service-account principal carries no claims (service accounts are
+/// strictly non-admin and never resolve IdP groups), so only a
+/// `GrantSubject::User(svc_user_id)` grant can back a declared permission
+/// here — the same shape `RbacEvaluator::service_account_cap_permissions`
+/// assumes.
+///
+/// Pure over the caller-supplied `evaluator` (no I/O): the caller loads
+/// the grant snapshot from Postgres and builds the evaluator once, so
+/// this function — and therefore the whole unbacked-permission-set
+/// mapping — is unit-testable without a database.
+///
+/// Returns `Ok(())` when every declared permission is backed; otherwise
+/// `Err` naming ALL unbacked permissions plus a copy-paste
+/// `PermissionGrant` YAML block per permission ([`unbacked_authority_message`]).
+fn check_require_authority(
+    evaluator: &RbacEvaluator,
+    svc_name: &str,
+    svc_user_id: Uuid,
+    permissions: &[Permission],
+) -> anyhow::Result<()> {
+    // A probe principal with no claims and no token cap: the shape a
+    // service account's own identity carries. `authorize_granted` reads
+    // only `user_id` / `claims` / `token_kind` / `token_cap`; the other
+    // identity fields are never inspected, so placeholders are fine.
+    let principal = CallerPrincipal {
+        user_id: svc_user_id,
+        external_id: String::new(),
+        username: String::new(),
+        email: String::new(),
+        claims: Vec::new(),
+        token_kind: None,
+        issued_at: chrono::Utc::now(),
+        token_cap: None,
+    };
+    let unbacked: Vec<Permission> = permissions
+        .iter()
+        .copied()
+        .filter(|&p| !evaluator.authorize_granted(&principal, p, None))
+        .collect();
+    if unbacked.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(unbacked_authority_message(svc_name, &unbacked));
+}
+
+/// Render the `--require-authority` preflight failure message (design §4).
+///
+/// Names every unbacked declared permission in one message (not just the
+/// first) and prints a copy-paste `PermissionGrant` YAML block per
+/// permission, so an operator fixes all of them in a single gitops apply
+/// pass. Pure string formatting — no I/O — so it is unit-testable
+/// without a live grant set.
+///
+/// `unbacked` is expected non-empty; the sole caller
+/// ([`check_require_authority`]) only invokes this after confirming that.
+fn unbacked_authority_message(svc_name: &str, unbacked: &[Permission]) -> String {
+    let names: Vec<String> = unbacked.iter().map(ToString::to_string).collect();
+    let mut msg = format!(
+        "service account {svc_name:?} exists but has no grant for permission(s): {} — the \
+         token would mint but the corresponding admin-task CronJob(s) would be denied (403) \
+         at run time. Add the following to your gitopsConfig and re-apply:\n",
+        names.join(", ")
+    );
+    for name in &names {
+        msg.push_str(&format!(
+            "\n  apiVersion: project-hort.de/v1beta1\n  kind: PermissionGrant\n  \
+             metadata: {{ name: {svc_name}-{name} }}\n  spec:\n    \
+             subject: {{ kind: serviceAccount, name: {svc_name} }}\n    \
+             permission: {name}        # global (no repository:)\n"
+        ));
+    }
+    msg
+}
+
 async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     if args.name.is_empty() {
         anyhow::bail!("--name must not be empty");
@@ -333,6 +436,26 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     let user_uc = UserUseCase::new(user_repo.clone());
     let found = user_uc.find_by_username(&username).await?;
     let svc_user = resolve_svc_user(found, &username, &args.name)?;
+
+    // `--require-authority` preflight (design doc §4, issue #21): catch
+    // the SILENT failure mode where the SA exists but its backing grant
+    // does not — the token would mint fine and every admin-task CronJob
+    // would 403 at run time with no install-time signal. Runs BEFORE the
+    // idempotent early-exit below so a grant an operator later revoked
+    // still surfaces on the next routine upgrade, not just on `--rotate`.
+    if args.require_authority {
+        let permission_grant_repo: Arc<dyn PermissionGrantRepository> =
+            Arc::new(PgPermissionGrantRepository::new(pool.clone()));
+        let grants = permission_grant_repo
+            .list_all()
+            .await
+            .context("listing permission grants for --require-authority preflight")?;
+        // The SAME RbacEvaluator the runtime authorizes every request
+        // with — not a hand-rolled grants query — so this check cannot
+        // drift from the request-time gate.
+        let evaluator = RbacEvaluator::new(grants);
+        check_require_authority(&evaluator, &args.name, svc_user.id, &permissions)?;
+    }
 
     // Check for an existing token with the same name on this user.
     let existing: Option<ApiToken> =
@@ -787,6 +910,29 @@ mod tests {
         // Default expiry: matches the system-mint path's
         // `DEFAULT_SVC_EXPIRY_DAYS` so admin-mint and rotation agree.
         assert_eq!(args.expires_in_days, DEFAULT_SVC_EXPIRY_DAYS);
+        // Default: the preflight is opt-in — unset ⇒ byte-for-byte
+        // unchanged behaviour, no grant read.
+        assert!(!args.require_authority);
+    }
+
+    #[test]
+    fn issue_svc_token_accepts_require_authority_flag() {
+        let cli = TestCli::try_parse_from([
+            "hort-server",
+            "admin",
+            "issue-svc-token",
+            "--name",
+            "cronjob-tasks",
+            "--require-authority",
+        ])
+        .unwrap();
+        let super::super::Command::Admin(admin_cmd) = cli.command else {
+            panic!("expected Admin");
+        };
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
+        assert!(args.require_authority);
     }
 
     #[test]
@@ -911,6 +1057,7 @@ mod tests {
             output: "kube-secret".into(),
             rotate: false,
             expires_in_days: DEFAULT_SVC_EXPIRY_DAYS,
+            require_authority: false,
         };
         // We can't call issue_svc_token_async without a live DB, but we can
         // assert the output detection logic by checking the expected branch.
@@ -1018,6 +1165,164 @@ mod tests {
         assert_eq!(resolved.id, row.id);
         assert!(resolved.is_service_account);
         assert!(!resolved.is_admin);
+    }
+
+    #[test]
+    fn resolve_svc_user_sa_absent_path_is_unchanged_by_require_authority() {
+        // `--require-authority` only changes behaviour AFTER `resolve_svc_user`
+        // succeeds. The SA-absent path is untouched: it still bails here,
+        // before any grant is ever consulted (there is no `RbacEvaluator` in
+        // scope in this branch at all).
+        let err = resolve_svc_user(None, "sa:cronjob-tasks", "cronjob-tasks").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"));
+        assert!(msg.contains("gitops"));
+    }
+
+    // -- issue-svc-token: --require-authority preflight ---------------------
+    //
+    // `check_require_authority` / `unbacked_authority_message` are pure over
+    // an in-memory `RbacEvaluator` snapshot (no I/O), so every branch is
+    // unit-testable without a database — design doc §4.
+
+    fn user_grant(
+        uid: Uuid,
+        perm: Permission,
+        repo: Option<Uuid>,
+    ) -> hort_domain::entities::rbac::PermissionGrant {
+        hort_domain::entities::rbac::PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: hort_domain::entities::rbac::GrantSubject::User(uid),
+            repository_id: repo,
+            permission: perm,
+            managed_by: hort_domain::entities::managed_by::ManagedBy::GitOps,
+            managed_by_digest: Some([0u8; 32]),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn check_require_authority_passes_when_every_permission_is_backed() {
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![
+            user_grant(uid, Permission::AdminTaskInvoke, None),
+            user_grant(uid, Permission::Read, None),
+        ]);
+        check_require_authority(
+            &eval,
+            "cronjob-tasks",
+            uid,
+            &[Permission::AdminTaskInvoke, Permission::Read],
+        )
+        .expect("all declared permissions are backed by a global grant");
+    }
+
+    #[test]
+    fn check_require_authority_fails_naming_the_single_unbacked_permission() {
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(Vec::new());
+        let err =
+            check_require_authority(&eval, "cronjob-tasks", uid, &[Permission::AdminTaskInvoke])
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cronjob-tasks"), "unexpected: {msg}");
+        assert!(msg.contains("admin_task_invoke"), "unexpected: {msg}");
+        assert!(msg.contains("no grant"), "unexpected: {msg}");
+        assert!(
+            msg.contains("kind: PermissionGrant"),
+            "must print copy-paste YAML: {msg}"
+        );
+        assert!(
+            msg.contains("kind: serviceAccount, name: cronjob-tasks"),
+            "must name the SA subject: {msg}"
+        );
+        assert!(
+            msg.contains("permission: admin_task_invoke"),
+            "must print the missing permission in the YAML: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_require_authority_fails_naming_all_unbacked_permissions_when_several() {
+        let uid = Uuid::new_v4();
+        // Only `Read` is backed; `AdminTaskInvoke` and `Write` are not.
+        let eval = RbacEvaluator::new(vec![user_grant(uid, Permission::Read, None)]);
+        let err = check_require_authority(
+            &eval,
+            "cronjob-tasks",
+            uid,
+            &[
+                Permission::AdminTaskInvoke,
+                Permission::Read,
+                Permission::Write,
+            ],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        // Both unbacked permissions are named — not just the first.
+        assert!(msg.contains("admin_task_invoke"), "unexpected: {msg}");
+        assert!(msg.contains("write"), "unexpected: {msg}");
+        // The backed permission must NOT be reported as missing.
+        assert_eq!(
+            msg.matches("no grant for permission").count(),
+            1,
+            "one summary clause naming both, not per-permission bails: {msg}"
+        );
+        // One copy-paste YAML block per unbacked permission (two), not one.
+        assert_eq!(
+            msg.matches("kind: PermissionGrant").count(),
+            2,
+            "expected one YAML block per unbacked permission: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_require_authority_repo_scoped_grant_does_not_satisfy_the_global_check() {
+        // The preflight checks GLOBAL authority (repository = None). A grant
+        // scoped to one repository must not be mistaken for a global grant —
+        // it would let the preflight pass while the CronJob (which invokes
+        // admin tasks with no repository in scope) still 403s.
+        let uid = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(
+            uid,
+            Permission::AdminTaskInvoke,
+            Some(repo),
+        )]);
+        let err =
+            check_require_authority(&eval, "cronjob-tasks", uid, &[Permission::AdminTaskInvoke])
+                .unwrap_err();
+        assert!(err.to_string().contains("admin_task_invoke"));
+    }
+
+    #[test]
+    fn check_require_authority_ignores_grants_on_a_different_user() {
+        let uid = Uuid::new_v4();
+        let other_uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(
+            other_uid,
+            Permission::AdminTaskInvoke,
+            None,
+        )]);
+        let err =
+            check_require_authority(&eval, "cronjob-tasks", uid, &[Permission::AdminTaskInvoke])
+                .unwrap_err();
+        assert!(err.to_string().contains("admin_task_invoke"));
+    }
+
+    #[test]
+    fn unbacked_authority_message_lists_every_permission_and_a_yaml_block_each() {
+        let msg = unbacked_authority_message(
+            "cronjob-tasks",
+            &[Permission::AdminTaskInvoke, Permission::Read],
+        );
+        assert!(msg.contains("admin_task_invoke"));
+        assert!(msg.contains("permission: read"));
+        assert_eq!(
+            msg.matches("apiVersion: project-hort.de/v1beta1").count(),
+            2
+        );
+        assert_eq!(msg.matches("metadata: { name: cronjob-tasks-").count(), 2);
     }
 
     // -- output-mode parsing (shared helper) --------------------------------
