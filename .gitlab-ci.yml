@@ -13,9 +13,9 @@
 # (role gitlab-ci-sccache) mints a read-only, single-path token for the S3 creds at
 # job time. Fail-safe: if Vault/S3 is unreachable or sccache is absent, the before_script
 # leaves RUSTC_WRAPPER unset and the job builds WITHOUT the cache instead of failing.
-# Only lint/unit/integration opt in; coverage stays off (sccache breaks llvm-cov
-# instrumentation) and the buildah image builds compile inside the Docker build, where
-# RUSTC_WRAPPER doesn't reach.
+# Only unit/integration opt in; lint and coverage stay off (sccache breaks
+# clippy-driver and llvm-cov instrumentation) and the buildah image builds compile
+# inside the Docker build, where RUSTC_WRAPPER doesn't reach.
 include:
   - component: gitlab.kdp.kloni.cloud/idp/components-catalog/supply-chain/sccache@v0.5.2
 
@@ -304,29 +304,24 @@ variables:
 # Parity with .github/workflows/ci.yml → lint-rust, but scoped to crates/.
 test:lint:
   stage: test
-  extends: [.sccache]
-  image: ${RUST_SCCACHE_IMAGE}
+  image: ${RUST_IMAGE}
   <<: *rust-cache
-  id_tokens:
-    # sccache does a Vault JWT login (aud must equal VAULT_ADDR); hort-auth uses the
-    # registry federation token (aud hort-server). Both are declared inline (like
-    # .docker) because extends:[.sccache] does NOT merge id_tokens into the job's own
-    # key, which otherwise leaves VAULT_ID_TOKEN unbound under the component's set -u.
-    VAULT_ID_TOKEN:
-      aud: "${VAULT_ADDR}"
-    HORT_OIDC_TOKEN:
-      aud: hort-server
+  variables:
+    # cargo clippy runs clippy-driver over workspace crates whose dependencies
+    # (sqlx + its sqlx-macros proc-macro) are compiled by rustc; under
+    # RUSTC_WRAPPER=sccache the wrapped-rustc artifacts don't resolve for
+    # clippy-driver → E0463 "can't find crate for sqlx" and a cascade of
+    # inference errors. Same wrapper-breaks-the-tool class as coverage/llvm-cov,
+    # and clippy gets 0 sccache hits anyway — keep it off sccache (like coverage).
+    RUSTC_WRAPPER: ""
+  id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
     # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
     # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
-    # extends:[.sccache] REPLACES before_script, so its sccache setup is chained
-    # back in explicitly after curl/CA are present (it enables RUSTC_WRAPPER only
-    # when the S3 backend is reachable, else leaves the build uncached).
     - *rust-apt-deps
     - *platform-ca-deb
     - *hort-auth-steps
-    - !reference [.sccache, before_script]
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all -- --check
