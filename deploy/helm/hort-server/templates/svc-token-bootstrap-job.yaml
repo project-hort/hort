@@ -89,6 +89,12 @@ spec:
             - --name=cronjob-tasks
             - --permission=admin_task_invoke
             - --output=file:/run/bootstrap/token
+            # Fail the hook loudly if the `cronjob-tasks` SA has no live
+            # `admin_task_invoke` grant, instead of minting a token that
+            # every admin-task CronJob then 403s on at run time. The grant
+            # is operator-declared gitops (see the `adminTasksEnabled`
+            # comment in values.yaml) — this chart never provisions it.
+            - --require-authority
             {{- if .Values.scheduledTasks.rotateSvcToken }}
             # scheduledTasks.rotateSvcToken=true: operator requested
             # rotation. issue-svc-token revokes the existing token +

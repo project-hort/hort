@@ -1239,6 +1239,14 @@ scheduledTasks:
   #     to write the service-account user and token rows.
   #   - A working in-cluster network path from the CronJob pods to the
   #     hort-server Service (HORT_SERVER = http://<fullname>:<httpPort>).
+  #   - A gitops-declared `cronjob-tasks` ServiceAccount PLUS a global
+  #     `admin_task_invoke` PermissionGrant targeting it (subject
+  #     `kind: serviceAccount, name: cronjob-tasks`) — this chart never
+  #     provisions either document; they are operator-owned gitops config.
+  #     The bootstrap Job's `issue-svc-token --require-authority` fails the
+  #     install loudly if the grant is missing, rather than minting a token
+  #     that every admin-task CronJob then 403s on at run time. See
+  #     docs/architecture/how-to/deploy/enable-admin-task-cronjobs.md.
   adminTasksEnabled: false
 
   # kubectl image used by the svc-token-bootstrap Job's write-secret
@@ -1515,6 +1523,13 @@ scheduledTasks:
   # retention-evaluate: replay-free read of active retention policies +
   # keyset-paginated non-protected artifacts → append ArtifactExpired
   # per fresh match (deletes nothing). Daily.
+  #
+  # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
+  # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
+  # svc-token is claimless and cannot run it. Run by hand with
+  # `hort-cli admin task invoke retention-evaluate`, or see the CronJob
+  # template's docstring for the opt-in override. Leaving `enabled: false`
+  # (default) is safe.
   retentionEvaluate:
     executionPath: admin-task
     enabled: false
@@ -1522,6 +1537,13 @@ scheduledTasks:
   # retention-purge: the destructive storage-GC walk. Refuses until
   # the worker boot refcount-reconcile sweep converged. Daily, after
   # retention-evaluate.
+  #
+  # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
+  # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
+  # svc-token is claimless and cannot run it. Run by hand with
+  # `hort-cli admin task invoke retention-purge`, or see the CronJob
+  # template's docstring for the opt-in override. Leaving `enabled: false`
+  # (default) is safe.
   retentionPurge:
     executionPath: admin-task
     enabled: false
@@ -1529,6 +1551,13 @@ scheduledTasks:
   # eventstore-archive: audit-retention stream sweep (seal terminal
   # / age-gated streams past the configured retention floor, via the
   # StreamSealed tombstone chokepoint). Weekly (Sunday) — lowest frequency.
+  #
+  # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
+  # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
+  # svc-token is claimless and cannot run it. Run by hand with
+  # `hort-cli admin task invoke eventstore-archive`, or see the CronJob
+  # template's docstring for the opt-in override. Leaving `enabled: false`
+  # (default) is safe.
   eventstoreArchive:
     executionPath: admin-task
     enabled: false
