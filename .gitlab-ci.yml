@@ -8,6 +8,17 @@
 # the SonarQube gate, container image builds (hort-server + hort-worker,
 # buildah + cosign), the Helm chart publish, and the release SBOM.
 
+# Shared Rust compiler cache (sccache -> Garage S3), opted into by the compile-heavy
+# test jobs below via `extends: [.sccache]`. Secretless: GitLab OIDC -> Vault JWT
+# (role gitlab-ci-sccache) mints a read-only, single-path token for the S3 creds at
+# job time. Fail-safe: if Vault/S3 is unreachable or sccache is absent, the before_script
+# leaves RUSTC_WRAPPER unset and the job builds WITHOUT the cache instead of failing.
+# Only lint/unit/integration opt in; coverage stays off (sccache breaks llvm-cov
+# instrumentation) and the buildah image builds compile inside the Docker build, where
+# RUSTC_WRAPPER doesn't reach.
+include:
+  - component: gitlab.kdp.kloni.cloud/idp/components-catalog/supply-chain/sccache@v0.5.2
+
 stages:
   - test
   - security
@@ -76,6 +87,10 @@ variables:
   # `scripts/check-rust-version.sh`. GitLab pins the image explicitly so a
   # silent toolchain bump can't break the gate.
   RUST_IMAGE: "rust:1.94-slim"
+  # Same toolchain as RUST_IMAGE (built FROM rust:1.94-slim) with sccache on PATH,
+  # used only by the test jobs that extend .sccache. Identical clippy/fmt behaviour
+  # and MSRV; sccache is the only addition. Only tag published is :latest.
+  RUST_SCCACHE_IMAGE: "mirror.kdp.kloni.cloud/ci/rust-sccache:latest"
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: "always"
@@ -289,16 +304,29 @@ variables:
 # Parity with .github/workflows/ci.yml → lint-rust, but scoped to crates/.
 test:lint:
   stage: test
-  image: ${RUST_IMAGE}
+  extends: [.sccache]
+  image: ${RUST_SCCACHE_IMAGE}
   <<: *rust-cache
-  id_tokens: !reference [.hort-auth, id_tokens]
+  id_tokens:
+    # sccache does a Vault JWT login (aud must equal VAULT_ADDR); hort-auth uses the
+    # registry federation token (aud hort-server). Both are declared inline (like
+    # .docker) because extends:[.sccache] does NOT merge id_tokens into the job's own
+    # key, which otherwise leaves VAULT_ID_TOKEN unbound under the component's set -u.
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+    HORT_OIDC_TOKEN:
+      aud: hort-server
   before_script:
     # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
     # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
+    # extends:[.sccache] REPLACES before_script, so its sccache setup is chained
+    # back in explicitly after curl/CA are present (it enables RUSTC_WRAPPER only
+    # when the S3 backend is reachable, else leaves the build uncached).
     - *rust-apt-deps
     - *platform-ca-deb
     - *hort-auth-steps
+    - !reference [.sccache, before_script]
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all -- --check
@@ -307,19 +335,27 @@ test:lint:
 # Parity with test-backend-unit, scoped to the rewrite.
 test:unit:
   stage: test
-  image: ${RUST_IMAGE}
+  extends: [.sccache]
+  image: ${RUST_SCCACHE_IMAGE}
   <<: *rust-cache
   needs:
     - job: test:lint
       artifacts: false
-  id_tokens: !reference [.hort-auth, id_tokens]
+  id_tokens:
+    # See test:lint - both tokens inline (extends:[.sccache] won't merge id_tokens).
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+    HORT_OIDC_TOKEN:
+      aud: hort-server
   before_script:
     # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
     # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
+    # extends:[.sccache] replaces before_script; chain its sccache setup back in.
     - *rust-apt-deps
     - *platform-ca-deb
     - *hort-auth-steps
+    - !reference [.sccache, before_script]
   script:
     - cargo test --workspace --lib --verbose
 
@@ -377,7 +413,8 @@ test:coverage:
 # database. Main / release / tags only, matching the GitHub CI gating.
 test:integration:
   stage: test
-  image: ${RUST_IMAGE}
+  extends: [.sccache]
+  image: ${RUST_SCCACHE_IMAGE}
   <<: *rust-cache
   <<: *rules-main-only
   needs:
@@ -391,14 +428,21 @@ test:integration:
     POSTGRES_USER: "registry"
     POSTGRES_PASSWORD: "registry"
     DATABASE_URL: "postgresql://registry:registry@postgres:5432/artifact_registry"
-  id_tokens: !reference [.hort-auth, id_tokens]
+  id_tokens:
+    # See test:lint - both tokens inline (extends:[.sccache] won't merge id_tokens).
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+    HORT_OIDC_TOKEN:
+      aud: hort-server
   before_script:
     # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
     # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
+    # extends:[.sccache] replaces before_script; chain its sccache setup back in.
     - *rust-apt-deps
     - *platform-ca-deb
     - *hort-auth-steps
+    - !reference [.sccache, before_script]
     - apt-get install -y -qq --no-install-recommends postgresql-client
     - for i in $(seq 1 30); do pg_isready -h postgres -U "${POSTGRES_USER}" && break; sleep 1; done
   script:
