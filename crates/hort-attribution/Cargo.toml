@@ -1,0 +1,21 @@
+[package]
+name = "hort-attribution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort license text + generated third-party attribution, embedded at compile time"
+
+[lints]
+workspace = true
+
+# Zero `hort-*` dependencies, deliberately: `hort-cli` is a pure HTTP client
+# with no `hort-domain` / `hort-app` / `hort-adapters-*` deps (enforced by
+# `cargo tree -p hort-cli`), and this crate is the one thing all three
+# shipped binaries (hort-server / hort-worker / hort-cli) depend on for the
+# `license` / `attribution` subcommands. Putting it in `hort-domain` or
+# `hort-app` instead would drag hort-cli's isolation guarantee down with it.
+# No `tokio`, no `clap` — this crate exposes plain sync functions returning
+# `String`/`&'static str`; each binary's clap wiring lives in that binary.
+[dependencies]
+
+[dev-dependencies]

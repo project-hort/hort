@@ -1,0 +1,61 @@
+# cargo-about configuration — third-party attribution generation.
+#
+# Consumed by `scripts/regenerate-attribution.sh` (dev-run) and the CI
+# staleness gate (`scripts/check-attribution.sh`, regenerates + diffs against
+# the committed `THIRD-PARTY-LICENSES.{md,json}`). Templates live in `about/`.
+#
+# A dependency change that alters the compiled-in graph (add/remove/upgrade
+# a crate reachable from hort-server/hort-worker/hort-cli) must regenerate
+# both committed artifacts (`scripts/regenerate-attribution.sh`) and commit
+# the result in the same change — the CI gate fails the build otherwise.
+#
+# `accepted` MUST stay byte-identical to `deny.toml`'s `[licenses] allow` list —
+# same graph, same permissive set. `cargo deny check licenses` is the inbound
+# gate that keeps every dependency's license within this set in the first
+# place; this list only has to mirror it so nothing shipped is silently
+# un-attributed. If you change one, change the other in the same commit.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+]
+
+# Same 5 shipping targets as `deny.toml`'s `[graph] targets` — the platforms
+# hort actually ships binaries for (see `.github/workflows/release.yml`).
+# Keeps target-gated (`cfg(...)`) dependencies consistent between the two
+# tools' graphs.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-gnu",
+]
+
+# Attribution covers what's actually compiled into the shipped binaries
+# (hort-server / hort-worker / hort-cli), not the workspace's dev/test
+# tooling.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# `private.ignore` is cargo-about's documented way to skip a workspace's own
+# crates, but it keys off `publish = false` in each crate's `Cargo.toml` —
+# hort's crates don't set that (see the `hort-attribution` design doc, D2).
+# The `used_by[].crate.source` field is `null` for path/workspace-member
+# dependencies and `Some(...)` for every real registry/git dependency, so the
+# two templates in `about/` filter on `crate.source` instead — that's the
+# actual first-party/third-party discriminator in effect today. This block
+# is left enabled as the documented, forward-compatible default in case a
+# future crate ever does set `publish = false`.
+[private]
+ignore = true

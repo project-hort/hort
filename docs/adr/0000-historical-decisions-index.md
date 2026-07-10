@@ -103,6 +103,7 @@ accepted?*
 | [0023](0023-implementation-discipline-objectively-better.md) | The design wins by default; deviations require an "objectively better" case |
 | [0024](0024-architect-skill-as-enforcement-index.md) | The architect skill is the enforcement index for these ADRs |
 | [0030](0030-sensitive-surface-structural-guards.md) | Fail-closed structural guards over the sensitive schema and retention registration |
+| [0047](0047-dual-license-generated-attribution.md) | Dual-license `MIT OR Apache-2.0`; third-party attribution is **generated** (`cargo-about` → committed `THIRD-PARTY-LICENSES.{md,json}`, embedded via `include_str!` in a zero-`hort-*`-dep `hort-attribution` leaf crate so hort-cli isolation holds) and **CI-verified** (`attribution-sync` regenerates+diffs, asserts `about.toml accepted == deny.toml allow`); image-bundled-tool NOTICE is a separate surface; DSN-free `license`/`attribution` subcommands on all three binaries |
 
 ## Open-items register
 

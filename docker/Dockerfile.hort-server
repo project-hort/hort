@@ -91,7 +91,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d3cda6e91129130d7229a1806b6a73
 # rest (`source`, `revision`, `version`, `created`) via `--label` on
 # the publish job.
 LABEL org.opencontainers.image.title="hort"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 # CAS staging dir + working directory. The chart mounts an emptyDir
 # (or a PVC for the filesystem-storage backend) over this path; the
@@ -107,6 +107,12 @@ EXPOSE 8080 9090
 
 COPY --from=builder /usr/local/bin/hort-server /usr/local/bin/hort-server
 COPY --from=builder /usr/local/bin/hort-cli    /usr/local/bin/hort-cli
+
+# Image-level NOTICE for bundled external tools (base image contents; this
+# image ships no other bundled tools — see docs/attribution/image-notice.md).
+# Separate surface from the compiled-in crate attribution the `hort-server
+# attribution` subcommand renders; do not conflate the two.
+COPY docs/attribution/image-notice.md /usr/share/hort/NOTICE
 
 # No CMD — operators pass the subcommand explicitly. `hort-server` with
 # no subcommand defaults to `serve` (preserved by clap for the

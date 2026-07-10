@@ -13,16 +13,21 @@
 use clap::{Parser, Subcommand};
 
 use crate::admin::AdminArgs;
+use crate::attribution::AttributionArgs;
 use crate::auth::AuthArgs;
 use crate::completions::CompletionsArgs;
 use crate::config::OutputFormat;
 use crate::curation::CurationArgs;
 use crate::get::GetArgs;
+use crate::license::LicenseArgs;
 use crate::list_versions::ListVersionsArgs;
 use crate::prefetch::PrefetchArgs;
 
 /// Admin task subcommands (invoke, list, get).
 pub mod admin;
+/// `attribution` subcommand — prints the embedded third-party
+/// attribution document (text/json). Sync, no config, no server call.
+pub mod attribution;
 /// Auth subcommands (login, status, logout).
 pub mod auth;
 pub mod client;
@@ -34,6 +39,9 @@ pub mod config;
 pub mod curation;
 /// Get subcommands (repo-score).
 pub mod get;
+/// `license` subcommand — prints the SPDX license identifier (and,
+/// with `--full`, both license texts). Sync, no config, no server call.
+pub mod license;
 /// `list-versions` subcommand. Top-level mount (mirrors `get`'s
 /// placement); calls
 /// `GET /api/v1/repositories/{repo}/discovery/versions/{package}` and
@@ -106,6 +114,11 @@ pub enum Commands {
     Prefetch(PrefetchArgs),
     /// Generate a shell completion script (bash/zsh/fish/powershell/elvish).
     Completions(CompletionsArgs),
+    /// Print hort's license identifier (and, with `--full`, the
+    /// complete license texts).
+    License(LicenseArgs),
+    /// Print the generated third-party attribution document.
+    Attribution(AttributionArgs),
 }
 
 /// Render a top-level CLI error for stderr.

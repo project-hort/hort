@@ -13,6 +13,12 @@ name = "hort-cli"
 path = "src/main.rs"
 
 [dependencies]
+# hort's license text + generated third-party attribution, embedded at
+# compile time. A std-only leaf crate with zero `hort-*` deps of its
+# own, so adding it does not touch hort-cli's isolation guarantee (no
+# hort-domain / hort-app / hort-adapters-* in the dep graph) — see that
+# crate's Cargo.toml. Backs the `license` / `attribution` subcommands.
+hort-attribution = { path = "../hort-attribution" }
 # HTTP client — pure HTTP, no DSN, no hort-domain / hort-app / hort-adapters-* deps.
 reqwest    = { workspace = true, features = ["rustls-tls", "json"] }
 clap       = { workspace = true, features = ["derive", "env"] }

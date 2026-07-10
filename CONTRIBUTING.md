@@ -87,7 +87,22 @@ this in the MR review.
 Please do **not** open a public issue for security vulnerabilities — see
 [`SECURITY.md`](SECURITY.md) for how to report privately.
 
+## Third-Party Attribution
+
+`THIRD-PARTY-LICENSES.md` and `THIRD-PARTY-LICENSES.json` are generated from
+the dependency graph of hort's shipped binaries (`hort-server`, `hort-worker`,
+`hort-cli`) via `cargo about` and committed at the repository root; they are
+embedded into those binaries' `attribution` subcommand. Any PR that changes
+the compiled-in dependency graph (adding, removing, or upgrading a crate
+reachable from one of the three binaries) must regenerate both files with
+`scripts/regenerate-attribution.sh` and commit the result in the same PR —
+`scripts/check-attribution.sh` (wired into both CI pipelines) fails the build
+if the committed files and a fresh regeneration diverge. `about.toml`'s
+`accepted` license list must also stay identical to `deny.toml`'s
+`[licenses] allow` list; the same check enforces that parity.
+
 ## License
 
-By contributing, you agree that your contributions will be licensed under the
-[MIT License](LICENSE).
+By contributing, you agree that your contributions will be dual-licensed under
+the [MIT License](LICENSE-MIT) and [Apache License, Version 2.0](LICENSE-APACHE),
+without any additional terms or conditions.

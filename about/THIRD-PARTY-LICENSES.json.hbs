@@ -1,0 +1,30 @@
+{{!-- Rendered by `cargo about generate` (see `scripts/regenerate-attribution.sh`
+    and `about.toml`). Same `licenses[].used_by[]` traversal + `crate.source`
+    first-party filter as THIRD-PARTY-LICENSES.md.hbs — see that template's
+    header comment for why.
+
+    Handlebars has no "is this the last kept element" lookahead once
+    entries are filtered mid-loop (@last is computed over the *unfiltered*
+    used_by array, so it doesn't track which elements survive the #if
+    crate.source guard). Every kept entry is therefore emitted with an
+    unconditional trailing comma, and scripts/regenerate-attribution.sh
+    strips the one dangling comma before the closing ] with `sed -z`. This
+    is the standard fix for comma-joining a filtered list in a stateless
+    template language — the field values below are 100% cargo-about's
+    resolved data; only that one trailing separator is fixed up outside
+    the template. --}}
+[
+{{#each licenses~}}
+{{#each used_by~}}
+{{#if crate.source~}}
+  {
+    "name": {{json crate.name}},
+    "version": {{json crate.version}},
+    "url": {{json crate.repository}},
+    "spdx": {{json ../id}},
+    "license_text": {{json ../text}}
+  },
+{{/if~}}
+{{/each~}}
+{{/each~}}
+]
