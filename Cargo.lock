@@ -2477,6 +2477,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hort-attribution"
+version = "0.9.9-dev"
+
+[[package]]
 name = "hort-cli"
 version = "0.9.9-dev"
 dependencies = [
@@ -2486,6 +2490,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "directories",
+ "hort-attribution",
  "humantime",
  "mockito",
  "rand 0.8.6",
@@ -2967,6 +2972,7 @@ dependencies = [
  "hort-adapters-storage",
  "hort-adapters-upstream-http",
  "hort-app",
+ "hort-attribution",
  "hort-config",
  "hort-domain",
  "hort-formats",
@@ -3032,6 +3038,7 @@ dependencies = [
  "hort-adapters-storage",
  "hort-adapters-upstream-http",
  "hort-app",
+ "hort-attribution",
  "hort-config",
  "hort-domain",
  "hort-formats",

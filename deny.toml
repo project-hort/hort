@@ -120,8 +120,9 @@ confidence-threshold = 0.93
 # legal-review checkpoint.
 exceptions = []
 
-# Workspace crates are MIT (`workspace.package.license = "MIT"`); the
-# `private` block below short-circuits the check for them.
+# Workspace crates are dual-licensed `MIT OR Apache-2.0`
+# (`workspace.package.license`); the `private` block below short-circuits the
+# check for them.
 [licenses.private]
 ignore = true
 

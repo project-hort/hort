@@ -20,7 +20,8 @@ on:
       - '**/*.md'
       - 'docs/**'
       - '.beads/**'
-      - 'LICENSE'
+      - 'LICENSE-MIT'
+      - 'LICENSE-APACHE'
   workflow_dispatch:
 
 permissions:

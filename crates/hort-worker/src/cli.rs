@@ -22,6 +22,9 @@
 
 use clap::{Parser, Subcommand};
 
+use crate::attribution::AttributionArgs;
+use crate::license::LicenseArgs;
+
 /// Top-level CLI. `cmd` is optional so the no-subcommand invocation
 /// (every existing manifest uses this) keeps working.
 #[derive(Debug, Parser)]
@@ -49,6 +52,14 @@ pub enum Command {
     /// initialisation — the probe runs every few seconds, so it must
     /// stay cheap.
     Healthcheck,
+    /// Print hort's license identifier (and, with `--full`, the
+    /// complete license texts) to stdout and exit. Synchronous; no
+    /// config, no DB, no Tokio runtime.
+    License(LicenseArgs),
+    /// Print the generated third-party attribution document
+    /// (Markdown or JSON) to stdout and exit. Synchronous; no
+    /// config, no DB, no Tokio runtime.
+    Attribution(AttributionArgs),
 }
 
 #[cfg(test)]
@@ -77,6 +88,39 @@ mod tests {
     fn healthcheck_subcommand_parses() {
         let cli = Cli::try_parse_from(["hort-worker", "healthcheck"]).expect("healthcheck parse");
         assert!(matches!(cli.cmd, Some(Command::Healthcheck)));
+    }
+
+    #[test]
+    fn license_subcommand_parses_with_and_without_full() {
+        let cli = Cli::try_parse_from(["hort-worker", "license"]).expect("license parse");
+        let Some(Command::License(args)) = cli.cmd else {
+            panic!("expected License");
+        };
+        assert!(!args.full);
+
+        let cli = Cli::try_parse_from(["hort-worker", "license", "--full"]).expect("license parse");
+        let Some(Command::License(args)) = cli.cmd else {
+            panic!("expected License");
+        };
+        assert!(args.full);
+    }
+
+    #[test]
+    fn attribution_subcommand_parses_default_and_json() {
+        use crate::attribution::AttributionFormatArg;
+
+        let cli = Cli::try_parse_from(["hort-worker", "attribution"]).expect("attribution parse");
+        let Some(Command::Attribution(args)) = cli.cmd else {
+            panic!("expected Attribution");
+        };
+        assert_eq!(args.format, AttributionFormatArg::Text);
+
+        let cli = Cli::try_parse_from(["hort-worker", "attribution", "--format", "json"])
+            .expect("attribution parse");
+        let Some(Command::Attribution(args)) = cli.cmd else {
+            panic!("expected Attribution");
+        };
+        assert_eq!(args.format, AttributionFormatArg::Json);
     }
 
     #[test]

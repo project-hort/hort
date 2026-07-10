@@ -27,6 +27,10 @@ path = "src/main.rs"
 [dependencies]
 hort-domain            = { path = "../hort-domain" }
 hort-http-core         = { path = "../hort-http-core" }
+# hort's license text + generated third-party attribution, embedded at
+# compile time. Backs the `license` / `attribution` subcommands
+# (`src/cli/license.rs`, `src/cli/attribution.rs`).
+hort-attribution       = { path = "../hort-attribution" }
 # The per-format HTTP adapter crates (ADR 0008). Each one
 # depends only on hort-domain + hort-app + hort-formats + hort-http-core and
 # carries no adapter deps. hort-server is the only crate that lists all

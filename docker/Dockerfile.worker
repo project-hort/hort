@@ -235,7 +235,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d3cda6e91129130d7229a1806b6a73
 # rest (`source`, `revision`, `version`, `created`) via `--label` on
 # the publish job (mirroring the hort-server Dockerfile).
 LABEL org.opencontainers.image.title="hort-worker"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 # Pull binaries in. Order is dependency-cascade (toolchain first,
 # scanners after, app last) to keep layer cache reads sequential.
@@ -243,6 +243,12 @@ COPY --from=tini    /usr/bin/tini                   /usr/local/bin/tini
 COPY --from=trivy   /usr/local/bin/trivy            /usr/local/bin/trivy
 COPY --from=osv     /usr/local/bin/osv-scanner      /usr/local/bin/osv-scanner
 COPY --from=builder /usr/local/bin/hort-worker        /usr/local/bin/hort-worker
+
+# Image-level NOTICE for the bundled external tools above (Trivy, osv-scanner,
+# tini) plus the base image contents — see docs/attribution/image-notice.md.
+# Separate surface from the compiled-in crate attribution the `hort-worker
+# attribution` subcommand renders; do not conflate the two.
+COPY docs/attribution/image-notice.md /usr/share/hort/NOTICE
 
 # WORKDIR is owned by the `nonroot` user (UID 65532) per the
 # distroless base-image convention. The chart mounts CAS at

@@ -28,12 +28,20 @@
 //! have been removed in favour of the generalised `TaskDispatcher`
 //! (see `how-to/using-hort-cli-with-admin-ops.md`).
 
+/// `attribution` subcommand — prints the embedded, `cargo about`-generated
+/// third-party attribution document (text/json). Synchronous, no config,
+/// no Tokio runtime of its own.
+pub mod attribution;
 pub mod cli;
 pub mod composition;
 pub mod config;
 pub mod extra_ca;
 pub mod healthcheck;
 pub mod heartbeat;
+/// `license` subcommand — prints the SPDX license identifier (and,
+/// with `--full`, both license texts). Synchronous, no config, no
+/// Tokio runtime of its own.
+pub mod license;
 pub mod metrics_server;
 pub mod poll_loop;
 pub mod telemetry;

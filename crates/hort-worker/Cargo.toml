@@ -16,6 +16,10 @@ path = "src/main.rs"
 # Domain + application layers — same shared core as hort-server.
 hort-domain                    = { path = "../hort-domain" }
 hort-app                       = { path = "../hort-app" }
+# hort's license text + generated third-party attribution, embedded at
+# compile time. Backs the `license` / `attribution` subcommands
+# (`src/license.rs`, `src/attribution.rs`).
+hort-attribution               = { path = "../hort-attribution" }
 
 # Adapter layer — explicitly diverges from hort-server: this binary
 # pulls in the scanner + advisory adapters, hort-server does not. The

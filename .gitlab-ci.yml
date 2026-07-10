@@ -497,6 +497,25 @@ security:advisory-sync:
   script:
     - bash scripts/check-advisory-sync.sh
 
+# Third-party attribution staleness + allowlist-parity gate. Regenerates
+# THIRD-PARTY-LICENSES.{md,json} via `cargo about generate` and diffs against
+# the committed copies (stale ⇒ fail), and asserts `about.toml`'s `accepted`
+# license list matches `deny.toml`'s `[licenses] allow` list. No workspace
+# compile — cargo-about is a prebuilt binstall download reading `cargo
+# metadata` — so this runs from pipeline start like the other security:* gates.
+security:attribution-sync:
+  stage: security
+  image: ${RUST_IMAGE}
+  needs: []
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl python3
+    - *install-binstall
+    - cargo binstall --no-confirm --locked cargo-about
+      || cargo install --locked cargo-about --features cli || true
+  script:
+    - bash scripts/check-attribution.sh
+
 # No-plans gate (D7): `docs/plans/` is the branch-lifetime home for design docs
 # + backlogs, distilled into `docs/adr/` + `docs/architecture/` and removed
 # before they reach main. Runs PRE-MERGE on every MR to a protected branch:

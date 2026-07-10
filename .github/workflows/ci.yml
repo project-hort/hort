@@ -8,7 +8,8 @@ on:
       - 'site/**'
       - '**/*.md'
       - '.beads/**'
-      - 'LICENSE'
+      - 'LICENSE-MIT'
+      - 'LICENSE-APACHE'
       - 'CLAUDE.md'
   pull_request:
     branches: [main, develop, 'release/**']
@@ -16,7 +17,8 @@ on:
       - 'site/**'
       - '**/*.md'
       - '.beads/**'
-      - 'LICENSE'
+      - 'LICENSE-MIT'
+      - 'LICENSE-APACHE'
       - 'CLAUDE.md'
   workflow_dispatch:
 
@@ -551,6 +553,30 @@ jobs:
       - name: cargo-deny (blocking)
         run: cargo deny --workspace check
 
+  # Third-party attribution staleness + allowlist-parity gate. Regenerates
+  # THIRD-PARTY-LICENSES.{md,json} via `cargo about generate` and diffs
+  # against the committed copies (stale ⇒ fail), and asserts `about.toml`'s
+  # `accepted` license list matches `deny.toml`'s `[licenses] allow` list.
+  # Mirrors the `security:attribution-sync` job in `.gitlab-ci.yml`.
+  attribution-sync:
+    name: 📄 Third-party attribution sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
+        with:
+          tool: cargo-about
+
+      - name: Verify THIRD-PARTY-LICENSES sync + allowlist parity (blocking)
+        run: bash scripts/check-attribution.sh
+
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BINARY BUILD VERIFICATION (build-only, never releases)
   # ════════════════════════════════════════════════════════════════════════════
@@ -576,7 +602,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [hort-deps-gate, check-rust, test-backend-unit, coverage, test-backend-integration, security-audit-sync, security-audit, cargo-deny]
+    needs: [hort-deps-gate, check-rust, test-backend-unit, coverage, test-backend-integration, security-audit-sync, security-audit, cargo-deny, attribution-sync]
     if: always()
     steps:
       - name: Check CI status
@@ -646,6 +672,14 @@ jobs:
             echo "✅ cargo-deny" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ cargo-deny: ${{ needs.cargo-deny.result }}" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
+
+          # Third-party attribution sync (blocking)
+          if [[ "${{ needs.attribution-sync.result }}" == "success" ]]; then
+            echo "✅ attribution-sync" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ attribution-sync: ${{ needs.attribution-sync.result }}" >> $GITHUB_STEP_SUMMARY
             tier1_pass=false
           fi
 
