@@ -592,6 +592,13 @@ security:cargo-deny:
 
 quality:sonar:
   stage: quality
+  # SonarQube is reachable only at its in-cluster service DNS
+  # (sonarqube-sonarqube.sonarqube.svc.cluster.local), so this job must run on
+  # an in-cluster runner. The `platform` tag selects the in-cluster Platform
+  # Runner; without it the untagged job can land on an out-of-cluster runner
+  # that cannot resolve the service hostname and fails at "query server version".
+  tags:
+    - platform
   image:
     name: sonarsource/sonar-scanner-cli:latest
     entrypoint: [""]
