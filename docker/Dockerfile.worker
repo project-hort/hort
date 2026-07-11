@@ -91,6 +91,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
 
+# The `hort-attribution` crate — a dependency of the worker binary — embeds
+# these workspace-root files at compile time via `include_str!` (the dual
+# licenses and the generated third-party manifests). They must be present in
+# the build context or `cargo build` fails with "couldn't read
+# `.../LICENSE-MIT`: No such file or directory".
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.md THIRD-PARTY-LICENSES.json ./
+
 # Same proc-macro-cache caveat the hort-server Dockerfile documents:
 # `sqlx::migrate!` only re-reads the migrations directory when its
 # host file is recompiled. Touching the worker's migrator host file

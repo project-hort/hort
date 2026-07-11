@@ -725,6 +725,13 @@ quality:fail2ban-regex-test:
 # wipes /tmp/cosign.key even if the build failed mid-step.
 
 .docker:
+  # build-images push to the mirror registry (mirror.kdp.kloni.cloud) with
+  # credentials mounted only on the in-cluster Platform Runner at /secrets/zot;
+  # off-cluster runners fall back to CI_REGISTRY_* (GitLab's own registry) and
+  # fail `buildah login` with "invalid username/password". The `platform` tag
+  # pins these jobs to the runner that holds the mirror secret.
+  tags:
+    - platform
   image: quay.io/buildah/stable:v1.39
   variables:
     STORAGE_DRIVER: vfs
@@ -970,6 +977,11 @@ build-images:hort-worker:
 
 helm:lint-and-publish:
   stage: helm
+  # `helm push` targets the same mirror registry as build-images, whose
+  # credentials are mounted only on the in-cluster Platform Runner; the
+  # `platform` tag pins the job to that runner (see .docker).
+  tags:
+    - platform
   # entrypoint: [""] — see quality:helm-template-test; the alpine/helm image's
   # ENTRYPOINT ["helm"] must be overridden so a podman-executor runner runs the
   # job shell instead of `helm sh`.
