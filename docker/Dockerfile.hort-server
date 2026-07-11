@@ -55,6 +55,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY migrations/ ./migrations/
 
+# The `hort-attribution` crate — a dependency of every binary built here —
+# embeds these workspace-root files into the binary at compile time via
+# `include_str!` (the dual licenses and the generated third-party manifests).
+# They must be present in the build context or `cargo build` fails with
+# "couldn't read `.../LICENSE-MIT`: No such file or directory".
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.md THIRD-PARTY-LICENSES.json ./
+
 # `sqlx::migrate!` re-scans the migrations directory only when its
 # host source file changes mtime. Touching the file invalidates the
 # cached proc-macro expansion inside the `/app/target` BuildKit cache
