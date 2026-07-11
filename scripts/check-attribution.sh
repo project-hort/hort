@@ -5,29 +5,35 @@
 #
 # Two independent checks:
 #
-#   1. Staleness: runs `scripts/regenerate-attribution.sh` (the same script a
-#      developer runs locally) and diffs its output against the committed
-#      `THIRD-PARTY-LICENSES.{md,json}`. A non-empty diff means the compiled
-#      dependency graph moved since the committed artifacts were generated
-#      (typically: a dependency was added/changed/removed and the attribution
-#      wasn't regenerated in the same change). Delegating to the regenerate
-#      script — rather than reimplementing its `cargo about generate` calls —
-#      means this gate automatically inherits the exact CRLF-normalization and
-#      JSON trailing-comma handling the regenerate script performs, so the
-#      comparison never spuriously fails on line-ending or formatting noise.
-#   2. Allowlist parity: `about.toml`'s `accepted` license list must equal
-#      `deny.toml`'s `[licenses] allow` list (same SPDX set, same permissive
-#      graph — see the header comments on both files). A divergence means a
-#      license `cargo deny check licenses` would accept could ship with no
-#      corresponding attribution entry, or vice versa.
+#   1. Staleness (structural): regenerates the attribution and compares the
+#      per-crate (name, version, SPDX, URL) SET of the fresh JSON against the
+#      committed JSON. That set is the dependency graph's identity — a
+#      crate@version's license is immutable on crates.io, so once the set
+#      matches, the committed attribution is not stale. The raw license TEXT is
+#      deliberately NOT byte-compared: cargo-about, for a crate shipping several
+#      license files with the same SPDX (e.g. miniz_oxide ships both `LICENSE`
+#      and `LICENSE-MIT.md`, both MIT, differing only by a blank line), selects
+#      one by filesystem-enumeration order, which is not stable across
+#      environments. A byte-diff flakes on that cosmetic, legally-meaningless
+#      difference. The SPDX field is part of the compared tuple, so a pick of a
+#      genuinely different license (a different SPDX) IS caught; only same-SPDX
+#      whitespace variance is tolerated. A real change — dependency
+#      added/removed, or version/SPDX/URL changed — still fails and names the
+#      crate.
+#   2. Allowlist parity: about.toml's `accepted` license list must equal
+#      deny.toml's `[licenses] allow` list (same SPDX set — see both files'
+#      header comments). A divergence means a license `cargo deny check
+#      licenses` would accept could ship with no corresponding attribution
+#      entry, or vice versa.
 #
 # Run by:
 #   - `.gitlab-ci.yml`               (security:attribution-sync stage)
 #   - `.github/workflows/ci.yml`     (attribution-sync job)
 #   - locally before pushing a dependency change
 #
-# Requires `cargo-about` on PATH (same requirement as
-# `scripts/regenerate-attribution.sh`, which this script calls).
+# Requires `cargo-about` (via scripts/regenerate-attribution.sh, which this
+# calls and which prepends $CARGO_HOME/bin to PATH so a CI-binstalled binary is
+# found under GitLab's project-local CARGO_HOME).
 
 set -euo pipefail
 
@@ -47,20 +53,72 @@ for f in "${about_toml}" "${deny_toml}" "${md_file}" "${json_file}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Check 1: staleness — regenerate in place, then diff against the committed
-# copies. `regenerate-attribution.sh` writes both files in place (the same
-# artifacts `git diff` below inspects), so a tree that was already in sync
-# comes out of this step byte-identical to how it went in.
+# Check 1: structural staleness. Regenerate, snapshot the fresh JSON, restore
+# the working tree, then compare the (name, version, SPDX, URL) set. See the
+# header note for why the license text itself is not byte-compared.
 # ---------------------------------------------------------------------------
-echo "Regenerating third-party attribution artifacts for comparison..." >&2
-bash "${repo_root}/scripts/regenerate-attribution.sh" >&2
+committed_json="$(mktemp)"
+fresh_json="$(mktemp)"
+trap 'rm -f "${committed_json}" "${fresh_json}"' EXIT
 
-if ! git diff --exit-code -- "${md_file}" "${json_file}"; then
-    echo "" >&2
-    echo "error: third-party attribution is stale — run scripts/regenerate-attribution.sh and commit the result" >&2
+git show "HEAD:${json_file}" > "${committed_json}"
+
+echo "Regenerating third-party attribution for structural comparison..." >&2
+bash "${repo_root}/scripts/regenerate-attribution.sh" >&2
+cp "${json_file}" "${fresh_json}"
+
+# regenerate-attribution.sh rewrote the artifacts in place; restore the working
+# tree so a cosmetic license-text difference (the thing we intentionally ignore)
+# does not leave it dirty for callers.
+git checkout -- "${md_file}" "${json_file}"
+
+if ! python3 - "${committed_json}" "${fresh_json}" <<'PY'
+import json
+import sys
+
+
+def graph(path):
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    # Structural identity of the dependency graph. license_text is excluded on
+    # purpose (see the script header): a crate@version's license is immutable,
+    # so this set fully captures whether the committed attribution is stale.
+    return {
+        (e["name"], e["version"], e.get("spdx", ""), e.get("url", ""))
+        for e in doc
+    }
+
+
+committed = graph(sys.argv[1])
+fresh = graph(sys.argv[2])
+
+if committed == fresh:
+    print(
+        "Third-party attribution staleness check: OK "
+        f"({len(fresh)} crates; dependency graph matches the committed attribution)"
+    )
+    sys.exit(0)
+
+removed = sorted(committed - fresh)
+added = sorted(fresh - committed)
+print(
+    "error: third-party attribution is stale — the compiled dependency graph "
+    "changed but THIRD-PARTY-LICENSES.{md,json} were not regenerated:",
+    file=sys.stderr,
+)
+for name, ver, spdx, _ in removed:
+    print(f"  - {name} {ver} ({spdx})", file=sys.stderr)
+for name, ver, spdx, _ in added:
+    print(f"  + {name} {ver} ({spdx})", file=sys.stderr)
+print(
+    "\n  run scripts/regenerate-attribution.sh and commit the result.",
+    file=sys.stderr,
+)
+sys.exit(1)
+PY
+then
     exit 1
 fi
-echo "Third-party attribution staleness check: OK (committed artifacts match a fresh regeneration)"
 
 # ---------------------------------------------------------------------------
 # Check 2: allowlist parity — about.toml's `accepted` array must be the same
