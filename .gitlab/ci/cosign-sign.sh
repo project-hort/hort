@@ -19,6 +19,12 @@ if [ -z "$IMAGE" ] || [ -z "$DIGEST" ]; then
   exit 1
 fi
 
+# cosign v3 gates --registry-referrers-mode=oci-1-1 (the OCI 1.1 referrers
+# carriage ADR 0039 §9 requires so a hosted hort repo resolves signatures via
+# the referrers API, not legacy .sig tags) behind COSIGN_EXPERIMENTAL=1;
+# without it cosign errors out before any registry call.
+export COSIGN_EXPERIMENTAL=1
+
 case "${SIGNING_MODE}" in
   none)
     echo "SIGNING_MODE=none — skipping signature for ${IMAGE}@${DIGEST}"
