@@ -1,8 +1,8 @@
-# Reference manifest for hort (Rust workspace + JS tooling).
+# Reference manifest for hort (Rust workspace).
 # Copy to <project>/.agents/manifest.yaml and adjust.
 name: hort
-toolchains: [rust, node]
-cache_volumes: [cargo, npm]
+toolchains: [rust]
+cache_volumes: [cargo]
 sidecars: [postgres]
 resources: { cpus: 3, mem: 12g }
 directive_timeout: 4h
