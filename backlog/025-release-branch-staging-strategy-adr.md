@@ -1,15 +1,22 @@
 # 025 — ADR + glossary: hort release / branch / staging strategy
 
 - **Source:** GitLab issue #25 (`agent:decision` — decision content **provided by the maintainer** in the issue; this records a stated policy, it does not decide one)
-- **Type:** docs (ADR + glossary + release-doc reconciliation). **No code.**
-- **Model hint:** **capable** — ADR authoring + reconciling the existing release docs is cross-cutting; the wording carries authority.
-- **Reviewable unit:** one directive. Architect reviews the ADR wording before landing (ADR lands only after an answered `agent:decision` — satisfied by #25).
+- **Type:** docs (ADR + glossary + release-doc reconciliation) **+ a scoped CI change**
+  (alpha-tag build/publish routing — see D4). No Rust/runtime code.
+- **Model hint:** **capable** — ADR authoring + cross-cutting release docs + a
+  two-CI-system change whose correctness (internal vs public registry) carries risk.
+- **Reviewable unit:** one directive. Architect reviews the ADR wording *and*
+  CI-lints the pipeline change before landing (ADR lands only after an answered
+  `agent:decision` — satisfied by #25).
 
 ## Goal
 
 Record hort's release/branch/staging model durably so the architect and future
-contributors share one model. Doc-only; staging-deploy / version-bump CI
-automation is explicitly a **separate future backlog item**, not this one.
+contributors share one model, **and** make the alpha/staging mechanism actually
+work by routing `alpha` tags to the internal registry/chart (D4). Broader
+staging-deploy automation and `test/*` branch-cut tooling remain a separate future
+item; the tag-regex routing is in-scope here because staging depends on it
+(maintainer, 2026-07-13).
 
 ## The policy to record (from #25 + the maintainer's 2026-07-13 clarification — do not re-decide it)
 
@@ -35,7 +42,11 @@ rename for internal builds and the no-merge-back requirement.
 - **Staging is continuous and multi-source** — deploys from `develop`, from `test/*`
   pre-release branches, and from `main`.
 - **Alpha builds are internal-only** — staging + the **local hort registry only**,
-  never published publicly.
+  never published publicly. They **do** produce container images + a Helm chart
+  (staging deploys from the chart + images — maintainer, 2026-07-13), but those
+  artifacts go to the **internal** registry (`${REGISTRY}` / registry.hort.rs via
+  GitLab CI), **not** the public ghcr (GitHub `docker-publish.yml`). D4 wires exactly
+  this split.
 - **`main` is the public release** — version-fixed, deliberate, infrequent; one
   release may close many `ready-for-staging` / `in-uat` issues at once.
 - Issues **rest** in `ready-for-staging` / `in-uat` until a release — not blocked
@@ -84,10 +95,35 @@ sets the file's format.
     behavior with the maintainer rather than guessing. Surface this in the report.
 - Add the ADR 0048 reference to CLAUDE.md so the agents apply it.
 
+### D4 — CI: route `alpha` tags to the internal registry only (maintainer requirement, 2026-07-13)
+Staging deploys from the Helm chart + images, so an internal `alpha` tag must build
+and publish them — **to the internal registry, never public.** Two edits:
+
+1. **GitLab `.gitlab-ci.yml` — widen the internal-publish regex.** `build-images:hort-server`,
+   `build-images:hort-worker`, and `helm:lint-and-publish` currently gate on
+   `$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/`. Widen the
+   pre-release group to include `alpha`: `-(alpha|rc|beta)\.[0-9]+`. These jobs push to
+   `${REGISTRY}` (the internal mirror / registry.hort.rs), which is what staging
+   consumes — so this is the intended internal build. (These jobs are also now
+   `changes:`-gated from #24, but the `$CI_COMMIT_TAG` arm is unconditional, so tag
+   pipelines still run — good.)
+2. **GitHub `.github/workflows/docker-publish.yml` — exclude `alpha` from the public
+   publish.** It triggers on `push: tags: ['v*']` with **no** pre-release filter, so a
+   `v…-alpha.N` tag would publish **public** ghcr images/charts — violating internal-only.
+   Add a guard so `alpha` pre-release tags are skipped (e.g. a job-level
+   `if: !contains(github.ref, '-alpha.')`, or narrow the tag trigger). `:latest` is
+   already correctly excluded for any pre-release (`!contains(ref,'-')`); the gap is the
+   **versioned** `:X.Y.Z-alpha.N` public push. Keep `beta`/`rc` behaviour unchanged
+   (those remain the public pre-release track room the naming leaves open).
+
+**Confirm, don't assume, the public-exclusion intent in the report** if anything about
+the internal-vs-public split reads ambiguously against the deployment reality — but the
+recorded policy (alpha = internal-only) makes the exclusion the fail-safe default.
+
 ## Out of scope
 
-- Any staging-deploy automation, `test/*` branch-cut tooling, or version-bump CI
-  (explicitly a separate future backlog item per #25).
+- Broader staging-deploy automation and `test/*` branch-cut tooling (a separate future
+  item). D4 covers only the alpha-tag build/publish **routing**, which staging needs now.
 - Creating/removing workflow labels (`workflow::in-uat` already exists).
 
 ## Acceptance criteria
@@ -101,8 +137,10 @@ sets the file's format.
    internal-only noted, and pointing at ADR 0048 — no remaining statement that
    contradicts the recorded policy. The `build-images/helm` tag-regex interaction is
    flagged in the report (not silently changed).
-4. Markdown only; no code, no CI/gate changes. (Doc-only push — will not run heavy
-   CI once #24 lands; harmless before then.)
+4. **D4:** the three GitLab internal-publish jobs' tag regex matches `alpha` (so a
+   `v…-alpha.N` tag builds/publishes to the internal registry); the GitHub public
+   publish **skips** `alpha` tags (no public ghcr image/chart for an alpha); `beta`/`rc`
+   behaviour unchanged on both sides.
 
 ## Verification (for the cockpit report)
 
@@ -111,3 +149,9 @@ sets the file's format.
   `RELEASING.md`/CLAUDE.md now contradicts ADR 0048 (or a flagged item if a
   maintainer call is needed).
 - Confirm `docs/glossary.md` links resolve to `docs/adr/0048-*`.
+- **D4:** paste the before/after of the three GitLab regex lines and the GitHub
+  guard; reason through the four cases in the report — `v1.2.3` (public + internal),
+  `v1.2.3-alpha.1` (**internal only**, no public), `v1.2.3-beta.1` / `-rc.1`
+  (unchanged). CI-lint the `.gitlab-ci.yml` change (the architect will also run the
+  GitLab CI-lint API on landing). A YAML/actions syntax check of `docker-publish.yml`
+  (e.g. `actionlint` if available, else careful review) for the guard.
