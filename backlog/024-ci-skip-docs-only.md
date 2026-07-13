@@ -19,7 +19,16 @@ Backlog stays version-controlled — the gitignore-`backlog/` alternative was ex
 
 **Doc-only (skip heavy jobs):** `**/*.md`, `docs/**`, `backlog/**`, `handover/**`, `site/**`, `LICENSE*`, `.gitignore`.
 
-**Code/build/CI (run full):** `crates/**`, `Cargo.toml`, `Cargo.lock`, `migrations/**`, `.gitlab-ci.yml`, `deploy/**`, `docker/**`, `scripts/**`, `.cargo/**`, `rust-toolchain.toml`, `deny.toml`, `.clippy.toml`, `rustfmt.toml`, `about.toml`.
+**Code/build/CI (run full):** `crates/**`, `Cargo.toml`, `Cargo.lock`, `migrations/**`, `.gitlab-ci.yml`, `.gitlab/**`, `sonar-project.properties`, `deploy/**`, `docker/**`, `scripts/**`, `.cargo/**`, `rust-toolchain.toml`, `deny.toml`, `.clippy.toml`, `rustfmt.toml`, `about.toml`.
+
+> **Amended post-implementation:** `.gitlab/**` and `sonar-project.properties` were
+> added to this list during implementation (accepted architect deviation) — both are
+> executed/read by jobs this split gates (`.gitlab/ci/cosign-*.sh` by `build-images:*`
+> / `release:sbom`; `sonar-project.properties` by `quality:sonar`), so editing them
+> must run those jobs, not fall through the `changes:` positive-match gap. Landed on
+> `develop` as `53b1321d`; CI-lint validated. Residual path-coverage triage (other
+> uncovered top-level paths) + the `THIRD-PARTY-LICENSES.md` doc-glob edge are a
+> follow-up (see issue filed from report flags #1/#2).
 
 Guiding rule: **`.gitlab-ci.yml` itself is a code path** — a change to the pipeline definition must run the full pipeline. When in doubt, a path runs the full pipeline (fail-safe toward *more* CI, never less).
 
