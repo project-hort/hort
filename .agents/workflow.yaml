@@ -1,0 +1,18 @@
+# Workflow label vocabulary for hort (spec §8 v1). Omit to use the built-in
+# DEFAULT_WORKFLOW; present here as the copy/adjust reference. `agents labels
+# sync` reconciles these onto the GitLab project (idempotent).
+states:
+  - { name: "workflow::in-specification",     color: "#F0AD4E", description: "human⇄architect iterate on the spec" }
+  - { name: "workflow::ready-for-refinement", color: "#F0AD4E", description: "spec approved; architect grooms backlog" }
+  - { name: "workflow::refined",              color: "#5BC0DE", description: "backlog prepared, awaiting human confirmation" }
+  - { name: "workflow::ready",                color: "#5BC0DE", description: "backlog confirmed; implementation may start" }
+  - { name: "workflow::in-progress",          color: "#428BCA", description: "directives dispatched, cockpit working" }
+  - { name: "workflow::in-test",              color: "#428BCA", description: "implemented; architect verifies" }
+  - { name: "workflow::ready-for-staging",    color: "#5CB85C", description: "merged to develop, deployed to staging" }
+  - { name: "workflow::closed",               color: "#5CB85C", description: "promoted to main; issue closed" }
+channels:
+  - { name: "agent:task",           color: "#6C757D", description: "human→architect: new work to groom" }
+  - { name: "agent:decision",       color: "#6C757D", description: "human→architect: ADR-level question" }
+  - { name: "agent:directive",      color: "#6C757D", description: "human→architect: do-this-now override" }
+  - { name: "agent:escalation",     color: "#D9534F", description: "architect→human: needs attention" }
+  - { name: "agent:review-request", color: "#D9534F", description: "architect→human: review/approve" }
