@@ -1,0 +1,12 @@
+# Reference manifest for hort (Rust workspace + JS tooling).
+# Copy to <project>/.agents/manifest.yaml and adjust.
+name: hort
+toolchains: [rust, node]
+cache_volumes: [cargo, npm]
+sidecars: [postgres]
+resources: { cpus: 3, mem: 12g }
+directive_timeout: 4h
+env:
+  DATABASE_URL: "postgres://dev:test@sbx-hort-pg:5432/hort"
+# staging: enable in Plan 4 (verifier)
+# models: tune per spec §7.5 when limits demand it
