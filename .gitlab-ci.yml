@@ -45,6 +45,88 @@ workflow:
     - if: $CI_COMMIT_TAG
 
 # ---------------------------------------------------------------------------
+# Doc-only skip (backlog 024 / issue #24)
+# ---------------------------------------------------------------------------
+#
+# Backlog-commit / coordination-only pushes to develop were running the full
+# build/test/lint/security/quality/image pipeline for a markdown-only diff.
+# `changes:` can only express a positive match, so this is the code/build/CI
+# side of the architect-finalized doc-vs-code split (backlog/024): a path
+# matching this list runs the gated jobs; anything else — including a path
+# on neither side of the split — skips them. That residual case (see the
+# DEVIATION note below) is the one place this mechanism can't fully honour
+# "unrecognized path -> fail safe to full run"; GitLab `changes:` has no way
+# to express that directly. Mitigate by listing broad code/build roots
+# (whole directories) rather than individual files, so newly-added files
+# under an existing code root are covered automatically.
+#
+# `.gitlab-ci.yml` is deliberately IN this list — editing the pipeline
+# definition must always re-run the full pipeline against itself.
+#
+# DEVIATION from the backlog-024 path split as literally written: it lists
+# `.gitlab-ci.yml` but not the rest of `.gitlab/**`, and doesn't mention
+# `sonar-project.properties`. Both are directly executed/read by jobs this
+# list gates — `.gitlab/ci/cosign-setup.sh` / `cosign-sign.sh` are sourced by
+# `.docker` (build-images:*) and `release:sbom`; `sonar-project.properties`
+# is the static-analysis config `quality:sonar`'s scanner auto-reads. Neither
+# path matches the doc-only set either, so under the literal finalized list
+# they'd fall through a `changes:` positive-match gap: not doc, not code,
+# silently skipped — a concrete violation of this directive's own fail-safe
+# constraint ("any path not in the doc-only set runs the full pipeline"),
+# not a stylistic preference. Added both; no other uncovered top-level paths
+# (.github/, .agents/, renovate.json, THIRD-PARTY-LICENSES.*, etc.) were
+# added — see the report's flags section for why those are left for the
+# architect to triage rather than decided unilaterally here.
+.code-changed-paths: &code-changed-paths
+  - "crates/**/*"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "migrations/**/*"
+  - ".gitlab-ci.yml"
+  - ".gitlab/**/*"
+  - "sonar-project.properties"
+  - "deploy/**/*"
+  - "docker/**/*"
+  - "scripts/**/*"
+  - ".cargo/**/*"
+  - "rust-toolchain.toml"
+  - "deny.toml"
+  - ".clippy.toml"
+  - "rustfmt.toml"
+  - "about.toml"
+
+# Shared rule template for jobs with no other rules: `!reference`'d as
+# `<<: [*other-anchor, *rules-code-changed]` (YAML merge; GitLab supports
+# merging multiple mapping anchors this way, same as `.rust-cache` below).
+# Tag pipelines always run full — releases stay fail-safe-full regardless of
+# what changed (backlog pitfall #2: `changes:` is not reliable/meaningful for
+# tag pipelines, so it's simply not used on that branch of the rule). MR and
+# branch pipelines only run the job when the diff touches a code/build/CI
+# path.
+.rules-code-changed: &rules-code-changed
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *code-changed-paths
+    - if: $CI_COMMIT_BRANCH
+      changes: *code-changed-paths
+
+# Guaranteed-present, guaranteed-green job. GitLab's "pipelines must succeed"
+# merge-check trap: if every job in a doc-only pipeline is gated out, the
+# pipeline has zero jobs and some project settings then block the MR
+# (backlog pitfall #1 / acceptance #4). This job carries no `rules:` (always
+# runs, on every pipeline) so a doc-only pipeline is never empty — it costs
+# nothing to also run it on code pipelines (no compile, no heavy image), and
+# keeping it unconditional is simpler than deriving "was anything else
+# skipped" via a second copy of the path list.
+docs-only:ok:
+  stage: test
+  image: alpine:3.20
+  needs: []
+  script:
+    - "true"
+
+# ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
 
@@ -190,15 +272,21 @@ variables:
     REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}"
     export REGISTRY_USER REGISTRY_PASSWORD
 
-# Jobs without explicit rules inherit the workflow scope above, so fmt,
-# clippy, unit tests, coverage, cargo-audit, and the sonar gate run on
-# every pipeline (feature branch, MR, main, release, tag). Jobs that
-# should stay gated (integration tests) opt in to this anchor.
+# Jobs without other rules now opt in to `.rules-code-changed` above, so
+# fmt, clippy, unit tests, coverage, cargo-audit, and the sonar gate run on
+# every pipeline (feature branch, MR, main, release, tag) EXCEPT a doc-only
+# diff, which skips them (backlog 024). Integration tests stay additionally
+# gated to main/master/release/tag via this anchor, now also composed with
+# the code-changed path list on its branch arms — the tag arm stays
+# unconditional (fail-safe-full, same reasoning as `.rules-code-changed`).
 .rules-main-only: &rules-main-only
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH == "master"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
     - if: $CI_COMMIT_TAG
 
 # ---------------------------------------------------------------------------
@@ -305,7 +393,7 @@ variables:
 test:lint:
   stage: test
   image: ${RUST_IMAGE}
-  <<: *rust-cache
+  <<: [*rust-cache, *rules-code-changed]
   variables:
     # cargo clippy runs clippy-driver over workspace crates whose dependencies
     # (sqlx + its sqlx-macros proc-macro) are compiled by rustc; under
@@ -332,7 +420,7 @@ test:unit:
   stage: test
   extends: [.sccache]
   image: ${RUST_SCCACHE_IMAGE}
-  <<: *rust-cache
+  <<: [*rust-cache, *rules-code-changed]
   needs:
     - job: test:lint
       artifacts: false
@@ -360,7 +448,7 @@ test:unit:
 test:coverage:
   stage: test
   image: ${RUST_IMAGE}
-  <<: *rust-cache
+  <<: [*rust-cache, *rules-code-changed]
   needs:
     - job: test:unit
       artifacts: false
@@ -410,8 +498,7 @@ test:integration:
   stage: test
   extends: [.sccache]
   image: ${RUST_SCCACHE_IMAGE}
-  <<: *rust-cache
-  <<: *rules-main-only
+  <<: [*rust-cache, *rules-main-only]
   needs:
     - job: test:coverage
       artifacts: false
@@ -461,6 +548,7 @@ security:cargo-audit:
   # prebuilt binstall download — so this runs from pipeline start rather than
   # queuing behind the serialized test-compile chain.
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
@@ -494,6 +582,7 @@ security:advisory-sync:
   stage: security
   image: ${RUST_IMAGE}
   needs: []
+  <<: *rules-code-changed
   script:
     - bash scripts/check-advisory-sync.sh
 
@@ -507,6 +596,7 @@ security:attribution-sync:
   stage: security
   image: ${RUST_IMAGE}
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl python3
@@ -567,6 +657,7 @@ security:cargo-deny:
   # tool is a prebuilt binstall download — so this runs from pipeline start
   # rather than queuing behind the serialized test-compile chain.
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
@@ -614,7 +705,16 @@ quality:sonar:
     # Runs only when a Sonar token is configured, so installations without a
     # Sonar instance don't hard-fail the quality stage. Set SONAR_TOKEN (and
     # SONAR_HOST_URL) as masked CI/CD variables to enable. See docs/ci/README.md.
-    - if: '$SONAR_TOKEN'
+    # Split tag vs. branch (rather than the old bare `if: '$SONAR_TOKEN'`) so
+    # this job's presence tracks `needs: test:coverage` exactly: tag pipelines
+    # stay unconditional (fail-safe-full), branch pipelines gate on the same
+    # code-changed path list test:coverage uses. Without this, a doc-only
+    # branch pipeline would skip test:coverage but still try to run sonar,
+    # which needs: test:coverage (not optional) — an unresolvable-needs error
+    # at pipeline creation (backlog pitfall #3).
+    - if: '$SONAR_TOKEN && $CI_COMMIT_TAG'
+    - if: '$SONAR_TOKEN && $CI_COMMIT_BRANCH'
+      changes: *code-changed-paths
   needs:
     - job: test:coverage
       artifacts: true
@@ -651,6 +751,7 @@ quality:chart-and-rust-pin-sync:
   stage: quality
   image: alpine:3.20
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apk add --no-cache bash grep
   script:
@@ -668,6 +769,7 @@ quality:g1-attestation-gate:
   stage: quality
   image: alpine:3.20
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apk add --no-cache bash grep findutils sed
   script:
@@ -695,6 +797,7 @@ quality:helm-template-test:
     name: alpine/helm:3.17.1
     entrypoint: [""]
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apk add --no-cache bash grep findutils sed
   script:
@@ -708,6 +811,7 @@ quality:fail2ban-regex-test:
   stage: quality
   image: debian:13-slim
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends fail2ban
@@ -795,7 +899,9 @@ build-images:hort-server:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
   script:
     - |
       set -euo pipefail
@@ -891,7 +997,9 @@ build-images:hort-worker:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
   script:
     - |
       set -euo pipefail
@@ -996,7 +1104,9 @@ helm:lint-and-publish:
   rules:
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
   before_script:
     # Trust platform CA for registry (Alpine: install ca-certificates first)
     - apk add --no-cache ca-certificates
