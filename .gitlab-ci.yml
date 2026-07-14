@@ -592,11 +592,29 @@ security:advisory-sync:
 # license list matches `deny.toml`'s `[licenses] allow` list. No workspace
 # compile — cargo-about is a prebuilt binstall download reading `cargo
 # metadata` — so this runs from pipeline start like the other security:* gates.
+#
+# Scoped to release-relevant pipelines only (issue #30), NOT `.rules-code-changed`
+# like its security:* siblings: attribution is a property of the shipped
+# artifact (embedded via `include_str!`, ADR 0047), so it's verified where a
+# public/internal artifact can actually be built, not on every code-touching
+# MR. Without this, a Renovate dep-bump MR changes the dep graph, the
+# committed attribution goes stale, and the job fails deterministically on
+# every such MR even though nothing ships from it. A stale attribution still
+# cannot ship: the develop → main promotion MR, main/release/* pushes, and
+# every v* tag all re-verify it before any artifact is built — only
+# internal, non-shipping pipelines (feature/Renovate MRs, develop-targeting
+# MRs, ordinary develop pushes) stop running it. No `changes:` filter on any
+# arm — always verify before a release-relevant build, regardless of what
+# changed.
 security:attribution-sync:
   stage: security
   image: ${RUST_IMAGE}
   needs: []
-  <<: *rules-code-changed
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|release\/)/'
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl python3
