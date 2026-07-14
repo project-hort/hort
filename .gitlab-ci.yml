@@ -73,10 +73,40 @@ workflow:
 # they'd fall through a `changes:` positive-match gap: not doc, not code,
 # silently skipped — a concrete violation of this directive's own fail-safe
 # constraint ("any path not in the doc-only set runs the full pipeline"),
-# not a stylistic preference. Added both; no other uncovered top-level paths
-# (.github/, .agents/, renovate.json, THIRD-PARTY-LICENSES.*, etc.) were
-# added — see the report's flags section for why those are left for the
-# architect to triage rather than decided unilaterally here.
+# not a stylistic preference. Added both at the time (backlog/024); the rest
+# of the then-uncovered top-level paths were deliberately left for the
+# architect to triage rather than decided unilaterally — that triage is the
+# rest of this comment (backlog/026, issue #26).
+#
+# backlog/026 (issue #26) triage of the residual uncovered paths, plus
+# `THIRD-PARTY-LICENSES.md`/`.json` (previously doc-side / uncovered — see
+# below). The rule: a path is **code-side** only if editing it can change a
+# heavy job's *output* (build, test, lint, attribution). Added here:
+#   - `.dockerignore` — image-build context (buildah/`docker build`), same
+#     rationale as the already-listed `docker/**`.
+#   - `about/**/*` — cargo-about templates/config read by
+#     `security:attribution-sync`, same rationale as the already-listed
+#     `about.toml`.
+#   - `THIRD-PARTY-LICENSES.md` / `.json` — the generated attribution
+#     artifacts. `.md` previously matched the doc-only `**/*.md` glob, so a
+#     lone hand-edit classified as doc-only and skipped its own
+#     verification job; `.json` matched neither side. Both are code-side now
+#     (the verification-*timing* half of this — re-checking on the
+#     `develop → main` promotion / release pushes / tags regardless of path
+#     classification — is issue #30's `security:attribution-sync` rescope,
+#     not this anchor; the two are complementary, not overlapping).
+#
+# Left **skip-safe** (deliberately NOT in this list — inert to every GitLab
+# job, so a lone edit correctly stays doc-only and skips the heavy jobs; not
+# an oversight, do not re-litigate without re-running the same "does it
+# change a heavy job's output?" test): `.github/**` (GitHub-only CI; no
+# GitLab job reads it), `.agents/**` (auto-agents config), `.env.example`,
+# `.gitguardian.yaml`, `.mergify.yml`, `renovate.json`, `install/**` (the CLI
+# installer served at hort.rs — not built/tested by the Rust pipeline),
+# `tools/**` (workspace-excluded — `exclude = ["tools/*"]` in the root
+# `Cargo.toml`, so no `--workspace` job builds it), `.trivyignore`
+# (grep-confirmed not referenced anywhere in `.gitlab-ci.yml` — consumed at
+# worker runtime, not in CI).
 .code-changed-paths: &code-changed-paths
   - "crates/**/*"
   - "Cargo.toml"
@@ -87,6 +117,7 @@ workflow:
   - "sonar-project.properties"
   - "deploy/**/*"
   - "docker/**/*"
+  - ".dockerignore"
   - "scripts/**/*"
   - ".cargo/**/*"
   - "rust-toolchain.toml"
@@ -94,6 +125,9 @@ workflow:
   - ".clippy.toml"
   - "rustfmt.toml"
   - "about.toml"
+  - "about/**/*"
+  - "THIRD-PARTY-LICENSES.md"
+  - "THIRD-PARTY-LICENSES.json"
 
 # Shared rule template for jobs with no other rules: `!reference`'d as
 # `<<: [*other-anchor, *rules-code-changed]` (YAML merge; GitLab supports
