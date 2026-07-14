@@ -17,6 +17,9 @@
 //! change that could alter the graph; see `about.toml` and the templates
 //! under `about/`.
 
+use std::io::{self, Write};
+use std::process::ExitCode;
+
 /// hort's SPDX license expression.
 pub const SPDX: &str = "MIT OR Apache-2.0";
 
@@ -74,6 +77,30 @@ pub fn render_attribution(format: AttributionFormat) -> &'static str {
     match format {
         AttributionFormat::Text => THIRD_PARTY_MD,
         AttributionFormat::Json => THIRD_PARTY_JSON,
+    }
+}
+
+/// Write `s` to stdout, exiting cleanly instead of panicking if the reader
+/// has gone away.
+///
+/// Rust ignores `SIGPIPE` by default and never resets it (that would need
+/// `libc::signal`, `unsafe`, forbidden workspace-wide), so writing to a pipe
+/// whose consumer already exited (`| head`, `| less` then `q`) surfaces as
+/// an `io::Error` rather than killing the process via signal. `print!` /
+/// `println!` unwrap that error and panic ("failed printing to stdout").
+/// This helper is the shared fix for every print-and-exit subcommand: the
+/// consumer already got all the bytes it wanted, so a `BrokenPipe` write
+/// error is swallowed into a clean `ExitCode::SUCCESS`. Any other write
+/// error still panics, same as `print!` today.
+pub fn write_stdout_or_exit(s: &str) -> ExitCode {
+    write_or_exit(&mut io::stdout(), s)
+}
+
+fn write_or_exit<W: Write>(w: &mut W, s: &str) -> ExitCode {
+    match w.write_all(s.as_bytes()).and_then(|()| w.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => panic!("failed printing to stdout: {e}"),
     }
 }
 
@@ -137,5 +164,68 @@ mod tests {
         assert_ne!(AttributionFormat::Text, AttributionFormat::Json);
         assert_eq!(format!("{a:?}"), "Text");
         assert_eq!(format!("{:?}", AttributionFormat::Json), "Json");
+    }
+
+    // Both fixtures accept every `write` call (like a `LineWriter` buffering
+    // a trailing partial line) and only fail on the final `flush` — the
+    // realistic shape of a `BrokenPipe` surfacing from `io::stdout()`, whose
+    // internal `LineWriter` doesn't necessarily hit the OS `write(2)` on
+    // every call to `write_all`.
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    struct OtherErrorWriter;
+
+    impl Write for OtherErrorWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::Other))
+        }
+    }
+
+    #[test]
+    fn write_or_exit_writes_full_content_and_succeeds() {
+        let mut buf: Vec<u8> = Vec::new();
+        let code = write_or_exit(&mut buf, "hello, world");
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(buf, b"hello, world");
+    }
+
+    #[test]
+    fn write_or_exit_swallows_broken_pipe_into_clean_success() {
+        let mut w = BrokenPipeWriter;
+        // Must not panic — a `BrokenPipe` write error means the consumer
+        // already got all the bytes it wanted (e.g. `| head`), not a
+        // failure.
+        let code = write_or_exit(&mut w, "hello");
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    #[should_panic(expected = "failed printing to stdout")]
+    fn write_or_exit_panics_on_non_broken_pipe_error() {
+        let mut w = OtherErrorWriter;
+        let _ = write_or_exit(&mut w, "hello");
+    }
+
+    #[test]
+    fn write_stdout_or_exit_writes_to_real_stdout_and_succeeds() {
+        // Exercises the public `io::stdout()`-backed entry point itself
+        // (every other test above drives the private, injectable
+        // `write_or_exit` so it can simulate `BrokenPipe`/other errors).
+        let code = write_stdout_or_exit("coverage exercise for write_stdout_or_exit\n");
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 }

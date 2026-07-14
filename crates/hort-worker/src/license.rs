@@ -16,9 +16,11 @@ pub struct LicenseArgs {
     pub full: bool,
 }
 
-/// Print hort's license information to stdout.
+/// Print hort's license information to stdout. A closed stdout pipe
+/// (`| head`) exits cleanly rather than panicking — see
+/// `hort_attribution::write_stdout_or_exit`.
 pub fn run(args: &LicenseArgs) -> anyhow::Result<()> {
-    print!("{}", hort_attribution::render_license(args.full));
+    let _ = hort_attribution::write_stdout_or_exit(&hort_attribution::render_license(args.full));
     Ok(())
 }
 

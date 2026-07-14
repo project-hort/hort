@@ -37,13 +37,10 @@ pub struct AttributionArgs {
 }
 
 /// Print the embedded third-party attribution document to stdout and
-/// exit 0.
+/// exit 0. A closed stdout pipe (`| head`) exits cleanly rather than
+/// panicking — see `hort_attribution::write_stdout_or_exit`.
 pub fn run(args: &AttributionArgs) -> ExitCode {
-    print!(
-        "{}",
-        hort_attribution::render_attribution(args.format.into())
-    );
-    ExitCode::SUCCESS
+    hort_attribution::write_stdout_or_exit(hort_attribution::render_attribution(args.format.into()))
 }
 
 #[cfg(test)]
