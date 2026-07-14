@@ -42,6 +42,18 @@ jobs:
   build-images:
     name: ${{ matrix.image }} (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    # `-alpha.N` tags are hort's internal-only pre-release track (ADR 0048):
+    # staging + the local hort registry, never this public ghcr publish. The
+    # internal build/publish happens instead via the GitLab pipeline
+    # (`.gitlab-ci.yml` `build-images:*` / `helm:lint-and-publish`, tag-regex
+    # gated to include `alpha`). This is the root job of the public-publish
+    # chain — `scan-containers` / `merge` / `mirror-to-hort-oci` /
+    # `publish-chart` / `verify-published` all transitively `needs:` it (or
+    # `merge`), so skipping it here cascades through the rest of the
+    # workflow's default "skip if a needed job was skipped" behaviour.
+    # `summary` is the one job that overrides that default (`if: always()`)
+    # and needs its own matching guard — see below.
+    if: ${{ !contains(github.ref, '-alpha.') }}
     permissions:
       contents: read
       packages: write
@@ -560,7 +572,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     needs: [merge, publish-chart]
-    if: always()
+    # `if: always()` runs regardless of `needs:` outcome, which would
+    # otherwise defeat build-images's alpha-exclusion guard above — this
+    # job would print a "Published Artifacts" summary for a tag whose
+    # publish was intentionally skipped. Match the same guard explicitly.
+    if: ${{ always() && !contains(github.ref, '-alpha.') }}
     steps:
       - name: Summary
         run: |

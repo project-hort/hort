@@ -897,7 +897,7 @@ build-images:hort-server:
     KUBERNETES_CPU_REQUEST: "2"
     KUBERNETES_CPU_LIMIT: "4"
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
       changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
@@ -995,7 +995,7 @@ build-images:hort-worker:
     KUBERNETES_CPU_REQUEST: "2"
     KUBERNETES_CPU_LIMIT: "4"
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
       changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
@@ -1102,7 +1102,7 @@ helm:lint-and-publish:
     - job: build-images:hort-worker
       artifacts: true
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
       changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
