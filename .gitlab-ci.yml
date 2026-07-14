@@ -105,8 +105,10 @@ workflow:
 # installer served at hort.rs — not built/tested by the Rust pipeline),
 # `tools/**` (workspace-excluded — `exclude = ["tools/*"]` in the root
 # `Cargo.toml`, so no `--workspace` job builds it), `.trivyignore`
-# (grep-confirmed not referenced anywhere in `.gitlab-ci.yml` — consumed at
-# worker runtime, not in CI).
+# (grep-confirmed not referenced by any GitLab job — it is the suppression
+# list for the Trivy publish gate in `.github/workflows/docker-publish.yml`,
+# a GitHub Actions workflow triggered on `v*` tags independently of this
+# GitLab-only path list, so it is correctly inert to every GitLab job).
 .code-changed-paths: &code-changed-paths
   - "crates/**/*"
   - "Cargo.toml"
