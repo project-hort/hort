@@ -37,6 +37,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 
 use chrono::{Duration, Utc};
@@ -103,6 +104,7 @@ fn sample_token(user_id: Uuid, prefix: &str) -> ApiToken {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn insert_then_find_by_id_round_trips() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -134,6 +136,7 @@ async fn insert_then_find_by_id_round_trips() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_by_prefix_returns_some_on_hit_none_on_miss() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -165,6 +168,7 @@ async fn find_by_prefix_returns_some_on_hit_none_on_miss() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_for_user_orders_by_created_at_desc() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -204,6 +208,7 @@ async fn list_for_user_orders_by_created_at_desc() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn update_last_used_buckets_ipv4_to_24() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -229,6 +234,7 @@ async fn update_last_used_buckets_ipv4_to_24() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn update_last_used_buckets_ipv6_to_48() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -261,6 +267,7 @@ async fn update_last_used_buckets_ipv6_to_48() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn update_last_used_truncates_user_agent_to_256_bytes() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -286,6 +293,7 @@ async fn update_last_used_truncates_user_agent_to_256_bytes() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn update_last_used_respects_utf8_boundary_on_truncation() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -324,6 +332,7 @@ async fn update_last_used_respects_utf8_boundary_on_truncation() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn update_last_used_passes_through_malformed_ip() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -350,6 +359,7 @@ async fn update_last_used_passes_through_malformed_ip() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn revoke_sets_revoked_at_idempotently() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -385,6 +395,7 @@ async fn revoke_sets_revoked_at_idempotently() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_by_id_raises_not_found_on_unknown_id() {
     let Some(pool) = admin_pool().await else {
         return;

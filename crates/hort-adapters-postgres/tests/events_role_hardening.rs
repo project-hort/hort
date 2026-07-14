@@ -63,6 +63,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 
 use hort_adapters_postgres::event_store::PgEventStore;
@@ -251,6 +252,7 @@ fn counter_value(snap: Snapshot, name: &str, want: &[(&str, &str)]) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_strips_forbidden_privileges_from_hort_app_role() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -318,6 +320,7 @@ async fn migration_strips_forbidden_privileges_from_hort_app_role() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_attempted_update_raises_permission_denied() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -359,6 +362,7 @@ async fn migration_attempted_update_raises_permission_denied() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn startup_probe_refuses_when_app_role_holds_update() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -427,6 +431,7 @@ async fn startup_probe_refuses_when_app_role_holds_update() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn startup_probe_skips_for_events_table_owner() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -479,6 +484,7 @@ async fn startup_probe_skips_for_events_table_owner() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn trigger_caught_emits_metric_on_attempted_update() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -605,6 +611,7 @@ async fn trigger_caught_emits_metric_on_attempted_update() {
 // `hort_app_role` can `append()` an `ArtifactIngested` event end-to-end.
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn member_of_hort_app_role_can_append_events_through_adapter() {
     let Some(admin) = admin_pool().await else {
         return;

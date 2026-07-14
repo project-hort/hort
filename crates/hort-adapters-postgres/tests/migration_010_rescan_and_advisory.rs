@@ -29,6 +29,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 
 use sqlx::{PgPool, Row};
@@ -108,6 +109,7 @@ async fn seed_artifact(pool: &PgPool, repo: Uuid) -> Uuid {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_010_creates_sbom_components() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -250,6 +252,7 @@ async fn migration_010_creates_sbom_components() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_010_creates_advisory_sync_state_with_seed_row() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -369,6 +372,7 @@ async fn migration_010_creates_advisory_sync_state_with_seed_row() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_010_does_not_alter_jobs_columns() {
     let Some(pool) = admin_pool().await else {
         return;

@@ -40,6 +40,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 
 use chrono::{Duration, Utc};
@@ -170,6 +171,7 @@ fn build_subscription(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn insert_then_find_by_id_round_trips() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -207,6 +209,7 @@ async fn insert_then_find_by_id_round_trips() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn snapshot_claims_round_trips_and_update_full_replaces() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -260,6 +263,7 @@ async fn snapshot_claims_round_trips_and_update_full_replaces() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn insert_then_find_by_id_round_trips_nats_target() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -290,6 +294,7 @@ async fn insert_then_find_by_id_round_trips_nats_target() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_by_name_returns_some_on_hit_none_on_miss() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -329,6 +334,7 @@ async fn find_by_name_returns_some_on_hit_none_on_miss() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_for_owner_orders_by_created_at_desc() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -366,6 +372,7 @@ async fn list_for_owner_orders_by_created_at_desc() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_active_returns_only_active_subscriptions() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -404,6 +411,7 @@ async fn list_active_returns_only_active_subscriptions() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn unique_constraint_on_owner_user_id_and_name() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -432,6 +440,7 @@ async fn unique_constraint_on_owner_user_id_and_name() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn users_id_delete_cascades() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -469,6 +478,7 @@ async fn users_id_delete_cascades() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn api_tokens_id_delete_sets_null_on_created_by_token_id() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -509,6 +519,7 @@ async fn api_tokens_id_delete_sets_null_on_created_by_token_id() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn update_last_delivered_persists_position_and_failure() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -552,6 +563,7 @@ async fn update_last_delivered_persists_position_and_failure() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn update_persists_state_and_disable_reason() {
     let Some(pool) = admin_pool().await else {
         return;

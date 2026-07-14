@@ -16,6 +16,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -121,6 +122,7 @@ fn unique_channel() -> String {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn listener_invokes_invalidate_token_on_uuid_payload() {
     let Some(pool) = admin_pool().await else {
         eprintln!("DATABASE_URL not set; skipping DB-gated test");
@@ -162,6 +164,7 @@ async fn listener_invokes_invalidate_token_on_uuid_payload() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn listener_invokes_invalidate_user_on_user_prefix_payload() {
     let Some(pool) = admin_pool().await else {
         eprintln!("DATABASE_URL not set; skipping DB-gated test");
@@ -199,6 +202,7 @@ async fn listener_invokes_invalidate_user_on_user_prefix_payload() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn listener_recovers_after_disconnection_drops_all() {
     let Some(pool) = admin_pool().await else {
         eprintln!("DATABASE_URL not set; skipping DB-gated test");
