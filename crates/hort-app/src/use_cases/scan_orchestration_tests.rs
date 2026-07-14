@@ -476,6 +476,25 @@ fn seed_quarantined_artifact(
     id
 }
 
+/// Same shape as [`seed_quarantined_artifact`] but seeds
+/// `QuarantineStatus::None` (permissive default — no quarantine window).
+/// Used by tests that need `record_outcome`'s retry-exhaustion arm to
+/// still reach `record_scan_indeterminate` (issue #6 narrowed that call
+/// to non-`Quarantined` prior statuses — see
+/// `record_outcome_failed_at_max_attempts_marks_job_failed_but_quarantined_artifact_stays_quarantined`).
+fn seed_none_status_artifact(
+    artifacts: &Arc<MockArtifactRepository>,
+    repositories: &Arc<MockRepositoryRepository>,
+) -> Uuid {
+    let artifact = sample_artifact(QuarantineStatus::None);
+    let mut repo = sample_repository();
+    repo.id = artifact.repository_id;
+    let id = artifact.id;
+    artifacts.insert(artifact);
+    repositories.insert(repo);
+    id
+}
+
 fn sample_scan_job(artifact_id: Uuid, attempts: u32) -> ScanJob {
     ScanJob {
         id: Uuid::new_v4(),
@@ -1337,13 +1356,20 @@ async fn record_outcome_failed_below_max_attempts_reschedules_with_backoff() {
     assert!(jobs.failed_calls().is_empty());
 }
 
+/// Issue #6 refinement of ADR 0007: a `Quarantined` artifact whose scan
+/// retries exhaust (scanner-execution failure — every backend errored)
+/// stays exactly where it is. `mark_failed` (job-level terminal) still
+/// fires — that IS the persisted "last scan errored" signal
+/// `RescanCandidatesRepository::select_stranded` reads — but there is no
+/// artifact-level transition at all: no `ScanIndeterminate` event, no
+/// `quarantine_status` UPDATE. See
+/// `record_outcome_failed_at_max_attempts_none_status_still_hard_blocks_to_scan_indeterminate`
+/// below for the *other* prior-status branch, which is unchanged.
 #[tokio::test]
-async fn record_outcome_failed_at_max_attempts_marks_failed_terminally() {
+async fn record_outcome_failed_at_max_attempts_marks_job_failed_but_quarantined_artifact_stays_quarantined(
+) {
     let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
         make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
-    // The retry-exhausted Failed arm transitions the
-    // artifact to ScanIndeterminate *before* mark_failed (ADR 0007), so the
-    // artifact must exist (the fail-closed transition is the priority).
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 5); // == default max_attempts.
 
@@ -1357,9 +1383,12 @@ async fn record_outcome_failed_at_max_attempts_marks_failed_terminally() {
     assert_eq!(calls[0].1, "dead");
     assert!(jobs.rescheduled_calls().is_empty());
 
-    // The artifact is now terminally ScanIndeterminate (ADR 0007).
+    // The artifact stays exactly where it was — still Quarantined, not
+    // ScanIndeterminate. Downloads stay blocked either way (the status
+    // itself is the gate, ADR 0007) but the artifact is now re-pickable
+    // by select_stranded rather than stuck behind an admin override.
     let saved = artifacts.get(artifact_id).unwrap();
-    assert_eq!(saved.quarantine_status, QuarantineStatus::ScanIndeterminate);
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
     assert!(!saved.is_downloadable());
 }
 
@@ -1367,15 +1396,14 @@ async fn record_outcome_failed_at_max_attempts_marks_failed_terminally() {
 // Fail-closed terminal scan failure (ADR 0007)
 // ===========================================================================
 
-/// The retry-exhausted Failed arm transitions a `Quarantined` artifact
-/// to `ScanIndeterminate` (fail-closed) AND still marks the job failed.
-/// The artifact transition lands before `mark_failed` so a crash
-/// between them leaves the job retryable rather than the artifact
-/// silently un-failed.
+/// Companion to the test above: confirms NO `ScanIndeterminate` event is
+/// committed for the Quarantined-stays-Quarantined case — the artifact
+/// lifecycle stays completely untouched (no silent quarantine-state
+/// UPDATE without a domain event; here there is no UPDATE at all).
 #[tokio::test]
-async fn record_outcome_failed_at_max_attempts_transitions_artifact_scan_indeterminate() {
-    let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
-        make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
+async fn record_outcome_failed_at_max_attempts_quarantined_artifact_commits_no_transition() {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    let (uc, jobs, artifacts, repositories, lifecycle) = make_uc_with_lifecycle(policy_projections);
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 5);
 
@@ -1384,9 +1412,42 @@ async fn record_outcome_failed_at_max_attempts_transitions_artifact_scan_indeter
         .expect("record_outcome");
 
     let saved = artifacts.get(artifact_id).unwrap();
-    assert_eq!(saved.quarantine_status, QuarantineStatus::ScanIndeterminate);
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
     // Job still marked failed (the per-attempt job state is unchanged).
     assert_eq!(jobs.failed_calls().len(), 1);
+    assert!(
+        lifecycle.committed_transitions().is_empty(),
+        "no ScanIndeterminate (or any) transition must be committed \
+         when a Quarantined artifact's scan retries exhaust"
+    );
+}
+
+/// The *other* prior-status branch is unchanged: a `None`-status
+/// artifact (permissive default — no quarantine window to fall back
+/// into) still hard-blocks to `ScanIndeterminate` on retry exhaustion.
+/// See `record_outcome_failed_permissive_none_hard_blocks` above for the
+/// full assertion; this test exists only to name the contrast explicitly
+/// next to the Quarantined-stays-Quarantined tests above, so a future
+/// reader sees both halves of the branch in one place.
+#[tokio::test]
+async fn record_outcome_failed_at_max_attempts_none_status_still_hard_blocks_to_scan_indeterminate()
+{
+    let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
+        make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
+    let none_artifact = sample_artifact(QuarantineStatus::None);
+    let mut repo = sample_repository();
+    repo.id = none_artifact.repository_id;
+    let artifact_id = none_artifact.id;
+    artifacts.insert(none_artifact);
+    repositories.insert(repo);
+    let job = sample_scan_job(artifact_id, 5);
+
+    uc.record_outcome(&job, ScanRunOutcome::Failed("all backends down".into()))
+        .await
+        .expect("record_outcome");
+
+    let saved = artifacts.get(artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::ScanIndeterminate);
 }
 
 /// Permissive mode (quarantineDuration:0): the artifact ingested in
@@ -1474,6 +1535,13 @@ async fn record_outcome_failed_idempotent_when_already_scan_indeterminate() {
 // Each test drives the retry-exhausted Failed arm of `record_outcome`
 // (attempts == max_attempts) and asserts the `scanner` field of the
 // resulting `ScanIndeterminate` event in the committed transition.
+//
+// Seeds `seed_none_status_artifact` (QuarantineStatus::None), NOT
+// `seed_quarantined_artifact` — issue #6 narrowed `record_scan_indeterminate`
+// (the only caller of `scanner_label_for_failed`) to non-`Quarantined`
+// prior statuses; a `None`-status artifact still reaches it (ADR 0007's
+// fail-closed backstop for a permissive-default artifact with no
+// quarantine window to fall back into).
 // ===========================================================================
 
 /// Factory variant that exposes the lifecycle mock handle so tests can
@@ -1625,7 +1693,7 @@ async fn scanner_label_for_failed_no_policy_yields_default_backend_label() {
 
     let (uc, _jobs, artifacts, repositories, lifecycle) =
         make_uc_with_lifecycle(policy_projections);
-    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 5);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("all down".into()))
@@ -1650,7 +1718,7 @@ async fn scanner_label_for_failed_policy_list_error_yields_none_sentinel() {
 
     let (uc, _jobs, artifacts, repositories, lifecycle) =
         make_uc_with_lifecycle(policy_projections);
-    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 5);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("scanner error".into()))
@@ -1676,7 +1744,7 @@ async fn scanner_label_for_failed_non_empty_backends_yields_joined_label() {
 
     let (uc, _jobs, artifacts, repositories, lifecycle) =
         make_uc_with_lifecycle(policy_projections);
-    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 5);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("backends down".into()))
@@ -2224,13 +2292,20 @@ mod metrics_emission_tests {
     // hort_scan_terminal_total (ADR 0007)
     // ---------------------------------------------------------------
 
+    /// `hort_scan_terminal_total{indeterminate}` fires on retry
+    /// exhaustion only for the non-`Quarantined` prior-status branch
+    /// (issue #6) — a `None`-status artifact still hard-blocks to
+    /// `ScanIndeterminate` (ADR 0007's fail-closed backstop; no
+    /// quarantine window to fall back into). See
+    /// `hort_scan_terminal_total_not_emitted_when_quarantined_artifact_stays_quarantined`
+    /// below for the companion Quarantined-stays-Quarantined case.
     #[test]
     fn hort_scan_terminal_total_indeterminate_on_retry_exhaustion() {
         let snap = capture_async_metrics(|| {
             Box::pin(async move {
                 let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
                     make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
-                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 5); // == max → terminal.
                 uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
                     .await
@@ -2241,6 +2316,38 @@ mod metrics_emission_tests {
             find_counter(&snap, "hort_scan_terminal_total", |l| l.get("result")
                 == Some(&"indeterminate")),
             Some(1)
+        );
+    }
+
+    /// Issue #6: a `Quarantined` artifact whose scan retries exhaust
+    /// does NOT tick `hort_scan_terminal_total` at all — it is not an
+    /// artifact-terminal decision (the artifact stays exactly where it
+    /// was). `hort_scan_jobs_total{failed}` still fires (job-attempt
+    /// terminal, unaffected).
+    #[test]
+    fn hort_scan_terminal_total_not_emitted_when_quarantined_artifact_stays_quarantined() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
+                    make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
+                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let job = sample_scan_job(artifact_id, 5); // == max → exhausted.
+                uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
+                    .await
+                    .expect("record_outcome");
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_scan_terminal_total", |_| true),
+            None,
+            "no hort_scan_terminal_total tick — the artifact stayed quarantined, \
+             not an artifact-terminal decision",
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_scan_jobs_total", |l| l.get("result")
+                == Some(&"failed")),
+            Some(1),
+            "hort_scan_jobs_total{{failed}} still fires — job-attempt terminal, unaffected",
         );
     }
 
@@ -2324,17 +2431,18 @@ mod metrics_emission_tests {
         );
     }
 
-    /// One-metric-one-layer: the retry-exhausted arm ticks
-    /// `hort_scan_terminal_total{indeterminate}` exactly once and the
-    /// per-attempt `hort_scan_jobs_total{failed}` exactly once — they
-    /// count different things and must not double-count.
+    /// One-metric-one-layer: the retry-exhausted arm (non-`Quarantined`
+    /// prior status, so it still reaches `record_scan_indeterminate` —
+    /// issue #6) ticks `hort_scan_terminal_total{indeterminate}` exactly
+    /// once and the per-attempt `hort_scan_jobs_total{failed}` exactly
+    /// once — they count different things and must not double-count.
     #[test]
     fn hort_scan_terminal_total_does_not_double_count_scan_jobs_total() {
         let snap = capture_async_metrics(|| {
             Box::pin(async move {
                 let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
                     make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
-                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 5);
                 uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
                     .await

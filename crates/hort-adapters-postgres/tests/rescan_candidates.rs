@@ -23,6 +23,26 @@
 //! - `select_eligible_returns_artifact_with_completed_scan_job_only`
 //! - `select_eligible_returns_null_quarantine_artifact`
 //! - `select_eligible_returns_null_quarantine_no_policy_artifact`
+//!
+//! `select_stranded` coverage matrix (issue #6 — stranded-scan recovery;
+//! mirrors the different predicate: `quarantine_status='quarantined'` +
+//! most-recent `kind='scan'` job `status='failed'`, no interval/`now`
+//! gating):
+//!
+//! - `select_stranded_returns_quarantined_artifact_with_failed_last_scan`
+//! - `select_stranded_skips_quarantined_artifact_with_no_scan_job`
+//! - `select_stranded_skips_quarantined_artifact_with_pending_last_scan`
+//! - `select_stranded_skips_released_artifact_even_with_failed_scan`
+//! - `select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan`
+//! - `select_stranded_skips_rejected_artifact_even_with_failed_scan`
+//! - `select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job`
+//!
+//! New tests carry `#[serial(hort_pg_db)]` per the crate-wide DB-test
+//! parallel-safety contract (CLAUDE.md → Test Coverage Tiers → DB-backed
+//! test isolation), in addition to this file's own in-binary
+//! `lock_serial()` gate (both are kept — `lock_serial()` predates the
+//! `#[serial(hort_pg_db)]` convention and only serializes within this one
+//! test binary; `#[serial(hort_pg_db)]` is the cross-binary lock).
 
 #![allow(clippy::expect_used)]
 
@@ -31,6 +51,7 @@ use std::sync::OnceLock;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
+use serial_test::serial;
 use sqlx::PgPool;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
@@ -485,5 +506,321 @@ async fn select_eligible_returns_null_quarantine_no_policy_artifact() {
         1,
         "never-scanned NULL-quarantine artifact with no policy must be \
          returned — DefaultPolicy fallback, not dropped by the join"
+    );
+}
+
+// =====================================================================
+// select_stranded — issue #6 stranded-scan recovery
+// =====================================================================
+
+/// Seed a `kind='scan'` `jobs` row with an explicit `created_at`, so
+/// tests can construct a deterministic "most recent job" ordering across
+/// multiple rows for the same artifact. Mirrors `seed_scan_job` but adds
+/// the timestamp override.
+async fn seed_scan_job_at(
+    pool: &PgPool,
+    repo_id: Uuid,
+    artifact_id: Uuid,
+    status: &str,
+    created_at: chrono::DateTime<Utc>,
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO public.jobs \
+            (kind, artifact_id, repository_id, content_hash, format, priority, status, created_at, updated_at) \
+         VALUES ('scan', $1, $2, $3, 'pypi', 0, $4, $5, $5) \
+         RETURNING id",
+    )
+    .bind(artifact_id)
+    .bind(repo_id)
+    .bind(format!("{}{}", artifact_id.simple(), artifact_id.simple()))
+    .bind(status)
+    .bind(created_at)
+    .fetch_one(pool)
+    .await
+    .expect("seed scan job row with explicit created_at");
+    id
+}
+
+// ---------------------------------------------------------------------
+// (a) Quarantined artifact, last (only) scan job failed → returned
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_returns_quarantined_artifact_with_failed_last_scan() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    let matched = filter_to(&rows, &[artifact]);
+    assert_eq!(
+        matched.len(),
+        1,
+        "quarantined artifact with a failed last scan must be returned"
+    );
+    assert_eq!(matched[0].repository_id, repo);
+    assert_eq!(matched[0].format, "pypi");
+}
+
+// ---------------------------------------------------------------------
+// (a2) Malformed `checksum_sha256` on an otherwise-matching row → Err
+//      (defensive row-decode error path, shared by select_eligible and
+//      select_stranded via the same content_hash_str.parse() closure)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_errs_on_malformed_checksum() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+    // `character(64)` accepts any 64-byte string — not hex-validated at
+    // the DB layer. `ContentHash::parse` is the only validator, so this
+    // exercises the adapter's defensive decode-error path.
+    sqlx::query("UPDATE public.artifacts SET checksum_sha256 = $1 WHERE id = $2")
+        .bind("z".repeat(64))
+        .bind(artifact)
+        .execute(&pool)
+        .await
+        .expect("corrupt checksum_sha256 for the decode-error test");
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let err = port
+        .select_stranded(1000)
+        .await
+        .expect_err("malformed checksum_sha256 must surface as an Err, not a silent skip");
+    assert!(
+        format!("{err}").contains("invalid content_hash"),
+        "error should name the decode failure: {err}"
+    );
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_eligible_errs_on_malformed_checksum() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let artifact = seed_artifact(&pool, repo, Some("released"), None).await;
+    sqlx::query("UPDATE public.artifacts SET checksum_sha256 = $1 WHERE id = $2")
+        .bind("z".repeat(64))
+        .bind(artifact)
+        .execute(&pool)
+        .await
+        .expect("corrupt checksum_sha256 for the decode-error test");
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let err = port
+        .select_eligible(1000, Utc::now())
+        .await
+        .expect_err("malformed checksum_sha256 must surface as an Err, not a silent skip");
+    assert!(
+        format!("{err}").contains("invalid content_hash"),
+        "error should name the decode failure: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (b) Quarantined artifact, never scanned (no jobs row) → NOT returned
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_quarantined_artifact_with_no_scan_job() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    // No scan job seeded at all.
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "a quarantined artifact with no scan job history at all is not \
+         stranded — it is awaiting its first scan (LATERAL JOIN excludes it)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (c) Quarantined artifact, last scan job pending (in flight) → NOT returned
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_quarantined_artifact_with_pending_last_scan() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "pending").await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "a scan already in flight must NOT be re-picked — last_job.status \
+         != 'failed' excludes it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (d) Released artifact with a failed scan job → NOT returned
+//     (that predicate belongs to select_eligible, not select_stranded)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_released_artifact_even_with_failed_scan() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("released"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "a released artifact is not stranded regardless of scan-job \
+         history — select_stranded only ever picks quarantine_status='quarantined'"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (e) scan_indeterminate artifact with a failed scan job → NOT returned
+//     — the critical ADR 0007 acceptance criterion: (b) must not
+//     re-pick the terminal fail-closed state.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("scan_indeterminate"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "scan_indeterminate is terminal (ADR 0007) — select_stranded must \
+         NEVER re-pick it, even when its last scan job is 'failed'; only \
+         admin override / post-exclusion policy re-evaluation exit it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (f) rejected artifact with a failed scan job → NOT returned
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_rejected_artifact_even_with_failed_scan() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("rejected"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "rejected is terminal — select_stranded must NOT re-pick it \
+         (sticky-rejection invariant, same as select_eligible)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (g) Older failed job + newer in-flight job for the same artifact →
+//     NOT returned. Proves the LATERAL ordering picks the MOST RECENT
+//     job (not "any failed job ever"), so a fresh re-scan already in
+//     flight is not double-enqueued.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    let now = Utc::now();
+    // Older exhausted attempt.
+    let _old_failed = seed_scan_job_at(
+        &pool,
+        repo,
+        artifact,
+        "failed",
+        now - ChronoDuration::hours(2),
+    )
+    .await;
+    // A fresh rescan already enqueued and now in flight (e.g. by a
+    // manual rescan) — this is the MOST RECENT job for the artifact.
+    let _new_pending = seed_scan_job_at(&pool, repo, artifact, "pending", now).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "the most-recent job (pending) must gate eligibility, not the \
+         older failed one — otherwise a fresh in-flight rescan would be \
+         double-enqueued"
     );
 }

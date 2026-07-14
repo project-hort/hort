@@ -10,12 +10,20 @@
 //!    to [`BATCH_SIZE`] artifacts whose policy-derived rescan interval
 //!    has elapsed, that are `quarantine_status='released'`, and that
 //!    have no in-flight `kind='scan'` job.
-//! 3. For each candidate, call
+//! 3. Call [`RescanCandidatesRepository::select_stranded`] (issue #6) to
+//!    fetch up to [`BATCH_SIZE`] **stranded** artifacts:
+//!    `quarantine_status='quarantined'` with a last scan attempt that
+//!    errored (every backend failed to run — see
+//!    `ScanOrchestrationUseCase::record_outcome`) and no in-flight
+//!    `kind='scan'` job. A scanner outage strands every artifact pulled
+//!    during it; this half of the sweep re-enqueues them once the
+//!    scanner recovers, self-healing without operator intervention.
+//! 4. For each candidate from either source, call
 //!    [`JobsRepository::enqueue_scan`] with `priority=10` and
 //!    `trigger_source="cron"`.
-//! 4. Return [`TaskOutcome::Completed`] with a result summary
-//!    `{ eligible, enqueued }` so the framework's `result_summary`
-//!    column captures per-tick load.
+//! 5. Return [`TaskOutcome::Completed`] with a result summary
+//!    `{ eligible, stranded_eligible, enqueued }` so the framework's
+//!    `result_summary` column captures per-tick load from both sources.
 //!
 //! Conflict detection is layered: the candidate SQL already filters
 //! `NOT EXISTS (in-flight scan job)`, but a race against another
@@ -23,7 +31,7 @@
 //! `DomainError::Conflict` from the partial unique index
 //! `(artifact_id) WHERE kind='scan'`. The handler swallows that
 //! variant per row and continues — ON-CONFLICT-DO-NOTHING
-//! semantics.
+//! semantics. Applies identically to both candidate sources.
 //!
 //! Worker registration in the dispatch table lives in the
 //! `hort-worker` composition root, not here.
@@ -35,12 +43,13 @@ use serde_json::json;
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::JobsRepository;
-use hort_domain::ports::rescan_candidates::RescanCandidatesRepository;
+use hort_domain::ports::rescan_candidates::{RescanCandidate, RescanCandidatesRepository};
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 
 use crate::metrics::{
-    emit_scan_jobs_enqueued, set_cron_rescan_eligible_artifacts, TriggerSourceLabel,
+    emit_scan_jobs_enqueued, set_cron_rescan_eligible_artifacts,
+    set_cron_rescan_stranded_eligible_artifacts, TriggerSourceLabel,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +95,75 @@ impl CronRescanTickHandler {
     ) -> Self {
         Self { candidates, jobs }
     }
+
+    /// Enqueue a `kind='scan'` job for every candidate in `batch`.
+    /// Shared by both candidate sources (interval-eligible and
+    /// stranded) — enqueue mechanics are identical; `stranded` only
+    /// selects the audit-log framing so a re-enqueued stranded artifact
+    /// gets its own distinguishable `info!` line (security-relevant
+    /// state-adjacent: an artifact that was stuck because the scanner
+    /// couldn't run is getting a fresh chance).
+    ///
+    /// Returns the count of rows that actually landed (Conflict-swallowed
+    /// rows do NOT count — ON-CONFLICT-DO-NOTHING semantics, a race
+    /// against another trigger source between SELECT and INSERT), or
+    /// `Err(reason)` on the first non-Conflict enqueue failure. The
+    /// caller maps that to a retryable `TaskOutcome::Failed` and aborts
+    /// the tick — the un-enqueued candidates (from either source) are
+    /// simply re-selected on the next tick, 5 minutes later.
+    async fn enqueue_batch(
+        &self,
+        batch: &[RescanCandidate],
+        stranded: bool,
+    ) -> Result<u32, String> {
+        let mut enqueued: u32 = 0;
+        for c in batch {
+            match self
+                .jobs
+                .enqueue_scan(
+                    c.artifact_id,
+                    c.repository_id,
+                    &c.content_hash,
+                    &c.format,
+                    CRON_RESCAN_PRIORITY,
+                    CRON_TRIGGER_SOURCE,
+                )
+                .await
+            {
+                Ok(_) => {
+                    enqueued += 1;
+                    if stranded {
+                        tracing::info!(
+                            artifact_id = %c.artifact_id,
+                            "cron rescan tick: re-enqueued a stranded artifact \
+                             (last scan errored — scanner appears to have recovered)",
+                        );
+                    }
+                }
+                Err(DomainError::Conflict(_)) => {
+                    // ON CONFLICT (against the partial unique index
+                    // `(artifact_id) WHERE kind='scan'`) DO NOTHING
+                    // — a race against ingest, manual rescan, or
+                    // advisory-watch resolves harmlessly.
+                    tracing::debug!(
+                        artifact_id = %c.artifact_id,
+                        stranded,
+                        "cron rescan tick: enqueue conflict swallowed (race against another trigger source)",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        artifact_id = %c.artifact_id,
+                        stranded,
+                        error = %err,
+                        "cron rescan tick: enqueue_scan failed; will retry on next tick",
+                    );
+                    return Err(format!("enqueue_scan failed: {err}"));
+                }
+            }
+        }
+        Ok(enqueued)
+    }
 }
 
 impl TaskHandler for CronRescanTickHandler {
@@ -114,66 +192,62 @@ impl TaskHandler for CronRescanTickHandler {
                     ));
                 }
             };
+            let stranded_candidates = match self.candidates.select_stranded(BATCH_SIZE).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "cron rescan tick: select_stranded failed; will retry on next tick",
+                    );
+                    return Ok(TaskOutcome::fail(
+                        format!("select_stranded failed: {err}"),
+                        true,
+                    ));
+                }
+            };
 
             let eligible = candidates.len();
+            let stranded_eligible = stranded_candidates.len();
             // `hort_cron_rescan_eligible_artifacts` gauge.
             // Set once per tick; operator alarms on sustained > batch_size.
             set_cron_rescan_eligible_artifacts(eligible as u64);
+            // `hort_cron_rescan_stranded_eligible_artifacts` gauge.
+            // Set once per tick; operator alarms on sustained > 0 (a
+            // healthy scanner drains this to zero every tick).
+            set_cron_rescan_stranded_eligible_artifacts(stranded_eligible as u64);
 
-            let mut enqueued: u32 = 0;
-
-            for c in &candidates {
-                match self
-                    .jobs
-                    .enqueue_scan(
-                        c.artifact_id,
-                        c.repository_id,
-                        &c.content_hash,
-                        &c.format,
-                        CRON_RESCAN_PRIORITY,
-                        CRON_TRIGGER_SOURCE,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        enqueued += 1;
-                    }
-                    Err(DomainError::Conflict(_)) => {
-                        // ON CONFLICT (against the partial unique index
-                        // `(artifact_id) WHERE kind='scan'`) DO NOTHING
-                        // — a race against ingest, manual rescan, or
-                        // advisory-watch resolves harmlessly.
-                        tracing::debug!(
-                            artifact_id = %c.artifact_id,
-                            "cron rescan tick: enqueue conflict swallowed (race against another trigger source)",
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            artifact_id = %c.artifact_id,
-                            error = %err,
-                            "cron rescan tick: enqueue_scan failed; will retry on next tick",
-                        );
-                        return Ok(TaskOutcome::fail(
-                            format!("enqueue_scan failed: {err}"),
-                            true,
-                        ));
-                    }
-                }
-            }
+            let enqueued_eligible = match self.enqueue_batch(&candidates, false).await {
+                Ok(n) => n,
+                Err(reason) => return Ok(TaskOutcome::fail(reason, true)),
+            };
+            let enqueued_stranded = match self.enqueue_batch(&stranded_candidates, true).await {
+                Ok(n) => n,
+                Err(reason) => return Ok(TaskOutcome::fail(reason, true)),
+            };
+            let enqueued = enqueued_eligible + enqueued_stranded;
 
             // `hort_scan_jobs_enqueued_total{trigger_source="cron"}`.
             // Conflict-on-enqueue rows do NOT count (the helper takes the
-            // landed-rows count, not the attempted-rows count).
+            // landed-rows count, not the attempted-rows count). Both
+            // candidate sources share this counter — trigger_source is
+            // "cron" either way; the stranded/interval split is
+            // observable via the two eligible-artifacts gauges and the
+            // per-artifact `info!` line above.
             if enqueued > 0 {
                 emit_scan_jobs_enqueued(TriggerSourceLabel::Cron, u64::from(enqueued));
             }
 
-            tracing::info!(eligible, enqueued, "cron rescan tick complete",);
+            tracing::info!(
+                eligible,
+                stranded_eligible,
+                enqueued,
+                "cron rescan tick complete",
+            );
 
             Ok(TaskOutcome::Completed {
                 result_summary: json!({
                     "eligible": eligible,
+                    "stranded_eligible": stranded_eligible,
                     "enqueued": enqueued,
                 }),
             })
@@ -257,6 +331,14 @@ mod tests {
         rows: Mutex<Vec<RescanCandidate>>,
         err: Mutex<Option<DomainError>>,
         last_batch_size: Mutex<Option<u32>>,
+        // select_stranded's independent row/error controls. Defaulting
+        // to empty/no-error means every pre-#6 test that constructs a
+        // `MockCandidates` via `new`/`new_failing` and never calls
+        // `with_stranded`/`new_failing_stranded` gets select_stranded
+        // returning `Ok(vec![])` — identical observable behavior to
+        // before this type gained the method.
+        stranded_rows: Mutex<Vec<RescanCandidate>>,
+        stranded_err: Mutex<Option<DomainError>>,
     }
 
     impl MockCandidates {
@@ -265,6 +347,8 @@ mod tests {
                 rows: Mutex::new(rows),
                 err: Mutex::new(None),
                 last_batch_size: Mutex::new(None),
+                stranded_rows: Mutex::new(Vec::new()),
+                stranded_err: Mutex::new(None),
             }
         }
 
@@ -273,7 +357,30 @@ mod tests {
                 rows: Mutex::new(Vec::new()),
                 err: Mutex::new(Some(err)),
                 last_batch_size: Mutex::new(None),
+                stranded_rows: Mutex::new(Vec::new()),
+                stranded_err: Mutex::new(None),
             }
+        }
+
+        /// Construct a mock whose `select_stranded` call fails —
+        /// `select_eligible` succeeds with an empty set (mirrors
+        /// `new_failing`'s shape, but for the other query).
+        fn new_failing_stranded(err: DomainError) -> Self {
+            Self {
+                rows: Mutex::new(Vec::new()),
+                err: Mutex::new(None),
+                last_batch_size: Mutex::new(None),
+                stranded_rows: Mutex::new(Vec::new()),
+                stranded_err: Mutex::new(Some(err)),
+            }
+        }
+
+        /// Builder: seed the rows `select_stranded` returns. Consuming
+        /// (`self` by value) so call sites read as
+        /// `MockCandidates::new(vec![]).with_stranded(vec![c1, c2])`.
+        fn with_stranded(self, rows: Vec<RescanCandidate>) -> Self {
+            *self.stranded_rows.lock().unwrap() = rows;
+            self
         }
 
         fn last_batch_size(&self) -> Option<u32> {
@@ -293,6 +400,18 @@ mod tests {
                 return Box::pin(async move { Err(err) });
             }
             let rows = self.rows.lock().unwrap().clone();
+            Box::pin(async move { Ok(rows) })
+        }
+
+        fn select_stranded<'a>(
+            &'a self,
+            _batch_size: u32,
+        ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
+            let maybe_err = self.stranded_err.lock().unwrap().take();
+            if let Some(err) = maybe_err {
+                return Box::pin(async move { Err(err) });
+            }
+            let rows = self.stranded_rows.lock().unwrap().clone();
             Box::pin(async move { Ok(rows) })
         }
     }
@@ -645,6 +764,138 @@ mod tests {
     }
 
     // =====================================================================
+    // select_stranded — issue #6 stranded-scan recovery
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_with_stranded_candidates_enqueues_each_and_reports_stranded_eligible() {
+        let s1 = make_candidate();
+        let s2 = make_candidate();
+        let candidates =
+            Arc::new(MockCandidates::new(Vec::new()).with_stranded(vec![s1.clone(), s2.clone()]));
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+
+        let jobs_for_assert = jobs.clone();
+        let handler = make_handler(candidates, jobs);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["eligible"], 0);
+                assert_eq!(result_summary["stranded_eligible"], 2);
+                assert_eq!(result_summary["enqueued"], 2);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        let calls = jobs_for_assert.calls();
+        assert_eq!(calls.len(), 2);
+        for (call, c) in calls.iter().zip([&s1, &s2]) {
+            assert_eq!(call.artifact_id, c.artifact_id);
+            assert_eq!(
+                call.trigger_source, "cron",
+                "stranded re-enqueue still uses trigger_source=cron (same handler)"
+            );
+            assert_eq!(call.priority, CRON_RESCAN_PRIORITY);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_combines_eligible_and_stranded_enqueue_counts() {
+        let e1 = make_candidate();
+        let s1 = make_candidate();
+        let candidates = Arc::new(MockCandidates::new(vec![e1]).with_stranded(vec![s1]));
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+
+        let jobs_for_assert = jobs.clone();
+        let handler = make_handler(candidates, jobs);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["eligible"], 1);
+                assert_eq!(result_summary["stranded_eligible"], 1);
+                assert_eq!(
+                    result_summary["enqueued"], 2,
+                    "enqueued must sum both sources"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(jobs_for_assert.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_returns_failed_retry_when_select_stranded_errors() {
+        let candidates = Arc::new(MockCandidates::new_failing_stranded(
+            DomainError::Invariant("simulated stranded-select failure".into()),
+        ));
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+
+        let jobs_for_assert = jobs.clone();
+        let handler = make_handler(candidates, jobs);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok — select_stranded errors are surfaced via TaskOutcome::Failed");
+
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(retry, "select_stranded failure must retry");
+                assert!(
+                    reason.contains("select_stranded"),
+                    "reason should mention select_stranded: {reason}",
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            jobs_for_assert.calls().len(),
+            0,
+            "select_stranded failure must short-circuit before any enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_swallows_conflict_for_stranded_candidate_too() {
+        let s1 = make_candidate();
+        let s2 = make_candidate();
+        let candidates = Arc::new(MockCandidates::new(Vec::new()).with_stranded(vec![s1, s2]));
+        // Second call (index 1, since eligible is empty so stranded's
+        // calls start at index 0) returns Conflict.
+        let jobs = Arc::new(MockJobs::new(FailureMode::ConflictAt(1)));
+
+        let jobs_for_assert = jobs.clone();
+        let handler = make_handler(candidates, jobs);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok — Conflict is swallowed for stranded candidates too");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["stranded_eligible"], 2);
+                assert_eq!(
+                    result_summary["enqueued"], 1,
+                    "Conflict on the second stranded candidate must NOT count"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(jobs_for_assert.calls().len(), 2, "both attempted");
+    }
+
+    // =====================================================================
     // Metric emission
     // =====================================================================
 
@@ -760,6 +1011,51 @@ mod tests {
                 "Conflict-swallowed row must NOT count toward enqueued metric"
             ),
             other => panic!("expected Counter, got {other:?}"),
+        }
+    }
+
+    /// `hort_cron_rescan_stranded_eligible_artifacts` is set once per
+    /// tick to the stranded-candidate count, independent of (and
+    /// alongside) `hort_cron_rescan_eligible_artifacts`.
+    #[test]
+    fn run_emits_stranded_eligible_gauge_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let s1 = make_candidate();
+        let s2 = make_candidate();
+        let s3 = make_candidate();
+        let candidates = Arc::new(MockCandidates::new(Vec::new()).with_stranded(vec![s1, s2, s3]));
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+        let handler = make_handler(candidates, jobs);
+
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(handler.run(&serde_json::Value::Null, make_context()))
+                .expect("Ok");
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        let gauge = snap.iter().find(|(ck, _, _, _)| {
+            ck.kind() == MetricKind::Gauge
+                && ck.key().name() == "hort_cron_rescan_stranded_eligible_artifacts"
+        });
+        let (gkey, _, _, gvalue) =
+            gauge.expect("hort_cron_rescan_stranded_eligible_artifacts gauge");
+        assert_eq!(
+            gkey.key().labels().count(),
+            0,
+            "hort_cron_rescan_stranded_eligible_artifacts must have no labels",
+        );
+        match gvalue {
+            DebugValue::Gauge(v) => assert_eq!(*v, 3.0, "gauge must reflect stranded count"),
+            other => panic!("expected Gauge, got {other:?}"),
         }
     }
 }

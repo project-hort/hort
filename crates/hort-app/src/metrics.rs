@@ -2973,6 +2973,24 @@ pub fn set_cron_rescan_eligible_artifacts(count: u64) {
     metrics::gauge!("hort_cron_rescan_eligible_artifacts").set(count as f64);
 }
 
+/// Set `hort_cron_rescan_stranded_eligible_artifacts` to the count of
+/// **stranded** artifacts (issue #6) the most recent `CronRescanTickHandler`
+/// invocation found via `RescanCandidatesRepository::select_stranded` —
+/// `quarantine_status='quarantined'` artifacts whose last scan attempt
+/// errored (every scanner backend failed to run) and exhausted retries. No
+/// labels — single global gauge, mirrors
+/// [`set_cron_rescan_eligible_artifacts`]'s shape exactly.
+///
+/// Distinct from the interval-based `hort_cron_rescan_eligible_artifacts`
+/// gauge: a sustained non-zero value here is a different operational
+/// signal — artifacts stuck because a scanner backend is down, not the
+/// routine rescan sweep falling behind. Operators alarm on sustained
+/// `> 0` for an extended period (a healthy scanner drains this to zero
+/// every tick once it recovers).
+pub fn set_cron_rescan_stranded_eligible_artifacts(count: u64) {
+    metrics::gauge!("hort_cron_rescan_stranded_eligible_artifacts").set(count as f64);
+}
+
 // ---------------------------------------------------------------------------
 // Continuous scan-policy re-evaluation (ADR 0041 Item 3)
 // ---------------------------------------------------------------------------
@@ -6215,6 +6233,30 @@ mod tests {
         match value {
             metrics_util::debugging::DebugValue::Gauge(v) => {
                 assert_eq!(*v, 1234.0);
+            }
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_cron_rescan_stranded_eligible_artifacts_records_gauge_value() {
+        let snap = capture_metrics(|| {
+            super::set_cron_rescan_stranded_eligible_artifacts(7);
+        });
+        let entries = snap.into_vec();
+        let (key, _, _, value) = entries
+            .iter()
+            .find(|(k, _, _, _)| k.key().name() == "hort_cron_rescan_stranded_eligible_artifacts")
+            .expect("hort_cron_rescan_stranded_eligible_artifacts must fire");
+        // No labels — single global gauge, mirrors the eligible-artifacts gauge.
+        assert_eq!(
+            key.key().labels().count(),
+            0,
+            "hort_cron_rescan_stranded_eligible_artifacts must have NO labels (single global gauge)",
+        );
+        match value {
+            metrics_util::debugging::DebugValue::Gauge(v) => {
+                assert_eq!(*v, 7.0);
             }
             other => panic!("expected Gauge, got {other:?}"),
         }
