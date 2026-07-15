@@ -9,12 +9,18 @@
 # The quarantine + scanning scenarios drive `hort-cli admin ...`. It is a
 # pure-HTTP client crate (no DSN / hort-app / sqlx deps — see crates/hort-cli),
 # so this compiles only its own subgraph, not the whole workspace. Built on
-# rust:1.94-bookworm (workspace MSRV) so the binary's glibc matches the bookworm
-# final stage. cargo needs every member's Cargo.toml for workspace resolution,
-# hence `COPY crates`, but only hort-cli's subgraph is compiled.
-FROM rust:1.94-bookworm AS cli-builder
+# rust:1.94-slim-trixie (workspace MSRV) so the binary's glibc matches the trixie
+# final stage — the same builder image the server/worker images pin. cargo needs
+# every member's Cargo.toml for workspace resolution, hence `COPY crates`, but
+# only hort-cli's subgraph is compiled.
+FROM rust:1.94-slim-trixie AS cli-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# hort-cli depends on hort-attribution, which embeds these workspace-root files
+# at compile time via `include_str!` (the dual licenses and the generated
+# third-party manifests). Without them the build fails with "couldn't read
+# `.../LICENSE-MIT`: No such file or directory". Mirrors docker/Dockerfile.hort-server.
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.md THIRD-PARTY-LICENSES.json ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
@@ -22,12 +28,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/hort-cli /usr/local/bin/hort-cli
 
 # ---------- Stage 2: the client image ----------
-# Based on python:3.12-slim-bookworm (Debian bookworm + a MODERN pip) rather than
-# debian:bookworm-slim: scenarios create venvs (`python3 -m venv`) and Debian's
-# stock pip 23.0.1 crashes on hort's PEP 658/714 simple-index metadata
-# ("TypeError: unhashable type: 'dict'"). python:3.12-slim ships pip 24.x and its
-# ensurepip seeds venvs with it — matching run-e2e's proven PYPI_IMAGE.
-FROM python:3.12-slim-bookworm
+# Based on python:3.12-slim-trixie (ships pip 24.x) rather than debian:trixie-slim:
+# scenarios create venvs (`python3 -m venv`) and the python:*-slim images seed them
+# (via ensurepip) with a modern pip. An older stock Debian pip mishandled hort's
+# PEP 658/714 simple-index metadata ("TypeError: unhashable type: 'dict'"). Trixie
+# keeps Python 3.12, so this stays on 3.12 — matching run-e2e's proven PYPI_IMAGE.
+FROM python:3.12-slim-trixie
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash curl ca-certificates jq git xz-utils \
@@ -35,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       postgresql-client \
       skopeo \
     && rm -rf /var/lib/apt/lists/*
-# Node 20 (Debian bookworm ships 18; the smokes are validated on 20).
+# Node 20 via NodeSource (a pinned major independent of the base image; the smokes are validated on 20).
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -46,15 +52,16 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # (The base image's pip is not externally-managed, so no --break-system-packages.)
 RUN python3 -m pip install --no-cache-dir build twine
 # JDK + Maven + Gradle for the maven/gradle scenario (clients/maven.sh:
-# `mvn deploy`/`dependency:get` + `gradle publish`/resolve). openjdk-17 is the
-# bookworm default JDK and matches the scenario's maven.compiler.target=17.
+# `mvn deploy`/`dependency:get` + `gradle publish`/resolve). trixie dropped
+# openjdk-17, so this uses openjdk-21 (trixie's LTS JDK); JDK 21 still compiles
+# and runs the scenario's maven.compiler.target=17 (backward compatible).
 # Maven + Gradle are installed from PINNED, CHECKSUM-VERIFIED distributions
 # (Debian's maven package is stale and pulls a large dep tree). The daemon is
 # disabled at runtime via `gradle --no-daemon` in the scenario.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      openjdk-17-jdk-headless unzip \
+      openjdk-21-jdk-headless unzip \
     && rm -rf /var/lib/apt/lists/*
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 ARG MAVEN_VERSION=3.9.9
 ARG MAVEN_SHA512=a555254d6b53d267965a3404ecb14e53c3827c09c3b94b5678835887ab404556bfaf78dcfe03ba76fa2508649dca8531c74bca4d5846513522404d48e8c4ac8b
 RUN curl -fsSL -o /tmp/maven.tar.gz \

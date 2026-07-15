@@ -3,13 +3,14 @@
 # hort-server — v2 service binary image.
 #
 # Scope: the compose stack for development and E2E testing. Not the
-# production image. Uses debian:bookworm-slim at
+# production image. Uses debian:trixie-slim at
 # runtime instead of distroless so `sh`/`ls` are available for live
 # debugging during early E2E shake-out.
 
 # ---------- Stage 1: builder ----------
 # Digest-pinned (B10/INFRA-8); Dependabot (docker ecosystem) bumps tag+digest.
-FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
+# rust:1.94-slim-trixie — the same builder image docker/Dockerfile.{hort-server,worker} pin.
+FROM rust:1.94-slim-trixie@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a AS builder
 
 WORKDIR /src
 
@@ -20,6 +21,11 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
+# hort-server depends on hort-attribution, which embeds these workspace-root
+# files at compile time via `include_str!` (the dual licenses and the generated
+# third-party manifests). Without them the build fails with "couldn't read
+# `.../LICENSE-MIT`: No such file or directory". Mirrors docker/Dockerfile.hort-server.
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.md THIRD-PARTY-LICENSES.json ./
 
 # `sqlx::migrate!` is a proc-macro that reads the filesystem at expansion
 # time and emits `tracked_path!()` entries for each migration file it sees.
@@ -48,7 +54,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # ---------- Stage 2: runtime ----------
 # Digest-pinned (B10/INFRA-8).
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
+FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime
 
 # Runtime deps: CA roots for outbound TLS (upstream fetch), nothing else.
 RUN apt-get update && \
