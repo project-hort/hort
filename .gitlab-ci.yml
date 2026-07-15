@@ -28,20 +28,28 @@ stages:
   - release
 
 # ---------------------------------------------------------------------------
-# Pipeline scope
+# Pipeline scope (issue #38)
 # ---------------------------------------------------------------------------
 #
-# Run a pipeline for: MR events, tags, and any branch push (so feature
-# branches get CI before an MR is opened). When a branch has an open MR
-# we keep the MR pipeline and suppress the duplicate branch pipeline, so
-# a single push doesn't run CI twice.
+# Run a pipeline for:
+#   - MR events — feature branches get CI via their merge request ONLY; a push
+#     to the source branch re-runs the MR pipeline while the MR is open;
+#   - every push to the integration trunks `main` / `develop` and the
+#     long-lived `release/*` maintenance branches;
+#   - any tag (`v*` finals/pre-releases AND the `test/*` alpha tags).
+# NOT for: a feature-branch push with no open MR, or a commit to a `test/*`
+# branch — those build only when their tag is set/moved. When a branch has an
+# open MR we keep the MR pipeline and suppress the duplicate branch pipeline,
+# so a single push doesn't run CI twice.
 
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
-    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
     - if: $CI_COMMIT_TAG
 
 # ---------------------------------------------------------------------------
