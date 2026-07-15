@@ -13,6 +13,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 
 use chrono::{SubsecRound, Utc};
@@ -78,6 +79,7 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid) {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn upsert_then_find_round_trips() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -113,6 +115,7 @@ async fn upsert_then_find_round_trips() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_missing_returns_none() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -124,6 +127,7 @@ async fn find_missing_returns_none() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn upsert_replaces_existing_row() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -175,6 +179,7 @@ async fn upsert_replaces_existing_row() {
 /// `apply_delta_in_tx` against a missing row inserts the row from a
 /// zero baseline.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn apply_delta_in_tx_inserts_missing_row() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -205,6 +210,7 @@ async fn apply_delta_in_tx_inserts_missing_row() {
 /// `apply_delta_in_tx` against an existing row adds the delta and
 /// clamps underflow at zero (`repo_security_scores` projection invariant).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn apply_delta_in_tx_clamps_underflow_at_zero() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -252,6 +258,7 @@ async fn apply_delta_in_tx_clamps_underflow_at_zero() {
 
 /// A noop delta is a true noop — the SQL is skipped entirely.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn apply_delta_in_tx_noop_does_not_create_row() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -273,6 +280,7 @@ async fn apply_delta_in_tx_noop_does_not_create_row() {
 /// `last_scan_at` propagates from the delta when set, and is preserved
 /// otherwise (the COALESCE in the upsert).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn apply_delta_in_tx_last_scan_at_set_then_preserved() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -323,6 +331,7 @@ async fn apply_delta_in_tx_last_scan_at_set_then_preserved() {
 /// Two sequential applies in independent transactions are consistent
 /// (post-commit reads see the cumulative state).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn sequential_applies_are_consistent() {
     let Some(pool) = admin_pool().await else {
         return;

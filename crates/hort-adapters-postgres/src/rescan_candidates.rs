@@ -15,6 +15,12 @@
 //! terminal state. Excluding it would leave every out-of-the-box
 //! deployment's artifacts un-rescanned.
 //!
+//! Also implements `select_stranded` (issue #6) — a companion
+//! eligibility query for `quarantine_status='quarantined'` artifacts
+//! whose scan could not run at all (every backend errored) and exhausted
+//! retries. See the port's module doc and this impl's `select_stranded`
+//! doc comment.
+//!
 //! # Repo→policy resolution
 //!
 //! `policy_projections.scope` is JSONB:
@@ -157,6 +163,87 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     content_hash,
                     format,
                     rescan_interval_hours,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    fn select_stranded<'a>(
+        &'a self,
+        batch_size: u32,
+    ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
+        Box::pin(async move {
+            tracing::debug!(batch_size, "select_stranded");
+            // The `LATERAL` subquery picks the artifact's single
+            // most-recent `kind='scan'` job row (any status), ordered by
+            // `created_at DESC` — `idx_jobs_scan_artifact_created_at`
+            // (migration 015) covers this as a direct index scan. Only
+            // rows whose most-recent scan attempt landed in `'failed'`
+            // (retry-exhausted scanner-execution failure —
+            // `ScanOrchestrationUseCase::record_outcome`) are stranded.
+            // `quarantine_status = 'quarantined'` (NOT `'released'`/`NULL`
+            // — that's `select_eligible`'s predicate, and NOT
+            // `'scan_indeterminate'`/`'rejected'` — those are terminal,
+            // ADR 0007, never auto-rescanned). The in-flight exclusion
+            // reuses the same shape as `select_eligible` and is covered by
+            // the existing `jobs_scan_unique` partial unique index
+            // (migration 009).
+            let sql = r#"
+                SELECT a.id            AS artifact_id,
+                       a.repository_id AS repository_id,
+                       a.checksum_sha256 AS content_hash,
+                       r.format::text  AS format
+                FROM artifacts a
+                JOIN repositories r ON r.id = a.repository_id
+                JOIN LATERAL (
+                    SELECT j.status
+                    FROM jobs j
+                    WHERE j.kind = 'scan'
+                      AND j.artifact_id = a.id
+                    ORDER BY j.created_at DESC
+                    LIMIT 1
+                ) last_job ON TRUE
+                WHERE a.quarantine_status = 'quarantined'
+                  AND a.is_deleted = false
+                  AND last_job.status = 'failed'
+                  AND NOT EXISTS (
+                        SELECT 1 FROM jobs j2
+                        WHERE j2.kind = 'scan'
+                          AND j2.artifact_id = a.id
+                          AND j2.status IN ('pending', 'running')
+                      )
+                LIMIT $1
+            "#;
+
+            let rows = sqlx::query(sql)
+                .bind(i64::from(batch_size))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "RescanCandidate", "select_stranded"))?;
+
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let artifact_id: Uuid = row.try_get("artifact_id").map_err(|e| decode_err(&e))?;
+                let repository_id: Uuid =
+                    row.try_get("repository_id").map_err(|e| decode_err(&e))?;
+                let content_hash_str: String =
+                    row.try_get("content_hash").map_err(|e| decode_err(&e))?;
+                let content_hash: ContentHash = content_hash_str.parse().map_err(|e| {
+                    DomainError::Invariant(format!(
+                        "rescan_candidates: invalid content_hash for artifact {artifact_id}: {e}"
+                    ))
+                })?;
+                let format: String = row.try_get("format").map_err(|e| decode_err(&e))?;
+                out.push(RescanCandidate {
+                    artifact_id,
+                    repository_id,
+                    content_hash,
+                    format,
+                    // Sentinel — see the field's doc comment on
+                    // `RescanCandidate`. This query has no interval
+                    // concept.
+                    rescan_interval_hours: 0,
                 });
             }
             Ok(out)

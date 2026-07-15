@@ -8,6 +8,17 @@
 # the SonarQube gate, container image builds (hort-server + hort-worker,
 # buildah + cosign), the Helm chart publish, and the release SBOM.
 
+# Shared Rust compiler cache (sccache -> Garage S3), opted into by the compile-heavy
+# test jobs below via `extends: [.sccache]`. Secretless: GitLab OIDC -> Vault JWT
+# (role gitlab-ci-sccache) mints a read-only, single-path token for the S3 creds at
+# job time. Fail-safe: if Vault/S3 is unreachable or sccache is absent, the before_script
+# leaves RUSTC_WRAPPER unset and the job builds WITHOUT the cache instead of failing.
+# Only unit/integration opt in; lint and coverage stay off (sccache breaks
+# clippy-driver and llvm-cov instrumentation) and the buildah image builds compile
+# inside the Docker build, where RUSTC_WRAPPER doesn't reach.
+include:
+  - component: gitlab.kdp.kloni.cloud/idp/components-catalog/supply-chain/sccache@v0.5.2
+
 stages:
   - test
   - security
@@ -32,6 +43,124 @@ workflow:
       when: never
     - if: $CI_COMMIT_BRANCH
     - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# Doc-only skip (backlog 024 / issue #24)
+# ---------------------------------------------------------------------------
+#
+# Backlog-commit / coordination-only pushes to develop were running the full
+# build/test/lint/security/quality/image pipeline for a markdown-only diff.
+# `changes:` can only express a positive match, so this is the code/build/CI
+# side of the architect-finalized doc-vs-code split (backlog/024): a path
+# matching this list runs the gated jobs; anything else — including a path
+# on neither side of the split — skips them. That residual case (see the
+# DEVIATION note below) is the one place this mechanism can't fully honour
+# "unrecognized path -> fail safe to full run"; GitLab `changes:` has no way
+# to express that directly. Mitigate by listing broad code/build roots
+# (whole directories) rather than individual files, so newly-added files
+# under an existing code root are covered automatically.
+#
+# `.gitlab-ci.yml` is deliberately IN this list — editing the pipeline
+# definition must always re-run the full pipeline against itself.
+#
+# DEVIATION from the backlog-024 path split as literally written: it lists
+# `.gitlab-ci.yml` but not the rest of `.gitlab/**`, and doesn't mention
+# `sonar-project.properties`. Both are directly executed/read by jobs this
+# list gates — `.gitlab/ci/cosign-setup.sh` / `cosign-sign.sh` are sourced by
+# `.docker` (build-images:*) and `release:sbom`; `sonar-project.properties`
+# is the static-analysis config `quality:sonar`'s scanner auto-reads. Neither
+# path matches the doc-only set either, so under the literal finalized list
+# they'd fall through a `changes:` positive-match gap: not doc, not code,
+# silently skipped — a concrete violation of this directive's own fail-safe
+# constraint ("any path not in the doc-only set runs the full pipeline"),
+# not a stylistic preference. Added both at the time (backlog/024); the rest
+# of the then-uncovered top-level paths were deliberately left for the
+# architect to triage rather than decided unilaterally — that triage is the
+# rest of this comment (backlog/026, issue #26).
+#
+# backlog/026 (issue #26) triage of the residual uncovered paths, plus
+# `THIRD-PARTY-LICENSES.md`/`.json` (previously doc-side / uncovered — see
+# below). The rule: a path is **code-side** only if editing it can change a
+# heavy job's *output* (build, test, lint, attribution). Added here:
+#   - `.dockerignore` — image-build context (buildah/`docker build`), same
+#     rationale as the already-listed `docker/**`.
+#   - `about/**/*` — cargo-about templates/config read by
+#     `security:attribution-sync`, same rationale as the already-listed
+#     `about.toml`.
+#   - `THIRD-PARTY-LICENSES.md` / `.json` — the generated attribution
+#     artifacts. `.md` previously matched the doc-only `**/*.md` glob, so a
+#     lone hand-edit classified as doc-only and skipped its own
+#     verification job; `.json` matched neither side. Both are code-side now
+#     (the verification-*timing* half of this — re-checking on the
+#     `develop → main` promotion / release pushes / tags regardless of path
+#     classification — is issue #30's `security:attribution-sync` rescope,
+#     not this anchor; the two are complementary, not overlapping).
+#
+# Left **skip-safe** (deliberately NOT in this list — inert to every GitLab
+# job, so a lone edit correctly stays doc-only and skips the heavy jobs; not
+# an oversight, do not re-litigate without re-running the same "does it
+# change a heavy job's output?" test): `.github/**` (GitHub-only CI; no
+# GitLab job reads it), `.agents/**` (auto-agents config), `.env.example`,
+# `.gitguardian.yaml`, `.mergify.yml`, `renovate.json`, `install/**` (the CLI
+# installer served at hort.rs — not built/tested by the Rust pipeline),
+# `tools/**` (workspace-excluded — `exclude = ["tools/*"]` in the root
+# `Cargo.toml`, so no `--workspace` job builds it), `.trivyignore`
+# (grep-confirmed not referenced by any GitLab job — it is the suppression
+# list for the Trivy publish gate in `.github/workflows/docker-publish.yml`,
+# a GitHub Actions workflow triggered on `v*` tags independently of this
+# GitLab-only path list, so it is correctly inert to every GitLab job).
+.code-changed-paths: &code-changed-paths
+  - "crates/**/*"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "migrations/**/*"
+  - ".gitlab-ci.yml"
+  - ".gitlab/**/*"
+  - "sonar-project.properties"
+  - "deploy/**/*"
+  - "docker/**/*"
+  - ".dockerignore"
+  - "scripts/**/*"
+  - ".cargo/**/*"
+  - "rust-toolchain.toml"
+  - "deny.toml"
+  - ".clippy.toml"
+  - "rustfmt.toml"
+  - "about.toml"
+  - "about/**/*"
+  - "THIRD-PARTY-LICENSES.md"
+  - "THIRD-PARTY-LICENSES.json"
+
+# Shared rule template for jobs with no other rules: `!reference`'d as
+# `<<: [*other-anchor, *rules-code-changed]` (YAML merge; GitLab supports
+# merging multiple mapping anchors this way, same as `.rust-cache` below).
+# Tag pipelines always run full — releases stay fail-safe-full regardless of
+# what changed (backlog pitfall #2: `changes:` is not reliable/meaningful for
+# tag pipelines, so it's simply not used on that branch of the rule). MR and
+# branch pipelines only run the job when the diff touches a code/build/CI
+# path.
+.rules-code-changed: &rules-code-changed
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *code-changed-paths
+    - if: $CI_COMMIT_BRANCH
+      changes: *code-changed-paths
+
+# Guaranteed-present, guaranteed-green job. GitLab's "pipelines must succeed"
+# merge-check trap: if every job in a doc-only pipeline is gated out, the
+# pipeline has zero jobs and some project settings then block the MR
+# (backlog pitfall #1 / acceptance #4). This job carries no `rules:` (always
+# runs, on every pipeline) so a doc-only pipeline is never empty — it costs
+# nothing to also run it on code pipelines (no compile, no heavy image), and
+# keeping it unconditional is simpler than deriving "was anything else
+# skipped" via a second copy of the path list.
+docs-only:ok:
+  stage: test
+  image: alpine:3.20
+  needs: []
+  script:
+    - "true"
 
 # ---------------------------------------------------------------------------
 # Variables
@@ -76,6 +205,10 @@ variables:
   # `scripts/check-rust-version.sh`. GitLab pins the image explicitly so a
   # silent toolchain bump can't break the gate.
   RUST_IMAGE: "rust:1.94-slim"
+  # Same toolchain as RUST_IMAGE (built FROM rust:1.94-slim) with sccache on PATH,
+  # used only by the test jobs that extend .sccache. Identical clippy/fmt behaviour
+  # and MSRV; sccache is the only addition. Only tag published is :latest.
+  RUST_SCCACHE_IMAGE: "mirror.kdp.kloni.cloud/ci/rust-sccache:latest"
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: "always"
@@ -175,15 +308,21 @@ variables:
     REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}"
     export REGISTRY_USER REGISTRY_PASSWORD
 
-# Jobs without explicit rules inherit the workflow scope above, so fmt,
-# clippy, unit tests, coverage, cargo-audit, and the sonar gate run on
-# every pipeline (feature branch, MR, main, release, tag). Jobs that
-# should stay gated (integration tests) opt in to this anchor.
+# Jobs without other rules now opt in to `.rules-code-changed` above, so
+# fmt, clippy, unit tests, coverage, cargo-audit, and the sonar gate run on
+# every pipeline (feature branch, MR, main, release, tag) EXCEPT a doc-only
+# diff, which skips them (backlog 024). Integration tests stay additionally
+# gated to main/master/release/tag via this anchor, now also composed with
+# the code-changed path list on its branch arms — the tag arm stays
+# unconditional (fail-safe-full, same reasoning as `.rules-code-changed`).
 .rules-main-only: &rules-main-only
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH == "master"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
     - if: $CI_COMMIT_TAG
 
 # ---------------------------------------------------------------------------
@@ -290,7 +429,15 @@ variables:
 test:lint:
   stage: test
   image: ${RUST_IMAGE}
-  <<: *rust-cache
+  <<: [*rust-cache, *rules-code-changed]
+  variables:
+    # cargo clippy runs clippy-driver over workspace crates whose dependencies
+    # (sqlx + its sqlx-macros proc-macro) are compiled by rustc; under
+    # RUSTC_WRAPPER=sccache the wrapped-rustc artifacts don't resolve for
+    # clippy-driver → E0463 "can't find crate for sqlx" and a cascade of
+    # inference errors. Same wrapper-breaks-the-tool class as coverage/llvm-cov,
+    # and clippy gets 0 sccache hits anyway — keep it off sccache (like coverage).
+    RUSTC_WRAPPER: ""
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
     # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
@@ -307,19 +454,27 @@ test:lint:
 # Parity with test-backend-unit, scoped to the rewrite.
 test:unit:
   stage: test
-  image: ${RUST_IMAGE}
-  <<: *rust-cache
+  extends: [.sccache]
+  image: ${RUST_SCCACHE_IMAGE}
+  <<: [*rust-cache, *rules-code-changed]
   needs:
     - job: test:lint
       artifacts: false
-  id_tokens: !reference [.hort-auth, id_tokens]
+  id_tokens:
+    # See test:lint - both tokens inline (extends:[.sccache] won't merge id_tokens).
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+    HORT_OIDC_TOKEN:
+      aud: hort-server
   before_script:
     # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
     # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
+    # extends:[.sccache] replaces before_script; chain its sccache setup back in.
     - *rust-apt-deps
     - *platform-ca-deb
     - *hort-auth-steps
+    - !reference [.sccache, before_script]
   script:
     - cargo test --workspace --lib --verbose
 
@@ -329,7 +484,7 @@ test:unit:
 test:coverage:
   stage: test
   image: ${RUST_IMAGE}
-  <<: *rust-cache
+  <<: [*rust-cache, *rules-code-changed]
   needs:
     - job: test:unit
       artifacts: false
@@ -377,9 +532,9 @@ test:coverage:
 # database. Main / release / tags only, matching the GitHub CI gating.
 test:integration:
   stage: test
-  image: ${RUST_IMAGE}
-  <<: *rust-cache
-  <<: *rules-main-only
+  extends: [.sccache]
+  image: ${RUST_SCCACHE_IMAGE}
+  <<: [*rust-cache, *rules-main-only]
   needs:
     - job: test:coverage
       artifacts: false
@@ -391,14 +546,21 @@ test:integration:
     POSTGRES_USER: "registry"
     POSTGRES_PASSWORD: "registry"
     DATABASE_URL: "postgresql://registry:registry@postgres:5432/artifact_registry"
-  id_tokens: !reference [.hort-auth, id_tokens]
+  id_tokens:
+    # See test:lint - both tokens inline (extends:[.sccache] won't merge id_tokens).
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+    HORT_OIDC_TOKEN:
+      aud: hort-server
   before_script:
     # rust-apt-deps installs curl/ca-certificates; platform-ca-deb then trusts
     # the internal PKI CA (PLATFORM_CA_PATH) so hort-auth's OIDC exchange (curl)
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
+    # extends:[.sccache] replaces before_script; chain its sccache setup back in.
     - *rust-apt-deps
     - *platform-ca-deb
     - *hort-auth-steps
+    - !reference [.sccache, before_script]
     - apt-get install -y -qq --no-install-recommends postgresql-client
     - for i in $(seq 1 30); do pg_isready -h postgres -U "${POSTGRES_USER}" && break; sleep 1; done
   script:
@@ -422,6 +584,7 @@ security:cargo-audit:
   # prebuilt binstall download — so this runs from pipeline start rather than
   # queuing behind the serialized test-compile chain.
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
@@ -455,8 +618,47 @@ security:advisory-sync:
   stage: security
   image: ${RUST_IMAGE}
   needs: []
+  <<: *rules-code-changed
   script:
     - bash scripts/check-advisory-sync.sh
+
+# Third-party attribution staleness + allowlist-parity gate. Regenerates
+# THIRD-PARTY-LICENSES.{md,json} via `cargo about generate` and diffs against
+# the committed copies (stale ⇒ fail), and asserts `about.toml`'s `accepted`
+# license list matches `deny.toml`'s `[licenses] allow` list. No workspace
+# compile — cargo-about is a prebuilt binstall download reading `cargo
+# metadata` — so this runs from pipeline start like the other security:* gates.
+#
+# Scoped to release-relevant pipelines only (issue #30), NOT `.rules-code-changed`
+# like its security:* siblings: attribution is a property of the shipped
+# artifact (embedded via `include_str!`, ADR 0047), so it's verified where a
+# public/internal artifact can actually be built, not on every code-touching
+# MR. Without this, a Renovate dep-bump MR changes the dep graph, the
+# committed attribution goes stale, and the job fails deterministically on
+# every such MR even though nothing ships from it. A stale attribution still
+# cannot ship: the develop → main promotion MR, main/release/* pushes, and
+# every v* tag all re-verify it before any artifact is built — only
+# internal, non-shipping pipelines (feature/Renovate MRs, develop-targeting
+# MRs, ordinary develop pushes) stop running it. No `changes:` filter on any
+# arm — always verify before a release-relevant build, regardless of what
+# changed.
+security:attribution-sync:
+  stage: security
+  image: ${RUST_IMAGE}
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|release\/)/'
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl python3
+    - *install-binstall
+    - cargo binstall --no-confirm --locked cargo-about
+      || cargo install --locked cargo-about --features cli || true
+  script:
+    - bash scripts/check-attribution.sh
 
 # No-plans gate (D7): `docs/plans/` is the branch-lifetime home for design docs
 # + backlogs, distilled into `docs/adr/` + `docs/architecture/` and removed
@@ -509,6 +711,7 @@ security:cargo-deny:
   # tool is a prebuilt binstall download — so this runs from pipeline start
   # rather than queuing behind the serialized test-compile chain.
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
@@ -534,6 +737,13 @@ security:cargo-deny:
 
 quality:sonar:
   stage: quality
+  # SonarQube is reachable only at its in-cluster service DNS
+  # (sonarqube-sonarqube.sonarqube.svc.cluster.local), so this job must run on
+  # an in-cluster runner. The `platform` tag selects the in-cluster Platform
+  # Runner; without it the untagged job can land on an out-of-cluster runner
+  # that cannot resolve the service hostname and fails at "query server version".
+  tags:
+    - platform
   image:
     name: sonarsource/sonar-scanner-cli:latest
     entrypoint: [""]
@@ -549,7 +759,16 @@ quality:sonar:
     # Runs only when a Sonar token is configured, so installations without a
     # Sonar instance don't hard-fail the quality stage. Set SONAR_TOKEN (and
     # SONAR_HOST_URL) as masked CI/CD variables to enable. See docs/ci/README.md.
-    - if: '$SONAR_TOKEN'
+    # Split tag vs. branch (rather than the old bare `if: '$SONAR_TOKEN'`) so
+    # this job's presence tracks `needs: test:coverage` exactly: tag pipelines
+    # stay unconditional (fail-safe-full), branch pipelines gate on the same
+    # code-changed path list test:coverage uses. Without this, a doc-only
+    # branch pipeline would skip test:coverage but still try to run sonar,
+    # which needs: test:coverage (not optional) — an unresolvable-needs error
+    # at pipeline creation (backlog pitfall #3).
+    - if: '$SONAR_TOKEN && $CI_COMMIT_TAG'
+    - if: '$SONAR_TOKEN && $CI_COMMIT_BRANCH'
+      changes: *code-changed-paths
   needs:
     - job: test:coverage
       artifacts: true
@@ -586,6 +805,7 @@ quality:chart-and-rust-pin-sync:
   stage: quality
   image: alpine:3.20
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apk add --no-cache bash grep
   script:
@@ -603,6 +823,7 @@ quality:g1-attestation-gate:
   stage: quality
   image: alpine:3.20
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apk add --no-cache bash grep findutils sed
   script:
@@ -622,8 +843,15 @@ quality:g1-attestation-gate:
 # `grep -E \b`, `find -print0`) which busybox lacks.
 quality:helm-template-test:
   stage: quality
-  image: alpine/helm:3.17.1
+  # entrypoint: [""] overrides the alpine/helm image's ENTRYPOINT ["helm"] so
+  # the executor runs the job's shell directly. Without it, a podman-executor
+  # runner launches the script as `helm sh …` → `unknown command "sh"`; only
+  # the docker executor overrides the entrypoint implicitly. Matches quality:sonar.
+  image:
+    name: alpine/helm:3.17.1
+    entrypoint: [""]
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apk add --no-cache bash grep findutils sed
   script:
@@ -637,6 +865,7 @@ quality:fail2ban-regex-test:
   stage: quality
   image: debian:13-slim
   needs: []
+  <<: *rules-code-changed
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends fail2ban
@@ -654,6 +883,13 @@ quality:fail2ban-regex-test:
 # wipes /tmp/cosign.key even if the build failed mid-step.
 
 .docker:
+  # build-images push to the mirror registry (mirror.kdp.kloni.cloud) with
+  # credentials mounted only on the in-cluster Platform Runner at /secrets/zot;
+  # off-cluster runners fall back to CI_REGISTRY_* (GitLab's own registry) and
+  # fail `buildah login` with "invalid username/password". The `platform` tag
+  # pins these jobs to the runner that holds the mirror secret.
+  tags:
+    - platform
   image: quay.io/buildah/stable:v1.39
   variables:
     STORAGE_DRIVER: vfs
@@ -715,9 +951,11 @@ build-images:hort-server:
     KUBERNETES_CPU_REQUEST: "2"
     KUBERNETES_CPU_LIMIT: "4"
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
   script:
     - |
       set -euo pipefail
@@ -811,9 +1049,11 @@ build-images:hort-worker:
     KUBERNETES_CPU_REQUEST: "2"
     KUBERNETES_CPU_LIMIT: "4"
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
   script:
     - |
       set -euo pipefail
@@ -899,16 +1139,28 @@ build-images:hort-worker:
 
 helm:lint-and-publish:
   stage: helm
-  image: alpine/helm:3.17.1
+  # `helm push` targets the same mirror registry as build-images, whose
+  # credentials are mounted only on the in-cluster Platform Runner; the
+  # `platform` tag pins the job to that runner (see .docker).
+  tags:
+    - platform
+  # entrypoint: [""] — see quality:helm-template-test; the alpine/helm image's
+  # ENTRYPOINT ["helm"] must be overridden so a podman-executor runner runs the
+  # job shell instead of `helm sh`.
+  image:
+    name: alpine/helm:3.17.1
+    entrypoint: [""]
   needs:
     - job: build-images:hort-server
       artifacts: true
     - job: build-images:hort-worker
       artifacts: true
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
     - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
   before_script:
     # Trust platform CA for registry (Alpine: install ca-certificates first)
     - apk add --no-cache ca-certificates
@@ -960,6 +1212,96 @@ helm:lint-and-publish:
       helm push hort-server-*.tgz "oci://${REGISTRY}/${IMAGE_PREFIX}/charts"
 
 # ===========================================================================
+# Stage 5b: helm chart signature — first-party keyed cosign (Vault Transit)
+# ===========================================================================
+#
+# Dogfood: hort signs its OWN Helm chart with the first-party Transit key
+# (hashivault://first-party-cosign) — the same key the platform's first-party
+# apps sign with — so the platform Flux gates the prod hort HelmRepository on a
+# valid signature (.spec.verify, cosign public key).
+#
+# LEGACY .sig-tag mode (deliberately NO --registry-referrers-mode=oci-1-1):
+# Flux source-controller (v1.8.0) discovers cosign signatures via the
+# sha256-<digest>.sig tag, NOT the OCI 1.1 Referrers API. This is the opposite
+# of the IMAGE signing (cosign-sign.sh, oci-1-1) whose verifier is hort's own
+# referrer-aware worker — each artefact is signed in the format its verifier
+# reads. Isolated from helm:lint-and-publish (needs: it) so a signing hiccup
+# never blocks chart publishing; the chart is pushed first, then signed.
+
+helm:sign-chart:
+  stage: helm
+  tags:
+    - platform
+  # buildah-cosign tools image: Fedora + cosign v3 + curl + jq (the same image
+  # the platform first-party oci component signs with). No helm needed — cosign
+  # resolves the chart tag to its digest itself.
+  image: mirror.kdp.kloni.cloud/ci/buildah-cosign:latest
+  needs:
+    - job: helm:lint-and-publish
+  rules:
+    # `alpha` included for parity with build-images:* / helm:lint-and-publish
+    # (the #25 alpha-routing widening). This job landed after that change with
+    # only `(rc|beta)`, so an internal `-alpha.N` tag would skip signing
+    # SILENTLY (no match, no failure) and publish an unsigned chart. Keep the
+    # tag-suffix set identical across every job that acts on a release tag.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+  before_script:
+    # Trust the platform CA (Fedora anchors) for TLS to the mirror + OpenBao.
+    - |
+      CA="${PLATFORM_CA_PATH:-${CI_SERVER_TLS_CA_FILE:-}}"
+      if [ -n "$CA" ] && [ -f "$CA" ]; then
+        cp "$CA" /etc/pki/ca-trust/source/anchors/kdp-platform-ca.crt && update-ca-trust
+      fi
+    - *resolve-registry-creds
+  script:
+    - |
+      set -eu
+      # Recompute VERSION identically to helm:lint-and-publish (kept self-
+      # contained so the publish job stays byte-for-byte untouched).
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION="${CI_COMMIT_TAG#v}"
+      else
+        VERSION="0.0.0-snapshot.${CI_PIPELINE_IID}"
+      fi
+      CHART_REF="${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server:${VERSION}"
+      echo "=== chart sign ==="
+      echo "  CHART_REF=${CHART_REF}"
+      echo "  key=hashivault://first-party-cosign (role first-party-hort)"
+      echo "=================="
+      # Vault JWT login -> token carrying the first-party-sign policy (transit
+      # sign on first-party-cosign). Role bound to project_path=pub-projects/hort
+      # + ref_protected=true, so it authorises only on protected refs.
+      VR=$(curl -sS --request POST \
+        --data "{\"jwt\":\"${VAULT_ID_TOKEN}\",\"role\":\"first-party-hort\"}" \
+        "${VAULT_ADDR}/v1/auth/gitlab/login")
+      VAULT_TOKEN="$(echo "$VR" | jq -r '.auth.client_token // empty')"
+      [ -n "$VAULT_TOKEN" ] || { echo "Vault auth failed (role first-party-hort): $VR"; exit 1; }
+      export VAULT_TOKEN
+      export TRANSIT_SECRET_ENGINE_PATH=transit
+      # cosign writes the signature as a PUSH -> authenticate to the mirror
+      # (anon-read, authenticated-write).
+      cosign login "${REGISTRY}" -u "${REGISTRY_USER}" -p "${REGISTRY_PASSWORD}"
+      # LEGACY .sig-tag signature (Flux-discoverable). No Rekor (private infra).
+      # Pin the output format explicitly: cosign v3 WITHOUT these flags defaults
+      # to an OCI-referrer + v0.3-bundle signature (validated on the beta.5 tag
+      # pipeline: referrer created, NO .sig tag) which Flux source-controller
+      # (v1.8.0, tag-based discovery) cannot see. new-bundle-format=false +
+      # referrers-mode=legacy = classic simplesigning payload under the
+      # sha256-<digest>.sig tag -- the one format Flux verifies.
+      cosign sign --yes --key hashivault://first-party-cosign \
+        --use-signing-config=false --tlog-upload=false \
+        --new-bundle-format=false --registry-referrers-mode=legacy \
+        "${CHART_REF}"
+      echo "signed ${CHART_REF} (first-party key, legacy .sig tag)"
+
+
+
+# ===========================================================================
 # Stage 6: release — CycloneDX SBOM artefact for tagged releases
 # ===========================================================================
 #
@@ -973,6 +1315,13 @@ helm:lint-and-publish:
 
 release:sbom:
   stage: release
+  # cosign-setup.sh authenticates to Vault at openbao.kdp.kloni.cloud, whose TLS
+  # cert is signed by the internal PKI CA that only the in-cluster runners
+  # trust; off-cluster the Vault login fails `curl (60) unable to get local
+  # issuer certificate`. The `platform` tag pins the job to that runner (see
+  # .docker).
+  tags:
+    - platform
   image: ${RUST_IMAGE}
   rules:
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+/

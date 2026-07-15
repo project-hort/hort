@@ -31,6 +31,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 use std::time::Duration;
 
@@ -80,6 +81,7 @@ async fn seed_user(pool: &PgPool, prefix: &str) -> Uuid {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_011_creates_oidc_issuers_with_defaults() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -185,6 +187,7 @@ async fn migration_011_creates_oidc_issuers_with_defaults() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_011_service_account_user_delete_restricts() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -238,6 +241,7 @@ async fn migration_011_service_account_user_delete_restricts() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_011_federated_identities_cascade_and_unique_position() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -373,6 +377,7 @@ async fn insert_fallback_rotation(
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_011_fallback_rotation_check_constraints() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -493,6 +498,7 @@ async fn migration_011_fallback_rotation_check_constraints() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_011_service_account_aggregate_round_trip() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -632,6 +638,7 @@ async fn migration_011_service_account_aggregate_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_011_oidc_issuer_non_default_round_trip() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -692,6 +699,7 @@ async fn migration_011_oidc_issuer_non_default_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_011_no_managed_by_column_on_new_tables() {
     let Some(pool) = admin_pool().await else {
         return;

@@ -4,11 +4,11 @@ metadata:
   name: oci-provenance-e2e
 spec:
   name: "OCI Provenance E2E"
-  description: "Hosted OCI repo under a provenanceMode=required + provenanceBackends=[cosign-key] ScanPolicy; used by scripts/native-tests/scenarios/quarantine/provenance-push-then-sign.sh to drive the keyed cosign hold-until-signed round-trip (ADR 0039, issues #13/#14)."
+  description: "Hosted PRIVATE (isPublic:false) OCI repo under a provenanceMode=required + provenanceBackends=[cosign-key] ScanPolicy; used by scripts/native-tests/scenarios/quarantine/provenance-push-then-sign.sh to drive the keyed cosign hold-until-signed round-trip. Private so the /v2/auth mint's pull-scoped access[] is load-bearing (provenance-ci's read grant is what carries pull) and anonymous reads are denied by visibility with a 401 challenge before the hold check (ADR 0039, ADR 0045)."
   format: oci
   type: hosted
   storage:
     backend: filesystem
     path: /var/lib/hort-server/cas/oci-provenance-e2e
-  isPublic: true
+  isPublic: false
   replicationPriority: local_only

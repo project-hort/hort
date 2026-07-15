@@ -336,6 +336,19 @@ Additionally, before pushing:
 - Check for code duplication: if structurally similar blocks appear 3+ times in new code, refactor into a shared helper
 - Check test coverage: `hort-domain` and `hort-app` require 100% coverage; all other crates require 85%+ (see Test Coverage Tiers above)
 - Check migration numbering: verify the migration number is not already taken (`ls migrations/ | tail -5`)
+- **Regenerate third-party attribution on ANY dependency-graph change** — if the
+  change adds/removes/re-versions a **non-workspace** crate in `Cargo.lock` (a dep
+  bump, `cargo update -p`/`-w`, adding/removing a dep or a crate-pulling feature),
+  run `scripts/regenerate-attribution.sh` and commit the updated
+  `THIRD-PARTY-LICENSES.{md,json}` **in the same change**. The
+  `security:attribution-sync` gate is **release-scoped** (tags + `main`/`release/*`
+  + MRs targeting them — issue #30), so it will **not** flag stale attribution on a
+  feature/`develop` pipeline — it is the fail-closed release backstop, not the
+  per-MR check. A dep-changing commit without the regen leaves `develop` stale and
+  fails the next release-relevant pipeline (this is exactly how the `spin 0.9.8 →
+  0.9.9` bump broke the `v0.9.9-beta.4` cut). A release **workspace-version-only**
+  bump (`X.Y.Z-dev → X.Y.Z-<pre>`) is exempt (no third-party change) but still runs
+  `check-attribution` as part of the cut. (see ADR 0049 / ADR 0047)
 
 ### Maintenance Branches
 
@@ -367,23 +380,48 @@ Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older releas
 Images are built and published **only on `v*` release tags** (and manual
 `workflow_dispatch`) — there is no longer a `:dev` build on `main` pushes.
 - Version tags **strip the `v` prefix**: git tag `v1.1.0-rc.2` → Docker tag `:1.1.0-rc.2`
-- `:latest` is only set for stable releases (no `-rc`, `-beta`, etc.)
+- `:latest` is only set for stable releases (no `-rc`, `-beta`, `-alpha`, etc.)
 - `:1.0`, `:1.1` series tags are set automatically via semver parsing
 - `:sha-<commit>` is set for every (tag) build
+- **`-alpha.N` tags are excluded from this whole public ghcr publish** — an
+  internal pre-release (see *Releases* below and
+  [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md)) is
+  build/published only to the internal registry via the GitLab pipeline,
+  never to ghcr. `-beta`/`-rc` are unaffected (reserved for a possible
+  future public pre-release track, not currently used).
 
 ### Releases
 
-**Pre-releases are tagged on `develop`; final releases are tagged on `main`.**
-See **`RELEASING.md`** for the exact step-by-step of each. In short:
+**Pre-releases are throwaway-branch tags cut off `develop`; final releases are
+tagged on `main`.** See **`RELEASING.md`** and
+[ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) (also
+[the glossary](docs/glossary.md)) for the full model and the exact
+step-by-step. In short:
 
-- A **pre-release** (`vX.Y.Z-beta.N` / `-rc.N`) is a **version bump only** —
-  `Cargo.toml` workspace version + `Cargo.lock` + `deploy/helm/hort-server/Chart.yaml`
-  (`version`/`appVersion`) — on a `chore/release-X.Y.Z-beta.N` branch, merged
-  to `develop` and tagged on the merge commit. **It does not touch
-  `CHANGELOG.md`.**
+- **`develop` carries an `X.Y.Z-dev` marker** (bumped once per cycle via a normal
+  MR, so a build off `develop` reports the honest unreleased-next version). An
+  **internal pre-release** (`vX.Y.Z-alpha.N`) is a **version-bump commit cut on
+  a `test/vX.Y.Z-alpha.N` branch off `develop`, tagged, and NOT merged back**
+  — unlike a one-off pre-release tag, this branch **is pushed** (so staging
+  can deploy it continuously), but its version-bump commit must never land on
+  `develop` or `main`. The bump touches `Cargo.toml` workspace version +
+  `Cargo.lock` + `deploy/helm/hort-server/Chart.yaml` (`version`/`appVersion`)
+  and **does not touch `CHANGELOG.md`**. This keeps `develop`/`main` free of
+  per-alpha bumps while the tagged commit stays version-honest (binary +
+  chart both report the pre-release version). Trade-off: alpha tags are off
+  `develop`'s line, so `git describe` from `develop` won't find them — fine
+  for internal builds. Alpha artifacts (images + Helm chart) build and
+  publish to the **internal registry only** — see *Docker image tags* above
+  and [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D4;
+  `beta`/`rc` naming stays reserved for a possible future *public*
+  pre-release track (not in use today).
+- **Staging is continuous and multi-source**: it deploys from `develop`, from
+  `test/*` alpha branches, and from `main` — there's always a deployable
+  artifact, independent of release cadence
+  ([ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D3).
 - A **final** release (`vX.Y.Z`, no suffix) is the **`develop → main`
   promotion**. That single promotion MR is where the changelog is stamped, the
-  version drops the `-beta`/`-rc` suffix, and the `Closes #…` keywords ride.
+  version drops any pre-release suffix, and the `Closes #…` keywords ride.
   The `vX.Y.Z` tag is pushed on the `main` merge commit. **Issues auto-close
   only on merges to the default branch (`main`)**, so a fix's issue references
   belong on the promotion MR, not on the feature MR into `develop` — this is
@@ -398,7 +436,7 @@ Release-note mechanics:
 ### Changelog and Release Notes
 
 - Follow the [Keep a Changelog](https://keepachangelog.com/) format: record changes under `### Added` / `### Changed` / `### Fixed` / `### Security` / `### Removed` beneath the `## [Unreleased]` heading.
-- **`[Unreleased]` accumulates across the entire pre-release (`-beta`/`-rc`) series and is stamped `## [X.Y.Z] - <date>` exactly once — at the final `develop → main` promotion.** Pre-release commits do **not** stamp or fold the changelog. (The old per-beta fold is retired: it produced stale section dates — a `[0.9.8] - 2026-07-03` heading that kept accreting later entries — and a manual, error-prone move at every beta.) A beta's "changelog" is simply the current `[Unreleased]` at that tag; per-beta traceability comes from the git tags plus the auto-generated GitHub release notes.
+- **`[Unreleased]` accumulates across the entire pre-release (`-alpha`, and any future `-beta`/`-rc`) series and is stamped `## [X.Y.Z] - <date>` exactly once — at the final `develop → main` promotion.** Pre-release commits do **not** stamp or fold the changelog. (The old per-pre-release fold is retired: it produced stale section dates — a `[0.9.8] - 2026-07-03` heading that kept accreting later entries — and a manual, error-prone move at every pre-release.) An alpha's "changelog" is simply the current `[Unreleased]` at that tag; per-alpha traceability comes from the git tags plus the auto-generated GitHub release notes.
 - GitHub Release notes are **auto-generated** (`generate_release_notes: true` in `release.yml`) — do NOT hardcode static product descriptions, feature lists, or format counts in release bodies.
 - Hort has a single author and no external contributors or sponsors at present, so changelog entries and release notes carry no `### Thank You` / `### Sponsors` recognition sections. If external contributors or sponsors appear later, reintroduce those sections at that point.
 

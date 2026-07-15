@@ -34,6 +34,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 
 use sqlx::{PgPool, Row};
@@ -120,6 +121,7 @@ async fn seed_artifact(pool: &PgPool, repo: Uuid) -> Uuid {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_creates_jobs_table_with_all_kinds() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -277,6 +279,7 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_creates_scan_findings_pk_uniqueness() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -363,6 +366,7 @@ async fn migration_009_creates_scan_findings_pk_uniqueness() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_creates_repo_security_scores() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -422,6 +426,7 @@ async fn migration_009_creates_repo_security_scores() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_creates_scanner_registry() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -459,6 +464,7 @@ async fn migration_009_creates_scanner_registry() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_artifacts_last_scan_at_column_exists_and_index_is_partial() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -519,6 +525,7 @@ async fn migration_009_artifacts_last_scan_at_column_exists_and_index_is_partial
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_scan_findings_cascades_on_artifact_delete() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -580,6 +587,7 @@ async fn migration_009_scan_findings_cascades_on_artifact_delete() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_repo_security_scores_cascades_on_repository_delete() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -629,6 +637,7 @@ async fn migration_009_repo_security_scores_cascades_on_repository_delete() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_scan_findings_rejects_oversized_text_columns() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -735,6 +744,7 @@ async fn migration_009_scan_findings_rejects_oversized_text_columns() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_scan_findings_rejects_negligible_severity() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -792,6 +802,7 @@ async fn migration_009_scan_findings_rejects_negligible_severity() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migration_009_scanner_registry_rejects_empty_backends() {
     let Some(pool) = admin_pool().await else {
         return;

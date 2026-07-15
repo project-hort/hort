@@ -91,6 +91,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
 
+# The `hort-attribution` crate — a dependency of the worker binary — embeds
+# these workspace-root files at compile time via `include_str!` (the dual
+# licenses and the generated third-party manifests). They must be present in
+# the build context or `cargo build` fails with "couldn't read
+# `.../LICENSE-MIT`: No such file or directory".
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.md THIRD-PARTY-LICENSES.json ./
+
 # Same proc-macro-cache caveat the hort-server Dockerfile documents:
 # `sqlx::migrate!` only re-reads the migrations directory when its
 # host file is recompiled. Touching the worker's migrator host file
@@ -235,7 +242,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d3cda6e91129130d7229a1806b6a73
 # rest (`source`, `revision`, `version`, `created`) via `--label` on
 # the publish job (mirroring the hort-server Dockerfile).
 LABEL org.opencontainers.image.title="hort-worker"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 # Pull binaries in. Order is dependency-cascade (toolchain first,
 # scanners after, app last) to keep layer cache reads sequential.
@@ -243,6 +250,12 @@ COPY --from=tini    /usr/bin/tini                   /usr/local/bin/tini
 COPY --from=trivy   /usr/local/bin/trivy            /usr/local/bin/trivy
 COPY --from=osv     /usr/local/bin/osv-scanner      /usr/local/bin/osv-scanner
 COPY --from=builder /usr/local/bin/hort-worker        /usr/local/bin/hort-worker
+
+# Image-level NOTICE for the bundled external tools above (Trivy, osv-scanner,
+# tini) plus the base image contents — see docs/attribution/image-notice.md.
+# Separate surface from the compiled-in crate attribution the `hort-worker
+# attribution` subcommand renders; do not conflate the two.
+COPY docs/attribution/image-notice.md /usr/share/hort/NOTICE
 
 # WORKDIR is owned by the `nonroot` user (UID 65532) per the
 # distroless base-image convention. The chart mounts CAS at

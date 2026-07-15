@@ -2701,15 +2701,36 @@ double-count (architect "one metric, one layer"). Closed taxonomy of
   `Completed{findings: []}` arm and the `SkippedNoBackends` arm (the
   operator `scan_backends: []` waiver — a decision, not a failure).
 - `indeterminate` — the scanner could not decide: terminal scan
-  failure after retry exhaustion. Ticks on the retry-exhausted
-  `Failed` arm; the artifact transitioned to `scan_indeterminate`
-  (fail-closed — ADR 0007). Never co-emitted with `completed`/
+  failure after retry exhaustion, for a prior status OTHER than
+  `Quarantined` (issue #6 narrowed this — see below). Ticks only when
+  the retry-exhausted `Failed` arm actually transitions the artifact to
+  `scan_indeterminate` (fail-closed — ADR 0007): a `None`-status
+  artifact (permissive default, no quarantine window to fall back into)
+  still hard-blocks here, and an already-terminal artifact hits the
+  idempotent skip (no double-tick). Never co-emitted with `completed`/
   `rejected` for the same observation. An attacker who DoSes a
   configured scanner for a chosen artifact shows up here, distinctly
   from a clean rejection — a required audit signal.
 - `rejected` — the scanner decided: bad content. Ticks on the
   `Completed{findings: [..]}` arm; the artifact transitioned to
   `rejected`.
+
+**Issue #6 refinement — retry exhaustion while `Quarantined` does NOT
+tick this metric at all.** When the artifact's prior status is
+`Quarantined` (mid-observation-window) and its scan retries exhaust
+(every backend failed to run — a scanner-execution failure, not a
+genuinely-ambiguous result), the artifact stays exactly where it is: no
+`scan_indeterminate` transition, no event, `quarantine_status`
+untouched. That is *not* an artifact-terminal decision, so it does not
+belong in this counter's closed taxonomy of 3 — it produces zero
+`hort_scan_terminal_total` ticks. The per-job-attempt
+`hort_scan_jobs_total{result=failed}` still fires (job exhausted
+`max_attempts`), and the persisted "last scan errored" fact
+(`jobs.status='failed'`) is what
+[`RescanCandidatesRepository::select_stranded`](../crates/hort-domain/src/ports/rescan_candidates.rs)
+reads to re-pick the artifact once the scanner recovers — see the
+`hort_cron_rescan_stranded_eligible_artifacts` gauge below and
+`docs/architecture/how-to/recover-stranded-artifacts.md`.
 
 Cardinality: 3 result values → 3 series ceiling. `artifact_id` is
 NOT a label (architect "high-cardinality metric labels" rule);
@@ -2731,6 +2752,7 @@ the OSV bulk diff).
 | `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout}` |
 | `hort_advisory_diff_duration_seconds` | histogram | `ecosystem` | seconds | per OSV bulk-archive ecosystem label |
 | `hort_cron_rescan_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation; operator alarms on sustained `> batch_size` (cron loop can't keep up) |
+| `hort_cron_rescan_stranded_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation to the count `RescanCandidatesRepository::select_stranded` returned (issue #6) — `quarantine_status='quarantined'` artifacts whose last scan attempt errored (every backend failed to run) and exhausted retries, with no in-flight scan job. Distinct operational signal from the row above: non-zero here means artifacts are stuck because a scanner backend is down, not that the routine interval-based sweep is falling behind. Operators alarm on sustained `> 0` — a recovered scanner drains this to zero every tick as the sweep re-enqueues each stranded artifact. |
 | `hort_policy_reevaluation_artifacts_total` | counter | `result` | — | `result ∈ {released, re_held, unchanged}` — per-artifact terminal outcome of an async scan-policy re-evaluation pass (ADR 0041 Item 3). One increment per in-scope artifact the pass reached a verdict for. NO high-cardinality labels (`policy_id` / `artifact_id` forbidden). |
 | `hort_policy_reevaluation_population` | gauge | (none) | artifacts | set once at the completion of a `policy-reevaluation` pass to the in-scope population it walked (loosen + tighten); the **completeness** signal — a partial pass (loosen-list truncation, a tighten-page read failure) reports the population it actually walked, so a population/counter gap is observable rather than silent |
 | `hort_policy_reevaluation_enqueue_failed_total` | counter | (none) | — | incremented when a gate-affecting policy mutation committed but its async `policy-reevaluation` pass failed to enqueue (the best-effort enqueue swallowed the error so the mutation still succeeds). The **alertable signal that a pass never ran** — the `_artifacts_total` / `_population` metrics emit only at pass completion, so a swallowed enqueue is otherwise invisible. For a TIGHTEN, the now-non-compliant population stays downloadable until a later gate-affecting mutation re-enqueues or the operator re-applies the policy; alert on a non-zero rate. Bare counter (no labels — the failed `policy_id` / `trigger` is on the warn-level log line). |
@@ -2884,6 +2906,21 @@ one tick can drain. Operators alert on
 "queue can't keep up" signal — increase tick frequency or the batch
 cap.
 
+**`hort_cron_rescan_stranded_eligible_artifacts` semantics** (issue #6)
+— set by the same `CronRescanTickHandler::run` tick, independently, to
+the count returned by `RescanCandidatesRepository::select_stranded(BATCH_SIZE)`.
+Same `BATCH_SIZE` cap and gauge shape as
+`hort_cron_rescan_eligible_artifacts`, but a structurally different
+predicate (`quarantine_status='quarantined'` + last-scan-errored, not
+`released`/interval-elapsed) and a different alert meaning: sustained
+`> 0` means artifacts are stuck behind a scanner outage, not that the
+routine sweep is falling behind. Candidates enqueued from this source
+land in the same `hort_scan_jobs_enqueued_total{trigger_source="cron"}`
+counter as interval-based candidates (both come from the same handler);
+this gauge, plus the per-artifact `info!` line
+(`cron rescan tick: re-enqueued a stranded artifact`), are the way to
+distinguish the two sources.
+
 The earlier-drafted `hort_scheduler_leader_active` gauge does NOT exist.
 Leader election was removed in favour of k8s CronJob
 + the admin-task framework — the `kube_job_status_*` metrics already
@@ -2896,6 +2933,7 @@ Cardinality:
 - `hort_advisory_diff_duration_seconds`: ≤ 11 histograms (one per
   configured ecosystem). Default deployment 8 histograms.
 - `hort_cron_rescan_eligible_artifacts`: 1 gauge (no labels).
+- `hort_cron_rescan_stranded_eligible_artifacts`: 1 gauge (no labels).
 - `hort_policy_reevaluation_artifacts_total`: 3 result values → 3 series.
 - `hort_policy_reevaluation_population`: 1 gauge (no labels).
 - `hort_policy_reevaluation_enqueue_failed_total`: 1 counter (no labels).

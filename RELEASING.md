@@ -1,11 +1,32 @@
 # Releasing Hort
 
-Two release shapes: **pre-releases** (`-beta` / `-rc`) and **final** releases.
-One rule drives everything:
+Two release shapes: **pre-releases** and **final** releases. Pre-releases
+split into an **internal** track (`-alpha.N`, staging + local registry
+only) that staging deploys continuously, and reserved naming room for a
+possible future **public** track (`-beta.N` / `-rc.N`, not in use today —
+see *A future public pre-release track* below). See
+[ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) and
+[the glossary](docs/glossary.md) for the full model. One rule drives
+everything:
 
-> **Pre-releases are cut from and tagged on `develop`. A final release is the
-> `develop → main` promotion and is tagged on `main`. `CHANGELOG.md` is stamped
-> exactly once — at the final promotion.**
+> **`develop` always carries an `X.Y.Z-dev` marker for the version being cooked.
+> A pre-release is a *throwaway-branch tag* cut off `develop` — its version
+> bump never lands on `develop` or `main`. A final release is the
+> `develop → main` promotion, tagged on `main`. `CHANGELOG.md` is stamped
+> exactly once, at that promotion.**
+
+Why throwaway-branch pre-releases: `develop` stays free of per-alpha
+version-bump commits, yet the tagged commit is fully honest — the binary
+(`CARGO_PKG_VERSION`) and the chart (`version`/`appVersion`) both report the
+pre-release version, and the tag-pipeline invariant that `Chart.yaml` equals
+the tag version is satisfied on the tagged commit. The trade-off is that
+alpha tags are off `develop`'s line (the alpha's *code* is exactly
+`develop`'s at the moment it was cut; only the one bump commit sits off it),
+so `git describe` from `develop` won't find them — acceptable, since the
+final always lands linearly on `main`. Unlike a one-off pre-release tag, an
+alpha's `test/vX.Y.Z-alpha.N` branch **is pushed** to origin — staging
+deploys from it continuously — but it is still **never merged back**: no MR
+into `develop` or `main`, ever.
 
 Every push in this doc is preceded by the full local gate in
 `CLAUDE.md` → *Pre-push Quality Checklist* (`fmt`, `clippy`, `test --workspace`,
@@ -20,24 +41,68 @@ A version bump touches exactly these three (one source of truth each):
   crate versions; dependencies are untouched)
 - `deploy/helm/hort-server/Chart.yaml` — `version` **and** `appVersion`
 
-## Pre-release — `vX.Y.Z-beta.N` / `-rc.N` (on `develop`)
+## Open a version cycle (once, right after a final ships)
 
-Version bump only. **Do not touch `CHANGELOG.md`** — `[Unreleased]` keeps
-accumulating and is the running record of what the eventual `X.Y.Z` final ships.
+`develop` carries a `-dev` marker so a build off `develop` reports the honest
+"unreleased next version", not the last release. When a new cycle starts (right
+after `X.Y.(Z-1)` ships, or when opening a new minor), bump `develop` to the next
+`X.Y.Z-dev` with a normal MR:
 
 ```bash
-git checkout -b chore/release-X.Y.Z-beta.N origin/develop
-# bump Cargo.toml + Chart.yaml (version + appVersion)
+git checkout -b chore/open-X.Y.Z-dev origin/develop
+# bump Cargo.toml + Chart.yaml (version + appVersion) → X.Y.Z-dev
 cargo check --workspace                     # rewrites Cargo.lock member versions
 # … run the full local gate …
-git commit -am "chore(release): X.Y.Z-beta.N"
-git push -u origin chore/release-X.Y.Z-beta.N
-# open an MR into develop; auto-merge on green is fine
-# after it merges, tag the DEVELOP MERGE COMMIT (lightweight, matching prior betas):
-git fetch origin
-git tag vX.Y.Z-beta.N <develop-merge-commit-sha>
-git push origin vX.Y.Z-beta.N
+git commit -am "chore: open X.Y.Z-dev cycle"
+git push -u origin chore/open-X.Y.Z-dev
+# open an MR into develop (squash); auto-merge on green is fine
 ```
+
+## Alpha pre-release — `vX.Y.Z-alpha.N` (pushed, throwaway `test/*` branch)
+
+**Internal-only**: staging + the local hort registry, never the public
+registry (see [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md)
+D4). A single version-bump commit cut on a **`test/vX.Y.Z-alpha.N`** branch
+off `develop`, tagged, and **not merged back** — no MR into `develop` or
+`main`, ever. Unlike a one-off pre-release tag, this branch itself (not just
+the tag) **is pushed**, so staging/CI can deploy it continuously. **Do not
+touch `CHANGELOG.md`** — `[Unreleased]` keeps accumulating and is the
+running record of what the eventual `X.Y.Z` final ships.
+
+```bash
+git fetch origin
+git checkout -b test/vX.Y.Z-alpha.N origin/develop
+# bump Cargo.toml + Chart.yaml (version + appVersion) X.Y.Z-dev → X.Y.Z-alpha.N
+cargo check --workspace                     # rewrites Cargo.lock member versions
+# … run the full local gate …
+git commit -am "chore(release): X.Y.Z-alpha.N"
+git tag vX.Y.Z-alpha.N                       # lightweight tag on the bump commit
+git push origin test/vX.Y.Z-alpha.N          # push the branch — staging deploys from it
+git push origin vX.Y.Z-alpha.N               # push the tag — triggers the internal-publish pipeline
+git checkout develop                         # do NOT merge or delete the test/* branch — it stays live for staging
+```
+
+The tag pipeline (GitLab `.gitlab-ci.yml` `build-images:hort-server` /
+`build-images:hort-worker` / `helm:lint-and-publish`, tag-regex-gated) builds
+and publishes `:X.Y.Z-alpha.N` **to the internal registry only**
+(`${REGISTRY}` / registry.hort.rs). The GitHub `docker-publish.yml` public
+ghcr publish explicitly **excludes** `-alpha.` tags — an alpha never reaches
+the public registry (see *Docker tags* below). The `§3.4` chart-version
+invariant (`Chart.yaml` `version` + `appVersion` == the tag) holds because
+the bump is on the tagged commit.
+
+### A future public pre-release track (`beta` / `rc`) — reserved, not in use
+
+The `alpha` rename intentionally leaves `beta`/`rc` unused so a future
+**public** pre-release track can adopt them without a naming collision
+(semver orders `alpha < beta < rc`). That track is not decided or wired up
+today: `docker-publish.yml`'s generic `v*` tag trigger already publishes a
+`-beta.N`/`-rc.N` *versioned* tag publicly if one were pushed (it only
+excludes `:latest` for any pre-release, not the versioned tag itself), and
+neither the GitLab regex nor the GitHub exclusion below single those names
+out — so the naming room exists structurally, but there is no
+`test/*`-branch-style mechanism (or maintainer decision) for a public
+pre-release yet. If/when one is designed, its mechanics belong here.
 
 ## Final release — `vX.Y.Z` (promote `develop → main`)
 
@@ -46,7 +111,7 @@ final on `main`.
 
 ```bash
 git checkout -b chore/release-X.Y.Z origin/develop
-# 1. bump Cargo.toml + Chart.yaml to FINAL X.Y.Z (drop -beta/-rc); cargo check --workspace
+# 1. bump Cargo.toml + Chart.yaml → FINAL X.Y.Z (drop the -dev suffix); cargo check --workspace
 # 2. stamp CHANGELOG.md:
 #      rename `## [Unreleased]`  →  `## [X.Y.Z] - <YYYY-MM-DD>`
 #      add a fresh empty `## [Unreleased]` above it
@@ -54,21 +119,30 @@ git checkout -b chore/release-X.Y.Z origin/develop
 git commit -am "chore(release): X.Y.Z"
 git push -u origin chore/release-X.Y.Z
 # open the PROMOTION MR targeting `main`; put `Closes #… #…` in the body
-#   (issues auto-close only on merges to the default branch, main)
+#   (issues auto-close only on merges to the default branch, main); preserve
+#   the merge commit (do NOT squash the promotion MR)
 # after it merges, tag the MAIN MERGE COMMIT:
 git fetch origin
 git tag vX.Y.Z <main-merge-commit-sha>
 git push origin vX.Y.Z            # triggers release.yml + docker-publish (:latest for a stable tag)
-# back-merge so develop carries the stamp and the next cycle starts clean:
-#   open an MR main → develop (fast-forward where possible)
+# back-merge so develop carries the changelog stamp:
+#   open an MR main → develop
+# then OPEN THE NEXT CYCLE: bump develop to the next X.Y.(Z+1)-dev
+#   (see "Open a version cycle" above)
 ```
 
 ## Docker tags (`docker-publish.yml`, on `v*` tags)
 
-- `:latest` is set **only** for a stable tag (no `-beta`/`-rc`) — so only a
-  final on `main` publishes `:latest`.
-- `:X.Y.Z[-beta.N]` strips the leading `v`; `:X.Y` series and `:sha-<commit>`
-  are set per build.
+- `:latest` is set **only** for a stable tag (no pre-release suffix) — so
+  only a final on `main` publishes `:latest`.
+- `:X.Y.Z[-alpha.N]` strips the leading `v`; `:X.Y` series and
+  `:sha-<commit>` are set per build — **except** an `-alpha.N` tag is
+  excluded from this whole public ghcr publish (job-level guard on
+  `-alpha.` in `github.ref`): alpha images/chart go to the internal
+  registry only, via the GitLab pipeline (`.gitlab-ci.yml`
+  `build-images:*` / `helm:lint-and-publish`), never ghcr.
+- A future public `-beta.N`/`-rc.N` tag is **not** excluded — see *A future
+  public pre-release track* above.
 
 ## Maintenance releases
 

@@ -88,6 +88,14 @@ members = [
     # hort-adapters-* deps). This member entry makes the crate visible to
     # the workspace build and `cargo tree` dep-isolation checks.
     "crates/hort-cli",
+    # License identifier + license texts + generated third-party
+    # attribution, embedded via `include_str!` of repo-root-committed
+    # files (see `about.toml` / `scripts/regenerate-attribution.sh`).
+    # Std-only leaf, zero `hort-*` deps — every one of the three shipped
+    # binaries depends on it for the `license`/`attribution` subcommands,
+    # so it must not carry any dependency that would erode `hort-cli`'s
+    # isolation.
+    "crates/hort-attribution",
 ]
 # tools/* hosts standalone, throwaway / one-off binaries (e.g.
 # `measurement-tools`). They are intentionally NOT workspace members: they
@@ -99,7 +107,7 @@ members = [
 exclude = ["tools/*"]
 
 [workspace.package]
-version = "0.9.8"
+version = "0.9.9"
 edition = "2021"
 # MSRV — kept in sync with `.clippy.toml` (`msrv = "1.94.0"`) and with
 # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` default (asserted
@@ -109,7 +117,7 @@ edition = "2021"
 # clippy itself, since `.clippy.toml`'s `msrv` enforces the floor at lint
 # time.
 rust-version = "1.94"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/project-hort/hort"
 
 [workspace.lints.clippy]

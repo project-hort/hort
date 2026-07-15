@@ -31,6 +31,10 @@ fn main() -> ExitCode {
         None => run_dispatcher(),
         // k8s livenessProbe exec gate.
         Some(Command::Healthcheck) => run_healthcheck(),
+        // license subcommand — synchronous, no config needed.
+        Some(Command::License(args)) => hort_worker::license::run(&args),
+        // attribution subcommand — synchronous, no config needed.
+        Some(Command::Attribution(args)) => hort_worker::attribution::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

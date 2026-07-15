@@ -136,6 +136,41 @@ Operator docs:
   - Hardening:      docs/architecture/how-to/deploy/security-hardening-checklist.md
   - Upgrade:        docs/architecture/how-to/deploy/upgrade-from-prototype.md
 
+{{- if .Values.scheduledTasks.adminTasksEnabled }}
+
+==============================================================================
+Admin-task CronJobs enabled — gitops prerequisite
+==============================================================================
+scheduledTasks.adminTasksEnabled = true. The svc-token-bootstrap Job mints a
+`cronjob-tasks` service-account token for the admin-task CronJobs, but this
+chart does NOT provision the service account or its authority — both are
+operator-declared gitops config. `issue-svc-token --require-authority` now
+makes the bootstrap Job FAIL LOUDLY (instead of the CronJobs 403-ing silently
+later) if the grant below is missing. Apply this to your gitopsConfig if you
+have not already:
+
+  apiVersion: project-hort.de/v1beta1
+  kind: ServiceAccount
+  metadata: { name: cronjob-tasks }
+  spec: {}
+  ---
+  apiVersion: project-hort.de/v1beta1
+  kind: PermissionGrant
+  metadata: { name: cronjob-tasks-admin_task_invoke }
+  spec:
+    subject: { kind: serviceAccount, name: cronjob-tasks }
+    permission: admin_task_invoke        # global (no repository:)
+
+DESTRUCTIVE_TASK_KINDS caveat: `retentionEvaluate`, `retentionPurge`, and
+`eventstoreArchive` additionally require the `task:destructive` claim, which
+the `cronjob-tasks` svc-token can never carry (svc-tokens are claimless).
+They ship `enabled: false` and stay so; run them by hand with a fresh
+IdP-backed admin session (`hort-cli admin task invoke <kind>`).
+
+See: docs/architecture/how-to/deploy/enable-admin-task-cronjobs.md
+==============================================================================
+{{- end }}
+
 {{- /*
   Rotation is enabled by the single toggle
   `scheduledTasks.serviceAccountRotation.enabled` (under the

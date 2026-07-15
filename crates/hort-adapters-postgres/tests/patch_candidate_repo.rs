@@ -16,6 +16,7 @@
 
 #![allow(clippy::expect_used)]
 
+use serial_test::serial;
 use std::env;
 
 use chrono::{DateTime, Duration, Utc};
@@ -150,6 +151,7 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_candidates_default_filter_returns_matching_pair() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -222,6 +224,7 @@ async fn list_candidates_default_filter_returns_matching_pair() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_candidates_repository_filter_excludes_other_repos() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -278,6 +281,7 @@ async fn list_candidates_repository_filter_excludes_other_repos() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_candidates_excludes_oci_format() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -345,6 +349,7 @@ async fn list_candidates_excludes_oci_format() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_candidates_excludes_soft_deleted_quarantined_rows() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -405,6 +410,7 @@ async fn list_candidates_excludes_soft_deleted_quarantined_rows() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_candidates_orders_by_severity_descending() {
     let Some(pool) = admin_pool().await else {
         return;

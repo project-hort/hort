@@ -514,3 +514,7 @@ worker log message for the exact cause.
 - [`wire-secrets.md`](./wire-secrets.md) — orthogonal: the
   general pattern for wiring operator-supplied k8s Secrets into
   hort-server.
+- [`deploy/enable-admin-task-cronjobs.md`](./deploy/enable-admin-task-cronjobs.md)
+  — the adjacent one-shot bootstrap-token path: the `cronjob-tasks`
+  service account the admin-task CronJobs use, minted once by
+  `issue-svc-token` rather than periodically rotated by this reconciler.

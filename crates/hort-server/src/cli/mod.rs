@@ -25,6 +25,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 pub mod admin;
+/// `attribution` subcommand — prints the embedded, `cargo about`-generated
+/// third-party attribution document (text/json). Synchronous, DSN-free,
+/// no Tokio runtime — mirrors `validate-config`'s DB-free shape.
+pub mod attribution;
 // DB-only enqueue subcommand the Helm
 // CronJob runs to schedule the prefetch tick. Runtime DSN; no
 // svc-token. The
@@ -51,6 +55,10 @@ pub mod enqueue_quarantine_release_sweep;
 // rationale (avoid the svc-token-bootstrap chain on a
 // default-shipped, default-disabled CronJob).
 pub mod enqueue_wheel_metadata_backfill;
+/// `license` subcommand — prints the SPDX license identifier (and,
+/// with `--full`, both license texts). Synchronous, DSN-free, no
+/// Tokio runtime — mirrors `validate-config`'s DB-free shape.
+pub mod license;
 pub mod migrate;
 pub mod rbac_refresh;
 pub mod reconcile_groups;
@@ -242,6 +250,14 @@ pub enum Command {
     /// error / strict-promoted warning, 2 missing/invalid env, 3
     /// operational). The only flag is `--strict` (warnings → failure).
     ValidateConfig(validate_config::ValidateConfigArgs),
+    /// Print hort's license identifier (and, with `--full`, the
+    /// complete license texts) to stdout and exit. Synchronous; no
+    /// config, no DSN, no Tokio runtime.
+    License(license::LicenseArgs),
+    /// Print the generated third-party attribution document
+    /// (Markdown or JSON) to stdout and exit. Synchronous; no
+    /// config, no DSN, no Tokio runtime.
+    Attribution(attribution::AttributionArgs),
 }
 
 /// Parse `std::env::args()` and dispatch to the selected subcommand.
@@ -271,6 +287,8 @@ fn dispatch(command: Command) -> ExitCode {
         }
         Command::EnqueueWheelMetadataBackfill(args) => enqueue_wheel_metadata_backfill::run(args),
         Command::ValidateConfig(args) => validate_config::run(&args),
+        Command::License(args) => license::run(&args),
+        Command::Attribution(args) => attribution::run(&args),
     }
 }
 
@@ -383,6 +401,8 @@ mod tests {
         assert!(rendered.contains("enqueue-prefetch-tick"));
         assert!(rendered.contains("enqueue-prefetch-row-retention-sweep"));
         assert!(rendered.contains("validate-config"));
+        assert!(rendered.contains("license"));
+        assert!(rendered.contains("attribution"));
     }
 
     // `validate-config` subcommand parses. Accepts
@@ -392,6 +412,24 @@ mod tests {
     fn validate_config_parses() {
         let cli = Cli::try_parse_from(["hort-server", "validate-config"]).unwrap();
         assert!(matches!(cli.command, Some(Command::ValidateConfig(_))));
+    }
+
+    // `license` subcommand parses. Accepts bare invocation — `--full`
+    // is optional.
+
+    #[test]
+    fn license_parses() {
+        let cli = Cli::try_parse_from(["hort-server", "license"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::License(_))));
+    }
+
+    // `attribution` subcommand parses. Accepts bare invocation —
+    // `--format` defaults to text.
+
+    #[test]
+    fn attribution_parses() {
+        let cli = Cli::try_parse_from(["hort-server", "attribution"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Attribution(_))));
     }
 
     // `seed-import` subcommand parses. Requires

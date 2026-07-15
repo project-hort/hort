@@ -152,6 +152,10 @@ async fn run() -> ExitCode {
         }
         // completions subcommand — synchronous, no config needed.
         Some(Commands::Completions(args)) => hort_cli::completions::run(&args),
+        // license subcommand — synchronous, no config needed.
+        Some(Commands::License(args)) => hort_cli::license::run(&args),
+        // attribution subcommand — synchronous, no config needed.
+        Some(Commands::Attribution(args)) => hort_cli::attribution::run(&args),
     }
 }
 

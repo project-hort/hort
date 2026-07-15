@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::Artifact;
+use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::scan_policy::ScanPolicyProjection;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::DomainError;
@@ -519,42 +519,98 @@ impl ScanOrchestrationUseCase {
             ScanRunOutcome::Failed(err) => {
                 if job.attempts >= self.config.max_attempts {
                     // A dead scanner is a real operational error operators
-                    // should alert on; keep the `error!`. The separate
-                    // `info!` security-transition line is emitted by
-                    // `QuarantineUseCase::record_scan_indeterminate`.
+                    // should alert on; keep the `error!`.
                     tracing::error!(
                         artifact_id = %job.artifact_id,
                         attempts = job.attempts,
                         last_error = %err,
                         "scan job exhausted retries",
                     );
-                    // FAIL-CLOSED (ADR 0007): transition the
-                    // artifact to ScanIndeterminate BEFORE mark_failed so
-                    // a crash between them leaves the job retryable
-                    // rather than the artifact silently un-failed. The
-                    // use case loads the artifact, calls
-                    // `fail_scan_indeterminate`, and commits the event +
-                    // status transition atomically via the EXISTING
-                    // `commit_transition_with_score`. An already-terminal
-                    // artifact is a recoverable skip (returns Ok); a
-                    // genuine load/commit error propagates and we do NOT
-                    // mark the job failed (fail-closed: keep the job
-                    // retryable so the transition is retried).
-                    let scanner_label = self.scanner_label_for_failed(job).await;
-                    self.quarantine
-                        .record_scan_indeterminate(
-                            job.artifact_id,
-                            scanner_label,
-                            err.clone(),
-                            job.attempts,
-                        )
-                        .await?;
-                    self.jobs.mark_failed(job.id, &err).await?;
-                    emit_scan_jobs(ScanJobsResult::Failed);
-                    // Artifact-terminal: indeterminate.
-                    emit_scan_terminal(ScanTerminalResult::Indeterminate);
+
+                    // This `Failed` outcome is a scanner-EXECUTION failure
+                    // (every configured backend errored — the scan could
+                    // not run at all), not a genuinely-ambiguous scan
+                    // RESULT. Issue #6 / ADR 0007 refinement: when the
+                    // artifact is already `Quarantined` (mid-observation-
+                    // window), a scanner outage must not escalate it to
+                    // the stricter terminal `scan_indeterminate` — it
+                    // fails closed by staying exactly where it already is
+                    // (downloads still blocked; `quarantine_status`
+                    // untouched, no event, no state UPDATE at all).
+                    // `mark_failed` alone (`jobs.status='failed'`,
+                    // `last_error`) IS the persisted "last scan errored"
+                    // fact `RescanCandidatesRepository::select_stranded`
+                    // reads to re-pick the artifact once the scanner
+                    // recovers (`CronRescanTickHandler`).
+                    //
+                    // Any OTHER current status still routes through
+                    // `record_scan_indeterminate`, exactly as before this
+                    // change: a `None`-status artifact (permissive
+                    // default — no quarantine window to fall back into)
+                    // has no "stay where you are" option, so ADR 0007's
+                    // fail-closed backstop (never-successfully-scanned →
+                    // blocked) still applies; an already-terminal status
+                    // (`ScanIndeterminate` / `Rejected` / `Released`)
+                    // hits `record_scan_indeterminate`'s existing
+                    // idempotent-skip. Best-effort load — on a genuine
+                    // load failure `current_status` is `None` here, which
+                    // falls through to `record_scan_indeterminate`
+                    // (unchanged behavior: it re-loads and propagates the
+                    // same error).
+                    let current_status = self
+                        .artifacts
+                        .find_by_id(job.artifact_id)
+                        .await
+                        .ok()
+                        .map(|a| a.quarantine_status);
+
+                    if current_status == Some(QuarantineStatus::Quarantined) {
+                        tracing::info!(
+                            artifact_id = %job.artifact_id,
+                            attempts = job.attempts,
+                            "scan retries exhausted while quarantined — staying quarantined \
+                             (not scan_indeterminate); will be re-picked by the rescan sweep \
+                             once the scanner recovers",
+                        );
+                        self.jobs.mark_failed(job.id, &err).await?;
+                        emit_scan_jobs(ScanJobsResult::Failed);
+                    } else {
+                        // FAIL-CLOSED (ADR 0007): transition the
+                        // artifact to ScanIndeterminate BEFORE mark_failed
+                        // so a crash between them leaves the job
+                        // retryable rather than the artifact silently
+                        // un-failed. The use case loads the artifact,
+                        // calls `fail_scan_indeterminate`, and commits the
+                        // event + status transition atomically via the
+                        // EXISTING `commit_transition_with_score`. An
+                        // already-terminal artifact is a recoverable skip
+                        // (returns Ok); a genuine load/commit error
+                        // propagates and we do NOT mark the job failed
+                        // (fail-closed: keep the job retryable so the
+                        // transition is retried).
+                        let scanner_label = self.scanner_label_for_failed(job).await;
+                        self.quarantine
+                            .record_scan_indeterminate(
+                                job.artifact_id,
+                                scanner_label,
+                                err.clone(),
+                                job.attempts,
+                            )
+                            .await?;
+                        self.jobs.mark_failed(job.id, &err).await?;
+                        emit_scan_jobs(ScanJobsResult::Failed);
+                        // Artifact-terminal: indeterminate.
+                        emit_scan_terminal(ScanTerminalResult::Indeterminate);
+                    }
                 } else {
                     let backoff = compute_backoff(job.attempts);
+                    tracing::info!(
+                        artifact_id = %job.artifact_id,
+                        attempts = job.attempts,
+                        max_attempts = self.config.max_attempts,
+                        backoff_secs = backoff.as_secs(),
+                        "scan failure classified as transient (scanner-execution) — rescheduling",
+                    );
                     self.jobs.reschedule(job.id, backoff, &err).await?;
                     emit_scan_jobs(ScanJobsResult::Retried);
                 }

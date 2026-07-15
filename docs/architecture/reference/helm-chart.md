@@ -95,7 +95,7 @@ the svc-token bootstrap Job + RBAC) stay off until
 | ConfigMap — worker (`worker-configmap.yaml`) | `worker.enabled` | non-secret worker env. |
 | ServiceAccount — worker (`worker-serviceaccount.yaml`) | `worker.enabled` **and** `worker.serviceAccount.create` | identity for worker pods. |
 | Role+RoleBinding ×N — rotation (`svc-rotation-rbac.yaml`) | `worker.enabled` **and** `scheduledTasks.serviceAccountRotation.enabled` (the single rotation toggle) **and** each entry in `worker.rotation.targetNamespaces` | one pair **per namespace**; lets the worker SA write `dockerconfigjson` Secrets. |
-| Job — svc-token bootstrap (`svc-token-bootstrap-job.yaml`) | `scheduledTasks.adminTasksEnabled` (post-install/post-upgrade hook) | mints the `hort_svc_*` token, writes the `<fullname>-svc-token` Secret. |
+| Job — svc-token bootstrap (`svc-token-bootstrap-job.yaml`) | `scheduledTasks.adminTasksEnabled` (post-install/post-upgrade hook) | mints the `hort_svc_*` token, writes the `<fullname>-svc-token` Secret. Requires an operator-declared gitops `ServiceAccount` + `PermissionGrant` the chart does not provision — see [enable-admin-task-cronjobs.md](../how-to/deploy/enable-admin-task-cronjobs.md). |
 | SA+Role+RoleBinding — bootstrap (`svc-bootstrap-rbac.yaml`) | `scheduledTasks.adminTasksEnabled` | lets the bootstrap Job create/patch that Secret. |
 | CronJob — staging-sweep (`cronjob-staging-sweep.yaml`) | `scheduledTasks.adminTasksEnabled` **and** `scheduledTasks.stagingSweep.enabled` | `hort-cli admin task invoke staging-sweep`. |
 | CronJob — cron-rescan-tick (`cronjob-cron-rescan-tick.yaml`) | `scheduledTasks.adminTasksEnabled` **and** `scheduledTasks.cronRescanTick.enabled` | `hort-cli admin task invoke cron-rescan-tick`. |
@@ -302,8 +302,13 @@ service-account rotation.
   what keeps worker identities distinct).
 - **Admin-task prerequisites:** `scheduledTasks.adminTasksEnabled=true`
   also needs `postgres.admin.existingSecret` (the bootstrap Job mints the
-  SA token under the admin DSN) and an in-cluster network path from
-  CronJob pods to the hort-server Service.
+  SA token under the admin DSN), an in-cluster network path from
+  CronJob pods to the hort-server Service, **and** an operator-declared
+  gitops `cronjob-tasks` `ServiceAccount` plus a global `admin_task_invoke`
+  `PermissionGrant` — the chart never provisions either, and
+  `issue-svc-token --require-authority` fails the bootstrap Job loudly if
+  the grant is missing. See
+  [enable-admin-task-cronjobs.md](../how-to/deploy/enable-admin-task-cronjobs.md).
 - **Rotation single toggle:**
   `scheduledTasks.serviceAccountRotation.enabled` is the **single**
   source-of-truth switch — it drives both the CronJob and the worker-side

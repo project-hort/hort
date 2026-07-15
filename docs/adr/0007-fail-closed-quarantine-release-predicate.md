@@ -22,11 +22,20 @@ The background sweep transitions an artifact to `released` only when `quarantine
 4. `CuratorWaiver` — curator waive (`Quarantined`-state only).
 5. `PolicyReEvaluation` — post-exclusion policy re-evaluation.
 
-`ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` immediately sets `rejected` (time never reverses this). A scan job that exhausts retries goes to the terminal `scan_indeterminate` status — non-downloadable, non-promotable, **not releasable by a timer alone** (only admin override or post-exclusion re-evaluation).
+`ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` immediately sets `rejected` (time never reverses this). A scan job that exhausts retries fails closed — see the exhaustion split below.
+
+### Scan-execution failure vs ambiguous result on retry-exhaustion (issue #6, amended 2026-07-14)
+
+A `ScanRunOutcome::Failed` that exhausts `HORT_SCANNER_MAX_ATTEMPTS` is a scanner-**execution** failure (every configured backend errored — the scan could not run), which is operationally distinct from a genuinely ambiguous scan **result**. On exhaustion, `ScanOrchestrationUseCase::record_outcome` splits by the artifact's **current** `quarantine_status`:
+
+- **`quarantined`** (mid-observation-window) → the artifact **stays `quarantined`**. No `ScanIndeterminate` event and **no `quarantine_status` UPDATE at all** — the failed `jobs` row (`status='failed'`, `last_error`) is the persisted "last scan errored" signal. It is re-picked by `RescanCandidatesRepository::select_stranded` + `CronRescanTickHandler` and re-scanned once the scanner recovers, self-healing without operator intervention.
+- **any other status** (`None` — the permissive default, no window to fall back into; or an already-terminal status) → terminal **`scan_indeterminate`**, exactly as before this amendment. A best-effort artifact-load failure resolves to `None` here and therefore also fails to `scan_indeterminate` (safe direction).
+
+**Why staying `quarantined` is still fail-closed.** The two impossible failure modes in *Context* are unchanged. A `quarantined`, never-successfully-scanned artifact is **not** releasable by the timer: release still requires one of the five enumerated authorities, and the only one the sweep can synthesize is `ScanSucceeded` — derived from a `ScanCompleted` **event on the artifact stream**, which a stranded artifact does not have. `resolve_release_authority` returns `None`, the sweep skips it (`skipped_no_authority`), and `Artifact::release` re-denies deny-by-default. Window expiry remains candidacy-only. This amendment adds **no new release authority** and changes **no** release path; it only avoids escalating a recoverable outage to the stricter terminal state, so the artifact can heal via the *existing* `ScanSucceeded` path instead of requiring an admin override.
 
 ## Consequences
 
-- A missing or failed scan **fails closed**: the artifact does not leak out when its timer expires; it lands in `scan_indeterminate`.
+- A missing or failed scan **fails closed**: the artifact does not leak out when its timer expires. A never-scanned (`None`-status) or already-terminal artifact lands in `scan_indeterminate`; an artifact still `quarantined` when its scan exhausts retries stays `quarantined` and is auto-rescanned once the scanner recovers (issue #6, above) — in both cases the timer cannot release it.
 - Adding any new release path means adding an authority to the enumerated predicate, with its own guard — there is no "fall through to released".
 - The `scan_backends: []` waiver is an explicit, audited authority, not an accidental gap.
 - Re-evaluation after an exclusion does not skip the remaining observation window: it removes the scan block, not the time hold.
@@ -42,3 +51,4 @@ The background sweep transitions an artifact to `released` only when `quarantine
 - `crates/hort-domain/src/entities/artifact.rs` (`Artifact::release`) and `crates/hort-domain/src/ports/quarantine_release.rs` — the release predicate and `ScanIndeterminate` status.
 - The architect skill → Quarantine Invariants; anti-pattern *scanner clean → immediate release*.
 - `docs/architecture/how-to/curator-workflow.md` — the curator-waiver authority in practice.
+- `docs/architecture/how-to/recover-stranded-artifacts.md`; `ScanOrchestrationUseCase::record_outcome` and `RescanCandidatesRepository::select_stranded` — the issue #6 exhaustion-split / stranded-scan recovery amended in above (commit `55a93e40`; ratified by decision issue #32, 2026-07-14).

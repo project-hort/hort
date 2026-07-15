@@ -84,6 +84,13 @@ RUN curl -fsSL -o /usr/local/bin/cosign \
       "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64" \
     && echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c - \
     && chmod +x /usr/local/bin/cosign
+# hort's own reference keyed-signing script (.gitlab/ci/cosign-sign.sh). The
+# provenance push-then-sign scenario reads it from this path to pin the exact
+# `cosign sign` flag set hort's CI signs with against the flags hort's own
+# provenance gate accepts (issue #18). Build context is the REPO ROOT (run.sh),
+# so the .gitlab/ path resolves.
+COPY .gitlab/ci/cosign-sign.sh /usr/local/bin/hort-cosign-sign.sh
+RUN chmod +x /usr/local/bin/hort-cosign-sign.sh
 # The hort-cli admin client (built in stage 1) — used by the quarantine +
 # scanning scenarios that drive admin/release/rescan flows over HTTP.
 COPY --from=cli-builder /usr/local/bin/hort-cli /usr/local/bin/hort-cli

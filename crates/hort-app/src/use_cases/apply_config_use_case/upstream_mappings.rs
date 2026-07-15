@@ -19,21 +19,13 @@ impl ApplyConfigUseCase {
         report: &mut ApplyReport,
         token: &GitOpsApplyToken,
     ) -> AppResult<()> {
-        // Operator-enumerated upstream-host
-        // allowlist enforcement. Run BEFORE any save_managed call so a
-        // miss aborts the apply with no partial writes. This is
-        // apply-time-only — only rows in the apply diff
-        // (create + update) are checked. An unchanged row that was
-        // saved under a previous, looser allowlist stays as-is until
-        // its YAML is touched (documented limitation; see
-        // `docs/operator/upstream-trust-model.md`). `delete` rows are
-        // deliberately exempt — removing a mapping that was previously
-        // permitted should always succeed regardless of current
-        // allowlist state, otherwise tightening the allowlist would
-        // also block GC of mappings the operator wants gone.
-        for env in plan.create.iter().chain(plan.update.iter()) {
-            self.check_upstream_host_allowed(&env.spec.upstream_url, &env.metadata.name)?;
-        }
+        // Upstream-host allowlist enforcement (write-time, defense-in-depth).
+        // The PRIMARY gate is pre-write in `run_pre_write_validation`, so a
+        // boot-time miss parks not-ready (`GitopsBootError::PreflightValidate`)
+        // instead of writing Stage-1/2 rows and then crashlooping. This
+        // re-checks the same diff-scoped set immediately before this stage's
+        // `save_managed`. See `check_upstream_allowlist_for_plan`.
+        self.check_upstream_allowlist_for_plan(plan)?;
 
         // Collect per-stream audit events.
         // Every UpstreamMapping mutation is repo-scoped (the row
@@ -299,6 +291,29 @@ impl ApplyConfigUseCase {
         Err(AppError::Domain(DomainError::Validation(format!(
             "upstream host '{host}' not in HORT_UPSTREAM_ALLOWLIST_HOSTS"
         ))))
+    }
+
+    /// Enforce the upstream-host allowlist over the diff's create+update
+    /// mappings — the apply-time scope: `delete` and unchanged rows are
+    /// exempt (tightening the allowlist neither blocks GC of a removed
+    /// mapping nor re-rejects an untouched one; documented in
+    /// `docs/operator/upstream-trust-model.md`). Returns
+    /// `DomainError::Validation` on the first miss.
+    ///
+    /// Called from two sites over the SAME set: **pre-write** in
+    /// `ApplyConfigUseCase::run_pre_write_validation` (the boot park gate —
+    /// a miss there surfaces as `GitopsBootError::PreflightValidate` and
+    /// parks the pod not-ready rather than crashlooping after an earlier
+    /// stage wrote), and again in [`Self::apply_upstream_mappings`] as
+    /// write-time defense-in-depth.
+    pub(super) fn check_upstream_allowlist_for_plan(
+        &self,
+        plan: &KindPlan<UpstreamMappingSpec, Uuid>,
+    ) -> AppResult<()> {
+        for env in plan.create.iter().chain(plan.update.iter()) {
+            self.check_upstream_host_allowed(&env.spec.upstream_url, &env.metadata.name)?;
+        }
+        Ok(())
     }
 }
 

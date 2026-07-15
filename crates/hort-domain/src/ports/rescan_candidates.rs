@@ -14,6 +14,20 @@
 //! per-artifact `artifacts.last_scan_at` denorm column,
 //! NOT `repo_security_scores.last_scan_at` (which is per-repo). See
 //! `docs/architecture/explanation/scanning-pipeline.md`.
+//!
+//! [`RescanCandidatesRepository::select_stranded`] is a companion
+//! eligibility query (issue #6 / ADR 0007) for a *different* predicate:
+//! `quarantine_status='quarantined'` artifacts whose scan could not even
+//! **run** (every configured scanner backend failed) and exhausted
+//! `HORT_SCANNER_MAX_ATTEMPTS` retries. That failure mode is
+//! transient/infrastructure, not a genuinely-ambiguous scan result, so it
+//! does NOT transition the artifact to the terminal `scan_indeterminate`
+//! status (ADR 0007 unchanged) — the artifact simply stays `quarantined`
+//! with a persisted "last scan errored" fact (`jobs.status='failed'` on
+//! its most recent `kind='scan'` row). `select_stranded` finds exactly
+//! those artifacts (with no in-flight scan job) so the sweep can give the
+//! scan another chance once the scanner recovers. See
+//! `docs/architecture/how-to/recover-stranded-artifacts.md`.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -49,6 +63,14 @@ pub struct RescanCandidate {
     /// The resolved policy's `rescan_interval_hours`. Carried for
     /// per-candidate tracing only; the eligibility query already filtered
     /// `> 0` and the past-interval predicate.
+    ///
+    /// **Sentinel `0` for [`RescanCandidatesRepository::select_stranded`]
+    /// candidates**: the stranded-recovery predicate has no interval
+    /// concept (it re-picks as soon as the last scan attempt errored, not
+    /// after a policy-derived wait), so this field is not meaningful for
+    /// those rows. Kept on the shared struct rather than forking a
+    /// second candidate type — `enqueue_scan` (the only consumer) never
+    /// reads this field either way.
     pub rescan_interval_hours: i32,
 }
 
@@ -71,6 +93,24 @@ pub trait RescanCandidatesRepository: Send + Sync {
         &'a self,
         batch_size: u32,
         now: DateTime<Utc>,
+    ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>>;
+
+    /// Return up to `batch_size` **stranded** artifacts: `quarantine_status
+    /// = 'quarantined'` with a most-recent `kind='scan'` job in
+    /// `status='failed'` (a scanner-execution failure that exhausted
+    /// retries — see the module doc) and no in-flight `kind='scan'` job.
+    ///
+    /// Distinct query from [`Self::select_eligible`] — different source
+    /// status (`quarantined`, not `released`/`NULL`), no interval/`now`
+    /// gating (a stranded artifact is eligible immediately, not after a
+    /// policy-derived wait), and a different "was it scanned" signal (the
+    /// most recent `jobs` row's status, not `artifacts.last_scan_at`).
+    /// Kept as a companion method rather than folded into
+    /// `select_eligible`'s SQL so that well-tested query's shape stays
+    /// untouched.
+    fn select_stranded<'a>(
+        &'a self,
+        batch_size: u32,
     ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>>;
 }
 
@@ -107,10 +147,14 @@ mod tests {
         assert_eq!(c, cloned);
     }
 
-    /// A handler-style smoke test that drives the trait through a
-    /// `Box<dyn>` to prove dispatch + the `BoxFuture` signature compile.
+    /// A handler-style smoke test that drives both trait methods through
+    /// a single `Box<dyn>` to prove dispatch + both `BoxFuture`
+    /// signatures compile. One `Stub` exercising both methods (rather
+    /// than a separate `Stub` per method, each only calling the one it's
+    /// testing) so neither implementation body is dead weight from the
+    /// other test's perspective.
     #[tokio::test]
-    async fn select_eligible_dispatches_through_trait_object() {
+    async fn select_eligible_and_select_stranded_dispatch_through_trait_object() {
         struct Stub;
         impl RescanCandidatesRepository for Stub {
             fn select_eligible<'a>(
@@ -120,10 +164,32 @@ mod tests {
             ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
                 Box::pin(async { Ok(Vec::new()) })
             }
+            fn select_stranded<'a>(
+                &'a self,
+                _batch_size: u32,
+            ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
+                Box::pin(async {
+                    Ok(vec![RescanCandidate {
+                        artifact_id: Uuid::nil(),
+                        repository_id: Uuid::nil(),
+                        content_hash:
+                            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                                .parse()
+                                .expect("valid sha256 hex"),
+                        format: "npm".into(),
+                        rescan_interval_hours: 0,
+                    }])
+                })
+            }
         }
 
         let port: Box<dyn RescanCandidatesRepository> = Box::new(Stub);
-        let out = port.select_eligible(1000, Utc::now()).await.expect("Ok");
-        assert!(out.is_empty());
+
+        let eligible = port.select_eligible(1000, Utc::now()).await.expect("Ok");
+        assert!(eligible.is_empty());
+
+        let stranded = port.select_stranded(1000).await.expect("Ok");
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].rescan_interval_hours, 0);
     }
 }
