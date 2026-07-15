@@ -1282,8 +1282,15 @@ helm:sign-chart:
       # (anon-read, authenticated-write).
       cosign login "${REGISTRY}" -u "${REGISTRY_USER}" -p "${REGISTRY_PASSWORD}"
       # LEGACY .sig-tag signature (Flux-discoverable). No Rekor (private infra).
+      # Pin the output format explicitly: cosign v3 WITHOUT these flags defaults
+      # to an OCI-referrer + v0.3-bundle signature (validated on the beta.5 tag
+      # pipeline: referrer created, NO .sig tag) which Flux source-controller
+      # (v1.8.0, tag-based discovery) cannot see. new-bundle-format=false +
+      # referrers-mode=legacy = classic simplesigning payload under the
+      # sha256-<digest>.sig tag -- the one format Flux verifies.
       cosign sign --yes --key hashivault://first-party-cosign \
         --use-signing-config=false --tlog-upload=false \
+        --new-bundle-format=false --registry-referrers-mode=legacy \
         "${CHART_REF}"
       echo "signed ${CHART_REF} (first-party key, legacy .sig tag)"
 
