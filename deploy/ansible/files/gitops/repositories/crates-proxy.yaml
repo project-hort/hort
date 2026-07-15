@@ -22,3 +22,14 @@ spec:
     upstreamUrl: "https://index.crates.io"
   isPublic: false
   replicationPriority: local_only
+  # Prefetch: warm the newest upstream versions off the build's critical path.
+  # on_dist_tag_move fires when a client fetches this proxy's sparse index (a
+  # cargo build, or Renovate's crate-datasource lookup via registryUrls) and
+  # upstream has advanced past the held set, starting the quarantine clock at
+  # lookup time instead of at the build's first fetch. depth 3 = newest 3
+  # versions per package. maxAgeDays is omitted: the apply-time linter rejects
+  # any value until the planner grows a per-version published-at surface (ADR 0015).
+  prefetchPolicy:
+    enabled: true
+    triggers: [on_dist_tag_move]
+    depth: 3
