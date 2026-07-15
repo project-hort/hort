@@ -431,7 +431,7 @@ the result instead.
 | allocator-api2 | 0.2.21 | MIT | https://github.com/zakarumych/allocator-api2 |
 | winnow | 1.0.2 | MIT | https://github.com/winnow-rs/winnow |
 | tinyvec | 1.11.0 | MIT | https://github.com/Lokathor/tinyvec |
-| spin | 0.9.8 | MIT | https://github.com/mvdnes/spin-rs.git |
+| spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
 | zip | 2.4.2 | MIT | https://github.com/zip-rs/zip2.git |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
 | endian-type | 0.1.2 | MIT | https://github.com/Lolirofle/endian-type.git |
@@ -15897,7 +15897,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
-### spin 0.9.8 — MIT
+### spin 0.9.9 — MIT
 
 Repository: https://github.com/mvdnes/spin-rs.git
 

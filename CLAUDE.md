@@ -336,6 +336,19 @@ Additionally, before pushing:
 - Check for code duplication: if structurally similar blocks appear 3+ times in new code, refactor into a shared helper
 - Check test coverage: `hort-domain` and `hort-app` require 100% coverage; all other crates require 85%+ (see Test Coverage Tiers above)
 - Check migration numbering: verify the migration number is not already taken (`ls migrations/ | tail -5`)
+- **Regenerate third-party attribution on ANY dependency-graph change** — if the
+  change adds/removes/re-versions a **non-workspace** crate in `Cargo.lock` (a dep
+  bump, `cargo update -p`/`-w`, adding/removing a dep or a crate-pulling feature),
+  run `scripts/regenerate-attribution.sh` and commit the updated
+  `THIRD-PARTY-LICENSES.{md,json}` **in the same change**. The
+  `security:attribution-sync` gate is **release-scoped** (tags + `main`/`release/*`
+  + MRs targeting them — issue #30), so it will **not** flag stale attribution on a
+  feature/`develop` pipeline — it is the fail-closed release backstop, not the
+  per-MR check. A dep-changing commit without the regen leaves `develop` stale and
+  fails the next release-relevant pipeline (this is exactly how the `spin 0.9.8 →
+  0.9.9` bump broke the `v0.9.9-beta.4` cut). A release **workspace-version-only**
+  bump (`X.Y.Z-dev → X.Y.Z-<pre>`) is exempt (no third-party change) but still runs
+  `check-attribution` as part of the cut. (see ADR 0049 / ADR 0047)
 
 ### Maintenance Branches
 
