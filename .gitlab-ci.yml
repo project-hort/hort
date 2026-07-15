@@ -462,6 +462,12 @@ test:lint:
 # Parity with test-backend-unit, scoped to the rewrite.
 test:unit:
   stage: test
+  # Pinned to the higher-powered podman runner (issue #39): a compile-only
+  # `--lib` job with no live service, so no runner-side per-build network is
+  # needed. Reachability (internal image mirror, CA, Vault/S3 sccache) is
+  # confirmed on that runner. `test:integration` stays on the default runner
+  # until `FF_NETWORK_PER_BUILD` is set there (its Postgres `services:` alias).
+  tags: [podman]
   extends: [.sccache]
   image: ${RUST_SCCACHE_IMAGE}
   <<: [*rust-cache, *rules-code-changed]
@@ -491,6 +497,9 @@ test:unit:
 # Postgres service or migrations are needed to collect --lib coverage.
 test:coverage:
   stage: test
+  # Pinned to the podman runner (issue #39): `--lib` coverage with no live
+  # Postgres service (see the DB-backed note below), so it pins like test:unit.
+  tags: [podman]
   image: ${RUST_IMAGE}
   <<: [*rust-cache, *rules-code-changed]
   needs:
