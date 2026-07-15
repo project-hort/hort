@@ -549,6 +549,11 @@ test:coverage:
 # database. Main / release / tags only, matching the GitHub CI gating.
 test:integration:
   stage: test
+  # Pinned to the podman runner (issue #39). Its Postgres `services:` alias
+  # resolves there now that `FF_NETWORK_PER_BUILD=true` is set on the runner
+  # (gitlab-runner-podman!29): each build gets its own bridge network so the
+  # docker-executor-on-rootless-podman resolves `postgres` via netavark DNS.
+  tags: [podman]
   extends: [.sccache]
   image: ${RUST_SCCACHE_IMAGE}
   <<: [*rust-cache, *rules-main-only]
