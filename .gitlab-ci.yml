@@ -1239,7 +1239,12 @@ helm:sign-chart:
   needs:
     - job: helm:lint-and-publish
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    # `alpha` included for parity with build-images:* / helm:lint-and-publish
+    # (the #25 alpha-routing widening). This job landed after that change with
+    # only `(rc|beta)`, so an internal `-alpha.N` tag would skip signing
+    # SILENTLY (no match, no failure) and publish an unsigned chart. Keep the
+    # tag-suffix set identical across every job that acts on a release tag.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release\//
   id_tokens:
