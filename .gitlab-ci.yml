@@ -1212,6 +1212,84 @@ helm:lint-and-publish:
       helm push hort-server-*.tgz "oci://${REGISTRY}/${IMAGE_PREFIX}/charts"
 
 # ===========================================================================
+# Stage 5b: helm chart signature — first-party keyed cosign (Vault Transit)
+# ===========================================================================
+#
+# Dogfood: hort signs its OWN Helm chart with the first-party Transit key
+# (hashivault://first-party-cosign) — the same key the platform's first-party
+# apps sign with — so the platform Flux gates the prod hort HelmRepository on a
+# valid signature (.spec.verify, cosign public key).
+#
+# LEGACY .sig-tag mode (deliberately NO --registry-referrers-mode=oci-1-1):
+# Flux source-controller (v1.8.0) discovers cosign signatures via the
+# sha256-<digest>.sig tag, NOT the OCI 1.1 Referrers API. This is the opposite
+# of the IMAGE signing (cosign-sign.sh, oci-1-1) whose verifier is hort's own
+# referrer-aware worker — each artefact is signed in the format its verifier
+# reads. Isolated from helm:lint-and-publish (needs: it) so a signing hiccup
+# never blocks chart publishing; the chart is pushed first, then signed.
+
+helm:sign-chart:
+  stage: helm
+  tags:
+    - platform
+  # buildah-cosign tools image: Fedora + cosign v3 + curl + jq (the same image
+  # the platform first-party oci component signs with). No helm needed — cosign
+  # resolves the chart tag to its digest itself.
+  image: mirror.kdp.kloni.cloud/ci/buildah-cosign:latest
+  needs:
+    - job: helm:lint-and-publish
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+  before_script:
+    # Trust the platform CA (Fedora anchors) for TLS to the mirror + OpenBao.
+    - |
+      CA="${PLATFORM_CA_PATH:-${CI_SERVER_TLS_CA_FILE:-}}"
+      if [ -n "$CA" ] && [ -f "$CA" ]; then
+        cp "$CA" /etc/pki/ca-trust/source/anchors/kdp-platform-ca.crt && update-ca-trust
+      fi
+    - *resolve-registry-creds
+  script:
+    - |
+      set -eu
+      # Recompute VERSION identically to helm:lint-and-publish (kept self-
+      # contained so the publish job stays byte-for-byte untouched).
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION="${CI_COMMIT_TAG#v}"
+      else
+        VERSION="0.0.0-snapshot.${CI_PIPELINE_IID}"
+      fi
+      CHART_REF="${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server:${VERSION}"
+      echo "=== chart sign ==="
+      echo "  CHART_REF=${CHART_REF}"
+      echo "  key=hashivault://first-party-cosign (role first-party-hort)"
+      echo "=================="
+      # Vault JWT login -> token carrying the first-party-sign policy (transit
+      # sign on first-party-cosign). Role bound to project_path=pub-projects/hort
+      # + ref_protected=true, so it authorises only on protected refs.
+      VR=$(curl -sS --request POST \
+        --data "{\"jwt\":\"${VAULT_ID_TOKEN}\",\"role\":\"first-party-hort\"}" \
+        "${VAULT_ADDR}/v1/auth/gitlab/login")
+      VAULT_TOKEN="$(echo "$VR" | jq -r '.auth.client_token // empty')"
+      [ -n "$VAULT_TOKEN" ] || { echo "Vault auth failed (role first-party-hort): $VR"; exit 1; }
+      export VAULT_TOKEN
+      export TRANSIT_SECRET_ENGINE_PATH=transit
+      # cosign writes the signature as a PUSH -> authenticate to the mirror
+      # (anon-read, authenticated-write).
+      cosign login "${REGISTRY}" -u "${REGISTRY_USER}" -p "${REGISTRY_PASSWORD}"
+      # LEGACY .sig-tag signature (Flux-discoverable). No Rekor (private infra).
+      cosign sign --yes --key hashivault://first-party-cosign \
+        --use-signing-config=false --tlog-upload=false \
+        "${CHART_REF}"
+      echo "signed ${CHART_REF} (first-party key, legacy .sig tag)"
+
+
+
+# ===========================================================================
 # Stage 6: release — CycloneDX SBOM artefact for tagged releases
 # ===========================================================================
 #
