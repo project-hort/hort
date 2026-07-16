@@ -117,11 +117,12 @@ SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:latest}"
 UNSIGNED_SOURCE_IMAGE="${UNSIGNED_SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:6.5.0}"
 # How long the scenario is willing to wait for the window to elapse + the
 # release/expiry sweep to run. The gitops policy's quarantineDuration MUST be
-# <= this for the release/reject legs to complete in-run. Raised 180 -> 300
-# for headroom under full-suite worker load (#44): the release depends on a
-# quarantine-release-sweep worker job being claimed+run, which queues behind
-# the whole suite's scan/verify jobs; the worker throughput bump (compose
-# HORT_SCANNER_BATCH_SIZE/POLL) is the primary fix, this is margin.
+# <= this for the release/reject legs to complete in-run. Kept at 300 for
+# headroom (#44): the real fix is that the clearance-gating provenance-verify
+# now enqueues at the elevated job priority so it preempts the full-suite
+# bulk ingest backlog and emits ProvenanceVerified promptly; the already
+# priority-10 release-sweep then releases on its next tick. This window is
+# just margin, not the fix.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-300}"
 
 # Strip scheme so skopeo/cosign's docker:// transport gets host:port only.

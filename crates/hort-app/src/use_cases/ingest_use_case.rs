@@ -42,6 +42,16 @@ use crate::use_cases::multi_hash::{
 };
 use crate::use_cases::read_expected_version;
 
+/// Enqueue priority for **clearance-gating** `provenance-verify` jobs — the
+/// signature-arrival hook and the expiry backstop. Set to the cron/sweep tier
+/// (10) so these latency-sensitive, post-hold jobs preempt the bulk priority-0
+/// ingest scan/verify backlog in the shared `ORDER BY priority DESC` claim.
+/// Under full-suite load a priority-0 signature-arrival verify was starved
+/// behind the backlog, so a signed image's release lagged past the E2E poll
+/// window (#44). Bulk ingest-time scan/verify stay at priority 0 — they ARE the
+/// backlog; only the sign-triggered clearance jobs (rare) jump the queue.
+pub(crate) const CLEARANCE_VERIFY_PRIORITY: i16 = 10;
+
 /// Request payload for [`IngestUseCase::ingest`].
 ///
 /// Bundled into a struct rather than positional arguments because the
@@ -1510,7 +1520,7 @@ impl IngestUseCase {
                             "provenance-verify",
                             &params,
                             None, // actor_id: system-driven signature-arrival hook
-                            0i16, // default tier (matches the ingest-time verify enqueue)
+                            CLEARANCE_VERIFY_PRIORITY, // #44: preempt bulk ingest so sign→release isn't queue-depth-dependent
                             "ingest",
                             None, // no idempotency key — a re-verify is harmless (idempotent verdict)
                         )
@@ -12355,6 +12365,13 @@ mod tests {
             // No idempotency key — a re-verify is a harmless idempotent
             // verdict.
             assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
+            // #44: the signature-arrival verify is clearance-gating, so it
+            // enqueues at the elevated tier to preempt the bulk ingest backlog.
+            assert_eq!(
+                jobs.enqueue_priorities(),
+                vec![CLEARANCE_VERIFY_PRIORITY],
+                "signature-arrival provenance-verify must enqueue at the elevated clearance tier (#44)"
+            );
         });
     }
 
