@@ -66,12 +66,31 @@ jobs:
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+          # Harden against transient apt mirror outages (#45). The arm64 runners
+          # fetch from ports.ubuntu.com, whose brief outage exit-100'd the whole
+          # v0.9.10-beta.2 release. Layer apt's own per-download retries with a
+          # backoff loop over update+install so a mirror blip retries instead of
+          # failing the release. (The apt.conf drop-in persists for the job, so
+          # the Windows cross-compile step below inherits the per-download retry.)
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries
+          for i in 1 2 3 4 5; do
+            sudo apt-get update && \
+              sudo apt-get install -y protobuf-compiler pkg-config libssl-dev && exit 0
+            echo "apt attempt $i failed; retrying in 15s"; sleep 15
+          done
+          echo "::error::apt-get failed after 5 attempts (protobuf-compiler/pkg-config/libssl-dev)"
+          exit 1
 
       - name: Install Windows cross-compilation tools
         if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: sudo apt-get install -y mingw-w64
+        run: |
+          # Same mirror-outage hardening as the Linux prereqs (#45).
+          for i in 1 2 3 4 5; do
+            sudo apt-get install -y mingw-w64 && exit 0
+            echo "apt attempt $i failed; retrying in 15s"; sleep 15
+          done
+          echo "::error::apt-get failed after 5 attempts (mingw-w64)"
+          exit 1
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
