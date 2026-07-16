@@ -22,7 +22,10 @@ COPY Cargo.toml Cargo.lock ./
 # `.../LICENSE-MIT`: No such file or directory". Mirrors docker/Dockerfile.hort-server.
 COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.md THIRD-PARTY-LICENSES.json ./
 COPY crates ./crates
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# sharing=locked on the cargo-registry cache, uniform with the server/worker/
+# compose Dockerfiles: this cache id is shared across builds, so serialize
+# unpacks to keep it race-free under any concurrency.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target \
     cargo build --release -p hort-cli && \
     cp target/release/hort-cli /usr/local/bin/hort-cli

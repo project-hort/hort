@@ -47,7 +47,10 @@ RUN touch crates/hort-server/src/migrate.rs
 # runtime sqlx APIs, not compile-time `query!` macros. cargo-chef could
 # speed incremental rebuilds; punt that until build time becomes a
 # bottleneck.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# sharing=locked on the cargo-registry cache: `docker compose up --build` builds
+# hort-server/hort-worker/… concurrently, all sharing this cache id — serialize
+# crate unpacks to avoid the ".cargo-ok: File exists (os error 17)" race.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin hort-server && \
     cp target/release/hort-server /usr/local/bin/hort-server
