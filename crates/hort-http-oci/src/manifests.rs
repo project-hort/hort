@@ -2404,6 +2404,69 @@ mod tests {
         );
     }
 
+    /// Issue #41 regression: push-then-sign resolves the pushed subject's
+    /// digest via a write-authorized **HEAD by TAG** (`/manifests/<tag>`),
+    /// not by digest. The hold-read exemption is reference-agnostic — the
+    /// tag is resolved to a `ContentHash` *before* the hold check — so a
+    /// held manifest's tag HEAD must serve 200 + `Docker-Content-Digest`
+    /// identically to the by-digest probe. Every other hold-read test is
+    /// digest-addressed; this closes the tag-addressed coverage gap.
+    #[test]
+    fn head_manifest_quarantined_by_tag_write_authorized_reports_digest_not_503() {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let (status, digest_header) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (_id, hash) = seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Quarantined,
+            );
+            seed_tag(&h.refs, repo_id, "library/nginx", "v1", &hash);
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = principal_with_claim("ci-pusher");
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                "v1",
+                &HeaderMap::new(),
+                /* head = */ true,
+                Some(&principal),
+            )
+            .await;
+            let status = resp.status();
+            let digest = resp
+                .headers()
+                .get("docker-content-digest")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            (status, digest)
+        });
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "write-authorized HEAD by TAG on a quarantined manifest must serve 200 (issue #41)"
+        );
+        assert_eq!(
+            digest_header.as_deref(),
+            Some(format!("sha256:{hex}").as_str()),
+            "the HEAD-by-tag response must carry Docker-Content-Digest so push-then-sign can \
+             resolve the pushed subject's digest from its tag (issue #41)"
+        );
+    }
+
     // -- Capability-token matrix: the hold exemption keys on GRANTED
     //    write authority (ADR 0039 §10). A `/v2/auth` capability
     //    principal presents a pull-scoped cap on its subject read —
