@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.10] - 2026-07-16
+
+_Release-pipeline verification + CI / test-harness hardening; no user-facing
+product changes. Restores and verifies the public release pipeline that failed
+on v0.9.9, and hardens CI: GitLab pipeline scope (#38), podman-runner pinning
+for the long test jobs (#39), `test:unit`/`test:coverage` parallelization (#43),
+an OCI provenance-E2E read-grant fix (#41), E2E worker throughput (#44), and
+`build-binaries` apt-retry hardening against transient mirror outages (#45)._
+
 ## [0.9.9] - 2026-07-15
 
 ### Added
