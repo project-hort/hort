@@ -1,0 +1,20 @@
+# PermissionGrant: [developer, ci-pusher] -> read oci-provenance-e2e
+# (issue #41) The provenance repo is PRIVATE (isPublic: false), and permissions
+# are flat — write does NOT imply read. In legacy credential mode the
+# push-then-sign scenario resolves the held index's digest with dev-user's
+# token; without a Read grant, serve()'s step-1 read gate anti-enumerates the
+# authenticated caller to 404 NAME_UNKNOWN *before* the write-authorized
+# hold-read exemption is ever consulted, so the digest never resolves. This
+# grants dev-user the parallel Read the write grant always needed on a private
+# repo — mirroring provenance-ci-read.yaml (native-token reader) and
+# dev-read-oci-e2e.yaml. Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-read-oci-provenance-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: oci-provenance-e2e

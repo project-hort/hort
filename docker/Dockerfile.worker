@@ -108,7 +108,10 @@ RUN touch crates/hort-worker/src/composition.rs
 # Build the release binary. `--bin hort-worker` keeps the build
 # scoped (no need to compile hort-server here). Cargo + target dirs are
 # cached as docker buildx mounts so iterative rebuilds in CI stay fast.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# sharing=locked on the cargo-registry cache: this image builds concurrently with
+# the server image (compose E2E and docker-publish) sharing this cache id —
+# serialize crate unpacks to avoid the ".cargo-ok: File exists (os error 17)" race.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin hort-worker && \
     cp target/release/hort-worker /usr/local/bin/hort-worker

@@ -84,7 +84,10 @@ RUN touch crates/hort-server/src/migrate.rs
 # `/usr/local/bin/hort-cli admin task invoke <kind>` directly against this
 # image. Keeping both binaries in one image avoids a separate hort-cli image
 # (and its publish pipeline) for what is otherwise a thin HTTP client.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# sharing=locked on the cargo-registry cache: this image builds concurrently with
+# the worker image in docker-publish, sharing this cache id — serialize crate
+# unpacks to avoid the ".cargo-ok: File exists (os error 17)" race.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target \
     cargo build --release -p hort-server -p hort-cli && \
     cp target/release/hort-server /usr/local/bin/hort-server && \

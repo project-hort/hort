@@ -28,20 +28,28 @@ stages:
   - release
 
 # ---------------------------------------------------------------------------
-# Pipeline scope
+# Pipeline scope (issue #38)
 # ---------------------------------------------------------------------------
 #
-# Run a pipeline for: MR events, tags, and any branch push (so feature
-# branches get CI before an MR is opened). When a branch has an open MR
-# we keep the MR pipeline and suppress the duplicate branch pipeline, so
-# a single push doesn't run CI twice.
+# Run a pipeline for:
+#   - MR events — feature branches get CI via their merge request ONLY; a push
+#     to the source branch re-runs the MR pipeline while the MR is open;
+#   - every push to the integration trunks `main` / `develop` and the
+#     long-lived `release/*` maintenance branches;
+#   - any tag (`v*` finals/pre-releases AND the `test/*` alpha tags).
+# NOT for: a feature-branch push with no open MR, or a commit to a `test/*`
+# branch — those build only when their tag is set/moved. When a branch has an
+# open MR we keep the MR pipeline and suppress the duplicate branch pipeline,
+# so a single push doesn't run CI twice.
 
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
-    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
     - if: $CI_COMMIT_TAG
 
 # ---------------------------------------------------------------------------
@@ -454,6 +462,12 @@ test:lint:
 # Parity with test-backend-unit, scoped to the rewrite.
 test:unit:
   stage: test
+  # Pinned to the higher-powered podman runner (issue #39): a compile-only
+  # `--lib` job with no live service, so no runner-side per-build network is
+  # needed. Reachability (internal image mirror, CA, Vault/S3 sccache) is
+  # confirmed on that runner. `test:integration` stays on the default runner
+  # until `FF_NETWORK_PER_BUILD` is set there (its Postgres `services:` alias).
+  tags: [podman]
   extends: [.sccache]
   image: ${RUST_SCCACHE_IMAGE}
   <<: [*rust-cache, *rules-code-changed]
@@ -483,10 +497,17 @@ test:unit:
 # Postgres service or migrations are needed to collect --lib coverage.
 test:coverage:
   stage: test
+  # Pinned to the podman runner (issue #39): `--lib` coverage with no live
+  # Postgres service (see the DB-backed note below), so it pins like test:unit.
+  tags: [podman]
   image: ${RUST_IMAGE}
   <<: [*rust-cache, *rules-code-changed]
+  # Runs in PARALLEL with test:unit (issue #43): both gate only on test:lint.
+  # Safe now that both compile-heavy jobs are pinned to the podman runner (#39);
+  # the prior `needs: test:unit` chain only existed to avoid two concurrent
+  # workspace compiles on the shared Platform runner.
   needs:
-    - job: test:unit
+    - job: test:lint
       artifacts: false
   variables:
     # cargo-llvm-cov drives rustc directly; sccache or other wrappers break
@@ -532,6 +553,11 @@ test:coverage:
 # database. Main / release / tags only, matching the GitHub CI gating.
 test:integration:
   stage: test
+  # Pinned to the podman runner (issue #39). Its Postgres `services:` alias
+  # resolves there now that `FF_NETWORK_PER_BUILD=true` is set on the runner
+  # (gitlab-runner-podman!29): each build gets its own bridge network so the
+  # docker-executor-on-rootless-podman resolves `postgres` via netavark DNS.
+  tags: [podman]
   extends: [.sccache]
   image: ${RUST_SCCACHE_IMAGE}
   <<: [*rust-cache, *rules-main-only]

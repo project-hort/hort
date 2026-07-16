@@ -117,8 +117,12 @@ SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:latest}"
 UNSIGNED_SOURCE_IMAGE="${UNSIGNED_SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:6.5.0}"
 # How long the scenario is willing to wait for the window to elapse + the
 # release/expiry sweep to run. The gitops policy's quarantineDuration MUST be
-# <= this for the release/reject legs to complete in-run.
-WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-180}"
+# <= this for the release/reject legs to complete in-run. Raised 180 -> 300
+# for headroom under full-suite worker load (#44): the release depends on a
+# quarantine-release-sweep worker job being claimed+run, which queues behind
+# the whole suite's scan/verify jobs; the worker throughput bump (compose
+# HORT_SCANNER_BATCH_SIZE/POLL) is the primary fix, this is margin.
+WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-300}"
 
 # Strip scheme so skopeo/cosign's docker:// transport gets host:port only.
 REGISTRY_HOST="${HORT_URL#http://}"
@@ -298,11 +302,22 @@ DIGEST="$(skopeo inspect --tls-verify=false --creds "$DEST_CREDS" \
 if [ -z "$DIGEST" ]; then
     # Fall back to the Docker-Content-Digest header of a write-authorized HEAD,
     # which the existence-probe exemption serves (200) even under the hold.
-    DIGEST="$(curl -sSI -H "Authorization: Bearer ${HOLD_BEARER}" \
-        "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/v1" 2>/dev/null \
-        | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' || true)"
+    # Capture the FULL status line + headers (no `2>/dev/null` discard) so a
+    # failed resolve surfaces the actual HTTP status/headers instead of an
+    # opaque empty string — issue #41 died here with the response thrown away.
+    HOLD_HEAD_RESP="$(curl -sS -I -H "Authorization: Bearer ${HOLD_BEARER}" \
+        "${HORT_URL}/v2/${REPO_KEY}/${SIGNED_NAME}/manifests/v1" 2>&1 || true)"
+    DIGEST="$(printf '%s' "$HOLD_HEAD_RESP" | tr -d '\r' \
+        | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')"
 fi
-[ -n "$DIGEST" ] || { fail "resolve pushed digest" "neither skopeo inspect nor a write-authorized HEAD returned a digest"; summary; }
+if [ -z "$DIGEST" ]; then
+    log "[diag #41] write-authorized HEAD-by-tag on ${SIGNED_NAME} (/manifests/v1) returned no Docker-Content-Digest."
+    log "[diag #41] HOLD_BEARER len=${#HOLD_BEARER}; full HEAD status line + headers follow:"
+    printf '%s\n' "${HOLD_HEAD_RESP:-<no response captured>}" | sed 's/^/[diag #41]   /'
+    fail "resolve pushed digest" \
+         "neither skopeo inspect nor a write-authorized HEAD returned a digest (actual HTTP status/headers logged above under [diag #41])"
+    summary
+fi
 log "[digest] pushed manifest digest = ${DIGEST}"
 
 # =============================================================================
