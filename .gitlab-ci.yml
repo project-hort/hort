@@ -502,8 +502,12 @@ test:coverage:
   tags: [podman]
   image: ${RUST_IMAGE}
   <<: [*rust-cache, *rules-code-changed]
+  # Runs in PARALLEL with test:unit (issue #43): both gate only on test:lint.
+  # Safe now that both compile-heavy jobs are pinned to the podman runner (#39);
+  # the prior `needs: test:unit` chain only existed to avoid two concurrent
+  # workspace compiles on the shared Platform runner.
   needs:
-    - job: test:unit
+    - job: test:lint
       artifacts: false
   variables:
     # cargo-llvm-cov drives rustc directly; sccache or other wrappers break
