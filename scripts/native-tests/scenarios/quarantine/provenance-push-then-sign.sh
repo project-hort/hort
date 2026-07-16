@@ -117,8 +117,12 @@ SOURCE_IMAGE="${SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:latest}"
 UNSIGNED_SOURCE_IMAGE="${UNSIGNED_SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:6.5.0}"
 # How long the scenario is willing to wait for the window to elapse + the
 # release/expiry sweep to run. The gitops policy's quarantineDuration MUST be
-# <= this for the release/reject legs to complete in-run.
-WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-180}"
+# <= this for the release/reject legs to complete in-run. Raised 180 -> 300
+# for headroom under full-suite worker load (#44): the release depends on a
+# quarantine-release-sweep worker job being claimed+run, which queues behind
+# the whole suite's scan/verify jobs; the worker throughput bump (compose
+# HORT_SCANNER_BATCH_SIZE/POLL) is the primary fix, this is margin.
+WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-300}"
 
 # Strip scheme so skopeo/cosign's docker:// transport gets host:port only.
 REGISTRY_HOST="${HORT_URL#http://}"
