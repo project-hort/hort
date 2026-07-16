@@ -5384,6 +5384,10 @@ pub struct MockJobsRepository {
     /// destructive-kind path passes `Some(server-derived-key)` while
     /// the non-destructive path passes `None`.
     enqueue_idem_keys: Mutex<Vec<Option<hort_domain::types::IdempotencyKey>>>,
+    /// Recorded `priority` arguments from `enqueue_task` calls, in lock-step
+    /// with `enqueue_calls`. Lets tests assert the enqueue tier (e.g. the
+    /// elevated clearance-gating provenance-verify priority, #44).
+    enqueue_priorities: Mutex<Vec<i16>>,
     /// When `Some`, the NEXT `enqueue_task`
     /// call returns `EnqueueOutcome::Duplicate { existing_job_id }`
     /// instead of `Enqueued`. One-shot, mirrors the `fail_next_enqueue`
@@ -5457,6 +5461,7 @@ impl Default for MockJobsRepository {
         Self {
             enqueue_calls: Mutex::new(Vec::new()),
             enqueue_idem_keys: Mutex::new(Vec::new()),
+            enqueue_priorities: Mutex::new(Vec::new()),
             next_duplicate: Mutex::new(None),
             delete_calls: Mutex::new(Vec::new()),
             list_rows: Mutex::new(Vec::new()),
@@ -5518,6 +5523,12 @@ impl MockJobsRepository {
     /// destructive-kind path) or `None` for the non-destructive path.
     pub fn enqueue_idem_keys(&self) -> Vec<Option<hort_domain::types::IdempotencyKey>> {
         self.enqueue_idem_keys.lock().unwrap().clone()
+    }
+
+    /// Recorded `priority` arguments from `enqueue_task` calls, in lock-step
+    /// with [`enqueue_calls`].
+    pub fn enqueue_priorities(&self) -> Vec<i16> {
+        self.enqueue_priorities.lock().unwrap().clone()
     }
 
     /// Recorded job ids passed to `delete_job`.
@@ -5730,7 +5741,7 @@ impl JobsRepository for MockJobsRepository {
         kind: &'a str,
         params: &'a serde_json::Value,
         actor_id: Option<Uuid>,
-        _priority: i16,
+        priority: i16,
         _trigger_source: &'a str,
         idempotency_key: Option<&'a hort_domain::types::IdempotencyKey>,
     ) -> BoxFuture<'a, DomainResult<hort_domain::ports::jobs_repository::EnqueueOutcome>> {
@@ -5738,6 +5749,7 @@ impl JobsRepository for MockJobsRepository {
             .lock()
             .unwrap()
             .push((kind.to_string(), params.clone(), actor_id));
+        self.enqueue_priorities.lock().unwrap().push(priority);
         // Record the idempotency_key
         // verbatim (cloned, since the borrow does not outlive the call).
         self.enqueue_idem_keys

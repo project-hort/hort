@@ -26,6 +26,7 @@ use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
 
 use crate::event_store_publisher::EventStorePublisher;
+use crate::use_cases::ingest_use_case::CLEARANCE_VERIFY_PRIORITY;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
@@ -1457,8 +1458,8 @@ impl QuarantineUseCase {
             .enqueue_task(
                 "provenance-verify",
                 &params,
-                None,     // actor_id: system-driven expiry backstop
-                0i16,     // default tier
+                None,                      // actor_id: system-driven expiry backstop
+                CLEARANCE_VERIFY_PRIORITY, // #44: clearance-gating verify preempts bulk ingest
                 "ingest", // reuse the ingest-time verify trigger source (CHECK-valid)
                 None,     // no idempotency key — the in-flight guard above is the dedup
             )
@@ -3946,6 +3947,12 @@ mod tests {
         );
         assert!(actor_id.is_none(), "expiry backstop is system-driven");
         assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
+        // #44: the expiry-backstop verify is clearance-gating → elevated tier.
+        assert_eq!(
+            jobs.enqueue_priorities(),
+            vec![CLEARANCE_VERIFY_PRIORITY],
+            "expiry-backstop provenance-verify must enqueue at the elevated clearance tier (#44)"
+        );
     }
 
     /// S4 idempotency: a second sweep tick, while a `provenance-verify`

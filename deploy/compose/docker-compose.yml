@@ -369,19 +369,13 @@ services:
       # fixture-validation step in the test confirms the upstream is
       # reachable before declaring a fixture-drift failure.
       HORT_ADVISORY_OSV_API_URL: "https://api.osv.dev/v1/querybatch"
-      # Worker tunables. Bumped for #44: the compose stack's compressed
-      # quarantine timings (30s window, 15s sweep-ticker) need the single
-      # worker to drain the full-suite job queue fast enough that a
-      # latency-sensitive quarantine-release-sweep row is claimed+run within a
-      # scenario's poll window. Batch 4 / 5s poll (~0.8 jobs/s, global-FIFO
-      # claim order) starved the release-sweep behind the scan/verify backlog
-      # under full-suite load (provenance-push-then-sign [5/6] timed out at
-      # 180s). Faster poll + larger batch (~8 claims/s) keeps releases prompt;
-      # the per-kind semaphores still bound actual concurrency. Generous lock
-      # duration + retry headroom so a slow Trivy invocation isn't reaped
-      # mid-scan.
-      HORT_SCANNER_POLL_INTERVAL_SECS: "2"
-      HORT_SCANNER_BATCH_SIZE: "16"
+      # Worker tunables: keep the smoke fast (5s poll, batch 4) but
+      # leave generous lock duration + retry headroom so a slow
+      # Trivy invocation doesn't get reaped mid-scan. (The #44 sign→release
+      # latency is fixed by the clearance-gating verify's elevated job
+      # priority, not by claim throughput — the sweep was never claim-starved.)
+      HORT_SCANNER_POLL_INTERVAL_SECS: "5"
+      HORT_SCANNER_BATCH_SIZE: "4"
       HORT_SCANNER_MAX_ATTEMPTS: "5"
       HORT_SCANNER_LOCK_DURATION_SECS: "900"
       HORT_WORKER_ID: "hort-worker-v2"
