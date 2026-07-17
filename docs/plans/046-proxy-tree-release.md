@@ -36,7 +36,27 @@ Notes:
 - **B** and **C** both keep lazy fetch + per-descendant scan (fail-closed). They differ only in the **observation window**: B elides it, C anchors it to the parent. B's safety *fully depends* on continuous rescan covering post-release CVEs; C keeps the window (just not stacked), so it's robust to that model either way.
 - **D** is a blunt instrument — it changes the security posture for every proxy artifact and doesn't actually remove the *stacking* (still N waves, just shorter). Listed for completeness; not recommended.
 
-## §4 — Recommendation
+## §4 — Decision: Option B (verified)
+
+**DECIDED: Option B — a tree descendant releases on its own clean scan, with no fresh observation window.** (Tom, 2026-07-17.)
+
+**The load-bearing precondition was verified, not assumed:** hort does **not** rescan an artifact *during* its quarantine window. `RescanCandidatesRepository::select_eligible` (`crates/hort-adapters-postgres/src/rescan_candidates.rs`) selects only `quarantine_status = 'released' OR NULL` artifacts whose `last_scan_at` is older than the policy `rescan_interval_hours` (default 24h). So the window is a **single-scan-at-ingest + timer**; forward-CVE observation is the periodic rescan of **released** artifacts.
+
+Therefore **B loses zero observation**: a descendant scanned clean at first-touch is scanned against the **current** CVE DB (fresher than the parent's ingest scan), and on release joins the **identical** released-artifact rescan pool as everything else. The window it skips is pure latency, not protection. B is also **simpler than C** (no parent-edge resolution — precondition #3 dropped).
+
+### B — final shape + implementation sketch
+- Lazy fetch (only the pulled arch) — unchanged.
+- Each descendant (child manifest, config/layer blob) is **still independently scanned** on first-touch (fail-closed — no unscanned release).
+- On its own `ScanCompleted(clean)`, it **releases immediately (window = 0)** — gated on its own scan only (per-node, consistent with ADR 0043's per-child model; robust if the parent is later rejected).
+- **Identifying a descendant at ingest:** an artifact that is a `content_references` **target** (referenced by an already-ingested manifest/index) is a tree descendant → assign it a **zero-length window** (`quarantine_until = ingested_at`) so the release sweep clears it as soon as its clean scan lands. Edge case — a blob touched before its referencing manifest exists (no edge yet): it takes the normal window; a later re-touch after the edge appears is a non-issue because the pull flow ingests the manifest before its blobs.
+- **⚠️ Scope refinement (verified against the code):** `content_references` today captures **`oci_index_member`** (index→child) and **`oci_subject`** (referrer→subject) — but **NOT** manifest→config/layer **blob** edges. The manifest PUT only *validates* blob existence (`MANIFEST_BLOB_UNKNOWN`), it doesn't record `content_references` rows for blobs. So the target-check identifies child *manifests* but **not blobs** → the **blob wave (wave 3) is NOT fixed** by the target-check alone. To fix all three waves, B must **also write manifest→blob `content_references` edges** (new kinds, e.g. `oci_config` / `oci_layer`) at manifest PUT — a bounded extension of the exact many-to-many ADR 0043 built (mirrors the `oci_index_member` write, capped by the existing `MAX_BLOB_REFERENCES = 1024`), and a generically useful completion of the membership graph (the deferred promotion cascade wants it too). **B's real scope:** (1) `content_references` gains manifest→blob edges at PUT; (2) any target (child manifest **or** blob) gets the zero-length window; (3) sweep unchanged; + tests + ADR 0007/0043 amendments. *(Open with Tom: land the blob-edge extension as its own step, or in one change with the zero-window logic.)*
+
+### Superseded alternative (kept for the record)
+Option **C** (anchor the descendant window to the parent) was the prior recommendation; it is safe but strictly more complex than B (needs parent-edge resolution) and buys nothing once the no-in-window-rescan fact is established. **A** (eager all-arch ingest) remains the fallback only if the `content_references` target check turns out not to be cheaply available at descendant-ingest.
+
+---
+
+<details><summary>Prior recommendation text (Option C) — superseded by §4 decision</summary>
 
 **Option C — anchor a descendant's observation window to its parent's, not a fresh per-node window.**
 
@@ -51,6 +71,16 @@ Rationale:
 3. **Where "parent" is known at descendant-ingest** — a lazily-ingested blob must resolve its parent index (via `content_references`) to inherit the anchor; confirm that edge is queryable on the ingest path.
 
 If (1)–(3) hold, C is a contained change (descendant ingest sets `quarantine_until` from the parent edge; the sweep predicate is unchanged — it already gates on window + own-scan). If the parent edge isn't resolvable cheaply at blob-ingest, **A** is the fallback (eager fetch makes the tree present so windows parallelize) at the cost of proxy efficiency.
+
+## §4a — ADR 0007 amendment: reconciling with the rejected "clean scan releases immediately"
+
+**Load-bearing for the amendment author:** Option B *is* the alternative ADR 0007 explicitly **rejected** — *"Clean scan releases immediately. Rejected: collapses the observation window the quarantine exists to provide."* The amendment must therefore be a **scoped carve-out**, not a reversal, and justify why the observation window is not actually lost for a **referenced-tree descendant**:
+
+- **No in-window rescan (verified).** `select_eligible` rescans only `released`/`NULL` artifacts on the 24h interval — the window never re-scans a `quarantined` artifact. So the window is a single-scan-at-ingest + timer for *every* artifact, parent included; it does not itself realise "reputation catch-up" via rescan.
+- **The descendant is scanned fresher than the parent.** A descendant scanned at first-touch T' uses the *current* CVE DB — strictly more recent than the parent's ingest-time scan the operator already trusted at release.
+- **Identical forward observation.** On release the descendant enters the same 24h released-artifact rescan pool as everything else; post-release CVEs are caught identically to any released artifact.
+
+So the carve-out is: *a scanned-clean artifact that is a `content_references` target of an already-ingested parent (a referenced-tree descendant) releases on its own `ScanSucceeded` without re-applying the observation window; forward observation is the standard released-artifact rescan.* The two impossible failure modes in ADR 0007 §Context are preserved (no unscanned release; no timer-only release — the descendant still needs its own `ScanSucceeded`). The scope is deliberately narrow (referenced descendants), **not** a general "clean scan releases immediately." Reviewer note: this reconciliation is the crux of the ADR amendment — do not land a broad reversal.
 
 ## §5 — Decision requested
 
