@@ -3154,9 +3154,67 @@ impl IngestUseCase {
             .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
 
         if effective_duration_secs > 0 {
-            // Resolve the quarantine-window anchor
-            // (`quarantine_window_start`). Two cases:
+            // Referenced-tree descendant zero-window carve-out (#46 Item
+            // 2, design doc §4 final shape + §4a). A SCOPED carve-out of
+            // ADR 0007, NOT a reversal — see the anchor resolution below.
             //
+            // This artifact is a "referenced-tree descendant" iff it is
+            // already a `content_references` **target** of some other,
+            // already-ingested artifact — a child manifest (`kind =
+            // "oci_index_member"`), a referrer's subject (`kind =
+            // "oci_subject"`), or a config/layer blob (`kind =
+            // "oci_config"` / `"oci_layer"`, #46 Item 1). Excludes the
+            // two self-referencing refcount kinds `primary_content` /
+            // `metadata_blob` — every artifact's OWN ingest writes a
+            // `primary_content` row targeting **its own** hash (see
+            // `ingest_direct_writes_primary_content_refcount`), so an
+            // unfiltered "is this hash a target of ANY kind" check would
+            // match every single artifact against itself and always
+            // fire. Those two kinds are this artifact's own bookkeeping,
+            // never "some other already-ingested artifact references
+            // me."
+            let is_referenced_descendant = match self
+                .content_references
+                .find_by_target(repository_id, &artifact.sha256_checksum, None)
+                .await
+            {
+                Ok(refs) => refs
+                    .iter()
+                    .any(|r| r.kind != "primary_content" && r.kind != "metadata_blob"),
+                Err(e) => {
+                    // Fail-safe, not fail-closed-on-scan: a lookup error
+                    // degrades to "not a descendant", i.e. the artifact
+                    // keeps its normal full window — the MORE
+                    // conservative outcome, never the zero-window one.
+                    tracing::warn!(
+                        artifact_id = %artifact.id,
+                        %repository_id,
+                        error = %e,
+                        "content_references target lookup failed; treating as non-descendant \
+                         (full window, fail-safe)"
+                    );
+                    false
+                }
+            };
+
+            // Resolve the quarantine-window anchor
+            // (`quarantine_window_start`). Three cases:
+            //
+            // - **Referenced-tree descendant** (checked first —
+            //   supersedes the opt-in below) — anchor = `ingested_at -
+            //   effective_duration`, so the live-computed deadline
+            //   (`anchor + duration`) equals `ingested_at` exactly: a
+            //   zero-length window. The RELEASE PREDICATE is completely
+            //   unchanged (`Artifact::release` still requires its own
+            //   `ScanSucceeded`/`ScanWaived` authority — ADR 0007's two
+            //   impossible failure modes stay impossible); this only
+            //   removes the *timer* wait, so the descendant's own clean
+            //   scan trips the existing event-driven fast-path release in
+            //   `QuarantineUseCase::record_scan_result` instead of
+            //   waiting out a window that provides no additional
+            //   observation (§4a: no in-window rescan exists, so the
+            //   window is pure latency for every artifact, not
+            //   protection).
             // - **Opt-in fired** — the serving `RepositoryUpstreamMapping`
             //   has `trust_upstream_publish_time = true` AND the format
             //   adapter extracted a non-`None` `upstream_published_at`:
@@ -3177,8 +3235,12 @@ impl IngestUseCase {
             // later policy edit of `quarantineDuration` takes effect on
             // the existing artifact's window without a backfill
             // migration.
-            let (anchor, anchor_clamp_fired): (DateTime<Utc>, bool) = if trust_upstream_publish_time
-            {
+            let (anchor, anchor_clamp_fired): (DateTime<Utc>, bool) = if is_referenced_descendant {
+                (
+                    now - chrono::Duration::seconds(effective_duration_secs),
+                    false,
+                )
+            } else if trust_upstream_publish_time {
                 match upstream_published_at {
                     Some(upstream_ts) => {
                         let clamped = std::cmp::min(upstream_ts, now);
@@ -3193,7 +3255,13 @@ impl IngestUseCase {
                 (now, false)
             };
 
-            let publish_anchored = trust_upstream_publish_time && upstream_published_at.is_some();
+            // `is_referenced_descendant` supersedes the opt-in above, so
+            // it must also supersede this flag — the anchor did not come
+            // from `upstream_published_at` on that path, even if the
+            // opt-in happens to also be configured for this repo.
+            let publish_anchored = !is_referenced_descendant
+                && trust_upstream_publish_time
+                && upstream_published_at.is_some();
 
             let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
                 (
@@ -3282,6 +3350,26 @@ impl IngestUseCase {
                     anchor_source = "upstream_published",
                     "quarantine anchor resolved via upstream publish time \
                      (trust_upstream_publish_time opt-in)"
+                );
+            }
+
+            // Distinct log line on the referenced-tree-descendant
+            // zero-window fire (#46 Item 2). `anchor_source =
+            // "referenced_descendant"` reserves a third value on the
+            // same axis as `"upstream_published"` / implicit `"ingest"`.
+            // The release predicate is untouched — this only records
+            // that the *window*, not the *release authority*, collapsed.
+            if is_referenced_descendant {
+                tracing::debug!(
+                    %artifact_id,
+                    %repository_id,
+                    ingested_at = %now,
+                    chosen_anchor = %anchor,
+                    window_duration_secs = effective_duration_secs,
+                    anchor_source = "referenced_descendant",
+                    "quarantine window collapsed to zero: artifact is a content_references \
+                     target of an already-ingested manifest/index (#46 Item 2 scoped carve-out; \
+                     release still requires this artifact's own ScanSucceeded/ScanWaived)"
                 );
             }
 
@@ -10289,6 +10377,237 @@ mod tests {
         });
     }
 
+    // ---------------------------------------------------------------------
+    // #46 Item 2 — referenced-tree descendant zero-window carve-out
+    //
+    // A scoped carve-out of ADR 0007 (design doc §4 final shape + §4a): a
+    // `content_references` TARGET (a referenced-tree descendant) gets its
+    // quarantine anchor backdated so the live-computed deadline
+    // (`anchor + duration`) equals `ingested_at` — a zero-length window —
+    // while the RELEASE PREDICATE stays completely untouched (still
+    // requires the descendant's own `ScanSucceeded`/`ScanWaived`
+    // authority; see `record_scan_result_zero_window_descendant_with_findings_still_rejects`
+    // in `quarantine_use_case.rs` for the fail-closed-intact proof). The
+    // four tests below pin: target → zero window; non-target → full
+    // window; the `primary_content`/`metadata_blob` self-reference
+    // exclusion (the bug a naive "any kind" check would introduce, since
+    // every artifact's own ingest writes a self-targeting
+    // `primary_content` row); and the lookup-failure fail-safe.
+    // ---------------------------------------------------------------------
+
+    /// A `content_references` target (an already-ingested parent
+    /// manifest/index references this artifact's hash) gets a
+    /// zero-length window: the anchor is backdated so `anchor +
+    /// effective_duration == ingested_at`. The artifact is still
+    /// `Quarantined` right after ingest — the zero window does NOT
+    /// itself release anything (acceptance #4: no timer-only release,
+    /// `ingest_direct` never calls a scan).
+    #[test]
+    fn ingest_direct_referenced_target_gets_zero_length_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"child-manifest-bytes";
+        let target_hash: ContentHash = sha256_of(content).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+
+            // Simulate an already-ingested parent (e.g. an OCI index)
+            // referencing this artifact's hash BEFORE this artifact is
+            // ingested — exactly the shape #46 Item 1 writes.
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: target_hash,
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let artifact = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .unwrap()
+                .artifact;
+            let after = Utc::now();
+
+            assert_eq!(
+                artifact.quarantine_status,
+                QuarantineStatus::Quarantined,
+                "zero window must NOT itself release the artifact (acceptance #4)"
+            );
+            let anchor = artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set for a referenced-tree descendant");
+            let duration = chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs());
+            let deadline = anchor + duration;
+            assert!(
+                deadline >= before && deadline <= after,
+                "deadline (anchor + duration) {deadline:?} must equal ingested_at \
+                 (between {before:?} and {after:?}) — a zero-length window"
+            );
+        });
+    }
+
+    /// A non-target artifact (no `content_references` row targets its
+    /// hash) keeps the full `ingested_at + quarantineDuration` window —
+    /// unchanged from pre-Item-2 behaviour (acceptance #2). A row exists
+    /// in the mock, but for a DIFFERENT hash — proves the target-check
+    /// discriminates by hash, not merely "the table is non-empty".
+    #[test]
+    fn ingest_direct_non_target_keeps_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"standalone-artifact-bytes";
+        let other_hash: ContentHash = sha256_of(b"someone-elses-child-manifest").parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: other_hash,
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let artifact = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .unwrap()
+                .artifact;
+            let after = Utc::now();
+
+            assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+            let anchor = artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under Default policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "non-target anchor must be the ingest timestamp (full window), \
+                 not backdated: {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
+    /// A hash that carries ONLY `primary_content`/`metadata_blob`
+    /// `content_references` rows (the self-referencing refcount kinds,
+    /// not an external reference) is NOT treated as a descendant — the
+    /// exclusion this implementation depends on to avoid every artifact
+    /// matching its OWN `primary_content` row (written earlier in the
+    /// same `ingest_inner` call) as if it were referenced by something
+    /// else.
+    #[test]
+    fn ingest_direct_self_reference_kinds_do_not_count_as_target() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"artifact-with-only-refcount-rows";
+        let hash: ContentHash = sha256_of(content).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+
+            // Pre-seed ONLY the two self-referencing kinds against this
+            // artifact's own future hash — simulates a coincidence (or a
+            // stale row); neither is "some other already-ingested
+            // artifact references me".
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: hash.clone(),
+                    kind: "primary_content".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: hash,
+                    kind: "metadata_blob".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let artifact = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .unwrap()
+                .artifact;
+            let after = Utc::now();
+
+            let anchor = artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under Default policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "primary_content/metadata_blob rows must NOT count as a target — \
+                 anchor must be the ingest timestamp (full window): \
+                 {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
+    /// A `find_by_target` port error degrades to "not a descendant" —
+    /// fail-safe (full window), never fail-open into a zero window from
+    /// an infra hiccup. Covers the `Err(e)` branch for `hort-app`'s
+    /// 100% coverage requirement.
+    #[test]
+    fn ingest_direct_target_lookup_failure_degrades_to_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"lookup-failure-bytes";
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            content_refs.fail_next_find_by_target(DomainError::Invariant(
+                "simulated content_references lookup failure (test fixture)".into(),
+            ));
+
+            let before = Utc::now();
+            let artifact = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .unwrap()
+                .artifact;
+            let after = Utc::now();
+
+            assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+            let anchor = artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under Default policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a lookup failure must degrade to full window (fail-safe), not zero window: \
+                 {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
     /// ProtocolNative: hash mismatch → Conflict, ChecksumMismatch on
     /// repository stream, no artifact row minted, CAS rolled back.
     #[test]
@@ -11263,6 +11582,43 @@ mod tests {
         Arc<MockPolicyProjectionRepository>,
         Arc<MockJobsRepository>,
     ) {
+        let (
+            uc,
+            artifacts,
+            lifecycle,
+            storage,
+            repos,
+            policy_projections,
+            jobs,
+            _content_references,
+        ) = make_scan_gated_use_case_with_content_references();
+        (
+            uc,
+            artifacts,
+            lifecycle,
+            storage,
+            repos,
+            policy_projections,
+            jobs,
+        )
+    }
+
+    /// Same wiring as [`make_scan_gated_use_case`], but also returns the
+    /// `MockContentReferenceIndex` handle so #46 Item 2 tests can
+    /// pre-seed a `content_references` row (simulating an
+    /// already-ingested parent manifest/index) before calling
+    /// `ingest_verified` / `ingest_direct` on the descendant artifact.
+    #[allow(clippy::type_complexity)]
+    fn make_scan_gated_use_case_with_content_references() -> (
+        IngestUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockStoragePort>,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+        Arc<MockJobsRepository>,
+        Arc<MockContentReferenceIndex>,
+    ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
@@ -11287,7 +11643,7 @@ mod tests {
             true,
             HashMap::new(),
             0,
-            content_references,
+            content_references.clone(),
             policy_projections.clone(),
             jobs.clone(),
         );
@@ -11299,6 +11655,7 @@ mod tests {
             repos,
             policy_projections,
             jobs,
+            content_references,
         )
     }
 

@@ -4155,6 +4155,7 @@ pub struct MockContentReferenceIndex {
     next_insert_error: Mutex<Option<DomainError>>,
     next_insert_error_for_kind: Mutex<Option<(String, DomainError)>>,
     next_delete_error: Mutex<Option<DomainError>>,
+    next_find_by_target_error: Mutex<Option<DomainError>>,
     /// Counts calls to `find_by_sources_and_kind` so
     /// tests can assert the simple-index serve issues exactly ONE
     /// batched lookup (rather than fanning out to N
@@ -4169,6 +4170,7 @@ impl MockContentReferenceIndex {
             next_insert_error: Mutex::new(None),
             next_insert_error_for_kind: Mutex::new(None),
             next_delete_error: Mutex::new(None),
+            next_find_by_target_error: Mutex::new(None),
             batch_call_count: AtomicUsize::new(0),
         }
     }
@@ -4225,6 +4227,16 @@ impl MockContentReferenceIndex {
     pub fn fail_next_delete(&self, err: DomainError) {
         *self.next_delete_error.lock().unwrap() = Some(err);
     }
+
+    /// Arm a one-shot failure on the **next** [`ContentReferenceIndex::find_by_target`]
+    /// call, regardless of the queried target/kind. Used by branch-coverage
+    /// tests for the `IngestUseCase` referenced-tree-descendant target-check
+    /// (#46 Item 2) fail-safe arm — a lookup error must degrade to "not a
+    /// descendant" (the artifact keeps its normal window) rather than
+    /// aborting the ingest.
+    pub fn fail_next_find_by_target(&self, err: DomainError) {
+        *self.next_find_by_target_error.lock().unwrap() = Some(err);
+    }
 }
 
 impl ContentReferenceIndex for MockContentReferenceIndex {
@@ -4264,6 +4276,9 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         target: &ContentHash,
         kind_filter: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Vec<ContentReference>>> {
+        if let Some(err) = self.next_find_by_target_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(err) });
+        }
         let target = target.clone();
         let kind_filter = kind_filter.map(str::to_owned);
         let mut out: Vec<ContentReference> = self
