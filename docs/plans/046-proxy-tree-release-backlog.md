@@ -15,6 +15,11 @@ PR-sized, ordered by dependency. Distil the design doc into the ADR amendments b
 - Unit tests: a manifest with N layers + config writes N+1 blob edges of the right kinds; cap enforced; DB-backed test carries `#[serial(hort_pg_db)]`.
 - No new metric/label without a catalog entry; `hort-http-oci` stays adapter-free (ADR 0008).
 
+**⚠️ Load-bearing GC-interaction (resolve BEFORE writing the edges):** the purge GC uses the **`content_references` refcount projection** (ADR 0020, `refcount_reconcile.rs`); a blob with content-ref refcount 0 is deleted. But config/layer blobs are kept alive **today** as **group members** (`ArtifactGroupUseCase::add_member`, `manifests_write.rs:645/671/698`), **not** content_references. Adding `oci_config`/`oci_layer` edges therefore changes each config/layer blob's content-ref refcount from 0 → ≥1. This is safe **only if** it does not double-count against whatever keeps them alive today. Two sub-questions to answer first (read `migrations/013_content_references_multivalue_pk.sql`, the refcount projection source, `purge_use_case.rs`, `refcount_reconcile.rs`, and the artifact-group membership GC path):
+  1. **Does the refcount projection / purge candidacy count group memberships, or only `content_references`?** If group membership is a *separate* GC gate (blob kept alive by membership, content-ref refcount 0 today), then the new edges add a redundant-but-consistent refcount, cleaned on manifest DELETE (`delete_by_source`) — safe. If group membership is *already folded into* the refcount, the new edges **double-count** (blob over-referenced → GC leak) — a bug.
+  2. Confirm manifest DELETE removes the new `oci_config`/`oci_layer` edges (`delete_by_source`) so a deleted manifest decrements its blobs correctly, exactly like `oci_index_member`.
+  Acceptance additions: a test that a config/layer blob's GC/purge outcome is **unchanged** by the new edges (deleted iff no live manifest/group references it); and the refcount-reconcile sweep does not flag drift for the new kinds. **If (1) shows double-counting, the design changes** — either don't count `oci_config`/`oci_layer` in the GC refcount (mark them GC-inert edges), or migrate config/layer alive-keep from group membership to these edges. Escalate that fork to the architect before coding.
+
 ### Starter prompt
 ```
 /hort-architect
