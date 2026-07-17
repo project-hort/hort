@@ -805,6 +805,40 @@ mod tests {
         cleanup(&pool, repo).await;
     }
 
+    /// `oci_config` / `oci_layer` sibling rows (#46 Item 1) are not
+    /// derived from `artifacts`/`artifact_metadata` columns, so the
+    /// reconcile scan — which only knows categories 1 (`primary_content`)
+    /// and 2 (`metadata_blob`) — must not flag them as drift, mirroring
+    /// the existing `oci_subject` sibling case in
+    /// `drift_delete_rejected_source_rows` but for a *released* (not
+    /// rejected) source, where category 3 doesn't apply either.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn oci_config_and_layer_sibling_rows_yield_no_drift() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let manifest = seed_artifact(&pool, repo, "manifest", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(manifest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, manifest, "primary_content", HASH_B).await;
+        insert_cr(&pool, repo, manifest, "oci_config", HASH_A).await;
+        insert_cr(&pool, repo, manifest, "oci_layer", HASH_C).await;
+        let adapter = PgRefcountReconcile::new(pool.clone());
+
+        let drift = adapter.scan_repo_drift(repo).await.unwrap();
+        assert!(
+            drift.repairs.is_empty(),
+            "oci_config/oci_layer sibling rows are not category 1/2/3 — no drift"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
     /// Quarantined artifacts are NOT reconciled into a refcount
     /// (evidence; excluded from category 1) and NOT swept (only
     /// `rejected` is category 3).

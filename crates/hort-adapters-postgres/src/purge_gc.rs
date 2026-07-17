@@ -847,6 +847,112 @@ mod tests {
         cleanup(&pool, repo).await;
     }
 
+    /// Manifest→blob membership (`oci_config` / `oci_layer`, #46 Item 1):
+    /// a live manifest keeps its config and layer blobs alive under GC,
+    /// exactly like `live_index_member_keeps_child_blob_then_frees_it`
+    /// keeps a child manifest alive — the GC-interaction resolution for
+    /// this item (issue #46 comment "Item 1 GC-interaction — RESOLVED")
+    /// requires these new kinds to behave identically to the shipped
+    /// `oci_index_member` precedent: GC-active, cross-kind counted, and
+    /// freed once the manifest's own edges are gone (manifest DELETE /
+    /// `delete_by_source` sweeps every kind for the source, same as an
+    /// index).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn live_manifest_blob_edges_keep_config_and_layer_blobs_then_free_them() {
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let repo = seed_repo(&pool).await;
+        // A config blob (own hash HASH_A), a layer blob (own hash
+        // HASH_C), and the single-image manifest artifact (own blob
+        // HASH_B) that references both.
+        let config = seed_artifact(&pool, repo, "config-blob", HASH_A, Some("released")).await;
+        let layer = seed_artifact(&pool, repo, "layer-blob", HASH_C, Some("released")).await;
+        let manifest = seed_artifact(&pool, repo, "image-manifest", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id IN ($1, $2, $3)")
+            .bind(config)
+            .bind(layer)
+            .bind(manifest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Each blob's own primary_content refcount (target = own hash).
+        insert_cr(&pool, repo, config, "primary_content", HASH_A).await;
+        insert_cr(&pool, repo, layer, "primary_content", HASH_C).await;
+        // The manifest → blob membership: one `oci_config` row + one
+        // `oci_layer` row, both `source = manifest`.
+        insert_cr(&pool, repo, manifest, "oci_config", HASH_A).await;
+        insert_cr(&pool, repo, manifest, "oci_layer", HASH_C).await;
+        assert_eq!(
+            cr_rows_for(&pool, manifest).await,
+            vec![
+                ("oci_config".into(), HASH_A.into()),
+                ("oci_layer".into(), HASH_C.into())
+            ],
+            "manifest carries one oci_config row and one oci_layer row"
+        );
+        append_event(&pool, config, "ArtifactExpired", 0).await;
+        append_event(&pool, layer, "ArtifactExpired", 0).await;
+
+        let adapter = PgPurgeGcPort::new(pool.clone());
+
+        // -- Phase 1: manifest is live → purging config/layer keeps them -
+        let config_refs = adapter.purge_artifact_refs(config).await.unwrap();
+        assert_eq!(config_refs.len(), 1);
+        assert_eq!(config_refs[0].content_hash.as_ref(), HASH_A);
+        assert_eq!(
+            config_refs[0].refs_remaining, 1,
+            "a live manifest keeps its config blob (cross-kind count)"
+        );
+        let layer_refs = adapter.purge_artifact_refs(layer).await.unwrap();
+        assert_eq!(layer_refs.len(), 1);
+        assert_eq!(layer_refs[0].content_hash.as_ref(), HASH_C);
+        assert_eq!(
+            layer_refs[0].refs_remaining, 1,
+            "a live manifest keeps its layer blob (cross-kind count)"
+        );
+        // Each blob's own primary_content row was swept; the manifest's
+        // membership rows survive (source = manifest, not the purged blob).
+        assert!(cr_rows_for(&pool, config).await.is_empty());
+        assert!(cr_rows_for(&pool, layer).await.is_empty());
+        assert_eq!(
+            cr_rows_for(&pool, manifest).await,
+            vec![
+                ("oci_config".into(), HASH_A.into()),
+                ("oci_layer".into(), HASH_C.into())
+            ],
+            "the manifest's oci_config/oci_layer edges survive the blob purge"
+        );
+
+        // -- Phase 2: manifest DELETE (delete_by_source) → blobs freed ---
+        // Manifest DELETE sweeps every `source = manifest` row (both
+        // kinds), same as an index DELETE. With no remaining reference,
+        // a re-purge of the config/layer blobs reports them GC-eligible.
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(manifest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let config_refs_after = adapter.purge_artifact_refs(config).await.unwrap();
+        assert_eq!(config_refs_after.len(), 1);
+        assert_eq!(config_refs_after[0].content_hash.as_ref(), HASH_A);
+        assert_eq!(
+            config_refs_after[0].refs_remaining, 0,
+            "once the manifest is deleted, its config blob is GC-eligible"
+        );
+        let layer_refs_after = adapter.purge_artifact_refs(layer).await.unwrap();
+        assert_eq!(layer_refs_after.len(), 1);
+        assert_eq!(layer_refs_after[0].content_hash.as_ref(), HASH_C);
+        assert_eq!(
+            layer_refs_after[0].refs_remaining, 0,
+            "once the manifest is deleted, its layer blob is GC-eligible"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
     /// A hard-deleted artifact row (FK cascade already swept its refs)
     /// is a clean no-op — nothing left to decrement.
     #[tokio::test]
