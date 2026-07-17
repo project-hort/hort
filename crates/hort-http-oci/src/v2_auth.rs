@@ -57,7 +57,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use hort_app::use_cases::oci_token_exchange_use_case::{
-    OciTokenExchangeError, OciTokenExchangeRequest,
+    OciAnonymousTokenRequest, OciTokenExchangeError, OciTokenExchangeRequest,
 };
 use hort_http_core::context::AppContext;
 
@@ -160,20 +160,36 @@ pub async fn handle_v2_auth(
     // body below — the gate itself is in `hort-app` so no caller can
     // skip it.
 
-    // Parse `Authorization: Basic <b64(user:PAT)>`.
-    let Some(plaintext) = extract_basic_password(&headers) else {
-        return unauthorized_with_challenge(&ctx, &query, "missing Basic credentials");
-    };
-
+    // Parse `Authorization: Basic <b64(user:PAT)>`. A MISSING credential
+    // is NOT an immediate 401 (#48): for PUBLIC pull-through repos the
+    // Distribution-Spec token flow mints an ANONYMOUS pull token so a
+    // `docker pull` against a public proxy works unauthenticated. The
+    // anonymous mint grants `pull` ONLY on public repos in the requested
+    // scope — private repos, push/delete, and `registry:catalog` are
+    // never anonymously granted (see
+    // `OciTokenExchangeUseCase::exchange_anonymous`). A malformed / empty
+    // `Basic` header is treated as absent → anonymous, exactly as before.
     let client_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
 
-    let request = OciTokenExchangeRequest {
-        plaintext_pat: plaintext,
-        service: query.service.clone(),
-        scopes: query.scope.clone(),
-        client_ip,
+    let result = match extract_basic_password(&headers) {
+        Some(plaintext) => {
+            let request = OciTokenExchangeRequest {
+                plaintext_pat: plaintext,
+                service: query.service.clone(),
+                scopes: query.scope.clone(),
+                client_ip,
+            };
+            exchange.exchange(request).await
+        }
+        None => {
+            let request = OciAnonymousTokenRequest {
+                service: query.service.clone(),
+                scopes: query.scope.clone(),
+            };
+            exchange.exchange_anonymous(request).await
+        }
     };
-    match exchange.exchange(request).await {
+    match result {
         Ok(resp) => {
             let body = V2AuthResponseBody {
                 token: resp.jwt.clone(),

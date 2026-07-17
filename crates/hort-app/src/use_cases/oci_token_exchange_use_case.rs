@@ -37,6 +37,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
+use uuid::Uuid;
 
 use hort_domain::entities::api_token::TokenCap;
 use hort_domain::entities::caller::CallerPrincipal;
@@ -51,7 +52,7 @@ use crate::oci_token_signing::{
 };
 use crate::rbac::RbacEvaluator;
 use crate::use_cases::pat_validation_use_case::{PatValidationError, PatValidationUseCase};
-use crate::use_cases::repository_access::RepositoryAccessUseCase;
+use crate::use_cases::repository_access::{AccessLevel, RepositoryAccessUseCase};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -89,6 +90,18 @@ pub struct OciTokenExchangeRequest {
     /// Client IP for the brute-force-lockout gate. `None` for
     /// in-process callers (tests / CLI).
     pub client_ip: Option<IpAddr>,
+}
+
+/// Raw input for the ANONYMOUS mint path (`/v2/auth` with NO `Basic`
+/// header). Carries no credential — the ABSENCE of a `plaintext_pat`
+/// (this type vs [`OciTokenExchangeRequest`]) is what selects the
+/// anonymous flow. No `client_ip`: there is no PAT to rate-limit. #48.
+pub struct OciAnonymousTokenRequest {
+    /// Echoed `service` query parameter — subject to the same
+    /// Step-0 `service=`-vs-`aud` gate as the credentialed path.
+    pub service: String,
+    /// Multi-`scope` query parameter values (as [`OciTokenExchangeRequest`]).
+    pub scopes: Vec<String>,
 }
 
 /// Successful response payload — the handler wraps this in the
@@ -211,33 +224,39 @@ impl OciTokenExchangeUseCase {
         }
     }
 
-    /// Drive the full /v2/auth flow.
-    pub async fn exchange(
+    /// Steps 0, 0.5, 1 — the credential-independent request-shape gate,
+    /// shared by [`exchange`](Self::exchange) (PAT) and
+    /// [`exchange_anonymous`](Self::exchange_anonymous) (no credential)
+    /// so the two mint paths run the IDENTICAL validation and cannot
+    /// drift on:
+    /// - **Step 0** — `service=`-vs-configured-`aud` match (the
+    ///   unbypassable, credential-independent registry-audience gate);
+    /// - **Step 0.5** — the `MAX_SCOPES` DoS bound;
+    /// - **Step 1** — scope-grammar parse.
+    ///
+    /// Runs BEFORE any credential work (a request-shape rejection is
+    /// independent of whether a credential was presented) and emits the
+    /// same denial metrics on rejection.
+    fn validate_service_and_parse_scopes(
         &self,
-        request: OciTokenExchangeRequest,
-    ) -> Result<OciTokenExchangeResponse, OciTokenExchangeError> {
-        // Step 0: the inbound `?service=` MUST
-        // match the configured registry audience. This is an
-        // unbypassable gate inside the shared use case — no inbound
-        // caller can skip it. It runs BEFORE scope parse and
-        // BEFORE the expensive Argon2 PAT verify: a `service` mismatch
-        // means the client is talking to the wrong registry entirely,
-        // so the scopes + credential are moot. Comparison is
-        // case-insensitive (RFC 3986 §3.2.2 — DNS hostnames are
-        // case-insensitive) and whitespace-trimmed; an empty requested
-        // service after trim cannot equal a non-empty configured host
-        // and therefore mismatches → 400. Bare-host vs bare-host: a
-        // client that sends a scheme or port (`https://host`,
-        // `host:5000`) mismatches and 400s — that is itself a
-        // misconfiguration worth surfacing.
-        let requested = normalize_service(&request.service);
+        service: &str,
+        scopes: &[String],
+    ) -> Result<Vec<ParsedScope>, OciTokenExchangeError> {
+        // Step 0: the inbound `?service=` MUST match the configured
+        // registry audience. Case-insensitive (RFC 3986 §3.2.2 — DNS
+        // hostnames are case-insensitive) and whitespace-trimmed; an
+        // empty requested service after trim cannot equal a non-empty
+        // configured host and therefore mismatches → 400. A client that
+        // sends a scheme or port (`https://host`, `host:5000`) mismatches
+        // and 400s — that is itself a misconfiguration worth surfacing.
+        let requested = normalize_service(service);
         let expected = normalize_service(&self.config.jwt_audience);
         if requested != expected {
             emit_verify_metric(VerifyResultLabel::ServiceMismatch);
             // Audit fact (client/config error, NOT an `error!`): both
             // values are hostnames (server config + client-echoed) — no
-            // credential, no PII. The wire body stays
-            // constant; the operator-debuggable detail lives here.
+            // credential, no PII. The wire body stays constant; the
+            // operator-debuggable detail lives here.
             tracing::info!(
                 event = "oci_v2_auth_denied",
                 reason = "service_mismatch",
@@ -251,34 +270,28 @@ impl OciTokenExchangeUseCase {
             });
         }
 
-        // Step 0.5: bound the scope count BEFORE parsing or the Argon2
-        // PAT verify. Each repository scope drives one indexed DB lookup
-        // in Step 4's authorization loop; an unbounded `scope=` count is
-        // a (PAT-gated) DoS amplification surface. Reject the largest
-        // input earliest — the same cheap, deterministic request-shape
-        // tier as the Step-0 service gate. Reuses the `invalid_scope`
-        // result label (a too-many-scopes request is a malformed request
-        // in aggregate) so no new metric label value is introduced; the
-        // distinct `reason="too_many_scopes"` rides the audit log.
-        if request.scopes.len() > MAX_SCOPES {
+        // Step 0.5: bound the scope count BEFORE parsing. Each repository
+        // scope drives one indexed DB lookup in the authorization loop;
+        // an unbounded `scope=` count is a DoS amplification surface.
+        // Reject the largest input earliest. Reuses the `invalid_scope`
+        // result label; the distinct `reason="too_many_scopes"` rides the
+        // audit log.
+        if scopes.len() > MAX_SCOPES {
             emit_result_metric(ResultLabel::InvalidScope);
             emit_verify_metric(VerifyResultLabel::Denied);
             tracing::info!(
                 event = "oci_v2_auth_denied",
                 reason = "too_many_scopes",
-                count = request.scopes.len(),
+                count = scopes.len(),
                 max = MAX_SCOPES,
                 "/v2/auth rejected: scope count exceeds MAX_SCOPES"
             );
             return Err(OciTokenExchangeError::TooManyScopes);
         }
 
-        // Step 1: parse every scope BEFORE PAT validation. A malformed
-        // scope is a deterministic 400 regardless of credential
-        // validity; emitting it before the (expensive) Argon2 verify
-        // saves work and produces a clearer client-side error.
-        let parsed: Vec<ParsedScope> = request
-            .scopes
+        // Step 1: parse every scope. A malformed scope is a deterministic
+        // 400 regardless of credential validity.
+        scopes
             .iter()
             .map(|raw| parse_scope(raw))
             .collect::<Result<_, _>>()
@@ -286,7 +299,136 @@ impl OciTokenExchangeUseCase {
                 emit_result_metric(ResultLabel::InvalidScope);
                 emit_verify_metric(VerifyResultLabel::Denied);
                 OciTokenExchangeError::InvalidScope { raw }
-            })?;
+            })
+    }
+
+    /// Mint an ANONYMOUS pull token (#48) — the `/v2/auth` path with NO
+    /// `Authorization: Basic` header. Rather than an unconditional 401,
+    /// the Distribution-Spec token flow issues a token so a
+    /// challenge-driven `docker pull` against a PUBLIC pull-through repo
+    /// succeeds without credentials.
+    ///
+    /// For each requested `repository:<name>:…` scope, `pull` is granted
+    /// **iff the repo is PUBLIC** — precisely when an anonymous (`None`)
+    /// actor's `resolve(Read)` succeeds. That mint-side predicate is
+    /// BYTE-IDENTICAL to the consume-side read gate
+    /// ([`RepositoryAccessUseCase::resolve`] with `actor = None`), so
+    /// mint ≡ consume: a repo the anonymous caller could not read is
+    /// never echoed as grantable. Private repos, non-`pull` actions
+    /// (`push`/`delete`), and the `registry:catalog` scope are NEVER
+    /// anonymously granted — they are silently omitted from `access[]`.
+    ///
+    /// The minted JWT carries `sub = Uuid::nil()`, the anonymous
+    /// sentinel: it owns no `GrantSubject::User` `PermissionGrant`s, so
+    /// on consume its effective authority is `is_public`-read only (ADR
+    /// 0036 — the token `access[]` is an UPPER BOUND intersected with the
+    /// subject's grants, not a direct grant; an empty grants leg yields
+    /// no ambient authority). An all-private / all-`push` request still
+    /// mints a valid token with an EMPTY `access[]` (the Distribution-Spec
+    /// "anonymous ping" token) — a 200, never a 401 — letting the client
+    /// finish its handshake and then read any public repo anonymously.
+    pub async fn exchange_anonymous(
+        &self,
+        request: OciAnonymousTokenRequest,
+    ) -> Result<OciTokenExchangeResponse, OciTokenExchangeError> {
+        // Steps 0, 0.5, 1 — same request-shape gate as the credentialed
+        // path (service/aud match, MAX_SCOPES, scope parse).
+        let parsed = self.validate_service_and_parse_scopes(&request.service, &request.scopes)?;
+
+        // Per-scope authorization for an ANONYMOUS actor. Grant `pull`
+        // iff the repo is public; nothing else is anonymously grantable.
+        let mut granted: Vec<AccessEntry> = Vec::with_capacity(parsed.len());
+        for scope in &parsed {
+            match scope.resource_type {
+                ResourceType::Repository => {
+                    // Only `pull` is anonymously grantable; push/delete
+                    // are never anonymous.
+                    if !scope.actions.contains(&ScopeAction::Pull) {
+                        continue;
+                    }
+                    // is_public gate — the IDENTICAL predicate the consume
+                    // side applies: an anonymous (`None`) Read `resolve`
+                    // succeeds iff the repo EXISTS and is PUBLIC. A private
+                    // or missing repo resolves to `Err` (anti-enumeration
+                    // `NotFound`) → no grant, no leak. Resolve by the
+                    // owning first-segment key (mirrors `evaluate_scope`
+                    // and the `/v2/*` consume route param).
+                    let repo_key = scope_name_to_repo_key(&scope.resource_name);
+                    if self
+                        .repo_access
+                        .resolve(repo_key, None, AccessLevel::Read)
+                        .await
+                        .is_ok()
+                    {
+                        emit_action_metric(ScopeAction::Pull.wire_str());
+                        granted.push(AccessEntry {
+                            // Echo the FULL `resource_name` per the
+                            // Distribution Spec (only the authz lookup uses
+                            // the first segment).
+                            resource_type: scope.resource_type.wire_str().to_string(),
+                            name: scope.resource_name.clone(),
+                            actions: vec![ScopeAction::Pull.wire_str().to_string()],
+                        });
+                    }
+                }
+                ResourceType::Registry => {
+                    // registry:catalog is never anonymously granted (no
+                    // ambient authority on the anonymous surface).
+                }
+            }
+        }
+
+        // Metrics: an anonymous mint has no credential to reject, so the
+        // verify axis is always `ok`. Grant breadth: empty → no_grant,
+        // else full_grant (every granted scope received its single
+        // requested `pull`).
+        emit_result_metric(if granted.is_empty() {
+            ResultLabel::NoGrant
+        } else {
+            ResultLabel::FullGrant
+        });
+
+        // Mint the JWT with the anonymous sentinel subject.
+        let now = Utc::now();
+        let exp = now
+            + chrono::Duration::from_std(self.config.mint_ttl)
+                .unwrap_or_else(|_| chrono::Duration::seconds(300));
+        let claims = OciAccessClaims {
+            iss: self.config.jwt_issuer.clone(),
+            sub: Uuid::nil(),
+            aud: self.config.jwt_audience.clone(),
+            exp,
+            access: granted.clone(),
+        };
+        let jwt = match self.signing_key.mint(&claims) {
+            Ok(jwt) => jwt,
+            Err(err) => {
+                emit_verify_metric(VerifyResultLabel::Denied);
+                return Err(err.into());
+            }
+        };
+        emit_verify_metric(VerifyResultLabel::Ok);
+
+        Ok(OciTokenExchangeResponse {
+            jwt,
+            expires_in_secs: self.config.mint_ttl.as_secs(),
+            issued_at: now,
+            granted_subset: granted,
+        })
+    }
+
+    /// Drive the full /v2/auth flow.
+    pub async fn exchange(
+        &self,
+        request: OciTokenExchangeRequest,
+    ) -> Result<OciTokenExchangeResponse, OciTokenExchangeError> {
+        // Steps 0, 0.5, 1 — the credential-independent request-shape
+        // gate (`service=`/`aud` match, `MAX_SCOPES` bound, scope-grammar
+        // parse). Extracted so the anonymous path (`exchange_anonymous`)
+        // runs the IDENTICAL gate — the two mint paths cannot drift on
+        // request validation, in particular the unbypassable Step-0
+        // service/audience check.
+        let parsed = self.validate_service_and_parse_scopes(&request.service, &request.scopes)?;
 
         // Step 2: validate the PAT.
         let validation = self
@@ -1627,6 +1769,283 @@ mod tests {
 
     fn ip() -> IpAddr {
         "203.0.113.42".parse().unwrap()
+    }
+
+    // -- #48 anonymous mint (`exchange_anonymous`) ---------------------
+
+    /// A PUBLIC repo with the given key — [`build_repo`] defaults to
+    /// `is_public: false`, so the anonymous grant tests flip the bit.
+    fn build_public_repo(key: &str) -> Repository {
+        let mut r = build_repo(key);
+        r.is_public = true;
+        r
+    }
+
+    /// Core #48: public repo + `pull`, NO credential → 200 with exactly
+    /// one `pull` `access[]` entry echoing the FULL scope name.
+    #[test]
+    fn anonymous_public_repo_grants_pull() {
+        let snap = capture_async(|| async {
+            let (uc, _t, _u, repos) = make_use_case(vec![], true);
+            repos.insert(build_public_repo("dockerhub-proxy"));
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:dockerhub-proxy/library/alpine:pull".into()],
+                })
+                .await
+                .expect("anonymous mint succeeds");
+            assert_eq!(res.granted_subset.len(), 1, "one granted scope");
+            let e = &res.granted_subset[0];
+            assert_eq!(e.resource_type, "repository");
+            assert_eq!(e.name, "dockerhub-proxy/library/alpine");
+            assert_eq!(e.actions, vec!["pull".to_string()]);
+            assert!(!res.jwt.is_empty(), "a JWT is minted");
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_oci_v2_auth_total", &[("result", "full_grant")]),
+            1,
+            "a granted anonymous mint classifies as full_grant"
+        );
+        assert_eq!(
+            counter_value(&snap, "hort_oci_auth_verify_total", &[("result", "ok")]),
+            1,
+            "an anonymous mint has no credential to reject → verify ok"
+        );
+    }
+
+    /// Private repo + `pull`, anonymous → 200 with EMPTY `access[]` (the
+    /// Distribution-Spec "anonymous ping" token). Never a leak, never a
+    /// 401: the read gate is enforced later at the resource endpoint.
+    #[test]
+    fn anonymous_private_repo_grants_nothing() {
+        let snap = capture_async(|| async {
+            let (uc, _t, _u, repos) = make_use_case(vec![], true);
+            // build_repo → is_public: false (private).
+            repos.insert(build_repo("private-oci"));
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:private-oci:pull".into()],
+                })
+                .await
+                .expect("anonymous mint still succeeds (200, empty access)");
+            assert!(
+                res.granted_subset.is_empty(),
+                "a private repo is never anonymously grantable"
+            );
+            assert!(
+                !res.jwt.is_empty(),
+                "an empty-access ping token is still minted"
+            );
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_oci_v2_auth_total", &[("result", "no_grant")]),
+            1,
+            "an empty anonymous mint classifies as no_grant"
+        );
+    }
+
+    /// A repo that does not exist → no grant, no error, no enumeration
+    /// leak (the `resolve` `NotFound` collapses to "omit the scope").
+    #[test]
+    fn anonymous_missing_repo_grants_nothing() {
+        capture_async(|| async {
+            let (uc, _t, _u, _repos) = make_use_case(vec![], true);
+            // No repo inserted.
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:ghost:pull".into()],
+                })
+                .await
+                .expect("missing repo is not an error on the anonymous path");
+            assert!(res.granted_subset.is_empty());
+        });
+    }
+
+    /// `push` on a public repo — the parser promotes `push` to
+    /// `pull,push` — yields ONLY `pull`; `push` is NEVER anonymous.
+    #[test]
+    fn anonymous_public_repo_push_scope_grants_pull_only() {
+        capture_async(|| async {
+            let (uc, _t, _u, repos) = make_use_case(vec![], true);
+            repos.insert(build_public_repo("pub-hosted"));
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:pub-hosted:push".into()],
+                })
+                .await
+                .expect("mint succeeds");
+            assert_eq!(res.granted_subset.len(), 1);
+            assert_eq!(
+                res.granted_subset[0].actions,
+                vec!["pull".to_string()],
+                "push is never anonymously granted — only the implied pull, and only because the repo is public"
+            );
+        });
+    }
+
+    /// `delete`-only scope (no `pull`) on a public repo → nothing
+    /// granted (the `!contains(Pull)` guard skips it).
+    #[test]
+    fn anonymous_delete_only_scope_grants_nothing() {
+        capture_async(|| async {
+            let (uc, _t, _u, repos) = make_use_case(vec![], true);
+            repos.insert(build_public_repo("pub-del"));
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:pub-del:delete".into()],
+                })
+                .await
+                .expect("mint succeeds");
+            assert!(
+                res.granted_subset.is_empty(),
+                "a delete-only scope carries no pull → nothing anonymously grantable"
+            );
+        });
+    }
+
+    /// `registry:catalog` is never anonymously granted (no ambient
+    /// authority on the anonymous surface).
+    #[test]
+    fn anonymous_registry_catalog_grants_nothing() {
+        capture_async(|| async {
+            let (uc, _t, _u, _repos) = make_use_case(vec![], true);
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["registry:catalog:*".into()],
+                })
+                .await
+                .expect("mint succeeds");
+            assert!(res.granted_subset.is_empty());
+        });
+    }
+
+    /// Mixed public + private scopes → ONLY the public repo is granted
+    /// pull; the private one is silently omitted.
+    #[test]
+    fn anonymous_mixed_scopes_grants_only_public() {
+        capture_async(|| async {
+            let (uc, _t, _u, repos) = make_use_case(vec![], true);
+            repos.insert(build_public_repo("pub"));
+            repos.insert(build_repo("priv")); // private
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:pub:pull".into(), "repository:priv:pull".into()],
+                })
+                .await
+                .expect("mint succeeds");
+            assert_eq!(res.granted_subset.len(), 1);
+            assert_eq!(res.granted_subset[0].name, "pub");
+            assert_eq!(res.granted_subset[0].actions, vec!["pull".to_string()]);
+        });
+    }
+
+    /// The shared Step-0 gate applies to the anonymous path too: a
+    /// `service=` that does not match the configured `aud` → 400
+    /// `ServiceMismatch` (proves the anonymous path cannot bypass it).
+    #[test]
+    fn anonymous_service_mismatch_is_rejected() {
+        capture_async(|| async {
+            let (uc, _t, _u, repos) = make_use_case(vec![], true);
+            repos.insert(build_public_repo("pub"));
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "evil.example.com".into(),
+                    scopes: vec!["repository:pub:pull".into()],
+                })
+                .await;
+            assert!(
+                matches!(res, Err(OciTokenExchangeError::ServiceMismatch { .. })),
+                "anonymous path is still gated on service=/aud"
+            );
+        });
+    }
+
+    /// Shared Step-0.5 gate: more than `MAX_SCOPES` requested → 400
+    /// `TooManyScopes`, before any per-scope work.
+    #[test]
+    fn anonymous_too_many_scopes_is_rejected() {
+        capture_async(|| async {
+            let (uc, _t, _u, _repos) = make_use_case(vec![], true);
+            let scopes: Vec<String> = (0..=MAX_SCOPES)
+                .map(|i| format!("repository:pub{i}:pull"))
+                .collect();
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes,
+                })
+                .await;
+            assert!(matches!(res, Err(OciTokenExchangeError::TooManyScopes)));
+        });
+    }
+
+    /// Shared Step-1 gate: a malformed scope → 400 `InvalidScope`.
+    #[test]
+    fn anonymous_invalid_scope_is_rejected() {
+        capture_async(|| async {
+            let (uc, _t, _u, _repos) = make_use_case(vec![], true);
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["not-a-valid-scope".into()],
+                })
+                .await;
+            assert!(matches!(
+                res,
+                Err(OciTokenExchangeError::InvalidScope { .. })
+            ));
+        });
+    }
+
+    /// SECURITY round-trip: an anonymous token minted for a public repo,
+    /// re-consumed via [`verify_inbound`](OciTokenExchangeUseCase::verify_inbound),
+    /// synthesizes a principal whose subject is the anonymous sentinel
+    /// `Uuid::nil()` and whose cap is `pull`→`Read` ONLY (never `Write`
+    /// / `Delete`). Since the synthesized subject owns NO
+    /// `GrantSubject::User` grants, its effective authority on consume is
+    /// `is_public`-read only (ADR 0036) — the token confers no ambient
+    /// authority.
+    #[test]
+    fn anonymous_token_verifies_as_nil_subject_pull_only() {
+        capture_async(|| async {
+            let (uc, _t, _u, repos) = make_use_case(vec![], true);
+            repos.insert(build_public_repo("pub"));
+            let res = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:pub:pull".into()],
+                })
+                .await
+                .expect("mint succeeds");
+            match uc.verify_inbound(&res.jwt) {
+                OciVerifyOutcome::Verified(p) => {
+                    assert_eq!(
+                        p.user_id,
+                        Uuid::nil(),
+                        "anonymous token carries the nil sentinel subject"
+                    );
+                    let cap = p.token_cap.expect("cap present");
+                    assert!(cap.permissions.contains(&Permission::Read), "pull → Read");
+                    assert!(
+                        !cap.permissions.contains(&Permission::Write),
+                        "no Write in an anonymous token"
+                    );
+                    assert!(
+                        !cap.permissions.contains(&Permission::Delete),
+                        "no Delete in an anonymous token"
+                    );
+                    assert!(p.claims.is_empty(), "no ambient claims");
+                }
+                other => panic!("expected Verified, got {other:?}"),
+            }
+        });
     }
 
     // -- hort_oci_v2_auth_total — failure paths ------------------------
