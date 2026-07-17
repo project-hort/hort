@@ -548,16 +548,19 @@ fn step2b_v2_auth_mints_under_disabled_auth_through_real_router() {
 }
 
 // ===========================================================================
-// Step 3 — `/v2/auth` with no Authorization → 401 + Bearer challenge
-// (the same realm/service shape as step 1).
+// Step 3 — `/v2/auth` with no Authorization now mints an ANONYMOUS token
+// (#48). Rather than a 401, the Distribution-Spec token flow returns 200
+// with a token so anonymous `docker pull` of a PUBLIC repo works. The 401
+// Bearer challenge moves to the RESOURCE endpoint (manifest/blob), which
+// still gates private repos. This SUPERSEDES the pre-#48 behaviour where
+// `/v2/auth` itself 401'd on missing credentials.
 // ===========================================================================
 
 #[test]
-fn step3_v2_auth_without_credentials_returns_401_with_challenge() {
-    // Send `service=…` only (no `scope=`). The 401-Bearer-challenge
-    // invariant pinned here is independent of scope; the scoped-request
-    // deserialisation is covered by the dedicated scope tests below.
-    let (status, www, body_text) = run(async {
+fn step3_v2_auth_without_credentials_mints_anonymous_token() {
+    // No `Authorization`, no `scope=` — a bare anonymous ping. Must be a
+    // 200 with a JWT (empty `access[]`), NOT a 401 challenge.
+    let (status, www, body_json) = run(async {
         let h = build_harness();
         let router =
             oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
@@ -574,21 +577,60 @@ fn step3_v2_auth_without_credentials_returns_401_with_challenge() {
             .headers()
             .get(header::WWW_AUTHENTICATE)
             .map(|v| v.to_str().unwrap().to_string());
-        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
-        let body_text = String::from_utf8_lossy(&body).to_string();
-        (status, www, body_text)
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (status, www, body_json)
     });
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
-        "/v2/auth without creds must 401, got {status}: {body_text}"
+        StatusCode::OK,
+        "#48: /v2/auth without creds mints an anonymous token, not a 401: {body_json}"
     );
-    let www = www.expect("WWW-Authenticate must be re-emitted on /v2/auth itself");
     assert!(
-        www.starts_with("Bearer"),
-        "expected Bearer challenge: {www}"
+        www.is_none(),
+        "a 200 anonymous mint carries no WWW-Authenticate challenge: {www:?}"
     );
-    assert!(www.contains(r#"realm="https://hort.example.com/v2/auth""#));
+    let token = body_json["token"]
+        .as_str()
+        .expect("response carries `token`");
+    assert_eq!(
+        token.split('.').count(),
+        3,
+        "anonymous token is a JWT (header.payload.signature)"
+    );
+}
+
+#[test]
+fn step3b_v2_auth_anonymous_public_repo_scope_mints_token() {
+    // No credential + a PUBLIC-repo pull scope → 200 with a JWT. The
+    // token's `access[]` (proven pull-only, nil-subject at the use-case
+    // layer) lets an anonymous client pull the public repo.
+    let (status, body_json) = run(async {
+        let h = build_harness();
+        let uri = format!(
+            "/v2/auth?service=hort.example.com&scope=repository:{}:pull",
+            h.repo_key
+        );
+        let router =
+            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let resp = router
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (status, body_json)
+    });
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "anonymous pull of a public repo mints a token: {body_json}"
+    );
+    let token = body_json["token"]
+        .as_str()
+        .expect("response carries `token`");
+    assert_eq!(token.split('.').count(), 3, "minted token is a JWT");
 }
 
 // ===========================================================================
