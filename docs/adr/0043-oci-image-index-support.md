@@ -106,6 +106,36 @@ layer-level-safety model above is unchanged — a scan-rejected layer under a
 signed, released index still 404s, and a never-signed index's constituents
 still reject `Unsigned` at window expiry.
 
+### Manifest→blob membership edges + per-node release for descendants (issue #46, amended 2026-07-17)
+
+`content_references` membership is now complete for the whole proxy tree, not
+just index→child manifest: a single-image manifest PUT additionally writes one
+row per referenced blob — `kind = "oci_config"` for the config blob,
+`"oci_layer"` for each layer blob — `source = manifest artifact, target =
+blob's own content hash`, through the same content-reference use case
+(adapter-free, ADR 0008) as `oci_index_member`. Bounded by the existing
+`MAX_BLOB_REFERENCES`; idempotent on re-PUT via the widened PK (point 2 above).
+An index PUT is unaffected — it has no config/layers, only `oci_index_member`
+for its children. These are GC-active keepalive edges exactly like
+`oci_index_member` / `oci_subject` — the refcount query's cross-`kind` count
+already covers them with no adapter change, and they are orthogonal to (not
+double-counted against) the config/layer blob's `ArtifactGroupUseCase` group
+membership.
+
+**Per-node release, no re-window for referenced descendants.** Consistent with
+this ADR's existing per-artifact release model (see "Why a released index over
+a held/rejected child is safe" above): each constituent — child manifest,
+config blob, layer blob — is independently scanned and independently gated.
+[ADR 0007](0007-fail-closed-quarantine-release-predicate.md)'s
+referenced-tree-descendant carve-out (amended alongside this one) uses the
+now-complete membership graph to identify any `content_references` **target**
+as a descendant and collapse its ingest-time observation window to zero — it
+still releases only on its own `ScanSucceeded`, exactly like every other
+artifact in this ADR's per-child model; nothing here changes the release
+predicate. This closes the "stacked quarantine waves" operability gap a cold
+pull of an already-released multi-arch image previously hit — each descendant
+no longer has to sit out a fresh window after its own scan completes.
+
 ## Consequences
 
 - **`content_references` is now the proper many-to-many.** The four existing
@@ -144,13 +174,19 @@ still reject `Unsigned` at window expiry.
 - **Deferred follow-on — promotion cascade:** `PromotionUseCase`
   (`crates/hort-app/src/use_cases/promotion_use_case.rs`) has **no index
   awareness**: promoting an image index copies the index artifact alone and does
-  **not** cascade to its `oci_index_member` child manifests, so a promoted index
-  would dangle in the target repo with its children absent (a pull of the
-  promoted multi-arch tag resolves the index but `MANIFEST_BLOB_UNKNOWN`s on each
-  platform child). Teaching promotion to walk the `oci_index_member` edges and
-  promote the children (and their blobs) alongside the index is a deferred
+  **not** cascade to its `oci_index_member` child manifests, nor — since the
+  #46 amendment above — to a manifest's `oci_config`/`oci_layer` blobs, so a
+  promoted index would dangle in the target repo with its children/blobs
+  absent (a pull of the promoted multi-arch tag resolves the index but
+  `MANIFEST_BLOB_UNKNOWN`s on each platform child). Teaching promotion to walk
+  the full membership graph (`oci_index_member` + `oci_config` + `oci_layer`
+  edges) and promote the descendants alongside the index is a deferred
   follow-on — recorded as the **OCI image-index promotion cascade** row in the
-  ADR 0000 open-items register (OPEN).
+  ADR 0000 open-items register (OPEN). The membership graph this needs is now
+  complete (#46 Item 1); the cascade itself is still not implemented, but it
+  can reuse the same "descendant inherits parent decision" primitive that
+  [ADR 0007](0007-fail-closed-quarantine-release-predicate.md)'s zero-window
+  carve-out established on the release-timing axis.
 
 - **Out of scope:** Docker schema-1 manifest lists (legacy; mirrors the existing
   single-image posture). No new artifact-schema change — indexes are stored as
@@ -189,8 +225,14 @@ still reject `Unsigned` at window expiry.
   write-authorized manifest HEAD-and-GET exemption (§10) the push-then-sign
   payoff reuses.
 - Migration `013_content_references_multivalue_pk.sql` — the widened PK.
-- The `oci_index_member` kind vocabulary in
-  `crates/hort-domain/src/ports/content_reference_index.rs`.
+- The `oci_index_member` / `oci_config` / `oci_layer` kind vocabulary in
+  `crates/hort-domain/src/ports/content_reference_index.rs`; the `oci_config`
+  / `oci_layer` write loop in
+  `crates/hort-http-oci/src/manifests_write.rs` (issue #46 Item 1).
+- Issue #46 — proxy-tree release without stacked quarantine waves; the
+  referenced-tree-descendant zero-window carve-out amended into
+  [ADR 0007](0007-fail-closed-quarantine-release-predicate.md) alongside this
+  amendment.
 - E2E regression gate:
   `scripts/native-tests/scenarios/quarantine/oci-image-index.sh` (multi-arch
   push accepted, index served with the index Content-Type, and — under a hold —
