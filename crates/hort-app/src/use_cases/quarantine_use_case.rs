@@ -2146,6 +2146,80 @@ mod tests {
 
     // -- record_scan_result tests --------------------------------------------
 
+    /// #46 Item 2 acceptance #3: a referenced-tree descendant whose
+    /// window has already collapsed to zero (`quarantine_window_start`
+    /// backdated by a full `quarantineDuration`, exactly what the
+    /// `IngestUseCase` target-check produces) still rejects on a dirty
+    /// scan — fail-closed intact. The `ScanOutcome::Reject` branch never
+    /// reads `quarantine_window_start` / the event-driven fast-path at
+    /// all (it is a structurally separate branch from
+    /// `ScanOutcome::Clean`'s fast-path release), so an already-elapsed
+    /// window must NOT be mistaken for a release authority — the
+    /// artifact still needs `reject_from_scan` to run its own course.
+    #[tokio::test]
+    async fn record_scan_result_zero_window_descendant_with_findings_still_rejects() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        // Backdate the anchor by a full default-policy duration (24h) —
+        // the exact shape `IngestUseCase`'s referenced-tree-descendant
+        // target-check produces: `anchor + duration == ingested_at`,
+        // i.e. the window has already elapsed at scan time.
+        artifact.quarantine_window_start =
+            Some(Utc::now() - chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs()));
+        let artifact_id = artifact.id;
+        let mut repo = sample_repository();
+        repo.id = artifact.repository_id;
+        artifacts.insert(artifact);
+        repositories.insert(repo);
+
+        let severity = SeveritySummary {
+            critical: 1,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved_artifact, batch, _metadata) = &transitions[0];
+        assert!(matches!(
+            &batch.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+        assert!(matches!(
+            &batch.events[1].event,
+            DomainEvent::PolicyEvaluated(_)
+        ));
+        assert!(
+            matches!(&batch.events[2].event, DomainEvent::ArtifactRejected(_)),
+            "an already-elapsed window must not substitute for a release authority: \
+             a dirty scan on a zero-window descendant must still reject"
+        );
+        assert_eq!(
+            saved_artifact.quarantine_status,
+            QuarantineStatus::Rejected,
+            "fail-closed intact: findings reject a zero-window descendant exactly \
+             like a full-window artifact — no ArtifactReleased anywhere in the batch"
+        );
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_))),
+            "no unscanned/timer-only release: the batch must carry no ArtifactReleased event"
+        );
+    }
+
     /// One critical CVE with no policy → DefaultPolicy::block_on_critical
     /// rejects. ScanCompleted + PolicyEvaluated(Fail) + ArtifactRejected
     /// must land in a single atomic commit_transition.
