@@ -91,18 +91,51 @@ the public registry (see *Docker tags* below). The `§3.4` chart-version
 invariant (`Chart.yaml` `version` + `appVersion` == the tag) holds because
 the bump is on the tagged commit.
 
-### A future public pre-release track (`beta` / `rc`) — reserved, not in use
+## Beta pre-release — `vX.Y.Z-beta.N` (PUBLIC, `internal + ghcr`)
 
-The `alpha` rename intentionally leaves `beta`/`rc` unused so a future
-**public** pre-release track can adopt them without a naming collision
-(semver orders `alpha < beta < rc`). That track is not decided or wired up
-today: `docker-publish.yml`'s generic `v*` tag trigger already publishes a
-`-beta.N`/`-rc.N` *versioned* tag publicly if one were pushed (it only
-excludes `:latest` for any pre-release, not the versioned tag itself), and
-neither the GitLab regex nor the GitHub exclusion below single those names
-out — so the naming room exists structurally, but there is no
-`test/*`-branch-style mechanism (or maintainer decision) for a public
-pre-release yet. If/when one is designed, its mechanics belong here.
+**Public** pre-release of the `X.Y.Z` candidate — for external testing before
+the final `develop → main` promotion. Same throwaway-branch mechanism as the
+alpha, but published **both** to the internal registry **and** publicly to
+ghcr + a GitHub pre-release. (semver orders `alpha < beta < rc`; `rc` stays
+reserved for the same shape if ever needed.)
+
+```bash
+git fetch origin
+git checkout -b test/vX.Y.Z-beta.N origin/develop
+# bump Cargo.toml + Chart.yaml (version + appVersion) X.Y.Z-dev → X.Y.Z-beta.N
+cargo check --workspace                     # rewrites Cargo.lock member versions
+# … run the local gate (fmt/clippy) …
+git commit -am "chore(release): X.Y.Z-beta.N"   # do NOT touch CHANGELOG.md
+git tag vX.Y.Z-beta.N
+git push origin test/vX.Y.Z-beta.N          # branch — staging can deploy it
+git push origin vX.Y.Z-beta.N               # tag → GitLab pipeline publishes to the INTERNAL registry
+git checkout develop                        # do NOT merge or delete the test/* branch
+```
+
+Then sync to **github-public** (holds the public-release creds; `docker-publish.yml`
++ `release.yml` run there):
+
+```bash
+git push github-public origin/develop:refs/heads/develop   # sync develop
+git push github-public vX.Y.Z-beta.N                        # tag → ghcr publish + GitHub release
+```
+
+- **Internal** publish: the GitLab tag pipeline (`$CI_COMMIT_TAG` rules) builds +
+  publishes `:X.Y.Z-beta.N` to the internal registry — same jobs as the alpha.
+- **Public** publish: GitHub `docker-publish.yml` (`v*` trigger) builds ghcr
+  images `:X.Y.Z-beta.N` — it excludes **only** `-alpha.` (`!contains(github.ref,
+  '-alpha.')`), so a `-beta` tag publishes; `:latest` is **not** moved (the
+  `!contains(github.ref, '-')` guard). `release.yml` cuts a GitHub release —
+  confirm it is marked **pre-release** (the `-beta` suffix; tick the box if the
+  workflow did not auto-mark it).
+- **Not merged back** — develop stays `X.Y.Z-dev`. `CHANGELOG.md` is **untouched**
+  (the running `[Unreleased]` still stamps once at the final `X.Y.Z` promotion).
+- The `§3.4` chart-version invariant (`Chart.yaml` `version`/`appVersion` == the
+  tag) holds because the bump is on the tagged commit.
+
+`rc` is not in use; if a release-candidate track is ever wanted it follows this
+exact shape (`vX.Y.Z-rc.N`), since neither the GitLab tag rules nor the GitHub
+`-alpha.`-only exclusion single it out.
 
 ## Final release — `vX.Y.Z` (promote `develop → main`)
 
