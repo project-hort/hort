@@ -213,10 +213,16 @@ variables:
   # `scripts/check-rust-version.sh`. GitLab pins the image explicitly so a
   # silent toolchain bump can't break the gate.
   RUST_IMAGE: "rust:1.94-slim"
-  # Same toolchain as RUST_IMAGE (built FROM rust:1.94-slim) with sccache on PATH,
-  # used only by the test jobs that extend .sccache. Identical clippy/fmt behaviour
-  # and MSRV; sccache is the only addition. Only tag published is :latest.
+  # FAST path (deliberate dev-cycle speedup): pre-baked rust:1.94-slim + sccache
+  # on PATH, used by the test jobs that extend .sccache. FALLBACK: the
+  # .sccache-install anchor (below) is a NO-OP when this image already ships
+  # sccache, but installs it on a stock image — so hort is never HARD-dependent
+  # on the custom image. To build without it (custom image unavailable, or off
+  # our internal registry entirely), override RUST_SCCACHE_IMAGE=${RUST_IMAGE}
+  # and sccache is installed inline. (The canonical GitHub Actions build already
+  # runs stock — it cannot reach mirror.kdp.kloni.cloud.)
   RUST_SCCACHE_IMAGE: "mirror.kdp.kloni.cloud/ci/rust-sccache:latest"
+  SCCACHE_VERSION: "0.16.0"
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: "always"
@@ -270,6 +276,24 @@ variables:
   - apt-get update -qq
   - apt-get install -y -qq --no-install-recommends
       protobuf-compiler pkg-config libssl-dev ca-certificates curl git
+
+# FALLBACK sccache install (resilience, NOT a replacement for RUST_SCCACHE_IMAGE):
+# a NO-OP when the image already ships sccache (the fast pre-baked image), else
+# installs the sccache binary on a stock ${RUST_IMAGE} so hort still builds if
+# the custom image is unavailable. Runs after *rust-apt-deps (curl + ca-certs)
+# and before the .sccache mixin. Best-effort: on ANY error the mixin sees sccache
+# absent and skips RUSTC_WRAPPER -> the build still runs, just uncached.
+.sccache-install: &sccache-install
+  - |
+    if ! command -v sccache >/dev/null 2>&1; then
+      echo "sccache not in image — installing inline (fallback path)"
+      _V="${SCCACHE_VERSION:-0.16.0}"; _A="sccache-v${_V}-x86_64-unknown-linux-musl"
+      ( curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${_V}/${_A}.tar.gz" \
+          | tar -xz -C /tmp \
+        && install -m0755 "/tmp/${_A}/sccache" /usr/local/bin/sccache \
+        && sccache --version ) \
+      || echo "sccache install failed — building uncached (fail-safe)"
+    fi
 
 # Fetch the PREBUILT cargo-binstall (a single static binary) into
 # $CARGO_HOME/bin, so tool installs (`cargo binstall <tool>`) download a
@@ -486,6 +510,7 @@ test:unit:
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
     # extends:[.sccache] replaces before_script; chain its sccache setup back in.
     - *rust-apt-deps
+    - *sccache-install
     - *platform-ca-deb
     - *hort-auth-steps
     - !reference [.sccache, before_script]
@@ -584,6 +609,7 @@ test:integration:
     # can verify an internal-CA HORT_URL endpoint. Both precede hort-auth-steps.
     # extends:[.sccache] replaces before_script; chain its sccache setup back in.
     - *rust-apt-deps
+    - *sccache-install
     - *platform-ca-deb
     - *hort-auth-steps
     - !reference [.sccache, before_script]
