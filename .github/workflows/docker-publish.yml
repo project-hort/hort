@@ -519,18 +519,26 @@ jobs:
       # MISSING. The image-signing job stays on the default v3 — images use the
       # OCI-1.1 referrer, not the Flux `.sig` path.) Revisit once Flux verifies
       # the new bundle format, then unpin.
-      - name: Install cosign (v2.x — legacy .sig tag for Flux, #47)
+      - name: Install cosign
         if: steps.ver.outputs.publish == 'true'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: 'v2.4.1'
 
       # Sign the pushed chart keyless (Fulcio OIDC — same trust anchor as the
-      # public images) in LEGACY `.sig`-tag mode so Flux source-controller can
-      # discover the signature. On the pinned cosign v2.4.1 the legacy `.sig`
-      # tag is the default output; `--registry-referrers-mode=legacy` keeps it
-      # explicit. Consumers verify with a `matchOIDCIdentity` block — see
-      # docs/architecture/how-to/deploy/install.md §5.0.
+      # public images) in LEGACY `.sig`-tag mode so Flux source-controller
+      # (tag-based discovery) can find it via the `sha256-<digest>.sig` tag, not
+      # the OCI-1.1 Referrers API. This MIRRORS the working GitLab
+      # `helm:sign-chart` job (`.gitlab-ci.yml`) — the same three format flags,
+      # keyless here vs keyed (Vault) there:
+      #   --use-signing-config=false  disables the v3 signing-config path, so
+      #       --new-bundle-format=false is accepted (with the signing-config on,
+      #       cosign v3 demands --new-bundle-format or --bundle and errors out).
+      #   --new-bundle-format=false   classic simplesigning payload (not the v3
+      #       v0.3 bundle, which Flux can't read).
+      #   --registry-referrers-mode=legacy   writes the `sha256-<digest>.sig` tag
+      #       rather than an OCI-1.1 referrer.
+      # cosign v3 WITHOUT these writes a referrer + v0.3 bundle and NO .sig tag —
+      # exactly what the verify-published probe caught. Consumers verify with a
+      # `matchOIDCIdentity` block — see docs/architecture/how-to/deploy/install.md §5.0.
       - name: Sign chart with cosign (keyless, legacy .sig for Flux)
         if: steps.ver.outputs.publish == 'true'
         env:
@@ -539,6 +547,8 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign --yes \
+            --use-signing-config=false \
+            --new-bundle-format=false \
             --registry-referrers-mode=legacy \
             "${REGISTRY}/${OWNER}/charts/hort-server@${DIGEST}"
           echo "Signed (keyless, legacy .sig) ${REGISTRY}/${OWNER}/charts/hort-server@${DIGEST}"
