@@ -506,24 +506,30 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
 
-      - name: Install cosign
+      # Pin cosign to v2.x for the CHART signature specifically. The default
+      # cosign that `cosign-installer@v4` ships is v3.x, whose new Sigstore
+      # bundle format is on by default — it stores the signature as an OCI-1.1
+      # referring artifact and does NOT write the legacy `sha256-<digest>.sig`
+      # tag. Flux source-controller discovers a chart signature ONLY via that
+      # legacy `.sig` tag (install.md §5.0), so a v3-signed chart is
+      # undiscoverable by Flux even though `cosign sign` "succeeds". cosign v2.x
+      # writes the legacy `.sig` tag by default — the format Flux needs.
+      # (#47 re-fix 3: the flag-drop in !154 made signing succeed but on v3's
+      # new format → the verify-published `.sig`-tag probe correctly reported it
+      # MISSING. The image-signing job stays on the default v3 — images use the
+      # OCI-1.1 referrer, not the Flux `.sig` path.) Revisit once Flux verifies
+      # the new bundle format, then unpin.
+      - name: Install cosign (v2.x — legacy .sig tag for Flux, #47)
         if: steps.ver.outputs.publish == 'true'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v2.4.1'
 
       # Sign the pushed chart keyless (Fulcio OIDC — same trust anchor as the
       # public images) in LEGACY `.sig`-tag mode so Flux source-controller can
-      # discover the signature (it reads the `sha256-<digest>.sig` tag, not the
-      # OCI-1.1 Referrers API). The `.sig`-tag discovery is what Flux needs
-      # (install.md §5.0); `--registry-referrers-mode=legacy` writes that tag.
-      # NOTE (#47 re-fix): the earlier `--new-bundle-format=false` is INVALID
-      # under the installed cosign (v4.1.2) — keyless signing uses a
-      # signing-config, which rejects `--new-bundle-format=false` without a
-      # `--bundle` path ("must provide --new-bundle-format or --bundle …",
-      # exit 1). It was never caught because this job only runs on a github
-      # `v*` tag push, and v0.9.11-beta.1 was its first real execution. Dropped
-      # the flag so cosign uses its default bundle format (same as the working
-      # image-signing step above); the legacy `.sig` tag Flux discovers is
-      # unchanged. Consumers verify with a `matchOIDCIdentity` block — see
+      # discover the signature. On the pinned cosign v2.4.1 the legacy `.sig`
+      # tag is the default output; `--registry-referrers-mode=legacy` keeps it
+      # explicit. Consumers verify with a `matchOIDCIdentity` block — see
       # docs/architecture/how-to/deploy/install.md §5.0.
       - name: Sign chart with cosign (keyless, legacy .sig for Flux)
         if: steps.ver.outputs.publish == 'true'
