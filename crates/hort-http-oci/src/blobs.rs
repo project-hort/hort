@@ -289,10 +289,16 @@ pub(super) async fn serve(
             // falls through with the appropriate response.
             match try_upstream_blob_pull(&ctx, &repo, name, &hash).await {
                 UpstreamPullOutcome::Ingested(a) => (repo, *a),
-                UpstreamPullOutcome::NotConfigured | UpstreamPullOutcome::CurationBlocked => {
-                    // `CurationBlocked` collapses into the same
-                    // `BLOB_UNKNOWN` (404) envelope as `NotConfigured`:
-                    // client sees a clean miss.
+                UpstreamPullOutcome::NotConfigured
+                | UpstreamPullOutcome::CurationBlocked
+                | UpstreamPullOutcome::UpstreamNotFound => {
+                    // `CurationBlocked` and `UpstreamNotFound` (#53 —
+                    // a definitive upstream 404) both collapse into the
+                    // same terminal `BLOB_UNKNOWN` (404) envelope as
+                    // `NotConfigured`: client sees a clean, terminal
+                    // miss — critically NOT the retryable 502
+                    // `UpstreamUnavailable` maps to, which containerd
+                    // would sit on forever with no `ErrImagePull`.
                     return OciError::BlobUnknown {
                         digest: format!("sha256:{}", hash.as_ref()),
                     }
@@ -507,9 +513,23 @@ pub(crate) enum UpstreamPullOutcome {
     /// emitted `ChecksumMismatch`. Surface as 502 + cache write
     /// suppressed.
     ChecksumMismatch,
-    /// Upstream returned a non-success status (4xx/5xx besides
-    /// 404 — 404 collapses into `NotConfigured` semantically since
-    /// the local + upstream both lack the blob). Surface as 502.
+    /// Upstream returned a definitive `404 Not Found` for the blob — the
+    /// layer is genuinely absent upstream. Surfaced to the OCI client as
+    /// `BLOB_UNKNOWN` (404, **terminal**), the same bucket as
+    /// `NotConfigured` / `CurationBlocked`, NOT `UpstreamUnavailable`
+    /// (#53). This distinction is load-bearing: containerd treats a 502
+    /// as retryable and will sit in `Init`/`PodInitializing` forever with
+    /// no `ErrImagePull` if a genuine upstream miss is surfaced as 502
+    /// instead of a terminal 404.
+    UpstreamNotFound,
+    /// Upstream returned a non-success status OTHER than a definitive
+    /// 404 (5xx, or a transport/TLS-level failure) — a transient
+    /// condition where retrying later may succeed. Surface as 502
+    /// (retryable). Prior to #53 this variant *also* absorbed 404s
+    /// (an aspirational doc comment here claimed "404 collapses into
+    /// `NotConfigured` semantically", but the code never actually made
+    /// that distinction) — see [`Self::UpstreamNotFound`] for the now-
+    /// separated terminal case.
     UpstreamUnavailable,
     /// Infrastructure failure (storage error, event-store error,
     /// repo lookup error after ingest). Surface as 500.
@@ -664,15 +684,36 @@ pub(crate) async fn try_upstream_blob_pull(
         }
         Err(err) => {
             // Pre-coalesce code distinguished `fetch_blob` transport
-            // errors (→ `UpstreamUnavailable`) from post-ingest
-            // infrastructure failures (→ `Internal`) by returning
-            // before vs after the ingest step. After the wrap both
-            // paths converge here; preserve the split by
+            // errors (→ `UpstreamUnavailable` / `UpstreamNotFound`) from
+            // post-ingest infrastructure failures (→ `Internal`) by
+            // returning before vs after the ingest step. After the wrap
+            // both paths converge here; preserve the split by
             // string-matching the rendered error — the upstream HTTP
-            // adapter prefixes its errors with "upstream:" (see
-            // `MockUpstreamProxy::fetch_blob` and the production
-            // `UpstreamHttpAdapter`).
+            // adapter prefixes its errors with "upstream:<kind>:<detail>"
+            // (see `MockUpstreamProxy::fetch_blob`, the production
+            // `UpstreamHttpAdapter`'s `classified_error`, and the
+            // identical pattern in `manifests.rs::map_manifest_pull_error`,
+            // which this mirrors).
+            //
+            // A definitive upstream 404 ("not_found" — the blob is
+            // genuinely absent upstream) is checked FIRST and separately
+            // from the broader "upstream:" match, so it routes to
+            // `UpstreamNotFound` (terminal 404) rather than being
+            // swallowed by the 5xx/transport `UpstreamUnavailable`
+            // bucket (#53 — the bug this fixes: containerd treats a 502
+            // as retryable and hangs with no `ErrImagePull`).
             let msg = err.to_string();
+            if msg.contains("404") || msg.contains("not_found") {
+                tracing::info!(
+                    repo_key = %repo.key,
+                    upstream_url = %mapping.upstream_url,
+                    upstream_name = %upstream_name,
+                    digest = %digest_str,
+                    "OCI upstream blob fetch returned not-found — terminal, layer genuinely \
+                     absent upstream"
+                );
+                return UpstreamPullOutcome::UpstreamNotFound;
+            }
             if msg.contains("upstream:") || msg.contains("upstream ") {
                 tracing::warn!(
                     repo_key = %repo.key,
@@ -3046,6 +3087,153 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // #53 — a definitive upstream 404 must be a terminal BLOB_UNKNOWN 404,
+    // not a 502 (which containerd treats as retryable and hangs on with
+    // no ErrImagePull). Root cause: `try_upstream_blob_pull`'s error match
+    // collapsed EVERY `fetch_blob` failure — including a genuine upstream
+    // 404 — into `UpstreamUnavailable` via a broad `.contains("upstream:")`
+    // match, before any 404-vs-5xx distinction was made. These two tests
+    // pin the fix: a definitive not-found is terminal (404); a genuine
+    // upstream outage (5xx/transport) stays retryable (502).
+    // ---------------------------------------------------------------------
+
+    /// Reproduction test (#53): a pull-through GET for a blob whose
+    /// upstream `fetch_blob` returns a definitive 404 must serve a
+    /// terminal `BLOB_UNKNOWN` 404 — not `BadGateway` 502. Before the
+    /// fix, this asserted 502 (matching the bug); the assertion below is
+    /// the POST-fix expectation.
+    #[test]
+    fn pull_through_upstream_blob_404_is_terminal_blob_unknown_get() {
+        let (status, body) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            seed_dockerhub_mapping(&mocks, repo_id);
+            // Deliberately NOT seeding an `insert_blob` fixture for this
+            // digest — `MockUpstreamProxy::fetch_blob` returns
+            // `upstream:not_found:…` for an unseeded key, exactly
+            // mirroring a genuine upstream 404 (the adapter's
+            // `classified_error(UpstreamErrorKind::NotFound, …)` sentinel
+            // shape for a real `404 Not Found` response).
+
+            let router = blob_router(ctx);
+            let uri = format!(
+                "/v2/myrepo/dockerhub/library/nginx/blobs/sha256:{}",
+                valid_hex()
+            );
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a definitive upstream 404 must be terminal (404), not retryable (502) — \
+             #53: containerd treats 502 as retryable and hangs with no ErrImagePull"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+    }
+
+    /// HEAD counterpart of the reproduction test above — Tom's repro
+    /// showed HEAD 502s too, and HEAD shares `blobs::serve`'s miss-arm
+    /// with GET (same `try_upstream_blob_pull` call, same outcome match),
+    /// so this pins that the fix covers both verbs, not just GET.
+    #[test]
+    fn pull_through_upstream_blob_404_is_terminal_blob_unknown_head() {
+        let status = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            seed_dockerhub_mapping(&mocks, repo_id);
+            // Same as the GET test — no fixture seeded for this digest.
+
+            let router = blob_router(ctx);
+            let uri = format!(
+                "/v2/myrepo/dockerhub/library/nginx/blobs/sha256:{}",
+                valid_hex()
+            );
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.status()
+        });
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "HEAD must also surface the definitive upstream 404 as terminal 404, not 502 \
+             (#53's repro specifically showed HEAD 502ing too)"
+        );
+    }
+
+    /// The other half of the split: a genuine upstream outage (5xx /
+    /// transport-level failure, NOT a definitive not-found) must still
+    /// surface as retryable `BadGateway` 502 — pins that the 404 fix
+    /// doesn't turn transient upstream outages into terminal 404s.
+    #[test]
+    fn pull_through_upstream_blob_5xx_still_returns_bad_gateway() {
+        let (status, body) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            seed_dockerhub_mapping(&mocks, repo_id);
+            // Inject a genuine upstream-5xx failure, distinct from the
+            // default unseeded-fixture 404 — same sentinel shape the real
+            // adapter's `classified_error(UpstreamErrorKind::Upstream5xx, …)`
+            // produces for a real `503 Service Unavailable` response.
+            mocks
+                .upstream_proxy
+                .fail_next_blob_with(DomainError::Invariant(
+                    "upstream:upstream_5xx:blob fetch returned 503 Service Unavailable".into(),
+                ));
+
+            let router = blob_router(ctx);
+            let uri = format!(
+                "/v2/myrepo/dockerhub/library/nginx/blobs/sha256:{}",
+                valid_hex()
+            );
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a genuine upstream outage (5xx/transport) must stay retryable (502), \
+             not collapse into the terminal 404 the not-found fix introduces"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // `OciError::BadGateway`'s spec code is `MANIFEST_INVALID` (no
+        // spec-mandated code exists for "upstream unavailable"; the
+        // BAD_GATEWAY HTTP status is what actually disambiguates it —
+        // see `OciError::code`'s doc comment). Unchanged by this
+        // directive; asserted here only to pin that this specific error
+        // path still routes through `BadGateway`, not some other variant.
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_INVALID");
+    }
+
+    // ---------------------------------------------------------------------
     // Tampered-upstream end-to-end test (ADR 0006)
     //
     // # Test location
@@ -3289,6 +3477,7 @@ mod tests {
             UpstreamPullOutcome::NotConfigured => "NotConfigured",
             UpstreamPullOutcome::CurationBlocked => "CurationBlocked",
             UpstreamPullOutcome::ChecksumMismatch => "ChecksumMismatch",
+            UpstreamPullOutcome::UpstreamNotFound => "UpstreamNotFound",
             UpstreamPullOutcome::UpstreamUnavailable => "UpstreamUnavailable",
             UpstreamPullOutcome::Internal => "Internal",
         }
@@ -3416,14 +3605,13 @@ mod tests {
         );
     }
 
-    /// Negative-cache test: the wrapped `fetch_blob` fails
-    /// (transport-level error via `fail_next_blob_with` analogue —
-    /// because `MockUpstreamProxy::fetch_blob` returns
-    /// `upstream:not_found:mock blob ...` when no fixture is seeded,
-    /// we exploit the absent-fixture path as the failure source).
-    /// The leader records the failure under the blob's `blob_by_hash`
-    /// dedup key with the configured negative-cache TTL (default 30 s
-    /// for `NotFound`). A second call within the TTL window must
+    /// Negative-cache test: the wrapped `fetch_blob` fails because
+    /// `MockUpstreamProxy::fetch_blob` returns `upstream:not_found:mock
+    /// blob ...` when no fixture is seeded — the absent-fixture path
+    /// doubles as a genuine-upstream-404 simulation (#53). The leader
+    /// records the failure under the blob's `blob_by_hash` dedup key
+    /// with the configured negative-cache TTL (default 30 s for
+    /// `NotFound`). A second call within the TTL window must
     /// short-circuit on `negative_cache_hit` without firing a second
     /// `leader_started`.
     #[test]
@@ -3447,11 +3635,14 @@ mod tests {
 
             // First call: upstream returns not_found → leader records
             // `Failed(NotFound)` under the blob's dedup key with the
-            // 30 s `ttl_not_found` TTL.
+            // 30 s `ttl_not_found` TTL. Post-#53, a definitive not-found
+            // surfaces as the terminal `UpstreamNotFound` variant, NOT
+            // `UpstreamUnavailable` (that bucket is now 5xx/transport
+            // only) — this assertion was updated alongside the #53 fix.
             let r1 = try_upstream_blob_pull(&ctx, &repo, "dockerhub/library/nginx", &hash).await;
             assert!(
-                matches!(r1, UpstreamPullOutcome::UpstreamUnavailable),
-                "first call must surface the upstream not_found as UpstreamUnavailable; \
+                matches!(r1, UpstreamPullOutcome::UpstreamNotFound),
+                "first call must surface the upstream not_found as UpstreamNotFound; \
                  got variant {}",
                 outcome_variant_name(&r1)
             );

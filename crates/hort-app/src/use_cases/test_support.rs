@@ -4624,6 +4624,15 @@ type MockArtifactEntry = (Vec<u8>, Option<DateTime<Utc>>);
 
 pub struct MockUpstreamProxy {
     blobs: Mutex<HashMap<(String, String, String), MockBlobEntry>>,
+    /// One-shot failure for the next `fetch_blob` call. Drained on
+    /// consumption. Mirrors `next_manifest_error` — tests that need to
+    /// drive the `UpstreamUnavailable` path (5xx / network) inject a
+    /// non-`not_found` error here; the caller's string classifier then
+    /// routes it to `UpstreamUnavailable` instead of `UpstreamNotFound`.
+    /// An unseeded fixture (no `insert_blob` call for the key) already
+    /// returns an `upstream:not_found:…` error by default (#53), so
+    /// this hook exists specifically to simulate the *other* branch.
+    next_blob_error: Mutex<Option<DomainError>>,
     manifests: Mutex<HashMap<(String, String, String), ManifestFetch>>,
     /// One-shot failure for the next `fetch_manifest` call. Drained on
     /// consumption. Used to drive the `UpstreamUnavailable` path
@@ -4666,6 +4675,7 @@ impl MockUpstreamProxy {
     pub fn new() -> Self {
         Self {
             blobs: Mutex::new(HashMap::new()),
+            next_blob_error: Mutex::new(None),
             manifests: Mutex::new(HashMap::new()),
             next_manifest_error: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
@@ -4737,6 +4747,16 @@ impl MockUpstreamProxy {
     /// `UpstreamNotFound`.
     pub fn fail_next_manifest_with(&self, err: DomainError) {
         *self.next_manifest_error.lock().unwrap() = Some(err);
+    }
+
+    /// Seed a one-shot failure on the next `fetch_blob` call. Cleared
+    /// on consumption. Use this to simulate an upstream 5xx / transport
+    /// error distinctly from the default "unseeded fixture" 404 (#53) —
+    /// pass a `DomainError` whose rendered message does NOT contain
+    /// `"404"` / `"not_found"` (e.g.
+    /// `DomainError::Invariant("upstream:upstream_5xx:mock 503".into())`).
+    pub fn fail_next_blob_with(&self, err: DomainError) {
+        *self.next_blob_error.lock().unwrap() = Some(err);
     }
 
     pub fn insert_blob(
@@ -4853,9 +4873,13 @@ impl UpstreamProxy for MockUpstreamProxy {
         upstream_name: String,
         digest: String,
     ) -> BoxFuture<'_, DomainResult<BlobFetch>> {
+        let injected = self.next_blob_error.lock().unwrap().take();
         let key = (mapping.path_prefix, upstream_name, digest);
         let entry = self.blobs.lock().unwrap().get(&key).cloned();
         Box::pin(async move {
+            if let Some(err) = injected {
+                return Err(err);
+            }
             match entry {
                 Some((body, declared, last_modified)) => {
                     use bytes::Bytes;
