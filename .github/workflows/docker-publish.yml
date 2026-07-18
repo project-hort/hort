@@ -446,6 +446,19 @@ jobs:
         run: |
           echo "${GH_TOKEN}" | helm registry login "${REGISTRY}" --username "${ACTOR}" --password-stdin
 
+      # cosign reads ~/.docker/config.json for registry auth; `helm registry
+      # login` above only populates HELM's own config, so the chart-sign step's
+      # `.sig`-layer upload to ghcr was UNAUTHORIZED (#47 re-fix 2). Add the same
+      # docker login the working image-signing job uses, so cosign can push the
+      # signature.
+      - name: Log in to ghcr for cosign (.sig upload)
+        if: steps.ver.outputs.publish == 'true'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       # §3.4 invariant: on a SemVer tag the in-tree Chart.yaml must already
       # declare the tag's version on BOTH `version` and `appVersion` (chart and
       # binary are versioned together). `helm package --version/--app-version`
