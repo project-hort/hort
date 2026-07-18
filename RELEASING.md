@@ -99,10 +99,18 @@ alpha, but published **both** to the internal registry **and** publicly to
 ghcr + a GitHub pre-release. (semver orders `alpha < beta < rc`; `rc` stays
 reserved for the same shape if ever needed.)
 
+**Cut the beta from the LAST ALPHA TAG (`vX.Y.Z-alpha.N`), not from develop** —
+the beta promotes to public *exactly the code the alpha validated*; develop may
+have moved past it. Fall back to `origin/develop` **only** if this cycle has no
+alpha tag. (The `X.Y.Z-dev → X.Y.Z-beta.N` bump is the same either way, since the
+alpha tag already carries an `X.Y.Z-alpha.N` bump on its own throwaway commit —
+you are re-bumping that one commit's version, not develop's.)
+
 ```bash
 git fetch origin
-git checkout -b test/vX.Y.Z-beta.N origin/develop
-# bump Cargo.toml + Chart.yaml (version + appVersion) X.Y.Z-dev → X.Y.Z-beta.N
+# From the last alpha tag (preferred); use `origin/develop` only if no alpha exists.
+git checkout -b test/vX.Y.Z-beta.N vX.Y.Z-alpha.<N>
+# bump Cargo.toml + Chart.yaml (version + appVersion) → X.Y.Z-beta.N
 cargo check --workspace                     # rewrites Cargo.lock member versions
 # … run the local gate (fmt/clippy) …
 git commit -am "chore(release): X.Y.Z-beta.N"   # do NOT touch CHANGELOG.md
