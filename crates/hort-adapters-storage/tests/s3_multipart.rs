@@ -63,8 +63,7 @@ const TEST_BUCKET: &str = "hort-test-bucket";
 /// secret keys are 64 lowercase-hex chars. `garage key import` validates
 /// both formats, so these must be well-formed, not arbitrary strings.
 const TEST_ACCESS_KEY: &str = "GK00112233445566778899aabb";
-const TEST_SECRET_KEY: &str =
-    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+const TEST_SECRET_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 /// Garage's `rpc_secret` must be exactly 32 bytes hex-encoded (64 hex
 /// chars). A wrong length makes the server refuse to start (the container
 /// exits before bootstrap — the 409 "container is not running" symptom).
@@ -270,8 +269,10 @@ fn build_storage(port: u16) -> hort_adapters_storage::ObjectStoreStorage {
 /// - **testcontainers Garage** (self-contained): otherwise stand up
 ///   `dxflrs/garage` and bootstrap it via [`start_garage`]. The returned
 ///   `ContainerAsync` guard MUST be held for the test's duration.
-async fn garage_storage(
-) -> (Option<ContainerAsync<GenericImage>>, hort_adapters_storage::ObjectStoreStorage) {
+async fn garage_storage() -> (
+    Option<ContainerAsync<GenericImage>>,
+    hort_adapters_storage::ObjectStoreStorage,
+) {
     if let Ok(endpoint) = env::var("HORT_TEST_S3_ENDPOINT") {
         let access = env::var("HORT_TEST_S3_ACCESS_KEY")
             .expect("HORT_TEST_S3_ACCESS_KEY is required when HORT_TEST_S3_ENDPOINT is set");
