@@ -233,6 +233,51 @@ fn build_storage(port: u16) -> hort_adapters_storage::ObjectStoreStorage {
     build_s3_storage(&opts).expect("S3 storage builds against the Garage endpoint")
 }
 
+/// Storage handle for the reproduction tests, in one of two modes:
+///
+/// - **External Garage** (fast diagnostic path): if `HORT_TEST_S3_ENDPOINT`
+///   is set, build storage directly against it — the operator provisions
+///   the Garage (a bucket + a key granted read/write). This sidesteps the
+///   in-container `garage` CLI bootstrap entirely, which matters because
+///   the `dxflrs/garage` image is shell-free (scratch), so the automated
+///   testcontainers bootstrap has to drive `/garage` directly. Required
+///   env: `HORT_TEST_S3_ENDPOINT` (e.g. `http://127.0.0.1:3900`),
+///   `HORT_TEST_S3_ACCESS_KEY`, `HORT_TEST_S3_SECRET_KEY`,
+///   `HORT_TEST_S3_BUCKET`; optional `HORT_TEST_S3_REGION` (default
+///   `garage`). No container is returned.
+/// - **testcontainers Garage** (self-contained): otherwise stand up
+///   `dxflrs/garage` and bootstrap it via [`start_garage`]. The returned
+///   `ContainerAsync` guard MUST be held for the test's duration.
+async fn garage_storage(
+) -> (Option<ContainerAsync<GenericImage>>, hort_adapters_storage::ObjectStoreStorage) {
+    if let Ok(endpoint) = env::var("HORT_TEST_S3_ENDPOINT") {
+        let access = env::var("HORT_TEST_S3_ACCESS_KEY")
+            .expect("HORT_TEST_S3_ACCESS_KEY is required when HORT_TEST_S3_ENDPOINT is set");
+        let secret = env::var("HORT_TEST_S3_SECRET_KEY")
+            .expect("HORT_TEST_S3_SECRET_KEY is required when HORT_TEST_S3_ENDPOINT is set");
+        let bucket = env::var("HORT_TEST_S3_BUCKET")
+            .expect("HORT_TEST_S3_BUCKET is required when HORT_TEST_S3_ENDPOINT is set");
+        let region = env::var("HORT_TEST_S3_REGION").unwrap_or_else(|_| "garage".to_string());
+        let opts = S3StorageOpts {
+            bucket: &bucket,
+            endpoint: Some(&endpoint),
+            force_path_style: true,
+            allow_http: endpoint.starts_with("http://"),
+            region: &region,
+            access_key: &access,
+            secret_key: &secret,
+            extra_trust_anchors: None,
+            sse_mode: None,
+        };
+        let storage = build_s3_storage(&opts)
+            .expect("external S3 storage builds against HORT_TEST_S3_ENDPOINT");
+        return (None, storage);
+    }
+    let (container, port) = start_garage().await;
+    let storage = build_storage(port);
+    (Some(container), storage)
+}
+
 /// Deterministic pseudo-random byte content of `len` bytes — not
 /// all-zero (some object stores / proxies special-case sparse all-zero
 /// bodies) and reproducible across runs without an external RNG
@@ -267,8 +312,7 @@ async fn multipart_put_roundtrips_large_blob() {
     if !s3_gate_enabled() {
         return;
     }
-    let (_container, port) = start_garage().await;
-    let storage = build_storage(port);
+    let (_container_guard, storage) = garage_storage().await;
 
     let content = deterministic_bytes(12 * 1024 * 1024);
     let expected_hash_hex = format!("{:x}", Sha256::digest(&content));
@@ -319,8 +363,7 @@ async fn single_part_put_small_blob_control() {
     if !s3_gate_enabled() {
         return;
     }
-    let (_container, port) = start_garage().await;
-    let storage = build_storage(port);
+    let (_container_guard, storage) = garage_storage().await;
 
     let content = deterministic_bytes(1024 * 1024); // 1 MiB, well under 5 MiB MIN_PART_SIZE
     let expected_hash_hex = format!("{:x}", Sha256::digest(&content));
