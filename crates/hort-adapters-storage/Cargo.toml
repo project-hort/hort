@@ -28,6 +28,12 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 metrics-util = { workspace = true, features = ["debugging"] }
 tracing-subscriber = { workspace = true }
+# `testcontainers` stands up a real Garage (S3-compatible) container for
+# `tests/s3_multipart.rs` — the large-blob multipart-upload reproduction
+# (#53). Gated on `HORT_TEST_S3=1`; self-skips (no Docker required)
+# otherwise, same discipline as `hort-notifier-nats`'s
+# `HORT_TEST_NATS`-gated `testcontainers` usage, which this mirrors.
+testcontainers = { workspace = true }
 # The two `builders::tests::warn_*` tests install a per-thread tracing
 # subscriber via `set_default()` + `rebuild_interest_cache()` to capture
 # WARN events from `build_s3_object_store`. The `CapturingLayer` already
