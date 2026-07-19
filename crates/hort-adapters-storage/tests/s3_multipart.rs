@@ -314,7 +314,16 @@ async fn multipart_put_roundtrips_large_blob() {
     }
     let (_container_guard, storage) = garage_storage().await;
 
-    let content = deterministic_bytes(12 * 1024 * 1024);
+    // Blob size is env-configurable (`HORT_TEST_S3_BLOB_MIB`, default 12) so
+    // the size that reproduced in prod (#53's 76 MB layer) can be swept
+    // against a live Garage without a rebuild. Any value > 5 (the
+    // `MIN_PART_SIZE` MiB) forces a genuine multi-part upload.
+    let blob_mib: usize = env::var("HORT_TEST_S3_BLOB_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(12);
+    let content = deterministic_bytes(blob_mib * 1024 * 1024);
     let expected_hash_hex = format!("{:x}", Sha256::digest(&content));
 
     let content_for_stream = content.clone();
@@ -326,8 +335,7 @@ async fn multipart_put_roundtrips_large_blob() {
     .unwrap_or_else(|_| {
         panic!(
             "reproduces #53: multipart put did not complete in 45s \
-             (12 MiB body, {} MiB MIN_PART_SIZE — a genuine multi-part upload)",
-            5
+             ({blob_mib} MiB body, 5 MiB MIN_PART_SIZE — a genuine multi-part upload)"
         )
     })
     .expect("multipart put succeeds against Garage");
