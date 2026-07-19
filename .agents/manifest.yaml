@@ -3,7 +3,44 @@
 name: hort
 toolchains: [rust]
 cache_volumes: [cargo]
-sidecars: [postgres]
+sidecars:
+  - postgres
+  - name: garage
+    image: mirror.kdp.kloni.cloud/docker.io/dxflrs/garage:v2.2.0
+    args: []   # image's default CMD is already ["/garage", "server"]; an explicit
+               # "server" arg here would replace argv[0] and fail to exec (no shell/PATH)
+    ports: [3900, 3903]
+    config:
+      /etc/garage.toml: { file: garage.toml }
+    env:
+      INIT_BUCKET: "{{values.bucket}}"
+      INIT_ACCESS_KEY: "{{values.access_key}}"
+      INIT_SECRET_KEY: "{{values.secret_key}}"
+    ready: { exec: ["/garage", "status"], retries: 30, delay: 1 }
+    init:
+      - { run: ["/garage", "node", "id", "-q"], capture: NODE, cut_before: "@" }
+      - { run: ["/garage", "layout", "assign", "-z", "dc1", "-c", "1G", "{{capture.NODE}}"], ignore_error: true }
+      - { run: ["/garage", "layout", "apply", "--version", "1"], ignore_error: true }
+      # v2.2.0's `key import` takes <key-id> <secret-key> positionally — no -a/-s flags.
+      - { run: ["/garage", "key", "import", "--yes", "{{values.access_key}}", "{{values.secret_key}}"], ignore_error: true }
+      - { run: ["/garage", "bucket", "create", "{{values.bucket}}"], ignore_error: true }
+      - { run: ["/garage", "bucket", "allow", "--read", "--write", "{{values.bucket}}", "--key", "{{values.access_key}}"], ignore_error: true }
+    values:
+      bucket: hort-dev-cas
+      # Garage validates key-id as "GK" + 12 hex-encoded bytes, and the secret as
+      # 32 hex-encoded bytes — plain "dev..." placeholders are rejected at import.
+      access_key: GKdeadbeefdeadbeefdeadbeef
+      secret_key: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+      rpc_secret: "0000000000000000000000000000000000000000000000000000000000000000"
+      admin_token: devadmintoken
+    expose:
+      AWS_ACCESS_KEY_ID: "{{values.access_key}}"
+      AWS_SECRET_ACCESS_KEY: "{{values.secret_key}}"
+      AWS_ENDPOINT_URL: "http://{{host}}:3900"
+      AWS_REGION: "garage"
+      HORT_STORAGE_S3_BUCKET: "{{values.bucket}}"
+      HORT_STORAGE_S3_ALLOW_HTTP: "true"
+      HORT_STORAGE_S3_FORCE_PATH_STYLE: "true"
 resources: { cpus: 3, mem: 12g }
 directive_timeout: 4h
 env:
