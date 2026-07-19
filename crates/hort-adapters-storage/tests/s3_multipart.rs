@@ -59,11 +59,16 @@ const TEST_BUCKET: &str = "hort-test-bucket";
 /// import` — avoids parsing `garage key create`'s human-formatted stdout
 /// for a generated ID/secret, which is one fewer fragile moving part in
 /// an unverified bootstrap.
-const TEST_ACCESS_KEY: &str = "GKtestaccesskeyforfiftythree0";
-const TEST_SECRET_KEY: &str = "testsecretkeyforfiftythreereproductiontestonly0000000000000000";
-/// Arbitrary-but-fixed 64 lowercase-hex chars — Garage's `rpc_secret`
-/// must be 32 bytes hex-encoded.
-const RPC_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
+/// Garage access-key IDs are `GK` + 24 lowercase-hex chars (26 total);
+/// secret keys are 64 lowercase-hex chars. `garage key import` validates
+/// both formats, so these must be well-formed, not arbitrary strings.
+const TEST_ACCESS_KEY: &str = "GK00112233445566778899aabb";
+const TEST_SECRET_KEY: &str =
+    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+/// Garage's `rpc_secret` must be exactly 32 bytes hex-encoded (64 hex
+/// chars). A wrong length makes the server refuse to start (the container
+/// exits before bootstrap — the 409 "container is not running" symptom).
+const RPC_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const ADMIN_TOKEN: &str = "hort-test-admin-token";
 
 /// Sentinel env var. Mirrors `HORT_TEST_NATS` / `DATABASE_URL`.
