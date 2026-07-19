@@ -165,12 +165,27 @@ git push -u origin chore/release-X.Y.Z
 # after it merges, tag the MAIN MERGE COMMIT:
 git fetch origin
 git tag vX.Y.Z <main-merge-commit-sha>
-git push origin vX.Y.Z            # triggers release.yml + docker-publish (:latest for a stable tag)
+git push origin vX.Y.Z            # GitLab tag pipeline → INTERNAL registry only
 # back-merge so develop carries the changelog stamp:
 #   open an MR main → develop
 # then OPEN THE NEXT CYCLE: bump develop to the next X.Y.(Z+1)-dev
 #   (see "Open a version cycle" above)
 ```
+
+**The `origin` tag push publishes the internal artifacts only. The public
+release is a second, separate push to `github-public`** — `release.yml` and
+`docker-publish.yml` are GitHub workflows and cannot fire from a GitLab tag
+push. Without this step there is no ghcr `:X.Y.Z`, no `:latest` move, and no
+GitHub release:
+
+```bash
+git push github-public origin/main:refs/heads/main   # sync main
+git push github-public vX.Y.Z                        # tag → ghcr publish + GitHub release
+```
+
+This mirrors the `github-public` sync already documented for the beta track
+above. `:latest` moves here, and only here, because only a stable tag clears
+`docker-publish.yml`'s `!contains(github.ref, '-')` guard.
 
 ## Docker tags (`docker-publish.yml`, on `v*` tags)
 
