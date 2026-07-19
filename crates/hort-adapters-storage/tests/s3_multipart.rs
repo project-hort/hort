@@ -1,7 +1,7 @@
 //! #53 reproduction: large-blob S3-multipart pull-through hang against a
 //! real Garage (S3-compatible) container.
 //!
-//! Stands up `dxflrs/garage:v1.0.1` via `testcontainers`, bootstraps a
+//! Stands up `dxflrs/garage:v2.2.0` (prod's version) via `testcontainers`, bootstraps a
 //! single-node cluster (layout assign/apply, bucket, API key) via the
 //! `garage` CLI inside the container, then exercises
 //! `ObjectStoreStorage::put` against it — the exact code path the
@@ -47,12 +47,17 @@ const S3_PORT: u16 = 3900;
 /// binds it).
 const RPC_PORT: u16 = 3901;
 
-/// Pinned Garage image. `v1.0.1` was the current stable v1.x release as
-/// of this branch's authoring — bump if a newer stable is preferred; the
-/// report notes this choice explicitly since this sandbox has no network
-/// access to check for a newer tag.
+/// Pinned Garage image — MUST match the production version so the
+/// reproduction is faithful. Prod runs **v2.2.0**; a multipart bug can be
+/// version-specific, so testing against a different major (e.g. v1.0.1,
+/// which passed) would not rule out a v2.2.0 regression. NOTE: the
+/// `garage.toml` in [`garage_config`] and the CLI bootstrap in
+/// [`garage_bootstrap_script`] were written for v1.x — the shell-free
+/// container-mode rewrite (#54) must re-validate both against v2.2.0's
+/// config/CLI. External mode (the working path today) is unaffected: the
+/// operator provisions their own v2.2.0 Garage.
 const GARAGE_IMAGE: &str = "dxflrs/garage";
-const GARAGE_TAG: &str = "v1.0.1";
+const GARAGE_TAG: &str = "v2.2.0";
 
 const TEST_BUCKET: &str = "hort-test-bucket";
 /// Fixed (not CLI-generated) API credentials, imported via `garage key
@@ -164,7 +169,7 @@ echo "BOOTSTRAP_OK"
     )
 }
 
-/// Start a `dxflrs/garage:v1.0.1` container, bootstrap a single-node
+/// Start a `dxflrs/garage:v2.2.0` container, bootstrap a single-node
 /// cluster + bucket + key inside it, and return the live container
 /// handle plus the host-mapped S3 API port.
 ///
