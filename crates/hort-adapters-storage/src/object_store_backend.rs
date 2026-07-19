@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -6,7 +7,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::storage::{PutResult, StoragePort, StreamItem};
@@ -65,6 +66,55 @@ fn resolve_put_timeout() -> std::time::Duration {
         .unwrap_or(DEFAULT_PUT_TIMEOUT_SECS);
     std::time::Duration::from_secs(secs)
 }
+
+/// Coarse `put()` phase markers (#53 diagnostic, directive 009).
+///
+/// The investigation has narrowed the wrong root cause twice already — an
+/// isolated fetch and an isolated multipart write both pass in reproduction,
+/// so the stall is somewhere in hort's *integrated* pull-through path. This
+/// enum pins exactly which stage of `put()` was in flight the moment the
+/// fail-fast timeout (`DEFAULT_PUT_TIMEOUT_SECS`) fires, so the next report
+/// is evidence, not another guess.
+#[repr(u8)]
+enum PutPhase {
+    InitMultipart = 0,
+    Reading = 1,
+    UploadingPart = 2,
+    FinalPart = 3,
+    HeadDedup = 4,
+    Complete = 5,
+    Copy = 6,
+    DeleteStaging = 7,
+    Done = 8,
+}
+
+/// Render a raw phase code — as loaded from the shared `AtomicU8` after
+/// `inner` was cancelled by the timeout — back to its name for the
+/// diagnostic log. An out-of-range code should never occur (every write
+/// site stores a `PutPhase as u8`); it renders as `"UNKNOWN"` rather than
+/// panicking, since this runs on the failure path and must not itself
+/// become a new failure mode.
+fn phase_name(code: u8) -> &'static str {
+    match code {
+        x if x == PutPhase::InitMultipart as u8 => "INIT_MULTIPART",
+        x if x == PutPhase::Reading as u8 => "READING",
+        x if x == PutPhase::UploadingPart as u8 => "UPLOADING_PART",
+        x if x == PutPhase::FinalPart as u8 => "FINAL_PART",
+        x if x == PutPhase::HeadDedup as u8 => "HEAD_DEDUP",
+        x if x == PutPhase::Complete as u8 => "COMPLETE",
+        x if x == PutPhase::Copy as u8 => "COPY",
+        x if x == PutPhase::DeleteStaging as u8 => "DELETE_STAGING",
+        x if x == PutPhase::Done as u8 => "DONE",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Bytes between each debug-level read-progress line (#53 diagnostic).
+/// `CHUNK_SIZE` (64 KiB) is far too fine-grained for a 76 MB blob — that
+/// would be 1000+ log lines — so progress is throttled to roughly this
+/// many bytes between lines. Mandatory diagnostics (the timeout-elapse
+/// `error!`) are unaffected; only the optional debug timeline is throttled.
+const READ_PROGRESS_LOG_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Object-store backed content-addressable storage (S3, GCS, Azure, local).
 ///
@@ -140,110 +190,175 @@ impl StoragePort for ObjectStoreStorage {
             // accepted, minor limitation (orphaned staging objects are the
             // same class of cleanup the existing "orphaned content" story
             // already covers, not a new failure mode this introduces).
-            let inner = async {
-                let mut guard = MetricGuard::new(backend, values::OPERATION_PUT);
-                // We need a temporary path for the multipart upload. We don't know
-                // the hash yet, so use a UUID-based staging path.
-                let staging_path: object_store::path::Path =
-                    format!(".staging/{}", uuid::Uuid::new_v4()).into();
+            // #53 phase diagnostics (directive 009): declared BEFORE the
+            // timeout wrapper, and cloned into `inner`, so the `Err(Elapsed)`
+            // arm below can still read the last-observed phase/progress
+            // after `inner` has been cancelled by the timeout. `Relaxed`
+            // ordering is enough — this is diagnostics, not synchronization;
+            // `inner` is the sole writer, this arm the sole (post-cancel)
+            // reader.
+            let phase = Arc::new(AtomicU8::new(PutPhase::InitMultipart as u8));
+            let bytes_read = Arc::new(AtomicU64::new(0));
+            let parts_uploaded = Arc::new(AtomicU64::new(0));
 
-                let mut upload = self.store.put_multipart(&staging_path).await.map_err(|e| {
-                    warn!(error = %e, "failed to initiate multipart upload");
-                    DomainError::Invariant(format!("storage upload init failed: {e}"))
-                })?;
+            let inner = {
+                let phase = Arc::clone(&phase);
+                let bytes_read = Arc::clone(&bytes_read);
+                let parts_uploaded = Arc::clone(&parts_uploaded);
+                async move {
+                    let mut guard = MetricGuard::new(backend, values::OPERATION_PUT);
+                    // We need a temporary path for the multipart upload. We don't know
+                    // the hash yet, so use a UUID-based staging path.
+                    let staging_path: object_store::path::Path =
+                        format!(".staging/{}", uuid::Uuid::new_v4()).into();
 
-                let mut hasher = Sha256::new();
-                let mut read_buf = vec![0u8; CHUNK_SIZE];
-                let mut part_buf = Vec::with_capacity(MIN_PART_SIZE);
-                let mut total_bytes: u64 = 0;
+                    phase.store(PutPhase::InitMultipart as u8, Ordering::Relaxed);
+                    let mut upload =
+                        self.store.put_multipart(&staging_path).await.map_err(|e| {
+                            warn!(error = %e, "failed to initiate multipart upload");
+                            DomainError::Invariant(format!("storage upload init failed: {e}"))
+                        })?;
 
-                loop {
-                    let n = stream.read(&mut read_buf).await.map_err(|e| {
-                        warn!(error = %e, "failed to read from input stream");
-                        DomainError::Invariant(format!("storage read failed: {e}"))
-                    })?;
-                    if n == 0 {
-                        break;
+                    let mut hasher = Sha256::new();
+                    let mut read_buf = vec![0u8; CHUNK_SIZE];
+                    let mut part_buf = Vec::with_capacity(MIN_PART_SIZE);
+                    let mut total_bytes: u64 = 0;
+                    let mut part_index: u64 = 0;
+                    // Debug-only throttle for the read-progress timeline —
+                    // see `READ_PROGRESS_LOG_INTERVAL_BYTES`.
+                    let mut last_logged_bytes: u64 = 0;
+
+                    loop {
+                        phase.store(PutPhase::Reading as u8, Ordering::Relaxed);
+                        let n = stream.read(&mut read_buf).await.map_err(|e| {
+                            warn!(error = %e, "failed to read from input stream");
+                            DomainError::Invariant(format!("storage read failed: {e}"))
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        total_bytes += n as u64;
+                        bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                        hasher.update(&read_buf[..n]);
+                        part_buf.extend_from_slice(&read_buf[..n]);
+
+                        if total_bytes - last_logged_bytes >= READ_PROGRESS_LOG_INTERVAL_BYTES {
+                            debug!(backend, total_bytes, "put: read progress");
+                            last_logged_bytes = total_bytes;
+                        }
+
+                        if part_buf.len() >= MIN_PART_SIZE {
+                            let payload =
+                                std::mem::replace(&mut part_buf, Vec::with_capacity(MIN_PART_SIZE));
+                            let part_bytes = payload.len();
+                            phase.store(PutPhase::UploadingPart as u8, Ordering::Relaxed);
+                            let started = std::time::Instant::now();
+                            upload.put_part(payload.into()).await.map_err(|e| {
+                                warn!(error = %e, "failed to upload part");
+                                DomainError::Invariant(format!("storage part upload failed: {e}"))
+                            })?;
+                            part_index += 1;
+                            parts_uploaded.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                backend,
+                                part_index,
+                                part_bytes,
+                                upload_ms = started.elapsed().as_millis() as u64,
+                                "put: part uploaded"
+                            );
+                        }
                     }
-                    total_bytes += n as u64;
-                    hasher.update(&read_buf[..n]);
-                    part_buf.extend_from_slice(&read_buf[..n]);
 
-                    if part_buf.len() >= MIN_PART_SIZE {
-                        let payload =
-                            std::mem::replace(&mut part_buf, Vec::with_capacity(MIN_PART_SIZE));
-                        upload.put_part(payload.into()).await.map_err(|e| {
-                            warn!(error = %e, "failed to upload part");
+                    // Flush remaining bytes as the final part (may be < MIN_PART_SIZE).
+                    if !part_buf.is_empty() {
+                        let part_bytes = part_buf.len();
+                        phase.store(PutPhase::FinalPart as u8, Ordering::Relaxed);
+                        let started = std::time::Instant::now();
+                        upload.put_part(part_buf.into()).await.map_err(|e| {
+                            warn!(error = %e, "failed to upload final part");
                             DomainError::Invariant(format!("storage part upload failed: {e}"))
                         })?;
+                        part_index += 1;
+                        parts_uploaded.fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            backend,
+                            part_index,
+                            part_bytes,
+                            upload_ms = started.elapsed().as_millis() as u64,
+                            "put: final part uploaded"
+                        );
                     }
-                }
 
-                // Flush remaining bytes as the final part (may be < MIN_PART_SIZE).
-                if !part_buf.is_empty() {
-                    upload.put_part(part_buf.into()).await.map_err(|e| {
-                        warn!(error = %e, "failed to upload final part");
-                        DomainError::Invariant(format!("storage part upload failed: {e}"))
+                    let hash_hex = format!("{:x}", hasher.finalize());
+                    let hash: ContentHash = hash_hex.parse().map_err(|e| {
+                        DomainError::Invariant(format!("SHA-256 produced invalid hex: {e}"))
                     })?;
-                }
 
-                let hash_hex = format!("{:x}", hasher.finalize());
-                let hash: ContentHash = hash_hex.parse().map_err(|e| {
-                    DomainError::Invariant(format!("SHA-256 produced invalid hex: {e}"))
-                })?;
+                    let final_path: object_store::path::Path = cas_path(&hash).into();
 
-                let final_path: object_store::path::Path = cas_path(&hash).into();
+                    // Check for dedup: if content already exists, abort the staging
+                    // upload and return the hash.
+                    phase.store(PutPhase::HeadDedup as u8, Ordering::Relaxed);
+                    let already_exists = self.store.head(&final_path).await.is_ok();
 
-                // Check for dedup: if content already exists, abort the staging
-                // upload and return the hash.
-                let already_exists = self.store.head(&final_path).await.is_ok();
+                    if already_exists {
+                        debug!(%hash, "deduplicated");
+                        let _ = upload.abort().await;
+                        let _ = self.store.delete(&staging_path).await;
+                        guard.finish_success();
+                        guard.mark_dedup();
+                        phase.store(PutPhase::Done as u8, Ordering::Relaxed);
+                        return Ok(PutResult {
+                            hash,
+                            size_bytes: total_bytes,
+                            created: false,
+                        });
+                    }
 
-                if already_exists {
-                    debug!(%hash, "deduplicated");
-                    let _ = upload.abort().await;
+                    // Complete the multipart to staging path.
+                    phase.store(PutPhase::Complete as u8, Ordering::Relaxed);
+                    upload.complete().await.map_err(|e| {
+                        warn!(error = %e, "failed to complete multipart upload");
+                        DomainError::Invariant(format!("storage upload complete failed: {e}"))
+                    })?;
+
+                    // Copy from staging to final CAS path, then clean up staging.
+                    phase.store(PutPhase::Copy as u8, Ordering::Relaxed);
+                    self.store
+                        .copy(&staging_path, &final_path)
+                        .await
+                        .map_err(|e| {
+                            warn!(%hash, error = %e, "failed to copy to final path");
+                            DomainError::Invariant(format!("storage copy failed: {e}"))
+                        })?;
+                    phase.store(PutPhase::DeleteStaging as u8, Ordering::Relaxed);
                     let _ = self.store.delete(&staging_path).await;
+
+                    debug!(%hash, "stored");
                     guard.finish_success();
-                    guard.mark_dedup();
-                    return Ok(PutResult {
+                    phase.store(PutPhase::Done as u8, Ordering::Relaxed);
+                    Ok(PutResult {
                         hash,
                         size_bytes: total_bytes,
-                        created: false,
-                    });
+                        created: true,
+                    })
                 }
-
-                // Complete the multipart to staging path.
-                upload.complete().await.map_err(|e| {
-                    warn!(error = %e, "failed to complete multipart upload");
-                    DomainError::Invariant(format!("storage upload complete failed: {e}"))
-                })?;
-
-                // Copy from staging to final CAS path, then clean up staging.
-                self.store
-                    .copy(&staging_path, &final_path)
-                    .await
-                    .map_err(|e| {
-                        warn!(%hash, error = %e, "failed to copy to final path");
-                        DomainError::Invariant(format!("storage copy failed: {e}"))
-                    })?;
-                let _ = self.store.delete(&staging_path).await;
-
-                debug!(%hash, "stored");
-                guard.finish_success();
-                Ok(PutResult {
-                    hash,
-                    size_bytes: total_bytes,
-                    created: true,
-                })
             };
 
             match tokio::time::timeout(put_timeout, inner).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
-                    warn!(
+                    let stalled_phase = phase_name(phase.load(Ordering::Relaxed));
+                    let stalled_bytes = bytes_read.load(Ordering::Relaxed);
+                    let stalled_parts = parts_uploaded.load(Ordering::Relaxed);
+                    error!(
                         backend,
-                        timeout_secs = put_timeout.as_secs(),
-                        "storage put exceeded the fail-fast timeout — refusing to hang the \
-                         caller (#53); the pull-through maps this to a retryable error"
+                        phase = stalled_phase,
+                        bytes_read = stalled_bytes,
+                        parts_uploaded = stalled_parts,
+                        put_timeout_secs = put_timeout.as_secs(),
+                        "#53 diagnostic: storage put timed out — stalled in phase {stalled_phase} \
+                         after {stalled_bytes} bytes, {stalled_parts} parts"
                     );
                     Err(DomainError::Invariant(format!(
                         "storage put timed out after {}s ({PUT_TIMEOUT_ENV_VAR})",
@@ -697,6 +812,47 @@ mod tests {
         assert_eq!(result.size_bytes, 0);
         let retrieved = get_bytes(&s, &result.hash).await;
         assert!(retrieved.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // #53 phase-diagnostic timeout test (directive 009)
+    // ----------------------------------------------------------------------
+
+    /// A `put()` whose input stream never produces a byte (and never
+    /// closes) must still be bounded by `put_timeout` — the #53 fail-fast
+    /// guard — and must fail with the timeout `Invariant`, not hang.
+    ///
+    /// This forces the timeout to fire while `inner` is parked on the
+    /// FIRST `stream.read()`, i.e. still in the `READING` phase before any
+    /// part has been uploaded — the exact "hort's client streaming the
+    /// body" hypothesis directive 009 wants distinguishable from a stall
+    /// inside `put_part` or `complete`/`copy`. `tokio::io::duplex` gives a
+    /// reader whose `read()` genuinely pends (not `Ready(0)`/EOF) as long
+    /// as the paired writer stays open and silent — `_writer` is kept
+    /// alive (not dropped) for exactly that reason.
+    ///
+    /// We assert on the returned error only, not a captured log line — a
+    /// prior attempt at this crate's own per-thread `tracing_subscriber`
+    /// capture (see `builders.rs`'s `missing_sse_warning_fires_for_non_aws_endpoint_without_sse`
+    /// doc comment) was flaky under parallel `cargo test`/`llvm-cov` due to
+    /// the global tracing callsite-interest cache; the directive marks log
+    /// capture optional for exactly this reason.
+    #[tokio::test]
+    async fn put_timeout_elapse_is_reported_while_reading_phase_is_in_flight() {
+        let s = storage().with_put_timeout(std::time::Duration::from_millis(50));
+        let (reader, _writer) = tokio::io::duplex(1024);
+
+        let result = s.put(Box::new(reader)).await;
+
+        match result {
+            Err(DomainError::Invariant(msg)) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "expected the #53 fail-fast timeout error, got: {msg}"
+                );
+            }
+            other => panic!("expected a timeout Invariant error, got: {other:?}"),
+        }
     }
 
     // ----------------------------------------------------------------------
