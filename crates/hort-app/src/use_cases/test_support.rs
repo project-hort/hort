@@ -4155,6 +4155,7 @@ pub struct MockContentReferenceIndex {
     next_insert_error: Mutex<Option<DomainError>>,
     next_insert_error_for_kind: Mutex<Option<(String, DomainError)>>,
     next_delete_error: Mutex<Option<DomainError>>,
+    next_find_by_target_error: Mutex<Option<DomainError>>,
     /// Counts calls to `find_by_sources_and_kind` so
     /// tests can assert the simple-index serve issues exactly ONE
     /// batched lookup (rather than fanning out to N
@@ -4169,6 +4170,7 @@ impl MockContentReferenceIndex {
             next_insert_error: Mutex::new(None),
             next_insert_error_for_kind: Mutex::new(None),
             next_delete_error: Mutex::new(None),
+            next_find_by_target_error: Mutex::new(None),
             batch_call_count: AtomicUsize::new(0),
         }
     }
@@ -4225,6 +4227,16 @@ impl MockContentReferenceIndex {
     pub fn fail_next_delete(&self, err: DomainError) {
         *self.next_delete_error.lock().unwrap() = Some(err);
     }
+
+    /// Arm a one-shot failure on the **next** [`ContentReferenceIndex::find_by_target`]
+    /// call, regardless of the queried target/kind. Used by branch-coverage
+    /// tests for the `IngestUseCase` referenced-tree-descendant target-check
+    /// (#46 Item 2) fail-safe arm — a lookup error must degrade to "not a
+    /// descendant" (the artifact keeps its normal window) rather than
+    /// aborting the ingest.
+    pub fn fail_next_find_by_target(&self, err: DomainError) {
+        *self.next_find_by_target_error.lock().unwrap() = Some(err);
+    }
 }
 
 impl ContentReferenceIndex for MockContentReferenceIndex {
@@ -4264,6 +4276,9 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
         target: &ContentHash,
         kind_filter: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Vec<ContentReference>>> {
+        if let Some(err) = self.next_find_by_target_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(err) });
+        }
         let target = target.clone();
         let kind_filter = kind_filter.map(str::to_owned);
         let mut out: Vec<ContentReference> = self
@@ -4609,6 +4624,15 @@ type MockArtifactEntry = (Vec<u8>, Option<DateTime<Utc>>);
 
 pub struct MockUpstreamProxy {
     blobs: Mutex<HashMap<(String, String, String), MockBlobEntry>>,
+    /// One-shot failure for the next `fetch_blob` call. Drained on
+    /// consumption. Mirrors `next_manifest_error` — tests that need to
+    /// drive the `UpstreamUnavailable` path (5xx / network) inject a
+    /// non-`not_found` error here; the caller's string classifier then
+    /// routes it to `UpstreamUnavailable` instead of `UpstreamNotFound`.
+    /// An unseeded fixture (no `insert_blob` call for the key) already
+    /// returns an `upstream:not_found:…` error by default (#53), so
+    /// this hook exists specifically to simulate the *other* branch.
+    next_blob_error: Mutex<Option<DomainError>>,
     manifests: Mutex<HashMap<(String, String, String), ManifestFetch>>,
     /// One-shot failure for the next `fetch_manifest` call. Drained on
     /// consumption. Used to drive the `UpstreamUnavailable` path
@@ -4651,6 +4675,7 @@ impl MockUpstreamProxy {
     pub fn new() -> Self {
         Self {
             blobs: Mutex::new(HashMap::new()),
+            next_blob_error: Mutex::new(None),
             manifests: Mutex::new(HashMap::new()),
             next_manifest_error: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
@@ -4722,6 +4747,16 @@ impl MockUpstreamProxy {
     /// `UpstreamNotFound`.
     pub fn fail_next_manifest_with(&self, err: DomainError) {
         *self.next_manifest_error.lock().unwrap() = Some(err);
+    }
+
+    /// Seed a one-shot failure on the next `fetch_blob` call. Cleared
+    /// on consumption. Use this to simulate an upstream 5xx / transport
+    /// error distinctly from the default "unseeded fixture" 404 (#53) —
+    /// pass a `DomainError` whose rendered message does NOT contain
+    /// `"404"` / `"not_found"` (e.g.
+    /// `DomainError::Invariant("upstream:upstream_5xx:mock 503".into())`).
+    pub fn fail_next_blob_with(&self, err: DomainError) {
+        *self.next_blob_error.lock().unwrap() = Some(err);
     }
 
     pub fn insert_blob(
@@ -4838,9 +4873,13 @@ impl UpstreamProxy for MockUpstreamProxy {
         upstream_name: String,
         digest: String,
     ) -> BoxFuture<'_, DomainResult<BlobFetch>> {
+        let injected = self.next_blob_error.lock().unwrap().take();
         let key = (mapping.path_prefix, upstream_name, digest);
         let entry = self.blobs.lock().unwrap().get(&key).cloned();
         Box::pin(async move {
+            if let Some(err) = injected {
+                return Err(err);
+            }
             match entry {
                 Some((body, declared, last_modified)) => {
                     use bytes::Bytes;
@@ -5384,6 +5423,10 @@ pub struct MockJobsRepository {
     /// destructive-kind path passes `Some(server-derived-key)` while
     /// the non-destructive path passes `None`.
     enqueue_idem_keys: Mutex<Vec<Option<hort_domain::types::IdempotencyKey>>>,
+    /// Recorded `priority` arguments from `enqueue_task` calls, in lock-step
+    /// with `enqueue_calls`. Lets tests assert the enqueue tier (e.g. the
+    /// elevated clearance-gating provenance-verify priority, #44).
+    enqueue_priorities: Mutex<Vec<i16>>,
     /// When `Some`, the NEXT `enqueue_task`
     /// call returns `EnqueueOutcome::Duplicate { existing_job_id }`
     /// instead of `Enqueued`. One-shot, mirrors the `fail_next_enqueue`
@@ -5457,6 +5500,7 @@ impl Default for MockJobsRepository {
         Self {
             enqueue_calls: Mutex::new(Vec::new()),
             enqueue_idem_keys: Mutex::new(Vec::new()),
+            enqueue_priorities: Mutex::new(Vec::new()),
             next_duplicate: Mutex::new(None),
             delete_calls: Mutex::new(Vec::new()),
             list_rows: Mutex::new(Vec::new()),
@@ -5518,6 +5562,12 @@ impl MockJobsRepository {
     /// destructive-kind path) or `None` for the non-destructive path.
     pub fn enqueue_idem_keys(&self) -> Vec<Option<hort_domain::types::IdempotencyKey>> {
         self.enqueue_idem_keys.lock().unwrap().clone()
+    }
+
+    /// Recorded `priority` arguments from `enqueue_task` calls, in lock-step
+    /// with [`enqueue_calls`].
+    pub fn enqueue_priorities(&self) -> Vec<i16> {
+        self.enqueue_priorities.lock().unwrap().clone()
     }
 
     /// Recorded job ids passed to `delete_job`.
@@ -5730,7 +5780,7 @@ impl JobsRepository for MockJobsRepository {
         kind: &'a str,
         params: &'a serde_json::Value,
         actor_id: Option<Uuid>,
-        _priority: i16,
+        priority: i16,
         _trigger_source: &'a str,
         idempotency_key: Option<&'a hort_domain::types::IdempotencyKey>,
     ) -> BoxFuture<'a, DomainResult<hort_domain::ports::jobs_repository::EnqueueOutcome>> {
@@ -5738,6 +5788,7 @@ impl JobsRepository for MockJobsRepository {
             .lock()
             .unwrap()
             .push((kind.to_string(), params.clone(), actor_id));
+        self.enqueue_priorities.lock().unwrap().push(priority);
         // Record the idempotency_key
         // verbatim (cloned, since the borrow does not outlive the call).
         self.enqueue_idem_keys

@@ -809,6 +809,10 @@ async fn try_upstream_manifest_pull_by_digest(
     // consumes `mapping`. Threaded into `VerifiedIngestRequest` so
     // `ingest_inner` can gate the publish-anchored quarantine resolution.
     let blob_trust_publish_time = mapping.trust_upstream_publish_time;
+    // Captured for the LEADER-side membership-edge registration (#46
+    // Item 4) below — the only path that (briefly) holds the manifest
+    // bytes after the stream-to-CAS retirement of the bytes-broadcast.
+    let blob_ctx = ctx.clone();
     let coalesce_result = ctx
         .pull_dedup
         .coalesce_blob(blob_dedup_key, move || async move {
@@ -877,6 +881,35 @@ async fn try_upstream_manifest_pull_by_digest(
             let outcome = blob_ingest
                 .ingest_verified(request, async_read, &OciFormatHandler)
                 .await?;
+
+            // Register-only content_references membership edges (#46
+            // Item 4 — the pull-through re-fix). Read the manifest body
+            // back from the still-live tempfile (best-effort; a read
+            // failure here is non-fatal — the manifest is already in
+            // CAS) and write the SAME edges the hosted PUT path writes,
+            // without fetching the referenced children/blobs.
+            match tokio::fs::read(&cache_handle.path).await {
+                Ok(manifest_bytes) => {
+                    crate::manifests_write::register_membership_edges_from_pull(
+                        &blob_ctx,
+                        blob_repo_id,
+                        outcome.artifact.id,
+                        &media_type,
+                        &manifest_bytes,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %blob_repo_id,
+                        artifact_id = %outcome.artifact.id,
+                        error = %e,
+                        "OCI pull-through: failed to re-read manifest tempfile for \
+                         membership-edge registration; skipping (non-fatal, manifest is in CAS)"
+                    );
+                }
+            }
+
             // Tempfile is in CAS now — drop it (the lifecycle
             // `manifest_body_bytes` used to own).
             hort_app::project::remove_cached_body(cache_handle).await;
@@ -1149,17 +1182,31 @@ async fn try_upstream_manifest_pull_by_tag(
                 "OCI upstream manifest pull-through succeeded"
             );
 
-            // LEADER-SIDE prefetch-on-tag-move trigger. The
+            // LEADER-SIDE re-read of the manifest tempfile. The
             // bytes-broadcast retirement (ADR 0026) means this is the only
-            // path that holds the manifest bytes; read them once from the
-            // just-ingested tempfile (only when prefetch is enabled and the
-            // tag moved — `fire_prefetch_trigger_oci` gates internally)
-            // BEFORE the cleanup below. Best-effort and background-spawned;
-            // never affects the live response. A tempfile read failure here
-            // is non-fatal — the manifest is already in CAS.
-            if meta_repo.prefetch_policy.enabled {
-                match tokio::fs::read(&cache_handle.path).await {
-                    Ok(manifest_bytes) => {
+            // path that (briefly) holds the manifest bytes; read them once
+            // BEFORE the cleanup below and reuse for both consumers:
+            // - Register-only content_references membership edges (#46
+            //   Item 4 — the pull-through re-fix), UNCONDITIONALLY (not
+            //   gated on prefetch, unlike the trigger below) — mirrors the
+            //   hosted PUT path's edges, without fetching children/blobs.
+            // - The prefetch-on-tag-move trigger (only when prefetch is
+            //   enabled and the tag moved — `fire_prefetch_trigger_oci`
+            //   gates internally).
+            // Both are best-effort and non-fatal — a tempfile read failure
+            // here never affects the live response; the manifest is
+            // already in CAS.
+            match tokio::fs::read(&cache_handle.path).await {
+                Ok(manifest_bytes) => {
+                    crate::manifests_write::register_membership_edges_from_pull(
+                        &meta_ctx,
+                        meta_repo_id,
+                        ingest_outcome.artifact.id,
+                        &media_type,
+                        &manifest_bytes,
+                    )
+                    .await;
+                    if meta_repo.prefetch_policy.enabled {
                         crate::prefetch::fire_prefetch_trigger_oci(
                             &meta_ctx,
                             &meta_repo,
@@ -1170,15 +1217,16 @@ async fn try_upstream_manifest_pull_by_tag(
                             &Bytes::from(manifest_bytes),
                         );
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            repo_key = %meta_repo_key,
-                            tag = %meta_tag,
-                            error = %e,
-                            "OCI prefetch: failed to re-read manifest tempfile for blob-digest \
-                             extraction; skipping prefetch (non-fatal, manifest is in CAS)"
-                        );
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        repo_key = %meta_repo_key,
+                        tag = %meta_tag,
+                        error = %e,
+                        "OCI pull-through: failed to re-read manifest tempfile for \
+                         membership-edge registration / prefetch; skipping both \
+                         (non-fatal, manifest is in CAS)"
+                    );
                 }
             }
 
@@ -1560,6 +1608,8 @@ mod tests {
     use hort_domain::entities::artifact::{ArtifactMetadata, QuarantineStatus};
     use hort_domain::entities::mutable_ref::MutableRef;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
+    use hort_domain::ports::artifact_repository::ArtifactRepository;
+    use hort_domain::ports::content_reference_index::ContentReferenceIndex;
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use hort_http_core::context::AppContext;
@@ -3076,6 +3126,196 @@ mod tests {
         });
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, content);
+    }
+
+    // ================================================================
+    // #46 Item 4 — the pull-through re-fix. Items 1/2 made proxy
+    // multi-arch tree-release work only on the hosted-PUSH path: the
+    // `oci_index_member` / `oci_config` / `oci_layer` content_references
+    // edges were written ONLY in `manifests_write.rs`. A pull-through
+    // ingest never parsed the manifest or wrote these edges, so
+    // `IngestUseCase::is_referenced_descendant`'s target-check always
+    // missed for a proxied tree's children — every proxy descendant got
+    // the FULL quarantine window, not the zero window Item 2 intended.
+    // This is the literal test gap that let that ship: the tests below
+    // exercise the PULL-THROUGH ingest path specifically (not the PUT
+    // path Item 1's tests already cover).
+    // ================================================================
+
+    /// A pull-through of an image INDEX by DIGEST writes one
+    /// `oci_index_member` content-reference edge per declared child —
+    /// the same edge the hosted PUT path writes (Item 1/D3) — WITHOUT
+    /// fetching the child (register-only; the child is never requested
+    /// from upstream in this test's mock, so a fetch attempt would panic
+    /// on an unseeded `insert_manifest` lookup).
+    #[test]
+    fn pull_through_by_digest_index_registers_oci_index_member_edge() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, member_rows, index_artifact_id) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let index_artifact_id = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .expect("pulled-through index must be committed as an artifact")
+                .id;
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap();
+            (status, member_rows, index_artifact_id)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            member_rows.len(),
+            1,
+            "one oci_index_member row for the declared child, registered from the \
+             pull-through path — without fetching the child"
+        );
+        assert_eq!(
+            member_rows[0].source_artifact_id, index_artifact_id,
+            "the edge's source is the pulled-through index artifact"
+        );
+    }
+
+    /// A pull-through of a single-image MANIFEST by TAG writes one
+    /// `oci_config` edge + one `oci_layer` edge per declared layer — the
+    /// same edges the hosted PUT path writes (Item 1) — WITHOUT fetching
+    /// the config/layer blobs. Exercises the tag-ref leg specifically
+    /// (`try_upstream_manifest_pull_by_tag`), distinct from the
+    /// digest-ref leg the index test above covers — the two legs read
+    /// the manifest tempfile at different call sites in `manifests.rs`.
+    #[test]
+    fn pull_through_by_tag_single_image_registers_oci_config_and_layer_edges() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let config_hex = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let layer_hex = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+        let single_image_media = "application/vnd.oci.image.manifest.v1+json";
+        let content = format!(
+            "{{\"schemaVersion\":2,\
+             \"mediaType\":\"{single_image_media}\",\
+             \"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\
+             \"digest\":\"sha256:{config_hex}\",\"size\":0}},\
+             \"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\
+             \"digest\":\"sha256:{layer_hex}\",\"size\":0}}]}}"
+        )
+        .into_bytes();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, config_rows, layer_rows, manifest_artifact_id) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                "latest",
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: single_image_media.into(),
+                    declared_digest: Some(format!("sha256:{hex}")),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/latest");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, single_image_media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let manifest_artifact_id = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .expect("pulled-through manifest must be committed as an artifact")
+                .id;
+            let config_hash: ContentHash = config_hex.parse().unwrap();
+            let layer_hash: ContentHash = layer_hex.parse().unwrap();
+            let config_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &config_hash, Some("oci_config"))
+                .await
+                .unwrap();
+            let layer_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &layer_hash, Some("oci_layer"))
+                .await
+                .unwrap();
+            (status, config_rows, layer_rows, manifest_artifact_id)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            config_rows.len(),
+            1,
+            "one oci_config row, registered pull-through"
+        );
+        assert_eq!(
+            layer_rows.len(),
+            1,
+            "one oci_layer row, registered pull-through"
+        );
+        assert_eq!(config_rows[0].source_artifact_id, manifest_artifact_id);
+        assert_eq!(layer_rows[0].source_artifact_id, manifest_artifact_id);
     }
 
     /// Manifest pull-through threads `ManifestFetch.last_modified`

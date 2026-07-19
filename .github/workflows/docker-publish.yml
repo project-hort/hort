@@ -401,9 +401,12 @@ jobs:
     name: Publish Helm Chart
     runs-on: ubuntu-latest
     needs: [merge]
+    outputs:
+      chart-digest: ${{ steps.chart.outputs.digest }}
     permissions:
       contents: read
       packages: write
+      id-token: write # keyless cosign chart signing (Fulcio OIDC) — #47
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -443,6 +446,19 @@ jobs:
         run: |
           echo "${GH_TOKEN}" | helm registry login "${REGISTRY}" --username "${ACTOR}" --password-stdin
 
+      # cosign reads ~/.docker/config.json for registry auth; `helm registry
+      # login` above only populates HELM's own config, so the chart-sign step's
+      # `.sig`-layer upload to ghcr was UNAUTHORIZED (#47 re-fix 2). Add the same
+      # docker login the working image-signing job uses, so cosign can push the
+      # signature.
+      - name: Log in to ghcr for cosign (.sig upload)
+        if: steps.ver.outputs.publish == 'true'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       # §3.4 invariant: on a SemVer tag the in-tree Chart.yaml must already
       # declare the tag's version on BOTH `version` and `appVersion` (chart and
       # binary are versioned together). `helm package --version/--app-version`
@@ -469,6 +485,7 @@ jobs:
           echo "§3.4 invariant ok: Chart.yaml version + appVersion = ${VERSION}"
 
       - name: Lint, package, and push chart
+        id: chart
         if: steps.ver.outputs.publish == 'true'
         run: |
           set -euo pipefail
@@ -479,10 +496,62 @@ jobs:
           helm package deploy/helm/hort-server/ \
             --app-version "${VERSION}" \
             --version "${VERSION}"
-          helm push hort-server-*.tgz "oci://${REGISTRY}/${OWNER}/charts"
-          echo "Pushed chart to oci://${REGISTRY}/${OWNER}/charts/hort-server:${VERSION}"
+          # Capture the pushed chart digest (helm push prints `Digest: sha256:…`)
+          # — cosign signs by digest, not tag, so the .sig tag is stable.
+          helm push hort-server-*.tgz "oci://${REGISTRY}/${OWNER}/charts" 2>&1 | tee /tmp/helm-push.out
+          DIGEST=$(grep -ioE 'sha256:[0-9a-f]{64}' /tmp/helm-push.out | head -1)
+          [ -n "${DIGEST}" ] || { echo "::error::could not parse chart digest from helm push output"; exit 1; }
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed chart to oci://${REGISTRY}/${OWNER}/charts/hort-server:${VERSION} (${DIGEST})"
         env:
           OWNER: ${{ github.repository_owner }}
+
+      # Pin cosign to v2.x for the CHART signature specifically. The default
+      # cosign that `cosign-installer@v4` ships is v3.x, whose new Sigstore
+      # bundle format is on by default — it stores the signature as an OCI-1.1
+      # referring artifact and does NOT write the legacy `sha256-<digest>.sig`
+      # tag. Flux source-controller discovers a chart signature ONLY via that
+      # legacy `.sig` tag (install.md §5.0), so a v3-signed chart is
+      # undiscoverable by Flux even though `cosign sign` "succeeds". cosign v2.x
+      # writes the legacy `.sig` tag by default — the format Flux needs.
+      # (#47 re-fix 3: the flag-drop in !154 made signing succeed but on v3's
+      # new format → the verify-published `.sig`-tag probe correctly reported it
+      # MISSING. The image-signing job stays on the default v3 — images use the
+      # OCI-1.1 referrer, not the Flux `.sig` path.) Revisit once Flux verifies
+      # the new bundle format, then unpin.
+      - name: Install cosign
+        if: steps.ver.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Sign the pushed chart keyless (Fulcio OIDC — same trust anchor as the
+      # public images) in LEGACY `.sig`-tag mode so Flux source-controller
+      # (tag-based discovery) can find it via the `sha256-<digest>.sig` tag, not
+      # the OCI-1.1 Referrers API. This MIRRORS the working GitLab
+      # `helm:sign-chart` job (`.gitlab-ci.yml`) — the same three format flags,
+      # keyless here vs keyed (Vault) there:
+      #   --use-signing-config=false  disables the v3 signing-config path, so
+      #       --new-bundle-format=false is accepted (with the signing-config on,
+      #       cosign v3 demands --new-bundle-format or --bundle and errors out).
+      #   --new-bundle-format=false   classic simplesigning payload (not the v3
+      #       v0.3 bundle, which Flux can't read).
+      #   --registry-referrers-mode=legacy   writes the `sha256-<digest>.sig` tag
+      #       rather than an OCI-1.1 referrer.
+      # cosign v3 WITHOUT these writes a referrer + v0.3 bundle and NO .sig tag —
+      # exactly what the verify-published probe caught. Consumers verify with a
+      # `matchOIDCIdentity` block — see docs/architecture/how-to/deploy/install.md §5.0.
+      - name: Sign chart with cosign (keyless, legacy .sig for Flux)
+        if: steps.ver.outputs.publish == 'true'
+        env:
+          OWNER: ${{ github.repository_owner }}
+          DIGEST: ${{ steps.chart.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes \
+            --use-signing-config=false \
+            --new-bundle-format=false \
+            --registry-referrers-mode=legacy \
+            "${REGISTRY}/${OWNER}/charts/hort-server@${DIGEST}"
+          echo "Signed (keyless, legacy .sig) ${REGISTRY}/${OWNER}/charts/hort-server@${DIGEST}"
 
   # ════════════════════════════════════════════════════════════════════════════
   # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually
@@ -566,6 +635,34 @@ jobs:
             exit 1
           fi
           echo "All expected ghcr.io artifacts present for ${VERSION}."
+
+      # #47: the chart's Flux-discoverable cosign signature is a legacy
+      # `sha256-<digest>.sig` tag. Probe it so a silent signing break (bad flags,
+      # missing OIDC token) fails the release instead of shipping an
+      # unverifiable chart.
+      - name: Probe chart cosign signature (.sig tag for Flux)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          CHART_DIGEST: ${{ needs.publish-chart.outputs.chart-digest }}
+        run: |
+          set -u
+          [ -n "${CHART_DIGEST:-}" ] || { echo "::error::no chart digest from publish-chart job"; exit 1; }
+          NAME="${OWNER}/charts/hort-server"
+          SIG_TAG="${CHART_DIGEST/:/-}.sig"
+          token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${NAME}:pull" \
+            -H "Authorization: Bearer ${GH_TOKEN}" | jq -r '.token // empty')
+          [ -n "${token}" ] || { echo "::error::could not mint ghcr pull token for ${NAME}"; exit 1; }
+          if curl -sfL --proto =https -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              "https://ghcr.io/v2/${NAME}/manifests/${SIG_TAG}"; then
+            echo "  ok  Flux-discoverable signature tag ghcr.io/${NAME}:${SIG_TAG}"
+          else
+            echo "::error::chart signature tag ghcr.io/${NAME}:${SIG_TAG} is MISSING — Flux verify: consumers cannot gate the chart (#47)"
+            exit 1
+          fi
 
   summary:
     name: Publish Summary

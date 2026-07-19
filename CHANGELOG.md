@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-07-19
+
+### Added
+
+- **`HORT_STORAGE_PUT_TIMEOUT_SECS`** (default `300`) — an overall bound on the
+  S3/object-store `put` multipart sequence (init + parts + complete + copy +
+  staging delete). `object_store` bounds each individual HTTP call but nothing
+  capped the aggregate, so a degraded backend could stall a pull-through
+  ingest for tens of minutes with no error. The whole operation now fails fast
+  at the configured bound.
+
+### Fixed
+
+- **Anonymous `docker pull` of a public pull-through repository now completes
+  its token handshake.** `GET /v2/auth` unconditionally `401`'d without a
+  `Authorization: Basic` credential, dead-ending the challenge-driven flow used
+  by skopeo, buildah, podman and cosign. Per the OCI Distribution Spec token
+  flow, the mint endpoint now issues a token for an anonymous request, granting
+  `pull` exactly when the repository is public — byte-identical to the
+  consume-side read gate. Private repositories, `push`/`delete` actions and
+  `registry:catalog` are never anonymously granted; an all-private request
+  mints a valid token with an empty `access[]` rather than a `401`. (#48)
+
+- **A proxied multi-arch image index now releases together with its children.**
+  Manifest ingest records `content_references` edges to the config and layer
+  blobs it references (previously only index→child edges existed), and an
+  artifact that is already a referenced descendant gets a zero-length
+  quarantine window instead of waiting out a window in which no additional
+  observation happens. The release predicate itself is unchanged — a descendant
+  still requires its own scan authority (ADR 0007). These edges were initially
+  written only on the hosted-push path; the pull-through ingest path now writes
+  them too, which is what makes the behavior reach proxied images at all. (#46)
+
+- **Purging a manifest or index no longer strands its `oci_*` reference edges.**
+  Purge tombstones the artifact row rather than hard-deleting it, so the
+  `ON DELETE CASCADE` never fired, and purge itself swept only the
+  `primary_content`/`metadata_blob` refcount kinds. The dangling
+  `oci_index_member`/`oci_subject`/`oci_config`/`oci_layer` source-edges then
+  kept every blob they pointed at permanently ineligible for GC. Purge now
+  sweeps all kinds, matching the manifest-DELETE path. (#49)
+
+- **A pull-through blob that genuinely does not exist upstream now returns a
+  terminal `BLOB_UNKNOWN` 404 instead of a `502`.** Every `fetch_blob` failure —
+  including an upstream `404` — collapsed into a "upstream unavailable" `502`,
+  which containerd treats as retryable: a pod with an absent layer sat in
+  `PodInitializing` indefinitely with no `ErrImagePull`. (#53)
+
+- **The clearance-gating provenance-verify jobs are enqueued at elevated
+  priority.** For a repository that waives scanning, the signature-arrival
+  provenance-verify is the only job gating release, and at priority 0 it queued
+  behind the entire bulk ingest backlog — so `ProvenanceVerified` landed too
+  late and the release sweep kept skipping for lack of clearance. The two
+  clearance-gating enqueues (signature-arrival and expiry-backstop) now preempt
+  bulk ingest work. Scheduling order only; the fail-closed release-authority
+  gate (ADR 0007) is untouched. (#44)
+
+- **The public Helm chart (`ghcr.io/project-hort/charts/hort-server`) is
+  signed.** It was pushed unsigned, leaving Flux `.spec.chart.spec.verify`
+  consumers with no legacy `.sig` tag to gate against. It is now keyless-signed
+  (Fulcio OIDC — the same trust anchor as the public images) in legacy `.sig`
+  mode, which is what Flux's source-controller discovers, and the release fails
+  if the signature tag is missing. `install.md` §5.0 documents the `cosign
+  verify` command and a Flux `matchOIDCIdentity` verify block. (#47)
+
+### Changed
+
+- **The storage `put` timeout reports which phase stalled.** On elapse it names
+  the backend, the phase (init-multipart / reading / uploading-part /
+  final-part / head-dedup / complete / copy / delete-staging), bytes read and
+  parts uploaded, so a stalled ingest yields evidence rather than a bare
+  timeout. An optional per-part debug timeline is available under
+  `RUST_LOG=debug`. Pure observability — no change to multipart behavior. (#53)
+
 ## [0.9.10] - 2026-07-16
 
 _Release-pipeline verification + CI / test-harness hardening; no user-facing

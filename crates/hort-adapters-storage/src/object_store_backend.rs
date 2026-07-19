@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -6,7 +7,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::storage::{PutResult, StoragePort, StreamItem};
@@ -24,6 +25,97 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// Parts smaller than this cause errors on most object stores.
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 
+/// Env var overriding [`DEFAULT_PUT_TIMEOUT_SECS`] — the overall
+/// wall-clock bound on one [`StoragePort::put`] call (#53 fail-fast
+/// guard). Parsed once at [`ObjectStoreStorage::new`] time; an absent,
+/// empty, unparseable, or zero value falls back to the default.
+const PUT_TIMEOUT_ENV_VAR: &str = "HORT_STORAGE_PUT_TIMEOUT_SECS";
+
+/// Default overall timeout for one `put()` call: 5 minutes.
+///
+/// **Why an overall wrapper, not just a per-HTTP-request timeout (#53).**
+/// `object_store`'s `ClientOptions` already defaults to a 30s per-request
+/// timeout with up to 10 retries / a 3-minute retry ceiling *per HTTP
+/// call* (`RetryConfig::default()`) — so no single `put_part` /
+/// `complete` / `copy` call is technically unbounded. But `put()` for a
+/// large blob issues MANY such calls in sequence (multipart init + one
+/// `put_part` per `MIN_PART_SIZE` chunk + `complete` + a server-side
+/// `copy` + a staging `delete`), and NOTHING bounds the AGGREGATE
+/// duration across that whole sequence — in the worst case (every call
+/// independently exhausting its own ~3-minute retry ceiling) a single
+/// `put()` could take tens of minutes without ever technically
+/// "hanging" at the HTTP layer. That is the actual #53 symptom
+/// (`http=000, 0B, 60s+` — a long, bounded-per-call-but-unbounded-in-
+/// aggregate stall, not a literal infinite hang). This constant is a
+/// generous-but-finite ceiling on the WHOLE operation: comfortably
+/// larger than any healthy multi-GB upload should need, while far
+/// tighter than the pathological many-calls-each-retrying-for-minutes
+/// worst case this fixes. Configurable via [`PUT_TIMEOUT_ENV_VAR`] —
+/// operators with slower backends or larger artifacts can raise it.
+const DEFAULT_PUT_TIMEOUT_SECS: u64 = 300;
+
+/// Resolve the configured overall `put()` timeout from
+/// [`PUT_TIMEOUT_ENV_VAR`], falling back to [`DEFAULT_PUT_TIMEOUT_SECS`]
+/// on an absent, unparseable, or zero value (zero would mean "no
+/// timeout", reintroducing the #53 hang — rejected rather than honoured).
+fn resolve_put_timeout() -> std::time::Duration {
+    let secs = std::env::var(PUT_TIMEOUT_ENV_VAR)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_PUT_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Coarse `put()` phase markers (#53 diagnostic, directive 009).
+///
+/// The investigation has narrowed the wrong root cause twice already — an
+/// isolated fetch and an isolated multipart write both pass in reproduction,
+/// so the stall is somewhere in hort's *integrated* pull-through path. This
+/// enum pins exactly which stage of `put()` was in flight the moment the
+/// fail-fast timeout (`DEFAULT_PUT_TIMEOUT_SECS`) fires, so the next report
+/// is evidence, not another guess.
+#[repr(u8)]
+enum PutPhase {
+    InitMultipart = 0,
+    Reading = 1,
+    UploadingPart = 2,
+    FinalPart = 3,
+    HeadDedup = 4,
+    Complete = 5,
+    Copy = 6,
+    DeleteStaging = 7,
+    Done = 8,
+}
+
+/// Render a raw phase code — as loaded from the shared `AtomicU8` after
+/// `inner` was cancelled by the timeout — back to its name for the
+/// diagnostic log. An out-of-range code should never occur (every write
+/// site stores a `PutPhase as u8`); it renders as `"UNKNOWN"` rather than
+/// panicking, since this runs on the failure path and must not itself
+/// become a new failure mode.
+fn phase_name(code: u8) -> &'static str {
+    match code {
+        x if x == PutPhase::InitMultipart as u8 => "INIT_MULTIPART",
+        x if x == PutPhase::Reading as u8 => "READING",
+        x if x == PutPhase::UploadingPart as u8 => "UPLOADING_PART",
+        x if x == PutPhase::FinalPart as u8 => "FINAL_PART",
+        x if x == PutPhase::HeadDedup as u8 => "HEAD_DEDUP",
+        x if x == PutPhase::Complete as u8 => "COMPLETE",
+        x if x == PutPhase::Copy as u8 => "COPY",
+        x if x == PutPhase::DeleteStaging as u8 => "DELETE_STAGING",
+        x if x == PutPhase::Done as u8 => "DONE",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Bytes between each debug-level read-progress line (#53 diagnostic).
+/// `CHUNK_SIZE` (64 KiB) is far too fine-grained for a 76 MB blob — that
+/// would be 1000+ log lines — so progress is throttled to roughly this
+/// many bytes between lines. Mandatory diagnostics (the timeout-elapse
+/// `error!`) are unaffected; only the optional debug timeline is throttled.
+const READ_PROGRESS_LOG_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Object-store backed content-addressable storage (S3, GCS, Azure, local).
 ///
 /// Wraps the `object_store` crate which abstracts across cloud providers.
@@ -35,6 +127,11 @@ pub struct ObjectStoreStorage {
     /// deployments with S3, GCS, Azure, or (in tests) in-memory each get a
     /// distinct `backend` series.
     backend: &'static str,
+    /// Overall wall-clock bound on one `put()` call (#53). See
+    /// [`DEFAULT_PUT_TIMEOUT_SECS`] for why this wraps the whole
+    /// operation rather than relying on `object_store`'s per-request
+    /// timeout alone.
+    put_timeout: std::time::Duration,
 }
 
 impl ObjectStoreStorage {
@@ -42,11 +139,25 @@ impl ObjectStoreStorage {
     ///
     /// `backend_label` must be one of the `values::BACKEND_*` constants in
     /// `crate::metrics::values` (`s3`, `gcs`, `azure`, `memory`, ...).
+    /// The put-timeout is resolved from [`PUT_TIMEOUT_ENV_VAR`] at
+    /// construction time (#53) — see [`Self::with_put_timeout`] to
+    /// override it directly (tests that need a tight bound without
+    /// mutating process env).
     pub fn new(store: Arc<dyn ObjectStore>, backend_label: &'static str) -> Self {
         Self {
             store,
             backend: backend_label,
+            put_timeout: resolve_put_timeout(),
         }
+    }
+
+    /// Override the overall `put()` timeout. Primarily for tests that
+    /// need a tight, deterministic bound rather than the env-configured
+    /// default (#53's own reproduction test uses this to keep a genuine
+    /// stall from exhausting the full default timeout in CI).
+    pub fn with_put_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.put_timeout = timeout;
+        self
     }
 }
 
@@ -67,100 +178,194 @@ impl StoragePort for ObjectStoreStorage {
         mut stream: Box<dyn AsyncRead + Send + Unpin>,
     ) -> BoxFuture<'_, DomainResult<PutResult>> {
         let backend = self.backend;
+        let put_timeout = self.put_timeout;
         Box::pin(async move {
-            let mut guard = MetricGuard::new(backend, values::OPERATION_PUT);
-            // We need a temporary path for the multipart upload. We don't know
-            // the hash yet, so use a UUID-based staging path.
-            let staging_path: object_store::path::Path =
-                format!(".staging/{}", uuid::Uuid::new_v4()).into();
+            // #53 fail-fast guard: bound the WHOLE multipart sequence
+            // (init + every part + complete + copy + staging delete), not
+            // just each individual HTTP call — see `DEFAULT_PUT_TIMEOUT_SECS`'s
+            // doc comment for why a per-request timeout alone does not cap
+            // the aggregate. `tokio::time::timeout` drops (cancels) the
+            // inner future on elapse; any in-flight multipart upload is
+            // abandoned server-side rather than explicitly aborted — an
+            // accepted, minor limitation (orphaned staging objects are the
+            // same class of cleanup the existing "orphaned content" story
+            // already covers, not a new failure mode this introduces).
+            // #53 phase diagnostics (directive 009): declared BEFORE the
+            // timeout wrapper, and cloned into `inner`, so the `Err(Elapsed)`
+            // arm below can still read the last-observed phase/progress
+            // after `inner` has been cancelled by the timeout. `Relaxed`
+            // ordering is enough — this is diagnostics, not synchronization;
+            // `inner` is the sole writer, this arm the sole (post-cancel)
+            // reader.
+            let phase = Arc::new(AtomicU8::new(PutPhase::InitMultipart as u8));
+            let bytes_read = Arc::new(AtomicU64::new(0));
+            let parts_uploaded = Arc::new(AtomicU64::new(0));
 
-            let mut upload = self.store.put_multipart(&staging_path).await.map_err(|e| {
-                warn!(error = %e, "failed to initiate multipart upload");
-                DomainError::Invariant(format!("storage upload init failed: {e}"))
-            })?;
+            let inner = {
+                let phase = Arc::clone(&phase);
+                let bytes_read = Arc::clone(&bytes_read);
+                let parts_uploaded = Arc::clone(&parts_uploaded);
+                async move {
+                    let mut guard = MetricGuard::new(backend, values::OPERATION_PUT);
+                    // We need a temporary path for the multipart upload. We don't know
+                    // the hash yet, so use a UUID-based staging path.
+                    let staging_path: object_store::path::Path =
+                        format!(".staging/{}", uuid::Uuid::new_v4()).into();
 
-            let mut hasher = Sha256::new();
-            let mut read_buf = vec![0u8; CHUNK_SIZE];
-            let mut part_buf = Vec::with_capacity(MIN_PART_SIZE);
-            let mut total_bytes: u64 = 0;
+                    phase.store(PutPhase::InitMultipart as u8, Ordering::Relaxed);
+                    let mut upload =
+                        self.store.put_multipart(&staging_path).await.map_err(|e| {
+                            warn!(error = %e, "failed to initiate multipart upload");
+                            DomainError::Invariant(format!("storage upload init failed: {e}"))
+                        })?;
 
-            loop {
-                let n = stream.read(&mut read_buf).await.map_err(|e| {
-                    warn!(error = %e, "failed to read from input stream");
-                    DomainError::Invariant(format!("storage read failed: {e}"))
-                })?;
-                if n == 0 {
-                    break;
-                }
-                total_bytes += n as u64;
-                hasher.update(&read_buf[..n]);
-                part_buf.extend_from_slice(&read_buf[..n]);
+                    let mut hasher = Sha256::new();
+                    let mut read_buf = vec![0u8; CHUNK_SIZE];
+                    let mut part_buf = Vec::with_capacity(MIN_PART_SIZE);
+                    let mut total_bytes: u64 = 0;
+                    let mut part_index: u64 = 0;
+                    // Debug-only throttle for the read-progress timeline —
+                    // see `READ_PROGRESS_LOG_INTERVAL_BYTES`.
+                    let mut last_logged_bytes: u64 = 0;
 
-                if part_buf.len() >= MIN_PART_SIZE {
-                    let payload =
-                        std::mem::replace(&mut part_buf, Vec::with_capacity(MIN_PART_SIZE));
-                    upload.put_part(payload.into()).await.map_err(|e| {
-                        warn!(error = %e, "failed to upload part");
-                        DomainError::Invariant(format!("storage part upload failed: {e}"))
+                    loop {
+                        phase.store(PutPhase::Reading as u8, Ordering::Relaxed);
+                        let n = stream.read(&mut read_buf).await.map_err(|e| {
+                            warn!(error = %e, "failed to read from input stream");
+                            DomainError::Invariant(format!("storage read failed: {e}"))
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        total_bytes += n as u64;
+                        bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                        hasher.update(&read_buf[..n]);
+                        part_buf.extend_from_slice(&read_buf[..n]);
+
+                        if total_bytes - last_logged_bytes >= READ_PROGRESS_LOG_INTERVAL_BYTES {
+                            debug!(backend, total_bytes, "put: read progress");
+                            last_logged_bytes = total_bytes;
+                        }
+
+                        if part_buf.len() >= MIN_PART_SIZE {
+                            let payload =
+                                std::mem::replace(&mut part_buf, Vec::with_capacity(MIN_PART_SIZE));
+                            let part_bytes = payload.len();
+                            phase.store(PutPhase::UploadingPart as u8, Ordering::Relaxed);
+                            let started = std::time::Instant::now();
+                            upload.put_part(payload.into()).await.map_err(|e| {
+                                warn!(error = %e, "failed to upload part");
+                                DomainError::Invariant(format!("storage part upload failed: {e}"))
+                            })?;
+                            part_index += 1;
+                            parts_uploaded.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                backend,
+                                part_index,
+                                part_bytes,
+                                upload_ms = started.elapsed().as_millis() as u64,
+                                "put: part uploaded"
+                            );
+                        }
+                    }
+
+                    // Flush remaining bytes as the final part (may be < MIN_PART_SIZE).
+                    if !part_buf.is_empty() {
+                        let part_bytes = part_buf.len();
+                        phase.store(PutPhase::FinalPart as u8, Ordering::Relaxed);
+                        let started = std::time::Instant::now();
+                        upload.put_part(part_buf.into()).await.map_err(|e| {
+                            warn!(error = %e, "failed to upload final part");
+                            DomainError::Invariant(format!("storage part upload failed: {e}"))
+                        })?;
+                        part_index += 1;
+                        parts_uploaded.fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            backend,
+                            part_index,
+                            part_bytes,
+                            upload_ms = started.elapsed().as_millis() as u64,
+                            "put: final part uploaded"
+                        );
+                    }
+
+                    let hash_hex = format!("{:x}", hasher.finalize());
+                    let hash: ContentHash = hash_hex.parse().map_err(|e| {
+                        DomainError::Invariant(format!("SHA-256 produced invalid hex: {e}"))
                     })?;
+
+                    let final_path: object_store::path::Path = cas_path(&hash).into();
+
+                    // Check for dedup: if content already exists, abort the staging
+                    // upload and return the hash.
+                    phase.store(PutPhase::HeadDedup as u8, Ordering::Relaxed);
+                    let already_exists = self.store.head(&final_path).await.is_ok();
+
+                    if already_exists {
+                        debug!(%hash, "deduplicated");
+                        let _ = upload.abort().await;
+                        let _ = self.store.delete(&staging_path).await;
+                        guard.finish_success();
+                        guard.mark_dedup();
+                        phase.store(PutPhase::Done as u8, Ordering::Relaxed);
+                        return Ok(PutResult {
+                            hash,
+                            size_bytes: total_bytes,
+                            created: false,
+                        });
+                    }
+
+                    // Complete the multipart to staging path.
+                    phase.store(PutPhase::Complete as u8, Ordering::Relaxed);
+                    upload.complete().await.map_err(|e| {
+                        warn!(error = %e, "failed to complete multipart upload");
+                        DomainError::Invariant(format!("storage upload complete failed: {e}"))
+                    })?;
+
+                    // Copy from staging to final CAS path, then clean up staging.
+                    phase.store(PutPhase::Copy as u8, Ordering::Relaxed);
+                    self.store
+                        .copy(&staging_path, &final_path)
+                        .await
+                        .map_err(|e| {
+                            warn!(%hash, error = %e, "failed to copy to final path");
+                            DomainError::Invariant(format!("storage copy failed: {e}"))
+                        })?;
+                    phase.store(PutPhase::DeleteStaging as u8, Ordering::Relaxed);
+                    let _ = self.store.delete(&staging_path).await;
+
+                    debug!(%hash, "stored");
+                    guard.finish_success();
+                    phase.store(PutPhase::Done as u8, Ordering::Relaxed);
+                    Ok(PutResult {
+                        hash,
+                        size_bytes: total_bytes,
+                        created: true,
+                    })
+                }
+            };
+
+            match tokio::time::timeout(put_timeout, inner).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    let stalled_phase = phase_name(phase.load(Ordering::Relaxed));
+                    let stalled_bytes = bytes_read.load(Ordering::Relaxed);
+                    let stalled_parts = parts_uploaded.load(Ordering::Relaxed);
+                    error!(
+                        backend,
+                        phase = stalled_phase,
+                        bytes_read = stalled_bytes,
+                        parts_uploaded = stalled_parts,
+                        put_timeout_secs = put_timeout.as_secs(),
+                        "#53 diagnostic: storage put timed out — stalled in phase {stalled_phase} \
+                         after {stalled_bytes} bytes, {stalled_parts} parts"
+                    );
+                    Err(DomainError::Invariant(format!(
+                        "storage put timed out after {}s ({PUT_TIMEOUT_ENV_VAR})",
+                        put_timeout.as_secs()
+                    )))
                 }
             }
-
-            // Flush remaining bytes as the final part (may be < MIN_PART_SIZE).
-            if !part_buf.is_empty() {
-                upload.put_part(part_buf.into()).await.map_err(|e| {
-                    warn!(error = %e, "failed to upload final part");
-                    DomainError::Invariant(format!("storage part upload failed: {e}"))
-                })?;
-            }
-
-            let hash_hex = format!("{:x}", hasher.finalize());
-            let hash: ContentHash = hash_hex.parse().map_err(|e| {
-                DomainError::Invariant(format!("SHA-256 produced invalid hex: {e}"))
-            })?;
-
-            let final_path: object_store::path::Path = cas_path(&hash).into();
-
-            // Check for dedup: if content already exists, abort the staging
-            // upload and return the hash.
-            let already_exists = self.store.head(&final_path).await.is_ok();
-
-            if already_exists {
-                debug!(%hash, "deduplicated");
-                let _ = upload.abort().await;
-                let _ = self.store.delete(&staging_path).await;
-                guard.finish_success();
-                guard.mark_dedup();
-                return Ok(PutResult {
-                    hash,
-                    size_bytes: total_bytes,
-                    created: false,
-                });
-            }
-
-            // Complete the multipart to staging path.
-            upload.complete().await.map_err(|e| {
-                warn!(error = %e, "failed to complete multipart upload");
-                DomainError::Invariant(format!("storage upload complete failed: {e}"))
-            })?;
-
-            // Copy from staging to final CAS path, then clean up staging.
-            self.store
-                .copy(&staging_path, &final_path)
-                .await
-                .map_err(|e| {
-                    warn!(%hash, error = %e, "failed to copy to final path");
-                    DomainError::Invariant(format!("storage copy failed: {e}"))
-                })?;
-            let _ = self.store.delete(&staging_path).await;
-
-            debug!(%hash, "stored");
-            guard.finish_success();
-            Ok(PutResult {
-                hash,
-                size_bytes: total_bytes,
-                created: true,
-            })
         })
     }
 
@@ -607,6 +812,47 @@ mod tests {
         assert_eq!(result.size_bytes, 0);
         let retrieved = get_bytes(&s, &result.hash).await;
         assert!(retrieved.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // #53 phase-diagnostic timeout test (directive 009)
+    // ----------------------------------------------------------------------
+
+    /// A `put()` whose input stream never produces a byte (and never
+    /// closes) must still be bounded by `put_timeout` — the #53 fail-fast
+    /// guard — and must fail with the timeout `Invariant`, not hang.
+    ///
+    /// This forces the timeout to fire while `inner` is parked on the
+    /// FIRST `stream.read()`, i.e. still in the `READING` phase before any
+    /// part has been uploaded — the exact "hort's client streaming the
+    /// body" hypothesis directive 009 wants distinguishable from a stall
+    /// inside `put_part` or `complete`/`copy`. `tokio::io::duplex` gives a
+    /// reader whose `read()` genuinely pends (not `Ready(0)`/EOF) as long
+    /// as the paired writer stays open and silent — `_writer` is kept
+    /// alive (not dropped) for exactly that reason.
+    ///
+    /// We assert on the returned error only, not a captured log line — a
+    /// prior attempt at this crate's own per-thread `tracing_subscriber`
+    /// capture (see `builders.rs`'s `missing_sse_warning_fires_for_non_aws_endpoint_without_sse`
+    /// doc comment) was flaky under parallel `cargo test`/`llvm-cov` due to
+    /// the global tracing callsite-interest cache; the directive marks log
+    /// capture optional for exactly this reason.
+    #[tokio::test]
+    async fn put_timeout_elapse_is_reported_while_reading_phase_is_in_flight() {
+        let s = storage().with_put_timeout(std::time::Duration::from_millis(50));
+        let (reader, _writer) = tokio::io::duplex(1024);
+
+        let result = s.put(Box::new(reader)).await;
+
+        match result {
+            Err(DomainError::Invariant(msg)) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "expected the #53 fail-fast timeout error, got: {msg}"
+                );
+            }
+            other => panic!("expected a timeout Invariant error, got: {other:?}"),
+        }
     }
 
     // ----------------------------------------------------------------------

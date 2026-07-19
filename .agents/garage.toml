@@ -1,0 +1,18 @@
+# Single-node dev garage for the sbx sidecar. Ephemeral (no volume) — data lives
+# in the container and is discarded on `sidecar down`.
+metadata_dir = "/tmp/garage/meta"
+data_dir = "/tmp/garage/data"
+db_engine = "sqlite"
+replication_factor = 1
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "{{values.rpc_secret}}"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.local"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "{{values.admin_token}}"

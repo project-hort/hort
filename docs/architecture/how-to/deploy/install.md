@@ -277,6 +277,43 @@ Three install scenarios. Each shows the values snippet plus the
 `helm install` invocation. Run from a working directory containing
 the values YAML.
 
+### 5.0 (Optional) Verify the chart signature
+
+The public chart is cosign-signed **keyless** (GitHub Actions Fulcio OIDC — the
+same trust anchor as the `hort-server`/`hort-worker` images), published in the
+legacy `sha256-<digest>.sig` tag mode so Flux can discover it. Verify before
+installing:
+
+```bash
+cosign verify \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp='https://github.com/project-hort/.*' \
+  ghcr.io/project-hort/charts/hort-server:<version>
+```
+
+To gate the chart in **Flux**, add a keyless `verify` block to the `HelmRelease`
+(Flux source-controller discovers the signature via the legacy `.sig` tag):
+
+```yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+spec:
+  chart:
+    spec:
+      chart: hort-server
+      version: "<version>"
+      sourceRef: { kind: HelmRepository, name: hort }   # oci://ghcr.io/project-hort/charts
+      verify:
+        provider: cosign
+        matchOIDCIdentity:
+          - issuer: https://token.actions.githubusercontent.com
+            subject: https://github.com/project-hort/.*
+```
+
+`matchOIDCIdentity` is the keyless equivalent of a key `verify.secretRef`; the
+`issuer`/`subject` mirror the `cosign verify` flags above. (See the Flux docs
+for the exact `HelmRelease` schema on your Flux version.)
+
 ### 5.1 Minimal-OIDC (single replica, filesystem, OIDC)
 
 The most common starting deployment. One pod, one PVC, OIDC auth.

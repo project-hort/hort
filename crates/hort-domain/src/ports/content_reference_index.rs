@@ -41,6 +41,17 @@
 //!   `delete`/cascade on `source = index`) drops the whole set. Excluded
 //!   from the Referrers API, which filters strictly on
 //!   `kind = "oci_subject"`.
+//! - `"oci_config"` / `"oci_layer"` — OCI single-image manifest→blob
+//!   membership. Seeded by the OCI manifest-write path on every
+//!   single-image manifest PUT: one row per referenced blob — `source =`
+//!   the manifest artifact, `target =` the blob's own content hash,
+//!   `kind = "oci_config"` for the config blob, `"oci_layer"` for each
+//!   layer blob. An image index PUT writes none of these (it has no
+//!   config/layers). Bounded by the same `MAX_BLOB_REFERENCES` cap
+//!   applied to blob-existence validation. GC-active keepalive exactly
+//!   like `oci_index_member` — orthogonal to, and not double-counted
+//!   against, the config/layer blob's `ArtifactGroupUseCase` group
+//!   membership (#46).
 //! - `"primary_content"` — refcount row. Written for every
 //!   `ArtifactIngested` (every format) so the GC-eligibility query
 //!   can prove a blob is unreferenced.

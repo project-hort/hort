@@ -29,24 +29,39 @@
 //!    artifact row so a concurrent ingest/promote cannot race the
 //!    refcount decrement; also recovers the authoritative
 //!    `checksum_sha256` for the idempotent-retry path.
-//! 2. `DELETE FROM content_references WHERE source_artifact_id = $1 AND
-//!    kind IN ('primary_content','metadata_blob') RETURNING
-//!    target_content_hash, kind` — remove this artifact's own refs.
+//! 2. `DELETE FROM content_references WHERE source_artifact_id = $1
+//!    RETURNING target_content_hash` — remove **every** kind of this
+//!    artifact's own source-edges: the `primary_content` /
+//!    `metadata_blob` refcount rows AND (#49) any `oci_index_member` /
+//!    `oci_subject` / `oci_config` / `oci_layer` membership edges this
+//!    artifact carries as a source (e.g. an image index's children, or
+//!    a manifest's config/layer blobs). Purge tombstones the `artifacts`
+//!    row rather than hard-deleting it, so the FK's `ON DELETE CASCADE`
+//!    never fires for a purge — this DELETE is the only sweep that
+//!    reaches a purged manifest's membership edges. Mirrors
+//!    `pg_content_reference_repo::delete_by_source`'s all-kinds
+//!    behavior (the manifest-DELETE path), now applied to purge too.
 //! 3. For each distinct returned hash `H`:
 //!    `SELECT count(*) FROM content_references WHERE
 //!    target_content_hash = H` — the **cross-`kind`** remaining count
-//!    (covers `oci_subject` too: a live OCI manifest still pointing at
-//!    `H` keeps the blob alive even when the artifact whose primary
-//!    content matches `H` is purged).
+//!    (covers `oci_subject` / `oci_index_member` / `oci_config` /
+//!    `oci_layer` too: a live OCI manifest/index still pointing at `H`
+//!    keeps the blob alive even when the artifact whose primary content
+//!    matches `H` is purged).
 //!
 //! **Idempotent retry.** If a prior partial run already committed the
 //! `DELETE` (storage delete / `ArtifactPurged` append then failed and
-//! the sweep retries), step 2 returns zero rows. The hash(es) are then
-//! recovered from the authoritative columns —
+//! the sweep retries), step 2 returns zero rows. `primary_content` and
+//! `metadata_blob` are recovered from the authoritative columns —
 //! `artifacts.checksum_sha256` (locked in step 1) and
 //! `artifact_metadata.metadata_blob` — and the now-stable cross-`kind`
-//! count is recomputed, so the retry still yields the decisions the
-//! use case needs to finish the purge.
+//! count is recomputed for those. **The `oci_*` membership targets are
+//! NOT recovered on retry** (#49, accepted bounded gap — see the code
+//! comment at the recovery branch): there is no authoritative column to
+//! reconstruct them from, and by the time the retry runs, their
+//! refcounts are already correctly decremented from the prior attempt's
+//! committed DELETE — only this retry call's own `PurgedRef` output
+//! (decision emission) omits them, not the underlying data.
 //!
 //! `metadata_blob` is stored as `character(64)` (blank-padded) on
 //! `artifact_metadata`; it is trimmed at the boundary before parsing,
@@ -227,11 +242,24 @@ impl PurgeGcPort for PgPurgeGcPort {
             };
 
             // -- Step 2: DELETE this artifact's own refs --------------
+            //
+            // ALL kinds (#49) — no `kind IN (...)` filter. Mirrors
+            // `pg_content_reference_repo::delete_by_source`'s all-kinds
+            // sweep. Purge tombstones the `artifacts` row (`ArtifactPurged`)
+            // rather than hard-`DELETE`ing it, so the `content_references`
+            // FK's `ON DELETE CASCADE` never fires for a purge — this
+            // DELETE is the only thing that removes a purged manifest's
+            // `oci_index_member` / `oci_subject` / `oci_config` /
+            // `oci_layer` **source**-edges (in addition to its own
+            // `primary_content` / `metadata_blob` refcount rows). Without
+            // sweeping every kind here, a purged manifest's membership
+            // edges dangled forever (no cascade, no other sweep reaches
+            // them), permanently over-retaining every target they pointed
+            // at — the #49 leak.
             let deleted: Vec<DeletedRefRow> = sqlx::query_as(
                 r#"
                 DELETE FROM content_references
                  WHERE source_artifact_id = $1
-                   AND kind IN ('primary_content','metadata_blob')
              RETURNING target_content_hash
                 "#,
             )
@@ -240,12 +268,17 @@ impl PurgeGcPort for PgPurgeGcPort {
             .await
             .map_err(|e| map_sqlx_error(&e, "purge_gc", "delete_refs"))?;
 
-            // Distinct target hashes this artifact referenced. On the
-            // happy path these come from the DELETE … RETURNING; on an
-            // idempotent retry (a prior run already committed the
-            // DELETE) the set is empty and is recovered from the
-            // authoritative `artifacts.checksum_sha256` +
-            // `artifact_metadata.metadata_blob` columns.
+            // Distinct target hashes this artifact referenced, across
+            // EVERY kind — the `oci_*` membership targets (child
+            // manifests / config / layer blobs) ride the same `hashes`
+            // set as `primary_content` / `metadata_blob` from here on,
+            // so step 3 recomputes their cross-`kind` remaining count
+            // exactly like any other target. On the happy path these
+            // come from the DELETE … RETURNING above; on an idempotent
+            // retry (a prior run already committed the DELETE) the set
+            // is empty and is recovered from the authoritative
+            // `artifacts.checksum_sha256` + `artifact_metadata.metadata_blob`
+            // columns.
             let mut hashes: BTreeMap<String, ContentHash> = BTreeMap::new();
             for row in &deleted {
                 let h = parse_hash(
@@ -259,6 +292,29 @@ impl PurgeGcPort for PgPurgeGcPort {
                 // deleted by a prior partial run. Recover from the
                 // authoritative columns so the retry still produces
                 // the decisions needed to finish the purge.
+                //
+                // **Accepted bounded gap (#49):** this recovery ONLY
+                // reconstructs `primary_content` (from
+                // `artifacts.checksum_sha256`) and `metadata_blob` (from
+                // `artifact_metadata.metadata_blob`) — there is no
+                // authoritative column anywhere that records what
+                // `oci_index_member` / `oci_subject` / `oci_config` /
+                // `oci_layer` **targets** this artifact's now-deleted
+                // membership edges used to point at, so those targets are
+                // NOT re-added to `hashes` on a retry. This does not
+                // reintroduce the #49 leak: by the time this branch runs,
+                // the DELETE in step 2 already committed on the prior
+                // attempt, so every `oci_*` target's refcount is already
+                // correctly decremented in the database — the gap is
+                // purely that THIS retry's `PurgedRef` output (and thus
+                // the use case's GC-eligibility decision emission for
+                // that call) skips those already-corrected targets. A
+                // later, unrelated purge/reconcile pass still sees their
+                // true (already-decremented) count. Deliberately not
+                // fixed by adding a column/table for this bounded,
+                // rare-partial-failure gap (directive #49 — do not expand
+                // the schema for it); revisit only if evidence shows the
+                // retry path is common enough to matter.
                 let primary = parse_hash(&checksum_sha256, "artifacts.checksum_sha256")?;
                 hashes.insert(primary.as_ref().to_owned(), primary);
 
@@ -843,6 +899,252 @@ mod tests {
             refs_after[0].refs_remaining, 0,
             "once no index references the child, its blob is GC-eligible"
         );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Manifest→blob membership (`oci_config` / `oci_layer`, #46 Item 1):
+    /// a live manifest keeps its config and layer blobs alive under GC,
+    /// exactly like `live_index_member_keeps_child_blob_then_frees_it`
+    /// keeps a child manifest alive — the GC-interaction resolution for
+    /// this item (issue #46 comment "Item 1 GC-interaction — RESOLVED")
+    /// requires these new kinds to behave identically to the shipped
+    /// `oci_index_member` precedent: GC-active, cross-kind counted, and
+    /// freed once the manifest's own edges are gone (manifest DELETE /
+    /// `delete_by_source` sweeps every kind for the source, same as an
+    /// index).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn live_manifest_blob_edges_keep_config_and_layer_blobs_then_free_them() {
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let repo = seed_repo(&pool).await;
+        // A config blob (own hash HASH_A), a layer blob (own hash
+        // HASH_C), and the single-image manifest artifact (own blob
+        // HASH_B) that references both.
+        let config = seed_artifact(&pool, repo, "config-blob", HASH_A, Some("released")).await;
+        let layer = seed_artifact(&pool, repo, "layer-blob", HASH_C, Some("released")).await;
+        let manifest = seed_artifact(&pool, repo, "image-manifest", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id IN ($1, $2, $3)")
+            .bind(config)
+            .bind(layer)
+            .bind(manifest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Each blob's own primary_content refcount (target = own hash).
+        insert_cr(&pool, repo, config, "primary_content", HASH_A).await;
+        insert_cr(&pool, repo, layer, "primary_content", HASH_C).await;
+        // The manifest → blob membership: one `oci_config` row + one
+        // `oci_layer` row, both `source = manifest`.
+        insert_cr(&pool, repo, manifest, "oci_config", HASH_A).await;
+        insert_cr(&pool, repo, manifest, "oci_layer", HASH_C).await;
+        assert_eq!(
+            cr_rows_for(&pool, manifest).await,
+            vec![
+                ("oci_config".into(), HASH_A.into()),
+                ("oci_layer".into(), HASH_C.into())
+            ],
+            "manifest carries one oci_config row and one oci_layer row"
+        );
+        append_event(&pool, config, "ArtifactExpired", 0).await;
+        append_event(&pool, layer, "ArtifactExpired", 0).await;
+
+        let adapter = PgPurgeGcPort::new(pool.clone());
+
+        // -- Phase 1: manifest is live → purging config/layer keeps them -
+        let config_refs = adapter.purge_artifact_refs(config).await.unwrap();
+        assert_eq!(config_refs.len(), 1);
+        assert_eq!(config_refs[0].content_hash.as_ref(), HASH_A);
+        assert_eq!(
+            config_refs[0].refs_remaining, 1,
+            "a live manifest keeps its config blob (cross-kind count)"
+        );
+        let layer_refs = adapter.purge_artifact_refs(layer).await.unwrap();
+        assert_eq!(layer_refs.len(), 1);
+        assert_eq!(layer_refs[0].content_hash.as_ref(), HASH_C);
+        assert_eq!(
+            layer_refs[0].refs_remaining, 1,
+            "a live manifest keeps its layer blob (cross-kind count)"
+        );
+        // Each blob's own primary_content row was swept; the manifest's
+        // membership rows survive (source = manifest, not the purged blob).
+        assert!(cr_rows_for(&pool, config).await.is_empty());
+        assert!(cr_rows_for(&pool, layer).await.is_empty());
+        assert_eq!(
+            cr_rows_for(&pool, manifest).await,
+            vec![
+                ("oci_config".into(), HASH_A.into()),
+                ("oci_layer".into(), HASH_C.into())
+            ],
+            "the manifest's oci_config/oci_layer edges survive the blob purge"
+        );
+
+        // -- Phase 2: manifest DELETE (delete_by_source) → blobs freed ---
+        // Manifest DELETE sweeps every `source = manifest` row (both
+        // kinds), same as an index DELETE. With no remaining reference,
+        // a re-purge of the config/layer blobs reports them GC-eligible.
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(manifest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let config_refs_after = adapter.purge_artifact_refs(config).await.unwrap();
+        assert_eq!(config_refs_after.len(), 1);
+        assert_eq!(config_refs_after[0].content_hash.as_ref(), HASH_A);
+        assert_eq!(
+            config_refs_after[0].refs_remaining, 0,
+            "once the manifest is deleted, its config blob is GC-eligible"
+        );
+        let layer_refs_after = adapter.purge_artifact_refs(layer).await.unwrap();
+        assert_eq!(layer_refs_after.len(), 1);
+        assert_eq!(layer_refs_after[0].content_hash.as_ref(), HASH_C);
+        assert_eq!(
+            layer_refs_after[0].refs_remaining, 0,
+            "once the manifest is deleted, its layer blob is GC-eligible"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// #49 — purging a manifest/index artifact removes ITS OWN `oci_*`
+    /// **source**-edges (not just `primary_content`/`metadata_blob`), so
+    /// a target it references is correctly retained while ANOTHER live
+    /// manifest still points at it, and correctly freed once no manifest
+    /// does. Covers all four `oci_*` kinds uniformly — `oci_index_member`,
+    /// `oci_subject`, `oci_config`, `oci_layer` — each in its own
+    /// independent (target, manifest_1, manifest_2) triple so the fix is
+    /// proven kind-by-kind, not just for one arbitrarily-chosen kind.
+    ///
+    /// Before the #49 fix, step 2's `DELETE ... AND kind IN
+    /// ('primary_content','metadata_blob')` never touched these edges;
+    /// since purge tombstones (not hard-deletes) the `artifacts` row, the
+    /// `ON DELETE CASCADE` never fired either, so a purged manifest's
+    /// `oci_*` edges dangled forever and permanently over-retained their
+    /// targets (`refs_remaining` never reached 0). This test would have
+    /// failed the second `refs_remaining == 0` assertion below against
+    /// the pre-fix code — purging manifest_2 would still have reported
+    /// `refs_remaining == 1` (manifest_1's dangling edge from the FIRST
+    /// purge never having been swept).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn purge_manifest_sweeps_all_oci_kinds_and_frees_target_once_unreferenced() {
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let repo = seed_repo(&pool).await;
+        let adapter = PgPurgeGcPort::new(pool.clone());
+
+        // (kind, target_hash, manifest_1_own_hash, manifest_2_own_hash) —
+        // one independent triple per oci_* kind.
+        const CASES: [(&str, &str, &str, &str); 4] = [
+            (
+                "oci_index_member",
+                "ec36e268b2d1bdf60cce909b3fe98bf5e5bfcde710a49609989b54ec8889a219",
+                "6b4103dbacc0c272786632a3ebfa28c83cf5aa4b92a243d035be911970ab1b68",
+                "2fdc5189a1993a57c847bb27a5ac3bd8e0b8ad1e663b50a7b7ca66e916a0ef48",
+            ),
+            (
+                "oci_subject",
+                "def413da534256fd1e39935baeae8fa4482bfee188c52c8972a09ec786523b74",
+                "a8f449b8d736dd92c6c3bb56a17053732f893752ae1564ac9fb61e8d49e08c81",
+                "3e43484e13fcadbfcc4a5281cfa128684d9077f716b4b8e890d92ae5afc21145",
+            ),
+            (
+                "oci_config",
+                "4289f601a395dc26002be9230c533f89caf989248a6993d101283b3b2523086b",
+                "912d5689c5ee8473469eeaa32556d9e6c387d4c75893e13a9f16b4bfd166ca78",
+                "4e6065244e725ef455b45a9b2e358ad899d78892e671edf71580472875a22fb9",
+            ),
+            (
+                "oci_layer",
+                "5bb4ff978f8fc58d81b65837626ea78ca9e4055e09abe95c40194131e00b5649",
+                "1f3806ad5244aa186cddc4c05cfb9959e148a37b307f9ce12282c23f22ec71f2",
+                "d3687773c21da4352074a4e231bfd48a2df7a40e10d4ed334500a2d35c154228",
+            ),
+        ];
+
+        for (kind, target_hash, manifest1_hash, manifest2_hash) in CASES {
+            let manifest_1 = seed_artifact(
+                &pool,
+                repo,
+                &format!("manifest-1-{kind}"),
+                manifest1_hash,
+                Some("released"),
+            )
+            .await;
+            let manifest_2 = seed_artifact(
+                &pool,
+                repo,
+                &format!("manifest-2-{kind}"),
+                manifest2_hash,
+                Some("released"),
+            )
+            .await;
+            sqlx::query("DELETE FROM content_references WHERE source_artifact_id IN ($1, $2)")
+                .bind(manifest_1)
+                .bind(manifest_2)
+                .execute(&pool)
+                .await
+                .unwrap();
+            // Each manifest's own primary_content refcount.
+            insert_cr(&pool, repo, manifest_1, "primary_content", manifest1_hash).await;
+            insert_cr(&pool, repo, manifest_2, "primary_content", manifest2_hash).await;
+            // Both manifests reference the SAME target via the SAME
+            // oci_* kind — the scenario `content_references` widened PK
+            // exists for (two sources, one target, one kind).
+            insert_cr(&pool, repo, manifest_1, kind, target_hash).await;
+            insert_cr(&pool, repo, manifest_2, kind, target_hash).await;
+            append_event(&pool, manifest_1, "ArtifactExpired", 0).await;
+            append_event(&pool, manifest_2, "ArtifactExpired", 0).await;
+
+            // -- Purge manifest_1: manifest_2's edge keeps the target alive --
+            let refs_1 = adapter.purge_artifact_refs(manifest_1).await.unwrap();
+            let target_ref_1 = refs_1
+                .iter()
+                .find(|r| r.content_hash.as_ref() == target_hash)
+                .unwrap_or_else(|| {
+                    panic!("kind {kind}: purging manifest_1 must report the target hash")
+                });
+            assert_eq!(
+                target_ref_1.refs_remaining, 1,
+                "kind {kind}: manifest_2's live {kind} edge must keep the target retained \
+                 after manifest_1 is purged"
+            );
+            // manifest_1's OWN oci_* source-edge is gone (the #49 fix) —
+            // not just its primary_content row.
+            assert!(
+                cr_rows_for(&pool, manifest_1).await.is_empty(),
+                "kind {kind}: purging manifest_1 must sweep ALL its source-edges, \
+                 including its {kind} edge, not just primary_content"
+            );
+            // manifest_2's edge survives untouched.
+            assert_eq!(
+                cr_rows_for(&pool, manifest_2).await,
+                vec![
+                    (kind.to_string(), target_hash.to_string()),
+                    ("primary_content".to_string(), manifest2_hash.to_string()),
+                ],
+                "kind {kind}: manifest_2's own edges must be untouched by manifest_1's purge"
+            );
+
+            // -- Purge manifest_2: no live source-edge remains → freed --
+            let refs_2 = adapter.purge_artifact_refs(manifest_2).await.unwrap();
+            let target_ref_2 = refs_2
+                .iter()
+                .find(|r| r.content_hash.as_ref() == target_hash)
+                .unwrap_or_else(|| {
+                    panic!("kind {kind}: purging manifest_2 must report the target hash")
+                });
+            assert_eq!(
+                target_ref_2.refs_remaining, 0,
+                "kind {kind}: once BOTH manifests are purged, the target must be \
+                 GC-eligible (refs_remaining == 0) — the #49 leak this test guards against"
+            );
+        }
 
         cleanup(&pool, repo).await;
     }
