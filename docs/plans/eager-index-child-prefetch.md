@@ -1,86 +1,92 @@
-# Eager index-child prefetch — design (issue #51)
+# Warm an index child's layers on the digest path — design (issue #51)
 
-Branch-local planning doc (D7). **Blocked on #55** — see §2.
+Branch-local planning doc (D7). **Revised 2026-07-20** after Tom's steer: the original design (index fan-out + a `PrefetchPolicy` platform allowlist) is withdrawn in favour of a materially smaller change. The withdrawn version is summarised in §6 so the reasoning is not lost.
 
 ## §1 — Deferred-items sweep (architect Step 0)
 
-Run 2026-07-20 against `develop` @ `a3dff74c`.
+Run 2026-07-20 against `develop` @ post-`!168`.
 
-- `docs/plans/*.md` — one sibling present on this branch line: `coalesce-leader-liveness.md` (#55). Its §4 carries forward *"`prefetch_ingest.rs` bypasses `PullDedup` while its module doc claims otherwise"* → filed as **#57**. **Decision: carry forward** — related (both concern prefetch dedup) but independent; #51 does not touch the task-queue cascade.
-- ADR open-items register — two OCI-index rows reviewed:
-  - *OCI image-index child-status rollup* ([0043]) — index visibility does not reflect child quarantine state. **Decision: carry forward, not absorbed.** Adjacent but distinct: that is about *serving* an index whose children are held; this is about *fetching* them earlier. Eager prefetch does not change what is served.
-  - *OCI image-index promotion cascade* ([0043]) — promotion does not walk `oci_index_member`. **Decision: carry forward.** Same edges, different consumer.
-- Issue #46's Option-B design deferred the eager-tree fetch explicitly; #51 **is** that deferral surfacing. **Decision: include now** — this is the scheduled follow-on.
+- `docs/plans/` — one sibling, `coalesce-leader-liveness.md` (#55), now **merged** via !168. Its §4 carry-forward (`prefetch_ingest.rs` bypasses `PullDedup` while its doc claims otherwise) is filed as **#57**. **Decision: carry forward** — related but independent; this item does not touch the task-queue cascade.
+- ADR open-items register — *OCI image-index child-status rollup* and *OCI image-index promotion cascade* (both [0043]) reviewed. **Decision: carry forward, not absorbed.** Both concern indexes but neither concerns fetch timing.
+- #46's Option-B deferred eager-tree fetch — **this item is that deferral surfacing.** Include now.
 
 ### Inherited-rationale re-validation
 
 **Reused claim (#46 Option B):** "register-only is sufficient for v1; the fetch half can be deferred because the descendant zero-window carve-out already collapses the latency."
 
-**Verdict: still valid, and it is why this item is low-priority.** Tom's prod validation confirmed a cold multi-arch pull dropped from ~15–18 min to ~5–8 min (bounded by the index's own quarantine window). The residual is the sequential per-level walk, not a broken invariant. Nothing about the threat surface changed. Recorded so the next sweep sees the verdict rather than silence.
+**Verdict: still valid — and it is now the reason this item shrank.** Prod validation showed a cold multi-arch pull dropped from ~15–18 min to ~5–8 min. The remaining cost is the sequential level-by-level walk, not a broken invariant. That framing is what makes the cheap fix below sufficient.
 
-## §2 — Hard prerequisite: #55 must land first
+## §2 — Prerequisite: #55 (SATISFIED)
 
-This is a sequencing constraint, not a preference.
+Eager fetching adds concurrent pull-through fetches, all riding `PullDedup`. Before !168 a wedged coalesce leader hung every in-process follower forever. **!168 merged**, so the leader is now bounded and self-healing. This item is unblocked.
 
-Eager child fetch means issuing **N child manifests × M config/layer blobs** concurrent pull-through fetches per index. Every one of those rides `PullDedup`. Per #55's design §2, a wedged coalesce leader currently hangs **every** in-process follower forever (`pull_dedup.rs:700`, unbounded `rx.recv().await`) and its heartbeat re-extends the cluster lock in perpetuity (`spawn_heartbeat`, aborted at 923 only after the await at 918).
+## §3 — The actual gap
 
-Shipping eager fan-out onto that machinery multiplies the blast radius of a known-open bug from one wedged digest to a whole image tree. **Do not schedule this item until #55's fix is merged.**
+`fire_prefetch_trigger_oci` (`crates/hort-http-oci/src/prefetch.rs:133`) already warms a manifest's config + layer blobs in the background, each riding `PullDedup`, best-effort. It is wired into the **tag path only** (`manifests.rs:1210`).
 
-## §3 — Reframing: this is not a new code path
+So a `docker pull` of a multi-arch image today does:
 
-The issue proposes eager register+fetch at the pull-through seam. The register half already shipped (`58b8548c`). For the fetch half, there are two candidate seams, and the obvious one is wrong.
+1. `GET /manifests/:tag` → index ingested → trigger fires → `parse_manifest_blob_digests` returns `Some(empty)` for an index → **nothing prefetched** (early return, prefetch.rs:197).
+2. `GET /manifests/sha256:<child>` → the digest path → `content_references` edges written → **no prefetch fired at all**.
+3. Every layer pulled lazily, one round trip at a time.
 
-**Rejected — inside the coalesce closure.** `register_membership_edges_from_pull` (manifests_write.rs:1362) runs its edge-write loop (1414–1450) *inside* the leader's `coalesce_blob`/`coalesce_to_hash` closure (called from manifests.rs:891 digest-path, manifests.rs:1201 tag-path). Adding N+M network fetches there extends the critical section that every Layer-A follower is blocked on. That loop is already the heaviest thing in the window — one DB round-trip per referenced blob, **serially**. Making it fetch too would turn a ~seconds window into a ~minutes one, which is precisely the condition #55 exists to bound. Reject.
-
-**Chosen — extend the existing post-ingest prefetch trigger.** `fire_prefetch_trigger_oci` (`crates/hort-http-oci/src/prefetch.rs:133`) already does exactly this job for single-image manifests: fired *after* ingest, spawns background blob pull-throughs, each riding `PullDedup` via `try_upstream_blob_pull`, results logged and discarded (best-effort). It is gated on `repo.prefetch_policy.enabled` and on an actual tag move (`prior_held_digest != upstream_digest`, line 158).
-
-It bails on an index. `parse_manifest_blob_digests` returns `Some(empty)` for index media types, hitting the early return at prefetch.rs:197–205: *"manifest references no blobs (config-only or index); nothing to prefetch."*
-
-**So #51 is: teach the shipped trigger the index case.** No new path, no new dedup story, no change to the pull-through hot path. That is a materially smaller and safer change than the issue implies.
+**Step 2 is the gap, and it is one missing call.** The client's own request for a specific child digest is an unambiguous statement of which architecture it wants — no inference, no policy, no guessing. Firing the existing trigger there warms exactly that arch's layers while the client is still parsing the child manifest.
 
 ## §4 — What to build
 
-### §4.1 — Index-aware fan-out
+**One change: fire the blob-warming fan-out on the digest path of manifest pull-through.**
 
-When the ingested manifest is an index, walk `parse_index_children` (manifests_write.rs:1222 — already `pub(crate)`, already caps width via the domain-level `index_child_digests`), then for each selected child: pull the child manifest through `try_upstream_manifest_pull_by_digest`, and let that call's own `register_membership_edges_from_pull` discover the child's config+layer blobs, which the existing single-image path then prefetches.
+`fire_prefetch_trigger_oci` cannot be called verbatim — its signature takes `tag` + `prior_held_digest` and gates on a dist-tag move (`prior_held_digest != upstream_digest`), neither of which exists for a by-digest pull. Split it:
 
-The recursion is one level deep and terminates naturally: index → child manifests → their blobs.
+```rust
+// prefetch.rs — the existing tag-move gate, unchanged in behaviour.
+pub(crate) fn fire_prefetch_trigger_oci(ctx, repo, name, tag, upstream_digest,
+                                        prior_held_digest, manifest_bytes) {
+    if !repo.prefetch_policy.enabled { return; }
+    if prior_held_digest == Some(upstream_digest) { return; }   // no tag move
+    if ctx.prefetch_use_case.plan(..).is_empty() { return; }    // planner gate
+    warm_manifest_blobs(ctx, repo, name, manifest_bytes);
+}
 
-### §4.2 — Bounded concurrency (new, and required)
+// NEW — the shared fan-out half, callable without a tag.
+pub(crate) fn warm_manifest_blobs(ctx, repo, name, manifest_bytes) { … }
+```
 
-The current fan-out at prefetch.rs:227 is a bare `tokio::spawn` per blob — **no `Semaphore`, no `JoinSet`, no cap, no backpressure**. For a single-image manifest (config + a handful of layers) that is tolerable. For an index it is not: a 8-arch image at ~10 layers each is ~88 concurrent pull-throughs against one upstream from a single client request.
+Call `warm_manifest_blobs` from the digest path (`manifests.rs`, alongside the existing `register_membership_edges_from_pull` at :891), gated on `repo.prefetch_policy.enabled` only.
 
-Introduce a bounded runner — a `Semaphore` sized by a new `HORT_OCI_PREFETCH_MAX_CONCURRENCY` (proposed default **8**) — and route **both** the existing single-image fan-out and the new index fan-out through it. Fixing the existing unbounded spawn is in scope: it is the same code path and leaving it unbounded while adding a much wider consumer would be negligent.
+**No planner call on the digest path.** The planner's trigger taxonomy has no "child manifest fetched" kind, and its role at the tag site is a plain on/off gate. Adding a trigger variant to satisfy a gate that `prefetch_policy.enabled` already answers is machinery for its own sake. If a future initiative needs per-trigger prefetch accounting, it can add the variant then.
 
-### §4.3 — Arch selection — **OPEN, needs Tom's steer**
+That is the whole change: one extracted helper, one new call site, one `enabled` check.
 
-This is the one genuine product decision and it is not mine to make. Fetching all arches of a multi-arch image is the difference between prefetching ~1 GB and ~8 GB per tag move.
+## §5 — Explicitly NOT doing
 
-- **(a) All children.** Simplest, guarantees the hit, worst bandwidth/storage. A typical cluster consumes 1–2 of 5–10 published arches.
-- **(b) Operator-configured platform allowlist** on `PrefetchPolicy` (e.g. `platforms: ["linux/amd64", "linux/arm64"]`), default to those two. Covers the overwhelming majority of real deployments at ~20–25 % of (a)'s cost.
-- **(c) Only the arch the triggering client is about to request.** Cheapest, but not knowable at trigger time — the client has only fetched the index. Would require deferring until the first child request, which is the lazy behaviour this issue exists to remove. **Not viable.**
+Recorded so these are not silently reintroduced.
 
-**Recommendation: (b).** It is the only option that lets an operator express the actual consumption profile, and the cost gap over (a) is large enough to matter on a proxy serving a cluster.
+- **Index child fan-out.** Withdrawn. Fetching an index's children eagerly means guessing which arches matter; the client tells us for free one round trip later. The index → child hop stays sequential — it is a single few-KB manifest fetch, and all the bytes are in the layers this design already warms.
+- **A `PrefetchPolicy.platforms` allowlist.** Withdrawn with the fan-out. No new operator surface, so **ADR 0015 does not apply at all** — there is no field to make load-bearing.
+- **Bounded-concurrency runner for the spawn fan-out.** The existing per-blob `tokio::spawn` at prefetch.rs:227 has no cap. Under this design the digest path warms **one manifest's** config + layers (~10 spawns) — identical in shape and width to what the tag path already does in production today. This change therefore adds **no** new concurrency pressure, so a cap is not required *for this item*. The unbounded spawn remains a pre-existing latent issue; if it is worth fixing it is worth fixing on its own merits, not smuggled in here. **Carried forward** — file separately if it ever bites.
+- **Quarantine changes.** None needed. An eagerly-warmed blob rides the identical `try_upstream_blob_pull` path a lazy client GET uses, so it is gated exactly as before. Eager warming changes **when** bytes arrive, never **whether** they are gated. ADR 0007's release predicate is untouched.
 
-**Note the ADR 0015 constraint:** a new `PrefetchPolicy` field must be **either enforced by the consuming use case or rejected at gitops apply**. A `platforms:` field accepted at apply and ignored at runtime is a hard block — operators would make capacity decisions on an inert knob. If (b) is chosen, the field and its enforcement ship together, in one item.
+## §6 — Withdrawn design (kept for the record)
 
-### §4.4 — Quarantine semantics for eagerly-fetched children
+The first pass proposed teaching `fire_prefetch_trigger_oci` the index case: parse `parse_index_children`, fetch each child manifest, let each child's own registration discover its blobs — plus a `PrefetchPolicy.platforms` allowlist (default `linux/amd64` + `linux/arm64`) to avoid pulling all 5–10 published arches, plus a `Semaphore` because an 8-arch image would have meant ~88 concurrent pull-throughs from one client request.
 
-No change required, and this is worth stating so nobody invents one. An eagerly-fetched child is ingested through the identical `try_upstream_manifest_pull_by_digest` path a lazy client pull would use, so it lands with the same zero-length quarantine window that #46 Item 2 gives any referenced-tree descendant, and releases on its own clean scan under its own authority. Eager fetch changes **when** bytes arrive, never **whether** they are gated. The release predicate (ADR 0007) is untouched.
+**Why withdrawn:** it solved a problem the client solves for us. Every part of that cost — the arch guess, the operator-facing policy field and its ADR 0015 enforcement obligation, the concurrency cap made necessary only by the fan-out itself — existed to work around not knowing the architecture at index-ingest time. We learn it definitively one request later. The simpler design captures essentially the same latency win (the layers are the bytes) at none of that cost.
 
-## §5 — Observability
+## §7 — Observability
 
-- `info!` on index fan-out start: `repo_key`, `name`, `tag`, `child_count`, `selected_count` (so a platform filter's effect is visible).
-- `warn!` on a child pull failure — best-effort, non-fatal, mirroring the existing single-image posture at prefetch.rs:240+.
-- New counter `hort_oci_prefetch_children_total{outcome}` — `selected` / `skipped_platform` / `succeeded` / `failed`. Without `skipped_platform` an operator cannot tell a working filter from a broken parse.
-- `docs/metrics-catalog.md` parity required (metrics.rs:1507 convention).
+Deliberately minimal — this rides an existing instrumented path.
 
-## §6 — Explicitly out of scope
+- The existing `info!` in the fan-out already reports `repo_key` / `name` / `blob_count`. Extend its call site to distinguish the trigger source (`tag_move` vs `child_digest`) so an operator can see which path warmed a blob.
+- No new metric. `hort_upstream_fetch_total` already counts the resulting pulls, and the existing prefetch counters cover the tag path. A dedicated counter here would measure a code path, not an operator-meaningful outcome.
 
-- The task-queue prefetch cascade (`prefetch_dependencies.rs` / `prefetch_ingest.rs`) — different mechanism, L3-deduped. See **#57**.
-- Index **promotion** cascade and index **child-status rollup** — carried forward from the ADR register per §1.
-- Any change to what a client is *served*. This item changes fetch timing only.
+## §8 — Testing
 
-## §7 — Layering check
+- A by-digest manifest pull-through on a `prefetch_policy.enabled` repo spawns warming pulls for that manifest's config + layers.
+- The same pull on a **disabled** repo spawns nothing.
+- The tag path's existing behaviour — including the tag-move gate and the planner gate — is unchanged. The existing prefetch tests (prefetch.rs:544+) must pass untouched; the refactor is behaviour-preserving on that side.
+- An index pulled by digest warms nothing (it has no config/layers) and does not error.
 
-Stays within the inbound OCI adapter (`hort-http-oci`) plus one config field if §4.3(b) is chosen. No new port, no new domain event, no `IngestUseCase` change. `hort-http-oci` must not import `hort-adapters-*` (ADR 0008) — the fan-out calls existing `crate::blobs` / `crate::manifests` helpers, so this holds by construction.
+## §9 — Layering
+
+Entirely within `hort-http-oci`. No new port, no domain event, no config field, no `IngestUseCase` change. `hort-http-oci` must not import `hort-adapters-*` (ADR 0008) — the fan-out calls existing `crate::blobs` helpers, so this holds by construction.
