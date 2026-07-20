@@ -3,7 +3,7 @@ use std::io::{Cursor, Read};
 use bytes::Bytes;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::format_handler::{DependencySpec, FormatHandler};
+use hort_domain::ports::format_handler::{DependencySpec, FormatHandler, VersionDiscovery};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
 
@@ -567,111 +567,16 @@ impl FormatHandler for PyPiFormatHandler {
         Some(format!("/pypi/{normalized}/{version}/json"))
     }
 
-    /// Extract the upstream-published version-string set from a PyPI
-    /// simple-index body (PEP 503 HTML *or* PEP 691 JSON; the format is
-    /// sniffed from the leading bytes).
-    ///
-    /// HTML path: scans `<a ... href="...">` anchors and applies the
-    /// filename → version helper ([`pypi_extract_version_from_filename`])
-    /// to each anchor's basename. Mirrors the hot-path trigger reader in
-    /// `crates/hort-http-pypi/src/simple_index.rs::parse_upstream_versions_pypi`
-    /// (the HTML arm).
-    ///
-    /// JSON path (PEP 691): reads the `versions[]` array directly when
-    /// present; otherwise falls back to the helper-via-filename walk
-    /// across `files[]`. Mirrors the hot-path JSON arm.
-    ///
-    /// Unparseable bodies (binary garbage, neither valid UTF-8 nor
-    /// JSON) yield `Ok(Vec::new())` — same degrade-open policy as the
-    /// hot-path trigger; the next tick re-evaluates.
-    ///
-    /// Bounded by the existing 128 KB
-    /// [`metadata_expected_max_bytes`](Self::metadata_expected_max_bytes)
-    /// cap, raised here to a 10 MiB ceiling to admit
-    /// realistic simple-index pages (the per-version JSON cap was
-    /// sized for METADATA only — a project with thousands of versions
-    /// publishes a much larger HTML index). Bodies above 10 MiB are
-    /// rejected as `Validation` (same shape as the npm 5 MB cap).
-    ///
-    /// Streaming (see ADR 0026): `body` is a streaming reader over the
-    /// simple-index page. The PyPI simple-index walk is dual-mode —
-    /// PEP 503 HTML (anchor scan over the whole body as a `&str`) OR PEP
-    /// 691 JSON (`versions[]` / `files[]`); both modes need the body in
-    /// memory. The body is read into a buffer bounded by the 10 MiB
-    /// simple-index cap (so an over-cap body cannot force an unbounded
-    /// allocation), then the existing byte-slice logic runs unchanged —
-    /// byte-identical version list, HTML/JSON sniffing, and degrade-open
-    /// policy. (The `PypiSimpleIndexProjector` only covers the PEP 691
-    /// JSON `files[]` arm, not the HTML arm or the `versions[]` array,
-    /// so it is not a drop-in here; the discovery seam in
-    /// `hort-formats-upstream` uses the projector for the JSON-only
-    /// serve path.)
-    fn extract_upstream_versions(&self, body: &mut dyn Read) -> DomainResult<Vec<String>> {
-        // Simple-index pages are bounded separately from per-version
-        // JSON metadata; 10 MiB hard cap (a project with O(10^4) versions,
-        // average filename ~80 bytes per anchor,
-        // tops out under 4 MiB — leaving 2.5x headroom).
-        const SIMPLE_INDEX_MAX_BYTES: usize = 10 * 1024 * 1024;
-        let body =
-            crate::stream_helpers::read_to_capped_vec(body, SIMPLE_INDEX_MAX_BYTES, |len, max| {
-                format!("pypi simple-index body is {len} bytes; per-format max is {max}")
-            })?;
-        let body = body.as_slice();
-
-        // PEP 691 JSON path — peek for a leading `{` after any
-        // whitespace. Cheap pre-check; the full sniff is the serde
-        // parse below.
-        let leading = body.iter().find(|&&b| !b.is_ascii_whitespace()).copied();
-        if leading == Some(b'{') {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
-                let mut out: Vec<String> = Vec::new();
-                if let Some(arr) = value.get("versions").and_then(|v| v.as_array()) {
-                    for entry in arr {
-                        if let Some(s) = entry.as_str() {
-                            out.push(s.to_string());
-                        }
-                    }
-                }
-                if out.is_empty() {
-                    if let Some(files) = value.get("files").and_then(|v| v.as_array()) {
-                        for f in files {
-                            let filename = f
-                                .get("filename")
-                                .and_then(|x| x.as_str())
-                                .map(str::to_string)
-                                .or_else(|| {
-                                    f.get("url")
-                                        .and_then(|x| x.as_str())
-                                        .and_then(|u| u.rsplit('/').next().map(str::to_string))
-                                });
-                            if let Some(fn_str) = filename {
-                                if let Some(v) = pypi_extract_version_from_filename(&fn_str) {
-                                    out.push(v);
-                                }
-                            }
-                        }
-                    }
-                }
-                return Ok(out);
-            }
-            // Falls through to HTML path on malformed JSON — a
-            // mis-served body labelled JSON but actually shaped like
-            // HTML still gets one more chance.
-        }
-
-        // HTML path — anchor walk + per-filename version extract.
-        let Ok(html) = std::str::from_utf8(body) else {
-            return Ok(Vec::new());
-        };
-        let mut out: Vec<String> = Vec::new();
-        for href in pypi_scan_href_values(html) {
-            if let Some(filename) = pypi_filename_from_href(href) {
-                if let Some(v) = pypi_extract_version_from_filename(filename) {
-                    out.push(v);
-                }
-            }
-        }
-        Ok(out)
+    /// `Some(self)` — pypi implements [`VersionDiscovery`]. See that impl
+    /// block below for `extract_upstream_versions` /
+    /// `upstream_metadata_path` / `upstream_metadata_accept` /
+    /// `extract_dependency_specs` / `resolve_range_max` (pypi does not
+    /// implement `download_config_path` / `compose_download_url_from_config`
+    /// / `resolve_download_url_from_metadata` — its own `VersionDiscovery`
+    /// impl returns the same inert values those methods used to inherit as
+    /// `FormatHandler` defaults).
+    fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+        Some(self)
     }
 
     /// Parse a per-version PyPI JSON API body, find the `urls[]` entry
@@ -774,57 +679,6 @@ impl FormatHandler for PyPiFormatHandler {
         }
 
         result
-    }
-
-    /// Extract a deterministic SBOM from the per-release JSON the
-    /// handler captured at ingest. Pure function — does not read
-    /// `payload`.
-    ///
-    /// Recognises both shapes the registry returns:
-    /// - `info.requires_dist: Vec<String>` (full per-release packument).
-    /// - `requires_dist: Vec<String>` at the top level (single-version slice).
-    ///
-    /// Each PEP 508 requirement string is parsed into a `(name, version)`
-    /// pair: extras (`name [extras]`) and environment markers (`; python_version >= '3.8'`)
-    /// are dropped; an exact-pin constraint (`==`) populates the version,
-    /// any other operator leaves it as `None`. The PURL is the canonical
-    /// `pkg:pypi/{pep503_name}@{version}` shape, with the name normalised
-    /// per PEP 503 §4.
-    ///
-    /// Licenses are pulled from `info.license` (string) or, when that is
-    /// empty/absent, from `info.classifiers` (any entry beginning
-    /// `License ::`).
-    ///
-    /// PyPI PEP 503 simple-index path — version-agnostic.
-    /// **Differs** from [`upstream_checksum_metadata_path`](Self::upstream_checksum_metadata_path)
-    /// (which returns `/pypi/<name>/<version>/json` and requires a
-    /// version). The simple-index document carries the version SET;
-    /// the per-version JSON carries the per-version checksum. PyPI is
-    /// the format where the metadata-index path and the per-version
-    /// checksum path are structurally distinct (for npm + cargo the
-    /// two coincide — see their `upstream_metadata_path` overrides).
-    ///
-    /// Returns the path with the PEP 503 `normalize_name` form. The
-    /// upstream-proxy adapter composes onto the mapping's
-    /// `upstream_url` base; pairs with
-    /// [`upstream_metadata_accept`](Self::upstream_metadata_accept)
-    /// which prefers PEP 691 JSON over HTML.
-    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
-        let normalized = self.normalize_name(package);
-        Some(format!("/simple/{normalized}/"))
-    }
-
-    /// PEP 691 content negotiation — prefer JSON (cheap parse), fall
-    /// back to HTML. Upstream PyPI (`pypi.org`) and the modern mirrors
-    /// (`pypi.python.org` redirects, devpi, simpleindex, recent
-    /// Bandersnatch builds) serve both; the JSON path hits the cheap
-    /// [`serde_json`] parser, the HTML fallback uses the slower
-    /// [`FULL_ANCHOR_RE`](crate::pypi::FULL_ANCHOR_RE)-shaped walk.
-    fn upstream_metadata_accept(&self) -> Vec<String> {
-        vec![
-            "application/vnd.pypi.simple.v1+json".to_string(),
-            "text/html;q=0.5".to_string(),
-        ]
     }
 
     /// Build an SBOM from a PyPI per-version JSON API body. Narrowed to
@@ -960,6 +814,158 @@ impl FormatHandler for PyPiFormatHandler {
         };
         extract_wheel_metadata_bytes_from_zip(&buf)
     }
+}
+
+/// pypi's [`VersionDiscovery`] participation — 5 of 8 members
+/// (`extract_upstream_versions`, `upstream_metadata_path`,
+/// `upstream_metadata_accept`, `extract_dependency_specs`,
+/// `resolve_range_max`). `download_config_path` /
+/// `compose_download_url_from_config` / `resolve_download_url_from_metadata`
+/// are not implemented — pypi resolves its download URL via a
+/// per-distribution fan-out the prefetch orchestrator special-cases, not
+/// via a config document or the upstream metadata body — so these return
+/// the same inert values the `FormatHandler` trait-level defaults used to
+/// supply before the VersionDiscovery extraction (issue #58). Preserved
+/// exactly, not filled in.
+impl VersionDiscovery for PyPiFormatHandler {
+    /// Extract the upstream-published version-string set from a PyPI
+    /// simple-index body (PEP 503 HTML *or* PEP 691 JSON; the format is
+    /// sniffed from the leading bytes).
+    ///
+    /// HTML path: scans `<a ... href="...">` anchors and applies the
+    /// filename → version helper ([`pypi_extract_version_from_filename`])
+    /// to each anchor's basename. Mirrors the hot-path trigger reader in
+    /// `crates/hort-http-pypi/src/simple_index.rs::parse_upstream_versions_pypi`
+    /// (the HTML arm).
+    ///
+    /// JSON path (PEP 691): reads the `versions[]` array directly when
+    /// present; otherwise falls back to the helper-via-filename walk
+    /// across `files[]`. Mirrors the hot-path JSON arm.
+    ///
+    /// Unparseable bodies (binary garbage, neither valid UTF-8 nor
+    /// JSON) yield `Ok(Vec::new())` — same degrade-open policy as the
+    /// hot-path trigger; the next tick re-evaluates.
+    ///
+    /// Bounded by the existing 128 KB
+    /// [`FormatHandler::metadata_expected_max_bytes`]
+    /// cap, raised here to a 10 MiB ceiling to admit
+    /// realistic simple-index pages (the per-version JSON cap was
+    /// sized for METADATA only — a project with thousands of versions
+    /// publishes a much larger HTML index). Bodies above 10 MiB are
+    /// rejected as `Validation` (same shape as the npm 5 MB cap).
+    ///
+    /// Streaming (see ADR 0026): `body` is a streaming reader over the
+    /// simple-index page. The PyPI simple-index walk is dual-mode —
+    /// PEP 503 HTML (anchor scan over the whole body as a `&str`) OR PEP
+    /// 691 JSON (`versions[]` / `files[]`); both modes need the body in
+    /// memory. The body is read into a buffer bounded by the 10 MiB
+    /// simple-index cap (so an over-cap body cannot force an unbounded
+    /// allocation), then the existing byte-slice logic runs unchanged —
+    /// byte-identical version list, HTML/JSON sniffing, and degrade-open
+    /// policy. (The `PypiSimpleIndexProjector` only covers the PEP 691
+    /// JSON `files[]` arm, not the HTML arm or the `versions[]` array,
+    /// so it is not a drop-in here; the discovery seam in
+    /// `hort-formats-upstream` uses the projector for the JSON-only
+    /// serve path.)
+    fn extract_upstream_versions(&self, body: &mut dyn Read) -> DomainResult<Vec<String>> {
+        // Simple-index pages are bounded separately from per-version
+        // JSON metadata; 10 MiB hard cap (a project with O(10^4) versions,
+        // average filename ~80 bytes per anchor,
+        // tops out under 4 MiB — leaving 2.5x headroom).
+        const SIMPLE_INDEX_MAX_BYTES: usize = 10 * 1024 * 1024;
+        let body =
+            crate::stream_helpers::read_to_capped_vec(body, SIMPLE_INDEX_MAX_BYTES, |len, max| {
+                format!("pypi simple-index body is {len} bytes; per-format max is {max}")
+            })?;
+        let body = body.as_slice();
+
+        // PEP 691 JSON path — peek for a leading `{` after any
+        // whitespace. Cheap pre-check; the full sniff is the serde
+        // parse below.
+        let leading = body.iter().find(|&&b| !b.is_ascii_whitespace()).copied();
+        if leading == Some(b'{') {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+                let mut out: Vec<String> = Vec::new();
+                if let Some(arr) = value.get("versions").and_then(|v| v.as_array()) {
+                    for entry in arr {
+                        if let Some(s) = entry.as_str() {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                if out.is_empty() {
+                    if let Some(files) = value.get("files").and_then(|v| v.as_array()) {
+                        for f in files {
+                            let filename = f
+                                .get("filename")
+                                .and_then(|x| x.as_str())
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    f.get("url")
+                                        .and_then(|x| x.as_str())
+                                        .and_then(|u| u.rsplit('/').next().map(str::to_string))
+                                });
+                            if let Some(fn_str) = filename {
+                                if let Some(v) = pypi_extract_version_from_filename(&fn_str) {
+                                    out.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(out);
+            }
+            // Falls through to HTML path on malformed JSON — a
+            // mis-served body labelled JSON but actually shaped like
+            // HTML still gets one more chance.
+        }
+
+        // HTML path — anchor walk + per-filename version extract.
+        let Ok(html) = std::str::from_utf8(body) else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<String> = Vec::new();
+        for href in pypi_scan_href_values(html) {
+            if let Some(filename) = pypi_filename_from_href(href) {
+                if let Some(v) = pypi_extract_version_from_filename(filename) {
+                    out.push(v);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// PyPI PEP 503 simple-index path — version-agnostic.
+    /// **Differs** from [`FormatHandler::upstream_checksum_metadata_path`]
+    /// (which returns `/pypi/<name>/<version>/json` and requires a
+    /// version). The simple-index document carries the version SET;
+    /// the per-version JSON carries the per-version checksum. PyPI is
+    /// the format where the metadata-index path and the per-version
+    /// checksum path are structurally distinct (for npm + cargo the
+    /// two coincide — see their `upstream_metadata_path` impls).
+    ///
+    /// Returns the path with the PEP 503 `normalize_name` form. The
+    /// upstream-proxy adapter composes onto the mapping's
+    /// `upstream_url` base; pairs with
+    /// [`upstream_metadata_accept`](Self::upstream_metadata_accept)
+    /// which prefers PEP 691 JSON over HTML.
+    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+        let normalized = self.normalize_name(package);
+        Some(format!("/simple/{normalized}/"))
+    }
+
+    /// PEP 691 content negotiation — prefer JSON (cheap parse), fall
+    /// back to HTML. Upstream PyPI (`pypi.org`) and the modern mirrors
+    /// (`pypi.python.org` redirects, devpi, simpleindex, recent
+    /// Bandersnatch builds) serve both; the JSON path hits the cheap
+    /// [`serde_json`] parser, the HTML fallback uses the slower
+    /// [`FULL_ANCHOR_RE`](crate::pypi::FULL_ANCHOR_RE)-shaped walk.
+    fn upstream_metadata_accept(&self) -> Vec<String> {
+        vec![
+            "application/vnd.pypi.simple.v1+json".to_string(),
+            "text/html;q=0.5".to_string(),
+        ]
+    }
 
     /// Extract the *declared runtime* dependency specs from the **stored
     /// PyPI distribution artifact stream**.
@@ -1071,6 +1077,46 @@ impl FormatHandler for PyPiFormatHandler {
     /// reuse it as the artifact-coords version string verbatim.
     fn resolve_range_max(&self, range: &str, available: &[&str]) -> DomainResult<Option<String>> {
         Ok(resolve_pep440_range_max(range, available))
+    }
+
+    /// pypi has no separate download-config document. Same fail-safe
+    /// value the `FormatHandler` trait-level default used to supply; a
+    /// format that returns `None` from `download_config_path` must never
+    /// reach `compose_download_url_from_config`.
+    fn download_config_path(&self) -> Option<String> {
+        None
+    }
+
+    /// Unreachable for pypi — see
+    /// [`download_config_path`](Self::download_config_path). Same
+    /// fail-safe `Validation` error the `FormatHandler` trait-level
+    /// default used to supply.
+    fn compose_download_url_from_config(
+        &self,
+        body: &mut dyn Read,
+        package: &str,
+        version: &str,
+        cksum_hex: Option<&str>,
+    ) -> DomainResult<String> {
+        let _ = (body, package, version, cksum_hex);
+        Err(DomainError::Validation(
+            "compose_download_url_from_config not supported for pypi".into(),
+        ))
+    }
+
+    /// pypi resolves its download URL via a per-distribution fan-out the
+    /// prefetch orchestrator special-cases, not from the upstream
+    /// metadata body directly. Same fail-safe `Validation` error the
+    /// `FormatHandler` trait-level default used to supply.
+    fn resolve_download_url_from_metadata(
+        &self,
+        body: &mut dyn Read,
+        coords: &ArtifactCoords,
+    ) -> DomainResult<String> {
+        let _ = (body, coords);
+        Err(DomainError::Validation(
+            "resolve_download_url_from_metadata not supported for pypi".into(),
+        ))
     }
 }
 

@@ -3,14 +3,17 @@
 //! This is the ONLY production crate other than `hort-server` that imports
 //! multiple `hort-http-<format>` inbound crates as a normal dep. The
 //! dispatch table on `format` ("npm" / "pypi" / "cargo") is the
-//! composition seam — each format branch composes:
-//!
-//! 1. the per-format `fetch_raw_with_cache` helper (in
-//!    `hort-http-<format>`), which owns the cache + dedup + upstream
-//!    proxy fetch + URL composition for that format's wire shape, with
-//!    2. the per-format `FormatHandler::extract_upstream_versions`
-//!    parser (in `hort-formats`), which extracts the upstream-advertised
-//!    version set from the raw bytes the helper returned.
+//! composition seam — each format branch calls the per-format
+//! `fetch_raw_with_cache` helper (in `hort-http-<format>`), which owns the
+//! cache + dedup + upstream proxy fetch + URL composition for that
+//! format's wire shape AND returns a typed per-format projection each
+//! dispatcher reads its version list off directly. This crate does not
+//! call into `hort-formats`'s `VersionDiscovery` capability group
+//! (issue #58's split of `extract_upstream_versions` and its seven
+//! siblings off `FormatHandler`) — see the note on `map_parse_result`'s
+//! retirement below for why the two-step "helper, then re-parse via
+//! FormatHandler" composition this crate-doc historically described no
+//! longer exists.
 //!
 //! See `docs/architecture/explanation/format-handlers.md` and
 //! `docs/architecture/explanation/prefetch-pipeline.md` for the design
@@ -28,13 +31,13 @@
 //!
 //! # Dispatch table
 //!
-//! | `format` | fetch                                                | parser                                                      |
-//! |----------|------------------------------------------------------|-------------------------------------------------------------|
-//! | `"npm"`  | [`hort_http_npm::packument::fetch_raw_with_cache`]     | [`hort_formats::npm::NpmFormatHandler::extract_upstream_versions`]   |
-//! | `"pypi"` | [`hort_http_pypi::simple_index::fetch_raw_with_cache`] | [`hort_formats::pypi::PyPiFormatHandler::extract_upstream_versions`] |
-//! | `"cargo"`| [`hort_http_cargo::index_cache::fetch_raw_with_cache`] | [`hort_formats::cargo::CargoFormatHandler::extract_upstream_versions`]|
-//! | `"oci"`  | rejected → [`UpstreamFetchError::UnsupportedFormat`] | n/a                                                         |
-//! | other    | rejected → [`UpstreamFetchError::UnsupportedFormat`] | n/a                                                         |
+//! | `format` | fetch (also the version-list source — a typed per-format projection, not a re-parse) |
+//! |----------|-----------------------------------------------------------------------------------------|
+//! | `"npm"`  | [`hort_http_npm::packument::fetch_raw_with_cache`]                                       |
+//! | `"pypi"` | [`hort_http_pypi::simple_index::fetch_raw_with_cache`]                                   |
+//! | `"cargo"`| [`hort_http_cargo::index_cache::fetch_raw_with_cache`]                                   |
+//! | `"oci"`  | rejected → [`UpstreamFetchError::UnsupportedFormat`]                                     |
+//! | other    | rejected → [`UpstreamFetchError::UnsupportedFormat`]                                     |
 //!
 //! # Error mapping
 //!
@@ -54,12 +57,6 @@
 //!   honored by construction — the label is hard-coded.
 //! - `Internal` → [`UpstreamFetchError::ParseError`] with a constant
 //!   `"envelope encode/decode"` label.
-//!
-//! Parse-side failures from
-//! [`FormatHandler::extract_upstream_versions`] (which can return
-//! [`DomainError::Validation`] when the upstream body exceeds the
-//! per-format byte cap) map to [`UpstreamFetchError::ParseError`] with
-//! a constant `"parser body too large"` or `"parser malformed"` label.
 //!
 //! **Future work — finer-grained classification.** The eight typed
 //! variants of [`UpstreamFetchError`] (`Unauthorized`, `RateLimited`,
@@ -88,7 +85,6 @@
 //! produces byte-identical version output as `None`.
 //!
 //! [`UpstreamErrorKind`]: hort_app::metrics::UpstreamErrorKind
-//! [`DomainError::Validation`]: hort_domain::error::DomainError::Validation
 
 use std::sync::Arc;
 
@@ -521,10 +517,9 @@ mod tests {
     //!   the small `map_*_helper_error` functions so the dispatch tests
     //!   only need to cover ONE error branch per format end-to-end
     //!   (the rest is exercised at the unit level).
-    //! - The parse-side error mapping: a fixture body large enough to
-    //!   trip the per-format byte cap drives
-    //!   `extract_upstream_versions` into `DomainError::Validation`;
-    //!   the adapter maps to `ParseError`.
+    //! - The parse-side error mapping: a malformed/oversized fixture body
+    //!   drives the per-format helper's own typed-projection parse into
+    //!   an error; the adapter maps it to `ParseError`.
     //! - The `upstream_name_prefix` invariant: `mapping.upstream_name_prefix
     //!   = Some("foo")` produces byte-identical version output as `None`
     //!   for each of the three non-OCI branches.

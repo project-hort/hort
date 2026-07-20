@@ -1,7 +1,9 @@
 use base64::Engine as _;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::format_handler::{DependencySpec, FormatHandler, MetadataStrategy};
+use hort_domain::ports::format_handler::{
+    DependencySpec, FormatHandler, MetadataStrategy, VersionDiscovery,
+};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
 
@@ -464,73 +466,16 @@ impl FormatHandler for NpmFormatHandler {
         UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, hex)
     }
 
-    /// Extract the upstream-published version-string set from an npm
-    /// packument body.
-    ///
-    /// Reads the top-level `versions{}` object and returns its keys in
-    /// iteration order (serde_json's object iteration preserves
-    /// insertion order). Same shape as the hot-path trigger in
-    /// `crates/hort-http-npm/src/packument.rs::fire_prefetch_trigger_npm`
-    /// (lifted verbatim) so the cron-tier and serve-site readers stay
-    /// in lock-step. A body that fails to parse, is not an object, or
-    /// has no `versions` key returns `Ok(Vec::new())` — the prefetch
-    /// tick treats this as "no upstream signal" and skips. Hard-error
-    /// would be surface-noise here: a malformed upstream is a
-    /// transient problem the next tick re-evaluates.
-    ///
-    /// Bounded by the streaming plausibility ceiling
-    /// ([`STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES`](crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES)
-    /// = 64 MiB) — this method STREAMS the body through the projector, so
-    /// per the cap taxonomy its ceiling is the plausibility / storage
-    /// bound (aligned with the `HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE`
-    /// fetch backstop), NOT the small in-memory
-    /// [`metadata_expected_max_bytes`](Self::metadata_expected_max_bytes)
-    /// ceiling. Bodies above that are rejected as `Validation`; the
-    /// projection keeps memory bounded by the version-string list, not the
-    /// body. Without the larger cap, prefetch would reject legitimately
-    /// large packuments (e.g. ~50 MiB `@types/node`) the serve path
-    /// streams fine.
-    ///
-    /// **Streaming.** Projects the packument via
-    /// [`NpmPackumentProjector`](crate::npm::projection::NpmPackumentProjector)
-    /// and returns its `versions[].version` keys in document order.
-    /// A body that fails to parse degrades to `Ok(Vec::new())` (degrade-open
-    /// policy); the 5 MiB input-size cap is preserved. A malformed body OR a
-    /// trip of the per-version object cap likewise degrades to an empty list
-    /// here (this is the best-effort prefetch-cron tier — surfacing an error
-    /// would only add noise the next tick re-evaluates); only a genuine trip
-    /// of the whole-body plausibility cap still surfaces `Validation`.
-    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
-        let max = crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES;
-        let result = crate::stream_helpers::project_with_byte_cap(
-            body,
-            max,
-            NpmPackumentProjector::new(npm_projector_per_version_cap()),
-            |len, max| {
-                format!(
-                    "npm upstream metadata body is {len} bytes; streaming plausibility max is {max}"
-                )
-            },
-        );
-        match result {
-            Ok(projection) => Ok(projection.versions.into_iter().map(|v| v.version).collect()),
-            // Degrade-open on a malformed body, but a genuine over-cap
-            // rejection still surfaces as `Validation`.
-            Err(DomainError::Validation(ref m)) if m.contains("streaming plausibility max is") => {
-                Err(DomainError::Validation(m.clone()))
-            }
-            Err(_) => Ok(Vec::new()),
-        }
-    }
-
-    /// npm packument path — version-agnostic. Coincides with the
-    /// per-package checksum-metadata path
-    /// ([`upstream_checksum_metadata_path`](Self::upstream_checksum_metadata_path))
-    /// because the npm packument carries both the version set AND
-    /// `dist.integrity` checksums. Scoped packages encode `/` as
-    /// `%2f` per the npm registry API.
-    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
-        Some(format!("/{}", url_encode_npm_name(package)))
+    /// `Some(self)` — npm implements [`VersionDiscovery`]. See that impl
+    /// block below for `extract_upstream_versions` /
+    /// `upstream_metadata_path` / `extract_dependency_specs` /
+    /// `resolve_range_max` / `resolve_download_url_from_metadata` (npm
+    /// does not implement `upstream_metadata_accept` /
+    /// `download_config_path` / `compose_download_url_from_config` — its
+    /// own `VersionDiscovery` impl returns the same inert values those
+    /// methods used to inherit as `FormatHandler` defaults).
+    fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+        Some(self)
     }
 
     /// Extract a deterministic SBOM from the per-version packument
@@ -621,6 +566,94 @@ impl FormatHandler for NpmFormatHandler {
             subject: Some(subject),
             components,
         }))
+    }
+}
+
+/// npm's [`VersionDiscovery`] participation — 5 of 8 members
+/// (`extract_upstream_versions`, `upstream_metadata_path`,
+/// `extract_dependency_specs`, `resolve_range_max`,
+/// `resolve_download_url_from_metadata`). `upstream_metadata_accept` /
+/// `download_config_path` / `compose_download_url_from_config` are not
+/// implemented — npm has no content-negotiation, no separate download-
+/// config document, so these return the same inert values the
+/// `FormatHandler` trait-level defaults used to supply before the
+/// VersionDiscovery extraction (issue #58). Preserved exactly, not
+/// filled in — closing that gap is out of scope (design §5).
+impl VersionDiscovery for NpmFormatHandler {
+    /// Extract the upstream-published version-string set from an npm
+    /// packument body.
+    ///
+    /// Reads the top-level `versions{}` object and returns its keys in
+    /// iteration order (serde_json's object iteration preserves
+    /// insertion order). Same shape as the hot-path trigger in
+    /// `crates/hort-http-npm/src/packument.rs::fire_prefetch_trigger_npm`
+    /// (lifted verbatim) so the cron-tier and serve-site readers stay
+    /// in lock-step. A body that fails to parse, is not an object, or
+    /// has no `versions` key returns `Ok(Vec::new())` — the prefetch
+    /// tick treats this as "no upstream signal" and skips. Hard-error
+    /// would be surface-noise here: a malformed upstream is a
+    /// transient problem the next tick re-evaluates.
+    ///
+    /// Bounded by the streaming plausibility ceiling
+    /// ([`STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES`](crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES)
+    /// = 64 MiB) — this method STREAMS the body through the projector, so
+    /// per the cap taxonomy its ceiling is the plausibility / storage
+    /// bound (aligned with the `HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE`
+    /// fetch backstop), NOT the small in-memory
+    /// [`FormatHandler::metadata_expected_max_bytes`]
+    /// ceiling. Bodies above that are rejected as `Validation`; the
+    /// projection keeps memory bounded by the version-string list, not the
+    /// body. Without the larger cap, prefetch would reject legitimately
+    /// large packuments (e.g. ~50 MiB `@types/node`) the serve path
+    /// streams fine.
+    ///
+    /// **Streaming.** Projects the packument via
+    /// [`NpmPackumentProjector`](crate::npm::projection::NpmPackumentProjector)
+    /// and returns its `versions[].version` keys in document order.
+    /// A body that fails to parse degrades to `Ok(Vec::new())` (degrade-open
+    /// policy); the 5 MiB input-size cap is preserved. A malformed body OR a
+    /// trip of the per-version object cap likewise degrades to an empty list
+    /// here (this is the best-effort prefetch-cron tier — surfacing an error
+    /// would only add noise the next tick re-evaluates); only a genuine trip
+    /// of the whole-body plausibility cap still surfaces `Validation`.
+    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
+        let max = crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES;
+        let result = crate::stream_helpers::project_with_byte_cap(
+            body,
+            max,
+            NpmPackumentProjector::new(npm_projector_per_version_cap()),
+            |len, max| {
+                format!(
+                    "npm upstream metadata body is {len} bytes; streaming plausibility max is {max}"
+                )
+            },
+        );
+        match result {
+            Ok(projection) => Ok(projection.versions.into_iter().map(|v| v.version).collect()),
+            // Degrade-open on a malformed body, but a genuine over-cap
+            // rejection still surfaces as `Validation`.
+            Err(DomainError::Validation(ref m)) if m.contains("streaming plausibility max is") => {
+                Err(DomainError::Validation(m.clone()))
+            }
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// npm packument path — version-agnostic. Coincides with the
+    /// per-package checksum-metadata path
+    /// ([`FormatHandler::upstream_checksum_metadata_path`])
+    /// because the npm packument carries both the version set AND
+    /// `dist.integrity` checksums. Scoped packages encode `/` as
+    /// `%2f` per the npm registry API.
+    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+        Some(format!("/{}", url_encode_npm_name(package)))
+    }
+
+    /// npm has no content-negotiation — the upstream's default
+    /// representation is fine. Same inert value the `FormatHandler`
+    /// trait-level default used to supply.
+    fn upstream_metadata_accept(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Extract the *declared runtime* dependency specs from the **stored
@@ -742,7 +775,7 @@ impl FormatHandler for NpmFormatHandler {
     ///
     /// **Streaming.** `body` is a reader over the same packument the
     /// orchestrator fetched for
-    /// [`parse_upstream_checksum`](Self::parse_upstream_checksum), so one
+    /// [`FormatHandler::parse_upstream_checksum`], so one
     /// fetch yields both the checksum and the URL. The walk captures only
     /// the target version's `dist.tarball` (memory bounded the same way the
     /// checksum walk is — the 50 MiB packument never lands in a
@@ -809,6 +842,31 @@ impl FormatHandler for NpmFormatHandler {
         }
 
         Ok(tarball)
+    }
+
+    /// npm has no separate download-config document — the download URL
+    /// comes from `resolve_download_url_from_metadata` instead. Same
+    /// fail-safe value the `FormatHandler` trait-level default used to
+    /// supply; a format that returns `None` from `download_config_path`
+    /// must never reach `compose_download_url_from_config`.
+    fn download_config_path(&self) -> Option<String> {
+        None
+    }
+
+    /// Unreachable for npm — see [`download_config_path`](Self::download_config_path).
+    /// Same fail-safe `Validation` error the `FormatHandler` trait-level
+    /// default used to supply.
+    fn compose_download_url_from_config(
+        &self,
+        body: &mut dyn std::io::Read,
+        package: &str,
+        version: &str,
+        cksum_hex: Option<&str>,
+    ) -> DomainResult<String> {
+        let _ = (body, package, version, cksum_hex);
+        Err(DomainError::Validation(
+            "compose_download_url_from_config not supported for npm".into(),
+        ))
     }
 }
 

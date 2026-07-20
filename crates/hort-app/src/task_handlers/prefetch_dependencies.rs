@@ -519,6 +519,28 @@ impl TaskHandler for PrefetchDependenciesHandler {
                         .to_json(parsed.current_depth, repo.prefetch_policy.transitive_depth),
                 });
             };
+            // The VersionDiscovery capability group (issue #58) owns
+            // `extract_dependency_specs`/`resolve_range_max`/
+            // `extract_upstream_versions` — a format with a registered
+            // `FormatHandler` but no `VersionDiscovery` participation
+            // (e.g. a future OCI/Maven prefetch-cascade wiring) completes
+            // as a structural no-op here, same as the "no handler" arm
+            // above, rather than reaching a trait method that no longer
+            // exists on `FormatHandler`. `vd` is `Send + Sync` (a
+            // supertrait bound), so holding it across this function's
+            // later `.await` points is fine.
+            let Some(vd) = handler.version_discovery() else {
+                tracing::warn!(
+                    repository = %repo.key,
+                    format = %format_key,
+                    "prefetch-dependencies: handler does not implement VersionDiscovery — \
+                     completing as a no-op",
+                );
+                return Ok(TaskOutcome::Completed {
+                    result_summary: WalkSummary::default()
+                        .to_json(parsed.current_depth, repo.prefetch_policy.transitive_depth),
+                });
+            };
 
             // ----- Step 4: read manifest bytes ------------------------
             let content = match self.read_artifact_bytes(&artifact).await {
@@ -548,8 +570,7 @@ impl TaskHandler for PrefetchDependenciesHandler {
             // extractor and parses it. The port stays a streaming
             // `&mut dyn Read`, so a cursor over the in-memory artifact
             // satisfies it without a second fetch.
-            let specs = match handler.extract_dependency_specs(&mut std::io::Cursor::new(&content))
-            {
+            let specs = match vd.extract_dependency_specs(&mut std::io::Cursor::new(&content)) {
                 Ok(specs) => specs,
                 Err(err) => {
                     // `Err` here covers BOTH archive-extraction failure
@@ -674,6 +695,23 @@ impl PrefetchDependenciesHandler {
             return Ok(summary);
         }
 
+        // The caller already checked `handler.version_discovery()` before
+        // extracting `specs` in the first place (a non-participating
+        // handler never reaches `extract_dependency_specs`, so `specs`
+        // would be empty and the early return above would already have
+        // fired) — but that fact isn't threaded through the call, so
+        // re-derive here as defense-in-depth (issue #58): a
+        // `VersionDiscovery`-less handler resolves no ranges rather than
+        // reaching a trait method that no longer exists on `FormatHandler`.
+        let Some(vd) = handler.version_discovery() else {
+            tracing::warn!(
+                repository = %repo.key,
+                "prefetch-dependencies: handler does not implement VersionDiscovery — \
+                 no deps resolved",
+            );
+            return Ok(summary);
+        };
+
         // Compute the depth-cap decision once for the cohort. A
         // child `prefetch-dependencies` is enqueued only if the
         // child's `current_depth + 1` is within the cap; the leaf
@@ -744,7 +782,7 @@ impl PrefetchDependenciesHandler {
             // the version string. Destructure the unused trailing
             // elements explicitly.
             let held_versions: Vec<&str> = held.iter().map(|(v, _, _)| v.as_str()).collect();
-            let resolved = handler
+            let resolved = vd
                 .resolve_range_max(&spec.range, &held_versions)
                 .ok()
                 .flatten();
@@ -850,7 +888,16 @@ impl PrefetchDependenciesHandler {
                 let versions_result = {
                     let handler = Arc::clone(handler);
                     crate::project::run_handler_body(cache_handle, move |reader| {
-                        handler.extract_upstream_versions(reader)
+                        // Re-derive from the cloned, owned `Arc` — the
+                        // closure must be `'static` and cannot capture
+                        // the outer borrowed `vd`. Pure dispatch on
+                        // `handler`'s concrete type, so re-deriving is
+                        // exactly as safe as the guard checked earlier.
+                        let vd = handler.version_discovery().expect(
+                            "handler participates in VersionDiscovery — checked earlier in \
+                             this function",
+                        );
+                        vd.extract_upstream_versions(reader)
                     })
                     .await
                 };
@@ -873,7 +920,7 @@ impl PrefetchDependenciesHandler {
                 let upstream_refs: Vec<&str> =
                     upstream_versions.iter().map(String::as_str).collect();
                 for cold in cold_specs {
-                    let concrete = match handler.resolve_range_max(cold.range, &upstream_refs) {
+                    let concrete = match vd.resolve_range_max(cold.range, &upstream_refs) {
                         Ok(Some(v)) => v,
                         Ok(None) => {
                             tracing::warn!(
@@ -1098,6 +1145,7 @@ mod tests {
         RepositoryType,
     };
     use hort_domain::events::system_actor;
+    use hort_domain::ports::format_handler::VersionDiscovery;
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
 
     use crate::use_cases::test_support::{
@@ -1252,6 +1300,11 @@ mod tests {
             // Packument path — `/express` etc.
             Some(format!("/{}", coords.name))
         }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for NpmInTest {
         fn extract_upstream_versions(
             &self,
             body: &mut dyn std::io::Read,
@@ -1268,6 +1321,12 @@ mod tests {
                 return Ok(Vec::new());
             };
             Ok(versions.keys().cloned().collect())
+        }
+        fn upstream_metadata_path(&self, _package: &str) -> Option<String> {
+            None
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
         }
         // NOTE: this stand-in JSON-parses `content` DIRECTLY,
         // which deliberately diverges from the production npm handler's
@@ -1324,6 +1383,29 @@ mod tests {
             }
             let max = available.iter().max().copied().map(str::to_string);
             Ok(max)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
         }
     }
 
@@ -1389,11 +1471,58 @@ mod tests {
         fn normalize_name(&self, name: &str) -> String {
             name.to_string()
         }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for AlwaysFailingExtractor {
+        fn extract_upstream_versions(
+            &self,
+            _body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn upstream_metadata_path(&self, _package: &str) -> Option<String> {
+            None
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
+        }
         fn extract_dependency_specs(
             &self,
             _content: &mut dyn std::io::Read,
         ) -> DomainResult<Vec<DependencySpec>> {
             Err(DomainError::Validation("injected extract failure".into()))
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
         }
     }
 
@@ -1406,6 +1535,33 @@ mod tests {
     fn handlers_failing() -> HashMap<String, Arc<dyn FormatHandler>> {
         let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
         m.insert("npm".to_string(), Arc::new(AlwaysFailingExtractor));
+        m
+    }
+
+    /// A registered `FormatHandler` that does NOT implement
+    /// `VersionDiscovery` — distinct from "no handler registered at all"
+    /// (`no_format_handler_completes_as_noop`, the `format_handlers` map
+    /// lookup missing entirely). Issue #58.
+    struct NoVersionDiscoveryHandler;
+    impl FormatHandler for NoVersionDiscoveryHandler {
+        fn format_key(&self) -> &str {
+            "maven"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!()
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        // `version_discovery` is NOT overridden — inherits `None`.
+    }
+
+    fn handlers_maven_no_version_discovery() -> HashMap<String, Arc<dyn FormatHandler>> {
+        let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        m.insert("maven".to_string(), Arc::new(NoVersionDiscoveryHandler));
         m
     }
 
@@ -2168,6 +2324,42 @@ mod tests {
             Arc::new(MockUpstreamProxy::new()),
             Arc::new(MockRepositoryUpstreamMappingRepository::new()),
             handlers_npm(), // no maven entry
+        );
+        let outcome = handler
+            .run(&json!({"artifact_id": art.id}), make_context())
+            .await
+            .expect("Ok");
+        let TaskOutcome::Completed { result_summary } = outcome else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["deps_extracted"], 0);
+        assert_eq!(result_summary["prefetch_rows_enqueued"], 0);
+        assert_eq!(jobs.prefetch_batch_calls().len(), 0);
+    }
+
+    /// Issue #58: a `FormatHandler` IS registered for the repo's format,
+    /// but it does not implement `VersionDiscovery`. Must complete as a
+    /// no-op exactly like the "no handler registered" case above, via the
+    /// `handler.version_discovery()` early-return, not reach a method
+    /// that no longer exists on `FormatHandler` for a non-participant.
+    #[tokio::test]
+    async fn registered_handler_without_version_discovery_completes_as_noop() {
+        let repo = make_repo(RepositoryFormat::Maven, 5);
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(repo.clone());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let jobs = Arc::new(MockJobsRepository::new());
+        let art = seed_artifact_with_bytes(&artifacts, &storage, repo.id, b"junk".to_vec()).await;
+
+        let handler = make_handler(
+            repos,
+            artifacts,
+            storage,
+            jobs.clone(),
+            Arc::new(MockUpstreamProxy::new()),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+            handlers_maven_no_version_discovery(),
         );
         let outcome = handler
             .run(&json!({"artifact_id": art.id}), make_context())

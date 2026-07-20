@@ -26,6 +26,280 @@ pub enum MetadataStrategy {
     HashReference { inline_threshold_bytes: usize },
 }
 
+/// Discovering a format's upstream-published versions and resolving their
+/// download URLs — the **VersionDiscovery** capability group (ADR 0005).
+///
+/// A format that cannot do this does not implement the trait at all;
+/// absence (via [`FormatHandler::version_discovery`] returning `None`) is
+/// the declaration, not a defaulted no-op. See ADR 0005's `VersionDiscovery`
+/// realisation note (issue #58) for the extraction history — eight methods
+/// that used to live directly on [`FormatHandler`] as defaulted no-ops,
+/// indistinguishable from "not yet implemented."
+///
+/// **No default method bodies.** Every method here is required for any
+/// format that implements the trait at all — the group either fully
+/// participates or is fully absent. A participating format that does not
+/// need a particular member (e.g. npm has no `download_config_path`
+/// concept) writes the same inert value the old trait-level default used
+/// to supply (`None` / `Vec::new()` / `Ok(None)`, per method) directly in
+/// its own impl; see each format's `impl VersionDiscovery for
+/// …FormatHandler` block for exactly which members it participates in.
+///
+/// Members and their semantics are unchanged from their pre-extraction
+/// `FormatHandler` doc comments (reproduced below); only the "default"
+/// framing changes, since there is no longer a trait-level default to
+/// inherit.
+pub trait VersionDiscovery: Send + Sync {
+    /// Extract the set of upstream-published version identifiers from a
+    /// just-fetched upstream metadata body.
+    ///
+    /// **Streaming contract (ADR 0026).** `body` is a streaming
+    /// reader over the upstream metadata body — implementations
+    /// project the reader (via the per-format `hort-formats` projectors)
+    /// without buffering the whole body.
+    ///
+    /// The caller already obtained `body` via
+    /// [`crate::ports::upstream_proxy::UpstreamProxy::fetch_metadata`]
+    /// (or any other byte source); this method only parses bytes into
+    /// the format's published version-string set. Used by the
+    /// `PrefetchTickHandler` to compute the divergence between
+    /// upstream and the registry's held set on the cron path — the
+    /// handler-tier equivalent of the per-format hot-path triggers
+    /// (`fire_prefetch_trigger_npm` / `fire_prefetch_trigger_cargo` /
+    /// `fire_prefetch_trigger_pypi`).
+    ///
+    /// Returns the version-string set in the order they appear in the
+    /// upstream document (no sort, no dedup at this layer — the planner
+    /// handles both via [`crate::entities::repository::PrefetchPolicy`]
+    /// and its `VersionOrdering` arg).
+    ///
+    /// **Phase-1 scope cap.** Reference implementations exist for
+    /// `npm` (packument `versions{}` keys), `cargo` (sparse-index
+    /// NDJSON `vers` field per line), and `pypi` (PEP 503 HTML anchor
+    /// list parsed via the filename → version extractor). A format that
+    /// does not implement `VersionDiscovery` at all (maven, oci, helm,
+    /// rpm, debian, generic, …) never reaches this method — the
+    /// scheduled tick reads `version_discovery() == None` as "format has
+    /// no Phase-1 upstream-version discovery" and silently skips it.
+    /// When a Phase-2 implementation lands (e.g. OCI prefetch-on-tag-move),
+    /// the format SHOULD implement the whole `VersionDiscovery` group in
+    /// the same commit that wires the hot-path counterpart — keeping
+    /// non-participation structural (rather than a per-method override)
+    /// prevents a stray override from "discovering versions" via an inert
+    /// path while the hot-path serve-site is still a no-op.
+    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>>;
+
+    /// Return the format-native
+    /// path for fetching the version-AGNOSTIC metadata-index document
+    /// (npm packument, cargo sparse-index entry, PyPI PEP 503 simple
+    /// index). Composed onto an upstream-mapping's base URL.
+    ///
+    /// Distinct from [`upstream_checksum_metadata_path`](FormatHandler::upstream_checksum_metadata_path)
+    /// — that one returns the per-VERSION checksum-metadata path
+    /// (which for PyPI is `/pypi/<name>/<version>/json`). For npm and
+    /// cargo the two paths happen to coincide (their packument /
+    /// sparse-index documents carry both the version-set and the
+    /// checksum metadata); for PyPI they differ structurally.
+    ///
+    /// Consumed by [`super::super::ports`]-adjacent task handlers that
+    /// need to discover the upstream version-set divergence without
+    /// already having the body in hand from a serve-path fetch
+    /// (the scheduled `prefetch-tick` handler is the current consumer).
+    ///
+    /// `None` — formats without a metadata-index concept
+    /// (oci, generic, raw) simply do not implement `VersionDiscovery`, so
+    /// this method is never called for them. Returns `Option` rather
+    /// than `Err` because absence is a normal state for a participating
+    /// format too, not an error; the caller skips and continues.
+    fn upstream_metadata_path(&self, package: &str) -> Option<String>;
+
+    /// Return the `Accept` header values the upstream-metadata fetch
+    /// should send for this format. Empty `Vec` = no Accept header
+    /// (the upstream's default representation is fine).
+    ///
+    /// Currently only PyPI uses this — it negotiates PEP 691 JSON via
+    /// `Accept: application/vnd.pypi.simple.v1+json` falling back to
+    /// `text/html`. npm / cargo / others accept the upstream default
+    /// representation and need no Accept header (their own impls return
+    /// `Vec::new()`, the same inert value the old trait-level default
+    /// used to supply). Future formats with content negotiation
+    /// (RubyGems JSON/marshal, Conda repodata variants) implement this
+    /// for real.
+    fn upstream_metadata_accept(&self) -> Vec<String>;
+
+    /// Extract the *declared runtime*
+    /// dependency specs from the **stored artifact stream** (the format's
+    /// own archive).
+    ///
+    /// **Input contract.** `content` is the raw stored
+    /// artifact the transitive prefetch cascade read from CAS — for the
+    /// archive formats this is the format's OWN container, NOT a
+    /// pre-selected manifest body:
+    ///
+    /// - **npm** — the `.tgz` gzip tarball; the declared `dependencies` live
+    ///   in `package/package.json` INSIDE it.
+    /// - **cargo** — the `.crate` gzip tarball; `[dependencies]` live in the
+    ///   top-level `<dir>/Cargo.toml` inside it.
+    /// - **pypi** — the wheel (zip) / sdist (gzip-tar); `Requires-Dist` lives
+    ///   in `*.dist-info/METADATA` inside the wheel.
+    ///
+    /// Each implementing handler is **archive-aware**: it locates its declared
+    /// runtime manifest inside the artifact (via the audited
+    /// `hort-formats::archive_bounds` extractor) and parses it. (An earlier
+    /// contract — "a just-ingested artifact's pre-selected manifest body" —
+    /// was a bug: the cascade never pre-selects a manifest, so an impl
+    /// that JSON/TOML-parsed `content` directly tripped on the archive's
+    /// magic byte and the cascade was inert for every archive format.)
+    ///
+    /// Runtime classes ONLY — never `devDependencies` / `peerDependencies`
+    /// / `optionalDependencies` / `bundleDependencies` (npm), never
+    /// `Requires-Dist` lines carrying a test/dev `extra` marker (PyPI),
+    /// never `[dev-dependencies]` / `[build-dependencies]` entries (cargo
+    /// `Cargo.toml`), never `scope = test`/`provided`/`system` (Maven).
+    /// The runtime-vs-dev class boundary is load-bearing for the
+    /// transitive prefetch cascade: a TypeScript devDependency
+    /// closure can be 1000+ packages that none of the production code
+    /// needs. Getting the class boundary wrong inflates the prefetch
+    /// fan-out by 10–100×.
+    ///
+    /// The `range` field stays opaque (a [`String`] in the format's
+    /// native range syntax — `"^1.2"` for npm, `">=2,<3"` for PyPI,
+    /// `"2.x"` for cargo, `"[1.0,2.0)"` for Maven). Parsing the range
+    /// is the per-format
+    /// [`resolve_range_max`](Self::resolve_range_max) implementation's
+    /// concern, not the caller's; different formats have different
+    /// range grammars, and the call-site does not need to know which.
+    ///
+    /// **Streaming contract (ADR 0026).** `content` stays a
+    /// `&mut dyn std::io::Read` (the `streaming_metadata_port`
+    /// guard test pins the signature). Implementations read the
+    /// stored artifact via the per-format `hort-formats` archive helpers.
+    ///
+    /// A format without a machine-readable runtime-dep concept
+    /// (oci, generic, raw uploads, helm, Maven) simply does not implement
+    /// `VersionDiscovery`; a participating format with nothing to declare
+    /// returns `Ok(Vec::new())`, which the cascade reads as "no
+    /// transitive deps to enqueue". Returning
+    /// `Err` is reserved for a *structurally* invalid artifact — input that
+    /// is not the expected container (e.g. npm input that is not a gzip-tar),
+    /// a missing declared manifest entry, an unparseable manifest, or an
+    /// `archive_bounds` guard trip; a well-formed artifact whose manifest
+    /// declares zero runtime deps must return `Ok(vec![])`, not `Err`.
+    fn extract_dependency_specs(
+        &self,
+        content: &mut dyn std::io::Read,
+    ) -> DomainResult<Vec<DependencySpec>>;
+
+    /// Resolve a declared `range` against an
+    /// `available` set of concrete versions, returning the highest
+    /// version that satisfies the range.
+    ///
+    /// **Range-max only — NOT a SAT solver.** This is one range against
+    /// one set, picking the highest match. Resolving a whole dependency
+    /// graph (multi-dep co-satisfaction across a closure) is out of
+    /// scope and never gets implemented at this layer — the transitive
+    /// cascade just calls `resolve_range_max` per declared
+    /// dep and accepts that the registry's pick may differ from a strict
+    /// resolver's. This is a deliberately "plausible closure"; the
+    /// deterministic exact closure is the job of
+    /// seed-import / lockfile prewarm. See
+    /// `docs/architecture/explanation/prefetch-pipeline.md`.
+    ///
+    /// Returns `Option<String>` — the matching version string in the
+    /// format's native form (suitable to feed back into
+    /// [`ArtifactCoords::version`](crate::types::ArtifactCoords::version)):
+    ///
+    /// - `None` — no version in `available` satisfies `range`, OR
+    ///   `range`/`available` are unparseable (best-effort; an
+    ///   unparseable user-supplied range silently no-ops rather than
+    ///   surfacing a `DomainError`). The cascade reads `None` as
+    ///   "skip this dep" — a transient or malformed range must not
+    ///   abort the rest of the walk.
+    /// - `Some(version_string)` — the highest version in `available`
+    ///   satisfying `range`, in the format's native string form.
+    ///
+    /// A format without a range concept (oci tags are exact pointers, not
+    /// ranges) simply does not implement `VersionDiscovery`. The
+    /// signature returns [`DomainResult`] for parity with
+    /// [`extract_dependency_specs`](Self::extract_dependency_specs);
+    /// the `Err` arm is reserved for genuinely structural errors,
+    /// not "unparseable input" (which is the silent-`None` path).
+    fn resolve_range_max(&self, range: &str, available: &[&str]) -> DomainResult<Option<String>>;
+
+    /// The path, relative to the upstream index host, of the registry
+    /// configuration document this format must fetch to learn its download
+    /// URL. `Some(path)` tells the prefetch orchestrator to fetch that
+    /// document and hand its body to
+    /// [`compose_download_url_from_config`](Self::compose_download_url_from_config);
+    /// `None` means the format's download URL comes from the
+    /// already-fetched upstream metadata via
+    /// [`resolve_download_url_from_metadata`](Self::resolve_download_url_from_metadata)
+    /// instead (npm) or from a per-distribution fan-out the orchestrator
+    /// special-cases (pypi).
+    ///
+    /// cargo returns `Some("/config.json")` — the sparse-registry index
+    /// config (<https://doc.rust-lang.org/cargo/reference/registry-index.html#index-configuration>),
+    /// whose `dl` field is the authoritative download-URL template. npm and
+    /// pypi's own impls return `None` (the same inert value the old
+    /// trait-level default used to supply).
+    fn download_config_path(&self) -> Option<String>;
+
+    /// Compose the absolute download URL for `(package, version)` from a
+    /// separately-fetched registry configuration document — cargo's
+    /// `config.json` (`dl` field), as identified by
+    /// [`download_config_path`](Self::download_config_path).
+    ///
+    /// `body` is a streaming reader over the config document, mirroring the
+    /// other `FormatHandler`/`VersionDiscovery` body methods (ADR 0026 — the
+    /// body never lands in a buffer at the port boundary). The config
+    /// document is tiny and fixed (`{"dl":…,"api":…}`), so the impl reads
+    /// it under a small bounded cap (defence-in-depth above the fetch-time
+    /// storage backstop); a body over the cap is rejected as `Validation`.
+    ///
+    /// `cksum_hex` is the verified upstream checksum hex (consumed by the
+    /// `{sha256-checksum}` `dl` placeholder for registries that template on
+    /// it; `None` leaves the placeholder unsubstituted so the upstream
+    /// request 404s naturally rather than routing to a wrong URL).
+    ///
+    /// cargo parses the body and substitutes the spec's five `dl`
+    /// placeholders (or appends the spec-default `/{crate}/{version}/download`
+    /// suffix when the template has none).
+    ///
+    /// A format that returns `None` from `download_config_path` (or does not
+    /// implement `VersionDiscovery` at all) must never reach this method.
+    fn compose_download_url_from_config(
+        &self,
+        body: &mut dyn std::io::Read,
+        package: &str,
+        version: &str,
+        cksum_hex: Option<&str>,
+    ) -> DomainResult<String>;
+
+    /// Resolve the authoritative absolute download URL for `coords.version`
+    /// from the already-fetched upstream metadata body — npm's packument
+    /// `versions[version].dist.tarball`, the publisher-asserted tarball
+    /// origin (NOT a conventional path the registry happens to serve).
+    ///
+    /// `body` is a streaming reader over the same metadata document the
+    /// orchestrator fetched for
+    /// [`parse_upstream_checksum`](FormatHandler::parse_upstream_checksum), so the
+    /// npm arm resolves the URL and the checksum from one fetch. The parse
+    /// is memory-bounded the same way `parse_upstream_checksum` is (it
+    /// captures only the target version's `dist.tarball`, never the whole
+    /// packument). The resolved URL must be `https://` — a non-`https`
+    /// origin is rejected as `Validation` so no downgrade target is ever
+    /// promoted to a fetch URL.
+    ///
+    /// A format that resolves its download URL another way (cargo via
+    /// config, pypi via per-distribution fan-out), or does not implement
+    /// `VersionDiscovery` at all, must never reach this method.
+    fn resolve_download_url_from_metadata(
+        &self,
+        body: &mut dyn std::io::Read,
+        coords: &ArtifactCoords,
+    ) -> DomainResult<String>;
+}
+
 /// Outbound port for format-specific artifact parsing.
 ///
 /// Synchronous and stateless — a pure strategy pattern, not an I/O port.
@@ -281,95 +555,30 @@ pub trait FormatHandler: Send + Sync {
         )))
     }
 
-    /// Extract the set of upstream-published version identifiers from a
-    /// just-fetched upstream metadata body.
+    /// `Some` iff this format declares the [`VersionDiscovery`] capability
+    /// group (ADR 0005) — discovering upstream-published versions and
+    /// resolving their download URLs. Default `None`.
     ///
-    /// **Streaming contract (ADR 0026).** `body` is a streaming
-    /// reader over the upstream metadata body — overriding implementations
-    /// project the reader (via the per-format `hort-formats` projectors)
-    /// without buffering the whole body; the default ignores the reader.
+    /// **Why an accessor returning `Option<&dyn VersionDiscovery>` rather
+    /// than a `capabilities() -> &[Group]` flag:** a flag can disagree
+    /// with reality — a format could declare the group and still inherit
+    /// no-op defaults, reproducing the exact problem this accessor closes
+    /// with extra ceremony. The accessor makes the declaration and the
+    /// implementation the same fact; `None` is not a default that lies,
+    /// it is the honest answer. See ADR 0005's `VersionDiscovery`
+    /// realisation note (issue #58).
     ///
-    /// The caller already obtained `body` via
-    /// [`crate::ports::upstream_proxy::UpstreamProxy::fetch_metadata`]
-    /// (or any other byte source); this method only parses bytes into
-    /// the format's published version-string set. Used by the
-    /// `PrefetchTickHandler` to compute the divergence between
-    /// upstream and the registry's held set on the cron path — the
-    /// handler-tier equivalent of the per-format hot-path triggers
-    /// (`fire_prefetch_trigger_npm` / `fire_prefetch_trigger_cargo` /
-    /// `fire_prefetch_trigger_pypi`).
+    /// **Why the default is `None` and not a required method:** every
+    /// non-participating format (OCI, Maven, Helm, and any future Tier-C)
+    /// would otherwise need a boilerplate `None` override. The default is
+    /// safe here precisely because it is *one* method whose meaning is "I
+    /// do not participate" — unlike the eight per-method defaults this
+    /// accessor replaced, each of which used to silently fake a behaviour.
     ///
-    /// Returns the version-string set in the order they appear in the
-    /// upstream document (no sort, no dedup at this layer — the planner
-    /// handles both via [`crate::entities::repository::PrefetchPolicy`]
-    /// and its `VersionOrdering` arg).
-    ///
-    /// **Phase-1 scope cap.** Reference implementations exist for
-    /// `npm` (packument `versions{}` keys), `cargo` (sparse-index
-    /// NDJSON `vers` field per line), and `pypi` (PEP 503 HTML anchor
-    /// list parsed via the filename → version extractor).
-    /// Every other format — maven, oci, helm, rpm, debian, generic —
-    /// returns `Ok(Vec::new())` from the default impl, which the
-    /// scheduled tick reads as "format has no Phase-1 upstream-version
-    /// discovery" and silently skips (alongside the unsupported-
-    /// `VersionOrdering` early-exit). When a Phase-2 implementation
-    /// lands (e.g. OCI prefetch-on-tag-move), the override
-    /// SHOULD be added in the same commit that wires the hot-path
-    /// counterpart — keeping the trait method default the
-    /// signal that the format is not yet wired prevents a stray
-    /// override from "discovering versions" via an inert path while
-    /// the hot-path serve-site is still a no-op.
-    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
-        let _ = body;
-        Ok(Vec::new())
-    }
-
-    /// Return the format-native
-    /// path for fetching the version-AGNOSTIC metadata-index document
-    /// (npm packument, cargo sparse-index entry, PyPI PEP 503 simple
-    /// index). Composed onto an upstream-mapping's base URL.
-    ///
-    /// Distinct from [`upstream_checksum_metadata_path`](Self::upstream_checksum_metadata_path)
-    /// — that one returns the per-VERSION checksum-metadata path
-    /// (which for PyPI is `/pypi/<name>/<version>/json`). For npm and
-    /// cargo the two paths happen to coincide (their packument /
-    /// sparse-index documents carry both the version-set and the
-    /// checksum metadata); for PyPI they differ structurally.
-    ///
-    /// Consumed by [`super::super::ports`]-adjacent task handlers that
-    /// need to discover the upstream version-set divergence without
-    /// already having the body in hand from a serve-path fetch
-    /// (the scheduled `prefetch-tick` handler is the current consumer).
-    ///
-    /// Default `None` — formats without a metadata-index concept
-    /// (oci, generic, raw) inherit the inert default. Returns `None`
-    /// rather than `Err` because absence is a normal state, not an
-    /// error; the caller skips the format and continues. The
-    /// `prefetch-tick` handler's pre-flight `ordering_for_format`
-    /// check ensures only formats with a Phase-1 ordering reach
-    /// this method, so in practice the `None` arm is unreachable on
-    /// the cron path — but the trait default keeps the contract
-    /// open for new formats opting in by override.
-    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
-        let _ = package;
+    /// npm, cargo, and pypi implement [`VersionDiscovery`] and return
+    /// `Some(self)`. Every other format inherits this default.
+    fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
         None
-    }
-
-    /// Return the `Accept` header values the upstream-metadata fetch
-    /// should send for this format. Empty `Vec` = no Accept header
-    /// (the upstream's default representation is fine).
-    ///
-    /// Currently only PyPI uses this — it negotiates PEP 691 JSON via
-    /// `Accept: application/vnd.pypi.simple.v1+json` falling back to
-    /// `text/html`. npm / cargo / others accept the upstream default
-    /// representation and need no Accept header. Future formats with
-    /// content negotiation (RubyGems JSON/marshal, Conda repodata
-    /// variants) override here.
-    ///
-    /// Default `Vec::new()` — same inert-default pattern as
-    /// [`upstream_metadata_path`](Self::upstream_metadata_path).
-    fn upstream_metadata_accept(&self) -> Vec<String> {
-        Vec::new()
     }
 
     /// Extract a deterministic SBOM from the ingested payload.
@@ -437,209 +646,6 @@ pub trait FormatHandler: Send + Sync {
     ) -> DomainResult<Option<Bytes>> {
         let _ = (coords, payload);
         Ok(None)
-    }
-
-    /// Extract the *declared runtime*
-    /// dependency specs from the **stored artifact stream** (the format's
-    /// own archive).
-    ///
-    /// **Input contract.** `content` is the raw stored
-    /// artifact the transitive prefetch cascade read from CAS — for the
-    /// archive formats this is the format's OWN container, NOT a
-    /// pre-selected manifest body:
-    ///
-    /// - **npm** — the `.tgz` gzip tarball; the declared `dependencies` live
-    ///   in `package/package.json` INSIDE it.
-    /// - **cargo** — the `.crate` gzip tarball; `[dependencies]` live in the
-    ///   top-level `<dir>/Cargo.toml` inside it.
-    /// - **pypi** — the wheel (zip) / sdist (gzip-tar); `Requires-Dist` lives
-    ///   in `*.dist-info/METADATA` inside the wheel.
-    ///
-    /// Each overriding handler is **archive-aware**: it locates its declared
-    /// runtime manifest inside the artifact (via the audited
-    /// `hort-formats::archive_bounds` extractor) and parses it. (An earlier
-    /// contract — "a just-ingested artifact's pre-selected manifest body" —
-    /// was a bug: the cascade never pre-selects a manifest, so an impl
-    /// that JSON/TOML-parsed `content` directly tripped on the archive's
-    /// magic byte and the cascade was inert for every archive format.)
-    ///
-    /// Runtime classes ONLY — never `devDependencies` / `peerDependencies`
-    /// / `optionalDependencies` / `bundleDependencies` (npm), never
-    /// `Requires-Dist` lines carrying a test/dev `extra` marker (PyPI),
-    /// never `[dev-dependencies]` / `[build-dependencies]` entries (cargo
-    /// `Cargo.toml`), never `scope = test`/`provided`/`system` (Maven).
-    /// The runtime-vs-dev class boundary is load-bearing for the
-    /// transitive prefetch cascade: a TypeScript devDependency
-    /// closure can be 1000+ packages that none of the production code
-    /// needs. Getting the class boundary wrong inflates the prefetch
-    /// fan-out by 10–100×.
-    ///
-    /// The `range` field stays opaque (a [`String`] in the format's
-    /// native range syntax — `"^1.2"` for npm, `">=2,<3"` for PyPI,
-    /// `"2.x"` for cargo, `"[1.0,2.0)"` for Maven). Parsing the range
-    /// is the per-format
-    /// [`resolve_range_max`](Self::resolve_range_max) implementation's
-    /// concern, not the caller's; different formats have different
-    /// range grammars, and the call-site does not need to know which.
-    ///
-    /// **Streaming contract (ADR 0026).** `content` stays a
-    /// `&mut dyn std::io::Read` (the `streaming_metadata_port`
-    /// guard test pins the signature). Overriding implementations read the
-    /// stored artifact via the per-format `hort-formats` archive helpers;
-    /// the default ignores the reader.
-    ///
-    /// Default returns `Ok(Vec::new())` — formats
-    /// without a machine-readable runtime-dep concept (oci, generic,
-    /// raw uploads, helm, Maven) inherit the empty-vec contract, which the
-    /// cascade reads as "no transitive deps to enqueue". Returning
-    /// `Err` is reserved for a *structurally* invalid artifact — input that
-    /// is not the expected container (e.g. npm input that is not a gzip-tar),
-    /// a missing declared manifest entry, an unparseable manifest, or an
-    /// `archive_bounds` guard trip; a well-formed artifact whose manifest
-    /// declares zero runtime deps must return `Ok(vec![])`, not `Err`.
-    ///
-    /// Same shape contract as
-    /// [`extract_upstream_versions`](Self::extract_upstream_versions):
-    /// keeping the default an inert empty Vec
-    /// lets new formats opt in by overriding without a cascade-of-
-    /// `unimplemented!()` panics elsewhere in the call graph.
-    fn extract_dependency_specs(
-        &self,
-        content: &mut dyn std::io::Read,
-    ) -> DomainResult<Vec<DependencySpec>> {
-        let _ = content;
-        Ok(Vec::new())
-    }
-
-    /// Resolve a declared `range` against an
-    /// `available` set of concrete versions, returning the highest
-    /// version that satisfies the range.
-    ///
-    /// **Range-max only — NOT a SAT solver.** This is one range against
-    /// one set, picking the highest match. Resolving a whole dependency
-    /// graph (multi-dep co-satisfaction across a closure) is out of
-    /// scope and never gets implemented at this layer — the transitive
-    /// cascade just calls `resolve_range_max` per declared
-    /// dep and accepts that the registry's pick may differ from a strict
-    /// resolver's. This is a deliberately "plausible closure"; the
-    /// deterministic exact closure is the job of
-    /// seed-import / lockfile prewarm. See
-    /// `docs/architecture/explanation/prefetch-pipeline.md`.
-    ///
-    /// Returns `Option<String>` — the matching version string in the
-    /// format's native form (suitable to feed back into
-    /// [`ArtifactCoords::version`](crate::types::ArtifactCoords::version)):
-    ///
-    /// - `None` — no version in `available` satisfies `range`, OR
-    ///   `range`/`available` are unparseable (best-effort; an
-    ///   unparseable user-supplied range silently no-ops rather than
-    ///   surfacing a `DomainError`). The cascade reads `None` as
-    ///   "skip this dep" — a transient or malformed range must not
-    ///   abort the rest of the walk.
-    /// - `Some(version_string)` — the highest version in `available`
-    ///   satisfying `range`, in the format's native string form.
-    ///
-    /// Default returns `Ok(None)` — formats without a range concept
-    /// (oci tags are exact pointers, not ranges) never resolve. The
-    /// signature returns [`DomainResult`] for parity with
-    /// [`extract_dependency_specs`](Self::extract_dependency_specs);
-    /// the `Err` arm is reserved for genuinely structural errors,
-    /// not "unparseable input" (which is the silent-`None` path).
-    fn resolve_range_max(&self, range: &str, available: &[&str]) -> DomainResult<Option<String>> {
-        let _ = (range, available);
-        Ok(None)
-    }
-
-    /// Compose the upstream pull URL(s) for a
-    /// `(upstream_url, package, version)` coordinate.
-    ///
-    /// Returns the URL(s) the leaf prefetch ingest (
-    /// [`crate::ports::task_handler::TaskHandler`] `kind = "prefetch"`)
-    /// should `fetch_artifact` against. The trait method stays
-    /// **I/O-free** — the caller has already resolved a concrete
-    /// The path, relative to the upstream index host, of the registry
-    /// configuration document this format must fetch to learn its download
-    /// URL. `Some(path)` tells the prefetch orchestrator to fetch that
-    /// document and hand its body to
-    /// [`compose_download_url_from_config`](Self::compose_download_url_from_config);
-    /// `None` (the default) means the format's download URL comes from the
-    /// already-fetched upstream metadata via
-    /// [`resolve_download_url_from_metadata`](Self::resolve_download_url_from_metadata)
-    /// instead (npm) or from a per-distribution fan-out the orchestrator
-    /// special-cases (pypi).
-    ///
-    /// cargo returns `Some("/config.json")` — the sparse-registry index
-    /// config (<https://doc.rust-lang.org/cargo/reference/registry-index.html#index-configuration>),
-    /// whose `dl` field is the authoritative download-URL template. Every
-    /// other format inherits the `None` default.
-    fn download_config_path(&self) -> Option<String> {
-        None
-    }
-
-    /// Compose the absolute download URL for `(package, version)` from a
-    /// separately-fetched registry configuration document — cargo's
-    /// `config.json` (`dl` field), as identified by
-    /// [`download_config_path`](Self::download_config_path).
-    ///
-    /// `body` is a streaming reader over the config document, mirroring the
-    /// other `FormatHandler` body methods (ADR 0026 — the body never lands
-    /// in a buffer at the port boundary). The config document is tiny and
-    /// fixed (`{"dl":…,"api":…}`), so the impl reads it under a small
-    /// bounded cap (defence-in-depth above the fetch-time storage backstop);
-    /// a body over the cap is rejected as `Validation`.
-    ///
-    /// `cksum_hex` is the verified upstream checksum hex (consumed by the
-    /// `{sha256-checksum}` `dl` placeholder for registries that template on
-    /// it; `None` leaves the placeholder unsubstituted so the upstream
-    /// request 404s naturally rather than routing to a wrong URL).
-    ///
-    /// cargo parses the body and substitutes the spec's five `dl`
-    /// placeholders (or appends the spec-default `/{crate}/{version}/download`
-    /// suffix when the template has none).
-    ///
-    /// Default returns `Err(DomainError::Validation(...))`: a format that
-    /// returns `None` from `download_config_path` has no config-driven
-    /// download URL and must never reach this method.
-    fn compose_download_url_from_config(
-        &self,
-        body: &mut dyn std::io::Read,
-        package: &str,
-        version: &str,
-        cksum_hex: Option<&str>,
-    ) -> DomainResult<String> {
-        let _ = (body, package, version, cksum_hex);
-        Err(DomainError::Validation(
-            "compose_download_url_from_config not supported for this format".into(),
-        ))
-    }
-
-    /// Resolve the authoritative absolute download URL for `coords.version`
-    /// from the already-fetched upstream metadata body — npm's packument
-    /// `versions[version].dist.tarball`, the publisher-asserted tarball
-    /// origin (NOT a conventional path the registry happens to serve).
-    ///
-    /// `body` is a streaming reader over the same metadata document the
-    /// orchestrator fetched for
-    /// [`parse_upstream_checksum`](Self::parse_upstream_checksum), so the
-    /// npm arm resolves the URL and the checksum from one fetch. The parse
-    /// is memory-bounded the same way `parse_upstream_checksum` is (it
-    /// captures only the target version's `dist.tarball`, never the whole
-    /// packument). The resolved URL must be `https://` — a non-`https`
-    /// origin is rejected as `Validation` so no downgrade target is ever
-    /// promoted to a fetch URL.
-    ///
-    /// Default returns `Err(DomainError::Validation(...))`: a format that
-    /// resolves its download URL another way (cargo via config, pypi via
-    /// per-distribution fan-out) must never reach this method.
-    fn resolve_download_url_from_metadata(
-        &self,
-        body: &mut dyn std::io::Read,
-        coords: &ArtifactCoords,
-    ) -> DomainResult<String> {
-        let _ = (body, coords);
-        Err(DomainError::Validation(
-            "resolve_download_url_from_metadata not supported for this format".into(),
-        ))
     }
 
     /// Resolve a mutable (re-deployable) version request to the concrete,
@@ -1025,75 +1031,27 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // `extract_upstream_versions` default impl
+    // `version_discovery` accessor default (VersionDiscovery capability
+    // group extraction, issue #58) — replaces the former per-method
+    // `extract_upstream_versions` / `upstream_metadata_path` /
+    // `upstream_metadata_accept` default-impl tests. Those methods no
+    // longer live on `FormatHandler` at all; `DefaultsOnlyHandler` (which
+    // implements nothing beyond the three required methods) is exactly
+    // the "does not participate" case the accessor exists to express.
     // -------------------------------------------------------------------
 
     #[test]
-    fn default_extract_upstream_versions_returns_empty_vec() {
-        // Opaque-format default: a handler that does not override
-        // returns `Ok(Vec::new())` regardless of body. The
-        // PrefetchTickHandler reads this as "no Phase-1 upstream
-        // discovery" and silently skips. Regression guard: changing
-        // the default to a non-empty Vec would silently enable
-        // scheduled prefetch for every handler that inherits it,
-        // including formats whose hot-path serve-site has no
-        // matching trigger.
-        let result = DefaultsOnlyHandler
-            .extract_upstream_versions(&mut std::io::Cursor::new(b"any bytes here"));
-        assert_eq!(result.expect("Ok"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn default_extract_upstream_versions_does_not_inspect_bytes() {
-        // The default does not parse — well-formed JSON, malformed
-        // bytes, and empty input all yield the same empty Vec. Pins
-        // the no-inspection contract for reviewers.
-        for body in [
-            &b""[..],
-            &b"{\"versions\":{\"1.0.0\":{}}}"[..],
-            &b"<<not even close to valid>>"[..],
-        ] {
-            let r = DefaultsOnlyHandler.extract_upstream_versions(&mut std::io::Cursor::new(body));
-            assert_eq!(r.expect("Ok"), Vec::<String>::new());
-        }
-    }
-
-    #[test]
-    fn default_upstream_metadata_path_returns_none() {
-        // Opaque-format default: a handler that does not override
-        // returns `None`. The PrefetchTickHandler reads this
-        // as "no metadata-index document for this format" and skips
-        // the repo. Regression guard: changing the default to a
-        // non-empty Option would silently activate scheduled prefetch
-        // for every handler that inherits it, including OCI / generic /
-        // raw which have no metadata-index concept at all.
-        assert_eq!(DefaultsOnlyHandler.upstream_metadata_path("anything"), None);
-    }
-
-    #[test]
-    fn default_upstream_metadata_path_ignores_package_name() {
-        // The default does not inspect its input — any package name
-        // produces the same `None`. Pins the no-inspection contract
-        // for reviewers; mirrors the same shape as
-        // `default_extract_upstream_versions_does_not_inspect_bytes`.
-        let long = "x".repeat(10_000);
-        for pkg in ["", "lodash", long.as_str()] {
-            assert_eq!(DefaultsOnlyHandler.upstream_metadata_path(pkg), None);
-        }
-    }
-
-    #[test]
-    fn default_upstream_metadata_accept_returns_empty() {
-        // Opaque-format default: no content negotiation. Most formats
-        // (npm, cargo, oci, generic, raw, …) accept the upstream's
-        // default representation and need no `Accept` header. Only
-        // PyPI overrides today (PEP 691 JSON negotiation); future
-        // formats with content negotiation (RubyGems, Conda) add
-        // their own override.
-        assert_eq!(
-            DefaultsOnlyHandler.upstream_metadata_accept(),
-            Vec::<String>::new(),
-        );
+    fn default_version_discovery_is_none() {
+        // A handler that does not implement `VersionDiscovery` inherits
+        // the accessor's `None` default. The prefetch consumers
+        // (prefetch_tick / prefetch_dependencies / prefetch_ingest /
+        // hort-formats-upstream) early-return on `None` — exactly the
+        // outcome the eight now-removed per-method defaults used to
+        // produce (empty Vec / None / Validation error), but declared
+        // structurally instead of by inheritance. Regression guard:
+        // returning `Some` here would silently opt every non-
+        // participating handler into the whole capability group.
+        assert!(DefaultsOnlyHandler.version_discovery().is_none());
     }
 
     #[test]
@@ -1108,155 +1066,6 @@ mod tests {
         let payload = PayloadAccess::Bytes(b"");
         let result = DefaultsOnlyHandler.extract_sbom(&coords, &metadata, payload);
         assert!(matches!(result, Ok(None)));
-    }
-
-    // -------------------------------------------------------------------
-    // `extract_dependency_specs` / `resolve_range_max` default impls
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn default_extract_dependency_specs_returns_empty_vec() {
-        // Opaque-format default: a handler that does not override
-        // returns `Ok(Vec::new())` regardless of body. The
-        // transitive-prefetch cascade reads this as "no
-        // declared runtime deps" and enqueues nothing. Regression
-        // guard: changing the default to a non-empty Vec would
-        // silently start cascading prefetch jobs for every handler
-        // that inherits it, including OCI / generic / raw uploads
-        // that have no runtime-dep concept at all.
-        let result = DefaultsOnlyHandler
-            .extract_dependency_specs(&mut std::io::Cursor::new(b"any bytes here"));
-        assert_eq!(result.expect("Ok"), Vec::<DependencySpec>::new());
-    }
-
-    #[test]
-    fn default_extract_dependency_specs_does_not_inspect_bytes() {
-        // The default does not parse — well-formed JSON, malformed
-        // bytes, and empty input all yield the same empty Vec. Same
-        // no-inspection contract as `extract_upstream_versions`.
-        for body in [
-            &b""[..],
-            &b"{\"dependencies\":{\"lodash\":\"^4\"}}"[..],
-            &b"<<not even close to valid>>"[..],
-        ] {
-            let r = DefaultsOnlyHandler.extract_dependency_specs(&mut std::io::Cursor::new(body));
-            assert_eq!(r.expect("Ok"), Vec::<DependencySpec>::new());
-        }
-    }
-
-    #[test]
-    fn default_resolve_range_max_returns_none() {
-        // Opaque-format default: a handler that does not override
-        // returns `Ok(None)` regardless of range/available. The
-        // cascade reads `None` as "skip this dep" so a handler
-        // without a range concept (oci tags, generic uploads)
-        // contributes nothing to the prefetch walk.
-        let result = DefaultsOnlyHandler.resolve_range_max("^1.0", &["1.0.0", "2.0.0"]);
-        assert!(matches!(result, Ok(None)));
-    }
-
-    #[test]
-    fn default_resolve_range_max_ignores_available_set_shape() {
-        // The default does not parse — an empty available set, a
-        // populated one, and one with garbage all yield `Ok(None)`.
-        // Pins the no-inspection contract for reviewers.
-        for available in [
-            &[][..],
-            &["1.0.0", "1.2.3", "2.0.0"][..],
-            &["definitely-not-a-version"][..],
-        ] {
-            let r = DefaultsOnlyHandler.resolve_range_max("anything", available);
-            assert!(matches!(r, Ok(None)));
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // download-URL resolution default impls
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn default_download_config_path_is_none() {
-        // Opaque-format default: a handler that does not override resolves
-        // its download URL without a separate config document. The prefetch
-        // orchestrator reads `None` as "no config.json leg".
-        assert_eq!(DefaultsOnlyHandler.download_config_path(), None);
-    }
-
-    #[test]
-    fn default_compose_download_url_from_config_returns_validation_error() {
-        // A format that returns `None` from `download_config_path` must
-        // never reach this method; the fail-safe default is a Validation
-        // error (NOT a fabricated URL).
-        let err = DefaultsOnlyHandler
-            .compose_download_url_from_config(
-                &mut std::io::Cursor::new(b"{}"),
-                "lodash",
-                "4.17.21",
-                None,
-            )
-            .expect_err("default must error");
-        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn default_compose_download_url_from_config_ignores_inputs() {
-        // The default does not parse — well-formed body, empty inputs, and
-        // garbage all yield the same Validation error.
-        for (body, pkg, ver, cksum) in [
-            (&br#"{"dl":"x"}"#[..], "name", "1.0.0", Some("abc")),
-            (&b""[..], "", "", None),
-            (&b"<<weird>>"[..], "<<x>>", "neither", Some("")),
-        ] {
-            let r = DefaultsOnlyHandler.compose_download_url_from_config(
-                &mut std::io::Cursor::new(body),
-                pkg,
-                ver,
-                cksum,
-            );
-            assert!(matches!(r, Err(DomainError::Validation(_))), "got {r:?}");
-        }
-    }
-
-    #[test]
-    fn default_resolve_download_url_from_metadata_returns_validation_error() {
-        // A format that resolves its URL another way (cargo via config,
-        // pypi via fan-out) must never reach this method; the fail-safe
-        // default is a Validation error.
-        let coords = ArtifactCoords {
-            name: "lodash".into(),
-            name_as_published: "lodash".into(),
-            version: Some("4.17.21".into()),
-            path: String::new(),
-            format: RepositoryFormat::Npm,
-            metadata: serde_json::Value::Null,
-        };
-        let err = DefaultsOnlyHandler
-            .resolve_download_url_from_metadata(&mut std::io::Cursor::new(b"{}"), &coords)
-            .expect_err("default must error");
-        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn default_resolve_download_url_from_metadata_does_not_inspect_body() {
-        // The default does not parse — well-formed JSON, malformed bytes,
-        // and empty input all yield the same Validation error.
-        let coords = ArtifactCoords {
-            name: "x".into(),
-            name_as_published: "x".into(),
-            version: Some("1.0.0".into()),
-            path: String::new(),
-            format: RepositoryFormat::Npm,
-            metadata: serde_json::Value::Null,
-        };
-        for body in [
-            &b""[..],
-            &br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://x/y.tgz"}}}}"#[..],
-            &b"<<not even close>>"[..],
-        ] {
-            let r = DefaultsOnlyHandler
-                .resolve_download_url_from_metadata(&mut std::io::Cursor::new(body), &coords);
-            assert!(matches!(r, Err(DomainError::Validation(_))), "got {r:?}");
-        }
     }
 
     #[test]
