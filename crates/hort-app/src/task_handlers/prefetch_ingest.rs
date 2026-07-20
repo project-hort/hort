@@ -37,14 +37,34 @@
 //! verified-ingest. Mirrors `fire_prefetch_trigger_pypi` in
 //! `crates/hort-http-pypi/src/simple_index.rs`.
 //!
-//! # PullDedup composition
+//! # Dedup composition — L2/L3 only, NOT L1
 //!
-//! Composition-root wires the `IngestUseCase` against the
-//! `UpstreamProxy` that has `PullDedup`'s `coalesce_blob`
-//! single-flight guard. The leaf handler doesn't
-//! need to wrap anything explicitly — the dedup absorbs the
-//! prefetch-vs-client-pull race naturally: the second caller for
-//! the same blob hash sees the leader's cached outcome.
+//! This handler calls `UpstreamProxy::fetch_artifact` and
+//! `IngestUseCase::ingest_verified` **directly**. It does **not**
+//! ride `PullDedup` (L1), and there is no `PullDedup`-wrapping
+//! `UpstreamProxy` decorator in the tree — `HttpUpstreamProxy` is
+//! the only implementation, and the composition root wires it
+//! unwrapped.
+//!
+//! Duplicates are absorbed by the other two layers of the scheme
+//! documented in `hort_app::pull_dedup` (L1 concurrent single-flight
+//! / L2 terminal ingest absorb / L3 cascade re-walk absorb):
+//!
+//! - **L3** — the `jobs.target_key` partial unique index (migration
+//!   009) collapses duplicate *cascade jobs* before they ever run,
+//!   which is the common case for this handler.
+//! - **L2** — the `artifacts` path-UNIQUE constraint absorbs a
+//!   duplicate *ingest* if a prefetch and a client pull-through
+//!   race to commit the same bytes.
+//!
+//! The residual cost of skipping L1 is therefore a redundant
+//! upstream *fetch* in that narrow race — wasted bandwidth, never a
+//! correctness problem: the second committer loses at L2 and the
+//! content hash is identical by construction (enforced CAS).
+//!
+//! An earlier version of this comment claimed the composition root
+//! wired this handler behind `PullDedup`'s `coalesce_blob` guard.
+//! It never did (issue #57). Do not reason from that guarantee.
 //!
 //! # Non-fatal per URL
 //!
