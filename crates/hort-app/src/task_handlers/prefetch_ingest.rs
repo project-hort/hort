@@ -588,6 +588,22 @@ async fn cargo_resolve_and_pull(ctx: &LeafCtx<'_>, summary: &mut LeafSummary) {
         return;
     };
 
+    // Only called from the `RepositoryFormat::Cargo` dispatch arm, so this
+    // is provably `Some` today — but the check is the structural,
+    // greppable replacement for what used to be an implicit assumption
+    // (issue #58): a future cargo-family alias routed here without a
+    // `VersionDiscovery` impl now short-circuits instead of hitting a
+    // trait method that no longer exists on `FormatHandler`.
+    let Some(vd) = ctx.handler.version_discovery() else {
+        tracing::warn!(
+            repository = %ctx.repo.key,
+            package = %ctx.parsed.package,
+            "prefetch (cargo): handler does not implement VersionDiscovery — short-circuit",
+        );
+        summary.short_circuited = true;
+        return;
+    };
+
     // The metadata-leg mapping honours `index_upstream_url` exactly as the
     // pull-through's `index_mapping` does (clone + swap `upstream_url`). The
     // download leg uses the ORIGINAL mapping; the composed absolute URL
@@ -630,7 +646,7 @@ async fn cargo_resolve_and_pull(ctx: &LeafCtx<'_>, summary: &mut LeafSummary) {
     };
 
     // Leg 2: config.json → compose the `dl`-based download URL.
-    let Some(config_path) = ctx.handler.download_config_path() else {
+    let Some(config_path) = vd.download_config_path() else {
         tracing::warn!(
             repository = %ctx.repo.key,
             package = %ctx.parsed.package,
@@ -649,12 +665,15 @@ async fn cargo_resolve_and_pull(ctx: &LeafCtx<'_>, summary: &mut LeafSummary) {
             &index_mapping,
             config_path,
             move |reader| {
-                handler.compose_download_url_from_config(
-                    reader,
-                    &package,
-                    &version,
-                    Some(&cksum_hex),
-                )
+                // Re-derive from the cloned, owned `Arc` — the closure
+                // must be `'static` and cannot capture the outer
+                // borrowed `vd`. Pure dispatch on `handler`'s concrete
+                // type, so re-deriving is exactly as safe as the guard
+                // above (same handler, same answer).
+                let vd = handler.version_discovery().expect(
+                    "handler participates in VersionDiscovery — checked earlier in this function",
+                );
+                vd.compose_download_url_from_config(reader, &package, &version, Some(&cksum_hex))
             },
             summary,
         )
@@ -678,6 +697,19 @@ async fn npm_resolve_and_pull(ctx: &LeafCtx<'_>, summary: &mut LeafSummary) {
     let Some(coords) = build_single_artifact_coords(ctx, summary) else {
         return;
     };
+
+    // Only called from the `RepositoryFormat::Npm` dispatch arm, so this
+    // is provably `Some` today — the structural, greppable replacement
+    // (issue #58) for what used to be an implicit assumption.
+    if ctx.handler.version_discovery().is_none() {
+        tracing::warn!(
+            repository = %ctx.repo.key,
+            package = %ctx.parsed.package,
+            "prefetch (npm): handler does not implement VersionDiscovery — short-circuit",
+        );
+        summary.short_circuited = true;
+        return;
+    }
 
     let Some(packument_path) = ctx.handler.upstream_checksum_metadata_path(&coords) else {
         tracing::warn!(
@@ -737,7 +769,10 @@ async fn npm_resolve_and_pull(ctx: &LeafCtx<'_>, summary: &mut LeafSummary) {
         let handler = Arc::clone(ctx.handler);
         let coords = coords.clone();
         crate::project::run_handler_body(cache_handle, move |reader| {
-            handler.resolve_download_url_from_metadata(reader, &coords)
+            let vd = handler.version_discovery().expect(
+                "handler participates in VersionDiscovery — checked earlier in this function",
+            );
+            vd.resolve_download_url_from_metadata(reader, &coords)
         })
         .await
     };
@@ -1073,6 +1108,7 @@ mod tests {
     use chrono::Utc;
 
     use hort_domain::events::system_actor;
+    use hort_domain::ports::format_handler::{DependencySpec, VersionDiscovery};
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
 
     fn make_context() -> TaskContext {
@@ -1389,6 +1425,36 @@ mod tests {
         ) -> DomainResult<UpstreamPublishedChecksum> {
             UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, self.cksum_hex.clone())
         }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for CargoDispatchStub {
+        fn extract_upstream_versions(
+            &self,
+            _body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn upstream_metadata_path(&self, _package: &str) -> Option<String> {
+            None
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn extract_dependency_specs(
+            &self,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            Ok(Vec::new())
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
         fn download_config_path(&self) -> Option<String> {
             Some("/config.json".to_string())
         }
@@ -1413,6 +1479,34 @@ mod tests {
                 .ok_or_else(|| DomainError::Validation("config.json missing dl".into()))?;
             Ok(format!("{dl}/{package}/{version}/download"))
         }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+    }
+
+    /// A registered `FormatHandler` under `"cargo"` that does NOT
+    /// implement `VersionDiscovery` (issue #58). Exercises the
+    /// `cargo_resolve_and_pull` guard: `short_circuited: true`, not a
+    /// call into a method that no longer exists on `FormatHandler` for a
+    /// non-participant.
+    struct NoVersionDiscoveryCargoHandler;
+    impl FormatHandler for NoVersionDiscoveryCargoHandler {
+        fn format_key(&self) -> &str {
+            "cargo"
+        }
+        fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+            unreachable!("not exercised by the dispatch test")
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_lowercase()
+        }
+        // `version_discovery` is NOT overridden — inherits `None`.
     }
 
     /// npm dispatch stub. Packument at `/express`; recovers a Sha256 cksum and
@@ -1452,6 +1546,50 @@ mod tests {
             _coords: &ArtifactCoords,
         ) -> DomainResult<UpstreamPublishedChecksum> {
             UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, self.cksum_hex.clone())
+        }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for NpmDispatchStub {
+        fn extract_upstream_versions(
+            &self,
+            _body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn upstream_metadata_path(&self, _package: &str) -> Option<String> {
+            None
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn extract_dependency_specs(
+            &self,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            Ok(Vec::new())
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
         }
         fn resolve_download_url_from_metadata(
             &self,
@@ -1602,6 +1740,42 @@ mod tests {
         );
         assert_eq!(summary["urls_failed"], 0, "{summary}");
         assert_eq!(summary["short_circuited"], false, "{summary}");
+    }
+
+    /// Issue #58: a `FormatHandler` IS registered under `"cargo"`, but it
+    /// does not implement `VersionDiscovery`. `cargo_resolve_and_pull`
+    /// must short-circuit via the `ctx.handler.version_discovery()`
+    /// early-return rather than reach `download_config_path` /
+    /// `compose_download_url_from_config`, which no longer exist on
+    /// `FormatHandler` for a non-participant.
+    #[tokio::test]
+    async fn cargo_arm_without_version_discovery_short_circuits() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Cargo);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let handler = build_dispatch_handler(
+            repos,
+            proxy,
+            mappings,
+            "cargo",
+            Arc::new(NoVersionDiscoveryCargoHandler),
+        );
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "serde", "1.0.0"), make_context())
+            .await
+            .expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(summary["short_circuited"], true, "{summary}");
+        assert_eq!(summary["urls_succeeded"], 0, "{summary}");
     }
 
     #[tokio::test]

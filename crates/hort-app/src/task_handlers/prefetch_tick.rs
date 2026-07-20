@@ -299,19 +299,6 @@ impl TaskHandler for PrefetchTickHandler {
                     summary.skipped_no_trigger += 1;
                     continue;
                 }
-                // Pre-flight: the format must have a Phase-1 ordering
-                // (boolean check only — the `&dyn VersionOrdering`
-                // itself is resolved *after* the await chain because
-                // the trait object is `!Send` and would taint the
-                // `Pin<Box<dyn Future + Send>>` return signature).
-                if ordering_for_format(&repo.format).is_none() {
-                    tracing::debug!(
-                        repository = %repo.key,
-                        format = ?repo.format,
-                        "prefetch-tick: format has no Phase-1 ordering — skipping repo",
-                    );
-                    continue;
-                }
                 let Some(handler) = self.format_handlers.get(&repo.format.to_string()) else {
                     tracing::warn!(
                         repository = %repo.key,
@@ -320,6 +307,24 @@ impl TaskHandler for PrefetchTickHandler {
                          skipping repo (Phase-1 ships npm/cargo/pypi/oci handlers; \
                          a Phase-2 format with an ordering but no handler is a \
                          composition oversight)",
+                    );
+                    continue;
+                };
+                // Pre-flight: the format must participate in the
+                // VersionDiscovery capability group (issue #58) — the
+                // structural replacement for the old
+                // `ordering_for_format(&repo.format).is_none()` boolean
+                // pre-check. `vd` (`&dyn VersionDiscovery`) is `Send +
+                // Sync` (a supertrait bound on the trait itself), so —
+                // unlike `&dyn VersionOrdering` below — holding it across
+                // this iteration's `.await` points does not taint the
+                // enclosing `Pin<Box<dyn Future + Send>>`.
+                let Some(vd) = handler.version_discovery() else {
+                    tracing::debug!(
+                        repository = %repo.key,
+                        format = ?repo.format,
+                        "prefetch-tick: format does not implement VersionDiscovery — \
+                         skipping repo",
                     );
                     continue;
                 };
@@ -402,13 +407,13 @@ impl TaskHandler for PrefetchTickHandler {
                         }
                     };
 
-                    // Per-format URL conventions live on the FormatHandler
-                    // trait. A format
-                    // with no metadata-index document inherits the default
-                    // `None` and we skip the package — but in practice the
-                    // pre-flight `ordering_for_format` filter above gates
-                    // to npm/cargo/pypi which all override.
-                    let Some(upstream_path) = handler.upstream_metadata_path(package) else {
+                    // Per-format URL conventions live on the
+                    // VersionDiscovery trait. `None` here is a
+                    // participating format that (like pypi's peers)
+                    // simply has no metadata-index document; the
+                    // structural pre-flight above already guarantees
+                    // `vd` participates in the group at all.
+                    let Some(upstream_path) = vd.upstream_metadata_path(package) else {
                         tracing::debug!(
                             repository = %repo.key,
                             package = %package,
@@ -418,7 +423,7 @@ impl TaskHandler for PrefetchTickHandler {
                         summary.packages_walked += 1;
                         continue;
                     };
-                    let accept = handler.upstream_metadata_accept();
+                    let accept = vd.upstream_metadata_accept();
                     let outcome = match self
                         .upstream_proxy
                         .fetch_metadata(mapping.clone(), upstream_path.clone(), accept)
@@ -457,7 +462,18 @@ impl TaskHandler for PrefetchTickHandler {
                     let versions_result = {
                         let handler = Arc::clone(handler);
                         crate::project::run_handler_body(cache_handle, move |reader| {
-                            handler.extract_upstream_versions(reader)
+                            // Re-derive `vd` from the cloned, owned `Arc`
+                            // — the closure must be `'static`, so it
+                            // cannot capture the outer borrowed `vd`.
+                            // `version_discovery()` is a pure dispatch
+                            // on `handler`'s concrete type, so re-deriving
+                            // it is exactly as safe as the pre-flight
+                            // check above (same handler, same answer).
+                            let vd = handler.version_discovery().expect(
+                                "handler participates in VersionDiscovery — checked at the \
+                                 top of this repo's iteration",
+                            );
+                            vd.extract_upstream_versions(reader)
                         })
                         .await
                     };
@@ -481,9 +497,12 @@ impl TaskHandler for PrefetchTickHandler {
                     // block — strictly after every `.await` in this
                     // iteration AND before the `enqueue_prefetch_batch` await
                     // below — so the `!Send` trait object never crosses an
-                    // await boundary. The pre-flight `is_none()` check above
-                    // guarantees this resolves; we still pattern-match for
-                    // defence-in-depth.
+                    // await boundary. Today npm/cargo/pypi are exactly both
+                    // the VersionDiscovery participants (the pre-flight
+                    // `vd` check above) and the only Phase-1-ordering
+                    // formats, so that check already guarantees this
+                    // resolves; we still pattern-match for defence-in-depth
+                    // against the two capabilities ever diverging.
                     let planned: Vec<String> = {
                         let Some(ordering) = ordering_for_format(&repo.format) else {
                             continue;
@@ -652,6 +671,7 @@ mod tests {
     };
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
+    use hort_domain::ports::format_handler::{DependencySpec, VersionDiscovery};
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
     use hort_domain::ports::repository_upstream_mapping_repository::{
         RepositoryUpstreamMapping, RepositoryUpstreamMappingArgs, UpstreamAuth,
@@ -799,8 +819,16 @@ mod tests {
         fn normalize_name(&self, name: &str) -> String {
             name.to_string()
         }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for NpmHandlerForTests {
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             Some(format!("/{package}"))
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
         }
         fn extract_upstream_versions(
             &self,
@@ -816,6 +844,42 @@ mod tests {
                 return Ok(Vec::new());
             };
             Ok(versions.keys().cloned().collect())
+        }
+        fn extract_dependency_specs(
+            &self,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            Ok(Vec::new())
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
         }
     }
 
@@ -833,6 +897,11 @@ mod tests {
         fn normalize_name(&self, name: &str) -> String {
             name.to_lowercase()
         }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for PypiHandlerForTests {
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             Some(format!("/simple/{}/", self.normalize_name(package)))
         }
@@ -862,6 +931,42 @@ mod tests {
                 .filter_map(|e| e.as_str().map(str::to_string))
                 .collect())
         }
+        fn extract_dependency_specs(
+            &self,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            Ok(Vec::new())
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
     }
 
     /// `FormatHandler` whose `extract_upstream_versions` always returns
@@ -881,8 +986,16 @@ mod tests {
         fn normalize_name(&self, name: &str) -> String {
             name.to_string()
         }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for AlwaysFailingParserHandler {
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             Some(format!("/{package}"))
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
         }
         fn extract_upstream_versions(
             &self,
@@ -890,6 +1003,68 @@ mod tests {
         ) -> DomainResult<Vec<String>> {
             Err(DomainError::Validation("injected parse failure".into()))
         }
+        fn extract_dependency_specs(
+            &self,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            Ok(Vec::new())
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+    }
+
+    /// A registered `FormatHandler` that does NOT implement
+    /// `VersionDiscovery` (inherits the accessor's `None` default) —
+    /// distinct from "no handler registered for the format" (see
+    /// `unsupported_format_silently_skips`, which is the `format_handlers`
+    /// map lookup missing entirely). This double exercises the newer,
+    /// narrower gate: a handler IS registered, but it does not participate
+    /// in the capability group, so the per-repo walk must still skip it
+    /// rather than reach a method that no longer exists on `FormatHandler`
+    /// for a non-participant (issue #58).
+    struct NoVersionDiscoveryHandler;
+    impl FormatHandler for NoVersionDiscoveryHandler {
+        fn format_key(&self) -> &str {
+            "maven"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!()
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        // `version_discovery` is NOT overridden — inherits `None`.
     }
 
     // ---------- mock RepositoryRepository --------------------------------
@@ -1339,6 +1514,48 @@ mod tests {
                 assert_eq!(result_summary["packages_walked"], 0);
                 assert_eq!(result_summary["skipped_disabled"], 0);
                 assert_eq!(result_summary["skipped_no_trigger"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Issue #58: distinct from `unsupported_format_silently_skips` (no
+    /// `FormatHandler` registered at all) — here a `FormatHandler` IS
+    /// registered for the repo's format, but it does not implement
+    /// `VersionDiscovery`. The per-repo walk must skip it via the
+    /// `handler.version_discovery()` early-return, not reach a method
+    /// that no longer exists on `FormatHandler` for a non-participant.
+    #[tokio::test]
+    async fn registered_handler_without_version_discovery_is_skipped() {
+        let r = repo_with(
+            "maven-mirror",
+            RepositoryFormat::Maven,
+            enabled_scheduled_policy(),
+        );
+        let repos = Arc::new(MockRepoRepo::returning(vec![r]));
+        let arts = Arc::new(MockArtRepo::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        handlers.insert(
+            "maven".to_string(),
+            Arc::new(NoVersionDiscoveryHandler) as Arc<dyn FormatHandler>,
+        );
+        let handler = make_handler(repos, arts, proxy, mappings, handlers);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(
+                    result_summary["repos_walked"], 0,
+                    "a registered handler with no VersionDiscovery participation must be \
+                     skipped exactly like a missing handler"
+                );
+                assert_eq!(result_summary["packages_walked"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }

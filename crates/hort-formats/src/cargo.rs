@@ -11,7 +11,7 @@ use std::io::BufRead as _;
 
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::format_handler::{DependencySpec, FormatHandler};
+use hort_domain::ports::format_handler::{DependencySpec, FormatHandler, VersionDiscovery};
 use hort_domain::ports::upstream_proxy::CountingReader;
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
@@ -434,72 +434,16 @@ impl FormatHandler for CargoFormatHandler {
         })
     }
 
-    /// Extract the upstream-published version-string set from a cargo
-    /// sparse-index NDJSON body.
-    ///
-    /// One non-blank line per published version; each line is a JSON
-    /// object with a `vers` field. Same shape as the hot-path trigger
-    /// reader in `crates/hort-http-cargo/src/index_cache.rs::parse_upstream_versions`
-    /// (lifted verbatim) so the cron-tier and serve-site readers
-    /// stay in lock-step. Lines that fail to parse / lack `vers` are
-    /// skipped per the hot-path policy (a single malformed line on
-    /// `crates.io` must not starve the rest of the catalog).
-    ///
-    /// Bounded by the streaming plausibility ceiling
-    /// ([`STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES`](crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES)
-    /// = 64 MiB) — this method STREAMS the body line-by-line, so per the
-    /// cap taxonomy its ceiling is the plausibility / storage bound
-    /// (aligned with the `HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE` fetch
-    /// backstop), NOT a small in-memory ceiling. Bodies above that are
-    /// rejected as `Validation`.
-    ///
-    /// **Streaming.** `body` is a streaming reader over the NDJSON page;
-    /// the walk is line-by-line via [`std::io::BufRead`] (one line in
-    /// memory at a time, never the whole page) and SKIPS lines that fail
-    /// to parse or lack `vers`. The size cap is enforced mid-stream. The
-    /// fail-closed shared projector is not used (it would reject a
-    /// missing-`vers` line that this method skips).
-    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
-        let max = crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES;
-        let mut reader = std::io::BufReader::new(CountingReader::new(body));
-        let counter = reader.get_ref().counter();
-        let mut out: Vec<String> = Vec::new();
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            let n = reader
-                .read_until(b'\n', &mut line)
-                .map_err(|e| DomainError::Validation(format!("cargo index read error: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            if let Some(v) = serde_json::from_slice::<serde_json::Value>(&line)
-                .ok()
-                .and_then(|v| v.get("vers").and_then(|x| x.as_str()).map(str::to_string))
-            {
-                out.push(v);
-            }
-        }
-        let total = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if total > max as u64 {
-            return Err(DomainError::Validation(format!(
-                "cargo upstream metadata body is {total} bytes; streaming plausibility max is {max}"
-            )));
-        }
-        Ok(out)
-    }
-
-    /// Cargo sparse-index path — version-agnostic. Coincides with the
-    /// per-crate checksum-metadata path
-    /// ([`upstream_checksum_metadata_path`](Self::upstream_checksum_metadata_path))
-    /// because the sparse-index entry is one NDJSON document carrying
-    /// every version + its `cksum`. The path layout (1-char, 2-char,
-    /// 3-char prefix buckets) is encoded in [`index_path_for`].
-    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
-        Some(format!("/{}", index_path_for(package)))
+    /// `Some(self)` — cargo implements [`VersionDiscovery`]. See that impl
+    /// block below for `extract_upstream_versions` /
+    /// `upstream_metadata_path` / `extract_dependency_specs` /
+    /// `resolve_range_max` / `download_config_path` /
+    /// `compose_download_url_from_config` (cargo does not implement
+    /// `upstream_metadata_accept` / `resolve_download_url_from_metadata` —
+    /// its own `VersionDiscovery` impl returns the same inert values those
+    /// methods used to inherit as `FormatHandler` defaults).
+    fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+        Some(self)
     }
 
     /// Extract a deterministic SBOM from the cargo metadata the handler
@@ -613,6 +557,94 @@ impl FormatHandler for CargoFormatHandler {
             components,
         }))
     }
+}
+
+/// cargo's [`VersionDiscovery`] participation — 6 of 8 members
+/// (`extract_upstream_versions`, `upstream_metadata_path`,
+/// `extract_dependency_specs`, `resolve_range_max`,
+/// `download_config_path`, `compose_download_url_from_config`).
+/// `upstream_metadata_accept` / `resolve_download_url_from_metadata` are
+/// not implemented — cargo has no content-negotiation, and its download
+/// URL comes from `config.json` (`download_config_path` +
+/// `compose_download_url_from_config`) rather than the upstream metadata
+/// body — so these return the same inert values the `FormatHandler`
+/// trait-level defaults used to supply before the VersionDiscovery
+/// extraction (issue #58). Preserved exactly, not filled in.
+impl VersionDiscovery for CargoFormatHandler {
+    /// Extract the upstream-published version-string set from a cargo
+    /// sparse-index NDJSON body.
+    ///
+    /// One non-blank line per published version; each line is a JSON
+    /// object with a `vers` field. Same shape as the hot-path trigger
+    /// reader in `crates/hort-http-cargo/src/index_cache.rs::parse_upstream_versions`
+    /// (lifted verbatim) so the cron-tier and serve-site readers
+    /// stay in lock-step. Lines that fail to parse / lack `vers` are
+    /// skipped per the hot-path policy (a single malformed line on
+    /// `crates.io` must not starve the rest of the catalog).
+    ///
+    /// Bounded by the streaming plausibility ceiling
+    /// ([`STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES`](crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES)
+    /// = 64 MiB) — this method STREAMS the body line-by-line, so per the
+    /// cap taxonomy its ceiling is the plausibility / storage bound
+    /// (aligned with the `HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE` fetch
+    /// backstop), NOT a small in-memory ceiling. Bodies above that are
+    /// rejected as `Validation`.
+    ///
+    /// **Streaming.** `body` is a streaming reader over the NDJSON page;
+    /// the walk is line-by-line via [`std::io::BufRead`] (one line in
+    /// memory at a time, never the whole page) and SKIPS lines that fail
+    /// to parse or lack `vers`. The size cap is enforced mid-stream. The
+    /// fail-closed shared projector is not used (it would reject a
+    /// missing-`vers` line that this method skips).
+    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
+        let max = crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES;
+        let mut reader = std::io::BufReader::new(CountingReader::new(body));
+        let counter = reader.get_ref().counter();
+        let mut out: Vec<String> = Vec::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|e| DomainError::Validation(format!("cargo index read error: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if let Some(v) = serde_json::from_slice::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|v| v.get("vers").and_then(|x| x.as_str()).map(str::to_string))
+            {
+                out.push(v);
+            }
+        }
+        let total = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if total > max as u64 {
+            return Err(DomainError::Validation(format!(
+                "cargo upstream metadata body is {total} bytes; streaming plausibility max is {max}"
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Cargo sparse-index path — version-agnostic. Coincides with the
+    /// per-crate checksum-metadata path
+    /// ([`FormatHandler::upstream_checksum_metadata_path`])
+    /// because the sparse-index entry is one NDJSON document carrying
+    /// every version + its `cksum`. The path layout (1-char, 2-char,
+    /// 3-char prefix buckets) is encoded in [`index_path_for`].
+    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+        Some(format!("/{}", index_path_for(package)))
+    }
+
+    /// cargo has no content-negotiation — the upstream's default
+    /// representation is fine. Same inert value the `FormatHandler`
+    /// trait-level default used to supply.
+    fn upstream_metadata_accept(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Extract the *declared runtime* dependency specs from the **stored
     /// cargo `.crate` artifact stream**.
@@ -627,7 +659,7 @@ impl FormatHandler for CargoFormatHandler {
     ///
     /// **The sparse-index NDJSON parser is unchanged and still in use.**
     /// [`extract_upstream_versions`](Self::extract_upstream_versions) and
-    /// [`parse_upstream_checksum`](Self::parse_upstream_checksum) legitimately
+    /// [`FormatHandler::parse_upstream_checksum`] legitimately
     /// read the sparse index (that is what the registry serves them); only
     /// THIS method switched to `Cargo.toml`. The two paths read different
     /// bytes for different purposes and do not share a parser.
@@ -781,6 +813,22 @@ impl FormatHandler for CargoFormatHandler {
             )));
         }
         Ok(url)
+    }
+
+    /// cargo resolves its download URL via `config.json`
+    /// (`download_config_path` + `compose_download_url_from_config`), not
+    /// from the upstream metadata body. Same fail-safe `Validation` error
+    /// the `FormatHandler` trait-level default used to supply; a format
+    /// that resolves its URL another way must never reach this method.
+    fn resolve_download_url_from_metadata(
+        &self,
+        body: &mut dyn std::io::Read,
+        coords: &ArtifactCoords,
+    ) -> DomainResult<String> {
+        let _ = (body, coords);
+        Err(DomainError::Validation(
+            "resolve_download_url_from_metadata not supported for cargo".into(),
+        ))
     }
 }
 
