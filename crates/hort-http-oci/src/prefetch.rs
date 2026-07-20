@@ -10,6 +10,14 @@
 //! ongoing client interactions, so by the time a client actually pulls
 //! the new layer bytes the window has already closed (or is close to).
 //!
+//! [`warm_manifest_blobs`] is the shared fan-out half of that trigger
+//! (issue #51, `docs/plans/eager-index-child-prefetch.md`): the OCI
+//! digest-ref manifest-pull-through path calls it directly, gated only
+//! on `repo.prefetch_policy.enabled` — a client's request for a
+//! specific child manifest digest (the multi-arch case) is itself an
+//! unambiguous architecture signal, so that path skips the planner /
+//! tag-move machinery entirely rather than needing a new trigger kind.
+//!
 //! # Load-bearing design constraints
 //!
 //! Two constraints shape this module and MUST NOT be relaxed without
@@ -187,6 +195,41 @@ pub(crate) fn fire_prefetch_trigger_oci(
         return;
     }
 
+    warm_manifest_blobs(ctx, repo, name, tag, "tag_move", manifest_bytes);
+}
+
+/// Shared fan-out half of the prefetch trigger (issue #51): parse a
+/// manifest body for `config.digest` + `layers[*].digest` and spawn
+/// one best-effort background pull-through per blob, each riding
+/// [`hort_app::pull_dedup::PullDedup`] so a racing client pull
+/// collapses to a single upstream fetch.
+///
+/// Extracted out of [`fire_prefetch_trigger_oci`] so the OCI
+/// manifest-pull-through digest path (`crate::manifests`'s
+/// `try_upstream_manifest_pull_by_digest`) can warm a child manifest's
+/// layers too — the client's own request for a specific child digest
+/// IS the architecture signal, no planner call and no policy surface
+/// needed (design doc §4/§5). `fire_prefetch_trigger_oci` keeps every
+/// one of its existing gates (the `prefetch_policy.enabled` check, the
+/// tag-move check, the planner call) unchanged and simply delegates
+/// here once they all pass.
+///
+/// `reference` is the tag or digest string the caller resolved this
+/// manifest from — a tracing field only, so the log lines below keep
+/// the same specificity the pre-split code had. `trigger` distinguishes
+/// the two call sites (`"tag_move"` | `"child_digest"`) on every log
+/// line this function emits, per design doc §7. Deliberately no new
+/// metric — `hort_upstream_fetch_total` already counts the resulting
+/// pulls and the existing `hort_prefetch_enqueued_total` covers the
+/// tag path's planner gate.
+pub(crate) fn warm_manifest_blobs(
+    ctx: &Arc<AppContext>,
+    repo: &Repository,
+    name: &str,
+    reference: &str,
+    trigger: &'static str,
+    manifest_bytes: &Bytes,
+) {
     // Parse the manifest body for blob references. A malformed or
     // unparseable manifest is non-fatal — log + skip the spawn. The
     // manifest has already been ingested at this call site, so a
@@ -199,7 +242,8 @@ pub(crate) fn fire_prefetch_trigger_oci(
             tracing::debug!(
                 repo_key = %repo.key,
                 name = %name,
-                tag = %tag,
+                reference = %reference,
+                trigger,
                 "OCI prefetch: manifest references no blobs (config-only or index); nothing to prefetch"
             );
             return;
@@ -208,7 +252,8 @@ pub(crate) fn fire_prefetch_trigger_oci(
             tracing::warn!(
                 repo_key = %repo.key,
                 name = %name,
-                tag = %tag,
+                reference = %reference,
+                trigger,
                 "OCI prefetch: manifest body did not parse as a blob-referencing OCI manifest; skipping prefetch (non-fatal)"
             );
             return;
@@ -219,11 +264,10 @@ pub(crate) fn fire_prefetch_trigger_oci(
         format = "oci",
         repository_key = %repo.key,
         name = %name,
-        tag = %tag,
-        upstream_digest = %upstream_digest_str,
-        prior_digest_present = prior_held_digest.is_some(),
+        reference = %reference,
+        trigger,
         blob_count = blob_hashes.len(),
-        "OCI prefetch on_dist_tag_move: spawning background blob pull-throughs"
+        "OCI prefetch: spawning background blob pull-throughs"
     );
 
     for blob_hash in blob_hashes {
@@ -245,7 +289,7 @@ pub(crate) fn fire_prefetch_trigger_oci(
                         repository_key = %repo.key,
                         name = %name,
                         blob_digest = %blob_hash,
-                        trigger = "on_dist_tag_move",
+                        trigger,
                         "OCI prefetch pull-through succeeded"
                     );
                 }
@@ -261,7 +305,7 @@ pub(crate) fn fire_prefetch_trigger_oci(
                         name = %name,
                         blob_digest = %blob_hash,
                         outcome = ?other,
-                        trigger = "on_dist_tag_move",
+                        trigger,
                         "OCI prefetch pull-through did not complete (non-fatal)"
                     );
                 }
@@ -803,6 +847,108 @@ mod tests {
             }),
             "hort_prefetch_enqueued_total must NOT fire when OnDistTagMove is not subscribed"
         );
+    }
+
+    // ---------- warm_manifest_blobs (issue #51) ----------
+    //
+    // `fire_prefetch_trigger_oci`'s own gating (enabled / tag-move /
+    // planner-subscribed) is exercised above via the metrics
+    // assertions — none of that changed shape in the split. These
+    // tests exercise the NEW public entry point directly, mirroring
+    // how the digest-ref manifest pull calls it: no planner, no
+    // policy check inside the function itself (the caller gates on
+    // `prefetch_policy.enabled` before calling), just parse + spawn.
+
+    /// An OCI image index has no `config`/`layers` — `warm_manifest_blobs`
+    /// must return without spawning anything and without panicking.
+    /// Mirrors design doc §8's "an index pulled by digest warms
+    /// nothing and does not error", exercised through the public
+    /// entry point rather than just the private parser.
+    #[test]
+    fn warm_manifest_blobs_on_index_body_is_a_noop_and_does_not_panic() {
+        in_runtime(|| {
+            let (ctx, _mocks) = build_mock_ctx(PrometheusBuilder::new().build_recorder().handle());
+            let repo = oci_repo_with_policy("oci-mirror", enabled_dist_tag_move_policy());
+            let index_body = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "manifests": [{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+                    }],
+                }))
+                .unwrap(),
+            );
+
+            warm_manifest_blobs(
+                &ctx,
+                &repo,
+                "library/nginx",
+                "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+                "child_digest",
+                &index_body,
+            );
+        });
+        // No assertion beyond "did not panic" — an index has nothing
+        // to warm, so there is no observable side effect to check
+        // (no metric, no spawned task; `try_upstream_blob_pull` is
+        // never reached).
+    }
+
+    /// A single-image manifest reaches the spawn loop (the config +
+    /// layer digests parsed successfully) even against an unconfigured
+    /// upstream resolver — the spawned tasks fail gracefully
+    /// (`UpstreamPullOutcome::NotConfigured`) in the background and
+    /// `warm_manifest_blobs` itself must not panic synchronously
+    /// either way. The strong "blobs actually get warmed" proof lives
+    /// in `hort-http-oci::manifests`'s digest-path integration tests,
+    /// which seed real upstream blob mocks and synchronize on the
+    /// spawn.
+    #[test]
+    fn warm_manifest_blobs_on_single_image_body_reaches_spawn_loop_without_panicking() {
+        in_runtime(|| {
+            let (ctx, _mocks) = build_mock_ctx(PrometheusBuilder::new().build_recorder().handle());
+            let repo = oci_repo_with_policy("oci-mirror", enabled_dist_tag_move_policy());
+            let manifest_bytes = synthetic_manifest_bytes(
+                "8888888888888888888888888888888888888888888888888888888888888888",
+                &["9999999999999999999999999999999999999999999999999999999999999999"],
+            );
+
+            warm_manifest_blobs(
+                &ctx,
+                &repo,
+                "library/nginx",
+                "sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
+                "child_digest",
+                &manifest_bytes,
+            );
+        });
+    }
+
+    /// An unparseable manifest body (garbage bytes) hits the `None`
+    /// arm of `parse_manifest_blob_digests` — `warm_manifest_blobs`
+    /// must log + return without panicking and without spawning
+    /// anything. This branch predates the #51 split (it existed
+    /// inline in `fire_prefetch_trigger_oci` before) but had no direct
+    /// test; closing that gap here now that it is reachable through
+    /// the new public entry point too.
+    #[test]
+    fn warm_manifest_blobs_on_unparseable_body_does_not_panic() {
+        in_runtime(|| {
+            let (ctx, _mocks) = build_mock_ctx(PrometheusBuilder::new().build_recorder().handle());
+            let repo = oci_repo_with_policy("oci-mirror", enabled_dist_tag_move_policy());
+            let garbage = Bytes::from_static(b"this is not JSON");
+
+            warm_manifest_blobs(
+                &ctx,
+                &repo,
+                "library/nginx",
+                "sha256:bbbb000000000000000000000000000000000000000000000000000000000000",
+                "child_digest",
+                &garbage,
+            );
+        });
     }
 
     // ---------- IndexMode guardrail ----------

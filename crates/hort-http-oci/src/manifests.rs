@@ -813,6 +813,12 @@ async fn try_upstream_manifest_pull_by_digest(
     // Item 4) below — the only path that (briefly) holds the manifest
     // bytes after the stream-to-CAS retirement of the bytes-broadcast.
     let blob_ctx = ctx.clone();
+    // Captured for the LEADER-side prefetch warming (#51) below —
+    // mirrors `blob_ctx` above; the digest path needs its own
+    // `Repository` clone since `warm_manifest_blobs` reads
+    // `repo.prefetch_policy` and `repo.key` (for the per-blob spawn's
+    // tracing fields).
+    let blob_repo = repo.clone();
     let coalesce_result = ctx
         .pull_dedup
         .coalesce_blob(blob_dedup_key, move || async move {
@@ -888,6 +894,14 @@ async fn try_upstream_manifest_pull_by_digest(
             // failure here is non-fatal — the manifest is already in
             // CAS) and write the SAME edges the hosted PUT path writes,
             // without fetching the referenced children/blobs.
+            //
+            // Also warm this manifest's own config + layer blobs (#51):
+            // a digest-ref pull IS the client naming a specific child
+            // architecture, so this is the earliest point that signal
+            // is known — no planner call, gated on
+            // `prefetch_policy.enabled` only (design doc §4/§5). An
+            // OCI index has no config/layers, so `warm_manifest_blobs`
+            // is a safe no-op for the index-by-digest case.
             match tokio::fs::read(&cache_handle.path).await {
                 Ok(manifest_bytes) => {
                     crate::manifests_write::register_membership_edges_from_pull(
@@ -898,6 +912,16 @@ async fn try_upstream_manifest_pull_by_digest(
                         &manifest_bytes,
                     )
                     .await;
+                    if blob_repo.prefetch_policy.enabled {
+                        crate::prefetch::warm_manifest_blobs(
+                            &blob_ctx,
+                            &blob_repo,
+                            name,
+                            reference,
+                            "child_digest",
+                            &Bytes::from(manifest_bytes),
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -905,7 +929,8 @@ async fn try_upstream_manifest_pull_by_digest(
                         artifact_id = %outcome.artifact.id,
                         error = %e,
                         "OCI pull-through: failed to re-read manifest tempfile for \
-                         membership-edge registration; skipping (non-fatal, manifest is in CAS)"
+                         membership-edge registration / prefetch; skipping both \
+                         (non-fatal, manifest is in CAS)"
                     );
                 }
             }
@@ -1607,7 +1632,7 @@ mod tests {
     };
     use hort_domain::entities::artifact::{ArtifactMetadata, QuarantineStatus};
     use hort_domain::entities::mutable_ref::MutableRef;
-    use hort_domain::entities::repository::{Repository, RepositoryFormat};
+    use hort_domain::entities::repository::{PrefetchPolicy, Repository, RepositoryFormat};
     use hort_domain::ports::artifact_repository::ArtifactRepository;
     use hort_domain::ports::content_reference_index::ContentReferenceIndex;
     use metrics_exporter_prometheus::PrometheusBuilder;
@@ -3218,6 +3243,324 @@ mod tests {
         assert_eq!(
             member_rows[0].source_artifact_id, index_artifact_id,
             "the edge's source is the pulled-through index artifact"
+        );
+    }
+
+    // ================================================================
+    // #51 — warm a child manifest's layers on the digest path. The
+    // digest-ref pull-through is the client naming a specific
+    // architecture; `crate::prefetch::warm_manifest_blobs` is called
+    // right alongside `register_membership_edges_from_pull` above,
+    // gated on `repo.prefetch_policy.enabled` only (no planner call —
+    // design doc §4/§5).
+    // ================================================================
+
+    /// Prefetch enabled on a digest-ref INDEX pull: an index has no
+    /// `config`/`layers`, so `warm_manifest_blobs` must be a no-op —
+    /// verified by the pull still succeeding (200) and the
+    /// `oci_index_member` edge still being written exactly as in the
+    /// prefetch-disabled test above. If `warm_manifest_blobs` ever
+    /// mistakenly tried to fetch the index's declared child, this
+    /// test would panic: the child manifest is deliberately NOT seeded
+    /// in the mock upstream proxy.
+    #[test]
+    fn pull_through_by_digest_index_with_prefetch_enabled_still_warms_nothing() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, member_rows) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = oci_repo("myrepo");
+            repo.prefetch_policy = PrefetchPolicy {
+                enabled: true,
+                ..PrefetchPolicy::default()
+            };
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            // Let any (wrongly) spawned background task get a chance to
+            // run and panic on the unseeded child-manifest mock before
+            // asserting.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap();
+            (status, member_rows)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            member_rows.len(),
+            1,
+            "the oci_index_member edge is unaffected by prefetch_policy.enabled"
+        );
+    }
+
+    /// Prefetch ENABLED on a digest-ref single-image manifest pull:
+    /// `warm_manifest_blobs` is called and its spawned background
+    /// pull-throughs actually ingest the config + layer blobs from the
+    /// (seeded) mock upstream.
+    #[test]
+    fn pull_through_by_digest_enabled_prefetch_policy_warms_config_and_layer_blobs() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        // Digests must be the REAL SHA-256 of the seeded blob bytes —
+        // `ingest_verified` rehashes the streamed content and rejects
+        // a mismatch (ADR 0006), so a synthetic/patterned hex string
+        // here would make the warming pull-through fail closed with
+        // `ChecksumMismatch` rather than commit an artifact.
+        let config_bytes = b"config-bytes".to_vec();
+        let layer_bytes = b"layer-bytes".to_vec();
+        let config_hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&config_bytes))
+        };
+        let layer_hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&layer_bytes))
+        };
+        let single_image_media = "application/vnd.oci.image.manifest.v1+json";
+        let content = format!(
+            "{{\"schemaVersion\":2,\
+             \"mediaType\":\"{single_image_media}\",\
+             \"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\
+             \"digest\":\"sha256:{config_hex}\",\"size\":0}},\
+             \"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\
+             \"digest\":\"sha256:{layer_hex}\",\"size\":0}}]}}"
+        )
+        .into_bytes();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, config_artifact, layer_artifact) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = oci_repo("myrepo");
+            repo.prefetch_policy = PrefetchPolicy {
+                enabled: true,
+                ..PrefetchPolicy::default()
+            };
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: single_image_media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+            // Seed the config + layer blobs so the spawned
+            // warming pull-throughs succeed.
+            mocks.upstream_proxy.insert_blob(
+                UP_PREFIX,
+                UP_NAME,
+                &format!("sha256:{config_hex}"),
+                config_bytes,
+                Some(format!("sha256:{config_hex}")),
+            );
+            mocks.upstream_proxy.insert_blob(
+                UP_PREFIX,
+                UP_NAME,
+                &format!("sha256:{layer_hex}"),
+                layer_bytes,
+                Some(format!("sha256:{layer_hex}")),
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, single_image_media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            // The warming pull-throughs are spawned background tasks
+            // (best-effort, not on the response's critical path) —
+            // yield repeatedly so they run to completion on this
+            // single-threaded test runtime before asserting.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
+            let config_artifact = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("blobs/sha256:{config_hex}"))
+                .await
+                .unwrap();
+            let layer_artifact = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("blobs/sha256:{layer_hex}"))
+                .await
+                .unwrap();
+            (status, config_artifact, layer_artifact)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            config_artifact.is_some(),
+            "prefetch_policy.enabled must warm the manifest's config blob on a digest pull"
+        );
+        assert!(
+            layer_artifact.is_some(),
+            "prefetch_policy.enabled must warm the manifest's layer blob on a digest pull"
+        );
+    }
+
+    /// Prefetch DISABLED (the `oci_repo` fixture default) on the same
+    /// digest-ref single-image manifest pull: `warm_manifest_blobs` is
+    /// never called, so the config + layer blobs — despite being
+    /// seeded in the mock upstream — are never fetched.
+    #[test]
+    fn pull_through_by_digest_disabled_prefetch_policy_warms_nothing() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let config_hex = "3030303030303030303030303030303030303030303030303030303030303030";
+        let layer_hex = "4040404040404040404040404040404040404040404040404040404040404040";
+        let single_image_media = "application/vnd.oci.image.manifest.v1+json";
+        let content = format!(
+            "{{\"schemaVersion\":2,\
+             \"mediaType\":\"{single_image_media}\",\
+             \"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\
+             \"digest\":\"sha256:{config_hex}\",\"size\":0}},\
+             \"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\
+             \"digest\":\"sha256:{layer_hex}\",\"size\":0}}]}}"
+        )
+        .into_bytes();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, config_artifact, layer_artifact) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            // `oci_repo` fixture's `PrefetchPolicy::default()` has
+            // `enabled: false` — deliberately NOT overridden here.
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: single_image_media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+            mocks.upstream_proxy.insert_blob(
+                UP_PREFIX,
+                UP_NAME,
+                &format!("sha256:{config_hex}"),
+                b"config-bytes".to_vec(),
+                Some(format!("sha256:{config_hex}")),
+            );
+            mocks.upstream_proxy.insert_blob(
+                UP_PREFIX,
+                UP_NAME,
+                &format!("sha256:{layer_hex}"),
+                b"layer-bytes".to_vec(),
+                Some(format!("sha256:{layer_hex}")),
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, single_image_media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
+            let config_artifact = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("blobs/sha256:{config_hex}"))
+                .await
+                .unwrap();
+            let layer_artifact = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("blobs/sha256:{layer_hex}"))
+                .await
+                .unwrap();
+            (status, config_artifact, layer_artifact)
+        });
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the manifest pull itself is unaffected"
+        );
+        assert!(
+            config_artifact.is_none(),
+            "prefetch_policy.enabled = false must warm nothing"
+        );
+        assert!(
+            layer_artifact.is_none(),
+            "prefetch_policy.enabled = false must warm nothing"
         );
     }
 
