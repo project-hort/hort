@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: oci-proxy-quarantine-e2e
+spec:
+  name: "OCI Proxy Quarantine E2E"
+  description: "Hosted OCI repo with a 24h-quarantining ScanPolicy and a Docker Hub upstream mapping (pull-through, exactly as oci-mirror-e2e); used by scripts/native-tests/scenarios/quarantine/proxy-multiarch-zero-window.sh to prove the #46 Item 2 referenced-tree-descendant zero-window carve-out fires for a proxy-pulled multi-arch index's child manifest."
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/oci-proxy-quarantine-e2e
+  isPublic: true
+  replicationPriority: local_only
