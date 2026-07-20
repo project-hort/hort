@@ -1452,7 +1452,7 @@ impl DedupLayer {
 /// Outcome of a single `coalesce_metadata` / `coalesce_blob` call.
 /// Used as the `outcome` label of `hort_pull_dedup_total`.
 ///
-/// Closed taxonomy of eight values. String values are normative —
+/// Closed taxonomy of ten values. String values are normative —
 /// they appear verbatim in `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupOutcomeLabel {
@@ -1501,6 +1501,23 @@ pub enum DedupOutcomeLabel {
     /// same pod. Cluster-wide coalescing is degraded; correctness is
     /// preserved by the existing CAS + path-conflict short-circuit.
     LayerBUnavailable,
+    /// The leader's `fetch_fn` did not complete within
+    /// `PullDedupConfig::leader_deadline` (issue #55). The leader is
+    /// abandoned: a `Failed(Timeout)` terminal is written so waiting
+    /// followers negative-cache rather than re-electing immediately,
+    /// and the Layer-A entry is evicted so the next caller elects
+    /// fresh. **This is the alertable signal for a recurrence of
+    /// #53** — `hort_pull_dedup_wait_seconds` does NOT cover this
+    /// case (`emit_wait` only fires after `fetch_fn` returns, and a
+    /// wedged leader's `fetch_fn` never does).
+    LeaderTimeout,
+    /// The `LeaderGuard` was dropped without a terminal outcome ever
+    /// having been recorded (client disconnect, runtime shutdown, or
+    /// a panic inside the leader's own call stack) — distinct from
+    /// `LeaderTimeout`, which is a deliberate deadline-driven
+    /// abandonment. Distinguishes "we gave up" from "the caller went
+    /// away."
+    LeaderCancelled,
 }
 
 impl DedupOutcomeLabel {
@@ -1516,6 +1533,8 @@ impl DedupOutcomeLabel {
             Self::LockExpiredReElected => "lock_expired_re_elected",
             Self::FollowerLagged => "follower_lagged",
             Self::LayerBUnavailable => "layer_b_unavailable",
+            Self::LeaderTimeout => "leader_timeout",
+            Self::LeaderCancelled => "leader_cancelled",
         }
     }
 }
@@ -5450,7 +5469,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_outcome_label_taxonomy_is_eight_distinct_strings() {
+    fn dedup_outcome_label_taxonomy_is_ten_distinct_strings() {
         use super::DedupOutcomeLabel;
         // Every variant in the closed taxonomy maps to a distinct
         // catalog string. If a future contributor adds a variant
@@ -5465,9 +5484,11 @@ mod tests {
             DedupOutcomeLabel::LockExpiredReElected,
             DedupOutcomeLabel::FollowerLagged,
             DedupOutcomeLabel::LayerBUnavailable,
+            DedupOutcomeLabel::LeaderTimeout,
+            DedupOutcomeLabel::LeaderCancelled,
         ];
         let labels: HashSet<&'static str> = all.iter().map(|v| v.as_metric_label()).collect();
-        assert_eq!(labels.len(), 8, "dedup outcome labels must be distinct");
+        assert_eq!(labels.len(), 10, "dedup outcome labels must be distinct");
         // Spot-check the canonical strings against the catalog.
         assert!(labels.contains("leader_started"));
         assert!(labels.contains("follower_waited_hit"));
@@ -5477,6 +5498,8 @@ mod tests {
         assert!(labels.contains("lock_expired_re_elected"));
         assert!(labels.contains("follower_lagged"));
         assert!(labels.contains("layer_b_unavailable"));
+        assert!(labels.contains("leader_timeout"));
+        assert!(labels.contains("leader_cancelled"));
     }
 
     #[test]
@@ -5515,6 +5538,14 @@ mod tests {
         assert_eq!(
             DedupOutcomeLabel::LayerBUnavailable.as_metric_label(),
             "layer_b_unavailable"
+        );
+        assert_eq!(
+            DedupOutcomeLabel::LeaderTimeout.as_metric_label(),
+            "leader_timeout"
+        );
+        assert_eq!(
+            DedupOutcomeLabel::LeaderCancelled.as_metric_label(),
+            "leader_cancelled"
         );
     }
 

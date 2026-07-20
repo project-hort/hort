@@ -585,6 +585,21 @@ pub struct Config {
     /// upstream). Zero surfaces as
     /// [`ConfigError::ValueNotPositive`].
     pub pull_dedup_follower_wait_secs: u64,
+    /// Hard ceiling on the pull-through deduplication leader's fetch
+    /// execution, in seconds (issue #55). Parsed from
+    /// `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS`; defaults to `600` (10
+    /// min). Wired into
+    /// [`hort_app::pull_dedup::PullDedupConfig::leader_deadline`]. On
+    /// expiry the leader is abandoned — a `Failed(Timeout)` terminal
+    /// is written and the next caller elects fresh — converting a
+    /// wedged leader from "poisoned until process restart" into
+    /// "self-heals within the deadline." 600s = 2x
+    /// `HORT_STORAGE_PUT_TIMEOUT_SECS` (default 300s), the leader
+    /// closure's slowest leg, leaving headroom for the surrounding
+    /// work (digest parse, DB round-trips) without abandoning
+    /// legitimately-slow large pulls. Zero surfaces as
+    /// [`ConfigError::ValueNotPositive`].
+    pub pull_dedup_leader_timeout_secs: u64,
     /// Wall-clock cap on the
     /// graceful-shutdown wait, in seconds. Parsed from
     /// `HORT_SHUTDOWN_GRACE_SECS`; defaults to `60`.
@@ -903,6 +918,7 @@ impl std::fmt::Debug for Config {
             pull_dedup_ttl_timeout_secs,
             pull_dedup_ttl_checksum_mismatch_secs,
             pull_dedup_follower_wait_secs,
+            pull_dedup_leader_timeout_secs,
             shutdown_grace_secs,
             upstream_allowlist,
             cas_scrub_action_on_mismatch,
@@ -1024,6 +1040,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "pull_dedup_follower_wait_secs",
                 pull_dedup_follower_wait_secs,
+            )
+            .field(
+                "pull_dedup_leader_timeout_secs",
+                pull_dedup_leader_timeout_secs,
             )
             .field("shutdown_grace_secs", shutdown_grace_secs)
             .field("upstream_allowlist", upstream_allowlist)
@@ -1979,6 +1999,7 @@ impl Config {
         let pull_dedup_ttl_timeout_secs = parse_pull_dedup_ttl_timeout_secs()?;
         let pull_dedup_ttl_checksum_mismatch_secs = parse_pull_dedup_ttl_checksum_mismatch_secs()?;
         let pull_dedup_follower_wait_secs = parse_pull_dedup_follower_wait_secs()?;
+        let pull_dedup_leader_timeout_secs = parse_pull_dedup_leader_timeout_secs()?;
 
         // Graceful-shutdown
         // wall-clock cap. Default 60s matches the prior hard-coded
@@ -2437,6 +2458,7 @@ impl Config {
             pull_dedup_ttl_timeout_secs,
             pull_dedup_ttl_checksum_mismatch_secs,
             pull_dedup_follower_wait_secs,
+            pull_dedup_leader_timeout_secs,
             shutdown_grace_secs,
             upstream_allowlist,
             cas_scrub_action_on_mismatch: parse_cas_scrub_action_on_mismatch()?,
@@ -2791,6 +2813,21 @@ fn parse_pull_dedup_ttl_checksum_mismatch_secs() -> Result<u64, ConfigError> {
 /// instantly on every concurrent follower request.
 fn parse_pull_dedup_follower_wait_secs() -> Result<u64, ConfigError> {
     parse_positive::<u64>("HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS", 300)
+}
+
+/// Parse `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS`.
+///
+/// Absent or empty env var → 600 seconds (10 minutes; issue #55). On
+/// expiry the leader is abandoned and the next caller elects fresh
+/// rather than inheriting a wedge. 600s = 2x
+/// `HORT_STORAGE_PUT_TIMEOUT_SECS` (default 300s), the leader
+/// closure's slowest leg — a tighter deadline would abandon leaders
+/// still doing legitimately-slow large pulls. Non-integer values
+/// surface as [`ConfigError::InvalidInt`]; zero surfaces as
+/// [`ConfigError::ValueNotPositive`] — a zero deadline would abandon
+/// every leader before its fetch could ever complete.
+fn parse_pull_dedup_leader_timeout_secs() -> Result<u64, ConfigError> {
+    parse_positive::<u64>("HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS", 600)
 }
 
 /// Parse `HORT_NOTIFY_CHANNEL_CAPACITY`.
@@ -3856,6 +3893,7 @@ mod tests {
             pull_dedup_ttl_timeout_secs: 10,
             pull_dedup_ttl_checksum_mismatch_secs: 60,
             pull_dedup_follower_wait_secs: 300,
+            pull_dedup_leader_timeout_secs: 600,
             shutdown_grace_secs: 60,
             upstream_allowlist:
                 hort_app::use_cases::apply_config_use_case::UpstreamHostAllowlist::Disabled,
@@ -3980,6 +4018,7 @@ mod tests {
             pull_dedup_ttl_timeout_secs: 10,
             pull_dedup_ttl_checksum_mismatch_secs: 60,
             pull_dedup_follower_wait_secs: 300,
+            pull_dedup_leader_timeout_secs: 600,
             shutdown_grace_secs: 60,
             upstream_allowlist:
                 hort_app::use_cases::apply_config_use_case::UpstreamHostAllowlist::Disabled,
@@ -4347,6 +4386,7 @@ mod tests {
             ("HORT_PULL_DEDUP_TTL_TIMEOUT_SECS", None),
             ("HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS", None),
             ("HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS", None),
+            ("HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS", None),
             // Graceful-shutdown
             // wall-clock cap. Default test env leaves it unset → 60s
             // default (matches the prior hard-coded serve-loop
@@ -8744,6 +8784,59 @@ mod tests {
             match err {
                 ConfigError::InvalidInt { var, .. } => {
                     assert_eq!(var, "HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS");
+                }
+                other => panic!("expected InvalidInt, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn pull_dedup_leader_timeout_secs_unset_defaults_to_600() {
+        temp_env::with_vars(fs_env(), || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.pull_dedup_leader_timeout_secs, 600);
+        });
+    }
+
+    #[test]
+    fn pull_dedup_leader_timeout_secs_explicit_value_parsed() {
+        let mut env = fs_env();
+        set_env_slot(&mut env, "HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS", Some("60"));
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.pull_dedup_leader_timeout_secs, 60);
+        });
+    }
+
+    #[test]
+    fn pull_dedup_leader_timeout_secs_zero_rejected() {
+        let mut env = fs_env();
+        set_env_slot(&mut env, "HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS", Some("0"));
+        temp_env::with_vars(env, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::ValueNotPositive {
+                    var: "HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS",
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn pull_dedup_leader_timeout_secs_non_integer_rejected() {
+        let mut env = fs_env();
+        set_env_slot(
+            &mut env,
+            "HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS",
+            Some("not-a-num"),
+        );
+        temp_env::with_vars(env, || {
+            let err = Config::from_env().unwrap_err();
+            match err {
+                ConfigError::InvalidInt { var, .. } => {
+                    assert_eq!(var, "HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS");
                 }
                 other => panic!("expected InvalidInt, got {other:?}"),
             }
