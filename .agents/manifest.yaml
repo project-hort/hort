@@ -33,14 +33,27 @@ sidecars:
       secret_key: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
       rpc_secret: "0000000000000000000000000000000000000000000000000000000000000000"
       admin_token: devadmintoken
-    expose:
-      AWS_ACCESS_KEY_ID: "{{values.access_key}}"
-      AWS_SECRET_ACCESS_KEY: "{{values.secret_key}}"
-      AWS_ENDPOINT_URL: "http://{{host}}:3900"
-      AWS_REGION: "garage"
-      HORT_STORAGE_S3_BUCKET: "{{values.bucket}}"
-      HORT_STORAGE_S3_ALLOW_HTTP: "true"
-      HORT_STORAGE_S3_FORCE_PATH_STYLE: "true"
+    # No `expose:` — deliberately. Nothing in the toolchain container
+    # consumes ambient S3 env, and exposing it broke `cargo test
+    # --workspace` under `sbx exec` (issue #56 / backlog/035):
+    # hort-server's `config::tests::s3_*` read ambient process env, so
+    # HORT_STORAGE_S3_{BUCKET,ALLOW_HTTP,FORCE_PATH_STYLE} produced ~10
+    # unrelated failures, and AWS_ENDPOINT_URL/AWS_REGION produced 2 more
+    # (an http:// endpoint with no allow-http opt-in is rejected).
+    #
+    # The two things that actually talk to this Garage bring their own
+    # config, which is why removing the block costs nothing:
+    #   - crates/hort-adapters-storage/tests/s3_multipart.rs — opt-in via
+    #     HORT_TEST_S3=1 with its own HORT_TEST_S3_{ENDPOINT,ACCESS_KEY,
+    #     SECRET_KEY,BUCKET,REGION} namespace, chosen precisely to avoid
+    #     colliding with the server's own variables.
+    #   - .agents/garage-smoke.bats — passes AWS_* explicitly with `-e`
+    #     to its aws-cli container.
+    # HORT_STORAGE_S3_* / AWS_* are hort-server and hort-worker *runtime*
+    # settings; the toolchain container only compiles and tests. Anyone
+    # running a server against this Garage sets them (plus
+    # HORT_STORAGE_BACKEND=s3, which was never exposed either) themselves.
+    # The sidecar stays reachable at sbx-hort-garage:3900 regardless.
 resources: { cpus: 3, mem: 12g }
 directive_timeout: 4h
 env:

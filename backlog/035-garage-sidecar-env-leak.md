@@ -30,6 +30,29 @@ called `Result::unwrap()` on an `Err` value: InvalidValue {
 
 CI is unaffected (no such env there), but this breaks the mandatory local pre-push gate — and a gate that fails for environmental reasons trains us to wave failures through. It cost three full-suite reruns to isolate during the v0.9.11 cut.
 
+## CORRECTION (2026-07-20, during implementation)
+
+**The "remove the trio, keep the `AWS_*` four" split below was wrong on the facts, and removing only the trio does not pass acceptance.** Recorded here rather than silently rewritten, because the reasoning error is the instructive part.
+
+Removing the trio while keeping `AWS_ENDPOINT_URL=http://sbx-hort-garage:3900` left the container **inconsistent rather than merely polluted** — an `http://` endpoint with no allow-http opt-in — and the gate still failed, just differently (2 failures instead of ~10):
+
+```
+config::tests::s3_backend_missing_bucket
+config::tests::stateful_upload_staging_dir_s3_fallback
+  InvalidValue { var: "HORT_STORAGE_S3_ALLOW_HTTP",
+    reason: "endpoint is http:// but HORT_STORAGE_S3_ALLOW_HTTP not set ..." }
+```
+
+The justification for keeping the `AWS_*` four — "genuine S3 client credentials an integration test consumes" — **is false**. Nothing consumes them:
+
+- `crates/hort-adapters-storage/tests/s3_multipart.rs` is opt-in via `HORT_TEST_S3=1` and reads its **own** `HORT_TEST_S3_{ENDPOINT,ACCESS_KEY,SECRET_KEY,BUCKET,REGION}` namespace — chosen precisely to avoid colliding with the server's variables.
+- `.agents/garage-smoke.bats` passes `AWS_*` **explicitly with `-e`** to its aws-cli container.
+- `hort-server` / `hort-worker` read `AWS_*` as **runtime server settings** — the same class as the trio.
+
+**Actual fix: remove the entire `expose:` block.** Simpler than the original ask *and* simpler than the narrowed one. Verified: `cargo test --workspace` under `sbx exec` with **no manual `unset`** → **10263 passed / 0 failed / 50 ignored**, exit 0. The sidecar remains reachable at `sbx-hort-garage:3900`; anything that wants it brings its own config.
+
+Acceptance criteria 1 and 4 below are superseded accordingly (the `AWS_*` four are removed too; `garage-smoke.bats` is unaffected because it never used the exposed values).
+
 ## Why remove the trio rather than fix the tests
 
 **The trio does not enable anything on its own.** `HORT_STORAGE_BACKEND` is *not* in the `expose:` block, so the S3 backend is not selected by these vars — anyone actually running hort-server against the sidecar Garage must set `HORT_STORAGE_BACKEND=s3` themselves, at which point they can set the other three in the same breath. So the exposure buys no working configuration; it only leaks server-runtime settings into a container whose job is compiling and testing.
