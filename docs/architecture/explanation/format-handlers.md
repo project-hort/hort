@@ -210,8 +210,10 @@ Single-replica deployments get coalescing for free: the in-memory
 `EphemeralStore` adapter is functionally identical to Redis at this
 scale (`HashMap` with TTL, sub-microsecond `put_if_absent`). No new
 infrastructure required; no feature toggle. Operators tune behaviour
-through five `HORT_PULL_DEDUP_*` env vars (above + `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS`,
-default 300s); see [`how-to/deploy/values-reference.md`](../how-to/deploy/values-reference.md).
+through six `HORT_PULL_DEDUP_*` env vars (above + `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS`,
+default 300s, and `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS`, default 600s —
+the leader-liveness bound from issue #55); see
+[`how-to/deploy/values-reference.md`](../how-to/deploy/values-reference.md).
 
 ## Capability taxonomy (the target)
 

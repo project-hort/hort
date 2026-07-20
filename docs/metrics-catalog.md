@@ -2361,7 +2361,7 @@ envelope of `hort_upstream_fetch_total`.
 
 | Metric | Type | Labels | Unit | `outcome` values |
 |--------|------|--------|------|------------------|
-| `hort_pull_dedup_total` | counter | `layer`, `format`, `outcome` | — | `leader_started`, `follower_waited_hit`, `follower_waited_failure`, `follower_fellthrough_503`, `negative_cache_hit`, `lock_expired_re_elected`, `follower_lagged`, `layer_b_unavailable` |
+| `hort_pull_dedup_total` | counter | `layer`, `format`, `outcome` | — | `leader_started`, `follower_waited_hit`, `follower_waited_failure`, `follower_fellthrough_503`, `negative_cache_hit`, `lock_expired_re_elected`, `follower_lagged`, `layer_b_unavailable`, `leader_timeout`, `leader_cancelled` |
 | `hort_pull_dedup_wait_seconds` | histogram | `layer`, `format` | seconds | — (buckets: `0.01, 0.05, 0.1, 0.5, 1, 5, 30, 60, 300`) |
 
 Emitted by `hort_app::pull_dedup::PullDedup::coalesce_metadata` and
@@ -2377,7 +2377,7 @@ Two-layer coalescing:
   write, or re-attempt election when the lock TTL expires without a
   terminal outcome.
 
-**`outcome` label semantics** (closed taxonomy of 8; source of truth:
+**`outcome` label semantics** (closed taxonomy of 10; source of truth:
 `hort_app::metrics::DedupOutcomeLabel`):
 
 - `leader_started` — this caller won leader election (Layer A
@@ -2417,6 +2417,25 @@ Two-layer coalescing:
   provides per-replica coalescing for any other concurrent caller
   on the same pod. Cluster-wide coalescing is degraded; correctness
   is preserved by the existing CAS + path-conflict short-circuit.
+- `leader_timeout` — the leader's fetch closure did not complete
+  within `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` (default `600`,
+  issue #55). The leader is abandoned: a `Failed(Timeout)` terminal
+  is written (using `ttl_timeout`'s TTL as the negative-cache
+  window) so waiting followers cache the failure rather than
+  re-electing immediately, and the Layer-A entry is evicted so the
+  *next* caller elects fresh. **This is the alertable signal for a
+  recurrence of #53 (a wedged coalesce leader poisoning every
+  follower on the pod).** `hort_pull_dedup_wait_seconds` does
+  **not** cover this case — `emit_wait` fires only after `fetch_fn`
+  returns, and a wedged leader's `fetch_fn` never does, so this
+  counter is the *only* signal a wedge occurred. Do not "fix" the
+  histogram later on the assumption it already tracks this.
+- `leader_cancelled` — the leader's cleanup guard was dropped
+  without ever recording a terminal outcome (client disconnect,
+  runtime shutdown, or a panic upstream of the leader's own await
+  points). Distinguishes "we gave up at the deadline"
+  (`leader_timeout`) from "the caller went away before the leader
+  itself decided anything."
 
 **`format` label values:** match `hort_upstream_fetch_total`'s closed
 taxonomy (`oci`, `pypi`, `npm`, `cargo`, …) for the metadata and
@@ -2428,7 +2447,7 @@ bounded at the same envelope as `hort_upstream_fetch_total` plus one.
 
 **Cardinality envelope:**
 - `hort_pull_dedup_total`: 2 layers × ~10 formats (incl. `_any` sentinel)
-  × 8 outcomes = ≤ 160 series. Flat per deployment.
+  × 10 outcomes = ≤ 200 series. Flat per deployment.
 - `hort_pull_dedup_wait_seconds`: 2 layers × ~10 formats × 9 buckets
   = ≤ 180 series. Flat per deployment.
 

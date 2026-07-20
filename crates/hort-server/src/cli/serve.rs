@@ -665,7 +665,7 @@ async fn run_async() -> anyhow::Result<()> {
         cfg.redis_url_evictable.clone(),
         cfg.redis_url_durable.clone(),
         // Pull-through dedup config built from
-        // the five `HORT_PULL_DEDUP_*` env vars parsed by `Config::from_env`.
+        // the six `HORT_PULL_DEDUP_*` env vars parsed by `Config::from_env`.
         // Composition consumes a parsed config struct, never re-reads
         // env vars itself.
         hort_app::pull_dedup::PullDedupConfig {
@@ -674,6 +674,7 @@ async fn run_async() -> anyhow::Result<()> {
             ttl_timeout: Duration::from_secs(cfg.pull_dedup_ttl_timeout_secs),
             ttl_checksum_mismatch: Duration::from_secs(cfg.pull_dedup_ttl_checksum_mismatch_secs),
             follower_wait: Duration::from_secs(cfg.pull_dedup_follower_wait_secs),
+            leader_deadline: Duration::from_secs(cfg.pull_dedup_leader_timeout_secs),
         },
         // Pass the value parsed at step 3b rather
         // than having build_app_context re-read the env var. The same
