@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: oci-s3-e2e
+spec:
+  name: "OCI S3 Multipart E2E"
+  description: "Hosted OCI repo for the `s3` compose overlay's large-blob multipart scenario (scripts/native-tests/scenarios/storage/s3-multipart-blob.sh)."
+  format: oci
+  type: hosted
+  # Deliberately NO `storage:` block. `StorageSpec`'s doc comment
+  # (crates/hort-config/src/repository.rs) calls omitting it "the
+  # documented honest path" — the repo inherits the deployment's effective
+  # global backend (HORT_STORAGE_BACKEND=s3 under this overlay). Every repo
+  # in the base example-config/ hardcodes `storage: { backend: filesystem,
+  # ... }`, which hort-app's apply-time per-repo-vs-effective-global-backend
+  # cross-check REJECTS (fatally — an Apply-class gitops-boot error, not the
+  # read-only park path) against an s3 deployment. That mismatch is exactly
+  # why this overlay mounts a dedicated config tree instead of reusing
+  # example-config/ — see docker-compose.s3.yml's hort-server volumes
+  # comment.
+  isPublic: true
+  replicationPriority: local_only

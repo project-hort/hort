@@ -1,0 +1,14 @@
+# ClaimMapping: IdP group `test-developers` resolves to the `developer`
+# claim. Copied verbatim from example-config/auth/developers.yaml — this
+# overlay mounts a dedicated config tree (see docker-compose.s3.yml's
+# hort-server volumes comment), so the base example-config/'s ClaimMapping
+# objects are not present unless duplicated here; without this, dev-user's
+# `test-developers` group would not resolve to the `developer` claim the
+# dev-*-oci-s3-e2e grants require.
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: developers
+spec:
+  idpGroup: test-developers
+  claim: developer
