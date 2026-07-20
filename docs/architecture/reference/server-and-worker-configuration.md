@@ -302,6 +302,7 @@ per-IP / per-token-prefix brute-force protection inside
 | `HORT_PULL_DEDUP_TTL_TIMEOUT_SECS` | u64 | `10` | No | TTL for Timeout / NetworkError. |
 | `HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS` | u64 | `60` | No | TTL for ChecksumMismatch / ParseError / BodyTooLarge / PinMismatch / CaUnknown. |
 | `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS` | u64 | `300` | No | Follower-wait ceiling for a concurrent in-flight fetch. |
+| `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` | u64 | `600` | No | Hard ceiling on the leader's own fetch (issue #55); on expiry the leader is abandoned and the next caller elects fresh. |
 
 #### Pull-through coalescing degradation alarm (recommended)
 

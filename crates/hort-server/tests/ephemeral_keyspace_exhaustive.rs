@@ -143,10 +143,16 @@ use hort_app::ephemeral_keyspace::keyspace_class;
 ///    function definitions. The same prefix is verified through the
 ///    in-module sites in `crates/hort-http-oci/src/upload_session.rs`
 ///    (which DO statically resolve via the same-file `fn session_key`).
-/// 3. `crates/hort-app/src/pull_dedup.rs:792` (`self.ephemeral.put(&key.serialised, ...)`),
-/// 4. `crates/hort-app/src/pull_dedup.rs:814` (`self.ephemeral.put_if_absent(&key.serialised, ...)`),
-/// 5. `crates/hort-app/src/pull_dedup.rs:926` (`self.ephemeral.put(&key.serialised, ...)`).
-///    All three call sites pass `&key.serialised` where `key:
+/// 3. `crates/hort-app/src/pull_dedup.rs:944` (`self.ephemeral.put(&key.serialised, ...)`
+///    in `layer_b_election`'s stale-record-overwrite branch),
+/// 4. `crates/hort-app/src/pull_dedup.rs:964` (`self.ephemeral.put_if_absent(&key.serialised, ...)`),
+/// 5. `crates/hort-app/src/pull_dedup.rs:1073` (`self.ephemeral.put(&key.serialised, ...)`
+///    in `run_as_leader`'s leader-deadline-timeout branch — issue #55;
+///    writes the `Failed(Timeout)` negative-cache terminal when the
+///    leader's `fetch_fn` is abandoned at `leader_deadline`),
+/// 6. `crates/hort-app/src/pull_dedup.rs:1132` (`self.ephemeral.put(&key.serialised, ...)`
+///    in `run_as_leader`'s happy-path terminal write).
+///    All four call sites pass `&key.serialised` where `key:
 ///    &DedupKey` is a function parameter. `DedupKey::serialised` IS
 ///    constructed in this same file via
 ///    `let serialised = format!("pulldedup:meta:{...}", ...)` (and
@@ -164,11 +170,11 @@ use hort_app::ephemeral_keyspace::keyspace_class;
 ///
 /// See the printed warnings on `--nocapture` for the exact file:line
 /// list. The runtime count is asserted against this constant.
-// Dropped from 5 → 4 when `authenticate_local`'s
-// `record_failed_attempt` chain was deleted (the
-// `increment_counter` helper had a `key: &str` write site that the
-// walker classified as dynamic).
-const EXPECTED_DYNAMIC_COUNT: usize = 4;
+// Bumped from 4 → 5 when issue #55 (coalesce leader liveness) added
+// the leader-deadline-timeout terminal write — same `&key.serialised`
+// shape and same `pulldedup:` forward-registered prefix as the three
+// pre-existing pull_dedup.rs sites; not a new class of dynamic write.
+const EXPECTED_DYNAMIC_COUNT: usize = 5;
 
 /// Prefixes that are registered in `KEYSPACE_REGISTRY` but not yet
 /// reachable from any write-side call site. Today only `pulldedup:`
