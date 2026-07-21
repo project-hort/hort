@@ -5,7 +5,7 @@ metadata:
 spec:
   scope:
     repository: hort-base
-  # D2-a (issue #60, maintainer-confirmed 2026-07-21: "threshold critical").
+  # D2-a (ADR 0051 decision 2; maintainer-confirmed 2026-07-21, "threshold critical").
   # Deliberately NARROWER than hort-oci's `high` — hort-oci's "rebuild on a
   # patched base" remediation does NOT exist here: these are THIRD-PARTY
   # base images (dex, postgres) we cannot patch, only upstream can. A
@@ -16,7 +16,7 @@ spec:
   # unignorable. A held image degrades only the MIRROR face — containerd
   # falls back to the real upstream (ghcr.io/dockerhub) exactly as it does
   # today for any pod not yet pointed at registry.hort.rs, so availability
-  # is never at risk. See docs/plans/self-contained-registry-chart.md §3 D2.
+  # is never at risk. See ADR 0051 (docs/adr/0051-…) decision 2.
   severityThreshold: critical
   quarantineDuration: 1h
   requireApproval: false

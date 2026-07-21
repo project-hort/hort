@@ -1,4 +1,4 @@
-# Sovereign-registry overlay (issue #60). The one load-bearing line: setting
+# Sovereign-registry overlay (ADR 0051). The one load-bearing line: setting
 # global.imageRegistry rewrites server, worker, AND dex (if enabled) onto
 # registry.hort.rs in one step via the chart's hort-server.image /
 # hort-server.worker.image / hort-server.dex.image helpers
@@ -15,7 +15,7 @@ global:
   imageRegistry: registry.hort.rs
 
 # NOT a chart value — the chart is external-DB by design (no bundled
-# Postgres subchart; see docs/plans/self-contained-registry-chart.md §5).
+# Postgres subchart; see ADR 0051 (docs/adr/0051-…) §4).
 # Point your OWN Postgres deployment's image at
 # registry.hort.rs/hort-base/postgres:17-alpine instead: the StatefulSet /
 # CloudNativePG Cluster / operator-specific image field you already manage

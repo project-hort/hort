@@ -4,7 +4,7 @@ This is the recipe for running the entire `hort-server` cold-start
 chain — server, worker, dex, and the operator's external Postgres —
 without a single image pulled directly from `ghcr.io` or Docker Hub.
 It assumes you already have a live hort instance publishing to
-`registry.hort.rs` (issue #60): the fleet installing hort now pulls
+`registry.hort.rs`. The fleet installing hort now pulls
 hort's own images, and hort's cold-start dependencies, from itself.
 
 This document does not repeat the base install path — see
@@ -58,7 +58,7 @@ default on the sovereign flavor, or via the overlay):
   only the registry+path prefix, never the tag.
 - **Postgres is not a chart value.** The chart is external-DB by
   design — no bundled Postgres subchart (deferred; see
-  `docs/plans/self-contained-registry-chart.md` §5). Point your own
+  [ADR 0051](../../../adr/0051-self-contained-chart-and-hort-base-hosting.md) §4). Point your own
   Postgres deployment's image (a StatefulSet, a CloudNativePG
   `Cluster`, or whatever your Postgres operator manages) at
   `registry.hort.rs/hort-base/postgres:17-alpine` directly — that is

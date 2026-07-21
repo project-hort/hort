@@ -9,9 +9,9 @@
   the two-flavor chart publish live in `.github/workflows/docker-publish.yml`, gated on
   `vars.HORT_PROXY_ENABLED == 'true'` + a release tag.
 - **Supersedes:** —
-- **Relates:** [0047](0047-dual-license-generated-attribution.md) / #47 (keyless chart signing, the
+- **Relates:** [0047](0047-dual-license-generated-attribution.md) (keyless chart signing — the
   Flux-discoverable legacy `.sig` flow this reuses); [0034](0034-public-dogfood-deployment.md)
-  (`registry.hort.rs` dogfood, the `gha-release` SA, `HORT_PROXY_ENABLED`); issue #60.
+  (`registry.hort.rs` dogfood, the `gha-release` SA, `HORT_PROXY_ENABLED`).
 
 ## Context
 
@@ -47,7 +47,7 @@ degrades **only the mirror face** — containerd falls back to the real upstream
 (upstream/dev). A second copy is published to `registry.hort.rs/hort-charts/hort-server` with the
 packaged default set to `registry.hort.rs` (turnkey/sovereign) — a `yq` mutation of a **temp copy**'s
 `values.yaml` at package time (`helm package` has no `--set`), never a chart fork. Both are
-keyless-signed with the identical #47 legacy-`.sig` cosign flow so both verify for Flux.
+keyless-signed with the identical keyless-cosign legacy-`.sig` flow (see ADR 0047 §D3) so both verify for Flux.
 
 **4. Postgres stays external-DB.** The chart does not bundle postgres; the operator points their own
 postgres deployment at `registry.hort.rs/hort-base/postgres` (documented, not a chart value). A
@@ -74,7 +74,7 @@ bundled-postgres subchart is deferred (revisit trigger: demand for a zero-depend
   first real exercise is a release cut with the flag on. Their correctness is not provable in CI-on-MR.
 - Enabling `HORT_PROXY_ENABLED` in production had one outstanding precondition — the `.hort_auth`
   error path must not echo the token-exchange response body. Both surfaces are now sanitized (GitLab
-  historically; the GitHub twin in issue #61), closing that gate.
+  historically; the GitHub `hort-auth` action was sanitized to match — the error path no longer echoes the exchange body), closing that gate.
 
 ## Alternatives considered
 
