@@ -60,10 +60,23 @@ is true and no explicit name is set; otherwise uses the explicit name.
 {{/*
 Resolve the image reference. Empty `image.tag` falls back to
 `Chart.AppVersion`.
+
+`global.imageRegistry` (issue #60 D1) rewrites the registry+path prefix
+when set: `<global.imageRegistry>/hort-oci/hort-server:<tag>`. Empty
+(the default) renders exactly as before this rewrite existed —
+`.Values.image.repository:<tag>` — so an unset `global.imageRegistry`
+is byte-identical to every prior chart release. This is a
+registry+path-prefix rewrite, not a per-component repository override
+— see `hort-server.worker.image` / `hort-server.dex.image` for the
+sibling helpers that own the rest of the split.
 */}}
 {{- define "hort-server.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- if .Values.global.imageRegistry -}}
+{{- printf "%s/hort-oci/hort-server:%s" .Values.global.imageRegistry $tag -}}
+{{- else -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -98,10 +111,45 @@ repository points at the bundled image variant
 (`ghcr.io/project-hort/hort-worker`) which carries the Rust binary
 plus the pre-installed Trivy + osv-scanner CLIs. Operators who build
 their own worker image override `image.repository`.
+
+`global.imageRegistry` (issue #60 D1) rewrite rule mirrors
+`hort-server.image` — see that helper's comment.
 */}}
 {{- define "hort-server.worker.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.worker.image.tag -}}
+{{- if .Values.global.imageRegistry -}}
+{{- printf "%s/hort-oci/hort-worker:%s" .Values.global.imageRegistry $tag -}}
+{{- else -}}
 {{- printf "%s:%s" .Values.worker.image.repository $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Dex image reference (issue #60 D1).
+
+`auth.dex.image` is a single combined `repo:tag` string (unlike
+`image`/`worker.image`, which split repository and tag) — the pin an
+operator would set is the tag half of that string. Empty
+`global.imageRegistry` (the default) renders `auth.dex.image` verbatim,
+byte-identical to every prior chart release. Set ⇒ rewrite to
+`<global.imageRegistry>/hort-base/dex:<pin>`, where `<pin>` is the tag
+parsed off the end of `auth.dex.image` (everything after the LAST `:` —
+robust to a registry host that itself carries a port, e.g.
+`myregistry:5000/dexidp/dex:v2.41.1` still yields `v2.41.1`, not
+`5000/dexidp/dex:v2.41.1`).
+
+This is the ONE place the dex image-mapping rule lives — every dex
+image reference in the chart goes through this helper rather than
+reading `auth.dex.image` directly, mirroring the server/worker helpers.
+*/}}
+{{- define "hort-server.dex.image" -}}
+{{- if .Values.global.imageRegistry -}}
+{{- $parts := splitList ":" .Values.auth.dex.image -}}
+{{- $pin := last $parts -}}
+{{- printf "%s/hort-base/dex:%s" .Values.global.imageRegistry $pin -}}
+{{- else -}}
+{{- .Values.auth.dex.image -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

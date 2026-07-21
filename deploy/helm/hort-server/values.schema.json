@@ -591,6 +591,17 @@
         }
       ]
     },
+    "global": {
+      "description": "Cross-cutting values consumed by more than one template. `imageRegistry` is the only member today — see the `hort-server.image` / `hort-server.worker.image` / `hort-server.dex.image` helpers in `_helpers.tpl` for the empty-vs-set rewrite rule (issue #60 D1).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "imageRegistry": {
+          "description": "Empty (default) ⇒ every image ref renders exactly as it does today (`image.repository`/`worker.image.repository`/`auth.dex.image`, each with its own tag). Set (e.g. `registry.hort.rs`) ⇒ the three image helpers rewrite to `<imageRegistry>/hort-oci/hort-{server,worker}:<tag>` and `<imageRegistry>/hort-base/dex:<pin>` — a registry+path-prefix rewrite, not a per-component repository override.",
+          "type": "string"
+        }
+      }
+    },
     "image": {
       "description": "Container image for the hort-server binary. Image-signature enforcement is the operator's policy controller's job (`cosign.publicKey` is the PEM the controller verifies against; the chart does not enforce it).",
       "type": "object",
