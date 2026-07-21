@@ -14,6 +14,54 @@
 #   cosign sign-blob --yes --bundle <name>.tar.gz.bundle <name>.tar.gz
 # Verification: cosign verify-blob --bundle <name>.tar.gz.bundle ...
 
+# ── Resolve the deploy version ────────────────────────────────────────────────
+# hort_version is supplied on the command line (`-e hort_version=0.9.11`), not
+# pinned in group_vars. The special value `latest` (an optional convenience)
+# resolves the newest STABLE GitHub release — the /releases/latest endpoint
+# excludes prereleases. Fail closed if neither an explicit version nor `latest`
+# is given, so a deploy never silently installs a stale default.
+- name: Assert a deploy version was provided
+  ansible.builtin.assert:
+    that:
+      - hort_version is defined
+      - (hort_version | string | trim | length) > 0
+    fail_msg: >-
+      No hort_version set. Provide it on the command line:
+      `-e hort_version=0.9.11` (explicit) or `-e hort_version=latest`
+      (resolve the newest stable release). It is intentionally not pinned in
+      group_vars.
+  run_once: true
+
+- name: Resolve the newest stable release when hort_version=latest (optional convenience)
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/project-hort/hort/releases/latest
+    headers:
+      Accept: application/vnd.github+json
+    return_content: true
+  register: hort_binaries_latest_release
+  delegate_to: localhost
+  run_once: true
+  when: hort_version == 'latest'
+
+- name: Adopt the resolved 'latest' version (strip the leading 'v')
+  ansible.builtin.set_fact:
+    hort_binaries_version: "{{ hort_binaries_latest_release.json.tag_name | regex_replace('^v', '') }}"
+  when: hort_version == 'latest'
+
+- name: Assert the effective version is a valid release version
+  ansible.builtin.assert:
+    that:
+      - hort_binaries_version is match('^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$')
+    fail_msg: >-
+      Resolved version '{{ hort_binaries_version }}' is not a valid release
+      version (expected e.g. 0.9.11 or 0.9.10-beta.2).
+  run_once: true
+
+- name: Report the hort version being deployed
+  ansible.builtin.debug:
+    msg: "Deploying hort {{ hort_binaries_version }} (native binaries)"
+  run_once: true
+
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 # cosign is the trust-bootstrap for the provenance gate.  An unpinned apt cosign
 # risks flag-semantics drift (bundle format requires cosign >= v2) and cannot
