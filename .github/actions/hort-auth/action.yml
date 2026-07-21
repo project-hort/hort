@@ -91,8 +91,10 @@ runs:
 
         token=$(echo "${response}" | jq -r '.access_token // empty')
         if [ -z "${token}" ]; then
-          echo "::error::hort token exchange failed — no access_token in response"
-          echo "Response: ${response}"
+          # Never echo ${response} — an auth-exchange body may carry a token
+          # or other secret, and Actions logs are readable (public on a public
+          # repo). Mirrors the GitLab .hort_auth fix ("… (omitted)"). See #61.
+          echo "::error::hort token exchange failed — no access_token in response (body omitted)"
           exit 1
         fi
         echo "::add-mask::${token}"
