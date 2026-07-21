@@ -15,8 +15,15 @@ spec:
     - issuer: github-actions          # references OidcIssuer metadata.name
       claims:
         repository: project-hort/hort # scope-narrowing: any workflow in this repo
-        # NOTE: this is intentionally repo-scope only (no environment/ref pin).
-        # Any workflow in project-hort/hort can assume this SA. This is
-        # acceptable: its grants are per-repo read on pull-through caches;
-        # read access confers no publish power. Add `environment:` or `ref:`
-        # here if the threat model later tightens.
+        # NOTE: scoped to the non-gating `ci` deployment environment (no
+        # protection rules — it exists only to stamp this claim) so this
+        # identity is disjoint from `gha-release`'s `environment: release`
+        # by construction. Before this, a bare repository-only claim was a
+        # SUBSET of gha-release's claim set, so a release-tagged token
+        # matched both SAs and the federated exchange failed closed on
+        # `multiple_sa_match` — blocking every release-publish path under
+        # HORT_PROXY_ENABLED. Every job authenticating as gha-ci MUST tag
+        # `environment: ci` (see the six jobs in ci.yml / feature-ci.yml);
+        # an untagged job's token carries no `environment` claim and would
+        # match neither SA (`no_sa_match`). Fixes #64.
+        environment: ci
