@@ -25,9 +25,9 @@ inputs:
   cargo_source_repo:
     description: >
       Cargo source repo key to use as the sparse-index source.
-      Default is 'cargo-virtual' (the virtual aggregation repo). Set to
-      'crates-proxy' for a one-line fallback until cargo-virtual
-      aggregation lands (§3 Class C).
+      Default is 'cargo-virtual' (the virtual aggregation repo, serve-path
+      shipped — ADR 0031). Set to 'crates-proxy' only to bypass aggregation
+      and resolve against the mirror member directly.
     required: false
     default: 'cargo-virtual'
 
@@ -103,8 +103,9 @@ runs:
     #   GET /cargo/{repo_key}/config.json
     #   GET /cargo/{repo_key}/{prefix}/{name}     ← sparse-index entries
     # The sparse+https:// prefix is the Cargo RFC 2789 sparse-registry scheme.
-    # Default source is cargo-virtual; set input.cargo_source_repo='crates-proxy'
-    # as the one-line fallback until the virtual aggregation path lands.
+    # Default source is cargo-virtual (its serve-path member aggregation is
+    # shipped — ADR 0031); set input.cargo_source_repo='crates-proxy' only to
+    # bypass aggregation and resolve against the mirror member directly.
     - name: Write .cargo/config.toml
       if: steps.guard.outputs.enabled == 'true'
       shell: bash

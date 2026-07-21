@@ -17,8 +17,9 @@
 #   (e) cargo publish a tiny test crate to hort-crates (admin token), then
 #       anonymous fetch → succeeds (public hosted, quarantineDuration: 0s).
 #   (f) Anonymous fetch from cargo-virtual → 401/403/404 (private).
-#   (g) SKIPPED until virtual cargo aggregation lands: a consumer resolving
-#       entirely against cargo-virtual. Gated on HORT_DOGFOOD_VIRTUAL_READY=1.
+#   (g) Virtual cargo aggregation (SHIPPED, ADR 0031): a consumer resolving
+#       entirely against cargo-virtual. Runs by default; set
+#       HORT_DOGFOOD_VIRTUAL_READY=0 to opt out.
 #
 # Preflight probes skip cleanly (exit 77) if the dogfood repos are not
 # present (compose stack uses example-config, not the ansible gitops tree;
@@ -485,15 +486,16 @@ esac
 # (g) Virtual cargo aggregation: a consumer resolving entirely against
 #     cargo-virtual (hort-crates + crates-proxy members).
 #
-# GATED: this assertion requires the virtual cargo serve-path member
-# aggregation to be shipped. Until it lands, skip with an explicit log
-# message. Enable by setting HORT_DOGFOOD_VIRTUAL_READY=1.
+# The virtual cargo serve-path member aggregation is SHIPPED (ADR 0031 —
+# VirtualCargoSource / aggregate_virtual_index, in tree since fc300987,
+# 2026-06-20), so this assertion runs by default. Set
+# HORT_DOGFOOD_VIRTUAL_READY=0 to opt out (e.g. against an older server).
 # ---------------------------------------------------------------------------
 log ""
-log "--- (g) Virtual cargo consumer resolve (gated on aggregation feature)"
+log "--- (g) Virtual cargo consumer resolve (aggregation shipped — ADR 0031)"
 
-if [ "${HORT_DOGFOOD_VIRTUAL_READY:-0}" = "1" ]; then
-    log "  HORT_DOGFOOD_VIRTUAL_READY=1 — running virtual-resolve assertion"
+if [ "${HORT_DOGFOOD_VIRTUAL_READY:-1}" = "1" ]; then
+    log "  running virtual-resolve assertion (cargo-virtual aggregation)"
 
     # Build a throwaway consumer crate that depends on the crate published in
     # step (e) (from hort-crates) AND a crates.io crate (serde) proxied via
@@ -542,11 +544,9 @@ EOF
 
     cd "$WORK_DIR" || true
 else
-    log "  SKIP (g): virtual cargo aggregation not yet shipped."
-    log "  Reason: the cargo serve-path member-aggregation feature is in progress"
-    log "  (see deploy/ansible/files/gitops/repositories/cargo-virtual.yaml comment:"
-    log "  'the cargo serve-path member aggregation is in progress separately')."
-    log "  To run: set HORT_DOGFOOD_VIRTUAL_READY=1"
+    log "  SKIP (g): HORT_DOGFOOD_VIRTUAL_READY=0 set (opt-out)."
+    log "  The cargo virtual serve-path aggregation is shipped (ADR 0031);"
+    log "  this leg runs by default. Opt out only against an older server."
 fi
 
 # ---------------------------------------------------------------------------
