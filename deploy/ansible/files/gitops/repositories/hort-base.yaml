@@ -4,7 +4,7 @@ metadata:
   name: hort-base
 spec:
   name: "Hort sovereign base-image mirror"
-  description: "World-readable, sovereign mirror of PINNED, digest-referenced third-party base images (dex, postgres) that hort's own cold-start chain depends on (issue #60). Push restricted to the gha-release ServiceAccount (tagged releases only) — this repo is populated exclusively by the mirror CI step, never a proxy, never an arbitrary-upstream cache."
+  description: "World-readable, sovereign mirror of PINNED, digest-referenced third-party base images (dex, postgres) that hort's own cold-start chain depends on. Push restricted to the gha-release ServiceAccount (tagged releases only) — this repo is populated exclusively by the mirror CI step, never a proxy, never an arbitrary-upstream cache."
   format: oci
   type: hosted
   storage:

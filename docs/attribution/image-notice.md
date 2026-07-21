@@ -70,7 +70,7 @@ The runtime stage is `gcr.io/distroless/cc-debian13:nonroot`, digest-pinned in
 `scripts/native-tests/Dockerfile.client` bundles a much larger set of external
 tools (skopeo, Node.js/npm, Maven, Gradle, cosign, OpenJDK, rustup, and more).
 That image is a **dev/E2E test harness, never published or shipped to
-operators** (per design doc `docs/plans/dual-license-attribution.md` §8) — it
+operators** (per [ADR 0047](../adr/0047-dual-license-generated-attribution.md) §D3) — it
 is explicitly **deferred as a follow-on** and is out of scope for this NOTICE.
 If it is ever covered, it gets its own client-image NOTICE rather than being
 folded into this one.
