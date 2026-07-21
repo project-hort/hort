@@ -11,9 +11,15 @@ hort_server_image: ghcr.io/project-hort/hort-server:latest
 hort_worker_image: ghcr.io/project-hort/hort-worker:latest
 postgres_image: postgres:15
 
-# hort_version is used by the native flavor (Task 9) to pin the downloaded
-# release binary.  The Podman flavor uses OCI image tags above instead.
-hort_version: "0.9.3-beta.2"
+# hort_version selects which native-flavor release binary is downloaded (the
+# Podman flavor uses the OCI image tags above instead). It is NOT pinned here —
+# provide it on the command line:
+#   -e hort_version=0.9.11   (explicit version — the normal path)
+#   -e hort_version=latest   (optional convenience — the hort_binaries role
+#                             resolves the newest STABLE GitHub release)
+# Empty by default so a deploy with neither fails closed with guidance rather
+# than silently installing a stale pinned version.
+hort_version: ""
 
 # Target CPU architecture for native binary downloads (hort_binaries role).
 # Matches the system architecture: amd64 for x86-64 hosts, arm64 for aarch64.
