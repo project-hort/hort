@@ -125,6 +125,16 @@ const TOKEN_TYPE_BEARER: &str = "Bearer";
 /// documented contract (capped at 255 chars).
 const CLIENT_ID_MAX_LEN: usize = 255;
 
+/// Advisory `Retry-After` (seconds) on the `ApiTokenError::Contended`
+/// 503 (issue #62). The use case's own bounded CAS retry already
+/// resolves realistic contention within a few milliseconds; a client
+/// hitting this path means the *entire* retry budget lost every race,
+/// so a short wait is enough for a fresh request-level attempt to land
+/// on a clean read. Not the 15s `OCI_CAP_RETRY_AFTER_SECS` scale — that
+/// waits out a TTL-bounded session cap, a fundamentally slower
+/// condition than an event-stream append race.
+const MINT_CONTENDED_RETRY_AFTER_SECS: u64 = 1;
+
 // ---------------------------------------------------------------------------
 // Metric labels — closed taxonomy; `docs/metrics-catalog.md` is the
 // catalog of record.
@@ -198,6 +208,14 @@ mod metrics {
     /// `RESULT_INFRASTRUCTURE_ERROR` so operator dashboards separate
     /// outages from caller-side gate denials at the mint step.
     pub(super) const RESULT_MINT_FAILED: &str = "mint_failed";
+    /// Step-8 mint: the SA-stream `ApiTokenIssued` append's bounded
+    /// CAS-retry budget was exhausted under concurrent-mint contention
+    /// (issue #62) — a TRANSIENT condition, not an infra fault. Maps to
+    /// HTTP 503 + `Retry-After`, distinct from both `RESULT_MINT_FAILED`
+    /// (a real `ApiTokenError` gate denial) and
+    /// `RESULT_INTERNAL_ERROR` (a genuine 500) so dashboards can tell
+    /// "retry me" apart from "something is broken".
+    pub(super) const RESULT_MINT_CONTENDED: &str = "mint_contended";
     /// Catch-all for unexpected internal errors during the federation
     /// branch (validator port returned a Domain error, SA listing
     /// failed, etc.). Maps to HTTP 500.
@@ -813,6 +831,29 @@ fn error_outcome_with_kind(
     }
 }
 
+/// Build the `503 Service Unavailable` + advisory `Retry-After`
+/// response for `ApiTokenError::Contended` (issue #62): the SA-stream
+/// append's bounded CAS retry lost every race. Transient, not an
+/// infra fault — a distinct HTTP status from the catch-all `500` so a
+/// client can tell "retry me" apart from a real server error. Mirrors
+/// `rate_limit_response`'s header-insertion idiom in
+/// `crate::middleware::rate_limit` (the other `Retry-After` emitter in
+/// this crate).
+fn contended_outcome() -> Outcome {
+    let mut outcome = error_outcome_with_kind(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+        "system-mint temporarily contended — retry shortly".to_string(),
+        metrics::RESULT_MINT_CONTENDED,
+        metrics::KIND_FEDERATED_JWT,
+    );
+    outcome.response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(MINT_CONTENDED_RETRY_AFTER_SECS),
+    );
+    outcome
+}
+
 /// Apply `Cache-Control: no-store` to every response (success AND
 /// error) — plaintext leaves the server exactly once.
 fn with_no_store(mut response: Response) -> Response {
@@ -1371,6 +1412,23 @@ async fn handle_federated_jwt(
                 &claims.subject,
                 &claims.audience,
             );
+        }
+        // The SA-stream append's bounded CAS retry (hort-app) lost
+        // every race under concurrent-mint contention — TRANSIENT, not
+        // an infra fault, so it does NOT go through the generic 500
+        // catch-all below. `warn!`, not `error!`/`info!`: nothing is
+        // broken (unlike the catch-all) and this isn't a security deny
+        // (unlike `deny_outcome`'s federation-deny framing) — it is a
+        // "retry me" signal. 503 + `Retry-After` per issue #62.
+        Err(ApiTokenError::Contended) => {
+            tracing::warn!(
+                sa_name = %sa.name,
+                iss = %claims.issuer,
+                sub = %claims.subject,
+                "federation: system-mint contended (SA-stream append retry \
+                 budget exhausted) — returning 503, client should retry"
+            );
+            return contended_outcome();
         }
         Err(err) => {
             tracing::warn!(
@@ -4437,6 +4495,103 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                 issued.declared_permissions
             );
         });
+    }
+
+    /// Issue #62: the SA-stream `ApiTokenIssued` append's bounded
+    /// CAS-retry loop (hort-app) loses every race under pathological
+    /// contention — `mocks.events.fail_all_appends` arms EVERY append
+    /// to fail with `DomainError::Conflict`, forcing the retry budget
+    /// to exhaust. Must surface as `503` + `Retry-After`, NOT the
+    /// generic `500` catch-all, and must carry no token.
+    #[test]
+    fn federation_mint_contended_returns_503_with_retry_after() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, validator, sas, mocks) = build_federation_router();
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa);
+                validator.register_token("ok-jwt", sample_validated_claims(600));
+                mocks
+                    .events
+                    .fail_all_appends(hort_domain::error::DomainError::Conflict(
+                        "concurrent append at position N".into(),
+                    ));
+                let resp = post_form(router, federation_form("ok-jwt")).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "exhausted append-retry budget MUST be 503, never a 500"
+                );
+                let retry_after = resp
+                    .headers()
+                    .get(http_header::RETRY_AFTER)
+                    .expect("Retry-After header missing on the contended 503")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(retry_after, "1");
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "temporarily_unavailable");
+                assert!(
+                    v.get("access_token").is_none(),
+                    "contended response must carry NO token"
+                );
+                // No event ever landed durably — every attempt in the
+                // bounded retry loop failed with Conflict.
+                assert!(
+                    mocks.events.appended_batches().is_empty(),
+                    "no ApiTokenIssued should be durably appended when every \
+                     retry attempt conflicts"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value_kind_result(&snap, metrics::COUNTER, "federated_jwt", "mint_contended"),
+            1,
+        );
+    }
+
+    /// Regression: a GENUINE infrastructure failure on the SA-stream
+    /// append (not a `Conflict`) must still surface as the existing
+    /// `500` `mint_failed`→`internal_error`... no — `Infrastructure`
+    /// path, NOT the new `Contended` 503. The retry loop's `Err(other)`
+    /// arm must propagate non-`Conflict` errors immediately, without
+    /// consuming any retry budget.
+    #[test]
+    fn federation_mint_genuine_infrastructure_error_still_500() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, validator, sas, mocks) = build_federation_router();
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa);
+                validator.register_token("ok-jwt", sample_validated_claims(600));
+                // A REAL infra failure — NOT a Conflict — must fail fast,
+                // not enter the retry loop at all.
+                mocks
+                    .events
+                    .fail_next_append(hort_domain::error::DomainError::Invariant(
+                        "injected outage".into(),
+                    ));
+                let resp = post_form(router, federation_form("ok-jwt")).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "a genuine (non-Conflict) infra error must still be a 500, not 503"
+                );
+                assert!(
+                    resp.headers().get(http_header::RETRY_AFTER).is_none(),
+                    "the generic 500 catch-all must not carry a Retry-After header"
+                );
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "server_error");
+            });
+        });
+        assert_eq!(
+            counter_value_kind_result(&snap, metrics::COUNTER, "federated_jwt", "mint_failed"),
+            1,
+        );
     }
 
     /// A present RFC 8693 `scope` narrows the snapshot: `scope=read` on

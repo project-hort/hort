@@ -775,7 +775,7 @@ labels — same anti-pattern discipline as the counter.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, mint_failed, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). |
+| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, mint_failed, mint_contended, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). |
 | `hort_token_exchange_duration_seconds` | histogram | `kind`, `result` | seconds | same set as the counter |
 | `hort_session_admin_issuance_total` | counter | `result` | — | `granted`, `denied_flag`, `denied_authority`, `denied_lifetime` |
 | `hort_fed_sa_match_total` | counter | `result` | — | `matched`, `denied_audience`, `denied_empty_claims` |
@@ -926,6 +926,14 @@ branch — the foreign-IdP JWT exchange path that mints a
   rejected the request (typed `ApiTokenError`). Distinct from
   `internal_error` so operator dashboards separate caller-side
   mint-gate denials from outages.
+- `mint_contended` — JWT and SA validated, and the system-mint's token
+  row persisted, but the SA-stream `ApiTokenIssued` append's bounded
+  CAS-retry loop (issue #62) lost every race under concurrent-mint
+  contention. **Transient, not an infra fault** — distinct from both
+  `mint_failed` (a real `ApiTokenError` gate denial) and
+  `internal_error` (a genuine outage) so dashboards can tell "retry
+  me" apart from "something is broken". Maps to HTTP 503 +
+  `Retry-After` (1s), never `500`.
 - `internal_error` — defensive catch-all: the validator port returned
   an unexpected error, SA listing failed, the federation ports are
   unwired (composition bug). Maps to HTTP 500 / 503.
