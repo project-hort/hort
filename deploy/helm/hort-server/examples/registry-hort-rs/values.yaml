@@ -1,0 +1,22 @@
+# Sovereign-registry overlay (issue #60). The one load-bearing line: setting
+# global.imageRegistry rewrites server, worker, AND dex (if enabled) onto
+# registry.hort.rs in one step via the chart's hort-server.image /
+# hort-server.worker.image / hort-server.dex.image helpers
+# (templates/_helpers.tpl) — see values.yaml's own `global:` block for the
+# full rationale.
+#
+# If you install the registry.hort.rs-flavor chart
+# (oci://registry.hort.rs/hort-charts/hort-server) this line is already the
+# packaged default — this overlay only matters when installing the ghcr
+# flavor (oci://ghcr.io/project-hort/charts/hort-server) and you want it to
+# resolve sovereign anyway. See the how-to for when each flavor applies:
+# docs/architecture/how-to/deploy/self-contained-registry-install.md
+global:
+  imageRegistry: registry.hort.rs
+
+# NOT a chart value — the chart is external-DB by design (no bundled
+# Postgres subchart; see docs/plans/self-contained-registry-chart.md §5).
+# Point your OWN Postgres deployment's image at
+# registry.hort.rs/hort-base/postgres:17-alpine instead: the StatefulSet /
+# CloudNativePG Cluster / operator-specific image field you already manage
+# outside this chart. This overlay cannot set that for you.

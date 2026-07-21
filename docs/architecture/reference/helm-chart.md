@@ -15,6 +15,7 @@ that already exists:
 | The binary env vars these values render into (defaults, interlocks) | [server & worker configuration](./server-and-worker-configuration.md) |
 | Step-by-step install playbook | [install.md](../how-to/deploy/install.md) |
 | Edge / TLS-termination overlays | [examples-overlays.md](../how-to/deploy/examples-overlays.md) |
+| Sovereign install against `registry.hort.rs` | [self-contained-registry-install.md](../how-to/deploy/self-contained-registry-install.md) |
 | Security control cross-walk | [security-hardening-checklist.md](../how-to/deploy/security-hardening-checklist.md) |
 
 > **Authority.** Ground truth is the chart itself —
@@ -362,6 +363,7 @@ the gaps an operator can fall into:
 - [Server & worker configuration reference](./server-and-worker-configuration.md)
 - [Install playbook](../how-to/deploy/install.md)
 - [Edge / TLS overlays](../how-to/deploy/examples-overlays.md)
+- [Sovereign install against `registry.hort.rs`](../how-to/deploy/self-contained-registry-install.md)
 - [Provision the two Postgres roles](../how-to/deploy/postgres-roles.md)
 - [Security hardening checklist](../how-to/deploy/security-hardening-checklist.md)
 - [Wire secrets](../how-to/wire-secrets.md) · [Declare gitops config](../how-to/declare-gitops-config.md)
