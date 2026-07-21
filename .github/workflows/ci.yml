@@ -62,6 +62,7 @@ jobs:
   hort-deps-gate:
     name: 🔎 Hort dependency gate
     runs-on: ubuntu-latest
+    environment: ci   # non-gating; stamps the OIDC environment:ci claim gha-ci matches (#64)
     timeout-minutes: 15
     permissions:
       contents: read
@@ -91,6 +92,7 @@ jobs:
   check-rust:
     name: 🦀 Check Rust
     runs-on: ubuntu-latest
+    environment: ci   # non-gating; stamps the OIDC environment:ci claim gha-ci matches (#64)
     timeout-minutes: 20
     needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red (quarantine/rejected)
     permissions:
@@ -151,6 +153,7 @@ jobs:
   test-backend-unit:
     name: 🧪 Backend Unit Tests
     runs-on: ubuntu-latest
+    environment: ci   # non-gating; stamps the OIDC environment:ci claim gha-ci matches (#64)
     timeout-minutes: 20
     needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red
     permissions:
@@ -172,6 +175,7 @@ jobs:
   coverage:
     name: 📊 Code Coverage
     runs-on: ubuntu-latest
+    environment: ci   # non-gating; stamps the OIDC environment:ci claim gha-ci matches (#64)
     timeout-minutes: 30
     needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red
     permissions:
@@ -428,6 +432,7 @@ jobs:
   test-backend-integration:
     name: 🔗 Backend Integration Tests
     runs-on: ubuntu-latest
+    environment: ci   # non-gating; stamps the OIDC environment:ci claim gha-ci matches (#64)
     timeout-minutes: 45
     needs: [hort-deps-gate]   # skips if the hort dep-resolution gate is red
     permissions:
