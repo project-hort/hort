@@ -220,8 +220,8 @@ variables:
   # on the custom image. To build without it (custom image unavailable, or off
   # our internal registry entirely), override RUST_SCCACHE_IMAGE=${RUST_IMAGE}
   # and sccache is installed inline. (The canonical GitHub Actions build already
-  # runs stock — it cannot reach mirror.kdp.kloni.cloud.)
-  RUST_SCCACHE_IMAGE: "mirror.kdp.kloni.cloud/ci/rust-sccache:latest"
+  # runs stock — it cannot reach hort.kdp.kloni.cloud.)
+  RUST_SCCACHE_IMAGE: "hort.kdp.kloni.cloud/ci/rust-sccache:latest"
   SCCACHE_VERSION: "0.16.0"
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
   CARGO_INCREMENTAL: "0"
@@ -935,7 +935,7 @@ quality:fail2ban-regex-test:
 # wipes /tmp/cosign.key even if the build failed mid-step.
 
 .docker:
-  # build-images push to the mirror registry (mirror.kdp.kloni.cloud) with
+  # build-images push to the mirror registry (hort.kdp.kloni.cloud) with
   # credentials mounted only on the in-cluster Platform Runner at /secrets/zot;
   # off-cluster runners fall back to CI_REGISTRY_* (GitLab's own registry) and
   # fail `buildah login` with "invalid username/password". The `platform` tag
@@ -1287,7 +1287,7 @@ helm:sign-chart:
   # buildah-cosign tools image: Fedora + cosign v3 + curl + jq (the same image
   # the platform first-party oci component signs with). No helm needed — cosign
   # resolves the chart tag to its digest itself.
-  image: mirror.kdp.kloni.cloud/ci/buildah-cosign:latest
+  image: hort.kdp.kloni.cloud/ci/buildah-cosign:latest
   needs:
     - job: helm:lint-and-publish
   rules:
