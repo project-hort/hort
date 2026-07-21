@@ -3357,9 +3357,15 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
     // =====================================================================
 
     /// Closed-enum lock for the federation `result` set.
-    /// 13 distinct values (8 from `FederationDenyReason::as_str()` + 5
+    /// 19 distinct values (8 from `FederationDenyReason::as_str()` + 11
     /// handler-layer: success, no_sa_match, multiple_sa_match,
-    /// mint_failed, internal_error). The `bad_request` value
+    /// mint_failed, internal_error, replayed_jti, replayed_composite,
+    /// replay_guard_unavailable, jti_required, mint_contended,
+    /// cap_exceeds_authority). The replay/JTI four ride
+    /// `FederationHandlerError::as_str()`; `mint_contended` rides
+    /// `contended_outcome()`; `cap_exceeds_authority` rides
+    /// `handle_federated_jwt`'s own FORBIDDEN arm. The `bad_request`
+    /// value
     /// (`requested_token_type != access_token` on the federation
     /// branch) is intentionally shared with the cli_session enum — same
     /// wire-shape error semantics, distinguished by the `kind` label.
@@ -3383,6 +3389,20 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             "multiple_sa_match",
             "mint_failed",
             "internal_error",
+            // Replay-guard / JTI outcomes (FederationHandlerError::as_str,
+            // via the ReplayDetected/ReplayGuardUnavailable/JtiRequired arms)
+            // and the concurrent-mint back-pressure outcome (issue #62,
+            // contended_outcome). All ride the federated_jwt result counter.
+            "replayed_jti",
+            "replayed_composite",
+            "replay_guard_unavailable",
+            "jti_required",
+            "mint_contended",
+            // Scope-exceeds-authority is emitted on BOTH branches
+            // (handle_federated_jwt's own FORBIDDEN arm here, plus the
+            // cli_session branch); the shared `success`/`bad_request`
+            // note below covers the intentional cross-branch overlaps.
+            "cap_exceeds_authority",
         ]
         .into_iter()
         .collect();
@@ -3398,6 +3418,12 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             metrics::RESULT_MULTIPLE_SA_MATCH,
             metrics::RESULT_MINT_FAILED,
             metrics::RESULT_INTERNAL_ERROR,
+            metrics::RESULT_REPLAYED_JTI,
+            metrics::RESULT_REPLAYED_COMPOSITE,
+            metrics::RESULT_REPLAY_GUARD_UNAVAILABLE,
+            metrics::RESULT_JTI_REQUIRED,
+            metrics::RESULT_MINT_CONTENDED,
+            metrics::RESULT_CAP_EXCEEDS_AUTHORITY,
         ]
         .into_iter()
         .collect();
