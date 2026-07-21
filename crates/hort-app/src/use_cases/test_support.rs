@@ -1864,6 +1864,13 @@ pub struct MockEventStore {
     /// path (e.g. the CliSession JWT mint, which appends
     /// `ApiTokenIssued` but persists no row).
     fail_next_append: Mutex<Option<DomainError>>,
+    /// When `Some`, EVERY subsequent `append` call returns this error
+    /// (never consumed) — unlike [`Self::fail_next_append`], which
+    /// fires once. Models pathological write contention where every
+    /// attempt in a bounded CAS-retry loop loses the race (issue #62:
+    /// `ApiTokenUseCase`'s SA-stream append retry). Seeded via
+    /// [`fail_all_appends`](Self::fail_all_appends).
+    fail_all_appends: Mutex<Option<DomainError>>,
     /// Per-stream one-shot replacement installed AFTER the next
     /// `read_stream` of that stream serves the current content —
     /// models a concurrent append landing between two reads (the
@@ -1871,6 +1878,14 @@ pub struct MockEventStore {
     /// `ProvenanceVerified` that appeared mid-flight). Seeded via
     /// [`set_stream_after_next_read`](Self::set_stream_after_next_read).
     stream_after_next_read: Mutex<HashMap<String, Vec<PersistedEvent>>>,
+    /// When `Some`, the NEXT `read_stream` call returns this error
+    /// instead of the seeded content (consumed on fire). Models a
+    /// genuine outage on the read side of a CAS-retry loop (e.g.
+    /// `ApiTokenUseCase`'s SA-stream expected-version read, issue
+    /// #62) — distinct from a `Conflict` on `append`, which the
+    /// retry loop absorbs; a `read_stream` failure is a real infra
+    /// error that must propagate immediately.
+    fail_next_read_stream: Mutex<Option<DomainError>>,
 }
 
 impl MockEventStore {
@@ -1881,13 +1896,29 @@ impl MockEventStore {
             category_events: Mutex::new(HashMap::new()),
             category_error_positions: Mutex::new(Vec::new()),
             fail_next_append: Mutex::new(None),
+            fail_all_appends: Mutex::new(None),
             stream_after_next_read: Mutex::new(HashMap::new()),
+            fail_next_read_stream: Mutex::new(None),
         }
     }
 
     /// Arm the NEXT `append` to fail once with `err`. Consumed on fire.
     pub fn fail_next_append(&self, err: DomainError) {
         *self.fail_next_append.lock().unwrap() = Some(err);
+    }
+
+    /// Arm EVERY subsequent `append` to fail with `err` (not consumed —
+    /// stays armed). Models a bounded CAS-retry loop losing every race
+    /// under pathological contention. Takes priority over
+    /// [`Self::fail_next_append`] if both are armed.
+    pub fn fail_all_appends(&self, err: DomainError) {
+        *self.fail_all_appends.lock().unwrap() = Some(err);
+    }
+
+    /// Arm the NEXT `read_stream` to fail once with `err`. Consumed on
+    /// fire.
+    pub fn fail_next_read_stream(&self, err: DomainError) {
+        *self.fail_next_read_stream.lock().unwrap() = Some(err);
     }
 
     pub fn appended_batches(&self) -> Vec<AppendEvents> {
@@ -1943,6 +1974,9 @@ impl MockEventStore {
 
 impl EventStore for MockEventStore {
     fn append(&self, batch: AppendEvents) -> BoxFut<'_, DomainResult<AppendResult>> {
+        if let Some(err) = self.fail_all_appends.lock().unwrap().clone() {
+            return Box::pin(async move { Err(err) });
+        }
         if let Some(err) = self.fail_next_append.lock().unwrap().take() {
             return Box::pin(async move { Err(err) });
         }
@@ -1962,6 +1996,9 @@ impl EventStore for MockEventStore {
         _from: ReadFrom,
         max_count: u64,
     ) -> BoxFut<'_, DomainResult<Vec<PersistedEvent>>> {
+        if let Some(err) = self.fail_next_read_stream.lock().unwrap().take() {
+            return Box::pin(async move { Err(err) });
+        }
         let key = stream_id.to_string();
         let events = self
             .streams

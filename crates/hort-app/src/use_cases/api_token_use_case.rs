@@ -56,7 +56,7 @@ use hort_domain::events::{
 };
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend};
+use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::types::{Page, PageRequest};
 
@@ -169,6 +169,14 @@ const TOKEN_PREFIX_LEN: usize = 8;
 
 /// Lowercase base32 alphabet, RFC 4648 §6.
 const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// Bounded CAS-retry budget for the system-mint `ApiTokenIssued` append
+/// on the SA's user stream (issue #62). Parallel jobs minting for the
+/// same `ServiceAccount` race this append; a loser re-reads the fresh
+/// head and re-appends the same event. 5 is generous headroom for
+/// realistic parallelism — exhausting it means pathological contention,
+/// surfaced as [`ApiTokenError::Contended`] rather than a 500.
+const SA_STREAM_APPEND_RETRY_ATTEMPTS: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -563,6 +571,19 @@ pub enum ApiTokenError {
     #[error("issuer requires a jti claim")]
     JtiRequired,
 
+    /// 503 — the SA-stream `ApiTokenIssued` append's bounded CAS-retry
+    /// budget was exhausted under concurrent-mint contention (issue
+    /// #62). **Transient, not an infrastructure fault**: the token row
+    /// is already persisted (`self.tokens.insert` succeeded once and is
+    /// never retried); only the event append raced and lost every
+    /// attempt. Distinct from [`Self::Infrastructure`] so callers can
+    /// map this to a retryable `503 Service Unavailable` +
+    /// `Retry-After` instead of a `500` — a genuine infra error
+    /// (a real DB outage on the append, say) still surfaces as
+    /// `Infrastructure`.
+    #[error("SA-stream append retry budget exhausted (transient contention)")]
+    Contended,
+
     /// 5xx infrastructure — propagated from outbound ports.
     #[error(transparent)]
     Infrastructure(#[from] DomainError),
@@ -631,6 +652,23 @@ pub struct ApiTokenUseCase {
     /// Keys are `cli-session-revoked:{jti}` with TTL = remaining-until-
     /// `exp`, so the set self-bounds.
     cli_session_revocation_denylist: Option<Arc<dyn EphemeralStore>>,
+}
+
+/// [`read_expected_version`] for the SA-stream `ApiTokenIssued` append,
+/// mapped to [`ApiTokenError::Infrastructure`]. Shared by the initial
+/// read and every CAS-retry re-read (issue #62) so the error-mapping
+/// logic exists at one call site instead of being duplicated per
+/// attempt.
+async fn read_sa_stream_expected_version(
+    events: &dyn EventStore,
+    stream_id: &StreamId,
+) -> Result<ExpectedVersion, ApiTokenError> {
+    read_expected_version(events, stream_id, false)
+        .await
+        .map_err(|e| match e {
+            crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
+            other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
+        })
 }
 
 impl ApiTokenUseCase {
@@ -1049,13 +1087,24 @@ impl ApiTokenUseCase {
 
         // 8. Emit ApiTokenIssued on the token-owner's user stream,
         //    attributed to System.
+        //
+        //    Bounded CAS retry (issue #62): parallel jobs minting for the
+        //    same ServiceAccount race this append — the loser's Postgres
+        //    unique-index rejection on `(stream_id, stream_position)`
+        //    surfaces as `DomainError::Conflict`. The event is
+        //    load-bearing (the subscription/event feed, the metrics
+        //    projection, and the audit join with
+        //    `ServiceAccountTokenRotated` on the same stream all read
+        //    it), so the fix retries the SAME append rather than
+        //    dropping it — mirroring
+        //    `ProvenanceOrchestrationUseCase::cascade_one`. Simpler than
+        //    that precedent: no idempotency re-check is needed here.
+        //    Each mint is a *distinct* token (`token.id` is fresh, and
+        //    the row is already inserted above and never retried) — a
+        //    conflict only ever means "re-read the fresh head and
+        //    re-append the same event," never "was this already
+        //    applied."
         let stream_id = StreamId::user(target.id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
-                other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
-            })?;
         let event = DomainEvent::ApiTokenIssued(ApiTokenIssued {
             token_id: token.id,
             user_id: target.id,
@@ -1086,16 +1135,61 @@ impl ApiTokenUseCase {
                 .as_ref()
                 .map(|fs| fs.subject.clone()),
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
-                causation_id: None,
-                actor: system_actor(),
-            })
-            .await?;
+        let correlation_id = Uuid::new_v4();
+        let mut expected =
+            read_sa_stream_expected_version(self.events.as_ref(), &stream_id).await?;
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .events
+                .append(AppendEvents {
+                    stream_id: stream_id.clone(),
+                    expected_version: expected,
+                    events: vec![EventToAppend::new(event.clone())],
+                    correlation_id,
+                    causation_id: None,
+                    actor: system_actor(),
+                })
+                .await
+            {
+                Ok(_) => break,
+                Err(DomainError::Conflict(_)) if attempt + 1 < SA_STREAM_APPEND_RETRY_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(
+                        token_id = %token.id,
+                        user_id = %target.id,
+                        attempt,
+                        "API token issuance: SA-stream append conflict — \
+                         retrying with a fresh read",
+                    );
+                    // Tiny linear backoff + jitter so concurrent retriers
+                    // spread out instead of all re-colliding on the same
+                    // freshly-read head.
+                    let jitter_ms = u64::from(rand::random::<u8>() % 3);
+                    tokio::time::sleep(StdDuration::from_millis(
+                        u64::from(attempt) * 2 + jitter_ms,
+                    ))
+                    .await;
+                    expected =
+                        read_sa_stream_expected_version(self.events.as_ref(), &stream_id).await?;
+                }
+                Err(DomainError::Conflict(_)) => {
+                    // Retry budget exhausted — pathological contention,
+                    // not an infra fault. `warn!`, not `error!`: nothing
+                    // is broken, and the caller gets a retryable 503, not
+                    // a 500.
+                    tracing::warn!(
+                        token_id = %token.id,
+                        user_id = %target.id,
+                        attempts = SA_STREAM_APPEND_RETRY_ATTEMPTS,
+                        "API token issuance: SA-stream append retry budget \
+                         exhausted (transient contention)",
+                    );
+                    return Err(ApiTokenError::Contended);
+                }
+                Err(other) => return Err(ApiTokenError::Infrastructure(other)),
+            }
+        }
 
         tracing::info!(
             token_id = %token.id,
@@ -3416,6 +3510,134 @@ mod tests {
         let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
         // No admin minted this — the field carries None.
         assert!(event.minted_by_admin_id.is_none());
+    }
+
+    /// Issue #62: two concurrent mints for the same `ServiceAccount`
+    /// race the SA-stream append; the loser's first attempt hits
+    /// `DomainError::Conflict`. The bounded CAS-retry loop must re-read
+    /// the head and re-append the SAME event, succeeding on the second
+    /// try — the token row is inserted exactly once (never retried) and
+    /// `ApiTokenIssued` is durably appended exactly once (the failed
+    /// first attempt is never recorded).
+    #[tokio::test]
+    async fn issue_for_service_account_system_retries_append_once_on_conflict() {
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(true));
+        events.fail_next_append(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let issued = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), make_request_system())
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        assert!(issued.plaintext.starts_with("hort_svc_"));
+
+        // Token row inserted exactly once — the insert is never retried,
+        // only the append races.
+        assert_eq!(tokens.inserts().len(), 1);
+
+        // Exactly one durable ApiTokenIssued — the failed first attempt
+        // is never recorded by the mock (it returns Err before pushing
+        // to its internal batch list), so this also proves the retry
+        // path re-appends rather than appending twice.
+        let batches = events.appended_batches();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the winning append must land exactly once, not twice"
+        );
+        let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
+        assert_eq!(event.kind, TokenKind::ServiceAccount);
+    }
+
+    /// Issue #62: pathological contention — EVERY append attempt
+    /// conflicts. The bounded retry loop must exhaust
+    /// (`SA_STREAM_APPEND_RETRY_ATTEMPTS`) and return the dedicated
+    /// [`ApiTokenError::Contended`] variant, NOT `Infrastructure` (the
+    /// distinction the federation handler's 503-vs-500 mapping depends
+    /// on) — and must never durably append the event.
+    #[tokio::test]
+    async fn issue_for_service_account_system_exhausted_retry_returns_contended() {
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(true));
+        events.fail_all_appends(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let err = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), make_request_system())
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(err, ApiTokenError::Contended),
+            "exhaustion must surface as Contended, not Infrastructure — got {err:?}"
+        );
+
+        // The token row IS inserted (step 7 runs before the append loop
+        // and is never retried/rolled back) but no event ever landed.
+        assert_eq!(tokens.inserts().len(), 1);
+        assert!(
+            events.appended_batches().is_empty(),
+            "no ApiTokenIssued should be durably appended when every retry conflicts"
+        );
+    }
+
+    /// A GENUINE infra failure on the SA-stream expected-version read
+    /// (`read_sa_stream_expected_version`, shared by the initial read
+    /// and every CAS-retry re-read) must propagate as `Infrastructure`
+    /// immediately — never absorbed by the conflict-retry loop, and
+    /// never confused with `Contended` (that variant is reserved for
+    /// exhausted `Conflict`s on the append side, not a read-side
+    /// outage).
+    #[tokio::test]
+    async fn issue_for_service_account_system_read_infra_error_propagates() {
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(true));
+        events.fail_next_read_stream(DomainError::Invariant("event store read down".into()));
+
+        let err = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), make_request_system())
+            .await
+            .expect_err("a genuine read-side outage must fail the mint");
+        assert!(
+            matches!(err, ApiTokenError::Infrastructure(_)),
+            "a read-side outage is Infrastructure, not Contended — got {err:?}"
+        );
+        // Step 7 (token persist) already ran before step 8's read — the
+        // same event-less-token strand a real outage here still leaves,
+        // same as before this fix (only the append side gained a retry).
+        assert_eq!(tokens.inserts().len(), 1);
+        assert!(
+            events.appended_batches().is_empty(),
+            "the append loop must never be entered when the expected-version read fails"
+        );
+    }
+
+    /// A GENUINE (non-`Conflict`) infra failure on the append itself
+    /// must fail fast on the FIRST attempt — the retry loop's
+    /// `Err(other)` arm propagates immediately, never consuming any of
+    /// the retry budget and never returning `Contended` (which is
+    /// reserved for exhausted `Conflict`s only).
+    #[tokio::test]
+    async fn issue_for_service_account_system_append_genuine_infra_error_propagates() {
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(true));
+        events.fail_next_append(DomainError::Invariant("event store append down".into()));
+
+        let err = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), make_request_system())
+            .await
+            .expect_err("a genuine append-side outage must fail the mint");
+        assert!(
+            matches!(err, ApiTokenError::Infrastructure(_)),
+            "a non-Conflict append error is Infrastructure, not Contended — got {err:?}"
+        );
+        assert_eq!(tokens.inserts().len(), 1);
+        assert!(
+            events.appended_batches().is_empty(),
+            "no ApiTokenIssued should be durably appended when the append itself fails"
+        );
     }
 
     #[tokio::test]
