@@ -1,0 +1,15 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-release-write-hort-base
+spec:
+  # Per-repo serviceAccount-subject grant: gha-release (the GitHub
+  # Actions release-publishing identity) pushes pinned third-party base
+  # images (dex, postgres) to hort-base. Resolves at apply to
+  # GrantSubject::User(<gha-release backing user>). Twin of
+  # gha-release-write-hort-oci.yaml.
+  subject:
+    kind: serviceAccount
+    name: gha-release
+  permission: write
+  repository: hort-base
