@@ -55,7 +55,7 @@ Two viable shapes:
 - **(D2-a, recommended) scan on, threshold `critical`** (not `high`): record findings for visibility, but only a `critical` holds — narrower than `hort-oci` precisely because we can't remediate, and the held→upstream-fallback keeps availability. Documents the tradeoff inline.
 - **(D2-b) `scanBackends: []`** — no scan, pure availability. Cleaner but loses defense-in-depth visibility on images we serve to our own fleet's cold start.
 
-**Recommendation D2-a.** It keeps visibility, holds only on the unignorable, and the fallback covers the availability hole. Flag for the reviewer; either is defensible.
+**DECISION: D2-a — CONFIRMED by the maintainer (Tom, #60, 2026-07-21: "threshold critical").** trivy on, `severityThreshold: critical`. It keeps visibility, holds only on the unignorable, and the held→upstream-fallback covers the availability hole. D2-b is not taken.
 
 ### D3 — CI: `mirror-to-hort-base` step + second chart flavor
 
