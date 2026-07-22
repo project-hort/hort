@@ -59,7 +59,7 @@ all streams and drives category-wide projections.
 |---|---|---|
 | `NoStream` | Stream must not exist yet | `ArtifactIngested`, `PolicyCreated` |
 | `Exact(n)` | Current stream position must equal `n` | All subsequent lifecycle events |
-| `Any` | No concurrency check | Reserved for high-volume idempotent events (deferred) |
+| `Any` | No concurrency check | Streams with no cross-writer race — ref moves, purge, retention sweeps, gitops CRUD-kind applies, auth events, download audit |
 
 `Any` is **forbidden for artifact and policy lifecycle events.** The
 application layer tests this invariant explicitly.
@@ -348,14 +348,14 @@ The operator-facing how-to is at
   `hort-http-<format>` crate can construct one from a request body.
 - **Correlation IDs are server-generated.** Use cases call
   `Uuid::new_v4()`; client idempotency keys never enter the event log.
-- **Payload size cap: 1 MB per event**, enforced by a `CHECK` on the
-  `event_data` column. An earlier 64 KB value
-  was chosen without considering rich format-specific metadata flowing
-  through `ArtifactIngested`. Real-world PyPI `METADATA` files and
-  npm per-version packument entries routinely reach 100–500 KB; 1 MB
-  gives realistic headroom without becoming a DoS vector. Per-format
-  sanity caps below the DB ceiling are applied at the application
-  layer — see [format-handlers.md](format-handlers.md).
+- **Payload size cap: 64 KB per event**, enforced by a `CHECK` on the
+  `event_data` column (`migrations/004_events.sql`) and mirrored in
+  `hort-adapters-postgres::event_store::MAX_EVENT_JSON_BYTES`. A separate,
+  larger 1 MB cap exists on the unrelated `artifact_metadata.metadata`
+  projection column (`migrations/003_artifacts_cas.sql`) — do not conflate
+  the two. Per-format sanity caps below the 64 KB event-log ceiling are
+  applied at the application layer — see
+  [format-handlers.md](format-handlers.md).
 - **Stream length cap: 200 events.** The application layer reads the
   current stream before appending and refuses to grow past the cap — an
   artifact that needs more events is a bug or abuse.

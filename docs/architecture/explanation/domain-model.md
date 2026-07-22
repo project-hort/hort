@@ -203,7 +203,7 @@ Three things worth noticing:
 
   - `MetadataStrategy::Inline` (default) — the full payload rides in
     both the event and the projection row. Fine for formats whose p99
-    payload fits inside the 1 MB event-payload ceiling (PyPI, cargo).
+    payload fits inside the 64 KB event-payload ceiling (PyPI, cargo).
   - `MetadataStrategy::HashReference { inline_threshold_bytes }` — when
     the serialised payload exceeds the threshold, the full payload is
     written to CAS via `storage.put` and the event + projection row

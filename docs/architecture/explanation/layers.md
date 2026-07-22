@@ -38,7 +38,8 @@ Rules the codebase enforces:
 - Adapters implement the port traits that the domain defines. They may
   import `sqlx`, `object_store`, etc.
 - **Per-format inbound HTTP crates (`hort-http-cargo`, `hort-http-npm`,
-  `hort-http-pypi`, `hort-http-oci`) depend only on `hort-domain`, `hort-app`,
+  `hort-http-pypi`, `hort-http-oci`, `hort-http-maven`) depend only on
+  `hort-domain`, `hort-app`,
   `hort-formats`, and `hort-http-core`.** They list no `hort-adapters-*` or
   `sqlx` / `reqwest` in their `Cargo.toml`, so a handler reaching for
   `hort_adapters_postgres::…` is a compile-time unresolved-import error
@@ -86,6 +87,7 @@ component "hort-http-cargo" <<inbound>>
 component "hort-http-npm" <<inbound>>
 component "hort-http-pypi" <<inbound>>
 component "hort-http-oci" <<inbound>>
+component "hort-http-maven" <<inbound>>
 component "hort-server"
 
 "hort-app" --> "hort-domain"
@@ -113,11 +115,16 @@ component "hort-server"
 "hort-http-oci"  --> "hort-app"
 "hort-http-oci"  --> "hort-formats"
 "hort-http-oci"  --> "hort-domain"
+"hort-http-maven" --> "hort-http-core"
+"hort-http-maven" --> "hort-app"
+"hort-http-maven" --> "hort-formats"
+"hort-http-maven" --> "hort-domain"
 "hort-server" --> "hort-http-core"
 "hort-server" --> "hort-http-cargo"
 "hort-server" --> "hort-http-npm"
 "hort-server" --> "hort-http-pypi"
 "hort-server" --> "hort-http-oci"
+"hort-server" --> "hort-http-maven"
 "hort-server" --> "hort-adapters-postgres"
 "hort-server" --> "hort-adapters-storage"
 "hort-server" --> "hort-adapters-oidc"
@@ -149,7 +156,7 @@ property the rewrite gets for free from the dep graph
 | `hort-adapters-oidc` | `OidcProvider` (implements `IdentityProvider`), JWKS cache, token validation against configured issuer/audience | Business rules, SQL, direct storage access |
 | `hort-formats` | `FormatHandler` implementations (PyPI, Cargo, npm, OCI today), planned WASM host | Direct DB access, direct storage writes |
 | `hort-http-core` | `AppContext` struct (data ports `pub(crate)`, [ADR 0008](../../adr/0008-per-format-adapter-free-http-crates.md)) + `AppContextParts` + `AppContext::new(parts)` cross-crate constructor, `AuthContext`, shared `ApiError` + `AppError → HTTP` mapping, middleware stack (`require_principal`, `extract_optional_principal`, trust / rate-limit / security-headers / metrics), authz extractors (`AdminPrincipal`, `WriteRepoAccess` — thin wrapper over `RepositoryAccessUseCase::resolve(.., AccessLevel::Write)`), `UrlResolver`, body limits, admin + metrics handlers, `router::wrap_with_middleware`, `test_support::build_mock_ctx` (behind `test-support` feature) | Per-format handlers; SQL; adapter crate imports |
-| `hort-http-<format>` (cargo, npm, pypi, oci) | Format-specific axum handlers + route builders (`<format>_routes()`, `<format>_routes_with_publish_limit` where relevant, `OciHttpConfig` for OCI) | Adapter crate imports, `sqlx`, `reqwest`, cross-format references |
+| `hort-http-<format>` (cargo, npm, pypi, oci, maven) | Format-specific axum handlers + route builders (`<format>_routes()`, `<format>_routes_with_publish_limit` where relevant, `OciHttpConfig` for OCI) | Adapter crate imports, `sqlx`, `reqwest`, cross-format references |
 | `hort-server` | Composition root (`hort-server::composition::build_app_context`), top-level router assembly (`hort-server::http::{build_router, build_router_with_oci_config, build_admin_router}`), CLI subcommands, migrations, startup glue (pool, tracing, Prometheus recorder, shutdown signalling, RBAC refresh task) | Business rules, HTTP handlers |
 
 ## The composition root
