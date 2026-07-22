@@ -824,8 +824,7 @@ async fn serve_virtual_pypi_file(
 /// (ADR 0031 rule 2b). Reuses the member's own [`IndexSource`] — the same
 /// path the index aggregation uses — so the ownership signal is identical
 /// across the index and download paths. Only invoked for non-proxy members
-/// (proxies never own), so the [`SimpleIndexFormat`] passed to
-/// `select_source` is inert here (the hosted source ignores it).
+/// (proxies never own).
 async fn pypi_member_name_presence(
     ctx: &Arc<AppContext>,
     member: &hort_domain::entities::repository::Repository,
@@ -834,7 +833,7 @@ async fn pypi_member_name_presence(
 ) -> hort_app::use_cases::virtual_resolution::MemberNamePresence {
     use hort_app::use_cases::virtual_resolution::MemberNamePresence;
 
-    match index_source::select_source(member, simple_index::SimpleIndexFormat::Json)
+    match index_source::select_source(member)
         .fetch(ctx, member, project, actor)
         .await
     {
