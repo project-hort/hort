@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-07-21
+
+### Added
+
+- **Self-contained Helm chart + `registry.hort.rs` hosting for the full cold-start
+  chain.** A single `global.imageRegistry` chart value rewrites every image
+  reference (server, worker, dex) to a sovereign registry, and a second chart
+  flavor published to `registry.hort.rs/hort-charts/hort-server` ships that preset
+  packaged. An operator can now run hort as the sole in-cluster registry and pull
+  the entire cold-start chain — `hort-server`, `hort-worker`, `dex`, `postgres`,
+  and the chart itself — from `registry.hort.rs` with **no** per-node
+  `registries.yaml` (direct-upstream remains only the containerd fallback). Base
+  images are mirrored to a hosted `hort-base` repo whose scan bar is
+  `critical` (upstream base-image CVEs are not locally remediable, so a `high`
+  bar would flap the mirror for a hold no operator can action). The default
+  (`global.imageRegistry: ""`) renders byte-identically to the previous chart, so
+  existing ghcr consumers are untouched. (#60)
+
+### Changed
+
+- **A proxied image index eagerly registers and prefetches its children on
+  pull-through.** The index ingest now warms its child manifests and blobs up
+  front instead of ingesting descendants sequentially on first access, removing
+  the per-child sequential-ingest latency on multi-arch pulls. The release
+  predicate is unchanged — each descendant still requires its own scan authority
+  (ADR 0007). (#51)
+
+- **Prefetch ingest now flows through the pull-dedup coalescer.** `prefetch_ingest`
+  bypassed `PullDedup` despite its module doc claiming coverage; a concurrent
+  prefetch and on-demand pull of the same content now coalesce to a single
+  upstream fetch, as documented. (#57)
+
+### Fixed
+
+- **A wedged pull-dedup coalesce leader no longer poisons its followers
+  indefinitely.** A stalled leader left every follower blocked until process
+  restart (a root cause behind #53-class ingest stalls). The leader now runs under
+  a bounded deadline (`HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS`, default 600 s) with
+  RAII cleanup that evicts the coalesce entry and releases waiting followers, and
+  emits `leader_timeout` / `leader_cancelled` metrics. (#55)
+
+- **Federation token-exchange no longer 500s on concurrent mints for the same
+  service account.** Simultaneous token mints raced on the service-account
+  event-stream append and the loser returned an unretried version conflict as a
+  500. The append now retries under a bounded CAS loop, and a genuinely contended
+  mint returns `503` with `Retry-After` rather than a 500. (#62)
+
+- **GitHub Actions federation: the CI and release identities are now disjoint.** A
+  release-environment OIDC token matched **both** `gha-ci` and `gha-release`, so
+  the federated exchange failed closed on `multiple_sa_match` (401) and blocked
+  every release-publish path under `HORT_PROXY_ENABLED`. `gha-ci` is now scoped to
+  a non-gating `ci` deployment environment, making the two identities disjoint by
+  construction (positive-claim scoping, the standard for GitHub-Actions OIDC
+  federation). (#64)
+
+### Security
+
+- **The GitHub `hort-auth` action no longer echoes the token-exchange response
+  body to CI logs.** On a failed exchange the action printed the raw response body
+  (the GitHub twin of the previously-fixed GitLab leak), which could surface a
+  bearer token in public Actions logs. The failure path is now sanitized. (#61)
+
 ## [0.9.11] - 2026-07-19
 
 ### Added

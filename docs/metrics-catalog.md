@@ -122,34 +122,38 @@ Emitted by `hort-http-core::middleware::rate_limit` on every `429 Too Many
 Requests` response produced by either layer builder
 (`auth_rate_limit_layer` / `write_rate_limit_layer`).
 
-**`scope` semantics:**
+**`scope` semantics** (corrected — issue #66; the two scopes now use
+structurally different bucket-consumption models, see
+`crates/hort-http-core/src/middleware/rate_limit.rs` module docstring
+for the full rationale):
 
-- `auth` — the per-IP token bucket protecting `require_principal`
-  (credential stuffing defense). Bucket cap via
-  `HORT_RATELIMIT_AUTH_PER_MIN` (default 60). Only engages on the same
-  HTTP methods that reach `require_principal` (POST, PUT, DELETE,
-  PATCH) — GET/HEAD/OPTIONS traffic bypasses the bucket entirely
-  because the read-path auth layer (`extract_optional_principal`)
-  doesn't 401 on invalid tokens and isn't a credential-stuffing
-  surface.
-- `write` — the per-IP token bucket bounding mutation throughput on
-  POST/PUT/DELETE/PATCH. Bucket cap via `HORT_RATELIMIT_WRITE_PER_MIN`
-  (default 300). Applied unconditionally (engages even under
-  `HORT_AUTH_PROVIDER=disabled` — mutation pressure is a DoS vector
-  regardless of authentication state).
+- `auth` — a per-IP **failure-window** counter (NOT a `governor` token
+  bucket) protecting `require_principal` AND `POST
+  /api/v1/auth/exchange` (credential-stuffing defense). Cap via
+  `HORT_RATELIMIT_AUTH_PER_MIN` (default 60 **failures**/minute/IP —
+  not 60 attempts). Counts only `401` responses (an invalid, missing,
+  or replayed credential); a valid principal's writes — success (200)
+  or a downstream authorization `403` on an already-accepted credential
+  — never draw this bucket down. Only engages on the same HTTP methods
+  that reach `require_principal` (POST, PUT, DELETE, PATCH) —
+  GET/HEAD/OPTIONS bypasses entirely.
+- `write` — the per-IP `governor` token bucket bounding mutation
+  throughput on POST/PUT/DELETE/PATCH, **unchanged**. Consumes on
+  EVERY write regardless of outcome. Bucket cap via
+  `HORT_RATELIMIT_WRITE_PER_MIN` (default 300). Applied unconditionally
+  (engages even under `HORT_AUTH_PROVIDER=disabled` — mutation pressure
+  is a DoS vector regardless of authentication state).
 
-**Scope overlap:** both layers engage on the same write-method set,
-so a single write request consumes from BOTH buckets simultaneously.
-With the defaults (auth=60/min, write=300/min) the auth bucket is the
-binding constraint on every single-IP burst, and `scope=write`
-rejections stay near-zero by design. Operators who want the write
-cap to actually surface in metrics should raise
-`HORT_RATELIMIT_AUTH_PER_MIN` above `HORT_RATELIMIT_WRITE_PER_MIN`.
-Rationale: the two caps defend different threat models
-(credential-stuffing vs. mutation-throughput abuse); when both
-defaults are in force, auth-floor applies first and write-floor is
-the backstop. See `crates/hort-http-core/src/middleware/rate_limit.rs` module
-docstring for the full rationale.
+**Scope overlap (corrected):** a valid-principal write now consumes
+from the `write` bucket only — the pre-#66 `min(auth, write)` coupling
+(where every write, success or failure, drew down both buckets
+simultaneously, so a well-behaved authenticated client's effective
+ceiling was `min(60, 300) = 60/min`) is gone. A bulk authenticated push
+(e.g. `cosign copy` mirroring many blobs/manifests) is now bounded only
+by `write_per_min`; `scope=auth` rejections are reserved for actual
+credential-stuffing floods (repeated `401`s from one IP), which still
+trip pre-validation — before `require_principal`'s JWKS work runs —
+once the FAILURE budget, not the attempt count, is exhausted.
 
 **`path` semantics:**
 
