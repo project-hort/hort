@@ -52,12 +52,12 @@ itself (ADR 0044). The read authority comes from a `serviceAccount`-subject
 shape, minted by hand via the CLI in step 2:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: image-puller
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: image-puller-read

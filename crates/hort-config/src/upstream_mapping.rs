@@ -7,7 +7,7 @@
 //! YAML shape:
 //!
 //! ```yaml
-//! apiVersion: project-hort.de/v1beta1
+//! apiVersion: project-hort.de/v1
 //! kind: UpstreamMapping
 //! metadata:
 //!   name: oci-mirror-dockerhub        # operator-cosmetic handle
@@ -387,7 +387,7 @@ mod tests {
 
     fn yaml(name: &str, body: &str) -> String {
         format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: UpstreamMapping\nmetadata:\n  name: {name}\nspec:{body}"
+            "apiVersion: project-hort.de/v1\nkind: UpstreamMapping\nmetadata:\n  name: {name}\nspec:{body}"
         )
     }
 
@@ -795,7 +795,7 @@ mod tests {
     type: anonymous
 ";
         let yaml_doc = format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: UpstreamMapping\nmetadata:\n  name: ''\nspec:{body}"
+            "apiVersion: project-hort.de/v1\nkind: UpstreamMapping\nmetadata:\n  name: ''\nspec:{body}"
         );
         let err = parse_upstream_mapping(&p(), yaml_doc.as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::EmptyMetadataName));
@@ -923,7 +923,7 @@ mod tests {
         // The dispatch in DesiredState::parse_files routes by kind, but
         // a single-file caller handing the wrong envelope here must
         // surface a typed error rather than silently coercing.
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: GroupMapping
 metadata:
   name: u

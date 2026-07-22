@@ -487,7 +487,7 @@ stage_curator_grant_overlay() {
 # single-claim-grant linter check). Scoped globally so the
 # curator surface (which has cross-repo finding-exclusion in scope) can
 # be exercised end-to-end.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: curate-e2e

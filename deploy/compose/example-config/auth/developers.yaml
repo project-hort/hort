@@ -2,7 +2,7 @@
 # claim. The claim confers no power until an operator-declared
 # PermissionGrant requires it — none ship here, so a fresh deploy has
 # zero grants until the operator adds them.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: developers

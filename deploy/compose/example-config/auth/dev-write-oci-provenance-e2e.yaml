@@ -3,7 +3,7 @@
 # scenarios/quarantine/provenance-push-then-sign.sh). Mirror of
 # dev-write-oci-quarantine-e2e.yaml — per-repo + two-claim subject passes the
 # allowlist linter. Rationale: see ci-pushers.yaml.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: dev-write-oci-provenance-e2e

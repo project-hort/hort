@@ -4,7 +4,7 @@
 # that user carries full admin authority — required for the admin-only
 # surfaces (admin quarantine release, patch-candidate listing).
 # Mirrors deploy/compose/example-config/auth/admins.yaml.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins

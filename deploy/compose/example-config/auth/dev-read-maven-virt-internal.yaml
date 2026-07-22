@@ -4,7 +4,7 @@
 # member to resolve it through the virtual — Write does NOT imply Read.
 # scripts/native-tests/scenarios/clients/maven-virtual.sh. Rationale: see
 # ci-pushers.yaml.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: dev-read-maven-virt-internal

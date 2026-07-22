@@ -150,7 +150,7 @@ Operator opt-in (per repository, declared via gitops):
 
 ```yaml
 # repositories/oci-public.yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: oci-mirror
@@ -218,7 +218,7 @@ the `:latest`-pull `503` for a specific upstream can set
 
 ```yaml
 # policies/oci-trusted-upstream.yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: oci-trusted-upstream
@@ -246,7 +246,7 @@ operator opt-out from quarantine-window friction. The repo-wide
 
 ```yaml
 # repositories/oci-public.yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: oci-mirror
@@ -265,7 +265,7 @@ spec:
 
 ```yaml
 # upstreams/oci-public.yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: oci-public

@@ -610,7 +610,7 @@ gitopsConfig:
   # envelope batch covers the grant's \`repository:\` and
   # \`subject.name\` references below.
   "repository.pypi-internal.yaml": |
-    apiVersion: project-hort.de/v1beta1
+    apiVersion: project-hort.de/v1
     kind: ArtifactRepository
     metadata:
       name: pypi-internal
@@ -625,7 +625,7 @@ gitopsConfig:
       isPublic: false
       replicationPriority: local_only
   "service-account.${SA_NAME}.yaml": |
-    apiVersion: project-hort.de/v1beta1
+    apiVersion: project-hort.de/v1
     kind: ServiceAccount
     metadata:
       name: ${SA_NAME}
@@ -641,7 +641,7 @@ gitopsConfig:
   # The SA envelope is identity-only; the CI pusher's authority is the
   # serviceAccount-subject PermissionGrant beside it.
   "grant.${SA_NAME}-write.yaml": |
-    apiVersion: project-hort.de/v1beta1
+    apiVersion: project-hort.de/v1
     kind: PermissionGrant
     metadata:
       name: ${SA_NAME}-write

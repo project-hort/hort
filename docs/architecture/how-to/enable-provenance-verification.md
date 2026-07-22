@@ -198,7 +198,7 @@ fail-closed — the proxy stays available on upstream flakiness).
 > v0.3 bundle.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: oci-verify-if-present
@@ -226,7 +226,7 @@ gate still applies). Unsigned, untrusted, or unverified artifacts stay
 quarantined. `required` never overrides an explicit Admin/Curator release.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: oci-required

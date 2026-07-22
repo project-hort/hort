@@ -202,7 +202,7 @@ The pair below produces a `dockerconfigjson` Secret for a
 docker-pull client:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: legacy-docker-puller
@@ -215,7 +215,7 @@ spec:
     rotationInterval: 6h
     validity: 24h
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: legacy-docker-puller-read
@@ -232,7 +232,7 @@ consumer (a publisher: `write` plus the `read` for the post-upload
 check — permissions are flat, `write` does not imply `read`):
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: legacy-pypi-pusher
@@ -245,7 +245,7 @@ spec:
     rotationInterval: 6h
     validity: 24h
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: legacy-pypi-pusher-write
@@ -256,7 +256,7 @@ spec:
   permission: write
   repository: pypi-internal
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: legacy-pypi-pusher-read

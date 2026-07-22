@@ -14,7 +14,7 @@
 # Per-repo scoped + two-claim subject: clears both the single-claim-grant and
 # wildcard-repo-non-admin linter rules (both reject by secure default).
 # Rationale for the second claim: see ci-readers.yaml.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: reader-read-oci-private-e2e

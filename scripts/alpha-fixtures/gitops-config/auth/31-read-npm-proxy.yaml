@@ -10,7 +10,7 @@
 # (the CliSession access token is a claims-carrying signed JWT) carries
 # [developer, ci-pusher], so this grant authorizes
 # `hort-cli list-versions npm-proxy <pkg>`.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: developers-read-npm-proxy

@@ -82,7 +82,7 @@ One envelope per cluster. The `issuerUrl` must match the cluster's
 `iss` claim string with no normalisation.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: OidcIssuer
 metadata:
   name: cluster-prod
@@ -134,7 +134,7 @@ are the SA's authority — the exchanged bearer's cap snapshots them
 at exchange time:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: prod-pypi-pusher
@@ -144,7 +144,7 @@ spec:
       claims:
         sub: system:serviceaccount:apps:pypi-publisher
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: prod-pypi-pusher-write

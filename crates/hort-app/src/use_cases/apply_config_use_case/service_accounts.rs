@@ -605,7 +605,7 @@ mod tests {
         claims.insert("repository".into(), "my-org/my-repo".into());
         claims.insert("environment".into(), "production".into());
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ServiceAccount,
             metadata: Metadata {
                 name: sa_name.into(),
