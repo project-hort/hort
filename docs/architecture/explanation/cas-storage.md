@@ -6,6 +6,9 @@ streams past.
 
 ## The port
 
+Abridged — the full trait also declares `get_range`, `delete`, `size_of`,
+`list_all`, and `backend_label`; see `hort-domain/src/ports/storage.rs`.
+
 ```rust
 pub trait StoragePort: Send + Sync {
     fn put(&self, stream: Box<dyn AsyncRead + Send + Unpin>)
@@ -200,7 +203,7 @@ if (handler-level validation OK?) then (yes)
       stop
     endif
     :build Artifact + event;
-    if (event passes 1 MB cap?) then (yes)
+    if (event passes 64 KB cap?) then (yes)
       if (commit_transition succeeds?) then (yes)
         #PaleGreen:ingested;
         stop
@@ -245,7 +248,7 @@ or per-tenant quotas.
 Also worth naming: each event-payload struct in `hort-domain/src/events/`
 has a `validate()` method that checks string-length and JSON-size
 limits, but the event-store adapter's
-`validate_and_serialize` only enforces the overall cap (now 1 MB —
+`validate_and_serialize` only enforces the overall 64 KB cap —
 see [event-sourcing.md](event-sourcing.md) §Security invariants) —
 it does not call `event.validate()`. Field-level payload invariants
 are currently not enforced on the append path. This is a known

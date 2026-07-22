@@ -161,8 +161,10 @@ closed-enum `denial_reason` (`subscription_use_case.rs`,
 security record a SIEM ingests. On the update path, a
 privileged-category refusal appends the same denied event, while an
 SSRF refusal returns the typed error and increments the
-`hort_subscription_ssrf_blocked_total` counter
-(`subscription_use_case.rs:845-850`).
+`hort_webhook_ssrf_block_total{reason}` counter
+(`subscription_use_case.rs`, `emit_ssrf_block`) — this name superseded an
+earlier `hort_subscription_ssrf_blocked_total` for the same emitter; there
+is exactly one emitter and one name, no double-count.
 
 ## Webhook targets are an outbound trust boundary
 

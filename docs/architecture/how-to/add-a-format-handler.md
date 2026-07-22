@@ -108,13 +108,14 @@ impl FormatHandler for MyFormatHandler {
     fn collision_key(&self, name: &str) -> Option<String> { None }
 
     // Override when the format's metadata is larger than
-    // the 64 KB default (e.g. npm packument per-version entries).
-    fn metadata_expected_max_bytes(&self) -> usize { 256 * 1024 }
+    // the 64 KB default (e.g. npm's real override is 5 * 1024 * 1024 —
+    // 5 MiB — for its largest packument per-version entries).
+    fn metadata_expected_max_bytes(&self) -> usize { 64 * 1024 }
 
     // Override to split large payloads to CAS via the
     // HashReference strategy. Default is Inline; only flip when
     // measurements show long-tail entries would otherwise hit the
-    // 1 MB event-payload ceiling.
+    // 64 KB event-payload ceiling.
     fn metadata_strategy(&self) -> MetadataStrategy { MetadataStrategy::Inline }
 
     // Called only when metadata_strategy is HashReference
@@ -237,14 +238,19 @@ let bytes = ctx
     .await?;
 ```
 
-Build `dedup_key` via the per-format `DedupKey::new_*` constructor
-(see `crates/hort-app/src/pull_dedup.rs`). The key namespace is
-`{format}:{repo_id}:{urlhash}` — coalescing across `repository_id`
-or across formats is forbidden by design (it would let one
-repository's upstream response leak into another's cache). Failure
-outcomes (`404`, `5xx`, `429`, network errors, timeouts, checksum
-mismatches) coalesce into the same short-cached response for every
-follower; do not write a second-attempt loop on top.
+Build `dedup_key` via `DedupKey::metadata(format, repo_id, url)` or
+`DedupKey::blob_by_url(format, repo_id, url)` (see
+`crates/hort-app/src/pull_dedup.rs`). Both are scoped
+`{format}:{repo_id}:{urlhash}` — coalescing across `repository_id` or
+across formats is forbidden by design for these two constructors (it would
+let one repository's upstream response leak into another's cache). A
+third constructor, `DedupKey::blob_by_hash(algorithm, hex_digest)`, is
+**deliberately the opposite**: cross-repository *and* cross-format,
+because the content hash is itself the natural dedup boundary — two
+callers of any shape asking for the same bytes can safely share the
+result. Failure outcomes (`404`, `5xx`, `429`, network errors, timeouts,
+checksum mismatches) coalesce into the same short-cached response for
+every follower; do not write a second-attempt loop on top.
 
 For a worked example see the four shipped formats:
 `crates/hort-http-cargo/src/upstream_pull.rs` (Cargo NDJSON +
@@ -418,7 +424,8 @@ Rules to respect:
 
 #### Architectural risk: read handlers are anonymous-by-default
 
-The global auth layer (`hort-http-core/src/router.rs:313-318`) dispatches
+The global auth layer (`hort-http-core/src/router.rs`, the
+`method_based_auth_dispatch` block) dispatches
 **by HTTP method**: every `GET`/`HEAD`/`OPTIONS` goes through
 `extract_optional_principal` (anonymous is *allowed* — the principal is
 `Option`), and only non-safe methods (`POST`/`PUT`/`DELETE`/…) go
@@ -561,24 +568,34 @@ At minimum:
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --lib
+cargo test --workspace
+cargo audit --deny warnings
+cargo deny check
 
 # Adapter-free guard (will fail fast if the dep list drifted):
 cargo tree -p hort-http-myfmt --edges normal --prefix none \
   | grep -E '^(hort-adapters-|sqlx |reqwest )' && exit 1 || true
 ```
 
+Use `cargo test --workspace`, not `--lib` — the `--lib`-only gate silently
+skips every `tests/` integration target, including DB-free structural
+guards like `crates/hort-formats/tests/version_discovery_participation.rs`
+(see CLAUDE.md's Pre-push Quality Checklist for the full rationale).
+
 Coverage: `hort-domain` and `hort-app` stay at 100 %; other crates at ≥ 85 %.
 
 ## The full `FormatHandler` method catalog
 
 `FormatHandler` (`crates/hort-domain/src/ports/format_handler.rs`) is a
-**flat trait with defaults**: three required methods and ~18 with inert
-defaults you override only when your format needs them. A handler that does
-nothing but identity + path parsing (the direct-upload-only Generic case)
-implements the three required methods and inherits everything else. The table
-below is the complete catalog, grouped by concern. "Default" is what a
-non-overriding handler gets; "Override when" is the trigger.
+**flat trait with defaults**: three required methods and 13 with inert
+defaults you override only when your format needs them. (The dependency-
+extraction/prefetch methods that used to also live here were split into
+their own `VersionDiscovery` trait — see below — so they no longer count
+as `FormatHandler` defaults.) A handler that does nothing but identity +
+path parsing (the direct-upload-only Generic case) implements the three
+required methods and inherits everything else. The table below is the
+complete catalog, grouped by concern. "Default" is what a non-overriding
+handler gets; "Override when" is the trigger.
 
 ### Identity, path, and registration
 
@@ -602,7 +619,7 @@ non-overriding handler gets; "Override when" is the trigger.
 
 | Method | Default | Override when |
 |---|---|---|
-| `classify_group_member(&self, coords, path) -> Option<GroupMembership>` | `None` | files group under one logical identity (Maven GAV, OCI image). Return `Some` (with identity-only `group_coords`, a `role`, and `is_primary`) for content files, `None` for non-members (sidecars, generated metadata). See the [artifact-groups section](#multifileartifact-artifact-groups-maven-worked-example). |
+| `classify_group_member(&self, coords, path) -> Option<GroupMembership>` | `None` | files group under one logical identity via this push-model hook (Maven GAV — the shipped instance). Return `Some` (with identity-only `group_coords`, a `role`, and `is_primary`) for content files, `None` for non-members (sidecars, generated metadata). **OCI does not use this hook** — its `classify_group_member` override is an explicit `None`-always stub; OCI image grouping is composed explicitly inside `OciManifestUseCase::put_manifest` (parses the manifest JSON, resolves blob references, calls `ArtifactGroupUseCase::add_member` once per member) rather than implicitly per-ingest. See the [artifact-groups section](#multifileartifact-artifact-groups-maven-worked-example). |
 | `resolve_mutable_version(&self, requested_path, available_paths) -> DomainResult<Option<String>>` | `Ok(None)` | the format has mutable (re-deployable) versions. **Maven SNAPSHOT only.** See [SNAPSHOT / mutable versions](#snapshot--mutable-versions). |
 
 ### Upstream verification (pull-through)
@@ -613,22 +630,47 @@ non-overriding handler gets; "Override when" is the trigger.
 | `upstream_checksum_metadata_path(&self, coords) -> Option<String>` | `None` | Case B / B-floor: the path of the metadata body carrying the published checksum (npm packument, PyPI per-version JSON, cargo NDJSON, Maven `.sha1` sidecar = the floor). Returning `Some` mandates overriding `parse_upstream_checksum` too. |
 | `parse_upstream_checksum(&self, body: &mut dyn Read, coords) -> DomainResult<UpstreamPublishedChecksum>` | `Err(Invariant)` | Case B / B-floor: parse the body → checksum. **Streaming** (`&mut dyn Read`, ADR 0026). No soft-fail — a malformed body or a well-formed body without a checksum is `Err(Validation)` → 502. |
 
-### Dependency extraction / prefetch (transitive cascade)
+### Dependency extraction / prefetch (transitive cascade) — the `VersionDiscovery` trait
 
-These back the scheduled/transitive prefetch cascade. Every one is an inert
-default today for Maven (Maven prefetch is deferred — ADR 0000 open-items);
-npm/cargo/pypi implement them.
+These eight members back the scheduled/transitive prefetch cascade, but
+**they do not live on `FormatHandler` any more** (issue #58). They were
+split into a separate `pub trait VersionDiscovery` with **no default method
+bodies** — every member is required for any format that participates at
+all. Participation is gated by a single accessor on `FormatHandler`:
 
-| Method | Default | Override when |
-|---|---|---|
-| `extract_upstream_versions(&self, body: &mut dyn Read) -> DomainResult<Vec<String>>` | `Ok(vec![])` | scheduled prefetch-tick needs the upstream version set (npm packument keys, cargo NDJSON `vers`, PyPI anchors). **Streaming** (ADR 0026). |
-| `upstream_metadata_path(&self, package) -> Option<String>` | `None` | the version-AGNOSTIC metadata-index path (npm packument, cargo sparse-index entry, PyPI simple index). |
-| `upstream_metadata_accept(&self) -> Vec<String>` | `vec![]` | the metadata fetch needs an `Accept` header (PyPI PEP 691 JSON negotiation). |
-| `extract_dependency_specs(&self, content: &mut dyn Read) -> DomainResult<Vec<DependencySpec>>` | `Ok(vec![])` | the format declares runtime deps inside its archive (npm `package.json`, cargo `Cargo.toml`, PyPI `METADATA`). **Runtime classes only** — never dev/test/peer. **Streaming** (ADR 0026, archive-aware). |
-| `resolve_range_max(&self, range, available) -> DomainResult<Option<String>>` | `Ok(None)` | the format has a version-range grammar (`^1.2`, `>=2,<3`, `[1.0,2.0)`). Range-max only, not a SAT solver. |
-| `download_config_path(&self) -> Option<String>` | `None` | the leaf prefetch must fetch a registry config doc to learn its download URL (cargo `/config.json`, whose `dl` field is authoritative). Pairs with `compose_download_url_from_config`. |
-| `compose_download_url_from_config(&self, config_body, package, version, cksum_hex) -> DomainResult<String>` | `Err(Validation)` | the format composes its download URL from the config doc (cargo: parse `dl` + substitute the spec placeholders). Reached only when `download_config_path` returns `Some`. |
-| `resolve_download_url_from_metadata(&self, body: &mut dyn Read, coords) -> DomainResult<String>` | `Err(Validation)` | the AUTHORITATIVE download URL lives in the already-fetched upstream metadata (npm `versions[ver].dist.tarball`). **Streaming** (ADR 0026); rejects non-`https`. PyPI fans out per-distribution from the per-version JSON instead; cargo uses the config-doc pair above. |
+```rust
+fn version_discovery(&self) -> Option<&dyn VersionDiscovery> { None }
+```
+
+A format either implements the whole group (returns `Some(self)` from the
+accessor, after a separate `impl VersionDiscovery for …FormatHandler`
+block) or inherits `None` and never reaches any of the eight methods —
+there is no per-method opt-in and no `capabilities() -> &[Group]` flag (a
+flag can disagree with reality; the accessor can't). **npm, Cargo, and
+PyPI are the shipped instances**, each implementing a strict subset of the
+eight (cargo 6, npm 5, pypi 5 — the rest return the same inert value the
+old `FormatHandler`-level defaults supplied). **OCI, Maven, and Helm do not
+implement the trait at all** and inherit the accessor's `None`. See ADR
+0005's "Realisation note (VersionDiscovery — shipped, issue #58)" for the
+full rationale, including why `resolve_mutable_version` (Maven SNAPSHOT
+resolution) belongs to `MultiFileArtifact`, not this trait, despite living
+in the same "dependency extraction" mental bucket.
+
+| Method | Override when |
+|---|---|
+| `extract_upstream_versions(&self, body: &mut dyn Read) -> DomainResult<Vec<String>>` | scheduled prefetch-tick needs the upstream version set (npm packument keys, cargo NDJSON `vers`, PyPI anchors). **Streaming** (ADR 0026). |
+| `upstream_metadata_path(&self, package) -> Option<String>` | the version-AGNOSTIC metadata-index path (npm packument, cargo sparse-index entry, PyPI simple index). |
+| `upstream_metadata_accept(&self) -> Vec<String>` | the metadata fetch needs an `Accept` header (PyPI PEP 691 JSON negotiation). |
+| `extract_dependency_specs(&self, content: &mut dyn Read) -> DomainResult<Vec<DependencySpec>>` | the format declares runtime deps inside its archive (npm `package.json`, cargo `Cargo.toml`, PyPI `METADATA`). **Runtime classes only** — never dev/test/peer. **Streaming** (ADR 0026, archive-aware). |
+| `resolve_range_max(&self, range, available) -> DomainResult<Option<String>>` | the format has a version-range grammar (`^1.2`, `>=2,<3`, `[1.0,2.0)`). Range-max only, not a SAT solver. |
+| `download_config_path(&self) -> Option<String>` | the leaf prefetch must fetch a registry config doc to learn its download URL (cargo `/config.json`, whose `dl` field is authoritative). Pairs with `compose_download_url_from_config`. |
+| `compose_download_url_from_config(&self, config_body, package, version, cksum_hex) -> DomainResult<String>` | the format composes its download URL from the config doc (cargo: parse `dl` + substitute the spec placeholders). Reached only when `download_config_path` returns `Some`. |
+| `resolve_download_url_from_metadata(&self, body: &mut dyn Read, coords) -> DomainResult<String>` | the AUTHORITATIVE download URL lives in the already-fetched upstream metadata (npm `versions[ver].dist.tarball`). **Streaming** (ADR 0026); rejects non-`https`. PyPI fans out per-distribution from the per-version JSON instead; cargo uses the config-doc pair above. |
+
+If your new format doesn't implement `VersionDiscovery` at all, leave
+`version_discovery()` at its default (`None`) — do not add per-method
+overrides on `FormatHandler` for these names; the compiler will reject
+them, since they no longer exist there.
 
 ### SBOM / content extraction
 

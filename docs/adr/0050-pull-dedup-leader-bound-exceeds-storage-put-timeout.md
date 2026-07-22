@@ -10,7 +10,7 @@
   independent environment variables, which is precisely why the relationship
   needs recording.
 - **Supersedes:** —
-- **Relates:** [0007](0007-quarantine-release-authority.md) (the release
+- **Relates:** [0007](0007-fail-closed-quarantine-release-predicate.md) (the release
   predicate the coalesce path must never influence); issue #53 (the
   openbao 2.6.0 layer that was unpullable for days); issue #55 (the wedged
   coalesce leader that was #53's root cause, fixed in `!168`).
@@ -62,7 +62,7 @@ Two corollaries follow:
   evicted and a `Failed{Timeout}` terminal is written under the existing
   negative-cache TTL, so the next request elects a fresh leader. A bound must
   never degrade into "proceed without the guarantee" — the coalesce path sits in
-  front of ingest, and ingest is where [ADR 0007](0007-quarantine-release-authority.md)'s
+  front of ingest, and ingest is where [ADR 0007](0007-fail-closed-quarantine-release-predicate.md)'s
   fail-closed release authority is established.
 
 ## Consequences

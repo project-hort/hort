@@ -9,9 +9,11 @@ Thanks for your interest in contributing! Here's how to get started.
 3. Create a feature branch: `git checkout -b feat/your-change` (`feat/`,
    `fix/`, `chore/`, `docs/`)
 4. Make your changes
-5. Run checks: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --lib && cargo audit --deny warnings`
+5. Run checks: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo audit --deny warnings && cargo deny check`
 6. Commit and push to your fork
-7. Open a Pull Request against `main`
+7. Open a Pull Request against `develop` (the integration trunk — `main`
+   only receives the deliberate `develop` → `main` release-promotion MR;
+   see `RELEASING.md`)
 
 ## Development Setup
 
