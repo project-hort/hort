@@ -50,7 +50,15 @@ and `args: ["serve"]` (k8s) are therefore correct and identical.
 | `scrub [FLAGS]` | CAS integrity scrubber — re-hash stored blobs, detect drift. | **full `Config`** |
 | `admin <SUB>` | Admin-user / service-token management (nested, required). | `MinimalConfig` |
 | `reconcile-groups [--since]` | Heal artifacts whose ingest-path group commit dropped between the `ArtifactIngested` and `ArtifactGroupMemberAdded` transactions. | `MinimalConfig` |
+| `verify-event-chain` | Offline tamper-evident event-chain verifier (ADR 0002): recomputes every per-stream hash chain, cross-checks live heads against anchored signed checkpoints, exits `0`=ok/`2`=broken/`3`=missing_checkpoint/`1`=operational error. Read-only — never writes or migrates. | `MinimalConfig` |
+| `enqueue-quarantine-release-sweep` | Enqueue one `quarantine-release-sweep` job and exit; the always-on worker dispatches it to `QuarantineReleaseSweepHandler`. The default `executionPath: dsn-direct` CronJob. | `MinimalConfig` |
+| `seed-import` | Parse an operator-supplied TSV describing a dependency cutover set and enqueue one `seed-import` job; the worker bulk-registers each item with a backdated `quarantine_window_start` (the *time* gate only — scan gate unchanged). One-shot, operator-invoked. | `MinimalConfig` |
+| `enqueue-prefetch-tick` | Enqueue one `prefetch-tick` job and exit; the worker dispatches `PrefetchTickHandler` over every scheduled-eligible repo + tracked package. | `MinimalConfig` |
+| `enqueue-prefetch-row-retention-sweep` | Enqueue one `prefetch-row-retention-sweep` job and exit; the worker deletes terminal `kind LIKE 'prefetch%'` rows older than a configurable horizon (default 7 days). | `MinimalConfig` |
+| `enqueue-wheel-metadata-backfill` | Enqueue one `wheel-metadata-backfill` job and exit; the worker retrofits PEP 658 `wheel_metadata` ContentReferences for pre-existing PyPI wheels. | `MinimalConfig` |
 | `validate-config [--strict]` | Offline gitops-config validation (CI pre-merge gate); see [§ `validate-config`](#validate-config). | _none_ — DSN-free; reads its own env directly |
+| `license [--full]` | Print hort's license identifier (and, with `--full`, the complete license texts) to stdout and exit. | _none_ — synchronous, no config, no DSN |
+| `attribution [--format json]` | Print the generated third-party attribution document (Markdown or JSON) to stdout and exit. | _none_ — synchronous, no config, no DSN |
 
 `--help` / `--version` work at the top level and on every subcommand.
 Unknown subcommand → clap `InvalidSubcommand` (non-zero exit). On error
@@ -471,6 +479,10 @@ it is referenced, not scheduled here.
 | `HORT_STATEFUL_UPLOAD_STAGING_DIR` | path | _derived_ | No | Stateful-upload chunk staging root. Default: `<HORT_STORAGE_FILESYSTEM_PATH>/stateful-upload-staging` (filesystem) or `/var/lib/hort/stateful-upload-staging` (S3, + boot WARN). |
 | `HORT_OCI_LEGACY_CATALOG_ENABLED` | bool | `false` | No | Mount the Docker-legacy global `/v2/_catalog`. |
 | `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` | u32 | `32` | No | Per-(repo, principal) OCI upload-session cap. |
+| `HORT_OCI_SESSION_MAX_AGE_SECS` | u64 | `3600` | No | OCI upload-session TTL. Hard-rejected above 7 days (`604800`) — a boot-time interlock. |
+| `HORT_EVENT_CHAIN_CHECKPOINT_CADENCE_SECS` | u64 | `3600` | No | Signed-checkpoint cadence for the tamper-evident event chain (ADR 0002). Read by the always-on `eventstore-checkpoint` `dsn-direct` task. |
+| `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS` | u64 | `86400` | No | Expected cadence of the `verify-event-chain` CronJob, used only to derive the staleness gauge (matches the chart's default `verifyEventChain` schedule). A query failure is logged and treated as "unknown" — never blocks boot. |
+| `HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the expected interval above before the last-run gauge is considered stale (tolerates missed ticks before alarming). |
 
 ---
 
