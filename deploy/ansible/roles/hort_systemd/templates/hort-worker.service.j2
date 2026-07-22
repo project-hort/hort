@@ -20,6 +20,17 @@ ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
 ReadWritePaths={{ hort_systemd_cas_dir }}
+# Scanner subprocesses (trivy, osv-scanner) need a writable, persistent cache.
+# HOME (/var/lib/hort) is read-only under ProtectSystem=strict, so trivy cannot
+# create $HOME/.cache for its vulnerability DB and every scan fails — the
+# artifact then never gains release authority and stays quarantined forever
+# (issue #74). CacheDirectory=hort-worker → /var/cache/hort-worker (User/Group-
+# owned, auto-added to ReadWritePaths), persistent across restarts so the
+# ~101 MiB trivy DB is not re-downloaded each boot. TRIVY_CACHE_DIR /
+# XDG_CACHE_HOME redirect the scanners' caches there (osv-scanner honours XDG).
+CacheDirectory=hort-worker
+Environment=TRIVY_CACHE_DIR=/var/cache/hort-worker/trivy
+Environment=XDG_CACHE_HOME=/var/cache/hort-worker
 CapabilityBoundingSet=
 # Worker needs AF_UNIX for the local postgres socket and AF_INET/AF_INET6
 # for scanner advisory API calls and upstream registry fetches.
