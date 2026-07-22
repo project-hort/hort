@@ -49,21 +49,32 @@ Before `helm install` you need:
   `replicaCount > 1` requires `ephemeralStore.backend: redis` — the
   in-memory store cannot share state across pods.
 
-### Storage caveat — range-read integrity (filesystem backend)
+### Storage caveat — range-read integrity
 
-When the chart uses `storage.backend: filesystem` (the default), range-read
-responses to large blob downloads are served by streaming offsets out of
-the on-disk file without re-verifying the SHA-256 of the slice against the
-manifest digest. The whole-object integrity check happens at PUT time (the
-CAS guarantee), and an offset read of an unmodified file returns the same
-bytes. The narrow risk is host-level corruption — filesystem bitrot, or a
-concurrent process tampering with files under the PVC mount — where a
-partial slice read could differ from the originally-stored content without
-a checksum mismatch surfacing. Operators with a strict
-integrity-on-every-read requirement should use `storage.backend: s3` (the
-S3 adapter re-verifies on slice) or wait for the planned chunked-CAS
-work. This is an accepted, documented limitation of the filesystem
-backend.
+Blob reads are integrity-checked as follows, identically on **both** storage
+backends (`filesystem` and `s3`):
+
+- **Full downloads *are* re-verified on read.** The storage adapter wraps the
+  read stream in a streaming SHA-256 verifier (`VerifyingReader`, ADR 0003):
+  bytes are hashed as they flow and a mismatch surfaces at EOF as a read error
+  (and bumps `hort_storage_integrity_failures_total`). So integrity is enforced
+  at PUT time (the CAS write) **and** re-checked incrementally on every full
+  read — not only at PUT.
+- **Range reads are *not* re-verified.** A partial slice `[offset, offset+len)`
+  cannot be hashed against the *whole-object* SHA-256 without reading the entire
+  object, which would defeat the range request — so both adapters intentionally
+  skip the verifier for `get_range`. An offset read of an unmodified file returns
+  the same bytes; the narrow residual risk is host-level corruption (filesystem
+  bitrot, or a process tampering with files under the PVC mount) where a partial
+  slice could differ from the stored content without a checksum mismatch
+  surfacing on that read.
+
+Switching `storage.backend: filesystem → s3` does **not** change this — the S3
+adapter skips slice verification for `get_range` identically (see its
+`get_range` rationale, which points back to the filesystem one). The backstop
+for at-rest range-read integrity is the daily `hort-server scrub` CronJob
+(below), which re-hashes every blob; operators on range-heavy workloads should
+treat its cadence as load-bearing.
 
 The chart ships a daily `hort-server scrub` CronJob
 (`templates/cronjob-scrub.yaml`, gated by `scheduledTasks.scrub.enabled`,
