@@ -1,4 +1,4 @@
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: hort-crates

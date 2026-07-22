@@ -2322,7 +2322,7 @@ mod tests {
             curation_rules: None,
         };
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ArtifactRepository,
             metadata: Metadata { name: name.into() },
             spec,
@@ -2351,7 +2351,7 @@ mod tests {
         claim: &str,
     ) -> Envelope<ClaimMappingSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ClaimMapping,
             metadata: Metadata {
                 // Mirror `claim_mapping_identity_name` (module-private)
@@ -2375,7 +2375,7 @@ mod tests {
         repo: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -2398,7 +2398,7 @@ mod tests {
         repo: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -2422,7 +2422,7 @@ mod tests {
         repo: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -2442,7 +2442,7 @@ mod tests {
         reason: &str,
     ) -> Envelope<hort_config::curation_rule::CurationRuleSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::CurationRule,
             metadata: Metadata { name: name.into() },
             spec: hort_config::curation_rule::CurationRuleSpec {
@@ -2458,7 +2458,7 @@ mod tests {
         name: &str,
     ) -> Envelope<ScanPolicySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ScanPolicy,
             metadata: Metadata { name: name.into() },
             spec: ScanPolicySpec {
@@ -2484,7 +2484,7 @@ mod tests {
         cve: &str,
     ) -> Envelope<ExclusionSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::Exclusion,
             metadata: Metadata { name: name.into() },
             spec: ExclusionSpec {
@@ -2934,7 +2934,7 @@ mod tests {
         overrides: hort_config::lint_config::RuleOverridesSpec,
     ) {
         let env = Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrantLintConfig,
             metadata: Metadata { name: name.into() },
             spec: hort_config::lint_config::PermissionGrantLintConfigSpec {
@@ -4082,7 +4082,7 @@ mod tests {
         upstream_url: &str,
     ) -> Envelope<UpstreamMappingSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::UpstreamMapping,
             metadata: Metadata { name: name.into() },
             spec: UpstreamMappingSpec {
@@ -4345,7 +4345,7 @@ mod tests {
         location: &str,
     ) -> Envelope<UpstreamMappingSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::UpstreamMapping,
             metadata: Metadata { name: name.into() },
             spec: UpstreamMappingSpec {
@@ -5289,7 +5289,7 @@ mod tests {
     /// `scan_policy_env` for everything else.
     fn scan_policy_with_backends(name: &str, backends: Vec<&str>) -> Envelope<ScanPolicySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ScanPolicy,
             metadata: Metadata { name: name.into() },
             spec: ScanPolicySpec {
@@ -6213,7 +6213,7 @@ mod tests {
         provenance_identities: Vec<SignerIdentitySpec>,
     ) -> Envelope<ScanPolicySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ScanPolicy,
             metadata: Metadata { name: name.into() },
             spec: ScanPolicySpec {
@@ -6247,7 +6247,7 @@ mod tests {
         provenance_identities: Vec<SignerIdentitySpec>,
     ) -> Envelope<ScanPolicySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ScanPolicy,
             metadata: Metadata { name: name.into() },
             spec: ScanPolicySpec {
@@ -6699,7 +6699,7 @@ mod tests {
         backends: Vec<&str>,
     ) -> Envelope<ScanPolicySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ScanPolicy,
             metadata: Metadata { name: name.into() },
             spec: ScanPolicySpec {
@@ -6733,7 +6733,7 @@ mod tests {
         name: &str,
     ) -> Envelope<OidcIssuerSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::OidcIssuer,
             metadata: Metadata { name: name.into() },
             spec: OidcIssuerSpec {
@@ -6762,7 +6762,7 @@ mod tests {
             }
         };
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ServiceAccount,
             metadata: Metadata {
                 name: sa_name.into(),

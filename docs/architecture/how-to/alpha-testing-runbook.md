@@ -706,7 +706,7 @@ SVC_USER_ID="$(docker exec hort-alpha-postgres psql -U registry -d artifact_regi
     -tAc "SELECT id FROM users WHERE username = 'svc_alpha-operator';")"
 mkdir -p "$HORT_CONFIG_DIR/permissions"
 cat > "$HORT_CONFIG_DIR/permissions/alpha-curator.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: alpha-svc-curator

@@ -835,7 +835,7 @@ mod tests {
 
     fn repo_env(name: &str) -> Envelope<RepositorySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ArtifactRepository,
             metadata: Metadata { name: name.into() },
             spec: repo_spec(name),
@@ -844,7 +844,7 @@ mod tests {
 
     fn cm_env(name: &str, idp_group: &str, claim: &str) -> Envelope<ClaimMappingSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ClaimMapping,
             metadata: Metadata { name: name.into() },
             spec: ClaimMappingSpec {
@@ -1090,7 +1090,7 @@ mod tests {
         repository: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: pg_claims_spec(required, permission, repository),
@@ -1104,7 +1104,7 @@ mod tests {
         repository: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -1126,7 +1126,7 @@ mod tests {
         repository: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -1189,7 +1189,7 @@ mod tests {
 
     fn cr_env(name: &str, action: &str) -> Envelope<CurationRuleSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::CurationRule,
             metadata: Metadata { name: name.into() },
             spec: cr_spec(action),
@@ -1629,7 +1629,7 @@ mod tests {
 
     fn oidc_env(name: &str) -> Envelope<OidcIssuerSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::OidcIssuer,
             metadata: Metadata { name: name.into() },
             spec: oidc_spec(),
@@ -1666,7 +1666,7 @@ mod tests {
 
     fn sa_env(name: &str) -> Envelope<ServiceAccountSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ServiceAccount,
             metadata: Metadata { name: name.into() },
             spec: sa_spec(),

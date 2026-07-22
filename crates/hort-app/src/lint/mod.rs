@@ -76,7 +76,7 @@ mod tests {
         allowlist: &[&str],
     ) -> hort_config::envelope::Envelope<PermissionGrantLintConfigSpec> {
         hort_config::envelope::Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrantLintConfig,
             metadata: Metadata {
                 name: "rbac-lint".into(),

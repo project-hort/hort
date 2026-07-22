@@ -159,7 +159,7 @@ runs **federation-only**: PATs for developers, federation for CI, no Keycloak.
 ### 3a. Declare the `OidcIssuer`
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: OidcIssuer
 metadata:
   name: github-actions
@@ -188,7 +188,7 @@ are the SA's authority
 the exchanged token's cap snapshots them at exchange time:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: gha-myorg-myrepo-prod-pypi
@@ -199,7 +199,7 @@ spec:
         repository: my-org/my-repo
         environment: production
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: gha-myorg-myrepo-prod-pypi-write
@@ -210,7 +210,7 @@ spec:
   permission: write
   repository: pypi-internal
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: gha-myorg-myrepo-prod-pypi-read
@@ -315,7 +315,7 @@ The `issuerUrl` is the GitLab instance's base URL. For
 `gitlab.com`:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: OidcIssuer
 metadata:
   name: gitlab-com
@@ -338,7 +338,7 @@ GitLab's claim shape is project-centric. Match on `project_path`
 `ref_protected: 'true'`:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: glci-myorg-myrepo-pypi
@@ -350,7 +350,7 @@ spec:
         ref: main
         ref_protected: 'true'
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: glci-myorg-myrepo-pypi-write

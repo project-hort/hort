@@ -469,7 +469,7 @@ write_rescan_scan_policy_yaml() {
 # (test-vulnerability-scan.sh covers that producer-pipeline shape).
 # We only assert that ScanCompleted events fire and the metric labels
 # emit correctly.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: ${SCAN_POLICY_NAME}

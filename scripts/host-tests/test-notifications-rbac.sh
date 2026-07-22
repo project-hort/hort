@@ -215,7 +215,7 @@ mkdir -p "$CONFIG_DIR/auth" "$CONFIG_DIR/repositories"
 # A hosted repo for the Claims-subject grant to target. Mirrors the
 # shipped pypi-e2e.yaml shape exactly.
 cat > "$CONFIG_DIR/repositories/${RBAC_REPO}.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: ${RBAC_REPO}
@@ -235,7 +235,7 @@ EOF
 # [developer, team-alpha] additive-claims set the grant requires). One
 # CRD per (idp_group, claim) tuple — flat additive model.
 cat > "$CONFIG_DIR/auth/init40-claim-mappings.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: developers-team-to-developer
@@ -243,7 +243,7 @@ spec:
   idpGroup: ${IDP_GROUP_A}
   claim: ${CLAIM_DEV}
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: developers-team-to-team-alpha
@@ -251,7 +251,7 @@ spec:
   idpGroup: ${IDP_GROUP_A}
   claim: ${CLAIM_TEAM}
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: team-alpha-to-developer
@@ -259,7 +259,7 @@ spec:
   idpGroup: ${IDP_GROUP_B}
   claim: ${CLAIM_DEV}
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: team-alpha-to-team-alpha
@@ -271,7 +271,7 @@ EOF
 # Claims-subject PermissionGrant: requires the additive set
 # [developer, team-alpha]; grants Read on the seeded repo.
 cat > "$CONFIG_DIR/auth/init40-claims-grant.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: init40-claims-read-${RBAC_REPO}

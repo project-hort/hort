@@ -77,7 +77,7 @@ cargo run -p hort-server
 #    docs/architecture/how-to/declare-gitops-config.md.
 mkdir -p /tmp/hort-config/repositories
 cat > /tmp/hort-config/repositories/pypi-dev.yaml <<'YAML'
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: pypi-dev

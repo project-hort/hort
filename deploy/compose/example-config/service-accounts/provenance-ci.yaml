@@ -12,7 +12,7 @@
 # resolves User-subject grants only (claims stay empty there, ADR 0036), so
 # the claims-based dev-user grants cannot back a native-token principal.
 # Inert in legacy (no-overlay) runs: the SA row exists, nothing mints for it.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: provenance-ci

@@ -5,7 +5,7 @@
 # grant the SA's admin-minted hort_svc_* token would carry an empty access[]
 # on a pull-scoped /v2/auth request (the repo is isPublic: false). Read-only
 # by design — the scenario never pushes with this identity.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: oci-private-e2e-reader-read

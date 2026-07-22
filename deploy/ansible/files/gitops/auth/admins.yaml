@@ -9,7 +9,7 @@
 # HORT_OIDC_ISSUER_URL at it (the hort role's Dex sidecar is the
 # dogfood/recommended minimal IdP; replace `hort-admins` with your real SSO
 # group claim if you front your org IdP instead).
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins

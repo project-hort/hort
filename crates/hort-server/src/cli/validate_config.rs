@@ -390,7 +390,7 @@ mod tests {
     // A minimal, well-formed hosted OCI repo on filesystem — clean under
     // every static rule. Used as the "valid small fixture".
     const REPO_OCI_HOSTED: &str = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: oci-hosted
@@ -616,7 +616,7 @@ spec:
     #[test]
     fn validate_tree_row_7b_storage_backend_mismatch_is_exit_1() {
         let repo = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: s3-on-fs
@@ -644,7 +644,7 @@ spec:
     #[test]
     fn validate_tree_row_5_trust_pt_with_empty_scan_backends_is_exit_1() {
         let repo = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: oci-proxy
@@ -661,7 +661,7 @@ spec:
     upstreamUrl: https://index.docker.io
 ";
         let mapping = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: oci-proxy-library
@@ -674,7 +674,7 @@ spec:
     type: anonymous
 ";
         let policy = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: p-collapse
@@ -702,7 +702,7 @@ spec:
     #[test]
     fn validate_tree_row_6_prefetch_max_age_days_is_exit_1() {
         let repo = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: npm-proxy
@@ -732,7 +732,7 @@ spec:
     #[test]
     fn validate_tree_row_7_provenance_required_on_no_verifier_format_is_exit_1() {
         let repo = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: npm-proxy
@@ -749,7 +749,7 @@ spec:
     upstreamUrl: https://registry.npmjs.org
 ";
         let policy = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: p-req-npm
@@ -783,7 +783,7 @@ spec:
     #[test]
     fn validate_tree_row_8_single_claim_grant_is_exit_1() {
         let repo = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: npm-proxy
@@ -800,7 +800,7 @@ spec:
         // A single-claim ([developer]) grant — the linter rejects it
         // (single-claim-grant rule, `reject` by secure default).
         let grant = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: single-claim-read
@@ -826,7 +826,7 @@ spec:
     #[test]
     fn validate_tree_warnings_only_strict_promotion() {
         let issuer = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: OidcIssuer
 metadata:
   name: github-actions
@@ -840,7 +840,7 @@ spec:
         // An SA with a single FI constrained by ONLY `repository` — an
         // under-constrained advisory (a warning, not an error).
         let sa = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: ci-loose

@@ -62,7 +62,7 @@ impl ApplyConfigUseCase {
             let desired_specs: Vec<ExclusionSpec> =
                 ex_envs.iter().map(|e| e.spec.clone()).collect();
             let synthetic = Envelope {
-                api_version: hort_config::envelope::ApiVersion::V1Beta1,
+                api_version: hort_config::envelope::ApiVersion::default(),
                 kind: Kind::Exclusion,
                 metadata: hort_config::envelope::Metadata {
                     name: format!("__bundle__{policy_name}"),

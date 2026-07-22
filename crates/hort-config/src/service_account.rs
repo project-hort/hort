@@ -481,7 +481,7 @@ mod tests {
 
     fn yaml(name: &str, body: &str) -> String {
         format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: ServiceAccount\nmetadata:\n  name: {name}\nspec:{body}"
+            "apiVersion: project-hort.de/v1\nkind: ServiceAccount\nmetadata:\n  name: {name}\nspec:{body}"
         )
     }
 
@@ -605,7 +605,7 @@ mod tests {
         // The full retired-authority envelope shape fails apply at
         // parse — no field is silently ignored.
         let doc = "\
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: ci-pypi-pusher
@@ -627,7 +627,9 @@ spec:
 
     #[test]
     fn parse_rejects_empty_metadata_name() {
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1\nkind: ServiceAccount\nmetadata:\n  name: ''\nspec: {}".to_string();
+        let yaml_doc =
+            "apiVersion: project-hort.de/v1\nkind: ServiceAccount\nmetadata:\n  name: ''\nspec: {}"
+                .to_string();
         let err = parse_service_account(&p(), yaml_doc.as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::EmptyMetadataName));
     }
@@ -1028,7 +1030,7 @@ spec:
     #[test]
     fn validate_rejects_blank_metadata_name() {
         let env = Envelope {
-            api_version: crate::envelope::ApiVersion::V1Beta1,
+            api_version: crate::envelope::ApiVersion::V1,
             kind: Kind::ServiceAccount,
             metadata: crate::envelope::Metadata { name: "   ".into() },
             spec: ServiceAccountSpec {

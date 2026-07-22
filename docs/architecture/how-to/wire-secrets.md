@@ -37,7 +37,7 @@ Every pattern below ends in the same Hort-side YAML: a standalone
 `type: proxy` repository:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -130,7 +130,7 @@ spec:
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -171,7 +171,7 @@ on the operator side.
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -216,7 +216,7 @@ interval picks up upstream rotations.
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -277,7 +277,7 @@ spec:
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -318,7 +318,7 @@ Mount identically to 2.4 (`csi.driver: secrets-store.csi.k8s.io`,
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -360,7 +360,7 @@ Mount identically to 2.4.
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -408,7 +408,7 @@ Mount identically to 2.4.
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -465,7 +465,7 @@ spec:
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -513,7 +513,7 @@ stringData:
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -561,7 +561,7 @@ container.
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -613,7 +613,7 @@ Hort does not see the env var `$CREDENTIALS_DIRECTORY` — `secretRef:
 file` requires an absolute path. Hard-code the resolved path:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream
@@ -647,7 +647,7 @@ cargo run -p hort-server
 Hort side:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: ghcr-mirror-upstream

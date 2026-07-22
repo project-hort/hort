@@ -355,7 +355,7 @@ fn unbacked_authority_message(svc_name: &str, unbacked: &[Permission]) -> String
     );
     for name in &names {
         msg.push_str(&format!(
-            "\n  apiVersion: project-hort.de/v1beta1\n  kind: PermissionGrant\n  \
+            "\n  apiVersion: project-hort.de/v1\n  kind: PermissionGrant\n  \
              metadata: {{ name: {svc_name}-{name} }}\n  spec:\n    \
              subject: {{ kind: serviceAccount, name: {svc_name} }}\n    \
              permission: {name}        # global (no repository:)\n"
@@ -1318,10 +1318,7 @@ mod tests {
         );
         assert!(msg.contains("admin_task_invoke"));
         assert!(msg.contains("permission: read"));
-        assert_eq!(
-            msg.matches("apiVersion: project-hort.de/v1beta1").count(),
-            2
-        );
+        assert_eq!(msg.matches("apiVersion: project-hort.de/v1").count(), 2);
         assert_eq!(msg.matches("metadata: { name: cronjob-tasks-").count(), 2);
     }
 

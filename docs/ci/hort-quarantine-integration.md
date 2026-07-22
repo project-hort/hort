@@ -82,7 +82,7 @@ alone is flagged by hort's under-constrained-FI linter — see
 explicit grants alongside:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: github-ci
@@ -94,7 +94,7 @@ spec:
         repository: project-hort/hort
         aud: hort-server
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: github-ci-read
@@ -105,7 +105,7 @@ spec:
   permission: read         # pull + discovery; no curate/admin
   # repository omitted = global; scope per-repo per your layout
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: github-ci-prefetch

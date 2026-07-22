@@ -61,7 +61,7 @@ error.
 ### `kind: ClaimMapping` — map an IdP group to a claim
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: developers
@@ -69,7 +69,7 @@ spec:
   idpGroup: hort-developers   # verbatim match against the OIDC groups claim
   claim: developer                       # the resolved claim name
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: team-alpha
@@ -77,7 +77,7 @@ spec:
   idpGroup: team-alpha
   claim: team-alpha
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins
@@ -89,7 +89,7 @@ spec:
 ### `kind: PermissionGrant` — claim-gated grant
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: alpha-devs-write-pypi-alpha
@@ -110,7 +110,7 @@ scoping mechanism.
 ### `kind: PermissionGrant` — direct user grant (break-glass)
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: incident-2026-05-bob-admin
@@ -161,7 +161,7 @@ The SA's authority is its explicit `serviceAccount`-subject
 `PermissionGrant`s, declared alongside:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: ci-deployer
@@ -172,7 +172,7 @@ spec:
         repository: my-org/my-repo
         ref: refs/heads/main
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: ci-deployer-write-pypi-internal
@@ -183,7 +183,7 @@ spec:
   permission: write
   repository: pypi-internal
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: ci-deployer-read-pypi-internal
@@ -352,7 +352,7 @@ escape hatch is the singleton gitops kind
 declaration is a named apply error, never a silent last-wins):
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrantLintConfig
 metadata:
   name: rbac-lint

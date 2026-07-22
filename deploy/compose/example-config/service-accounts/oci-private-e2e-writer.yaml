@@ -15,7 +15,7 @@
 # in auth/oci-private-e2e-writer-write.yaml. Inert in legacy (no-overlay)
 # runs: the SA row exists, nothing mints for it — the scenario's Basic-mode
 # branch keeps using dev-user's OIDC token instead.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: oci-private-e2e-writer
