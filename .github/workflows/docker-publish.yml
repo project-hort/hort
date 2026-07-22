@@ -414,7 +414,14 @@ jobs:
     name: Mirror base images to registry.hort.rs/hort-base
     runs-on: ubuntu-latest
     environment: release
-    needs: [merge]
+    # needs: [merge, mirror-to-hort-oci] (not just merge) — serializes the
+    # two bulk cosign-copy pushes (issue #66 Part B) so they don't hammer
+    # registry.hort.rs concurrently on release-tag pushes. Defense-in-depth
+    # only: the real fix is the auth-scope rate-limit change in this same
+    # commit (failures-only counting) — this alone would not have prevented
+    # the original 429s, since each job's OWN burst already exceeded the
+    # per-IP cap regardless of the other job running concurrently.
+    needs: [merge, mirror-to-hort-oci]
     permissions:
       contents: read
       id-token: write   # mint the OIDC token for the gha-release SA exchange
