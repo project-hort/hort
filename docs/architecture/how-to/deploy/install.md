@@ -342,7 +342,7 @@ ephemeralStore: {backend: memory}
 
 ```bash
 helm install hort oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server \
-  --version 2.0.0-rc.7 -n hort --create-namespace \
+  --version 0.9.12-dev -n hort --create-namespace \
   -f values.yaml
 ```
 
@@ -394,7 +394,7 @@ podDisruptionBudget:
 
 ```bash
 helm install hort oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server \
-  --version 2.0.0-rc.7 -n hort --create-namespace \
+  --version 0.9.12-dev -n hort --create-namespace \
   -f values-ha.yaml
 ```
 
@@ -473,7 +473,7 @@ adapt `publicBaseUrl` + the two postgres secret names.
 
 ```bash
 helm install hort oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server \
-  --version 2.0.0-rc.23 -n hort --create-namespace \
+  --version 0.9.12-dev -n hort --create-namespace \
   -f values-noidc.yaml
 ```
 

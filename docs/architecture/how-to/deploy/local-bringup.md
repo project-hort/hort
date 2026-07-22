@@ -367,7 +367,7 @@ User=hort-svc
 EnvironmentFile=/var/run/hort/rescan-token.env
 ExecStart=/usr/bin/curl -sf \
     -H "Authorization: Bearer ${TOKEN}" \
-    -X POST http://localhost:8080/api/v1/admin/tasks/cron-rescan
+    -X POST http://localhost:8080/api/v1/admin/tasks/cron-rescan-tick
 ```
 
 ```ini
@@ -398,13 +398,13 @@ done
 
 Repeat the `.service` + `.timer` pattern above for each task. The
 canonical cadence (matches the Helm chart's CronJob defaults — see
-[`values-reference.md`](values-reference.md) `worker.cronjobs.*`):
+[`values-reference.md`](values-reference.md) `scheduledTasks.*`):
 
 | Task | Schedule | Notes |
 |------|----------|-------|
 | `staging-sweep` | `*:0/15` (every 15 minutes) | Cleans abandoned stateful-upload sessions |
-| `cron-rescan` | `*-*-* 02:00:00` (nightly) | Re-scans artifacts against current advisory DB |
-| `advisory-watch` | `*-*-* 03:00:00` (nightly) | Pulls fresh advisory feed |
+| `cron-rescan-tick` | `*-*-* 02:00:00` (nightly) | Re-scans artifacts against current advisory DB |
+| `advisory-watch-tick` | `*-*-* 03:00:00` (nightly) | Pulls fresh advisory feed |
 
 > **Destructive tasks** (`eventstore-archive`, `retention-purge`, `retention-evaluate`) are **not** set up as unattended timers — an `admin_task_invoke` svc-token cannot run them (they need the `task:destructive` claim — see §5.2). Run them by hand with the bootstrap-session admin token (§5.1), or track the approval-workflow follow-on (GitLab issue #2).
 
@@ -426,8 +426,8 @@ sudo systemctl list-timers --all
 ```cron
 # Run as hort-svc; environment-load the per-task token before curl.
 */15 * * * * hort-svc TOKEN=$(cat /var/run/hort/staging-sweep-token)      curl -sf -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/api/v1/admin/tasks/staging-sweep
-0    2 * * * hort-svc TOKEN=$(cat /var/run/hort/rescan-token)             curl -sf -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/api/v1/admin/tasks/cron-rescan
-0    3 * * * hort-svc TOKEN=$(cat /var/run/hort/advisory-watch-token)     curl -sf -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/api/v1/admin/tasks/advisory-watch
+0    2 * * * hort-svc TOKEN=$(cat /var/run/hort/rescan-token)             curl -sf -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/api/v1/admin/tasks/cron-rescan-tick
+0    3 * * * hort-svc TOKEN=$(cat /var/run/hort/advisory-watch-token)     curl -sf -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/api/v1/admin/tasks/advisory-watch-tick
 0    4 * * 0 hort-svc TOKEN=$(cat /var/run/hort/eventstore-archive-token) curl -sf -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/api/v1/admin/tasks/eventstore-archive
 ```
 
@@ -560,7 +560,7 @@ curl -sf http://localhost:8080/healthz
 
 ```bash
 curl -sf http://localhost:8080/version | jq .
-# → {"version":"2.0.0-rc.23",...}
+# → {"version":"0.9.12-dev",...}
 ```
 
 ### 9.3 Worker health (via the worker's healthcheck binary)
@@ -605,7 +605,7 @@ Test the full path before waiting for the timer:
 ```bash
 TOKEN=$(cat /var/run/hort/rescan-token.env | cut -d= -f2)
 curl -sf -H "Authorization: Bearer $TOKEN" \
-    -X POST http://localhost:8080/api/v1/admin/tasks/cron-rescan
+    -X POST http://localhost:8080/api/v1/admin/tasks/cron-rescan-tick
 # → 202 Accepted (or 200 with the enqueued job id)
 
 # Check the job got picked up by hort-worker:
@@ -1158,7 +1158,7 @@ for the retention contract.
 | `npm publish` / `twine upload` / `docker push` returns 403 | Token authenticated but `PermissionGrant` is missing or scoped to the wrong `repository_id` | §10.2 — add or fix the YAML, restart `hort-server`; verify with `curl …/api/v1/repositories/<name>` per §10.6 |
 | Publish works locally but fails from CI runner with `connection refused` / TLS handshake errors | `hort-server` is only reachable on `localhost` (edge wiring §8 not done) or the runner doesn't trust the proxy's TLS cert | Wire the edge per §8; for self-signed certs in dev, distribute the issuing CA via the runner's trust store (do NOT use `*_INSECURE_TLS` knobs — none exist, by design; see [ADR 0010](../../../adr/0010-tls-builder-no-insecure-knobs.md)) |
 | `hort-server admin issue-svc-token` fails with `connection refused` | `HORT_DATABASE_URL` points at a Postgres that isn't running, or the network blocks the port | Test with `psql $HORT_DATABASE_URL -c 'SELECT 1'` |
-| Boot-fail with `ConfigError::Validation { kind: "STAGING_DIR" }` | Fail-loud boot check — staging dir isn't writable / not 0o700-chmod-able by the runtime UID | `chown hort-svc:hort-svc /var/lib/hort-server` (or whatever runs the service) |
+| Boot-fail logging `stateful-upload staging root is not writable/ownable — refusing to boot` | Fail-loud boot check — staging dir isn't writable / not ownable by the runtime UID | `chown hort-svc:hort-svc /var/lib/hort-server` (or whatever runs the service) |
 | `cargo audit --deny warnings` red after `cargo update` on a self-built binary | A newly-published advisory matches a pinned crate — RustSec DB updates continuously | `cargo update -p <crate> --precise <fixed-version>` per the repository's Pre-push Quality Checklist (`CLAUDE.md`) |
 
 ---

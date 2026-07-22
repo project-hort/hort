@@ -4,8 +4,9 @@ This guide is for operators turning on `scheduledTasks.adminTasksEnabled:
 true` — the umbrella toggle that renders the svc-token bootstrap Job plus
 the `executionPath: admin-task` CronJobs (`staging-sweep`,
 `cron-rescan-tick`, `advisory-watch-tick`, `service-account-rotation`,
-`noop`, `replay-seen-prune`, `verify-event-chain`, and the destructive
-trio). It covers the **gitops prerequisite** the chart deliberately does
+`noop`, `replay-seen-prune`, `scanner-registry-prune`,
+`verify-event-chain`, and the destructive trio). It covers the
+**gitops prerequisite** the chart deliberately does
 not provision, the **two ways getting it wrong fails**, and the
 **destructive-task caveat**.
 

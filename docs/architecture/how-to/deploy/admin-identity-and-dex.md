@@ -107,6 +107,6 @@ Dex CliSession, or keep those CronJobs disabled (the deploy default).
 - ADR 0037 — gitops `serviceAccount`-subject grants for non-admin SA authority.
 - `docs/auth-catalog.md` — Entries 1 (OIDC), 3 (CliSession), 4 (ServiceAccount),
   the bootstrap-session note, and the deployment/IdP cross-cutting note.
-- [Federate CI OIDC](federate-ci-oidc.md) and
+- [Federate CI OIDC](../federate-ci-oidc.md) and
   [federate k8s workload identity](../federate-k8s-workload-identity.md) — the
   keyless non-admin machine-identity paths.

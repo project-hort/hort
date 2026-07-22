@@ -23,7 +23,8 @@ reference is the complete list.
 asserts every top-level key in `values.yaml` has a comment
 block above it. [`values.schema.json`](../../../../deploy/helm/hort-server/values.schema.json)
 enforces required-vs-optional and cross-field invariants at
-`helm install` time (eight cross-field rules).
+`helm install` time (14 numbered cross-field rules, some with
+sub-parts — 1, 2, 3, 4, 4b, 4c, 4d, 5, 6, 7, 8a, 8b, 9a, 9b).
 
 **The schema is strict** (see
 [ADR 0029](../../../adr/0029-operator-config-hard-rename.md)):
@@ -162,7 +163,7 @@ Example:
 ```yaml
 image:
   repository: registry.example.com/hort/hort-server
-  tag: 2.0.0-rc.7
+  tag: 0.9.12-dev
   pullSecrets: [{name: ghcr-pull}]
 ```
 
@@ -1000,9 +1001,11 @@ as of HEAD:
 | `eventstoreCheckpoint` | admin-task | `false` | `0 * * * *` | — |
 | `replaySeenPrune` | admin-task | `true` | `0 * * * *` | — |
 | `verifyEventChain` | admin-task | `false` | `0 2 * * *` | — |
+| `scannerRegistryPrune` | admin-task | `true` | `0 * * * *` | — |
 
-`replaySeenPrune` is the only admin-task task that defaults `enabled:
-true` (it runs once `adminTasksEnabled` is flipped). `scrub.actionOnMismatch`
+`replaySeenPrune` and `scannerRegistryPrune` are the only admin-task
+tasks that default `enabled: true` (both run once `adminTasksEnabled`
+is flipped). `scrub.actionOnMismatch`
 (`HORT_CAS_SCRUB_ACTION_ON_MISMATCH`) is **also read by the main
 Deployment**, so it is load-bearing even with `scrub.enabled: false`. The
 schedule floor is 5 minutes (the admin-task Idempotency-Key uses
