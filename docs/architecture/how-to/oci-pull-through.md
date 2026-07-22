@@ -273,7 +273,11 @@ spec:
   repository: oci-mirror
   pathPrefix: dockerhub/
   upstreamUrl: https://registry-1.docker.io
-  upstreamNamePrefix: ""
+  # upstreamNamePrefix omitted — Docker Hub needs no outbound path
+  # splice. Set it only when the upstream's path layout requires one
+  # (Zot multi-storage, Artifactory rewrites, GitLab per-project URLs
+  # — see declare-gitops-config.md). An empty string is rejected at
+  # apply time; omit the field entirely instead.
   auth:
     type: anonymous
   # Opt-in publish-time anchoring. When true, the
