@@ -320,7 +320,7 @@ visibly opted out in audited gitops config. CI fails on `reject`.
 |---|---|---|
 | `single-claim-grant` | A `Claims(_)` grant whose `required_claims` has exactly one element, and that claim is **not** in `single_claim_allowlist`. | **`reject`** — the allowlist is the opt-out |
 | `wildcard-repo-non-admin` | A `Claims(_)` grant with no `repository` (global) and `permission != admin`. | **`reject`** |
-| `direct-user-grant-without-justification` | A `User(_)` grant with no justification annotation. | **`reject`** when `permission == admin` OR (global AND `permission ∈ {write, delete}`); else **`warn`** |
+| `direct-user-grant-without-justification` | A `User(_)` grant with no justification annotation. | **`reject`** when `permission == admin` OR (global AND `permission ∈ {write, delete, admin_task_invoke, curate, prefetch}`); else **`warn`** |
 | `claim-name-collision` | A `ClaimMapping` whose `claim` collides with a reserved name. | **`reject`** |
 
 > **Reserved-name note (as-built).** The reserved set the
@@ -423,10 +423,10 @@ GET /api/v1/admin/users/{user_id}/effective-permissions
 ```json
 {
   "user_id": "...",
-  "claims": ["developer", "team-alpha", "admin"],
   "is_admin": true,
+  "claim_based_authority": "not_resolvable_without_session",
+  "claim_based_authority_hint": "claim-based authority is resolved live from the user's IdP groups — use POST /api/v1/admin/rbac/resolve with the user's groups (from your IdP/user-management)",
   "grants": [
-    { "repository_id": "...",  "permission": "write", "source": { "kind": "claims", "required": ["developer", "team-alpha"] } },
     { "repository_id": null,   "permission": "admin", "source": { "kind": "claims", "required": ["admin"] } },
     { "repository_id": "...",  "permission": "write", "source": { "kind": "user" } }
   ]
@@ -443,13 +443,18 @@ hort-cli admin users effective-permissions <user_id> --output json
 Notes:
 
 - Admin-only (`Permission::Admin`).
-- `claims` reflects the user's resolved claims **from their last
-  successful OIDC login** — empty if they have never logged in via
-  OIDC. A user who only ever authenticates via PAT shows the PAT
-  path's effective set (synthetic-`admin` only, or empty).
-- The `grants` list is every grant that *currently* matches the
-  user — claim-gated grants the user's resolved claims satisfy, plus
-  every `User`-subject grant bound to them.
+- There is no claims cache and OIDC resolves claims live at login, so
+  this endpoint cannot show the user's real IdP-group-derived claims
+  without their session. `claim_based_authority` is always the literal
+  string `"not_resolvable_without_session"`; `claim_based_authority_hint`
+  points at `POST /api/v1/admin/rbac/resolve` (the what-if resolver —
+  supply the user's IdP groups yourself to see what they'd resolve to).
+- The `grants` list carries only what hort knows **without** the
+  user's token: every `User`-subject grant bound to them, plus the
+  synthetic `admin`-claim-derived grant when `is_admin` is true (that
+  one claim is a persisted DB bit, not a live-session lookup, so it
+  *is* resolvable here). Arbitrary IdP-group-derived `Claims(_)` grants
+  do not appear — use the resolver above for those.
 - This is the operator-discipline mitigation: the trade for losing
   server-enforced structure is that you can always ask one endpoint
   the question an auditor cares about.

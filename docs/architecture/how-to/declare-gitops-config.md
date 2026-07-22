@@ -155,11 +155,12 @@ spec:
   replicationPriority: on_demand
 ```
 
-**Serve-supported formats: `npm`, `pypi`, `cargo`.** A `type: virtual`
-repo on any other format (`oci`, `maven`, …) is **rejected at apply** —
-its `virtualMembers` would be accepted but never served (the ADR 0015
-inert-field guard). The supported set is the single source of truth in
-`crates/hort-config/src/repository.rs` (`VIRTUAL_SERVE_SUPPORTED_FORMATS`).
+**Serve-supported formats: `npm`, `pypi`, `cargo`, `maven`, `gradle`.** A
+`type: virtual` repo on any other format (`oci`, …) is **rejected at
+apply** — its `virtualMembers` would be accepted but never served (the
+ADR 0015 inert-field guard). The supported set is the single source of
+truth in `crates/hort-config/src/repository.rs`
+(`VIRTUAL_SERVE_SUPPORTED_FORMATS`).
 
 Members must reference other ArtifactRepository objects in the same
 `$HORT_CONFIG_DIR`. Mixing a managed virtual with `Local` (API-created)
@@ -413,7 +414,7 @@ section documents the operator-facing YAML and apply semantics.
   ([ADR 0038](../../adr/0038-admin-identity-model.md)).
 
 **Permission** is a single string, one of
-`read | write | delete | admin | admin_task_invoke | curate`.
+`read | write | delete | admin | admin_task_invoke | curate | prefetch`.
 
 **Repository** is a single optional `ArtifactRepository.metadata.name`
 reference. **Omit the field entirely** for a global grant; a blank

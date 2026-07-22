@@ -51,22 +51,31 @@ and stick with it; mixing the two on one host is not supported.
    Vault) with at minimum:
 
    ```yaml
-   vault_db_password: <strong random>
-   vault_db_migrate_password: <strong random, used for DDL role>
-   # vault_hort_svc_dev and vault_hort_svc_curator are written by the
-   # gitops role on first run; they do not need to be pre-populated.
+   # Native flavor (site-native.yml) — two ADR-0009 Postgres roles:
+   hort_db_ddl_password: <strong random>      # DDL / migrate role
+   hort_db_runtime_password: <strong random>  # least-privilege runtime role
+   # Podman flavor (site-podman.yml) — a single container Postgres password:
+   # hort_db_password: <strong random>
    ```
+
+   The gitops role mints the two operator `hort_svc_*` tokens
+   (`maintainer-dev` read, `maintainer-curator` curate) on first run and
+   writes them to `/run/secrets/` (tmpfs — cleared on reboot). Retrieve
+   them from there and store them in Ansible Vault / your secret store
+   immediately after provisioning; they are **not** written to Vault
+   automatically.
 
 3. **Pin `hort_version` (native flavor only).** Edit
    `deploy/ansible/group_vars/all.yml` and set `hort_version` to the desired
    released `v*` tag (e.g. `0.9.3`). Podman deployments use OCI image tags
    (`hort_server_image` / `hort_worker_image` in the same file) instead.
 
-4. **Replace the GitLab `project_path` placeholder.** Edit
-   `deploy/ansible/files/gitops/auth/service-accounts/gitlab-ci.yaml` and
-   replace `REPLACE_ME/hort` with the real GitLab project path
-   (e.g. `mygroup/hort`). Without this, GitLab CI tokens will not match the
-   `gitlab-ci` ServiceAccount.
+4. **Set up the GitLab CI service account.** Copy
+   `deploy/ansible/files/gitops/auth/service-accounts/gitlab-ci.yaml.example`
+   to `gitlab-ci.yaml` in the same directory, then replace the
+   `REPLACE_ME` `project_path` placeholder with the real GitLab
+   namespace/project (e.g. `mygroup/hort`). Without this, GitLab CI
+   tokens will not match the `gitlab-ci` ServiceAccount.
 
 5. **Run the playbook** (choose the flavor):
 
@@ -83,7 +92,9 @@ and stick with it; mixing the two on one host is not supported.
    The playbook: installs packages; configures nginx, certbot, and fail2ban;
    writes the gitops config tree; (re)starts hort-server so the boot-time apply
    runs; then mints the two operator `hort_svc_*` tokens via
-   `hort-server admin issue-svc-token` and writes them to Vault.
+   `hort-server admin issue-svc-token` and writes them to `/run/secrets/`
+   (tmpfs) — retrieve them from there and store them in Vault yourself
+   immediately after provisioning; the playbook does not do this for you.
 
 6. **Verify.** After the playbook succeeds:
    - `curl -s https://registry.hort.rs/api/v1/status` → `{"status":"ok"}` (or
@@ -124,7 +135,7 @@ hort_server_image: ghcr.io/project-hort/hort-server:0.9.4
 hort_worker_image:  ghcr.io/project-hort/hort-worker:0.9.4
 ```
 
-Then re-run the playbook. Quadlet units are restarted by the `hort-quadlet`
+Then re-run the playbook. Quadlet units are restarted by the `hort`
 role's handler when the unit definition changes. Migrations run automatically
 via the `hort-server migrate` one-shot unit that is ordered before
 `hort-server serve`.
@@ -246,20 +257,20 @@ any `pg_*` variable in `group_vars/production/` or `host_vars/` as needed.
 
 ```bash
 # Dump inside the container
-podman exec hort-postgres pg_dump -U hort hort > /backup/hort-db-$(date +%Y%m%d).sql
+podman exec postgres pg_dump -U hort artifact_registry > /backup/hort-db-$(date +%Y%m%d).sql
 ```
 
 **Native flavor** (apt Postgres):
 
 ```bash
-sudo -u postgres pg_dump hort > /backup/hort-db-$(date +%Y%m%d).sql
+sudo -u postgres pg_dump artifact_registry > /backup/hort-db-$(date +%Y%m%d).sql
 ```
 
 **Restore** (both flavors — stop hort-server first):
 
 ```bash
-# Podman:  psql -U hort hort < /backup/hort-db-YYYYMMDD.sql
-# Native:  sudo -u postgres psql hort < /backup/hort-db-YYYYMMDD.sql
+# Podman:  podman exec -i postgres psql -U hort artifact_registry < /backup/hort-db-YYYYMMDD.sql
+# Native:  sudo -u postgres psql artifact_registry < /backup/hort-db-YYYYMMDD.sql
 ```
 
 Then restart hort-server. The boot-time gitops apply is idempotent; existing
@@ -306,8 +317,8 @@ sudo fail2ban-client status hort-nginx-auth
 ```
 
 An IP can be permanently whitelisted in the jail config
-(`deploy/ansible/roles/fail2ban/templates/jail.local.j2` or the production
-host_vars) under `ignoreip`. Re-run the `fail2ban` role to apply.
+(`deploy/ansible/roles/fail2ban/templates/jail-hort.local.j2` or the
+production host_vars) under `ignoreip`. Re-run the `fail2ban` role to apply.
 
 ### Testing the filter
 
@@ -344,11 +355,12 @@ sudo systemctl status certbot.timer
 ```
 
 After a renewal, nginx must reload to pick up the new certificate. The certbot
-post-renewal hook (installed by the role) runs `systemctl reload nginx`
-automatically. Verify the hook is in place:
+**deploy** hook (installed by the role — fires only on an actual renewal, not
+every renewal attempt) runs `systemctl reload nginx` automatically. Verify the
+hook is in place:
 
 ```bash
-cat /etc/letsencrypt/renewal-hooks/post/reload-nginx.sh
+cat /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 ```
 
 If you need to force a manual renewal and reload:
@@ -373,10 +385,10 @@ Add to `~/.cargo/config.toml` (or the project-level `.cargo/config.toml`):
 replace-with = "hort"
 
 [registries.hort]
-# Once cargo-virtual aggregation is live (ADR 0031), use:
-#   index = "sparse+https://registry.hort.rs/cargo/cargo-virtual/"
-# Until then, point at crates-proxy directly:
-index = "sparse+https://registry.hort.rs/cargo/crates-proxy/"
+# cargo-virtual is the aggregation repo (ADR 0031, shipped) — use it
+# unless you specifically need to bypass aggregation and resolve
+# against the crates-proxy mirror member directly.
+index = "sparse+https://registry.hort.rs/cargo/cargo-virtual/"
 ```
 
 ### Configure container registry
@@ -468,22 +480,22 @@ in the session.
 ### State: `ScanIndeterminate` — ad-hoc admin token
 
 `ScanIndeterminate` means the scanner failed terminally (network outage, OOM,
-etc.). The curator token is insufficient; `Permission::Admin` is required. Mint
-an ad-hoc admin token **on the VPS only** and revoke it immediately after:
+etc.). The curator token is insufficient; `Permission::Admin` is required.
+**`issue-svc-token` unconditionally rejects `--permission=admin`** — service
+accounts are strictly non-admin (ADR 0038) — so the break-glass admin path is
+the dedicated, DSN-gated `bootstrap-session` command instead, which mints a
+short-lived (≤1 h, ADR 0013 cap), non-service-account, full-cap token:
 
 ```bash
-# On the VPS — note: hort-server must be running
-# The CLI accepts only whole-day TTLs (--expires-in-days <1-365>); there is no
-# hour-granularity option. Use --expires-in-days 1 (minimum) and revoke
-# immediately after use.
+# On the VPS — note: hort-server must be running, and this requires
+# HORT_TOKEN_ALLOW_ADMIN=true (an issuance-time gate you set in your shell
+# for this command only — the running hort-server does NOT need it set).
 # Podman flavor:
-podman exec hort-server \
-  hort-server admin issue-svc-token --name break-glass-admin --permission admin \
-  --expires-in-days 1
+podman exec -e HORT_TOKEN_ALLOW_ADMIN=true hort-server \
+  hort-server admin bootstrap-session --ttl 1h
 
 # Native flavor:
-hort-server admin issue-svc-token --name break-glass-admin --permission admin \
-  --expires-in-days 1
+HORT_TOKEN_ALLOW_ADMIN=true hort-server admin bootstrap-session --ttl 1h
 ```
 
 Paste the token into `hort-cli auth login --paste`, release the artifact via the
@@ -493,9 +505,10 @@ admin quarantine endpoint, then immediately revoke the token:
 hort-cli admin quarantine release <artifact_id> \
   --justification "ScanIndeterminate: scanner outage, manually verified clean, admin release authorized"
 
-# Revoke — replace <token_id> with the id from issue-svc-token output
+# Revoke — replace <token_id> with the id from bootstrap-session's output
+# (a normal api_tokens row; same revocation path as any other token).
 # No hort-cli subcommand exists for token revocation; use the admin REST API
-# directly (supply the break-glass-admin token as HORT_TOKEN):
+# directly (supply the bootstrap-session token as HORT_TOKEN):
 curl -s -X DELETE \
   -H "Authorization: Bearer $HORT_TOKEN" \
   https://registry.hort.rs/api/v1/admin/tokens/<token_id>

@@ -32,15 +32,20 @@ that already exists:
 | `apiVersion` | `v2` |
 | `name` | `hort-server` |
 | `type` | `application` |
-| `version` (chart) | `1.0.0-rc.14` |
-| `appVersion` (binary) | `1.0.0-rc.14` — chart and binary are versioned together |
+| `version` (chart) | `0.9.12-dev` (tracks `Chart.yaml`; bumped every release) |
+| `appVersion` (binary) | same value as `version` — chart and binary are versioned together |
 | `kubeVersion` | `>=1.27.0-0` (1.27 = `RuntimeDefault` seccomp, restricted PSS baseline, native `topologySpreadConstraints` v1) |
 | Subcharts / dependencies | none |
 | Annotations | `artifacthub.io/license: MIT` |
 
 The chart deploys **two** workloads from **two** images: `hort-server`
 (the HTTP edge, `image.*`) and `hort-worker` (the scanner-bundled job
-dispatcher, `worker.image.*`, **disabled by default**). It ships **no
+dispatcher, `worker.image.*`, **enabled by default** — `worker.enabled:
+true`; quarantine is the default ingest posture and the release
+predicate needs a `ScanCompleted` from a running worker, so vanilla
+deploys need the worker present. Set `worker.enabled: false` only
+alongside a `ScanPolicy` declaring `scan_backends: []` — see
+`values.yaml`'s own comment on the key). It ships **no
 Ingress / Gateway / HTTPRoute** — the operator owns the edge.
 
 ---
@@ -74,11 +79,16 @@ Minimum required values for any install (schema-enforced at
 ## 3. Rendered-resource matrix
 
 Default install (`helm install` with only the required values set)
-renders everything in the **Always** rows plus the two default-enabled
-`executionPath: dsn-direct` CronJobs — **scrub** and
-**quarantine-release-sweep**. All `executionPath: admin-task` CronJobs (and
-the svc-token bootstrap Job + RBAC) stay off until
-`scheduledTasks.adminTasksEnabled=true`.
+renders everything in the **Always** rows plus: the worker Deployment
++ ConfigMap + ServiceAccount (`worker.enabled: true` by default), the
+NetworkPolicy pair (`networkPolicy.enabled: true` by default), and the
+two default-enabled `executionPath: dsn-direct` CronJobs — **scrub**
+and **quarantine-release-sweep**. All `executionPath: admin-task`
+CronJobs (and the svc-token bootstrap Job + RBAC) stay off until
+`scheduledTasks.adminTasksEnabled=true` — **except** `replaySeenPrune`
+and `scannerRegistryPrune`, which default `enabled: true` within that
+umbrella (so they still only render once the umbrella itself is
+flipped on).
 
 | Resource (template) | Rendered when | Purpose |
 |---|---|---|
@@ -90,7 +100,7 @@ the svc-token bootstrap Job + RBAC) stay off until
 | PVC (`pvc.yaml`) | `storage.backend=filesystem` **and** `storage.filesystem.pvc.enabled` (default true) | CAS data volume; annotated `helm.sh/resource-policy: keep`. |
 | CronJob — scrub (`cronjob-scrub.yaml`) | `scheduledTasks.scrub.enabled` (default **true**) | `hort-server scrub` CAS integrity sweep. **`executionPath: dsn-direct`: gated by `scheduledTasks.scrub.enabled` alone — not by `scheduledTasks.adminTasksEnabled`.** |
 | PodDisruptionBudget (`pdb.yaml`) | `replicaCount > 1` **OR** `podDisruptionBudget.enabled` | `minAvailable` guard. |
-| NetworkPolicy (`networkpolicy.yaml`) | `networkPolicy.enabled` (default false) | Ingress+Egress policy for server pods. |
+| NetworkPolicy (`networkpolicy.yaml`) | `networkPolicy.enabled` (default **true**) | Ingress+Egress policy for server pods. |
 | ServiceMonitor (`servicemonitor.yaml`) | `metrics.serviceMonitor.enabled` (hard-fails render if `metrics.bindAddr` empty) | Prometheus-operator scrape. |
 | Deployment — worker (`worker-deployment.yaml`) | `worker.enabled` | multi-kind poll-loop dispatcher (scanners + rescan/advisory/sweep/noop). |
 | ConfigMap — worker (`worker-configmap.yaml`) | `worker.enabled` | non-secret worker env. |
@@ -105,7 +115,7 @@ the svc-token bootstrap Job + RBAC) stay off until
 | CronJob — noop (`cronjob-noop.yaml`) | `scheduledTasks.adminTasksEnabled` **and** `scheduledTasks.noop.enabled` | `hort-cli admin task invoke noop` heartbeat. |
 | CronJob — quarantine-release-sweep (`cronjob-quarantine-release-sweep.yaml`) | `scheduledTasks.quarantineReleaseSweep.enabled` (default **true**) | `executionPath: dsn-direct` — `hort-server enqueue-quarantine-release-sweep`; not gated by `adminTasksEnabled`. |
 | CronJobs — prefetch-tick / prefetch-row-retention-sweep / wheel-metadata-backfill | each task's own `scheduledTasks.<task>.enabled` (all default **false**) | `executionPath: dsn-direct` — `hort-server enqueue-<task>`; not gated by `adminTasksEnabled`. |
-| CronJobs — retention-evaluate / retention-purge / eventstore-archive / eventstore-checkpoint / replay-seen-prune (default **true**) / verify-event-chain | `scheduledTasks.adminTasksEnabled` **and** the task's own `scheduledTasks.<task>.enabled` | `executionPath: admin-task` (`verify-event-chain` runs `hort-server verify-event-chain` directly but shares the `adminTasksEnabled` gate). |
+| CronJobs — retention-evaluate / retention-purge / eventstore-archive / eventstore-checkpoint / replay-seen-prune (default **true**) / scanner-registry-prune (default **true**) / verify-event-chain | `scheduledTasks.adminTasksEnabled` **and** the task's own `scheduledTasks.<task>.enabled` | `executionPath: admin-task` (`verify-event-chain` runs `hort-server verify-event-chain` directly but shares the `adminTasksEnabled` gate). |
 | Job — helm test (`tests/test-connection.yaml`) | only under `helm test` (test hook) | busybox `wget` poll of `/healthz`. |
 
 The `<fullname>-svc-token` **Secret** is created at run time by the
@@ -233,10 +243,6 @@ server boot-crash loop.
 | `scheduledTasks.serviceAccountRotation.enabled` (the single rotation toggle) | `scheduledTasks.adminTasksEnabled == true` (rule 9a) | the rotation CronJob silently not rendering — it is an `executionPath: admin-task` template that renders only under the umbrella. |
 | `scheduledTasks.serviceAccountRotation.enabled` | `worker.enabled == true` **and** `worker.rotation.publicRegistryHost` (non-empty) (rule 9b) | a worker that cannot rotate (no worker deployed) or a `dockerconfigjson.auths` map with nowhere to point. |
 
-> The schema header says "eight rules"; the file actually encodes ~12
-> conditional constructs (the count above) — the description is stale,
-> the rules are not.
-
 ### Template-level guards (fail at `helm template`/render, not in the schema)
 
 | Condition | Failure |
@@ -278,11 +284,13 @@ for what each rendered env var does and its boot-time interlocks.
 ## 7. Scheduled tasks & worker — operator notes
 
 All periodic tasks live under `scheduledTasks.*`; each
-carries an `executionPath` attribute. `worker.enabled` and
-`scheduledTasks.adminTasksEnabled` are **both off by default**; neither is
-required for a functioning registry. Enable them only when you need
-scanning, rescanning, advisory-watch, staging-sweep, retention, or
-service-account rotation.
+carries an `executionPath` attribute. `worker.enabled` defaults **on**
+(quarantine-by-default needs a running worker to ever release an
+artifact — see §1); `scheduledTasks.adminTasksEnabled` defaults
+**off** — enable it only when you need rescanning, advisory-watch,
+staging-sweep, retention, or service-account rotation on a schedule
+(scanning itself already runs via the default-on worker, independent
+of this umbrella).
 
 - **`executionPath: dsn-direct` tasks** (`scrub`, `quarantineReleaseSweep`,
   `prefetchTick`, `prefetchRowRetentionSweep`, `wheelMetadataBackfill`) run
@@ -293,8 +301,9 @@ service-account rotation.
   admin task invoke <kind>` with the `<release>-svc-token` PAT and are gated
   by **both** `scheduledTasks.adminTasksEnabled` (the master toggle, which
   also renders the svc-token bootstrap Job + RBAC) **and** the task's own
-  `enabled`. All default **off** except `replaySeenPrune` (default on once
-  the master toggle is flipped). `verifyEventChain` is the one hybrid: it
+  `enabled`. All default **off** except `replaySeenPrune` and
+  `scannerRegistryPrune` (both default on once the master toggle is
+  flipped). `verifyEventChain` is the one hybrid: it
   shares the `adminTasksEnabled` gate but runs `hort-server
   verify-event-chain` directly (no PAT).
 - **Worker prerequisites:** `worker.enabled=true` requires the

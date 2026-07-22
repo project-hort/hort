@@ -251,7 +251,7 @@ The response body is RFC 8693 §2.2.1 standard:
 
 ```json
 {
-  "access_token": "hort_sa_…",
+  "access_token": "hort_svc_…",
   "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
   "token_type": "Bearer",
   "expires_in": 3600
