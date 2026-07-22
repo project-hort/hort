@@ -30,26 +30,48 @@ Start here if you want to know **why** the system looks the way it does.
 - [Tune HTTP transport timeouts](how-to/http-transport-timeouts.md)
 - [Verify a release with `cosign verify-blob`](how-to/release-verification.md)
 - [Use `hort-cli` for admin operations (`--admin`, `--expires-in`)](how-to/using-hort-cli-with-admin-ops.md)
+- [Install `hort-cli`](how-to/install-cli.md)
+- [Shell completions for `hort-cli`](how-to/cli-completions.md)
 - [Federate k8s workload identity (preferred, no PAT at rest)](how-to/federate-k8s-workload-identity.md)
 - [Federate CI OIDC (GitHub Actions / GitLab) via `/auth/exchange`](how-to/federate-ci-oidc.md)
 - [Rotate service-account PATs via the worker reconciler (fallback)](how-to/rotating-service-account-tokens.md)
+- [Enable provenance (Sigstore/cosign) verification](how-to/enable-provenance-verification.md)
+- [Quarantine patch-candidates and release](how-to/quarantine-patch-release.md)
+- [Recover stranded (failed-scan) artifacts](how-to/recover-stranded-artifacts.md)
+- [The curator workflow](how-to/curator-workflow.md)
+- [Third-party attribution](how-to/third-party-attribution.md)
 
 ### Format-specific
 
 - [Add a format handler](how-to/add-a-format-handler.md)
+- [Configure OCI pull-through with verified upstream](how-to/oci-pull-through.md)
 - [Configure npm pull-through with verified upstream](how-to/npm-pull-through.md)
 - [Configure PyPI pull-through with verified upstream](how-to/pypi-pull-through.md)
 
 ### Deployment
 
 - [Install `hort-server` on Kubernetes](how-to/deploy/install.md)
+- [Install `hort-server` + `hort-worker` on a single Linux host](how-to/deploy/local-bringup.md)
 - [Helm chart — values reference](how-to/deploy/values-reference.md)
 - [Helm chart — edge overlays](how-to/deploy/examples-overlays.md)
 - [Install fully sovereign against `registry.hort.rs`](how-to/deploy/self-contained-registry-install.md)
 - [Provision the two Postgres roles](how-to/deploy/postgres-roles.md)
 - [Trust internal or corporate CAs (`extraCaBundle`)](how-to/deploy/extra-ca-bundle.md)
 - [Admin identity and the Dex bootstrap](how-to/deploy/admin-identity-and-dex.md)
+- [Enable admin-task CronJobs](how-to/deploy/enable-admin-task-cronjobs.md)
+- [Split the control plane onto a dedicated listener](how-to/deploy/control-plane-tiers.md)
 - [Security hardening checklist](how-to/deploy/security-hardening-checklist.md)
+
+### Operate
+
+- [Claim-based RBAC](how-to/operate/claim-based-rbac.md)
+- [OCI image-pull secret / token](how-to/operate/oci-imagepull-secret-token.md)
+- [Public supply-chain deployment](how-to/operate/public-supply-chain-deployment.md)
+
+### Operator
+
+- [IdP setup](../operator/idp-setup.md)
+- [Upstream trust model](../operator/upstream-trust-model.md)
 
 ## Reference — look up exact values
 
