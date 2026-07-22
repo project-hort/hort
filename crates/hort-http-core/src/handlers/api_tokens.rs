@@ -64,7 +64,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -520,6 +520,19 @@ fn map_use_case_error(err: ApiTokenError) -> Response {
         E::JtiRequired => err_body(StatusCode::UNAUTHORIZED, "jti_required"),
         E::ReplayGuardUnavailable => {
             err_body(StatusCode::SERVICE_UNAVAILABLE, "replay_guard_unavailable")
+        }
+        // Same "never actually reaches here" category as the three
+        // arms above: `Contended` is produced only by
+        // `issue_for_service_account_system`'s SA-stream append retry
+        // (issue #62), which this admin-mint handler
+        // (`issue_for_service_account`) never calls. Mapped exhaustively
+        // for type-safety, 503 + a short advisory `Retry-After` so a
+        // future caller cannot accidentally 500.
+        E::Contended => {
+            let mut resp = err_body(StatusCode::SERVICE_UNAVAILABLE, "mint_contended");
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(1u64));
+            resp
         }
         E::Infrastructure(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

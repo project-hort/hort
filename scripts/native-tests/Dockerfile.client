@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.25
 # scripts/native-tests/Dockerfile.client
 # One image with every client tool the scenarios need, so each scenario runs in
 # a container instead of on a host with drifting toolchains (no PEP 668 venv

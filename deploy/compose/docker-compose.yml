@@ -129,7 +129,7 @@ services:
     # up AND the realm import has finished), then exits 0. hort-server
     # waits for this container's `service_completed_successfully`
     # rather than Keycloak's own healthcheck.
-    image: curlimages/curl:8.10.1
+    image: curlimages/curl:8.21.0
     container_name: hort-keycloak-ready
     depends_on:
       - keycloak

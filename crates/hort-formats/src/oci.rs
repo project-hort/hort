@@ -153,30 +153,28 @@ mod tests {
         assert!(handler().protocol_native_integrity());
     }
 
-    /// OCI inherits the trait-default empty Vec for
-    /// `extract_dependency_specs`. OCI tags are exact pointers, not
-    /// version ranges; there is no notion of "declared runtime deps" for
-    /// an OCI image at this layer (honest-degradation rule: OCI quarantine
-    /// `503`s rather than substitute). Regression guard: a stray override
-    /// here would silently start enqueuing prefetch jobs for OCI artifacts,
+    /// OCI does not implement the `VersionDiscovery` capability group
+    /// (issue #58) — `version_discovery()` inherits the `FormatHandler`
+    /// accessor's `None` default. Structural replacement for the two
+    /// former per-method tests (`extract_dependency_specs_inherits_default_empty_vec`
+    /// / `resolve_range_max_inherits_default_none`), which lost their
+    /// subject when those methods moved off `FormatHandler` onto
+    /// `VersionDiscovery` — their reasoning is preserved here rather than
+    /// discarded:
+    ///
+    /// - **No declared runtime deps.** OCI tags are exact pointers, not
+    ///   version ranges; there is no notion of "declared runtime deps"
+    ///   for an OCI image at this layer (honest-degradation rule: OCI
+    ///   quarantine `503`s rather than substitute).
+    /// - **No range concept.** OCI tags are not ranges, so there is
+    ///   nothing for `resolve_range_max` to resolve against.
+    ///
+    /// Regression guard: OCI declaring `VersionDiscovery` participation
+    /// would silently start enqueuing prefetch jobs for OCI artifacts,
     /// reintroducing the substitution behaviour the OCI handler explicitly
     /// rejects (see explanation/prefetch-pipeline.md).
     #[test]
-    fn extract_dependency_specs_inherits_default_empty_vec() {
-        let specs = handler()
-            .extract_dependency_specs(&mut std::io::Cursor::new(b"any bytes"))
-            .expect("Ok");
-        assert!(specs.is_empty());
-    }
-
-    /// OCI inherits the trait-default `None` for `resolve_range_max`.
-    /// OCI tags are not ranges. Same rationale as the empty-vec test
-    /// above.
-    #[test]
-    fn resolve_range_max_inherits_default_none() {
-        let out = handler()
-            .resolve_range_max("anything", &["sha256:abc"])
-            .expect("Ok");
-        assert!(out.is_none());
+    fn does_not_implement_version_discovery() {
+        assert!(handler().version_discovery().is_none());
     }
 }

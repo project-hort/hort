@@ -134,6 +134,16 @@ pub struct PullDedupConfig {
     /// `AppError::External("pull-dedup: follower wait ceiling
     /// exceeded")` and the format handler maps it to the wire).
     pub follower_wait: Duration,
+    /// Hard ceiling on the leader's `fetch_fn` execution (issue #55).
+    /// On elapse the leader is abandoned: a `Failed(Timeout)`
+    /// terminal is written (using `ttl_timeout` as the negative-cache
+    /// TTL), the Layer-A entry is evicted, and the next caller elects
+    /// fresh rather than inheriting the wedge. MUST exceed the
+    /// slowest legitimate fetch+ingest, which is itself bounded by
+    /// `HORT_STORAGE_PUT_TIMEOUT_SECS` (default 300s) — a tighter
+    /// deadline would abandon leaders still doing legitimately-slow
+    /// large pulls.
+    pub leader_deadline: Duration,
 }
 
 impl PullDedupConfig {
@@ -147,6 +157,7 @@ impl PullDedupConfig {
             ttl_timeout: Duration::from_secs(10),
             ttl_checksum_mismatch: Duration::from_secs(60),
             follower_wait: Duration::from_secs(300),
+            leader_deadline: Duration::from_secs(600),
         }
     }
 }
@@ -530,6 +541,82 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// `DashMap::get`.
 type LayerAMap = DashMap<DedupKey, Weak<broadcast::Sender<DedupOutcome>>>;
 
+/// RAII guard constructed immediately after a leader inserts its
+/// Layer-A broadcast entry (D3 / D4 of issue #55). Closes every exit
+/// path — success, error, leader-deadline timeout, panic, or
+/// cancellation — through one mechanism instead of the sequential
+/// manual cleanup that previously covered only the happy path.
+///
+/// `heartbeat` is `None` for
+/// [`PullDedup::run_as_leader_layer_b_down`], which never spawns one
+/// (there is no cluster lock to keep alive when Layer B is down);
+/// [`PullDedup::run_as_leader`] always supplies one.
+struct LeaderGuard {
+    layer_a: Arc<LayerAMap>,
+    key: DedupKey,
+    heartbeat: Option<tokio::task::AbortHandle>,
+    disarmed: bool,
+}
+
+impl LeaderGuard {
+    fn new(
+        layer_a: Arc<LayerAMap>,
+        key: DedupKey,
+        heartbeat: Option<tokio::task::AbortHandle>,
+    ) -> Self {
+        Self {
+            layer_a,
+            key,
+            heartbeat,
+            disarmed: false,
+        }
+    }
+
+    /// Abort the heartbeat early — before the terminal write — so it
+    /// cannot race the leader's own persisted outcome. Idempotent:
+    /// `Drop` re-aborts unconditionally regardless of whether this
+    /// was already called, which is what closes the pre-existing
+    /// leak where a *cancelled* (not just wedged) leader skipped the
+    /// old sequential `heartbeat_handle.abort()` call entirely.
+    fn abort_heartbeat(&self) {
+        if let Some(handle) = &self.heartbeat {
+            handle.abort();
+        }
+    }
+
+    /// Happy-path (and leader-timeout-path) cleanup: remove the
+    /// Layer-A entry and suppress `Drop`'s fallback removal +
+    /// `leader_cancelled` emission. MUST be called AFTER the
+    /// broadcast send so follower ordering is unchanged.
+    fn disarm(&mut self) {
+        self.disarmed = true;
+        self.layer_a.remove(&self.key);
+    }
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        self.abort_heartbeat();
+        if !self.disarmed {
+            // Reached only when the leader future was dropped
+            // without ever recording a terminal outcome (client
+            // disconnect, runtime shutdown, or a panic upstream of
+            // this guard's own scope) — routine, not an error.
+            debug!(
+                key_hash = self.key.key_hash().as_str(),
+                format = self.key.format_label(),
+                "leader guard dropped without a terminal outcome; evicting layer-A entry"
+            );
+            emit_total(
+                DedupLayer::Cluster,
+                self.key.format_label(),
+                DedupOutcomeLabel::LeaderCancelled,
+            );
+            self.layer_a.remove(&self.key);
+        }
+    }
+}
+
 /// `hort-app::pull_dedup::PullDedup` — the coordination service. Held
 /// on `AppContext` as `Arc<PullDedup>`. Cheap to clone via `Arc`.
 pub struct PullDedup {
@@ -697,8 +784,8 @@ impl PullDedup {
                     format = key.format_label(),
                     "joining existing in-process coalescing window"
                 );
-                match rx.recv().await {
-                    Ok(outcome) => {
+                match tokio::time::timeout(self.config.follower_wait, rx.recv()).await {
+                    Ok(Ok(outcome)) => {
                         // Drop the strong upgrade BEFORE we return so
                         // the leader's `Arc<Sender>` is the only
                         // remaining strong reference.
@@ -720,13 +807,13 @@ impl PullDedup {
                         emit_total(DedupLayer::InProcess, key.format_label(), label);
                         return self.handle_follower_outcome(&key, DedupLayer::InProcess, outcome);
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
                         // Sender dropped before sending — leader
                         // panicked on early return. Fall through to
                         // Layer B.
                         debug!("layer-A sender closed without outcome; falling through to layer B");
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                    Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                         // Channel capacity exceeded — implausible but
                         // defended. Fall through to Layer B.
                         warn!(
@@ -737,6 +824,29 @@ impl PullDedup {
                             DedupLayer::InProcess,
                             key.format_label(),
                             DedupOutcomeLabel::FollowerLagged,
+                        );
+                    }
+                    Err(_elapsed) => {
+                        // D1: the leader is alive (the `Weak` upgrade
+                        // above succeeded) but has not broadcast a
+                        // terminal outcome within our patience — it
+                        // is wedged, not merely slow (a merely-slow
+                        // leader is still bounded by
+                        // `leader_deadline` on its own side). Evict
+                        // the poisoned entry so the NEXT caller
+                        // elects fresh instead of joining the same
+                        // stuck broadcast, and fall through to Layer
+                        // B for this caller.
+                        warn!(
+                            format = key.format_label(),
+                            namespace = key.namespace.as_str(),
+                            "layer-A follower wait ceiling exceeded; leader appears wedged — evicting entry and falling through to layer B"
+                        );
+                        self.layer_a.remove(&key);
+                        emit_total(
+                            DedupLayer::InProcess,
+                            key.format_label(),
+                            DedupOutcomeLabel::FollowerFellthrough503,
                         );
                     }
                 }
@@ -911,16 +1021,77 @@ impl PullDedup {
         let weak = Arc::downgrade(&tx_strong);
         self.layer_a.insert(key.clone(), weak);
 
-        // Heartbeat — spawn BEFORE the fetch.
+        // Heartbeat — spawn BEFORE the fetch. `guard` closes every
+        // exit path (success, error, leader-deadline timeout, panic,
+        // cancellation) exactly once (D3 / D4).
         let heartbeat_handle = self.spawn_heartbeat(key.serialised.clone());
+        let mut guard = LeaderGuard::new(
+            self.layer_a.clone(),
+            key.clone(),
+            Some(heartbeat_handle.abort_handle()),
+        );
 
         let started = std::time::Instant::now();
-        let fetch_res = fetch_fn().await;
+        let fetch_res = match tokio::time::timeout(self.config.leader_deadline, fetch_fn()).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                // D2: the leader closure is wedged past its
+                // deadline — `timeout` drops it here. Abandon it:
+                // write a `Failed(Timeout)` terminal so waiting
+                // followers negative-cache instead of re-electing
+                // immediately, unblock this leader's own caller with
+                // an error, and evict the Layer-A entry so the next
+                // caller elects fresh. No `emit_wait` — the fetch
+                // never returned, so there is no wait sample (see
+                // the `leader_timeout` catalog entry: this counter is
+                // the only signal for this case).
+                let deadline_elapsed = started.elapsed();
+                guard.abort_heartbeat();
+                emit_total(
+                    DedupLayer::Cluster,
+                    key.format_label(),
+                    DedupOutcomeLabel::LeaderTimeout,
+                );
+                info!(
+                    layer = DedupLayer::Cluster.as_metric_label(),
+                    format = key.format_label(),
+                    namespace = key.namespace.as_str(),
+                    key_hash = key.key_hash().as_str(),
+                    elapsed_secs = deadline_elapsed.as_secs(),
+                    leader_deadline_secs = self.config.leader_deadline.as_secs(),
+                    "leader abandoned at deadline; evicted for the next caller to elect fresh"
+                );
+                let outcome = DedupOutcome::Failed {
+                    kind: UpstreamErrorKind::Timeout,
+                    message: "pull-dedup: leader deadline exceeded".into(),
+                    expires_at_unix_secs: now_unix_secs()
+                        .saturating_add(self.config.ttl_timeout.as_secs()),
+                };
+                let terminal_bytes = encode_outcome(&outcome);
+                if let Err(e) = self
+                    .ephemeral
+                    .put(&key.serialised, terminal_bytes, self.config.ttl_timeout)
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        "ephemeral put for leader-timeout terminal failed; followers will re-elect"
+                    );
+                }
+                let _ = tx_strong.send(outcome);
+                // Remove AFTER the broadcast send — same ordering
+                // guarantee as the happy path below.
+                guard.disarm();
+                return Err(AppError::External(
+                    "pull-dedup: leader deadline exceeded".into(),
+                ));
+            }
+        };
         let elapsed = started.elapsed();
         emit_wait(DedupLayer::Cluster, key.format_label(), elapsed);
 
         // Stop heartbeat before the terminal CAS.
-        heartbeat_handle.abort();
+        guard.abort_heartbeat();
 
         // Build the terminal outcome.
         let outcome = match &fetch_res {
@@ -970,8 +1141,9 @@ impl PullDedup {
         // Broadcast to Layer-A followers.
         let _ = tx_strong.send(outcome);
 
-        // Drop Layer-A entry.
-        self.layer_a.remove(key);
+        // Drop Layer-A entry — after the broadcast send so follower
+        // ordering is unchanged (D4).
+        guard.disarm();
 
         let outcome_label = match &fetch_res {
             Ok(_) => "leader_succeeded",
@@ -1005,8 +1177,46 @@ impl PullDedup {
         let weak = Arc::downgrade(&tx_strong);
         self.layer_a.insert(key.clone(), weak);
 
+        // No heartbeat here — Layer B is down, so there is no cluster
+        // lock to keep alive. `guard` still closes the Layer-A
+        // cleanup path (D4) for every exit — success, error,
+        // leader-deadline timeout, panic, or cancellation.
+        let mut guard = LeaderGuard::new(self.layer_a.clone(), key.clone(), None);
+
         let started = std::time::Instant::now();
-        let fetch_res = fetch_fn().await;
+        let fetch_res = match tokio::time::timeout(self.config.leader_deadline, fetch_fn()).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                // D2, applied to the Layer-B-down leader too — this
+                // path also inserts into Layer A, so an unbounded
+                // wedge here poisons identically. No `ephemeral.put`
+                // (Layer B is down for this leader by definition).
+                emit_total(
+                    DedupLayer::Cluster,
+                    key.format_label(),
+                    DedupOutcomeLabel::LeaderTimeout,
+                );
+                info!(
+                    layer = DedupLayer::Cluster.as_metric_label(),
+                    format = key.format_label(),
+                    namespace = key.namespace.as_str(),
+                    key_hash = key.key_hash().as_str(),
+                    leader_deadline_secs = self.config.leader_deadline.as_secs(),
+                    "leader abandoned at deadline (layer B down); evicted for the next caller to elect fresh"
+                );
+                let outcome = DedupOutcome::Failed {
+                    kind: UpstreamErrorKind::Timeout,
+                    message: "pull-dedup: leader deadline exceeded".into(),
+                    expires_at_unix_secs: now_unix_secs()
+                        .saturating_add(self.config.ttl_timeout.as_secs()),
+                };
+                let _ = tx_strong.send(outcome);
+                guard.disarm();
+                return Err(AppError::External(
+                    "pull-dedup: leader deadline exceeded".into(),
+                ));
+            }
+        };
         let elapsed = started.elapsed();
         emit_wait(DedupLayer::Cluster, key.format_label(), elapsed);
 
@@ -1025,7 +1235,7 @@ impl PullDedup {
             },
         };
         let _ = tx_strong.send(outcome);
-        self.layer_a.remove(key);
+        guard.disarm();
         fetch_res
     }
 
@@ -1853,13 +2063,18 @@ mod tests {
 
     fn fast_cfg() -> PullDedupConfig {
         // Short follower-wait so the 503 fall-through test does not
-        // sit on a 5-minute clock.
+        // sit on a 5-minute clock. `leader_deadline` stays generous
+        // (existing tests never let a leader run that long) — tests
+        // that specifically exercise the leader deadline override it
+        // explicitly via `PullDedupConfig { leader_deadline: ..,
+        // ..fast_cfg() }`.
         PullDedupConfig {
             ttl_not_found: Duration::from_secs(30),
             ttl_unavailable: Duration::from_secs(10),
             ttl_timeout: Duration::from_secs(10),
             ttl_checksum_mismatch: Duration::from_secs(60),
             follower_wait: Duration::from_millis(50),
+            leader_deadline: Duration::from_secs(600),
         }
     }
 
@@ -2412,6 +2627,7 @@ mod tests {
         assert_eq!(c.ttl_timeout, Duration::from_secs(10));
         assert_eq!(c.ttl_checksum_mismatch, Duration::from_secs(60));
         assert_eq!(c.follower_wait, Duration::from_secs(300));
+        assert_eq!(c.leader_deadline, Duration::from_secs(600));
     }
 
     #[test]
@@ -2532,5 +2748,243 @@ mod tests {
                 .unwrap();
             assert_eq!(res, Bytes::from_static(b"alone"));
         });
+    }
+
+    // ------- Issue #55: coalesce leader liveness (D1-D4) ----------
+    //
+    // Design doc §6 test list. Before this change every test in this
+    // module used a leader that always completes; nothing here
+    // exercised a wedged leader, touched `dd.layer_a` directly, or
+    // asserted the heartbeat actually stops. All five would fail (or
+    // hang) against the pre-#55 code.
+
+    /// Design §6 item 1 — a wedged leader (never completes) must not
+    /// hang a Layer-A follower. D1: the follower's `rx.recv().await`
+    /// is now bounded by `follower_wait`.
+    #[test]
+    fn wedged_leader_does_not_hang_layer_a_follower() {
+        let snap = capture(|| async {
+            let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+            let dd = Arc::new(PullDedup::new(store, fast_cfg()));
+            let key = DedupKey::metadata("pypi", uuid::Uuid::nil(), "u-wedge-1");
+
+            // Leader closure that never completes — models D1's
+            // "leader alive but wedged" case exactly (as opposed to
+            // the pre-existing ghost-leader test at
+            // `follower_wait_ceiling_triggers_503_and_emits_followfellthrough_metric`,
+            // which never reaches Layer A at all).
+            let dd1 = dd.clone();
+            let key1 = key.clone();
+            let _leader = tokio::spawn(async move {
+                let _ = dd1
+                    .coalesce_metadata(key1, std::future::pending::<Result<Bytes, AppError>>)
+                    .await;
+            });
+            // Let the leader actually elect (Layer-A insert +
+            // put_if_absent) before the follower joins.
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            assert!(
+                dd.layer_a.get(&key).is_some(),
+                "leader must be visible in layer-A before the follower joins"
+            );
+
+            let follower_res = tokio::time::timeout(
+                Duration::from_secs(2),
+                dd.coalesce_metadata(key.clone(), || async { Ok(Bytes::from_static(b"unused")) }),
+            )
+            .await
+            .expect(
+                "follower must return within 2s — a wedged leader must not hang it forever (D1)",
+            );
+            assert!(
+                follower_res.is_err(),
+                "follower falls through to a 503 rather than succeeding against a wedged leader"
+            );
+        });
+        assert_eq!(
+            counter_for_layer(&snap, "follower_fellthrough_503", "in_process"),
+            1,
+            "the layer-A follower-wait ceiling must evict the entry and emit fellthrough"
+        );
+    }
+
+    /// Design §6 item 2 — the acceptance criterion from the issue:
+    /// after the leader deadline elapses, a SUBSEQUENT call must run
+    /// a fresh closure (assert the closure ran twice), not inherit
+    /// the wedge. D2: `fetch_fn` is now wrapped in
+    /// `tokio::time::timeout(leader_deadline, ..)`.
+    #[test]
+    fn leader_timeout_self_heals_next_call_runs_fresh_closure() {
+        let snap = capture(|| async {
+            let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+            // Short leader_deadline so the timeout actually fires in
+            // the test; short ttl_timeout so the Failed(Timeout)
+            // negative-cache record is provably stale by the time the
+            // second call runs (otherwise the second call would
+            // legitimately negative-cache-hit instead of re-electing
+            // — that would be correct production behaviour, but it
+            // is not what this test is checking).
+            let cfg = PullDedupConfig {
+                leader_deadline: Duration::from_millis(40),
+                ttl_timeout: Duration::from_millis(10),
+                ..fast_cfg()
+            };
+            let dd = PullDedup::new(store, cfg);
+            let key = DedupKey::metadata("pypi", uuid::Uuid::nil(), "u-selfheal");
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let c1 = calls.clone();
+            let res1 = dd
+                .coalesce_metadata(key.clone(), move || {
+                    let c1 = c1.clone();
+                    async move {
+                        c1.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<Result<Bytes, AppError>>().await
+                    }
+                })
+                .await;
+            assert!(
+                res1.is_err(),
+                "the wedged leader's own caller observes the deadline as an error"
+            );
+
+            // Let the leader-timeout's negative-cache record (10ms
+            // TTL) go stale before the next call.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let c2 = calls.clone();
+            let res2 = dd
+                .coalesce_metadata(key, move || {
+                    let c2 = c2.clone();
+                    async move {
+                        c2.fetch_add(1, Ordering::SeqCst);
+                        Ok(Bytes::from_static(b"fresh"))
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(res2, Bytes::from_static(b"fresh"));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "the second call must run a FRESH closure, not inherit the wedge"
+            );
+        });
+        assert_eq!(
+            counter_for(&snap, "leader_timeout"),
+            1,
+            "exactly one leader_timeout — the second call is a normal fresh election"
+        );
+    }
+
+    /// Design §6 item 3 — no existing test inspects `dd.layer_a`.
+    /// After a leader-deadline timeout the Layer-A entry must be
+    /// evicted (D2 + D4), not left pointing at the abandoned leader.
+    #[test]
+    fn leader_timeout_evicts_layer_a_entry() {
+        capture(|| async {
+            let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+            let cfg = PullDedupConfig {
+                leader_deadline: Duration::from_millis(30),
+                ..fast_cfg()
+            };
+            let dd = PullDedup::new(store, cfg);
+            let key = DedupKey::metadata("pypi", uuid::Uuid::nil(), "u-evict");
+            let res = dd
+                .coalesce_metadata(key.clone(), || {
+                    std::future::pending::<Result<Bytes, AppError>>()
+                })
+                .await;
+            assert!(res.is_err());
+            assert!(
+                dd.layer_a.get(&key).is_none(),
+                "layer-A entry must be evicted after a leader-deadline timeout"
+            );
+        });
+    }
+
+    /// Design §6 item 4 — the heartbeat must be aborted even when
+    /// `LeaderGuard` is dropped without ever calling `disarm()`
+    /// (client disconnect / runtime shutdown, modelled directly here
+    /// since production never exposes the heartbeat's `JoinHandle` to
+    /// a caller). Mirrors the abort-on-drop assertion pattern of
+    /// `leader_heartbeat_runs_periodically_and_aborts_on_handle_drop`
+    /// but for the NEW `LeaderGuard` cleanup path (D3), not a direct
+    /// `JoinHandle::abort()` call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn leader_guard_drop_without_disarm_aborts_heartbeat_and_evicts_layer_a() {
+        let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+        let dd = PullDedup::new(store, PullDedupConfig::defaults());
+        let key = DedupKey::metadata("pypi", uuid::Uuid::nil(), "u-guard-cancel");
+        // Placeholder Layer-A entry for the guard to evict — its
+        // value is never upgraded by this test, only its presence in
+        // the map matters.
+        dd.layer_a.insert(key.clone(), Weak::new());
+        let heartbeat = dd.spawn_heartbeat(key.serialised_for_test().to_owned());
+        let heartbeat_abort = heartbeat.abort_handle();
+        {
+            let _guard = LeaderGuard::new(dd.layer_a.clone(), key.clone(), Some(heartbeat_abort));
+            // `_guard` drops here WITHOUT `disarm()` — simulates
+            // cancellation / an exit path that never reached the
+            // terminal write.
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            heartbeat.is_finished(),
+            "the heartbeat must be aborted when the guard drops without disarm (D3)"
+        );
+        assert!(
+            dd.layer_a.get(&key).is_none(),
+            "the layer-A entry must be evicted when the guard drops without disarm (D4)"
+        );
+    }
+
+    /// Design §6 item 5 — dropping the LEADER'S OWN future mid-fetch
+    /// (the caller's task is aborted / the client disconnects) must
+    /// leak neither the heartbeat's cluster-lock renewal nor the
+    /// Layer-A entry, end to end through the real `run_as_leader`
+    /// path (not just the `LeaderGuard` unit test above). Also
+    /// asserts the `leader_cancelled` metric (Item 2) fires exactly
+    /// once — distinguishing "the caller went away" from
+    /// `leader_timeout`'s "we gave up at the deadline".
+    #[test]
+    fn cancelling_the_leader_future_mid_fetch_leaks_no_layer_a_entry() {
+        let snap = capture(|| async {
+            let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+            let dd = Arc::new(PullDedup::new(store, PullDedupConfig::defaults()));
+            let key = DedupKey::metadata("pypi", uuid::Uuid::nil(), "u-cancel-mid");
+
+            let dd1 = dd.clone();
+            let key1 = key.clone();
+            let handle = tokio::spawn(async move {
+                dd1.coalesce_metadata(key1, std::future::pending::<Result<Bytes, AppError>>)
+                    .await
+            });
+            // Let the leader actually elect + spawn its heartbeat
+            // before cancelling.
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            assert!(
+                dd.layer_a.get(&key).is_some(),
+                "leader must be visible in layer-A before cancellation"
+            );
+
+            handle.abort();
+            let join_res = handle.await;
+            assert!(
+                join_res.is_err_and(|e| e.is_cancelled()),
+                "the leader task must have been cancelled, not merely finished"
+            );
+            tokio::task::yield_now().await;
+
+            assert!(
+                dd.layer_a.get(&key).is_none(),
+                "layer-A entry must not survive leader cancellation (D4)"
+            );
+        });
+        assert_eq!(
+            counter_for(&snap, "leader_cancelled"),
+            1,
+            "the guard must emit leader_cancelled when dropped without a terminal outcome"
+        );
     }
 }

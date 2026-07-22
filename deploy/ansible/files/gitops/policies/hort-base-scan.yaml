@@ -1,0 +1,25 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: hort-base-scan
+spec:
+  scope:
+    repository: hort-base
+  # D2-a (ADR 0051 decision 2; maintainer-confirmed 2026-07-21, "threshold critical").
+  # Deliberately NARROWER than hort-oci's `high` — hort-oci's "rebuild on a
+  # patched base" remediation does NOT exist here: these are THIRD-PARTY
+  # base images (dex, postgres) we cannot patch, only upstream can. A
+  # `high` block bar would flap this mirror on every upstream base-image
+  # CVE disclosure, for a hold we can't act on beyond waiting for upstream.
+  # `critical` keeps the same defence-in-depth visibility (findings are
+  # still recorded at every threshold below it) but holds only on the
+  # unignorable. A held image degrades only the MIRROR face — containerd
+  # falls back to the real upstream (ghcr.io/dockerhub) exactly as it does
+  # today for any pod not yet pointed at registry.hort.rs, so availability
+  # is never at risk. See ADR 0051 (docs/adr/0051-…) decision 2.
+  severityThreshold: critical
+  quarantineDuration: 1h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["trivy"]
+  licensePolicy: {}

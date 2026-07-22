@@ -9,9 +9,10 @@ spec:
   type: virtual
   # The cold-start fix lives on the member (crates-proxy's indexMode:
   # include_pending); cargo-virtual's served index is the union of member
-  # indexes, so it needs no indexMode of its own. NOTE: the cargo serve-path
-  # member aggregation is in progress separately — until it lands, builds point
-  # at crates-proxy directly for mirror deps. The type + members validate now.
+  # indexes, so it needs no indexMode of its own. The cargo serve-path member
+  # aggregation is SHIPPED (ADR 0031 — VirtualCargoSource /
+  # aggregate_virtual_index, in tree since fc300987, 2026-06-20), so builds
+  # resolve both own crates and mirror deps through cargo-virtual directly.
   virtualMembers: [hort-crates, crates-proxy]
   isPublic: false
   replicationPriority: local_only

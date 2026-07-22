@@ -11,6 +11,21 @@
 # `helm install` time.
 # =============================================================================
 
+# -------------------- Global --------------------
+# Cross-cutting values consumed by more than one template.
+global:
+  # Empty (default) ⇒ every image reference below renders exactly as it
+  # does today: `image.repository`/`worker.image.repository`/
+  # `auth.dex.image`, each with its own tag. Set to a registry host (e.g.
+  # "registry.hort.rs") to rewrite ALL THREE image references onto that
+  # registry in one step — the chart's `hort-server.image` /
+  # `hort-server.worker.image` / `hort-server.dex.image` helpers
+  # (templates/_helpers.tpl) own the registry+path-prefix split
+  # (`<imageRegistry>/hort-oci/hort-{server,worker}:<tag>`,
+  # `<imageRegistry>/hort-base/dex:<pin>`) so operators set ONE value
+  # instead of three per-component repository overrides. See issue #60.
+  imageRegistry: ""
+
 # -------------------- Image --------------------
 # Container image for the hort-server binary. The chart does not enforce
 # image signatures; consumers (Kyverno, sigstore policy-controller,
@@ -223,7 +238,10 @@ auth:
     # When true: render the Dex sidecar AND point HORT_OIDC_ISSUER_URL at
     # auth.dex.issuerUrl (requires auth.provider=oidc).
     enabled: false
-    # Dex container image. Pin to a digest in production.
+    # Dex container image. Pin to a digest in production. The tag here is
+    # also the pin `global.imageRegistry` (see above) rewrites onto
+    # `<imageRegistry>/hort-base/dex:<tag>` when set — see
+    # `hort-server.dex.image` in templates/_helpers.tpl.
     image: "ghcr.io/dexidp/dex:v2.41.1"
     imagePullPolicy: IfNotPresent
     # The OIDC issuer URL Dex advertises AND that hort-server validates

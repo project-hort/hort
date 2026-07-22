@@ -1,9 +1,11 @@
 ---
 # Defaults for the hort-binaries role.
 #
-# hort_version is set in group_vars/all.yml (currently "0.9.3-beta.2").
-# Override here if you need to pin a different version for this role specifically.
-# Must be a published v* tag on github.com/project-hort/hort.
+# hort_version selects the release to download. Supply it on the command line
+# (`-e hort_version=0.9.11`), NOT pinned in group_vars. The special value
+# `latest` resolves the newest STABLE GitHub release (see tasks/main.yml —
+# "Resolve the deploy version"). Must resolve to a published v* tag on
+# github.com/project-hort/hort.
 #
 # Signature artifact form: cosign sign-blob writes a self-contained Sigstore
 # bundle (--bundle, cosign v3+).  Each release asset ships:
@@ -16,10 +18,16 @@
 #           --certificate-oidc-issuer https://token.actions.githubusercontent.com \
 #           <file>.tar.gz
 
+# Effective version to download: the CLI-provided hort_version, unless that is
+# `latest`, in which case tasks/main.yml resolves it to the newest stable release
+# and overrides this fact. Role-prefixed so the download URL never depends on
+# whether the resolution step ran.
+hort_binaries_version: "{{ hort_version }}"
+
 # GitHub release download base URL (no trailing slash).
 # hort_arch (amd64|arm64) is set in group_vars/all.yml — override per-host.
 hort_binaries_github_release_url: >-
-  https://github.com/project-hort/hort/releases/download/v{{ hort_version }}
+  https://github.com/project-hort/hort/releases/download/v{{ hort_binaries_version }}
 
 # Cosign identity pin — the regexp must match the Actions workflow ref that
 # signed the release.  Pinning to refs/tags/v* ensures only a tag-triggered

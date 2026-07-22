@@ -391,6 +391,85 @@ jobs:
           done
 
   # ════════════════════════════════════════════════════════════════════════════
+  # MIRROR-TO-HORT-BASE: publish pinned third-party base images (dex, postgres)
+  # to registry.hort.rs/hort-base (D3, issue #60). Twin of mirror-to-hort-oci
+  # above: same gate, same hort-auth SA exchange, same `cosign copy` mechanism.
+  # Unlike hort-oci's mirror, the source here is a third-party upstream image
+  # we do not build, so §6 invariant 4 requires resolving it to a digest FIRST
+  # (never `cosign copy` a floating tag) using the same `docker buildx
+  # imagetools inspect --format '{{json .Manifest}}' | jq -r .digest` idiom the
+  # `merge` job above already uses for hort's own images. `cosign copy`
+  # preserves any upstream signature/attestation it finds (§6 invariant 2) but
+  # does not fail when there is none — postgres carries no upstream cosign
+  # signature; the sovereign copy's integrity guarantee is the digest pin, not
+  # a re-signature. The destination tag is the UPSTREAM tag (not hort's own
+  # release version) because that is what the chart's helper template
+  # resolves: `hort-server.dex.image` rewrites `auth.dex.image`'s pin
+  # (currently v2.41.1) to `<imageRegistry>/hort-base/dex:<pin>` — mirroring
+  # under a different tag would make that lookup 404. The dex source is read
+  # out of values.yaml (not hardcoded a second time) so a renovate dex bump and
+  # this job can never drift apart.
+  # ════════════════════════════════════════════════════════════════════════════
+  mirror-to-hort-base:
+    name: Mirror base images to registry.hort.rs/hort-base
+    runs-on: ubuntu-latest
+    environment: release
+    needs: [merge]
+    permissions:
+      contents: read
+      id-token: write   # mint the OIDC token for the gha-release SA exchange
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      vars.HORT_PROXY_ENABLED == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Authenticate to registry.hort.rs as the gha-release SA (environment:
+      # release ↔ SA claim). The action's docker login writes the registry.hort.rs
+      # credential that `cosign copy` reads from ~/.docker/config.json to push.
+      - uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+
+      - name: Resolve dex source tag (must match values.yaml auth.dex.image)
+        id: dex_ref
+        run: |
+          set -euo pipefail
+          image=$(grep -E '^\s*image:\s*"ghcr\.io/dexidp/dex:' deploy/helm/hort-server/values.yaml \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          [ -n "${image}" ] || { echo "::error::could not find auth.dex.image in values.yaml"; exit 1; }
+          echo "ref=${image}" >> "$GITHUB_OUTPUT"
+          echo "Dex source (from values.yaml): ${image}"
+
+      - name: Mirror base images (digest-pinned) to hort-base
+        env:
+          DEX_SRC: ${{ steps.dex_ref.outputs.ref }}
+          PG_SRC: docker.io/postgres:17-alpine
+        run: |
+          set -euo pipefail
+          declare -A SOURCES=(
+            [dex]="${DEX_SRC}"
+            [postgres]="${PG_SRC}"
+          )
+          for name in "${!SOURCES[@]}"; do
+            src="${SOURCES[$name]}"
+            tag="${src##*:}"
+            digest=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${src}" | jq -r '.digest')
+            [ -n "${digest}" ] && [ "${digest}" != "null" ] || { echo "::error::could not resolve digest for ${src}"; exit 1; }
+            echo "Resolved ${src} -> ${digest}"
+            dest="registry.hort.rs/hort-base/${name}:${tag}"
+            echo "Mirroring ${src}@${digest} -> ${dest}"
+            cosign copy --force "${src}@${digest}" "${dest}"
+          done
+
+  # ════════════════════════════════════════════════════════════════════════════
   # PUBLISH-CHART: package and push the hort-server Helm chart as an OCI
   # artifact to ghcr.io, mirroring the GitLab `helm:lint-and-publish` job. The
   # chart lands at ghcr.io/<owner>/charts/hort-server:<version>. Runs after the
@@ -552,6 +631,133 @@ jobs:
             --registry-referrers-mode=legacy \
             "${REGISTRY}/${OWNER}/charts/hort-server@${DIGEST}"
           echo "Signed (keyless, legacy .sig) ${REGISTRY}/${OWNER}/charts/hort-server@${DIGEST}"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PUBLISH-CHART-REGISTRY-HORT-RS: publish a second flavor of the same chart —
+  # identical source tree, but packaged with global.imageRegistry defaulted to
+  # registry.hort.rs (D3, issue #60), so installing THIS flavor is
+  # self-contained with no extra --set. `helm package` has no --set, so the
+  # mutated default is baked into values.yaml on a throwaway copy of
+  # deploy/helm/hort-server/ before packaging — the in-tree chart, and the
+  # ghcr flavor published by publish-chart above (default stays ""), are never
+  # written to. Signed with the identical #47 keyless v2.x legacy-.sig flow so
+  # it verifies exactly like the ghcr copy (§6 invariant 2). Sequenced after
+  # both mirror jobs (needs:) so this chart is never published pointing at
+  # images that have not actually landed in hort-base / hort-oci yet.
+  # ════════════════════════════════════════════════════════════════════════════
+  publish-chart-registry-hort-rs:
+    name: Publish Helm Chart (registry.hort.rs flavor)
+    runs-on: ubuntu-latest
+    environment: release
+    needs: [merge, mirror-to-hort-oci, mirror-to-hort-base]
+    permissions:
+      contents: read
+      id-token: write   # hort-auth SA exchange + keyless cosign chart signing (Fulcio OIDC) — #47
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      vars.HORT_PROXY_ENABLED == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Resolve chart version
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'${VERSION}' is not a SemVer chart version — this job's if: gate only allows a refs/tags/v* ref, so this should be unreachable."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Chart version: ${VERSION}"
+
+      - name: Verify helm is available
+        run: helm version
+
+      # Authenticate to registry.hort.rs as the gha-release SA. Populates
+      # ~/.docker/config.json (read by cosign below, same as mirror-to-hort-oci
+      # / mirror-to-hort-base) and yields the bearer token the next step's
+      # `helm registry login` needs — helm keeps its own credential store,
+      # separate from docker's (see publish-chart's ghcr equivalent above).
+      - name: Authenticate to registry.hort.rs
+        id: hort_auth
+        uses: ./.github/actions/hort-auth
+        with:
+          proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+
+      - name: Log in to registry.hort.rs (Helm OCI)
+        env:
+          HORT_TOKEN: ${{ steps.hort_auth.outputs.token }}
+        run: |
+          echo "${HORT_TOKEN}" | helm registry login registry.hort.rs --username hort-ci --password-stdin
+
+      # §3.4 invariant (same assertion publish-chart makes for the ghcr
+      # flavor): Chart.yaml must already declare this tag's version.
+      - name: Assert Chart.yaml matches tag (§3.4)
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          chart_version=$(grep -E '^version:' deploy/helm/hort-server/Chart.yaml \
+            | sed -E 's/^version:[[:space:]]*//;s/^"//;s/"$//')
+          chart_app_version=$(grep -E '^appVersion:' deploy/helm/hort-server/Chart.yaml \
+            | sed -E 's/^appVersion:[[:space:]]*//;s/^"//;s/"$//')
+          if [ "${chart_version}" != "${VERSION}" ] || [ "${chart_app_version}" != "${VERSION}" ]; then
+            echo "::error::Chart.yaml drifted from tag v${VERSION} (§3.4 invariant)."
+            exit 1
+          fi
+          echo "§3.4 invariant ok: Chart.yaml version + appVersion = ${VERSION}"
+
+      # One source tree, two packaged defaults (D3). Copy to a throwaway dir
+      # and mutate ONLY the copy's values.yaml.
+      - name: Prepare registry.hort.rs flavor (temp copy, mutated default)
+        id: flavor
+        run: |
+          set -euo pipefail
+          FLAVOR_DIR="$(mktemp -d)/hort-server"
+          cp -r deploy/helm/hort-server/ "${FLAVOR_DIR}"
+          yq -i '.global.imageRegistry = "registry.hort.rs"' "${FLAVOR_DIR}/values.yaml"
+          echo "dir=${FLAVOR_DIR}" >> "$GITHUB_OUTPUT"
+          echo "Packaged default global.imageRegistry:"
+          yq '.global.imageRegistry' "${FLAVOR_DIR}/values.yaml"
+
+      - name: Lint, package, and push chart (registry.hort.rs flavor)
+        id: chart
+        env:
+          FLAVOR_DIR: ${{ steps.flavor.outputs.dir }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          # Same reasoning as the ghcr flavor: values.yaml defaults are
+          # intentionally invalid (publicBaseUrl empty), so lint against
+          # test-values.yaml layered on top of the mutated copy.
+          helm lint "${FLAVOR_DIR}" -f "${FLAVOR_DIR}/test-values.yaml"
+          helm package "${FLAVOR_DIR}" \
+            --app-version "${VERSION}" \
+            --version "${VERSION}"
+          helm push hort-server-*.tgz "oci://registry.hort.rs/hort-charts" 2>&1 | tee /tmp/helm-push-hort-rs.out
+          DIGEST=$(grep -ioE 'sha256:[0-9a-f]{64}' /tmp/helm-push-hort-rs.out | head -1)
+          [ -n "${DIGEST}" ] || { echo "::error::could not parse chart digest from helm push output"; exit 1; }
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed chart to oci://registry.hort.rs/hort-charts/hort-server:${VERSION} (${DIGEST})"
+
+      # Pin cosign to v2.x — identical rationale to publish-chart's ghcr
+      # flavor above: Flux discovers a chart signature only via the legacy
+      # sha256-<digest>.sig tag, which only cosign v2.x's default writes.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign chart with cosign (keyless, legacy .sig for Flux)
+        env:
+          DIGEST: ${{ steps.chart.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes \
+            --use-signing-config=false \
+            --new-bundle-format=false \
+            --registry-referrers-mode=legacy \
+            "registry.hort.rs/hort-charts/hort-server@${DIGEST}"
+          echo "Signed (keyless, legacy .sig) registry.hort.rs/hort-charts/hort-server@${DIGEST}"
 
   # ════════════════════════════════════════════════════════════════════════════
   # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually

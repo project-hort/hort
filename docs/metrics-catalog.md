@@ -775,7 +775,7 @@ labels — same anti-pattern discipline as the counter.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, mint_failed, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). |
+| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, replayed_jti, replayed_composite, replay_guard_unavailable, jti_required, mint_failed, mint_contended, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). |
 | `hort_token_exchange_duration_seconds` | histogram | `kind`, `result` | seconds | same set as the counter |
 | `hort_session_admin_issuance_total` | counter | `result` | — | `granted`, `denied_flag`, `denied_authority`, `denied_lifetime` |
 | `hort_fed_sa_match_total` | counter | `result` | — | `matched`, `denied_audience`, `denied_empty_claims` |
@@ -926,6 +926,14 @@ branch — the foreign-IdP JWT exchange path that mints a
   rejected the request (typed `ApiTokenError`). Distinct from
   `internal_error` so operator dashboards separate caller-side
   mint-gate denials from outages.
+- `mint_contended` — JWT and SA validated, and the system-mint's token
+  row persisted, but the SA-stream `ApiTokenIssued` append's bounded
+  CAS-retry loop (issue #62) lost every race under concurrent-mint
+  contention. **Transient, not an infra fault** — distinct from both
+  `mint_failed` (a real `ApiTokenError` gate denial) and
+  `internal_error` (a genuine outage) so dashboards can tell "retry
+  me" apart from "something is broken". Maps to HTTP 503 +
+  `Retry-After` (1s), never `500`.
 - `internal_error` — defensive catch-all: the validator port returned
   an unexpected error, SA listing failed, the federation ports are
   unwired (composition bug). Maps to HTTP 500 / 503.
@@ -2361,7 +2369,7 @@ envelope of `hort_upstream_fetch_total`.
 
 | Metric | Type | Labels | Unit | `outcome` values |
 |--------|------|--------|------|------------------|
-| `hort_pull_dedup_total` | counter | `layer`, `format`, `outcome` | — | `leader_started`, `follower_waited_hit`, `follower_waited_failure`, `follower_fellthrough_503`, `negative_cache_hit`, `lock_expired_re_elected`, `follower_lagged`, `layer_b_unavailable` |
+| `hort_pull_dedup_total` | counter | `layer`, `format`, `outcome` | — | `leader_started`, `follower_waited_hit`, `follower_waited_failure`, `follower_fellthrough_503`, `negative_cache_hit`, `lock_expired_re_elected`, `follower_lagged`, `layer_b_unavailable`, `leader_timeout`, `leader_cancelled` |
 | `hort_pull_dedup_wait_seconds` | histogram | `layer`, `format` | seconds | — (buckets: `0.01, 0.05, 0.1, 0.5, 1, 5, 30, 60, 300`) |
 
 Emitted by `hort_app::pull_dedup::PullDedup::coalesce_metadata` and
@@ -2377,7 +2385,7 @@ Two-layer coalescing:
   write, or re-attempt election when the lock TTL expires without a
   terminal outcome.
 
-**`outcome` label semantics** (closed taxonomy of 8; source of truth:
+**`outcome` label semantics** (closed taxonomy of 10; source of truth:
 `hort_app::metrics::DedupOutcomeLabel`):
 
 - `leader_started` — this caller won leader election (Layer A
@@ -2417,6 +2425,25 @@ Two-layer coalescing:
   provides per-replica coalescing for any other concurrent caller
   on the same pod. Cluster-wide coalescing is degraded; correctness
   is preserved by the existing CAS + path-conflict short-circuit.
+- `leader_timeout` — the leader's fetch closure did not complete
+  within `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` (default `600`,
+  issue #55). The leader is abandoned: a `Failed(Timeout)` terminal
+  is written (using `ttl_timeout`'s TTL as the negative-cache
+  window) so waiting followers cache the failure rather than
+  re-electing immediately, and the Layer-A entry is evicted so the
+  *next* caller elects fresh. **This is the alertable signal for a
+  recurrence of #53 (a wedged coalesce leader poisoning every
+  follower on the pod).** `hort_pull_dedup_wait_seconds` does
+  **not** cover this case — `emit_wait` fires only after `fetch_fn`
+  returns, and a wedged leader's `fetch_fn` never does, so this
+  counter is the *only* signal a wedge occurred. Do not "fix" the
+  histogram later on the assumption it already tracks this.
+- `leader_cancelled` — the leader's cleanup guard was dropped
+  without ever recording a terminal outcome (client disconnect,
+  runtime shutdown, or a panic upstream of the leader's own await
+  points). Distinguishes "we gave up at the deadline"
+  (`leader_timeout`) from "the caller went away before the leader
+  itself decided anything."
 
 **`format` label values:** match `hort_upstream_fetch_total`'s closed
 taxonomy (`oci`, `pypi`, `npm`, `cargo`, …) for the metadata and
@@ -2428,7 +2455,7 @@ bounded at the same envelope as `hort_upstream_fetch_total` plus one.
 
 **Cardinality envelope:**
 - `hort_pull_dedup_total`: 2 layers × ~10 formats (incl. `_any` sentinel)
-  × 8 outcomes = ≤ 160 series. Flat per deployment.
+  × 10 outcomes = ≤ 200 series. Flat per deployment.
 - `hort_pull_dedup_wait_seconds`: 2 layers × ~10 formats × 9 buckets
   = ≤ 180 series. Flat per deployment.
 

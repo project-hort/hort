@@ -1,5 +1,5 @@
 //! Supplementary functional proof that the npm packument streaming
-//! projector handles a multi-megabyte body through the `FormatHandler`
+//! projector handles a multi-megabyte body through the `VersionDiscovery`
 //! streaming-reader port without materialising a whole-body
 //! `serde_json::Value` tree (see ADR 0026).
 //!
@@ -29,7 +29,7 @@
 //! a `serde_json::Value`. No exact peak-RSS probe (env-dependent); the
 //! streaming success on a multi-MiB body is the observable signal.
 
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::VersionDiscovery;
 use hort_formats::npm::NpmFormatHandler;
 
 /// Build a syntactically-valid npm packument JSON with `count` versions,

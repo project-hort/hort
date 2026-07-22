@@ -44,7 +44,7 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: dex
-          image: {{ .Values.auth.dex.image | quote }}
+          image: {{ include "hort-server.dex.image" . | quote }}
           imagePullPolicy: {{ .Values.auth.dex.imagePullPolicy }}
           args:
             - dex

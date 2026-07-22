@@ -1082,7 +1082,7 @@ pub async fn build_app_context(
     redis_url_evictable: Option<String>,
     redis_url_durable: Option<String>,
     // Pull-through deduplication config built by
-    // the caller (`cli::serve`) from the five `HORT_PULL_DEDUP_*` env vars
+    // the caller (`cli::serve`) from the six `HORT_PULL_DEDUP_*` env vars
     // on `Config`. Threaded into `PullDedup::new` after
     // `build_ephemeral_stores` returns. Composition is the consumer of
     // parsed config, never the parser.
