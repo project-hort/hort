@@ -1,0 +1,17 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: gha-release-read-crates-proxy
+spec:
+  # cargo-virtual aggregates crates-proxy resolving each member AS THE
+  # CALLING identity, so the publish job (gha-release, resolving external
+  # crate deps via cargo-virtual during `cargo publish`) needs read on the
+  # crates-proxy member or the aggregated index omits it and cargo reports
+  # "no matching package named <dep>". Keeps release dependency resolution
+  # fully within registry.hort.rs (vetted, quarantined+scanned pull-through),
+  # never crates.io. Mirrors gha-ci-read-crates-proxy.
+  subject:
+    kind: serviceAccount
+    name: gha-release
+  permission: read
+  repository: crates-proxy
