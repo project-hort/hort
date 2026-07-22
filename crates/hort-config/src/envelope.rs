@@ -23,21 +23,41 @@ pub struct Envelope<Spec> {
     pub spec: Spec,
 }
 
-/// API version literal. Only `project-hort.de/v1beta1` is accepted in v1.
+/// API version literal. `project-hort.de/v1` (stable) and
+/// `project-hort.de/v1beta1` (supported, deprecated) are both accepted.
 ///
-/// `v1beta1` carries the "stabilising schema, removal-after-deprecation-window"
-/// semantics — additive changes can land without a bump, but removals and
-/// breaking renames are announced one minor before they take effect. There
-/// is no automatic upgrade of older versions; operators re-emit when a new
-/// variant is added here.
+/// `v1` is the stable schema (issue #67): additive changes can land
+/// without a bump, but removals and breaking renames are announced one
+/// minor before they take effect — the same "stabilising schema"
+/// contract `v1beta1` carried, now under its post-deprecation-window
+/// name. `v1beta1` continues to parse identically (no forced operator
+/// migration; existing gitops trees are not broken by the bump) but new
+/// envelopes should be authored as `v1` — see [`ApiVersion::default`].
+/// There is no automatic upgrade of older versions; operators re-emit
+/// when a new variant is added here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiVersion {
+    /// `project-hort.de/v1` — the stable, current schema version.
+    V1,
+    /// `project-hort.de/v1beta1` — supported for existing gitops trees;
+    /// deprecated in favor of `V1`. Parses and behaves identically to
+    /// `V1`; the two variants exist only to preserve the literal string
+    /// an operator's tree already declares.
     V1Beta1,
+}
+
+impl Default for ApiVersion {
+    /// The version anything that constructs a fresh envelope should
+    /// emit (issue #67).
+    fn default() -> Self {
+        Self::V1
+    }
 }
 
 impl fmt::Display for ApiVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::V1 => f.write_str("project-hort.de/v1"),
             Self::V1Beta1 => f.write_str("project-hort.de/v1beta1"),
         }
     }
@@ -48,6 +68,7 @@ impl FromStr for ApiVersion {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "project-hort.de/v1" => Ok(Self::V1),
             "project-hort.de/v1beta1" => Ok(Self::V1Beta1),
             _ => Err(ParseError::UnsupportedApiVersion { got: s.to_string() }),
         }
@@ -223,11 +244,22 @@ mod tests {
 
     #[test]
     fn api_version_display() {
+        assert_eq!(ApiVersion::V1.to_string(), "project-hort.de/v1");
         assert_eq!(ApiVersion::V1Beta1.to_string(), "project-hort.de/v1beta1");
     }
 
     #[test]
-    fn api_version_from_str_accepts_canonical() {
+    fn api_version_from_str_accepts_v1() {
+        let v: ApiVersion = "project-hort.de/v1".parse().unwrap();
+        assert_eq!(v, ApiVersion::V1);
+    }
+
+    /// `v1beta1` MUST keep parsing (issue #67 promises no forced
+    /// operator migration) — this is the one test that must never be
+    /// removed or repointed at `v1` when this file's fixtures are
+    /// otherwise migrated to the stable version string.
+    #[test]
+    fn api_version_from_str_still_accepts_v1beta1() {
         let v: ApiVersion = "project-hort.de/v1beta1".parse().unwrap();
         assert_eq!(v, ApiVersion::V1Beta1);
     }
@@ -237,8 +269,10 @@ mod tests {
         let err = "project-hort.de/v2".parse::<ApiVersion>().unwrap_err();
         let rendered = err.to_string();
         assert!(
-            rendered.contains("v2") && rendered.contains("project-hort.de/v1beta1"),
-            "error must name both the bad version and the known one: {rendered}"
+            rendered.contains("v2")
+                && rendered.contains("project-hort.de/v1")
+                && rendered.contains("project-hort.de/v1beta1"),
+            "error must name the bad version and BOTH accepted versions: {rendered}"
         );
     }
 
@@ -248,18 +282,23 @@ mod tests {
     }
 
     #[test]
+    fn api_version_default_is_v1() {
+        assert_eq!(ApiVersion::default(), ApiVersion::V1);
+    }
+
+    #[test]
     fn api_version_serde_roundtrip() {
         // Wrap in a tiny struct so we exercise serde, not just FromStr.
         #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
         struct Wrap {
             v: ApiVersion,
         }
-        let w = Wrap {
-            v: ApiVersion::V1Beta1,
-        };
-        let yaml = serde_yaml_ng::to_string(&w).unwrap();
-        let back: Wrap = serde_yaml_ng::from_str(&yaml).unwrap();
-        assert_eq!(w, back);
+        for v in [ApiVersion::V1, ApiVersion::V1Beta1] {
+            let w = Wrap { v };
+            let yaml = serde_yaml_ng::to_string(&w).unwrap();
+            let back: Wrap = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(w, back);
+        }
     }
 
     // -- Kind ---------------------------------------------------------------

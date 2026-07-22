@@ -45,7 +45,7 @@ To get a live, group-based human admin you need **one** of:
 2. **Map the group to `admin`.** Apply a `ClaimMapping` in the gitops tree:
 
    ```yaml
-   apiVersion: project-hort.de/v1beta1
+   apiVersion: project-hort.de/v1
    kind: ClaimMapping
    metadata:
      name: admins

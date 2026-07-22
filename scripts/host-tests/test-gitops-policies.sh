@@ -839,7 +839,7 @@ else
     # `ArtifactRejected { reason: CurationRetroactive { rule_id } }`
     # per match.
     cat > "$STAGE_ROOT/config/policies/curation-block-retro.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: CurationRule
 metadata:
   name: block-retro-1
@@ -854,7 +854,7 @@ EOF
     # `block-known-bad-1` reference is preserved (removing it would
     # be a second curation-rule diff and muddy the metric assertions).
     cat > "$STAGE_ROOT/config/repositories/pypi-curated.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: pypi-curated
@@ -942,7 +942,7 @@ else
     # evaluator must NOT fire on weakening (asymmetry rule, mirroring
     # architect-skill quarantine invariant 3).
     cat > "$STAGE_ROOT/config/policies/curation-block-retro.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: CurationRule
 metadata:
   name: block-retro-1

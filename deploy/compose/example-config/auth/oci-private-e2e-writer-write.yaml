@@ -9,7 +9,7 @@
 # from the read-only oci-private-e2e-reader SA, so the native-mode run
 # exercises the SAME "Read grant != Write grant" capability-precision split
 # the legacy-mode run does with dev-user/reader-user.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: oci-private-e2e-writer-write

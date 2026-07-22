@@ -855,7 +855,7 @@ mod tests {
 
     fn repo_env(name: &str, format: &str) -> Envelope<RepositorySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ArtifactRepository,
             metadata: Metadata { name: name.into() },
             spec: RepositorySpec {
@@ -886,7 +886,7 @@ mod tests {
 
     fn oidc_issuer_env(name: &str) -> Envelope<OidcIssuerSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::OidcIssuer,
             metadata: Metadata { name: name.into() },
             spec: OidcIssuerSpec {
@@ -906,7 +906,7 @@ mod tests {
         claims.insert("repository".to_string(), "my-org/my-repo".to_string());
         claims.insert("environment".to_string(), "production".to_string());
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ServiceAccount,
             metadata: Metadata { name: name.into() },
             spec: ServiceAccountSpec {
@@ -925,7 +925,7 @@ mod tests {
         let mut claims = BTreeMap::new();
         claims.insert("repository".to_string(), "my-org/my-repo".to_string());
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ServiceAccount,
             metadata: Metadata { name: name.into() },
             spec: ServiceAccountSpec {
@@ -945,7 +945,7 @@ mod tests {
         trust_pt: bool,
     ) -> Envelope<UpstreamMappingSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::UpstreamMapping,
             metadata: Metadata { name: name.into() },
             spec: UpstreamMappingSpec {
@@ -977,7 +977,7 @@ mod tests {
         scan_backends: Vec<&str>,
     ) -> Envelope<ScanPolicySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ScanPolicy,
             metadata: Metadata { name: name.into() },
             spec: ScanPolicySpec {
@@ -1344,7 +1344,7 @@ mod tests {
                 repo_env("cargo-proxy", "cargo"),
             ],
             scan_policies: vec![Envelope {
-                api_version: ApiVersion::V1Beta1,
+                api_version: ApiVersion::V1,
                 kind: Kind::ScanPolicy,
                 metadata: Metadata {
                     name: "p-global".into(),
@@ -1587,7 +1587,7 @@ mod tests {
         repository: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -1607,7 +1607,7 @@ mod tests {
         repository: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -1627,7 +1627,7 @@ mod tests {
         repository: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
@@ -1642,7 +1642,7 @@ mod tests {
 
     fn claim_mapping_env(name: &str, idp_group: &str, claim: &str) -> Envelope<ClaimMappingSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ClaimMapping,
             metadata: Metadata { name: name.into() },
             spec: ClaimMappingSpec {
@@ -1655,7 +1655,7 @@ mod tests {
     /// A minimal identity-only `ServiceAccount` envelope.
     fn sa_env(name: &str) -> Envelope<ServiceAccountSpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ServiceAccount,
             metadata: Metadata { name: name.into() },
             spec: ServiceAccountSpec {
@@ -1830,7 +1830,7 @@ mod tests {
     #[test]
     fn row8_operator_downgrade_lands_as_warning() {
         let lint_env = Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::PermissionGrantLintConfig,
             metadata: Metadata {
                 name: "rbac-lint".into(),

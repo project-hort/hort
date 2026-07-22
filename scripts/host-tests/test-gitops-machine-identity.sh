@@ -235,7 +235,7 @@ echo "[2/7] Seeding gitops config (example-config + OidcIssuer + ServiceAccount 
 cp -r "${EXAMPLE_CONFIG}/." "${CONFIG_DIR}/"
 
 cat > "${CONFIG_DIR}/oidc-issuers/federation-test-issuer.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: OidcIssuer
 metadata:
   name: federation-test-issuer
@@ -247,7 +247,7 @@ spec:
 EOF
 
 cat > "${CONFIG_DIR}/service-accounts/ci-federation-test.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: ci-federation-test
@@ -266,7 +266,7 @@ EOF
 # Grants apply after repositories and service accounts within one
 # gitops pass, so a single seeded tree covers the references.
 cat > "${CONFIG_DIR}/auth/ci-federation-test-write.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: ci-federation-test-write
@@ -279,7 +279,7 @@ spec:
 EOF
 
 cat > "${CONFIG_DIR}/auth/ci-federation-test-read.yaml" <<EOF
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: ci-federation-test-read

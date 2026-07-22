@@ -309,7 +309,7 @@ mod tests {
 
     fn yaml(name: &str, body: &str) -> String {
         format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: ScanPolicy\nmetadata:\n  name: {name}\nspec:{body}"
+            "apiVersion: project-hort.de/v1\nkind: ScanPolicy\nmetadata:\n  name: {name}\nspec:{body}"
         )
     }
 
@@ -827,7 +827,7 @@ mod tests {
   licensePolicy: {}
 ";
         let yaml_doc = format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: ScanPolicy\nmetadata:\n  name: ''\nspec:{body}"
+            "apiVersion: project-hort.de/v1\nkind: ScanPolicy\nmetadata:\n  name: ''\nspec:{body}"
         );
         let err = parse_scan_policy(&p(), yaml_doc.as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::EmptyMetadataName));

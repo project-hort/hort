@@ -5,7 +5,7 @@
 # OCI repositories are excluded at the use-case layer
 # (`oci_unsupported`), so no OCI prefetch grant is needed.
 # See `31-read-npm-proxy.yaml` for the full reshape rationale.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: developers-prefetch-npm-proxy

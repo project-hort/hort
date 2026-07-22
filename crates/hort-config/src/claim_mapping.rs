@@ -4,7 +4,7 @@
 //! canonical one-object-per-file envelope shape:
 //!
 //! ```yaml
-//! apiVersion: project-hort.de/v1beta1
+//! apiVersion: project-hort.de/v1
 //! kind: ClaimMapping
 //! metadata:
 //!   name: admins
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn parse_canonical_envelope_round_trip() {
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins
@@ -126,7 +126,7 @@ spec:
 
     #[test]
     fn empty_idp_group_is_rejected() {
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins
@@ -141,7 +141,7 @@ spec:
 
     #[test]
     fn empty_claim_is_rejected() {
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins
@@ -159,7 +159,7 @@ spec:
         // Defensive — operators shouldn't write `idpGroup: "   "`, but
         // matching `is_empty` after `trim` makes the rejection
         // intentional rather than accidental on the trim side.
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins
@@ -173,7 +173,7 @@ spec:
 
     #[test]
     fn unknown_field_in_spec_is_rejected() {
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins
@@ -194,7 +194,7 @@ spec:
         // is renamed AND the field names changed; `deny_unknown_fields`
         // makes the old shape surface as a parse error rather than
         // silently dropping the fields.
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: admins
@@ -208,7 +208,7 @@ spec:
 
     #[test]
     fn empty_metadata_name_is_rejected() {
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: ''
@@ -222,7 +222,7 @@ spec:
 
     #[test]
     fn wrong_kind_envelope_is_rejected() {
-        let yaml = "apiVersion: project-hort.de/v1beta1
+        let yaml = "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: admins

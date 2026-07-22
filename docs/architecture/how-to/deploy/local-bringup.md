@@ -452,7 +452,7 @@ sudo mkdir -p /etc/hort-server/config/grants
 
 ```yaml
 # /etc/hort-server/config/grants/cron-rescan.yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: cron-rescan-can-invoke
@@ -684,7 +684,7 @@ shape as the cron-task grants (§7.3), different `permission` and
 
 ```yaml
 # /etc/hort-server/config/grants/ci-publish-internal-libs.yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: ci-publish-internal-libs-can-write-libs

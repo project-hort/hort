@@ -3,7 +3,7 @@
 # (ADR 0031 / ADR 0021 auth composition), so the dev needs explicit Read on
 # the member to see it merged into the virtual — Write does NOT imply Read.
 # scripts/native-tests/scenarios/clients/virtual.sh. Rationale: see ci-pushers.yaml.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: dev-read-npm-virt-internal

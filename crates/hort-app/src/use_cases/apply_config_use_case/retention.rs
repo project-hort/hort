@@ -387,7 +387,7 @@ mod tests {
             scope: serde_json::Value,
         ) -> Envelope<RetentionPolicySpec> {
             Envelope {
-                api_version: ApiVersion::V1Beta1,
+                api_version: ApiVersion::V1,
                 kind: Kind::RetentionPolicy,
                 metadata: Metadata { name: name.into() },
                 spec: RetentionPolicySpec { predicate, scope },

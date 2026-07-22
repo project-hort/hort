@@ -77,7 +77,7 @@
 #
 #   gitopsConfig:
 #     "auth/admins.yaml": |
-#       apiVersion: project-hort.de/v1beta1
+#       apiVersion: project-hort.de/v1
 #       kind: GroupMapping
 #       metadata:
 #         name: admins
@@ -85,7 +85,7 @@
 #         group: hort-admins
 #         role: admin
 #     "repositories/npm-public.yaml": |
-#       apiVersion: project-hort.de/v1beta1
+#       apiVersion: project-hort.de/v1
 #       kind: ArtifactRepository
 #       metadata:
 #         name: npm-public

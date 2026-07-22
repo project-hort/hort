@@ -927,7 +927,7 @@ gitopsConfig:
         value: hort-admins
         role: admin
   "repos/ghcr-mirror.yaml": |
-    apiVersion: project-hort.de/v1beta1
+    apiVersion: project-hort.de/v1
     kind: ArtifactRepository
     metadata:
       name: ghcr-mirror
