@@ -286,6 +286,55 @@ practice.
 
 See ADR 0038.
 
+### Cross-cutting note — inbound rate-limit posture (issue #66)
+
+Not a mechanism — a defense-in-depth control layered in front of the
+mechanisms above, documented here because its posture materially
+affects how much credential-stuffing resistance Entry 1's write paths
+and Entry 6 (`/auth/exchange`) actually get.
+
+`hort-http-core::middleware::rate_limit` attaches two per-IP layers:
+`write_rate_limit_layer` (unconditional, bounds mutation throughput
+regardless of auth outcome — `HORT_RATELIMIT_WRITE_PER_MIN`, default
+300/min) and `auth_rate_limit_layer` (attached wherever
+`require_principal` runs, and over the anonymous `POST
+/api/v1/auth/exchange` route — `HORT_RATELIMIT_AUTH_PER_MIN`, default
+60/min).
+
+**Corrected posture (was: counted every attempt; now: counts
+FAILURES only).** Before this fix, `auth_rate_limit_layer` consumed a
+token on every write — success or failure — so a valid, authenticated
+client's effective throughput ceiling was `min(auth_per_min,
+write_per_min)`, typically the tighter `auth_per_min` (60/min). A bulk
+authenticated push (e.g. `cosign copy` mirroring many blobs/manifests
+in one release job) hit that ceiling and was rejected even though
+every credential presented was valid — the auth scope's own threat
+model (credential-stuffing: repeated presentation of a BAD credential)
+never justified penalizing a stream of GOOD credentials for being
+numerous. `auth_rate_limit_layer` now counts only `401` responses
+(invalid, missing, or replayed credential) toward its per-IP budget; a
+successful write, and a downstream `403` on an already-accepted
+credential (an authorization decision, not a credential failure),
+never draw the bucket down. A valid-principal client's throughput is
+now bounded by `write_per_min` alone — the control the doc always
+described as the mutation-throughput backstop.
+
+**The pre-validation throttle is preserved.** The entry check (is this
+IP already over its failure budget?) still runs, and still rejects,
+BEFORE `require_principal` performs JWKS validation or `/auth/exchange`
+performs its own credential-exchange work — an attacker cannot burn
+that validation path past the cap. The change is WHAT counts toward
+the budget (failures, not attempts), not WHEN the pre-validation
+reject fires once the budget is exhausted.
+
+**Enforcement owner:** `Hort-enforced`. See
+`crates/hort-http-core/src/middleware/rate_limit.rs` module docstring
+for the full mechanic (why `governor`'s keyed limiter — coupled
+check+consume, no peek, no refund — could not express this and a
+bespoke per-IP failure-window counter was used instead) and
+`docs/metrics-catalog.md`'s `hort_rate_limit_rejects_total` entry for
+the metric-level detail.
+
 ## §4 — How this catalog is enforced
 
 `.claude/commands/hort-architect.md` adds this doc to its
