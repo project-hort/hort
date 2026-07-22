@@ -131,7 +131,7 @@ pub(crate) async fn serve_simple_index_unified(
         RepositoryType::Virtual => "virtual",
         _ => "hosted",
     };
-    let output: IndexSourceOutput = select_source(&repo, format)
+    let output: IndexSourceOutput = select_source(&repo)
         .fetch(ctx, &repo, project, caller)
         .await
         .map_err(ApiError::from)?;
