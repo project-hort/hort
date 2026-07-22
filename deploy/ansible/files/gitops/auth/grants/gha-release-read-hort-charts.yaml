@@ -1,0 +1,15 @@
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: gha-release-read-hort-charts
+spec:
+  # Per-repo serviceAccount-subject grant: gha-release reads hort-charts.
+  # The release workflow cosign-signs the chart it pushes, and the
+  # signing step resolves the just-pushed manifest back from the
+  # registry — write does not imply read, so the read is granted
+  # explicitly (same reason hort-oci has a read grant).
+  subject:
+    kind: serviceAccount
+    name: gha-release
+  permission: read
+  repository: hort-charts
