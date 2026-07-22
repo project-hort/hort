@@ -1106,7 +1106,7 @@ mod tests {
             ""
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: {name}
@@ -1124,7 +1124,7 @@ spec:
 
     fn cm_yaml(meta_name: &str, idp_group: &str, claim: &str) -> Vec<u8> {
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: {meta_name}
@@ -1168,6 +1168,38 @@ spec:
         );
     }
 
+    /// Issue #67: a tree with SOME envelopes on the new stable `v1` and
+    /// SOME still on `v1beta1` parses and cross-validates identically —
+    /// the version bump is opt-in per file, never a forced operator
+    /// migration.
+    #[test]
+    fn parse_files_accepts_mixed_v1_and_v1beta1_apiversions() {
+        let v1beta1_repo = b"apiVersion: project-hort.de/v1beta1
+kind: ArtifactRepository
+metadata:
+  name: legacy-repo
+spec:
+  name: legacy-repo
+  format: npm
+  type: hosted
+  storage: { backend: filesystem, path: /data/legacy-repo }
+  isPublic: true
+  replicationPriority: immediate
+"
+        .to_vec();
+        let files = vec![
+            (p("legacy.yaml"), v1beta1_repo),
+            (p("a.yaml"), repo_yaml("a", "hosted", None)),
+            (p("admins.yaml"), cm_yaml("admins", "g", "admin")),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        assert_eq!(state.repositories.len(), 2);
+        assert_eq!(state.claim_mappings.len(), 1);
+        state
+            .validate()
+            .expect("mixed v1/v1beta1 tree must cross-validate cleanly");
+    }
+
     #[test]
     fn parse_files_collects_every_per_file_error() {
         let files = vec![
@@ -1201,7 +1233,7 @@ spec:
 
     #[test]
     fn parse_files_unknown_kind_surfaces_error() {
-        let yaml = b"apiVersion: project-hort.de/v1beta1
+        let yaml = b"apiVersion: project-hort.de/v1
 kind: Bogus
 metadata: { name: x }
 spec: {}
@@ -1454,7 +1486,7 @@ spec: {}
             None => String::new(),
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: {name}
@@ -1474,7 +1506,7 @@ spec:
             None => String::new(),
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: {name}
@@ -1488,7 +1520,7 @@ spec:
 
     fn cr_yaml(name: &str) -> Vec<u8> {
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: CurationRule
 metadata:
   name: {name}
@@ -1504,7 +1536,7 @@ spec:
 
     fn sp_yaml(name: &str) -> Vec<u8> {
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: {name}
@@ -1525,7 +1557,7 @@ spec:
             None => String::new(),
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: Exclusion
 metadata:
   name: {name}
@@ -1549,7 +1581,7 @@ spec:
             format!("  curationRules: [{}]\n", rules.join(", "))
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: {name}
@@ -1870,7 +1902,7 @@ spec:
             format!("  scanBackends: [{}]\n", backends.join(", "))
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: {name}
@@ -2013,7 +2045,7 @@ spec:
             format!("  scanBackends: [{}]\n", backends.join(", "))
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: {name}
@@ -2042,7 +2074,7 @@ spec:
             ""
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: {meta_name}
@@ -2204,7 +2236,7 @@ spec:
             ""
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: {name}
@@ -2226,7 +2258,7 @@ spec:
 
     fn oidc_yaml(name: &str, url: &str) -> Vec<u8> {
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: OidcIssuer
 metadata:
   name: {name}
@@ -2244,7 +2276,7 @@ spec:
             None => String::new(),
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: {meta_name}
@@ -2272,7 +2304,7 @@ spec:
             ),
         };
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: {name}
@@ -2429,7 +2461,7 @@ metadata:
 
     fn lint_yaml(name: &str, body: &str) -> Vec<u8> {
         format!(
-            "apiVersion: project-hort.de/v1beta1
+            "apiVersion: project-hort.de/v1
 kind: PermissionGrantLintConfig
 metadata:
   name: {name}
@@ -2514,7 +2546,7 @@ spec:{body}"
 
     #[test]
     fn parse_files_routes_unknown_kind_and_lists_known_kinds() {
-        let yaml = b"apiVersion: project-hort.de/v1beta1
+        let yaml = b"apiVersion: project-hort.de/v1
 kind: Bogus
 metadata: { name: x }
 spec: {}
