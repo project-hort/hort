@@ -661,7 +661,7 @@ flags, OCI session records, auth-event throttle). Each falls back to
 
 Two-layer request coalescing covers every upstream
 pull-through path (Cargo, npm, PyPI, OCI). The chart **does not yet
-expose named values** for this feature; the binary reads six
+expose named values** for this feature; the binary reads seven
 `HORT_PULL_DEDUP_*` env vars. Set them via `extraEnv` until the chart
 exposes named keys.
 
@@ -672,6 +672,8 @@ exposes named keys.
 | `HORT_PULL_DEDUP_TTL_TIMEOUT_SECS` | `10` | Short-cache TTL for upstream timeouts and network errors. Same rationale as `UNAVAILABLE`. |
 | `HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS` | `60` | Short-cache TTL for upstream-checksum-mismatch outcomes. Longer than `UNAVAILABLE` because checksum mismatch is a content-integrity signal, not a transient transport issue — re-fetching immediately wastes bandwidth on the same poisoned upstream. |
 | `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS` | `300` | Maximum wall-time a follower waits for the leader's fetch to complete (Layer B / cluster-wide path). On expiry, the follower returns `502 Bad Gateway` with a `leader-timeout` reason. Set higher than your slowest expected upstream fetch — defaults safe for OCI image-layer pulls under typical latency. |
+| `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` | `600` | Hard ceiling on the leader's own fetch (issue #55); on expiry the leader is abandoned and the next caller elects fresh. |
+| `HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS` | `90` | Cluster-wide leader-lock lease (issue #65). A healthy heartbeat (renewing every `ttl / 3`) keeps a legitimately-slow leader's lock alive regardless of this value; it only bounds how long followers wait to detect a genuinely-dead leader. |
 | `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` | `600` | Hard ceiling on the leader's own fetch (issue #55). On expiry the leader is abandoned — a `Failed(Timeout)` terminal is written and the Layer-A entry evicted so the next caller elects fresh, converting a wedged leader from "poisoned until process restart" into "self-heals within the deadline." Must stay above `HORT_STORAGE_PUT_TIMEOUT_SECS` (default 300s) — the leader closure's slowest leg — or legitimately-slow large pulls get abandoned. |
 
 Coalescing has no chart-level toggle: it is **always on** because

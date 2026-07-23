@@ -311,6 +311,7 @@ per-IP / per-token-prefix brute-force protection inside
 | `HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS` | u64 | `60` | No | TTL for ChecksumMismatch / ParseError / BodyTooLarge / PinMismatch / CaUnknown. |
 | `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS` | u64 | `300` | No | Follower-wait ceiling for a concurrent in-flight fetch. |
 | `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` | u64 | `600` | No | Hard ceiling on the leader's own fetch (issue #55); on expiry the leader is abandoned and the next caller elects fresh. |
+| `HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS` | u64 | `90` | No | Cluster-wide leader-lock lease (Layer B, issue #65). The heartbeat renews it every `ttl / 3`; a healthy heartbeat keeps a legitimately-slow leader's lock alive for the full `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS`, regardless of this value — this TTL instead bounds how long followers wait to detect a genuinely-dead (crashed, no heartbeat) leader before re-electing. Independent of the `leader_deadline` / `HORT_STORAGE_PUT_TIMEOUT_SECS` pairing in ADR 0050 — see that ADR's *Relates* note. |
 
 #### Pull-through coalescing degradation alarm (recommended)
 
@@ -480,6 +481,7 @@ it is referenced, not scheduled here.
 | `HORT_OCI_LEGACY_CATALOG_ENABLED` | bool | `false` | No | Mount the Docker-legacy global `/v2/_catalog`. |
 | `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` | u32 | `32` | No | Per-(repo, principal) OCI upload-session cap. |
 | `HORT_OCI_SESSION_MAX_AGE_SECS` | u64 | `3600` | No | OCI upload-session TTL. Hard-rejected above 7 days (`604800`) — a boot-time interlock. |
+| `HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS` | u64 | `10` | No | Bounded-await ceiling for the cold-pull-through blob-GET release race (issue #65): when a `Quarantined` artifact's window has already elapsed (release-pending on its own scan, not a genuine time-hold), the handler polls for up to this long before falling back to the pre-existing `503 + Retry-After`. `0` disables the wait entirely (pre-#65 behavior). Never delays a genuine, not-yet-elapsed time-quarantine — see `hort-http-oci::blobs::maybe_bounded_await_release`. |
 | `HORT_EVENT_CHAIN_CHECKPOINT_CADENCE_SECS` | u64 | `3600` | No | Signed-checkpoint cadence for the tamper-evident event chain (ADR 0002). Read by the always-on `eventstore-checkpoint` `dsn-direct` task. |
 | `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS` | u64 | `86400` | No | Expected cadence of the `verify-event-chain` CronJob, used only to derive the staleness gauge (matches the chart's default `verifyEventChain` schedule). A query failure is logged and treated as "unknown" — never blocks boot. |
 | `HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the expected interval above before the last-run gauge is considered stale (tolerates missed ticks before alarming). |

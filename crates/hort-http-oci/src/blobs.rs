@@ -33,6 +33,7 @@
 //! "rejected blob" code; hiding it prevents supply-chain probing.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -165,6 +166,147 @@ pub(super) fn parse_range_header(value: &str, size: u64) -> Result<ByteRange, Ra
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// #65 — cold-blob first-GET release race (bounded-await)
+// ---------------------------------------------------------------------------
+
+/// If `artifact` is `Quarantined` AND its computed quarantine window has
+/// already elapsed, poll for its own release for up to
+/// `ctx.oci_pullthrough_release_wait_secs` before returning — giving the
+/// artifact's own async scan a bounded chance to land before the caller's
+/// `check_quarantine` 503 decision runs. Returns the artifact unchanged
+/// (no I/O beyond the caller's own resolve) in every other case: not
+/// `Quarantined`, the window has NOT elapsed (a genuine time-based hold —
+/// e.g. a non-released-parent manifest's full window), or the wait is
+/// disabled (`oci_pullthrough_release_wait_secs == 0`).
+///
+/// # Why this is safe under ADR 0007 (fail-closed release predicate)
+///
+/// This function **never releases anything**. It only re-reads
+/// [`ArtifactUseCase::get_by_id`] in a loop and returns whatever
+/// `quarantine_status` it observes. The actual release — the ADR 0007
+/// predicate requiring the artifact's OWN `ScanSucceeded` / `ScanWaived`
+/// authority via [`hort_domain::entities::artifact::Artifact::release`]
+/// — happens exactly where it always did: the async scan pipeline
+/// (`QuarantineUseCase::record_scan_result`), completely independent of
+/// this HTTP handler. If the scan never completes, or rejects the
+/// artifact, this function returns the still-`Quarantined` (or now-
+/// `Rejected`) artifact and the caller's existing `check_quarantine` /
+/// `Rejected` handling runs exactly as it does today — a 503 (or the
+/// hidden-404 for Rejected), never a served blob. The wait can only ever
+/// turn a would-be 503 into a 200 that a client's OWN retry-after-503
+/// loop would eventually have received anyway; it can never turn a
+/// would-be 503 into an incorrectly-served blob.
+///
+/// # Why only when the window has elapsed
+///
+/// A `Quarantined` artifact whose window has NOT elapsed is a genuine
+/// time-based hold (e.g. a default-policy manifest with a multi-minute
+/// window still running) — awaiting that would block the request for
+/// however long remains, which is never the intent (the client's
+/// existing 503-retry loop already handles this case, unchanged). Only
+/// the release-PENDING case — window already elapsed, i.e. nothing left
+/// to wait on except the artifact's own scan result — is worth a bounded
+/// wait, because the expected latency there is the scan's own
+/// turnaround (observed ~1-5s), not an operator-configured hold.
+///
+/// The elapsed check is [`QuarantineUseCase::is_window_elapsed`], NOT a
+/// direct read of `artifact.quarantine_deadline` as hydrated by
+/// [`hort_app::use_cases::artifact_use_case::ArtifactUseCase::find_visible_by_path`].
+/// That hydration sets `quarantine_deadline = quarantine_window_start`
+/// (the bare ingest-time anchor, no duration added — `ArtifactUseCase`
+/// holds no policy-projection port), so it reads as "elapsed" for every
+/// `Quarantined` artifact almost immediately, including one under a
+/// genuine, still-running, multi-minute (or longer) hold. Using that
+/// signal here would silently defeat this whole section's safety
+/// argument. `QuarantineUseCase::is_window_elapsed` resolves the real
+/// matched-policy duration (the same computation the `record_scan_result`
+/// inline fast-path and the `release_expired` sweep use), so a
+/// still-running hold correctly reads as NOT elapsed and this function
+/// returns immediately without waiting.
+///
+/// # Await mechanism: poll, not subscribe
+///
+/// Polls [`hort_app::use_cases::artifact_use_case::ArtifactUseCase::get_by_id`]
+/// (a plain, authz-free row read — `artifact` was already resolved
+/// through the visibility-checked path above) on a fixed short interval
+/// rather than subscribing to the notification broadcast
+/// (`EventStorePublisher::subscribe`). The broadcast is best-effort
+/// (`HORT_NOTIFICATIONS_ENABLED`-gated, and a lagged/full-capacity
+/// receiver silently drops sends) — coupling this hot read path's
+/// correctness-adjacent latency behaviour to an unrelated, optional
+/// feature would be fragile and would need new plumbing through
+/// `AppContext` for a narrow win. A cold pull-through miss is rare (by
+/// definition, only the first request for a given blob); polling at
+/// [`RELEASE_WAIT_POLL_INTERVAL`] up to the bound costs at most a
+/// handful of cheap row reads.
+async fn maybe_bounded_await_release(ctx: &Arc<AppContext>, artifact: Artifact) -> Artifact {
+    let bound_secs = ctx.oci_pullthrough_release_wait_secs;
+    if bound_secs == 0 || !matches!(artifact.quarantine_status, QuarantineStatus::Quarantined) {
+        return artifact;
+    }
+    // Fail-safe on a resolution error (e.g. a transient policy-projection
+    // read failure): treat as "not elapsed" so this degrades to the
+    // pre-#65 behaviour (immediate 503) rather than risking an incorrect
+    // wait decision.
+    let window_elapsed = ctx
+        .quarantine_use_case
+        .is_window_elapsed(&artifact)
+        .await
+        .unwrap_or(false);
+    if !window_elapsed {
+        return artifact;
+    }
+
+    let bound = Duration::from_secs(bound_secs);
+    let started = std::time::Instant::now();
+    let mut current = artifact;
+    loop {
+        if started.elapsed() >= bound {
+            tracing::debug!(
+                artifact_id = %current.id,
+                bound_secs,
+                "pull-through release bounded-await elapsed; falling back to quarantine check"
+            );
+            return current;
+        }
+        tokio::time::sleep(RELEASE_WAIT_POLL_INTERVAL).await;
+        match ctx.artifact_use_case.get_by_id(current.id).await {
+            Ok(refreshed) => {
+                let released =
+                    !matches!(refreshed.quarantine_status, QuarantineStatus::Quarantined);
+                current = refreshed;
+                if released {
+                    tracing::debug!(
+                        artifact_id = %current.id,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        status = %current.quarantine_status,
+                        "pull-through release bounded-await observed a terminal status"
+                    );
+                    return current;
+                }
+            }
+            Err(e) => {
+                // A transient read failure degrades to "keep waiting on
+                // the bound" — the next poll re-tries. Fail-safe, not
+                // fail-closed: the worst case is falling through to the
+                // existing 503 path at the bound, never a served blob.
+                tracing::debug!(
+                    artifact_id = %current.id,
+                    error = %e,
+                    "pull-through release bounded-await re-fetch failed; will retry"
+                );
+            }
+        }
+    }
+}
+
+/// Poll interval for [`maybe_bounded_await_release`]. Short enough that
+/// the bounded-await feels responsive against the observed ~1-5s scan
+/// latency, long enough that a full-bound wait (default 10s) costs only
+/// ~50 cheap row reads.
+const RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------------
 // Main flow
@@ -342,6 +484,17 @@ pub(super) async fn serve(
     // Defensive: avoid unused-binding warnings for `repo` on builds
     // where the upstream-pull branch isn't taken.
     let _ = &repo;
+
+    // 4a. #65 bounded-await: a cold pull-through blob is ingested
+    // `Quarantined` and its own async scan flips it to `Released` a
+    // few seconds later — after this handler would already have
+    // 503'd. Only waits when the artifact is `Quarantined` AND its
+    // computed window has already elapsed (release-pending on its own
+    // scan, e.g. the referenced-tree-descendant zero-window case);
+    // never awaits a genuine, not-yet-elapsed time-quarantine. See
+    // `maybe_bounded_await_release`'s doc comment for the full
+    // ADR-0007-safety argument.
+    let artifact = maybe_bounded_await_release(&ctx, artifact).await;
 
     // 5. Quarantine / rejected check. See module docs for why this is
     //    done in the handler rather than deferred to
@@ -1236,6 +1389,43 @@ mod tests {
         id
     }
 
+    /// Like [`seed_blob`], but for `Quarantined` lets the caller control
+    /// the effective deadline directly instead of the fixed +120s default —
+    /// used by the #65 bounded-await tests, which need to control whether
+    /// the window has ELAPSED (past) or is a genuine still-running hold
+    /// (future).
+    ///
+    /// `quarantine_window_start` — not `quarantine_deadline` — is what
+    /// actually reaches the handler: `ArtifactUseCase::hydrate_quarantine_deadline`
+    /// (invoked by `find_visible_by_path` on every read) unconditionally
+    /// overwrites `quarantine_deadline` with `quarantine_window_start`.
+    /// So `deadline` here is written to `quarantine_window_start`; any
+    /// `quarantine_deadline` set directly on the fixture would be
+    /// discarded before `serve()` ever sees it.
+    fn seed_blob_with_deadline(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        hex: &str,
+        content: &[u8],
+        status: QuarantineStatus,
+        deadline: DateTime<Utc>,
+    ) -> Uuid {
+        let hash: ContentHash = hex.parse().unwrap();
+        let mut a = sample_artifact(QuarantineStatus::None);
+        a.repository_id = repo_id;
+        a.path = format!("blobs/sha256:{hex}");
+        a.sha256_checksum = hash.clone();
+        a.size_bytes = content.len() as i64;
+        a.quarantine_status = status;
+        a.quarantine_window_start = Some(deadline);
+        a.quarantine_deadline = Some(deadline);
+        let id = a.id;
+        artifacts.insert(a);
+        storage.insert_content(hash, content.to_vec());
+        id
+    }
+
     // -- Handler: missing repo / blob / digest -----------------------------
 
     /// Missing repo, AUTHENTICATED caller → `NAME_UNKNOWN` 404 through the
@@ -1528,6 +1718,176 @@ mod tests {
         assert!(
             parsed["errors"][0]["detail"]["retry_after_seconds"].is_i64(),
             "detail.retry_after_seconds must be a number"
+        );
+    }
+
+    // -- #65 bounded-await release race -------------------------------------
+
+    use hort_http_core::test_support::with_oci_pullthrough_release_wait_secs;
+
+    /// Cold pull-through blob: `Quarantined` with an ALREADY-ELAPSED window
+    /// (the referenced-tree-descendant zero-window case) whose own async
+    /// scan flips it to `Released` shortly after the GET arrives. With the
+    /// bounded-await feature enabled, the handler must observe the release
+    /// and serve 200 instead of the pre-#65 immediate 503.
+    #[test]
+    fn get_blob_quarantined_elapsed_window_releases_within_bound_returns_200() {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, body) = run(async {
+            let h = harness();
+            let ctx = with_oci_pullthrough_release_wait_secs(&h.ctx, 5);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let artifact_id = seed_blob_with_deadline(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+                Utc::now() - chrono::Duration::seconds(1),
+            );
+
+            // Simulate the artifact's own async scan pipeline completing a
+            // few hundred ms after the GET arrives: re-insert the same
+            // artifact id as `Released` (`MockArtifactRepository::insert`
+            // overwrites by id, mirroring a real row update).
+            let artifacts = h.artifacts.clone();
+            let spawn_hex = hex.clone();
+            let spawn_size = content.len() as i64;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let mut released = sample_artifact(QuarantineStatus::Released);
+                released.id = artifact_id;
+                released.repository_id = repo_id;
+                released.path = format!("blobs/sha256:{spawn_hex}");
+                released.sha256_checksum = spawn_hex.parse().unwrap();
+                released.size_bytes = spawn_size;
+                artifacts.insert(released);
+            });
+
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, content);
+    }
+
+    /// A `Quarantined` blob whose window has NOT elapsed (a genuine,
+    /// operator-configured time-hold still running) must 503 immediately —
+    /// the bounded-await must never block on a hold that isn't
+    /// release-pending. Asserted by wall-clock: with a large bound
+    /// configured, a slow response here would mean the code incorrectly
+    /// awaited the still-running window instead of returning immediately.
+    #[test]
+    fn get_blob_quarantined_unelapsed_window_returns_503_immediately() {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, elapsed) = run(async {
+            let h = harness();
+            // Bound is large enough that a wrongly-awaited request would
+            // take clearly longer than the assertion threshold below.
+            let ctx = with_oci_pullthrough_release_wait_secs(&h.ctx, 30);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            // A genuine still-running hold: the window is in the FUTURE,
+            // unlike the elapsed-window fixtures above.
+            seed_blob_with_deadline(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+                Utc::now() + chrono::Duration::seconds(120),
+            );
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+            let started = std::time::Instant::now();
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, started.elapsed())
+        });
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "request took {elapsed:?}; bounded-await incorrectly waited on a \
+             not-yet-elapsed genuine time-quarantine"
+        );
+    }
+
+    /// Cold pull-through blob whose window has elapsed but whose scan never
+    /// completes (or is still running past the bound): the bounded-await
+    /// must fall back to the existing 503+Retry-After behaviour once the
+    /// bound is exhausted, never hang indefinitely and never serve the
+    /// still-quarantined blob.
+    #[test]
+    fn get_blob_quarantined_elapsed_window_scan_never_completes_falls_back_to_503() {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, elapsed) = run(async {
+            let h = harness();
+            let ctx = with_oci_pullthrough_release_wait_secs(&h.ctx, 1);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            // No background task re-inserts the artifact: the scan never
+            // completes within the bound.
+            seed_blob_with_deadline(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+                Utc::now() - chrono::Duration::seconds(1),
+            );
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+            let started = std::time::Instant::now();
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, started.elapsed())
+        });
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // Must have actually waited out (approximately) the configured
+        // 1s bound before falling back — not returned instantly.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "fell back to 503 too early ({elapsed:?}); bounded-await must \
+             exhaust its bound before giving up"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "fell back to 503 too late ({elapsed:?}); bound is not being enforced"
         );
     }
 

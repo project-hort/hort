@@ -77,14 +77,25 @@ use crate::metrics::{DedupLayer, DedupOutcomeLabel, UpstreamErrorKind};
 // ---------------------------------------------------------------------------
 // Constants — NOT env-tunable.
 // ---------------------------------------------------------------------------
+//
+// The Layer-B leader-lock TTL and its derived heartbeat interval used to
+// be hardcoded here (90s / 30s). Issue #65 made the TTL operator-tunable
+// (`PullDedupConfig::leader_lock_ttl`, default still 90s) — see
+// `heartbeat_interval()` (below the `PullDedupConfig` struct) for the
+// derivation, and `spawn_heartbeat` for the retry-on-failure fix.
+//
+// Retry budget for a single heartbeat tick's `extend_ttl` call (issue
+// #65). A healthy heartbeat TASK must not let one transient
+// `EphemeralStore` blip cost a full missed-heartbeat cycle: on failure,
+// retry a bounded number of times with a short, fixed backoff before
+// giving up on that tick and waiting for the next natural one.
+const HEARTBEAT_RETRY_MAX_ATTEMPTS: u32 = 3;
 
-/// Layer-B lock TTL. Heartbeat every `HEARTBEAT_INTERVAL`; one missed
-/// heartbeat is tolerated. Not operator-tunable.
-const LEADER_LOCK_TTL: Duration = Duration::from_secs(90);
-
-/// Heartbeat refresh cadence. `LEADER_LOCK_TTL / 3` so two missed
-/// heartbeats expire the lock; one missed heartbeat is tolerated.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Backoff between heartbeat retry attempts (issue #65). `3 *
+/// HEARTBEAT_RETRY_BACKOFF` (6s) stays comfortably under the default
+/// 30s heartbeat interval, so exhausting the retry budget on one tick
+/// never delays the next natural tick.
+const HEARTBEAT_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Layer-A `broadcast` channel capacity. >64 concurrent followers per
 /// pod per key is implausible; over-flow surfaces as
@@ -144,6 +155,27 @@ pub struct PullDedupConfig {
     /// deadline would abandon leaders still doing legitimately-slow
     /// large pulls.
     pub leader_deadline: Duration,
+    /// The Layer-B cluster-wide leader lock's TTL (issue #65). The
+    /// leader's heartbeat refreshes this lock every `leader_lock_ttl /
+    /// 3` — see [`heartbeat_interval`]. SEPARATE from `leader_deadline`:
+    /// that one bounds the fetch itself; this one bounds how long the
+    /// *cluster lock* survives without a successful heartbeat. Too
+    /// tight a value abandons an otherwise-healthy, still-heartbeating
+    /// leader (a follower observes the lock expired with no terminal
+    /// outcome and re-elects) on a large/slow blob fetch even though
+    /// the leader is making progress.
+    pub leader_lock_ttl: Duration,
+}
+
+/// Heartbeat refresh cadence derived from `leader_lock_ttl`: a third of
+/// it, so two consecutive missed heartbeats (not one) are required to
+/// expire the lock. Kept as a pure function of `leader_lock_ttl` rather
+/// than a second independent config field — an operator raising the TTL
+/// to tolerate a slower backend gets a proportionally longer heartbeat
+/// interval for free, and the "which combination is safe" question
+/// (interval must stay comfortably below the TTL) never arises.
+pub(crate) fn heartbeat_interval(leader_lock_ttl: Duration) -> Duration {
+    leader_lock_ttl / 3
 }
 
 impl PullDedupConfig {
@@ -158,6 +190,7 @@ impl PullDedupConfig {
             ttl_checksum_mismatch: Duration::from_secs(60),
             follower_wait: Duration::from_secs(300),
             leader_deadline: Duration::from_secs(600),
+            leader_lock_ttl: Duration::from_secs(90),
         }
     }
 }
@@ -934,14 +967,15 @@ impl PullDedup {
         // create, overwrite via `put` (we already classified it as
         // stale above; no other caller can have raced because the
         // overwrite carries our InFlight payload).
+        let leader_lock_ttl = self.config.leader_lock_ttl;
         let in_flight = encode_outcome(&DedupOutcome::InFlight {
             leader: self.replica_id.clone(),
-            expires_at_unix_secs: now_unix_secs().saturating_add(LEADER_LOCK_TTL.as_secs()),
+            expires_at_unix_secs: now_unix_secs().saturating_add(leader_lock_ttl.as_secs()),
         });
         let elected = if stale_record_to_overwrite {
             match self
                 .ephemeral
-                .put(&key.serialised, in_flight.clone(), LEADER_LOCK_TTL)
+                .put(&key.serialised, in_flight.clone(), leader_lock_ttl)
                 .await
             {
                 Ok(()) => true,
@@ -961,7 +995,7 @@ impl PullDedup {
         } else {
             match self
                 .ephemeral
-                .put_if_absent(&key.serialised, in_flight, LEADER_LOCK_TTL)
+                .put_if_absent(&key.serialised, in_flight, leader_lock_ttl)
                 .await
             {
                 Ok(true) => true,
@@ -1125,7 +1159,7 @@ impl PullDedup {
             // Terminal success records linger long enough for any
             // straggler follower to read them; the lock TTL is the
             // natural ceiling.
-            _ => LEADER_LOCK_TTL,
+            _ => self.config.leader_lock_ttl,
         };
         if let Err(e) = self
             .ephemeral
@@ -1333,17 +1367,60 @@ impl PullDedup {
 
     /// Spawn the heartbeat task. Returns a handle the leader aborts
     /// when the fetch completes (success OR failure).
+    ///
+    /// Runs entirely independently of the leader's `fetch_fn` future —
+    /// its own `tokio::spawn`ed task, woken solely by its own interval
+    /// timer, with no shared lock or await-point in common with the
+    /// fetch. A large/slow fetch cannot itself starve this task under
+    /// tokio's cooperative scheduler (each `.await` point yields), so
+    /// the mechanism this function implements was never actually
+    /// coupled to fetch duration.
+    ///
+    /// What COULD still let a healthy, still-running leader lose its
+    /// lock (issue #65): a transient `EphemeralStore::extend_ttl`
+    /// failure (e.g. a brief backend blip) used to just `debug!` and
+    /// wait for the NEXT full `heartbeat_interval` tick to retry — two
+    /// such failures back to back (a ~2x `heartbeat_interval` window)
+    /// would let the lock expire with the heartbeat loop still running
+    /// exactly as designed. Retrying a failed `extend_ttl` immediately,
+    /// with a short bounded backoff, closes that gap without
+    /// materially delaying the next natural tick (the retry budget —
+    /// `HEARTBEAT_RETRY_MAX_ATTEMPTS` x `HEARTBEAT_RETRY_BACKOFF` — is
+    /// well under `heartbeat_interval`).
     fn spawn_heartbeat(&self, key_serialised: String) -> tokio::task::JoinHandle<()> {
         let store = self.ephemeral.clone();
+        let leader_lock_ttl = self.config.leader_lock_ttl;
+        let interval = heartbeat_interval(leader_lock_ttl);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+            let mut ticker = tokio::time::interval(interval);
             // First tick fires immediately; skip it so the heartbeat
             // does not race the leader's `put_if_absent` write.
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if let Err(e) = store.extend_ttl(&key_serialised, LEADER_LOCK_TTL).await {
-                    debug!(error = %e, "heartbeat extend_ttl failed");
+                let mut attempt = 0u32;
+                loop {
+                    match store.extend_ttl(&key_serialised, leader_lock_ttl).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            attempt += 1;
+                            if attempt > HEARTBEAT_RETRY_MAX_ATTEMPTS {
+                                warn!(
+                                    error = %e,
+                                    attempt,
+                                    "heartbeat extend_ttl failed after retries; \
+                                     will retry on next tick"
+                                );
+                                break;
+                            }
+                            debug!(
+                                error = %e,
+                                attempt,
+                                "heartbeat extend_ttl failed; retrying shortly"
+                            );
+                            tokio::time::sleep(HEARTBEAT_RETRY_BACKOFF).await;
+                        }
+                    }
                 }
             }
         })
@@ -1654,6 +1731,67 @@ mod tests {
         }
         fn extend_ttl(&self, _k: &str, _ttl: Duration) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Err(DomainError::Invariant("simulated".into())) })
+        }
+    }
+
+    /// Wraps [`InMemoryEphemeralStore`], injecting a configurable number
+    /// of consecutive `extend_ttl` failures before delegating to the
+    /// real store — models the transient backend blip issue #65's
+    /// heartbeat retry is meant to survive. Tracks how many delegated
+    /// (successful) `extend_ttl` calls actually landed, so a test can
+    /// assert recovery happened without relying on the wrapped store's
+    /// real-`SystemTime` TTL (which a short-lived test would never
+    /// observe expiring either way).
+    struct FlakyExtendTtlStore {
+        inner: Arc<InMemoryEphemeralStore>,
+        remaining_failures: std::sync::atomic::AtomicU32,
+        successes: std::sync::atomic::AtomicU32,
+    }
+
+    impl EphemeralStore for FlakyExtendTtlStore {
+        fn get(&self, key: &str) -> BoxFuture<'_, DomainResult<Option<Bytes>>> {
+            self.inner.get(key)
+        }
+        fn put(&self, k: &str, v: Bytes, ttl: Duration) -> BoxFuture<'_, DomainResult<()>> {
+            self.inner.put(k, v, ttl)
+        }
+        fn put_if_absent(
+            &self,
+            k: &str,
+            v: Bytes,
+            ttl: Duration,
+        ) -> BoxFuture<'_, DomainResult<bool>> {
+            self.inner.put_if_absent(k, v, ttl)
+        }
+        fn compare_and_swap(
+            &self,
+            k: &str,
+            ev: u64,
+            v: Bytes,
+            ttl: Duration,
+        ) -> BoxFuture<'_, DomainResult<Option<u64>>> {
+            self.inner.compare_and_swap(k, ev, v, ttl)
+        }
+        fn delete(&self, k: &str) -> BoxFuture<'_, DomainResult<()>> {
+            self.inner.delete(k)
+        }
+        fn extend_ttl(&self, k: &str, ttl: Duration) -> BoxFuture<'_, DomainResult<()>> {
+            use std::sync::atomic::Ordering;
+            let took_failure = self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+            if took_failure {
+                return Box::pin(async { Err(DomainError::Invariant("simulated blip".into())) });
+            }
+            self.successes.fetch_add(1, Ordering::SeqCst);
+            self.inner.extend_ttl(k, ttl)
         }
     }
 
@@ -2075,6 +2213,7 @@ mod tests {
             ttl_checksum_mismatch: Duration::from_secs(60),
             follower_wait: Duration::from_millis(50),
             leader_deadline: Duration::from_secs(600),
+            leader_lock_ttl: Duration::from_secs(90),
         }
     }
 
@@ -2661,10 +2800,11 @@ mod tests {
             .await
             .unwrap();
         let handle = dd.spawn_heartbeat(key_serialised.clone());
+        let heartbeat_interval_for_test = heartbeat_interval(Duration::from_secs(90));
         // Advance past several heartbeat intervals; the heartbeat
         // task ticks `extend_ttl` each time.
         for _ in 0..3 {
-            tokio::time::advance(HEARTBEAT_INTERVAL + Duration::from_millis(100)).await;
+            tokio::time::advance(heartbeat_interval_for_test + Duration::from_millis(100)).await;
             tokio::task::yield_now().await;
         }
         // The store retains the entry — heartbeat is silently
@@ -2674,9 +2814,75 @@ mod tests {
         assert!(store.get(&key_serialised).await.unwrap().is_some());
         handle.abort();
         // Confirm the abort took effect — the JoinHandle resolves.
-        tokio::time::advance(HEARTBEAT_INTERVAL).await;
+        tokio::time::advance(heartbeat_interval_for_test).await;
         tokio::task::yield_now().await;
         assert!(handle.is_finished() || handle.await.is_err());
+    }
+
+    /// #65 — a leader whose heartbeat hits transient `extend_ttl`
+    /// failures (a backend blip) must recover WITHIN the same tick's
+    /// retry budget, not by waiting for the next full `heartbeat_interval`
+    /// — the exact gap that used to let a still-heartbeating leader's
+    /// lock lapse (see `spawn_heartbeat`'s doc comment). Injects
+    /// `HEARTBEAT_RETRY_MAX_ATTEMPTS - 1` consecutive failures (within
+    /// the retry budget, so the pre-#65 code and the fixed code would
+    /// both eventually call `extend_ttl` again — the distinguishing
+    /// behaviour is WHEN: the fix retries after `HEARTBEAT_RETRY_BACKOFF`
+    /// inside the tick; the old code would have waited a full next
+    /// `heartbeat_interval`).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn leader_heartbeat_survives_transient_extend_ttl_failures_without_losing_lock() {
+        let inner = Arc::new(InMemoryEphemeralStore::new());
+        let key_serialised =
+            "pulldedup:meta:test:00000000-0000-0000-0000-000000000000:u".to_owned();
+        inner
+            .put(
+                &key_serialised,
+                Bytes::from_static(b"x"),
+                Duration::from_secs(90),
+            )
+            .await
+            .unwrap();
+        let flaky = Arc::new(FlakyExtendTtlStore {
+            inner: inner.clone(),
+            remaining_failures: std::sync::atomic::AtomicU32::new(HEARTBEAT_RETRY_MAX_ATTEMPTS - 1),
+            successes: std::sync::atomic::AtomicU32::new(0),
+        });
+        let dd = PullDedup::new(
+            flaky.clone() as Arc<dyn EphemeralStore>,
+            PullDedupConfig::defaults(),
+        );
+        let leader_lock_ttl = Duration::from_secs(90);
+        let interval = heartbeat_interval(leader_lock_ttl);
+        let handle = dd.spawn_heartbeat(key_serialised.clone());
+        // Let the freshly-spawned task run its first (immediate,
+        // skipped) tick and register its real-interval timer before we
+        // advance the clock past it.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // First tick fires; extend_ttl fails HEARTBEAT_RETRY_MAX_ATTEMPTS-1
+        // times, each retried after HEARTBEAT_RETRY_BACKOFF — all within
+        // this single tick, well before a second `interval` would elapse.
+        tokio::time::advance(interval + Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        for _ in 0..(HEARTBEAT_RETRY_MAX_ATTEMPTS - 1) {
+            tokio::time::advance(HEARTBEAT_RETRY_BACKOFF + Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            flaky.successes.load(Ordering::SeqCst),
+            1,
+            "heartbeat must recover from transient extend_ttl failures within \
+             the same tick's retry budget instead of waiting a full extra \
+             heartbeat_interval — the gap that let a still-heartbeating \
+             leader's lock lapse"
+        );
+
+        handle.abort();
     }
 
     /// Heartbeat is spawned BEFORE the fetch closure runs. We assert
