@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-07-23
+
+### Added
+
+- **GitOps schema `project-hort.de/v1`.** The configuration schema is promoted
+  to a stable `v1` ahead of the 1.0 release; every shipped example, fixture,
+  and doc snippet now declares `apiVersion: project-hort.de/v1`. Existing
+  `project-hort.de/v1beta1` trees continue to parse and apply identically —
+  the bump is opt-in per file, with no forced operator migration. (#67)
+
+### Changed
+
+- **The auth-scope rate limiter now counts authentication *failures* only.**
+  Previously every authenticated write drew down the anti-credential-stuffing
+  bucket (`HORT_RATELIMIT_AUTH_PER_MIN`, default 60/min), so a bulk multi-arch
+  `cosign copy` push would 429 regardless of the write limit — and no fixed
+  ceiling could fit both workloads. Failed or anonymous credential attempts are
+  still rejected at the configured rate *before* any token validation runs;
+  valid-principal writes are now governed solely by the write scope
+  (`HORT_RATELIMIT_WRITE_PER_MIN`, 300/min). (#66)
+- **Hosted OCI manifest-PUT failures are now diagnosable.** The seven
+  post-ingest write steps of the manifest/index PUT path previously collapsed
+  any error into an opaque `500 INTERNAL` logged only at `warn!`; each now
+  logs at `error!` naming the failing step, the underlying error, and the
+  manifest/child digests. (#73)
+
+### Fixed
+
+- **The PyPI pull-through proxy is functional again.** The upstream simple
+  index was fetched as HTML and hard-rejected over a 2 MiB cap, making any
+  large package (e.g. `rapidfuzz`, whose HTML index is 5.3 MiB) permanently
+  unresolvable; the fetch is now PEP 691 JSON via a streaming parser (with
+  HTML fallback for non-compliant upstreams), and a `ReleasedOnly` proxy now
+  enqueues a prefetch on a cold index request so `pip` can bootstrap instead
+  of hard-failing on an empty index. (#72)
+- **Cold pull-through blob downloads no longer 503 during the release
+  handoff.** A freshly-fetched blob was always quarantined by ingest and
+  released by its own scan a few seconds later — after the blocking GET had
+  already returned 503, forcing a retry per cold layer. The GET now waits
+  (bounded, `HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`, default 10 s) for the
+  blob's own scan/release when its quarantine window has already elapsed, and
+  serves 200 directly; genuine time-quarantines still 503 immediately, and
+  the fail-closed release predicate is untouched. (#65)
+- **Large-layer pull-through fetches no longer lose their coalesce leader.**
+  A transient lock-store hiccup could lapse the 90 s leader lease mid-fetch
+  (the heartbeat only retried on its next 30 s tick), abandoning an in-flight
+  download and re-fetching from scratch. The heartbeat now retries within the
+  tick, and the lease TTL is operator-tunable
+  (`HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS`). (#65)
+- **The `registry.hort.rs` chart-flavor publish has a target repository.** The
+  self-contained-registry work shipped the publish job but never defined the
+  `hort-charts` gitops repository, so the chart push 404'd; the repo (hosted,
+  world-readable, release-gated push, no quarantine on the signed first-party
+  chart) is now part of the shipped gitops tree. (#71)
+- **Native-deploy worker scans work under the hardened systemd unit.** The
+  worker unit's `ProtectSystem=strict` left trivy no writable cache directory,
+  so every scan failed and scanned repositories never released anything; the
+  unit now provisions a persistent `/var/cache/hort-worker` and points
+  `TRIVY_CACHE_DIR`/`XDG_CACHE_HOME` at it. (#74)
+- **Native-deploy scheduled-task tokens self-heal after a database rebuild.**
+  The `cronjob-tasks` service-account token was only minted when its on-disk
+  file was absent, so a DB recreate left every token-gated scheduled task
+  silently failing with 401; the mint now runs on every deploy and re-mints
+  exactly when the token row is missing. (#75)
+
 ## [0.9.12] - 2026-07-21
 
 ### Added
