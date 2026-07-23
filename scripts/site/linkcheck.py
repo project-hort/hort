@@ -68,6 +68,11 @@ def check(dist):
                 path_part, frag = href, None
 
             target = os.path.normpath(os.path.join(os.path.dirname(path), path_part))
+            # A directory-style href ("dl/", or one that happens to resolve
+            # to an existing directory) implies its index.html, matching
+            # how any static file server actually resolves it.
+            if os.path.isdir(target):
+                target = os.path.join(target, "index.html")
             if not os.path.isfile(target):
                 errors.append(f"{rel}: broken link -> {href} (resolved {os.path.relpath(target, dist)} does not exist)")
                 continue

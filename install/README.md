@@ -3,12 +3,22 @@
 ## Single source of truth
 
 This directory is the authoritative source for the installer scripts and pinned
-data served at **https://hort.rs**. Files authored and tested here are published
-to the **main repo's own GitHub Pages site (`hort.rs`)** by CI on merge to
-`main` — the installer lives alongside the binaries and signing config it
-depends on. There is no separate installer repo; all changes flow from here.
-At go-live, `hort.rs` serves `install-cli.sh`, `install-cli.ps1`, `cosign.pin`,
-and the landing page (`index.html`) as static files from this directory.
+data served at **https://hort.rs**. There is no separate installer repo; all
+changes flow from here.
+
+`install-cli.sh`, `install-cli.ps1`, and `cosign.pin` are copied byte-for-byte
+into the generated hort.rs site at their exact published apex paths by
+`scripts/build-site.sh --site hort.rs` (see
+`scripts/site/generate.py::copy_hort_rs_apex_files`), deployed by the
+`website` ansible role (`deploy/ansible/roles/website/`,
+`deploy/ansible/site-website.yml`) — **not** GitHub Pages (that path was
+retired in issue #77; `.github/workflows/install.yml` still lints and
+fixture-tests these scripts on every push/PR, it just no longer deploys
+them). `index.html` here predates that pipeline and is not currently served —
+hort.rs's actual landing page is generated from
+`docs/architecture/how-to/install-cli.md` by the same build (see
+`scripts/site/generate.py::build_hort_rs_landing`); this file is kept as a
+design/tone reference pending an explicit decision to delete it.
 
 ## Files
 

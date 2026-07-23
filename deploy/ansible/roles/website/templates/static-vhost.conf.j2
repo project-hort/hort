@@ -13,7 +13,7 @@
 # parsed as a tag), so there is no "listen 443 ssl" reference to a missing
 # certificate.
 
-# ── project-hort.de — port 80 (ACME + redirect) ──────────────────────────────
+# ── {{ website_fqdn }} — port 80 (ACME + redirect) ───────────────────────────
 server {
     listen 80;
     server_name {{ website_fqdn }};
@@ -28,7 +28,7 @@ server {
 }
 
 {% if website_cert_exists %}
-# ── project-hort.de — port 443 (TLS) ─────────────────────────────────────────
+# ── {{ website_fqdn }} — port 443 (TLS) ──────────────────────────────────────
 server {
     listen 443 ssl;
     server_name {{ website_fqdn }};
@@ -61,8 +61,8 @@ server {
     # Suppress the nginx version (Server header / error pages).
     server_tokens off;
 
-    access_log /var/log/nginx/project-hort.de.access.log combined;
-    error_log  /var/log/nginx/project-hort.de.error.log;
+    access_log /var/log/nginx/{{ website_fqdn }}.access.log combined;
+    error_log  /var/log/nginx/{{ website_fqdn }}.error.log;
 
     root {{ website_root }};
     index index.html;
