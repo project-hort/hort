@@ -65,6 +65,11 @@ jobs:
             core.setSecret(token);
             core.setOutput('token', token);
 
+      # Kept in sync with prefetch-warm.yml's copy (issue #80): that workflow
+      # runs this same batched prefetch on develop pushes + nightly, because
+      # feature branches are never pushed to this repository (they live on the
+      # internal GitLab) — this trigger never fires here. Both sides carry
+      # this note.
       - name: Prefetch resolved dependencies into hort
         if: ${{ vars.HORT_PROXY_ENABLED == 'true' }}
         env:
