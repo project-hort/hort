@@ -1,0 +1,119 @@
+---
+# website role — the project-hort.de static site (issue #78): a self-
+# contained nginx vhost serving a fully static, pre-built directory. Zero
+# runtime dependency on hort-server; no server-side execution at all.
+#
+# Self-contained by design: unlike the registry `nginx` role (which is tuned
+# for hort-server's streaming/large-body/OIDC needs), this role installs its
+# own nginx and templates its own vhost, so it can be deployed to a host that
+# never runs hort-server at all — or to the same host, alongside it, without
+# any changes to the registry nginx role. It defines its own copies of the
+# small, generic "Validate nginx config" / "Reload nginx" handlers rather
+# than relying on the registry nginx role's handlers being present in the
+# same play.
+#
+# Content-deploy mechanism (v1, per backlog/048 "simplest robust
+# mechanism"): build the static site on the CONTROL node (the operator's own
+# checkout already has the repo — same assumption the rest of this ansible
+# tree makes) via scripts/build-site.sh, then rsync the built site/dist/ tree
+# onto the target host with ansible.posix.synchronize. `--rsync-path=sudo
+# rsync` on the remote side lets an unprivileged SSH user write into the
+# root-owned /var/www/project-hort.de without a separate stage-then-become
+# copy step — this repo's ansible operator account already has (passwordless
+# or -K) sudo, per deploy/ansible/README.md's prerequisites.
+
+- name: Build the static site on the control node
+  ansible.builtin.command:
+    cmd: "{{ website_build_script }}"
+    chdir: "{{ website_repo_root }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true
+  register: website_build_result
+
+- name: Fail with the build's own output if the site build failed
+  ansible.builtin.fail:
+    msg: "{{ website_build_result.stdout }}\n{{ website_build_result.stderr }}"
+  when: website_build_result.rc != 0
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Install nginx and rsync
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - rsync
+    state: present
+    update_cache: true
+
+- name: Ensure nginx is started and enabled
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Ensure the website content root exists
+  ansible.builtin.file:
+    path: "{{ website_root }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+- name: Stat LE certificate (determines whether the 443 block is rendered)
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ website_fqdn }}/fullchain.pem"
+  register: website_cert_stat
+
+- name: Template project-hort.de vhost (sites-available)
+  ansible.builtin.template:
+    src: project-hort.de.conf.j2
+    dest: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    website_cert_exists: "{{ website_cert_stat.stat.exists }}"
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Enable project-hort.de vhost (sites-enabled symlink)
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ website_fqdn }}.conf"
+    state: link
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Remove default nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+# Mirrors the built tree exactly (--delete): a page removed from the source
+# docs on a prior build doesn't linger as an orphaned, unlinked file forever.
+- name: Sync the built site to the target host
+  ansible.posix.synchronize:
+    src: "{{ website_dist_dir }}/"
+    dest: "{{ website_root }}/"
+    delete: true
+    recursive: true
+    rsync_opts:
+      - "--rsync-path=sudo rsync"
+      - "--chown=www-data:www-data"
+
+- name: Fix directory permissions after sync
+  ansible.builtin.file:
+    path: "{{ website_root }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+    recurse: true

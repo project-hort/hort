@@ -239,6 +239,47 @@ ansible-playbook -i inventory/production/hosts.ini site-podman.yml \
   --ask-vault-pass --check --diff
 ```
 
+## project-hort.de static site (issue #78)
+
+A fully static landing page + operator-docs site — zero runtime dependency
+on hort-server. `site-website.yml` targets the `[website]` inventory group
+(same host as `[hort]`, or a separate one — nothing in this playbook reads
+any hort-server-specific variable).
+
+**Prerequisites:**
+
+1. **DNS A record:** `project-hort.de` must resolve to the target host's
+   public IP before running the play (certbot's webroot ACME challenge needs
+   this — same requirement as `registry_fqdn`). This is the operator's step;
+   the playbook does not manage DNS.
+2. **`le_email`** in Vault (same variable the registry playbooks use —
+   certbot's role is shared, see *Vault variables* above).
+3. **The control node needs a checkout of this repo**, `python3`, and
+   `rsync` on `PATH` — the `website` role builds `site/dist/` locally (via
+   `scripts/build-site.sh`) then `ansible.posix.synchronize`s it to the
+   target host. `python3` is the only dependency the build itself has (see
+   `scripts/site/generate.py`'s module docstring for why); `rsync` is
+   standard on virtually every Linux/macOS control node already.
+
+**Content-deploy mechanism (v1):** build-at-ansible-run-time. The `website`
+role runs `scripts/build-site.sh` on the **control node** (delegated,
+`run_once`), then `ansible.posix.synchronize`s the resulting `site/dist/`
+onto the target host's `/var/www/project-hort.de` (`--delete`, so a page
+removed from the source docs doesn't linger as an orphan). This is the
+simplest robust option for a small, infrequently-changing static site — a
+push-based artifact pipeline (build in CI, publish to an object store, pull
+on deploy) would remove the "control node needs a checkout" prerequisite but
+is more moving parts than this site currently needs; revisit if the deploy
+cadence or site size grows enough to make the rsync-from-checkout model
+awkward.
+
+```bash
+ansible-playbook -i inventory/production/hosts.ini site-website.yml --ask-vault-pass
+```
+
+Re-run the playbook any time the docs or `README.md` change to redeploy —
+there is no separate "publish" step; the ansible run IS the publish step.
+
 ## First admin (bootstrap-session)
 
 The playbook provisions only **non-admin** service accounts (see *Provisioned
@@ -306,6 +347,7 @@ privilege.
 | `certbot` | 4 | Let's Encrypt certificate issuance + renewal timer |
 | `fail2ban` | 4 | SSH + nginx auth brute-force protection |
 | `gitops` | 4 | Sync gitops config tree; restart hort-server; mint operator tokens |
+| `website` | 8 | project-hort.de static site: build + rsync + self-contained nginx vhost (issue #78) |
 
 ## certbot operations
 

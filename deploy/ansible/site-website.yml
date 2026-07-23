@@ -1,0 +1,34 @@
+---
+# project-hort.de static site (issue #78) — a self-contained landing page +
+# operator-docs site. Zero runtime dependency on hort-server: this playbook
+# can run against the SAME host as site-native.yml/site-podman.yml or an
+# entirely separate one — nothing here reads registry_fqdn, hort_api_port,
+# or any other hort-server-specific variable.
+#
+# Role execution order:
+#   website — installs nginx, builds the static site on the control node
+#             (scripts/build-site.sh) and rsyncs it to the host, templates
+#             the port-80-only vhost (cert not yet issued)
+#   certbot — Let's Encrypt certificate issuance + renewal for project-hort.de
+#             (certbot_fqdn / certbot_notify_handlers overridden below so
+#             the shared certbot role certifies THIS domain and re-renders
+#             THIS vhost, not the registry one)
+#
+# Required vars (group_vars/production/ or --extra-vars):
+#   le_email — Let's Encrypt registration email (same variable the registry
+#              playbooks use; certbot's own role asserts it's set)
+
+- name: Deploy the project-hort.de static site
+  hosts: website
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: website
+    - role: certbot
+      vars:
+        certbot_fqdn: "{{ website_fqdn }}"
+        certbot_notify_handlers:
+          - "Render website vhost (cert present)"
+          - "Validate nginx config"
+          - "Reload nginx"

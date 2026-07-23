@@ -1,0 +1,18 @@
+---
+# website role defaults — the project-hort.de static landing + operator-docs
+# site (issue #78).
+
+# Public FQDN served by this vhost.
+website_fqdn: project-hort.de
+
+# Where the built static tree is deployed on the target host.
+website_root: /var/www/project-hort.de
+
+# Repo checkout root, computed relative to this playbook. The operator runs
+# ansible-playbook from a checkout of the hort repo (same assumption the rest
+# of this ansible tree makes — see deploy/ansible/README.md prerequisites),
+# so `scripts/build-site.sh` and its output (`site/dist/`) are reachable on
+# the CONTROL node without any extra checkout step.
+website_repo_root: "{{ playbook_dir }}/../.."
+website_build_script: "{{ website_repo_root }}/scripts/build-site.sh"
+website_dist_dir: "{{ website_repo_root }}/site/dist"
