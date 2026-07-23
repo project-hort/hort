@@ -7,6 +7,14 @@
 # the registry nginx role's handlers/main.yml exactly (same shape,
 # deliberately duplicated rather than shared — see tasks/main.yml's header
 # comment for why this role is self-contained).
+#
+# IMPORTANT (issue #77): handlers are deduplicated by NAME within a single
+# PLAY. This role is invoked once per site (project-hort.de, hort.rs) —
+# deploy/ansible/site-website.yml MUST keep each invocation in its OWN play
+# (not two `roles:` entries in one play), or the second site's "Render
+# website vhost (cert present)" notification would collapse into the
+# first's single handler run at flush time, re-rendering the WRONG site's
+# vhost (or simply never firing for the second site at all).
 
 # Re-renders the vhost with the 443 block after the certbot role issues a
 # cert on a fresh host. Notified by the certbot role's cert-issuance task
@@ -15,7 +23,7 @@
 # this role and certbot in the same play).
 - name: Render website vhost (cert present)
   ansible.builtin.template:
-    src: project-hort.de.conf.j2
+    src: static-vhost.conf.j2
     dest: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
     owner: root
     group: root

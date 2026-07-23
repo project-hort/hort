@@ -1,7 +1,10 @@
 ---
-# website role — the project-hort.de static site (issue #78): a self-
-# contained nginx vhost serving a fully static, pre-built directory. Zero
-# runtime dependency on hort-server; no server-side execution at all.
+# website role — hort's static sites (issues #78, #77): a self-contained
+# nginx vhost serving a fully static, pre-built directory. Zero runtime
+# dependency on hort-server; no server-side execution at all. Parameterized
+# per invocation (website_fqdn/website_root/website_dist_dir) so the SAME
+# role deploys either project-hort.de or hort.rs — see
+# deploy/ansible/site-website.yml, which invokes it twice.
 #
 # Self-contained by design: unlike the registry `nginx` role (which is tuned
 # for hort-server's streaming/large-body/OIDC needs), this role installs its
@@ -15,12 +18,30 @@
 # Content-deploy mechanism (v1, per backlog/048 "simplest robust
 # mechanism"): build the static site on the CONTROL node (the operator's own
 # checkout already has the repo — same assumption the rest of this ansible
-# tree makes) via scripts/build-site.sh, then rsync the built site/dist/ tree
-# onto the target host with ansible.posix.synchronize. `--rsync-path=sudo
-# rsync` on the remote side lets an unprivileged SSH user write into the
-# root-owned /var/www/project-hort.de without a separate stage-then-become
-# copy step — this repo's ansible operator account already has (passwordless
-# or -K) sudo, per deploy/ansible/README.md's prerequisites.
+# tree makes) via scripts/build-site.sh, then rsync the built site/dist/
+# tree onto the target host with ansible.posix.synchronize. `--rsync-path=
+# sudo rsync` on the remote side lets an unprivileged SSH user write into
+# the root-owned website_root without a separate stage-then-become copy
+# step — this repo's ansible operator account already has (passwordless or
+# -K) sudo, per deploy/ansible/README.md's prerequisites.
+#
+# hort.rs's dl/ archive (issue #77) lives INSIDE website_root (so nginx
+# serves it with zero extra vhost config) but is populated by a completely
+# separate script/task, never by the site build above — the sync task's
+# `--exclude=dl` is load-bearing: without it, the site sync's `--delete`
+# would erase the entire permanent archive on every single deploy, since
+# scripts/build-site.sh's own output only ever contains a placeholder
+# dl/index.html, never the real per-tag directories.
+
+- name: Assert website_fqdn is defined and non-empty
+  ansible.builtin.assert:
+    that:
+      - website_fqdn is defined
+      - website_fqdn | length > 0
+    fail_msg: >-
+      website_fqdn must be set per invocation (e.g. project-hort.de or
+      hort.rs) — pass it as a role var from the playbook. There is no
+      default; see defaults/main.yml for why.
 
 - name: Build the static site on the control node
   ansible.builtin.command:
@@ -67,9 +88,9 @@
     path: "/etc/letsencrypt/live/{{ website_fqdn }}/fullchain.pem"
   register: website_cert_stat
 
-- name: Template project-hort.de vhost (sites-available)
+- name: Template static vhost (sites-available)
   ansible.builtin.template:
-    src: project-hort.de.conf.j2
+    src: static-vhost.conf.j2
     dest: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
     owner: root
     group: root
@@ -80,7 +101,7 @@
     - Validate nginx config
     - Reload nginx
 
-- name: Enable project-hort.de vhost (sites-enabled symlink)
+- name: Enable static vhost (sites-enabled symlink)
   ansible.builtin.file:
     src: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
     dest: "/etc/nginx/sites-enabled/{{ website_fqdn }}.conf"
@@ -99,6 +120,9 @@
 
 # Mirrors the built tree exactly (--delete): a page removed from the source
 # docs on a prior build doesn't linger as an orphaned, unlinked file forever.
+# `--exclude=dl` is load-bearing for hort.rs (see the header comment) — the
+# permanent /dl/ archive is populated by a separate task below, never by
+# this sync, and must survive every site rebuild untouched.
 - name: Sync the built site to the target host
   ansible.posix.synchronize:
     src: "{{ website_dist_dir }}/"
@@ -108,6 +132,7 @@
     rsync_opts:
       - "--rsync-path=sudo rsync"
       - "--chown=www-data:www-data"
+      - "--exclude=dl"
 
 - name: Fix directory permissions after sync
   ansible.builtin.file:
@@ -117,3 +142,42 @@
     group: www-data
     mode: "0755"
     recurse: true
+
+# ── hort.rs only: permanent /dl/ version archive (issue #77) ────────────────
+
+- name: Install jq (required by populate-dl-archive.sh)
+  ansible.builtin.apt:
+    name: jq
+    state: present
+  when: website_dl_archive_enabled
+
+- name: Assert cosign is present on this host (populate-dl-archive.sh does not bootstrap it)
+  ansible.builtin.command:
+    cmd: cosign version
+  become: true
+  become_user: www-data
+  changed_when: false
+  when: website_dl_archive_enabled
+
+- name: Ensure the dl/ archive root exists
+  ansible.builtin.file:
+    path: "{{ website_root }}/dl"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+  when: website_dl_archive_enabled
+
+# Runs ON THE TARGET HOST (not delegated) — it needs the host's own network
+# path to GitHub, per backlog/050 ("needs network on the host — that's
+# fine, it's the operator's deploy step, not the site build"). Idempotent
+# and additive: an existing dl/<tag>/ is left untouched (see the script's
+# own header comment for the immutability + fail-closed-verify mechanics).
+- name: Populate the permanent /dl/ version archive
+  ansible.builtin.command:
+    cmd: "{{ website_repo_root }}/scripts/populate-dl-archive.sh {{ website_root }}/dl"
+  become: true
+  become_user: www-data
+  register: website_dl_result
+  changed_when: "'0 new version(s) populated' not in website_dl_result.stdout"
+  when: website_dl_archive_enabled

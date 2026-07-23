@@ -155,15 +155,21 @@ workflow:
     - if: $CI_COMMIT_BRANCH
       changes: *code-changed-paths
 
-# project-hort.de static site (issue #78): anything that can change
-# scripts/build-site.sh's output — the docs it's generated from, the root
-# README (landing-page content source), the site chrome/generator itself.
+# hort's static sites, project-hort.de (issue #78) + hort.rs (issue #77):
+# anything that can change scripts/build-site.sh's output for EITHER site —
+# the docs both are generated from, the root README (project-hort.de's
+# landing-page content source), the installer scripts + cosign.pin
+# (hort.rs's apex files, copied verbatim), the hort-cli README (one of
+# hort.rs's four doc sources), and the site chrome/generator itself.
 .site-changed-paths: &site-changed-paths
   - "docs/architecture/**/*"
   - "README.md"
+  - "crates/hort-cli/README.md"
+  - "install/**/*"
   - "site/**/*"
   - "scripts/build-site.sh"
   - "scripts/site/**/*"
+  - "scripts/populate-dl-archive.sh"
 
 .rules-site-changed: &rules-site-changed
   rules:
@@ -960,6 +966,12 @@ quality:site-build:
     - apt-get install -y -qq --no-install-recommends python3
   script:
     - ./scripts/build-site.sh
+    # populate-dl-archive.sh (issue #77) is not exercised by the site build
+    # itself (it runs host-side, at ansible-deploy time, against live
+    # GitHub releases — see its own header comment) — a syntax check here
+    # is the cheap CI-side guard against a change to it breaking the gate
+    # this path list also triggers on.
+    - bash -n scripts/populate-dl-archive.sh
   artifacts:
     paths:
       - site/dist/
