@@ -2086,9 +2086,15 @@ fetch port is called:
 - `permission_denied` — RBAC denied (caller lacks `Permission::Read`
   for discovery, or `Permission::Read ∧ Permission::Prefetch` for
   self-service prefetch). Per-call tick from the use-case gate block.
-- `token_kind_denied` — caller's `token_kind` is not
-  `TokenKind::CliSession` (the amplification-surface gate).
-  Per-call tick; first gate (cheapest — no repo resolution required).
+- `token_kind_denied` — the amplification-surface gate (per-call tick;
+  first gate, cheapest — no repo resolution required). For discovery,
+  caller's `token_kind` is not `TokenKind::CliSession`. For self-service
+  prefetch, caller's `token_kind` is not `TokenKind::CliSession` **or**
+  `TokenKind::ServiceAccount` — issue #80 widened this gate so a
+  ServiceAccount bearer can reach the `permission_denied` RBAC gate
+  instead of being rejected on kind alone (`docs/ci/hort-quarantine-integration.md`
+  designs the CI prefetch caller as exactly this). PATs are rejected by
+  both endpoints.
 - `oci_unsupported` — caller asked for discovery / self-service
   prefetch against an OCI-format repo. The
   [`UpstreamMetadataPort::list_versions`](../crates/hort-app/src/ports/upstream_metadata.rs)
