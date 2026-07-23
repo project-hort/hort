@@ -1,0 +1,30 @@
+apiVersion: project-hort.de/v1
+kind: Exclusion
+metadata:
+  name: crates-scan-rustsec-2026-0002
+spec:
+  policy: crates-scan
+  cveId: RUSTSEC-2026-0002
+  # Unscoped by version (packagePattern only glob-matches the package
+  # NAME — crates.io/lru — not a version range; see
+  # crates/hort-domain/src/policy/exclusion.rs::pattern_matches). Matches
+  # the build-side acceptance's scope: any lru 0.x version this workspace
+  # depends on.
+  packagePattern: "lru"
+  scope: global
+  # Mirrors the risk-acceptance rationale in .cargo/audit.toml /
+  # deny.toml verbatim: lru's `IterMut` iterator violates Stacked
+  # Borrows by temporarily creating an exclusive reference that
+  # invalidates the internal HashMap's shared pointer. hort-app pins lru
+  # 0.12 for `LruCache::push -> Option<(K, V)>`'s eviction-return shape
+  # (`use_cases::pat_cache`), which uses only `get`/`put`/`push` and
+  # never constructs an `IterMut` -- `grep -rn "iter_mut\|IterMut"
+  # crates/ | grep -i lru` returns empty. Tracks for removal once the
+  # lru API stabilises and hort-app can absorb the upgrade.
+  reason: "lru 0.12.5 IterMut Stacked-Borrows unsoundness (aliases GHSA-rhfx-m35p-ff5j) -- hort-app's pat_cache uses only get/put/push, never constructs IterMut; see .cargo/audit.toml for the full build-side rationale this mirrors"
+  # No expiresAt: mirrors .cargo/audit.toml's own posture -- a manually
+  # maintained, indefinite acceptance re-reviewed when the lru dependency
+  # is upgraded (tracked there), not an auto-expiring one. An arbitrary
+  # expiry date here would silently re-reject the artifact on that date
+  # with no corresponding code change -- worse than the honest "no
+  # expiry, remove by hand" model the build-side ignore already uses.

@@ -23,9 +23,14 @@
 //! `extract_optional_principal` (principal is `Option<…>`), which is
 //! exactly the read-endpoint pattern (ADR 0013): handlers receive `None`
 //! for unauthenticated callers and enforce visibility themselves via the
-//! use-case layer. The discovery-versions and prefetch routes additionally
-//! apply a token-kind gate inside their use cases (CliSession or PAT
-//! required); `GET /repositories` has no token-kind restriction.
+//! use-case layer. `GET /repositories` has no token-kind restriction. The
+//! other two routes additionally apply a token-kind gate inside their use
+//! cases — NOT identical between them (issue #80): discovery-versions
+//! requires `TokenKind::CliSession` alone (PATs rejected); prefetch
+//! accepts `CliSession` **or** a `ServiceAccount` token whose resolved
+//! grants include `Permission::Read ∧ Permission::Prefetch` on the target
+//! repository (see `hort_app::use_cases::self_service_prefetch_use_case`'s
+//! module docs and `docs/ci/hort-quarantine-integration.md` for why).
 
 use std::sync::Arc;
 

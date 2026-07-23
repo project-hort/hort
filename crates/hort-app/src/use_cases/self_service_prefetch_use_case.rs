@@ -30,13 +30,23 @@
 //!
 //! # Gate order
 //!
-//! 1. **Token-kind gate** — `caller.token_kind == Some(TokenKind::CliSession)`
-//!    is required. PATs and service-account tokens are rejected with
-//!    `Forbidden`. Fires first (cheapest — no repo resolution required)
-//!    and emits `result="token_kind_denied"` ONCE per call.
+//! 1. **Token-kind gate** — `caller.token_kind` must be `CliSession` OR
+//!    `ServiceAccount` (issue #80: the CI prefetch caller is designed as a
+//!    read+prefetch-only, non-admin ServiceAccount bearer —
+//!    `docs/ci/hort-quarantine-integration.md` — so a blanket CliSession-only
+//!    gate was implementation drift from that spec). PATs (and no token
+//!    kind at all) are still rejected with `Forbidden`. Fires first
+//!    (cheapest — no repo resolution required) and emits
+//!    `result="token_kind_denied"` ONCE per call. This gate alone grants NO
+//!    authority — see Gate 2, which is what actually admits or denies a
+//!    ServiceAccount caller.
 //! 2. **RBAC gate** — `Permission::Read ∧ Permission::Prefetch` on the
 //!    resolved repo (BOTH required). Denial emits
-//!    `result="permission_denied"` ONCE per call.
+//!    `result="permission_denied"` ONCE per call. This is the ONLY gate
+//!    that distinguishes an authorized ServiceAccount caller (CI, holding
+//!    an explicit `prefetch` grant) from an unauthorized one — the same
+//!    `RbacEvaluator` path every other permission check uses, no bespoke
+//!    SA-only logic.
 //! 3. **OCI rejection** — if the repo's format is `"oci"`, emits
 //!    `result="oci_unsupported"` ONCE per call and returns an error
 //!    wrapped in [`DomainError::Validation`].
@@ -153,7 +163,18 @@ const OCI_UNSUPPORTED_MESSAGE: &str =
     "discovery + prefetch are not supported for OCI; use registry-protocol-native \
      catalog/tags endpoints, or warm via crane pull";
 
-const TOKEN_KIND_DENIED_MESSAGE: &str = "this endpoint requires a CLI session token";
+// issue #80: the prefetch caller's design (docs/ci/hort-quarantine-integration.md
+// §"The hort side") is a read+prefetch-only, non-admin ServiceAccount bearer for
+// CI — the prior blanket "CliSession only" gate was implementation drift from
+// that spec (spec wins per CLAUDE.md's authority hierarchy). ServiceAccount is
+// accepted here alongside CliSession; the RBAC gate immediately below (Gate 2)
+// is what actually authorizes it (Permission::Read ∧ Permission::Prefetch on
+// the resolved repository) — no separate SA-specific logic. PATs remain
+// rejected; the discovery/list-versions endpoint is untouched (see
+// `discovery_use_case.rs`, which still requires CliSession alone — the design
+// doc speaks only to prefetch).
+const TOKEN_KIND_DENIED_MESSAGE: &str =
+    "this endpoint requires a CLI session or service-account token";
 
 /// `kind` value passed to [`JobsRepository::enqueue_task`] for each
 /// per-item enqueue: the **leaf-ingest** kind
@@ -235,12 +256,19 @@ impl SelfServicePrefetchUseCase {
         // yet; emit `FORMAT_UNKNOWN` per the catalog's missing-format
         // sentinel rule. The `repository` label collapses to
         // `REPOSITORY_ALL` for pre-resolution gate ticks.
-        if caller.token_kind != Some(TokenKind::CliSession) {
+        //
+        // CliSession OR ServiceAccount (issue #80 — see this file's module
+        // docs and the `TOKEN_KIND_DENIED_MESSAGE` comment above for the
+        // spec citation). PATs and the no-token-kind case remain denied here.
+        if !matches!(
+            caller.token_kind,
+            Some(TokenKind::CliSession) | Some(TokenKind::ServiceAccount)
+        ) {
             tracing::info!(
                 caller_user_id = %caller.user_id,
                 caller_token_kind = ?caller.token_kind,
                 outcome = "denied",
-                "self-service prefetch denied: token kind is not CliSession",
+                "self-service prefetch denied: token kind is not CliSession or ServiceAccount",
             );
             emit_prefetch_self_service(
                 values::FORMAT_UNKNOWN,
@@ -1101,18 +1129,138 @@ mod tests {
         );
     }
 
+    // ============================================================
+    // issue #80 token matrix: SA+grant 200 / SA-grant 403 / PAT rejected /
+    // CliSession identical. All four share the same repo + grant + item
+    // shape (npm_repo, a single explicit-version item, a mapping wired so
+    // the leaf-ingest enqueues cleanly) so the ONLY variable is token kind
+    // + grants — proving the RBAC gate, not token kind, is what
+    // distinguishes an authorized ServiceAccount caller from an
+    // unauthorized one. The PAT-rejected case is covered by
+    // `token_kind_denied_for_pat_caller_ticks_once_and_returns_forbidden`
+    // above (unchanged by this issue).
+    // ============================================================
+
     #[test]
-    fn token_kind_denied_for_service_account_ticks_once() {
+    fn service_account_with_prefetch_grant_succeeds_and_enqueues() {
+        // SA + grant -> 200/queued. Proves issue #80's core change: a
+        // ServiceAccount bearer is no longer rejected at the token-kind
+        // gate when its resolved grants include Read + Prefetch on the
+        // target repo (docs/ci/hort-quarantine-integration.md's CI
+        // prefetch-caller design).
         let snap = capture(|| {
             Box::pin(async {
                 let repo = npm_repo();
                 let repo_id = repo.id;
-                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
-                let actor = caller_with_token_kind(&["dev"], Some(TokenKind::ServiceAccount));
-                let _err =
-                    h.uc.enqueue_self_service("k", vec![], &actor)
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("gha-ci", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                let actor = caller_with_token_kind(&["gha-ci"], Some(TokenKind::ServiceAccount));
+                let outcome =
+                    h.uc.enqueue_self_service(&key, vec![item("a", Some("1.0.0"))], &actor)
                         .await
-                        .expect_err("service-account token must be rejected");
+                        .expect("SA with Read+Prefetch grants must be admitted");
+                assert_eq!(outcome.enqueued_job_ids.len(), 1);
+                assert!(outcome.skipped_already_held.is_empty());
+                assert!(outcome.rejected_packages.is_empty());
+                assert!(outcome.failed.is_empty());
+            })
+        });
+        // Neither denial gate ticked — the call passed both Gate 1 and
+        // Gate 2 cleanly.
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "token_kind_denied"
+            ),
+            None
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "permission_denied"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn service_account_without_prefetch_grant_is_permission_denied_not_token_kind_denied() {
+        // SA - grant -> 403, but via the RBAC gate (authority), NOT the
+        // token-kind gate (kind). This is the distinction issue #80's
+        // design requires: a ServiceAccount is never rejected for BEING a
+        // service account, only for lacking the grant.
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                // Read-only grant: holds Read (so it could enumerate) but
+                // not Prefetch -- deliberately NOT the same as "no grants
+                // at all", to prove this is the AND gate rejecting, same
+                // as the existing CliSession Read-only-rejected test.
+                let eval = evaluator_with_grants(vec![grant(
+                    "gha-ci-readonly",
+                    repo_id,
+                    Permission::Read,
+                )]);
+                let h = wire(repo, eval);
+                let actor =
+                    caller_with_token_kind(&["gha-ci-readonly"], Some(TokenKind::ServiceAccount));
+                let err =
+                    h.uc.enqueue_self_service(&key, vec![item("a", Some("1.0.0"))], &actor)
+                        .await
+                        .expect_err("SA without a Prefetch grant must be denied");
+                if let AppError::Domain(DomainError::Forbidden(msg)) = err {
+                    assert!(msg.contains("Prefetch"), "msg: {msg}");
+                } else {
+                    panic!("expected Forbidden, got other variant");
+                }
+            })
+        });
+        // Denied by Gate 2 (authority), never reached/tripped Gate 1
+        // (kind) -- the token-kind gate admitted the SA caller.
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "token_kind_denied"
+            ),
+            None
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "permission_denied"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn cli_session_with_prefetch_grant_succeeds_identically_to_service_account() {
+        // CliSession -> byte-identical behavior to the SA+grant case above
+        // (same repo/grant-shape/item; only the token kind differs) --
+        // proves this issue did not change CliSession's existing behavior.
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&key, vec![item("a", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("CliSession with Read+Prefetch grants must be admitted");
+                assert_eq!(outcome.enqueued_job_ids.len(), 1);
+                assert!(outcome.skipped_already_held.is_empty());
+                assert!(outcome.rejected_packages.is_empty());
+                assert!(outcome.failed.is_empty());
             })
         });
         assert_eq!(
@@ -1121,7 +1269,15 @@ mod tests {
                 "hort_prefetch_self_service_total",
                 "token_kind_denied"
             ),
-            Some(1)
+            None
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "permission_denied"
+            ),
+            None
         );
     }
 

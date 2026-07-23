@@ -19,8 +19,24 @@
 # not match the ignore and emits `advisory-not-detected` (which is a
 # hard failure). The marker tells `scripts/check-advisory-sync.sh` the
 # divergence is intentional.
+#
+# issue #80: `scripts/check-advisory-sync.sh` also asserts a THIRD axis —
+# every ID here needs a matching `kind: Exclusion` in
+# `deploy/ansible/files/gitops/policies/exclusions/` (a build-side risk
+# acceptance with no registry-side mirror would let hort's own quarantine
+# gate reject the same package CI has already decided is safe to build
+# with, once CI's prefetch — now SA-token-authorized — warms it through
+# `crates-proxy`). An entry tagged `REGISTRY-EXEMPT: RUSTSEC-YYYY-NNNN`
+# is intentionally **not** mirrored to a registry Exclusion — same
+# marker-naming convention as AUDIT-ONLY/DENY-ONLY.
 ignore = [
     # AUDIT-ONLY: RUSTSEC-2026-0173
+    # REGISTRY-EXEMPT: RUSTSEC-2026-0173 — not observed to block a CI
+    # prefetch/build (issue #80's prod evidence names only the lru /
+    # RUSTSEC-2026-0002 finding); also unreachable in the active build
+    # graph (see the AUDIT-ONLY rationale below), so hort's own scan of
+    # crates-proxy's dependency closure has no path to this crate at
+    # all. Revisit (add a registry Exclusion) if that ever changes.
     # proc-macro-error2 2.0.1 - unmaintained. Reachable ONLY through
     # `sigstore`'s DISABLED `cosign` feature, so it is NEVER compiled into any
     # hort binary:
@@ -40,6 +56,11 @@ ignore = [
     # oci-client/getset chain.
     "RUSTSEC-2026-0173",
 
+    # REGISTRY-EXEMPT: RUSTSEC-2023-0071 — not observed to block a CI
+    # prefetch/build (issue #80's prod evidence names only the lru /
+    # RUSTSEC-2026-0002 finding). Revisit (add a registry Exclusion) if
+    # hort's own crates-proxy scan of `rsa` is ever observed to
+    # quarantine/reject it for a CI dependency build.
     # rsa 0.9.10 - Marvin Attack: a timing sidechannel that can leak an
     # RSA *private* key over the network (RUSTSEC-2023-0071). This
     # enters the ACTIVE build graph via
@@ -72,6 +93,9 @@ ignore = [
     # API stabilises and hort-app can absorb the upgrade in its own PR.
     "RUSTSEC-2026-0002",
 
+    # REGISTRY-EXEMPT: RUSTSEC-2025-0134 — dev-only (test-only
+    # axum-server tls-rustls feature, never a production dependency);
+    # not observed to block a CI prefetch/build. Revisit if that changes.
     # rustls-pemfile - Unmaintained; thin wrapper around the same code
     # in rustls-pki-types since 1.9.0. The repo was archived 2025-08;
     # there is no fix to apply. We migrated our own PEM parsing
@@ -84,6 +108,13 @@ ignore = [
     # API.
     "RUSTSEC-2025-0134",
 
+    # REGISTRY-EXEMPT: RUSTSEC-2026-0194 — not observed to block a CI
+    # prefetch/build (issue #80's prod evidence names only the lru /
+    # RUSTSEC-2026-0002 finding). Revisit (add a registry Exclusion) if
+    # hort's own crates-proxy scan of `quick-xml` is ever observed to
+    # quarantine/reject it for a CI dependency build.
+    # REGISTRY-EXEMPT: RUSTSEC-2026-0195 — same rationale as
+    # RUSTSEC-2026-0194 immediately above (one finding pair, one crate).
     # quick-xml 0.39.4 - two high-severity DoS advisories (both 2026-06-29):
     #   RUSTSEC-2026-0194 - quadratic run time checking a start tag for
     #     duplicate attribute names.
