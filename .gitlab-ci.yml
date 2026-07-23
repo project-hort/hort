@@ -155,6 +155,24 @@ workflow:
     - if: $CI_COMMIT_BRANCH
       changes: *code-changed-paths
 
+# project-hort.de static site (issue #78): anything that can change
+# scripts/build-site.sh's output — the docs it's generated from, the root
+# README (landing-page content source), the site chrome/generator itself.
+.site-changed-paths: &site-changed-paths
+  - "docs/architecture/**/*"
+  - "README.md"
+  - "site/**/*"
+  - "scripts/build-site.sh"
+  - "scripts/site/**/*"
+
+.rules-site-changed: &rules-site-changed
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *site-changed-paths
+    - if: $CI_COMMIT_BRANCH
+      changes: *site-changed-paths
+
 # Guaranteed-present, guaranteed-green job. GitLab's "pipelines must succeed"
 # merge-check trap: if every job in a doc-only pipeline is gated out, the
 # pipeline has zero jobs and some project settings then block the MR
@@ -923,6 +941,29 @@ quality:fail2ban-regex-test:
     - apt-get install -y -qq --no-install-recommends fail2ban
   script:
     - bash scripts/test-fail2ban-regex.sh
+
+# project-hort.de static site (issue #78): builds site/dist/ and runs the
+# link-check that fails the build on any broken internal link or heading
+# anchor. Output is an artifact for manual review only — never committed
+# (site/dist/ is gitignored) and never deployed from here; deployment is the
+# ansible `website` role (deploy/ansible/roles/website/), run by the
+# operator. python3 is the ONLY tool this needs — see
+# scripts/site/generate.py's module docstring for why (no pandoc, no pip,
+# no npm-ecosystem SSG).
+quality:site-build:
+  stage: quality
+  image: debian:13-slim
+  needs: []
+  <<: *rules-site-changed
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends python3
+  script:
+    - ./scripts/build-site.sh
+  artifacts:
+    paths:
+      - site/dist/
+    expire_in: 3 days
 
 # ===========================================================================
 # Stage 4: build-images — buildah + cosign sign for hort-server

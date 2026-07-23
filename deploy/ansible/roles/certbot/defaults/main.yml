@@ -16,3 +16,24 @@
 #   Use this for test runs or CI-driven provisioning against a non-production
 #   host.  Set to false (the default) for all production deployments.
 certbot_staging: false
+
+# certbot_fqdn — the domain to certify.  Defaults to registry_fqdn so every
+#   pre-#78 caller (site-native.yml / site-podman.yml, which invoke this role
+#   with no extra vars) is byte-for-byte unaffected.  A second call site
+#   (the project-hort.de `website` role, issue #78) overrides this to certify
+#   a different domain on the same or a different host, without touching
+#   this role's default behaviour.
+certbot_fqdn: "{{ registry_fqdn }}"
+
+# certbot_notify_handlers — handler names notified after a successful
+#   issuance (see tasks/main.yml).  Defaults to the nginx role's three
+#   registry-vhost handlers, preserving today's behaviour exactly. A caller
+#   certifying a different vhost (e.g. the `website` role) overrides this
+#   with its own "Render <vhost> (cert present)" handler name — the handler
+#   must exist somewhere in the same play (handlers are play-scoped); the
+#   generic "Validate nginx config" / "Reload nginx" handlers are reusable
+#   as-is regardless of which vhost is being certified.
+certbot_notify_handlers:
+  - "Render nginx vhost (cert present)"
+  - "Validate nginx config"
+  - "Reload nginx"
