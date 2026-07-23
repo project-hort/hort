@@ -426,6 +426,22 @@ pub struct Config {
     /// max-age would prune every session immediately (including live
     /// ones) and set a zero TTL, which is never operator-meaningful.
     pub oci_session_max_age_secs: u64,
+    /// Bound on how long a cold pull-through blob GET will wait for its
+    /// own artifact's async scan to release it before falling back to
+    /// the normal `503 + Retry-After` (issue #65). Parsed from
+    /// `HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`, in seconds; default
+    /// `10` (comfortably above the observed 1-5s scan latency, far
+    /// below a CI runner's ~180s deadline). `0` disables the bounded
+    /// await entirely (today's behaviour: an immediate 503 on every
+    /// `Quarantined` blob, regardless of window state). ONLY consulted
+    /// when the artifact is `Quarantined` AND its computed
+    /// `quarantine_deadline` has already elapsed (release-pending on
+    /// its own scan) — a genuine, not-yet-elapsed time-quarantine is
+    /// never awaited, no matter this value. Does not change the
+    /// release predicate (ADR 0007): the wait only polls for the
+    /// artifact's OWN existing `ScanSucceeded`/`ScanWaived`-authorized
+    /// release to land; it never grants a release itself.
+    pub oci_pullthrough_release_wait_secs: u64,
     /// Selection between the in-memory and
     /// Redis backends for the `EphemeralStore` port. Default in dev /
     /// test is [`EphemeralStoreBackend::Memory`]; operators running
@@ -600,6 +616,24 @@ pub struct Config {
     /// legitimately-slow large pulls. Zero surfaces as
     /// [`ConfigError::ValueNotPositive`].
     pub pull_dedup_leader_timeout_secs: u64,
+    /// The Layer-B cluster-wide leader lock's TTL, in seconds (issue
+    /// #65). Parsed from `HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS`;
+    /// defaults to `90`. Wired into
+    /// [`hort_app::pull_dedup::PullDedupConfig::leader_lock_ttl`]. The
+    /// leader's heartbeat refreshes this lock every `leader_lock_ttl /
+    /// 3` (so two consecutive missed heartbeats — not one — expire the
+    /// lock); a follower that observes the lock expired without a
+    /// terminal outcome re-elects and re-fetches from scratch, so a
+    /// too-tight TTL abandons an otherwise-healthy, still-heartbeating
+    /// leader on a large/slow blob fetch. This is a SEPARATE knob from
+    /// `pull_dedup_leader_timeout_secs` (`leader_deadline`, ADR 0050) —
+    /// that one bounds the fetch itself; this one bounds how long the
+    /// *cluster lock* survives without a successful heartbeat. Raise it
+    /// for a consistently slow `EphemeralStore` backend or very large
+    /// blobs. Zero surfaces as [`ConfigError::ValueNotPositive`] — a
+    /// zero TTL would expire the lock before the leader could ever
+    /// heartbeat it.
+    pub pull_dedup_leader_lock_ttl_secs: u64,
     /// Wall-clock cap on the
     /// graceful-shutdown wait, in seconds. Parsed from
     /// `HORT_SHUTDOWN_GRACE_SECS`; defaults to `60`.
@@ -902,6 +936,7 @@ impl std::fmt::Debug for Config {
             oci_legacy_catalog_enabled,
             oci_max_sessions_per_principal,
             oci_session_max_age_secs,
+            oci_pullthrough_release_wait_secs,
             ephemeral_store_backend,
             redis_url: _,
             redis_url_evictable: _,
@@ -919,6 +954,7 @@ impl std::fmt::Debug for Config {
             pull_dedup_ttl_checksum_mismatch_secs,
             pull_dedup_follower_wait_secs,
             pull_dedup_leader_timeout_secs,
+            pull_dedup_leader_lock_ttl_secs,
             shutdown_grace_secs,
             upstream_allowlist,
             cas_scrub_action_on_mismatch,
@@ -987,6 +1023,10 @@ impl std::fmt::Debug for Config {
                 oci_max_sessions_per_principal,
             )
             .field("oci_session_max_age_secs", oci_session_max_age_secs)
+            .field(
+                "oci_pullthrough_release_wait_secs",
+                oci_pullthrough_release_wait_secs,
+            )
             .field("ephemeral_store_backend", ephemeral_store_backend)
             .field("redis_url", &"<redacted>")
             // Per-class Redis URL overrides. Mirror
@@ -1044,6 +1084,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "pull_dedup_leader_timeout_secs",
                 pull_dedup_leader_timeout_secs,
+            )
+            .field(
+                "pull_dedup_leader_lock_ttl_secs",
+                pull_dedup_leader_lock_ttl_secs,
             )
             .field("shutdown_grace_secs", shutdown_grace_secs)
             .field("upstream_allowlist", upstream_allowlist)
@@ -2000,6 +2044,7 @@ impl Config {
         let pull_dedup_ttl_checksum_mismatch_secs = parse_pull_dedup_ttl_checksum_mismatch_secs()?;
         let pull_dedup_follower_wait_secs = parse_pull_dedup_follower_wait_secs()?;
         let pull_dedup_leader_timeout_secs = parse_pull_dedup_leader_timeout_secs()?;
+        let pull_dedup_leader_lock_ttl_secs = parse_pull_dedup_leader_lock_ttl_secs()?;
 
         // Graceful-shutdown
         // wall-clock cap. Default 60s matches the prior hard-coded
@@ -2041,6 +2086,10 @@ impl Config {
         // threshold). Default 3600 s matches the Docker Registry v2
         // reference window.
         let oci_session_max_age_secs = parse_oci_session_max_age_secs()?;
+
+        // OCI pull-through cold-blob release-race bounded-await (#65).
+        // 0 disables (today's immediate-503 behaviour).
+        let oci_pullthrough_release_wait_secs = parse_oci_pullthrough_release_wait_secs()?;
 
         // `EphemeralStore` backend + Redis URL.
         // Default is Memory so dev / test envs boot without a Redis
@@ -2442,6 +2491,7 @@ impl Config {
             oci_legacy_catalog_enabled,
             oci_max_sessions_per_principal,
             oci_session_max_age_secs,
+            oci_pullthrough_release_wait_secs,
             ephemeral_store_backend,
             redis_url,
             redis_url_evictable,
@@ -2459,6 +2509,7 @@ impl Config {
             pull_dedup_ttl_checksum_mismatch_secs,
             pull_dedup_follower_wait_secs,
             pull_dedup_leader_timeout_secs,
+            pull_dedup_leader_lock_ttl_secs,
             shutdown_grace_secs,
             upstream_allowlist,
             cas_scrub_action_on_mismatch: parse_cas_scrub_action_on_mismatch()?,
@@ -2756,6 +2807,18 @@ fn parse_oci_session_max_age_secs() -> Result<u64, ConfigError> {
     Ok(secs)
 }
 
+/// Parse `HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`.
+///
+/// Absent or empty env var → 10 seconds. Non-integer values surface
+/// as [`ConfigError::InvalidInt`]. Unlike most timing knobs in this
+/// file, `0` is a valid, deliberate value here — it disables the
+/// bounded-await entirely, restoring the pre-#65 behaviour (an
+/// immediate 503 on every `Quarantined` blob). `parse_u64` (not
+/// `parse_positive`) is used specifically to allow it.
+fn parse_oci_pullthrough_release_wait_secs() -> Result<u64, ConfigError> {
+    parse_u64("HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS", 10)
+}
+
 /// Parse `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`.
 ///
 /// Absent or empty env var → 30 seconds. Non-integer values surface
@@ -2828,6 +2891,21 @@ fn parse_pull_dedup_follower_wait_secs() -> Result<u64, ConfigError> {
 /// every leader before its fetch could ever complete.
 fn parse_pull_dedup_leader_timeout_secs() -> Result<u64, ConfigError> {
     parse_positive::<u64>("HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS", 600)
+}
+
+/// Parse `HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS` (issue #65).
+///
+/// Absent or empty env var → 90 seconds (the pre-#65 hardcoded
+/// value). Non-integer values surface as [`ConfigError::InvalidInt`];
+/// zero surfaces as [`ConfigError::ValueNotPositive`] — a zero TTL
+/// would expire the cluster lock before the leader's heartbeat (which
+/// fires every `leader_lock_ttl / 3`) could ever refresh it. Raise
+/// this for a consistently slow `EphemeralStore` backend or very
+/// large blobs; it is a separate knob from
+/// `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` (`leader_deadline`, which
+/// bounds the fetch itself, not the cluster lock's survival).
+fn parse_pull_dedup_leader_lock_ttl_secs() -> Result<u64, ConfigError> {
+    parse_positive::<u64>("HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS", 90)
 }
 
 /// Parse `HORT_NOTIFY_CHANNEL_CAPACITY`.
@@ -3871,6 +3949,7 @@ mod tests {
             oci_legacy_catalog_enabled: false,
             oci_max_sessions_per_principal: 32,
             oci_session_max_age_secs: 3600,
+            oci_pullthrough_release_wait_secs: 10,
             ephemeral_store_backend: EphemeralStoreBackend::Memory,
             redis_url: None,
             // Per-class overrides default to None
@@ -3894,6 +3973,7 @@ mod tests {
             pull_dedup_ttl_checksum_mismatch_secs: 60,
             pull_dedup_follower_wait_secs: 300,
             pull_dedup_leader_timeout_secs: 600,
+            pull_dedup_leader_lock_ttl_secs: 90,
             shutdown_grace_secs: 60,
             upstream_allowlist:
                 hort_app::use_cases::apply_config_use_case::UpstreamHostAllowlist::Disabled,
@@ -3994,6 +4074,7 @@ mod tests {
             oci_legacy_catalog_enabled: false,
             oci_max_sessions_per_principal: 32,
             oci_session_max_age_secs: 3600,
+            oci_pullthrough_release_wait_secs: 10,
             ephemeral_store_backend: EphemeralStoreBackend::Redis,
             redis_url: Some(format!(
                 "redis://user:{SENSITIVE_REDIS_PASSWORD}@localhost:6379/0"
@@ -4019,6 +4100,7 @@ mod tests {
             pull_dedup_ttl_checksum_mismatch_secs: 60,
             pull_dedup_follower_wait_secs: 300,
             pull_dedup_leader_timeout_secs: 600,
+            pull_dedup_leader_lock_ttl_secs: 90,
             shutdown_grace_secs: 60,
             upstream_allowlist:
                 hort_app::use_cases::apply_config_use_case::UpstreamHostAllowlist::Disabled,

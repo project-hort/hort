@@ -1412,6 +1412,17 @@ pub fn build_mock_ctx_with_label_flag(
         // default (2 MiB). Tests that need to trip the projector cap
         // override this via `with_*` in the per-test wiring.
         upstream_projector_version_object_max_bytes: 2 * 1024 * 1024,
+        // Test default is `0` (DISABLED) — deliberately NOT the
+        // production default (10s). The bounded-await polls on a real
+        // `tokio::time::sleep`, and most existing quarantine-shaped
+        // fixtures across the test suite don't care about this feature
+        // at all; defaulting it on would silently add up to a real
+        // multi-second wall-clock delay to any test whose artifact
+        // happens to be `Quarantined` with an elapsed window, without
+        // that test ever asking for it. Tests exercising the #65
+        // bounded-await set this explicitly to a short value via
+        // `with_*`.
+        oci_pullthrough_release_wait_secs: 0,
         auth: AuthContext::Disabled,
         // Default to None in all mock contexts.
         // Tests that need to exercise extra-CA behaviour supply it directly.
@@ -1665,6 +1676,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         publish_body_limit_bytes: base.publish_body_limit_bytes,
         upstream_projector_version_object_max_bytes: base
             .upstream_projector_version_object_max_bytes,
+        oci_pullthrough_release_wait_secs: base.oci_pullthrough_release_wait_secs,
         auth: AuthContext::Disabled,
         // Carry forward from base; callers that need
         // to test with extra anchors override this field in the mutate closure.
@@ -1781,6 +1793,17 @@ pub fn with_oidc_issuer_repo(
 /// drive both branches without rebuilding every port.
 pub fn with_pat_over_http_allowed(base: &Arc<AppContext>, allowed: bool) -> Arc<AppContext> {
     rebuild(base, |ctx| ctx.pat_over_http_allowed = allowed)
+}
+
+/// Override the #65 pull-through release bounded-await bound on a mock
+/// context. The shared harness default is `0` (disabled) precisely so
+/// this override is required to exercise the feature — see the field's
+/// seed-site comment in [`build_mock_ctx`].
+pub fn with_oci_pullthrough_release_wait_secs(
+    base: &Arc<AppContext>,
+    secs: u64,
+) -> Arc<AppContext> {
+    rebuild(base, |ctx| ctx.oci_pullthrough_release_wait_secs = secs)
 }
 
 /// Wire the OCI signing-key handle on a mock

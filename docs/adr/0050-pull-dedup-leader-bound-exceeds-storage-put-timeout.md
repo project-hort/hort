@@ -96,10 +96,45 @@ Two corollaries follow:
   insufficient — it bounds one leg while the aggregate coalesce operation stays
   unbounded, which is exactly the gap #55 closed.
 
+## Addendum (issue #65) — the cluster leader-lock TTL is a third, deliberately-unpaired knob
+
+`PullDedupConfig::leader_lock_ttl` (`HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS`,
+default 90s) is the Layer-B cluster-wide `EphemeralStore` lock lease — a knob
+this ADR's "paired decision" reasoning does not cover, and deliberately does
+not need to. `leader_deadline` / `HORT_STORAGE_PUT_TIMEOUT_SECS` bound how
+long the leader's *own fetch* may legitimately run; `leader_lock_ttl` bounds
+how long **other replicas** wait to detect a leader that is truly gone
+(process crash, no heartbeat) before re-electing. As long as the heartbeat
+renews the lock every `leader_lock_ttl / 3` and that renewal is itself
+resilient to a transient blip, the lock survives for the *entire* duration of
+a legitimately-slow leader's fetch regardless of the TTL value — so, unlike
+`leader_deadline` vs the storage timeout, raising or lowering
+`leader_lock_ttl` alone does not reintroduce false abandonment of a healthy
+leader. It only trades off crash-recovery latency (how long a dead leader's
+digest stays "poisoned" before a follower re-elects) against heartbeat
+traffic.
+
+That said, issue #65 found the pre-existing heartbeat was not actually that
+resilient: `spawn_heartbeat`'s `extend_ttl` failure path used to `debug!` and
+wait a full next `heartbeat_interval` tick to retry, so two consecutive
+transient failures (a ~2×`heartbeat_interval` window) could lapse the lock
+out from under a still-progressing leader — the false-abandonment failure
+mode this ADR describes for the *other* pairing, reachable here too, but
+through a liveness bug rather than a tuning mismatch. Fixed with a bounded
+retry-with-backoff (`HEARTBEAT_RETRY_MAX_ATTEMPTS` × `HEARTBEAT_RETRY_BACKOFF`,
+well under `heartbeat_interval`) inside each tick, so a transient blip is
+absorbed without waiting for the next natural tick. This addendum, not a new
+ADR, records the decision: no new fail-open surface was introduced (the retry
+still gives up and lets the lock lapse if the backend stays down past the
+retry budget — the eventual-fallback contract this ADR's *Decision* section
+requires is unchanged), and the reasoning is a direct corollary of this
+document's existing scope rather than an independent standing decision.
+
 ## References
 
 - `crates/hort-app/src/pull_dedup.rs` — `PullDedupConfig::leader_deadline`,
-  `LeaderGuard`, the two `tokio::time::timeout` sites.
+  `PullDedupConfig::leader_lock_ttl` (issue #65), `LeaderGuard`,
+  `spawn_heartbeat`, the two `tokio::time::timeout` sites.
 - `crates/hort-adapters-storage/src/object_store_backend.rs` — the `put`
   timeout and its phase diagnostics.
 - `docs/metrics-catalog.md` — `leader_timeout` / `leader_cancelled`.
