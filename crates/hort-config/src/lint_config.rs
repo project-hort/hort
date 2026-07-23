@@ -314,7 +314,7 @@ mod tests {
 
     fn yaml(name: &str, body: &str) -> String {
         format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: PermissionGrantLintConfig\n\
+            "apiVersion: project-hort.de/v1\nkind: PermissionGrantLintConfig\n\
              metadata:\n  name: {name}\nspec:{body}"
         )
     }
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_wrong_kind() {
-        let doc = "apiVersion: project-hort.de/v1beta1\nkind: ScanPolicy\n\
+        let doc = "apiVersion: project-hort.de/v1\nkind: ScanPolicy\n\
                    metadata:\n  name: x\nspec: {}\n";
         let err = parse_lint_config(&p(), doc.as_bytes()).unwrap_err();
         assert!(matches!(
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_empty_metadata_name() {
-        let doc = "apiVersion: project-hort.de/v1beta1\nkind: PermissionGrantLintConfig\n\
+        let doc = "apiVersion: project-hort.de/v1\nkind: PermissionGrantLintConfig\n\
                    metadata:\n  name: ''\nspec: {}\n";
         let err = parse_lint_config(&p(), doc.as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::EmptyMetadataName));
@@ -559,7 +559,7 @@ mod tests {
     fn validate_rejects_blank_metadata_name() {
         // `metadata.name` is non-empty (parse gate) but whitespace-only
         // slips past `is_empty()` — caught by the trim check.
-        let doc = "apiVersion: project-hort.de/v1beta1\nkind: PermissionGrantLintConfig\n\
+        let doc = "apiVersion: project-hort.de/v1\nkind: PermissionGrantLintConfig\n\
                    metadata:\n  name: '   '\nspec: {}\n";
         let env = parse_lint_config(&p(), doc.as_bytes()).unwrap();
         let errs = validate_lint_config(&env);

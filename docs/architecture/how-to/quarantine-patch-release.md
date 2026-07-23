@@ -128,12 +128,17 @@ The `ArtifactReleased` event for step 3 carries:
 - `released_by_user_id = <your user UUID>` (from the admin token used)
 - `justification = "<the text you supplied>"`
 
-Both `released_by_user_id` and `justification` are present iff `released_by = Admin`;
-the timer-sweep release path produces an `ArtifactReleased` with both
-fields `None`, and the policy-re-evaluation path (when an exclusion is
-added and the observation window has elapsed) also produces both `None`.
-This contrast is what makes the admin path forensically distinguishable
-from the routine release paths.
+Both `released_by_user_id` and `justification` are present iff
+`released_by ∈ {Admin, Curator}` — the curator-waiver endpoint
+(`POST /api/v1/admin/curation/quarantine/:artifact_id/waive`, day-to-day
+non-admin release authority, `Quarantined`-only source state) emits the
+same attribution shape as the admin path this guide walks through; the
+timer-sweep release
+path produces an `ArtifactReleased` with both fields `None`, and the
+policy-re-evaluation path (when an exclusion is added and the
+observation window has elapsed) also produces both `None`. This
+contrast is what makes the two human-attributed release paths
+forensically distinguishable from the two automatic ones.
 
 ---
 

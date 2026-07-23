@@ -1,0 +1,24 @@
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: hort-charts-scan
+spec:
+  scope:
+    repository: hort-charts
+  # quarantineDuration: 0 — REQUIRED, and deliberately different from hort-oci's 1h:
+  # (a) the publish job cosign-SIGNS the chart immediately after push
+  #     (docker-publish.yml, `cosign sign …@DIGEST`), which resolves the
+  #     just-pushed manifest back — a quarantine 503 there would fail the publish
+  #     (hort-oci gets away with 1h because its mirror uses `cosign copy`, which
+  #     carries the signature across in one op with no fresh readback);
+  # (b) adopters `helm install` the chart the moment a release ships — a quarantine
+  #     window on our own signed first-party chart is pure friction with no upside;
+  #     trust here comes from the keyless cosign signature, not a quarantine/scan.
+  # NOTE: with NO ScanPolicy the repo would inherit the 24h DEFAULT quarantine, so
+  # this policy MUST exist to set 0. See issue #71.
+  quarantineDuration: 0
+  severityThreshold: high
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

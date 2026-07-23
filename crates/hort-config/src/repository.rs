@@ -754,7 +754,7 @@ mod tests {
     /// whitespace and corrupting indentation.
     fn yaml(spec_body: &str) -> String {
         format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: ArtifactRepository\nmetadata:\n  name: npm-public\nspec:{spec_body}"
+            "apiVersion: project-hort.de/v1\nkind: ArtifactRepository\nmetadata:\n  name: npm-public\nspec:{spec_body}"
         )
     }
 
@@ -1019,7 +1019,7 @@ mod tests {
     fn type_virtual_with_self_reference_is_validation_error() {
         // metadata.name == "x" and virtualMembers contains "x" — the
         // self-reference rule must fire.
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: x
@@ -1041,7 +1041,7 @@ spec:
 
     #[test]
     fn type_virtual_with_duplicate_members_is_validation_error() {
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: a
@@ -1088,7 +1088,7 @@ spec:
         // steady state. The repo below is otherwise valid (members present, no
         // dup, no self-reference), so the unsupported-format rejection is the
         // operative error.
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: vroot
@@ -1116,7 +1116,7 @@ spec:
         // served (A-level merge + V-level authoritative + file download).
         for format in ["maven", "gradle"] {
             let yaml_doc = format!(
-                "apiVersion: project-hort.de/v1beta1
+                "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: vroot
@@ -1146,7 +1146,7 @@ spec:
         // Phase 1 lifted npm into `VIRTUAL_SERVE_SUPPORTED_FORMATS`, so a
         // valid `type: virtual` npm repo no longer trips the inert-field
         // stopgap — `virtualMembers` is now genuinely served (ADR 0031).
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: vroot
@@ -1175,7 +1175,7 @@ spec:
         // unknown (`Other(_)`) — that is reported by the format check, and
         // stacking "not yet serve-supported" on top would be noise. Exercises
         // the `!matches!(format, Other(_))` short-circuit (cond-false arm).
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: vroot
@@ -1209,7 +1209,7 @@ spec:
   replicationPriority: immediate
 ";
         let yaml_doc = format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: ArtifactRepository\nmetadata:\n  name: NPM-Public\nspec:\n{body}"
+            "apiVersion: project-hort.de/v1\nkind: ArtifactRepository\nmetadata:\n  name: NPM-Public\nspec:\n{body}"
         );
         let env = parse_repository(&p(), yaml_doc.as_bytes()).unwrap();
         let errors = validate_repository(&env);
@@ -1678,7 +1678,7 @@ spec:
         use crate::ApiVersion;
 
         let env = Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ArtifactRepository,
             metadata: Metadata { name: "x".into() },
             spec: RepositorySpec {
@@ -2167,7 +2167,7 @@ spec:
 
     #[test]
     fn empty_metadata_name_at_parse_time() {
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: ''

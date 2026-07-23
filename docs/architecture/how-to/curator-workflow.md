@@ -59,7 +59,7 @@ taxonomy is deliberately closed at two):
 operator identities):
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: curator-security-team
@@ -76,7 +76,7 @@ spec:
 token or a specific human):
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: curator-ci-rotation-bot
@@ -413,7 +413,7 @@ ingest — it is to set `quarantineDuration: 0s` on the repo's
 `ScanPolicy`.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: internal-hosted-quarantine-opt-out

@@ -58,7 +58,7 @@ per file under `$HORT_CONFIG_DIR/auth/`. A file declaring the legacy
 Every object shares the same four-field envelope:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: <ArtifactRepository | ClaimMapping | PermissionGrant | CurationRule | ScanPolicy | Exclusion | UpstreamMapping | OidcIssuer | ServiceAccount | RetentionPolicy | PermissionGrantLintConfig>
 metadata:
   name: <unique-within-kind>
@@ -75,7 +75,7 @@ registry-claim). Declaring a retired kind is a fatal boot-apply
 error — `ParseError::UnknownKind` with the current allow-list
 rendered in the message.
 
-`apiVersion: project-hort.de/v1beta1` is the only accepted version. The
+`apiVersion: project-hort.de/v1` is the only accepted version. The
 `v1alpha1` suffix signals "subject to change without a deprecation
 window" — re-emit your YAML when a new variant lands.
 
@@ -87,7 +87,7 @@ boot, not as silent defaults.
 ## 3. `kind: ArtifactRepository`
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: npm-public
@@ -155,11 +155,12 @@ spec:
   replicationPriority: on_demand
 ```
 
-**Serve-supported formats: `npm`, `pypi`, `cargo`.** A `type: virtual`
-repo on any other format (`oci`, `maven`, …) is **rejected at apply** —
-its `virtualMembers` would be accepted but never served (the ADR 0015
-inert-field guard). The supported set is the single source of truth in
-`crates/hort-config/src/repository.rs` (`VIRTUAL_SERVE_SUPPORTED_FORMATS`).
+**Serve-supported formats: `npm`, `pypi`, `cargo`, `maven`, `gradle`.** A
+`type: virtual` repo on any other format (`oci`, …) is **rejected at
+apply** — its `virtualMembers` would be accepted but never served (the
+ADR 0015 inert-field guard). The supported set is the single source of
+truth in `crates/hort-config/src/repository.rs`
+(`VIRTUAL_SERVE_SUPPORTED_FORMATS`).
 
 Members must reference other ArtifactRepository objects in the same
 `$HORT_CONFIG_DIR`. Mixing a managed virtual with `Local` (API-created)
@@ -256,7 +257,7 @@ no-op.
 ### Example — IdP group → registry claim
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: security-team
@@ -280,7 +281,7 @@ per IdP group; `metadata.name` distinguishes the envelopes). This
 is the canonical "any of these IdP groups grants this claim" shape:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: developers-from-platform-eng
@@ -288,7 +289,7 @@ spec:
   idpGroup: platform-eng
   claim: developer
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: developers-from-app-team
@@ -413,7 +414,7 @@ section documents the operator-facing YAML and apply semantics.
   ([ADR 0038](../../adr/0038-admin-identity-model.md)).
 
 **Permission** is a single string, one of
-`read | write | delete | admin | admin_task_invoke | curate`.
+`read | write | delete | admin | admin_task_invoke | curate | prefetch`.
 
 **Repository** is a single optional `ArtifactRepository.metadata.name`
 reference. **Omit the field entirely** for a global grant; a blank
@@ -423,7 +424,7 @@ parser refuses to silently equate them).
 #### Claim-gated grant
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: security-team-curate-global
@@ -440,7 +441,7 @@ A multi-claim grant tightens the requirement — the caller must carry
 **all** listed claims:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: alpha-devs-write-pypi-alpha
@@ -455,7 +456,7 @@ spec:
 #### ServiceAccount-subject grant (the SA authority mechanism)
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: ci-rotation-bot-read-npm-proxy
@@ -470,7 +471,7 @@ spec:
 #### User-bound grant (break-glass)
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: oncall-read-npm-proxy
@@ -522,7 +523,7 @@ out of the embedded `Repository.curation` field — there is no
 equivalent inline form on a managed repository today.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: CurationRule
 metadata:
   name: block-known-bad-1
@@ -536,7 +537,7 @@ spec:
 Attach to a repository via the junction list:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: pypi-curated
@@ -564,7 +565,7 @@ one event per changed field (plus `PolicyCreated` on first apply,
 `PolicyArchived` when the YAML disappears).
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: default-quarantine
@@ -625,7 +626,7 @@ The two operator-facing postures:
 Example permissive override scoped to a single hosted repo:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: ci-builds-permissive
@@ -649,7 +650,7 @@ Event-sourced sub-state of a parent `ScanPolicy` (same stream).
 Identity is `(policy_name, cve_id, package_pattern_or_null)`.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: Exclusion
 metadata:
   name: cve-2024-3094-on-old-xz
@@ -701,7 +702,7 @@ an extra segment that a spec-compliant OCI client would not produce:
   that mounts repositories under a prefix
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: UpstreamMapping
 metadata:
   name: docker-io-via-zot
@@ -783,7 +784,7 @@ algorithms have no JWKS to verify against). `jwksRefreshInterval`
 is bounded `[1m, 24h]`.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: OidcIssuer
 metadata:
   name: github-actions
@@ -836,7 +837,7 @@ envelope binds the identity; the grants beside it confer read+write
 on one repository:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: gha-myorg-myrepo-pypi
@@ -847,7 +848,7 @@ spec:
         repository: my-org/my-repo
         environment: production
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: gha-myorg-myrepo-pypi-write
@@ -858,7 +859,7 @@ spec:
   permission: write
   repository: pypi-internal
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: gha-myorg-myrepo-pypi-read
@@ -878,7 +879,7 @@ post-upload check) needs both grants.
 consumer needs just the `read` grant:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: legacy-docker-puller
@@ -891,7 +892,7 @@ spec:
     rotationInterval: 6h
     validity: 24h
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: legacy-docker-puller-read
@@ -909,7 +910,7 @@ whichever path issued the token, the cap snapshots the same grant
 set:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: ci-pypi-pusher
@@ -927,7 +928,7 @@ spec:
     rotationInterval: 6h
     validity: 24h
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: ci-pypi-pusher-write
@@ -1239,7 +1240,7 @@ end-to-end smoke covering these examples is
 ### Scan-result enforcement (`decision_point=scan_result`)
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: prod-default
@@ -1292,7 +1293,7 @@ records the explicit gap.
 ### Re-evaluation after exclusion added (`decision_point=re_evaluation`)
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: Exclusion
 metadata:
   name: cve-2024-3094-on-old-xz
@@ -1329,7 +1330,7 @@ exercise lands when a `ScannerPort` adapter ships.
 ### Curation ingest-time blocking (`decision_point=curation`)
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: CurationRule
 metadata:
   name: block-known-bad-1
@@ -1339,7 +1340,7 @@ spec:
   action: block
   reason: "CVE-2024-9999 — recorded on every match"
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: pypi-curated

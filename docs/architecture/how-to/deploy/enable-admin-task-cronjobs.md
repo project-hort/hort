@@ -4,8 +4,9 @@ This guide is for operators turning on `scheduledTasks.adminTasksEnabled:
 true` — the umbrella toggle that renders the svc-token bootstrap Job plus
 the `executionPath: admin-task` CronJobs (`staging-sweep`,
 `cron-rescan-tick`, `advisory-watch-tick`, `service-account-rotation`,
-`noop`, `replay-seen-prune`, `verify-event-chain`, and the destructive
-trio). It covers the **gitops prerequisite** the chart deliberately does
+`noop`, `replay-seen-prune`, `scanner-registry-prune`,
+`verify-event-chain`, and the destructive trio). It covers the
+**gitops prerequisite** the chart deliberately does
 not provision, the **two ways getting it wrong fails**, and the
 **destructive-task caveat**.
 
@@ -43,12 +44,12 @@ envelopes to your `gitopsConfig` (or the equivalent files under
 [`declare-gitops-config.md`](../declare-gitops-config.md)):
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata: { name: cronjob-tasks }
 spec: {}
 ---
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata: { name: cronjob-tasks-admin_task_invoke }
 spec:
@@ -170,7 +171,7 @@ admin_task_invoke — the token would mint but the corresponding admin-task
 CronJob(s) would be denied (403) at run time. Add the following to your
 gitopsConfig and re-apply:
 
-  apiVersion: project-hort.de/v1beta1
+  apiVersion: project-hort.de/v1
   kind: PermissionGrant
   metadata: { name: cronjob-tasks-admin_task_invoke }
   spec:

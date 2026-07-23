@@ -272,20 +272,23 @@ impl UpstreamMetadataAdapter {
         package: &str,
     ) -> Result<Vec<String>, UpstreamFetchError> {
         let repo = Self::synthetic_repo(mapping);
-        // The composition seam fetches the HTML simple-index for the
-        // upstream-advertised version list — it is the universal-fallback
-        // shape (every PEP 503 mirror serves HTML; PEP 691 JSON is an
-        // upgrade). HTML is the conservative choice for an upstream we
-        // don't have prior knowledge of.
+        // The composition seam fetches the simple-index for the
+        // upstream-advertised version list. `fetch_raw_with_cache` always
+        // prefers PEP 691 JSON upstream and content-sniffs the actual
+        // response to pick the projector (#72 Mode 1) — this seam used to
+        // hardcode the HTML arm here (the buffered, 2 MiB-capped
+        // projector), which meant a package with a large HTML index (e.g.
+        // one with many releases) failed version discovery through this
+        // seam the same way the direct serve path did before the fix.
         //
-        // The pypi helper streams the body through the format-appropriate
-        // projector and returns the small `PypiSimpleIndexProjection` (the
-        // raw body went to the mirror on the serve path). This
-        // low-frequency discovery seam passes `mirror = None` (it does not
-        // serve, so it has no mirror and no stale-while-error need) and the
-        // default per-value-object cap (2 MiB), then derives the version
-        // list directly from the projection's `files[]` filenames — so the
-        // seam no longer caches the raw body either (the spec's "raw leaves
+        // The pypi helper streams the body through the sniffed projector
+        // and returns the small `PypiSimpleIndexProjection` (the raw body
+        // went to the mirror on the serve path). This low-frequency
+        // discovery seam passes `mirror = None` (it does not serve, so it
+        // has no mirror and no stale-while-error need) and the default
+        // per-value-object cap (2 MiB), then derives the version list
+        // directly from the projection's `files[]` filenames — so the seam
+        // no longer caches the raw body either (the spec's "raw leaves
         // Redis" invariant covers pypi wholesale, not just serve). A
         // filename that yields no PEP 440 version is dropped (the same
         // skip-unparseable policy the retired `extract_upstream_versions`
@@ -299,7 +302,6 @@ impl UpstreamMetadataAdapter {
             UPSTREAM_PROJECTOR_VERSION_OBJECT_DEFAULT_MAX_BYTES,
             &repo,
             package,
-            pypi_helpers::SimpleIndexFormat::Html,
         )
         .await
         {

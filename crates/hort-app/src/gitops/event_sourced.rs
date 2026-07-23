@@ -692,7 +692,7 @@ mod tests {
 
     fn policy_envelope(spec: ScanPolicySpec) -> Envelope<ScanPolicySpec> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::ScanPolicy,
             metadata: Metadata {
                 name: "prod-default".into(),
@@ -750,7 +750,7 @@ mod tests {
 
     fn exclusion_envelope(specs: Vec<ExclusionSpec>) -> Envelope<Vec<ExclusionSpec>> {
         Envelope {
-            api_version: ApiVersion::V1Beta1,
+            api_version: ApiVersion::V1,
             kind: Kind::Exclusion,
             metadata: Metadata {
                 name: "exclusions-for-prod-default".into(),

@@ -23,7 +23,8 @@ reference is the complete list.
 asserts every top-level key in `values.yaml` has a comment
 block above it. [`values.schema.json`](../../../../deploy/helm/hort-server/values.schema.json)
 enforces required-vs-optional and cross-field invariants at
-`helm install` time (eight cross-field rules).
+`helm install` time (14 numbered cross-field rules, some with
+sub-parts — 1, 2, 3, 4, 4b, 4c, 4d, 5, 6, 7, 8a, 8b, 9a, 9b).
 
 **The schema is strict** (see
 [ADR 0029](../../../adr/0029-operator-config-hard-rename.md)):
@@ -162,7 +163,7 @@ Example:
 ```yaml
 image:
   repository: registry.example.com/hort/hort-server
-  tag: 2.0.0-rc.7
+  tag: 0.9.12-dev
   pullSecrets: [{name: ghcr-pull}]
 ```
 
@@ -660,7 +661,7 @@ flags, OCI session records, auth-event throttle). Each falls back to
 
 Two-layer request coalescing covers every upstream
 pull-through path (Cargo, npm, PyPI, OCI). The chart **does not yet
-expose named values** for this feature; the binary reads six
+expose named values** for this feature; the binary reads seven
 `HORT_PULL_DEDUP_*` env vars. Set them via `extraEnv` until the chart
 exposes named keys.
 
@@ -671,6 +672,8 @@ exposes named keys.
 | `HORT_PULL_DEDUP_TTL_TIMEOUT_SECS` | `10` | Short-cache TTL for upstream timeouts and network errors. Same rationale as `UNAVAILABLE`. |
 | `HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS` | `60` | Short-cache TTL for upstream-checksum-mismatch outcomes. Longer than `UNAVAILABLE` because checksum mismatch is a content-integrity signal, not a transient transport issue — re-fetching immediately wastes bandwidth on the same poisoned upstream. |
 | `HORT_PULL_DEDUP_FOLLOWER_WAIT_SECS` | `300` | Maximum wall-time a follower waits for the leader's fetch to complete (Layer B / cluster-wide path). On expiry, the follower returns `502 Bad Gateway` with a `leader-timeout` reason. Set higher than your slowest expected upstream fetch — defaults safe for OCI image-layer pulls under typical latency. |
+| `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` | `600` | Hard ceiling on the leader's own fetch (issue #55); on expiry the leader is abandoned and the next caller elects fresh. |
+| `HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS` | `90` | Cluster-wide leader-lock lease (issue #65). A healthy heartbeat (renewing every `ttl / 3`) keeps a legitimately-slow leader's lock alive regardless of this value; it only bounds how long followers wait to detect a genuinely-dead leader. |
 | `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` | `600` | Hard ceiling on the leader's own fetch (issue #55). On expiry the leader is abandoned — a `Failed(Timeout)` terminal is written and the Layer-A entry evicted so the next caller elects fresh, converting a wedged leader from "poisoned until process restart" into "self-heals within the deadline." Must stay above `HORT_STORAGE_PUT_TIMEOUT_SECS` (default 300s) — the leader closure's slowest leg — or legitimately-slow large pulls get abandoned. |
 
 Coalescing has no chart-level toggle: it is **always on** because
@@ -926,7 +929,7 @@ gitopsConfig:
         value: hort-admins
         role: admin
   "repos/ghcr-mirror.yaml": |
-    apiVersion: project-hort.de/v1beta1
+    apiVersion: project-hort.de/v1
     kind: ArtifactRepository
     metadata:
       name: ghcr-mirror
@@ -1000,9 +1003,11 @@ as of HEAD:
 | `eventstoreCheckpoint` | admin-task | `false` | `0 * * * *` | — |
 | `replaySeenPrune` | admin-task | `true` | `0 * * * *` | — |
 | `verifyEventChain` | admin-task | `false` | `0 2 * * *` | — |
+| `scannerRegistryPrune` | admin-task | `true` | `0 * * * *` | — |
 
-`replaySeenPrune` is the only admin-task task that defaults `enabled:
-true` (it runs once `adminTasksEnabled` is flipped). `scrub.actionOnMismatch`
+`replaySeenPrune` and `scannerRegistryPrune` are the only admin-task
+tasks that default `enabled: true` (both run once `adminTasksEnabled`
+is flipped). `scrub.actionOnMismatch`
 (`HORT_CAS_SCRUB_ACTION_ON_MISMATCH`) is **also read by the main
 Deployment**, so it is load-bearing even with `scrub.enabled: false`. The
 schedule floor is 5 minutes (the admin-task Idempotency-Key uses

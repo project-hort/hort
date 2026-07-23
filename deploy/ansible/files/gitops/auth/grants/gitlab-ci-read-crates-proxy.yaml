@@ -1,4 +1,4 @@
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: PermissionGrant
 metadata:
   name: gitlab-ci-read-crates-proxy

@@ -640,6 +640,18 @@ pub(crate) async fn put_manifest_dispatch(
     let group_coords = oci_group_coords(&name, &manifest_digest);
     let actor_any = Actor::Api(actor.clone());
 
+    // #73 step 1 (diagnosability): a failure here used to fold into a
+    // silent `OciError::Internal` at `warn!` — undiagnosable from the
+    // logs on a genuine error (prod-confirmed: a worker image's index
+    // PUT 500s with no ERROR logged). `add_member`'s own idempotent-
+    // duplicate case (same artifact_id + same role re-add) is ALREADY
+    // absorbed as `Ok` by the adapter (see
+    // `ArtifactGroupLifecyclePort::commit_member_added`'s documented
+    // step 4: "same role → idempotent no-op ... return Ok(Committed)")
+    // — it never reaches this call site as an `Err`. So any `Conflict`
+    // seen here is by construction a GENUINE divergence (a different
+    // primary role already claimed, or the same artifact already a
+    // member under a different role) and must never be swallowed.
     if let Err(e) = ctx
         .artifact_group_use_case
         .add_member(
@@ -656,11 +668,14 @@ pub(crate) async fn put_manifest_dispatch(
         )
         .await
     {
-        tracing::warn!(
+        tracing::error!(
             manifest_artifact_id = %manifest_artifact.id,
+            manifest_digest = %manifest_digest,
+            repo_key = %repo_key,
             stage = "group_attach_manifest",
-            error = %e,
-            "partial attachment; client retry will reconcile"
+            error = ?e,
+            "manifest group-attach failed; not idempotent-shaped (see commit_member_added \
+             contract) — this is a genuine error"
         );
         return OciError::Internal.into_response();
     }
@@ -682,11 +697,15 @@ pub(crate) async fn put_manifest_dispatch(
             )
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
+                manifest_digest = %manifest_digest,
+                config_digest = %config_artifact.sha256_checksum,
+                repo_key = %repo_key,
                 stage = "group_attach_config",
-                error = %e,
-                "partial attachment; client retry will reconcile"
+                error = ?e,
+                "config group-attach failed; not idempotent-shaped (see commit_member_added \
+                 contract) — this is a genuine error"
             );
             return OciError::Internal.into_response();
         }
@@ -709,12 +728,16 @@ pub(crate) async fn put_manifest_dispatch(
             )
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
-                stage = "group_attach_layer",
+                manifest_digest = %manifest_digest,
                 layer_id = %layer.id,
-                error = %e,
-                "partial attachment; client retry will reconcile"
+                layer_digest = %layer.sha256_checksum,
+                repo_key = %repo_key,
+                stage = "group_attach_layer",
+                error = ?e,
+                "layer group-attach failed; not idempotent-shaped (see commit_member_added \
+                 contract) — this is a genuine error"
             );
             return OciError::Internal.into_response();
         }
@@ -722,6 +745,15 @@ pub(crate) async fn put_manifest_dispatch(
 
     // Tag-ref PUT: set the ref. Digest-ref PUT: skip — the digest is
     // self-naming; creating a ref would be redundant.
+    //
+    // #73 step 1: `RefUseCase::set` already short-circuits to `Ok` when
+    // the target is unchanged (`try_set`'s "same_target" no-op) and its
+    // only race outcome (`RefCommitOutcome::RefAlreadyExists`) is
+    // retried internally, never surfaced as `Err` — `set` structurally
+    // cannot return `DomainError::Conflict` today (see
+    // `RefLifecyclePort`, which has no Conflict-shaped outcome). Any
+    // error reaching here is therefore a genuine infrastructure failure,
+    // not an idempotency case to collapse.
     if !reference_is_digest {
         if let Err(e) = ctx
             .ref_use_case
@@ -735,11 +767,15 @@ pub(crate) async fn put_manifest_dispatch(
             )
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
+                manifest_digest = %manifest_digest,
+                repo_key = %repo_key,
+                reference = %reference,
                 stage = "ref_set",
-                error = %e,
-                "partial attachment; client retry will reconcile"
+                error = ?e,
+                "ref set failed; RefUseCase::set has no idempotent-Conflict path — \
+                 this is a genuine error"
             );
             return OciError::Internal.into_response();
         }
@@ -752,6 +788,14 @@ pub(crate) async fn put_manifest_dispatch(
     // pre-check needed here. The digest itself was validated up
     // front via `subject_digest_parsed` (N-5 fix); a None here means
     // the manifest had no `subject` field at all.
+    //
+    // #73 step 1: this INSERT is a genuine SQL `ON CONFLICT ... DO
+    // UPDATE` upsert (see `pg_content_reference_repo.rs::insert`) — a
+    // duplicate can NEVER surface as `DomainError::Conflict` here; the
+    // database absorbs it silently as a metadata refresh. Any `Err`
+    // reaching this call site is therefore a genuine infrastructure
+    // failure (e.g. FK violation, connection loss), not an idempotency
+    // case — never swallow it.
     if let Some(subject_hash) = subject_digest_parsed.clone() {
         let reference_row = ContentReference {
             source_artifact_id: manifest_artifact.id,
@@ -775,11 +819,15 @@ pub(crate) async fn put_manifest_dispatch(
             .insert_for_repo(repo_id, reference_row)
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
-                error = %e,
+                manifest_digest = %manifest_digest,
+                repo_key = %repo_key,
+                error = ?e,
                 stage = "content_references_insert",
-                "content_references insert failed; referrers index is eventual — operator rebuild is future work"
+                "content_references (oci_subject) insert failed; upsert cannot Conflict — \
+                 this is a genuine error, referrers index is eventual — operator rebuild is \
+                 future work"
             );
             return OciError::Internal.into_response();
         }
@@ -829,13 +877,17 @@ pub(crate) async fn put_manifest_dispatch(
             .insert_for_repo(repo_id, blob_reference)
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
+                manifest_digest = %manifest_digest,
                 blob_digest = %blob.digest_raw,
                 kind,
-                error = %e,
+                repo_key = %repo_key,
+                error = ?e,
                 stage = "oci_blob_reference_insert",
-                "blob content_references insert failed; GC alive-keep for this blob is eventual — operator rebuild is future work"
+                "blob content_references insert failed; upsert cannot Conflict — this is a \
+                 genuine error, GC alive-keep for this blob is eventual — operator rebuild is \
+                 future work"
             );
             return OciError::Internal.into_response();
         }
@@ -882,12 +934,16 @@ pub(crate) async fn put_manifest_dispatch(
             .insert_for_repo(repo_id, member_reference)
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
+                manifest_digest = %manifest_digest,
                 child_digest = %child.digest_raw,
-                error = %e,
+                repo_key = %repo_key,
+                error = ?e,
                 stage = "oci_index_member_insert",
-                "index-member content_references insert failed; GC alive-keep for this child is eventual — operator rebuild is future work"
+                "index-member content_references insert failed; upsert cannot Conflict — \
+                 this is a genuine error, GC alive-keep for this child is eventual — operator \
+                 rebuild is future work"
             );
             return OciError::Internal.into_response();
         }
@@ -1539,14 +1595,18 @@ fn created_manifest_response(
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+
     use axum::body::to_bytes;
     use axum::http::Request as HttpRequest;
     use chrono::Utc;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use tower::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Registry;
 
     use hort_app::use_cases::test_support::{
-        sample_artifact, sample_repository, MockArtifactGroupLifecyclePort,
+        sample_artifact, sample_repository, GroupCommitInjection, MockArtifactGroupLifecyclePort,
         MockArtifactGroupRepository, MockArtifactLifecycle, MockArtifactRepository,
         MockContentReferenceIndex, MockEventStore, MockRefLifecyclePort, MockRefRegistryPort,
         MockRepositoryRepository, MockStoragePort,
@@ -2089,6 +2149,193 @@ mod tests {
             second_group_calls,
             2 * group_delta_per_put,
             "second PUT must also delegate 3× (adapter-level ON CONFLICT DO NOTHING is the no-op guard); commit_call_count={second_group_calls}"
+        );
+    }
+
+    // -------------------- #73 step 1: diagnosability --------------------
+    //
+    // `put_idempotence_second_put_emits_zero_new_events` above (and the
+    // `*_idempotent_on_repush` / `oci_manifest_put_idempotent_*` tests
+    // elsewhere in this module) already exercise the idempotent-success
+    // path end to end and continue to pass unchanged — confirming no
+    // behaviour change on the success path. The tests below cover the
+    // NEW diagnosability behaviour: a genuine (non-idempotent) Conflict
+    // from `add_member` is logged at `error!` with rich context, not
+    // silently folded into an unlogged 500.
+
+    /// Custom tracing layer that captures emitted events into a shared
+    /// vector. Mirrors the identical pattern in
+    /// `crates/hort-http-pypi/src/upstream_pull.rs` (and the cargo / npm
+    /// siblings) — see that module for the detailed rationale on
+    /// `Interest::sometimes()`, per-callsite caching, and the
+    /// global-passthrough seeding.
+    #[derive(Clone, Default)]
+    struct CapturingLayer {
+        records: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            self.records
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.combined));
+        }
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        combined: String,
+    }
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.combined
+                .push_str(&format!("{}={:?} ", field.name(), value));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.combined
+                .push_str(&format!("{}={} ", field.name(), value));
+        }
+    }
+
+    /// Serialises tests that install per-thread tracing subscribers.
+    /// `tracing` caches per-callsite `Interest` globally; installing one
+    /// subscriber on thread A while thread B fires the same callsite
+    /// races. The mutex eliminates the race without touching global state.
+    static TRACING_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Install a global passthrough subscriber (once per process) so the
+    /// per-callsite cache is seeded with `Interest::sometimes()` rather
+    /// than `Never`. Without this, a no-op subscriber installed by any
+    /// earlier test can cache `Never` for our callsites and prevent the
+    /// per-thread `set_default` subscriber from ever seeing those events.
+    fn install_global_passthrough_subscriber() {
+        use std::sync::OnceLock;
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let global_layer = CapturingLayer::default();
+            let global_subscriber = Registry::default().with(global_layer);
+            let _ = tracing::subscriber::set_global_default(global_subscriber);
+        });
+    }
+
+    /// #73 step 1 acceptance: a genuine (non-idempotent) `Conflict` from
+    /// `add_member`'s manifest-attach call is logged at `error!` with
+    /// the manifest digest, repo key, stage, and the full `DomainError`
+    /// (variant + message) — not folded into a silent `warn!` the way
+    /// it used to be. The response stays a 500 (no wire-behaviour
+    /// change, per the directive's diagnosability-first scope); what
+    /// changed is that the failure is now legible from the logs.
+    #[test]
+    fn divergent_add_member_conflict_is_logged_at_error_not_swallowed() {
+        install_global_passthrough_subscriber();
+        let _serial = TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let layer = CapturingLayer::default();
+        let captured = layer.records.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = rt.block_on(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, &[layer_hash]);
+
+            // Force the FIRST add_member call (the "manifest" primary
+            // attach) to observe a genuine divergence — mirrors the
+            // real `commit_member_added` "primary role mismatch" /
+            // "already belongs with a different role" Conflict shapes,
+            // neither of which is idempotent-collapsible (see the
+            // `group_attach_manifest` call site's own comment).
+            h.group_lifecycle.inject(GroupCommitInjection::Conflict {
+                reason: "primary role mismatch: existing `config`, requested `manifest`".into(),
+            });
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            resp.status()
+        });
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no wire-behaviour change: a genuine Conflict is still a 500"
+        );
+
+        let records = captured.lock().unwrap();
+        let error_event = records
+            .iter()
+            .find(|(lvl, msg)| {
+                *lvl == tracing::Level::ERROR
+                    && msg.contains("group-attach failed")
+                    && msg.contains("genuine error")
+            })
+            .map(|(_, msg)| msg.clone());
+        assert!(
+            error_event.is_some(),
+            "expected an ERROR-level log naming the group-attach failure as genuine; \
+             captured records: {:?}",
+            records
+                .iter()
+                .map(|(l, m)| format!("{l:?}: {m}"))
+                .collect::<Vec<_>>()
+        );
+        let msg = error_event.unwrap();
+        assert!(
+            msg.contains("stage=group_attach_manifest"),
+            "expected the stage field in the log line, got: {msg}"
+        );
+        assert!(
+            msg.contains("error=Domain(Conflict"),
+            "expected the full DomainError (variant + message) via Debug formatting, got: {msg}"
+        );
+        // No pre-existing WARN-level "partial attachment" line for this
+        // failure — confirms the old silent-warn path is gone, not just
+        // supplemented.
+        assert!(
+            !records.iter().any(
+                |(lvl, msg)| *lvl == tracing::Level::WARN && msg.contains("partial attachment")
+            ),
+            "the old warn!-level 'partial attachment' message must be fully replaced, not \
+             merely supplemented"
         );
     }
 

@@ -23,8 +23,8 @@ pub enum ParseError {
     Yaml(#[from] serde_yaml_ng::Error),
 
     #[error(
-        "unsupported apiVersion `{got}` — only `project-hort.de/v1beta1` is accepted in v1; \
-         operators must re-emit older shapes"
+        "unsupported apiVersion `{got}` — accepts `project-hort.de/v1` (current) and \
+         `project-hort.de/v1beta1` (supported; deprecated); operators must re-emit older shapes"
     )]
     UnsupportedApiVersion { got: String },
 

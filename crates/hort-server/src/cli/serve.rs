@@ -643,6 +643,7 @@ async fn run_async() -> anyhow::Result<()> {
         cfg.upstream_metadata_cache_max_bytes,
         cfg.upstream_manifest_cache_max_bytes,
         cfg.upstream_projector_version_object_max_bytes,
+        cfg.oci_pullthrough_release_wait_secs,
         cfg.public_base_url.clone(),
         trust_config,
         rate_limit_config,
@@ -665,9 +666,9 @@ async fn run_async() -> anyhow::Result<()> {
         cfg.redis_url_evictable.clone(),
         cfg.redis_url_durable.clone(),
         // Pull-through dedup config built from
-        // the six `HORT_PULL_DEDUP_*` env vars parsed by `Config::from_env`.
-        // Composition consumes a parsed config struct, never re-reads
-        // env vars itself.
+        // the seven `HORT_PULL_DEDUP_*` env vars parsed by `Config::from_env`
+        // (issue #65 added `leader_lock_ttl`). Composition consumes a
+        // parsed config struct, never re-reads env vars itself.
         hort_app::pull_dedup::PullDedupConfig {
             ttl_not_found: Duration::from_secs(cfg.pull_dedup_ttl_not_found_secs),
             ttl_unavailable: Duration::from_secs(cfg.pull_dedup_ttl_unavailable_secs),
@@ -675,6 +676,7 @@ async fn run_async() -> anyhow::Result<()> {
             ttl_checksum_mismatch: Duration::from_secs(cfg.pull_dedup_ttl_checksum_mismatch_secs),
             follower_wait: Duration::from_secs(cfg.pull_dedup_follower_wait_secs),
             leader_deadline: Duration::from_secs(cfg.pull_dedup_leader_timeout_secs),
+            leader_lock_ttl: Duration::from_secs(cfg.pull_dedup_leader_lock_ttl_secs),
         },
         // Pass the value parsed at step 3b rather
         // than having build_app_context re-read the env var. The same

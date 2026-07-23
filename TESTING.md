@@ -78,8 +78,10 @@ declaring its infrastructure needs in a `# requires:` header (empty ⇒ only
 hort+keycloak; tokens: `db`, `worker`, `egress`, `compose`, `compose:<overlay>`).
 Exit codes: `0` pass, `1` fail, `77` self-skip. See
 `scripts/native-tests/README.md` for the full contract and how to add a scenario.
-Groups today: `clients` (pypi, npm, cargo, oci), `proxy` (oci-mirror,
-oci-mirror-name-prefix, pull-dedup), `gitops`, `quarantine` (patch-candidate).
+Groups today: `clients`, `proxy` (oci-mirror, oci-mirror-name-prefix,
+pull-dedup), `gitops`, `quarantine`, `dogfood` — run `./scripts/native-tests/run.sh --list`
+for the exact, current scenario set per group rather than relying on
+examples here, which drift as scenarios are added.
 
 ## Host-side + kind suites
 

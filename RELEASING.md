@@ -4,7 +4,7 @@ Two release shapes: **pre-releases** and **final** releases. Pre-releases
 split into an **internal** track (`-alpha.N`, staging + local registry
 only) that staging deploys continuously, and reserved naming room for a
 possible future **public** track (`-beta.N` / `-rc.N`, not in use today —
-see *A future public pre-release track* below). See
+see *Beta pre-release* below). See
 [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) and
 [the glossary](docs/glossary.md) for the full model. One rule drives
 everything:
@@ -197,8 +197,8 @@ above. `:latest` moves here, and only here, because only a stable tag clears
   `-alpha.` in `github.ref`): alpha images/chart go to the internal
   registry only, via the GitLab pipeline (`.gitlab-ci.yml`
   `build-images:*` / `helm:lint-and-publish`), never ghcr.
-- A future public `-beta.N`/`-rc.N` tag is **not** excluded — see *A future
-  public pre-release track* above.
+- A future public `-beta.N`/`-rc.N` tag is **not** excluded — see *Beta
+  pre-release* above.
 
 ## Maintenance releases
 

@@ -1020,6 +1020,11 @@ pub async fn build_app_context(
     upstream_metadata_cache_max_bytes: u64,
     upstream_manifest_cache_max_bytes: u64,
     upstream_projector_version_object_max_bytes: u64,
+    // #65: bound on the cold pull-through blob-GET bounded-await
+    // before falling back to the normal 503. Threaded from
+    // `Config::oci_pullthrough_release_wait_secs`
+    // (`HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`). `0` disables it.
+    oci_pullthrough_release_wait_secs: u64,
     public_base_url: Option<url::Url>,
     trust_config: hort_http_core::middleware::trust::TrustConfig,
     rate_limit_config: hort_http_core::middleware::rate_limit::RateLimitConfig,
@@ -1082,7 +1087,7 @@ pub async fn build_app_context(
     redis_url_evictable: Option<String>,
     redis_url_durable: Option<String>,
     // Pull-through deduplication config built by
-    // the caller (`cli::serve`) from the six `HORT_PULL_DEDUP_*` env vars
+    // the caller (`cli::serve`) from the seven `HORT_PULL_DEDUP_*` env vars
     // on `Config`. Threaded into `PullDedup::new` after
     // `build_ephemeral_stores` returns. Composition is the consumer of
     // parsed config, never the parser.
@@ -2856,6 +2861,7 @@ pub async fn build_app_context(
         http_timeout_config,
         publish_body_limit_bytes,
         upstream_projector_version_object_max_bytes,
+        oci_pullthrough_release_wait_secs,
         auth,
         extra_trust_anchors,
         // Pass through the optional cache so

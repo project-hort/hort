@@ -85,3 +85,8 @@ hort-domain                   = { path = "../hort-domain" }
 chrono                      = { workspace = true }
 serde_json                  = { workspace = true }
 uuid                        = { workspace = true }
+# #73 step 1: tracing-capture layer for the manifest-PUT diagnosability
+# tests (asserting a genuine Conflict is logged at `error!`, not
+# swallowed). Same workspace-pinned version already used for this exact
+# purpose in hort-http-pypi / hort-http-npm / hort-http-cargo.
+tracing-subscriber          = { workspace = true }

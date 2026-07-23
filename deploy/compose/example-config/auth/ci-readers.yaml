@@ -9,7 +9,7 @@
 # directory defines only one reader group, so both claims are mapped from it —
 # the additive-claims grant shape is identical either way. Mirrors
 # `ci-pushers.yaml` (the developer-side equivalent).
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: ci-readers

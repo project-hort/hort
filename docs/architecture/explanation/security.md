@@ -123,12 +123,16 @@ pub struct WriteRepoAccess { pub principal: CallerPrincipal, pub repository: Arc
 pub struct DeleteRepoAccess { pub principal: CallerPrincipal, pub repository: Arc<Repository> }
 ```
 
-`WriteRepoAccess` and `DeleteRepoAccess` both collapse to thin
-wrappers over `RepositoryAccessUseCase::resolve(repo_key, actor,
-AccessLevel::{Write,Delete})` — the policy itself lives in the use
-case; the extractors exist so handlers keep the "one fetch per
-request, stashed in extensions" property. `AdminPrincipal` is
-unchanged.
+`WriteRepoAccess` and `DeleteRepoAccess` do **not** go through
+`RepositoryAccessUseCase` — that use case's `AccessLevel` only has
+`Read`/`Write` variants, with no `Delete`. Instead both extractors call
+local helpers inside `hort-http-core::authz::extractors`:
+`resolve_repository()` (looks the repository up directly) and
+`authorize()` (evaluates `RbacEvaluator` directly against
+`Permission::Write` / `Permission::Delete` — a different enum, on
+`hort-domain::entities::rbac`). The extractors exist so handlers keep the
+"one fetch per request, stashed in extensions" property. `AdminPrincipal`
+is unchanged.
 
 `Delete` is split out of `Write` deliberately. Destroying an
 artifact is structurally distinct from publishing one — a CI service

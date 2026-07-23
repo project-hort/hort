@@ -45,7 +45,7 @@ To get a live, group-based human admin you need **one** of:
 2. **Map the group to `admin`.** Apply a `ClaimMapping` in the gitops tree:
 
    ```yaml
-   apiVersion: project-hort.de/v1beta1
+   apiVersion: project-hort.de/v1
    kind: ClaimMapping
    metadata:
      name: admins
@@ -107,6 +107,6 @@ Dex CliSession, or keep those CronJobs disabled (the deploy default).
 - ADR 0037 — gitops `serviceAccount`-subject grants for non-admin SA authority.
 - `docs/auth-catalog.md` — Entries 1 (OIDC), 3 (CliSession), 4 (ServiceAccount),
   the bootstrap-session note, and the deployment/IdP cross-cutting note.
-- [Federate CI OIDC](federate-ci-oidc.md) and
+- [Federate CI OIDC](../federate-ci-oidc.md) and
   [federate k8s workload identity](../federate-k8s-workload-identity.md) — the
   keyless non-admin machine-identity paths.

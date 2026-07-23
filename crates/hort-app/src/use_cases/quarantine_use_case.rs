@@ -1085,6 +1085,49 @@ impl QuarantineUseCase {
         Ok(repo_scoped.or(global))
     }
 
+    /// #65 — whether `artifact`'s quarantine window has genuinely
+    /// elapsed, using the SAME anchor + resolved-policy-duration
+    /// computation ([`resolve_active_policy_for_repo`] +
+    /// [`effective_quarantine_deadline`]) as the `record_scan_result`
+    /// inline fast-path and the `release_expired` sweep's candidacy
+    /// filter.
+    ///
+    /// Deliberately NOT the same signal as
+    /// `ArtifactUseCase::hydrate_quarantine_deadline`, which format
+    /// crates read for the `check_quarantine` `Retry-After` computation:
+    /// that hydration sets `quarantine_deadline = quarantine_window_start`
+    /// (the bare ingest-time anchor, with no duration added) because
+    /// `ArtifactUseCase` holds no policy-projection port — so it always
+    /// reads as "elapsed" the instant the anchor is in the past, which is
+    /// true for every `Quarantined` artifact almost immediately. Using
+    /// that signal here would make a bounded-await candidacy check that
+    /// never actually excludes a genuine, still-running, multi-minute (or
+    /// longer) hold. This method resolves the real matched-policy
+    /// duration instead, so a still-running hold correctly reads as NOT
+    /// elapsed.
+    ///
+    /// Read-only candidacy check — consults no release authority and
+    /// mutates nothing; never itself an authorization to release (ADR
+    /// 0007). Returns `false` for a non-`Quarantined` artifact or one
+    /// with no window anchor.
+    pub async fn is_window_elapsed(&self, artifact: &Artifact) -> AppResult<bool> {
+        if !matches!(artifact.quarantine_status, QuarantineStatus::Quarantined) {
+            return Ok(false);
+        }
+        let Some(anchor) = artifact.quarantine_window_start else {
+            return Ok(false);
+        };
+        let policy = self
+            .resolve_active_policy_for_repo(artifact.repository_id)
+            .await?;
+        let duration_secs = policy
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+        let deadline =
+            effective_quarantine_deadline(anchor, chrono::Duration::seconds(duration_secs));
+        Ok(deadline <= Utc::now())
+    }
+
     /// Timer-release authority resolution (ADR 0007).
     ///
     /// Construct the timer-release authority for a candidate, **fail

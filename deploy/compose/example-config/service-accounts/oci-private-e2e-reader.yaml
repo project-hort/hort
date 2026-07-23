@@ -15,7 +15,7 @@
 # branch reuses the existing reader-user OIDC credential instead, because the
 # native /v2/auth mint validates the Basic password strictly as a PAT and an
 # IdP JWT can never complete it either way.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ServiceAccount
 metadata:
   name: oci-private-e2e-reader

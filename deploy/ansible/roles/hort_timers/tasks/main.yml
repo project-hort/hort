@@ -34,14 +34,24 @@
 # admin_task_invoke User-subject grant) and applied BEFORE this mint, else the
 # mint errors on a missing SA user. Until Fix B lands, the system-mint path
 # below is the correct (and only wired) way to provision it.
-- name: Mint the cronjob-tasks service-account token (admin_task_invoke)
+- name: Mint (or re-mint) the cronjob-tasks service-account token (admin_task_invoke)
+  # No `creates:` guard (issue #75). `issue-svc-token` is idempotent by name:
+  # when the token row already EXISTS it prints "already exists" and exits 0
+  # WITHOUT touching --output (it cannot re-emit the hashed secret — see
+  # cli/admin.rs); when the row is ABSENT it mints a fresh token and writes the
+  # new secret to the file. Running it every deploy therefore self-heals a DB
+  # recreate/wipe (which deletes the token row while the stale on-disk token
+  # survives) without churning a valid token. The old `creates:`-on-file guard
+  # keyed on the on-disk FILE, not token validity — exactly what left
+  # registry.hort.rs's token-gated cron ticks silently 401ing after a DB rebuild.
   ansible.builtin.command:
     cmd: >-
       {{ gitops_admin_cmd }} issue-svc-token
       --name cronjob-tasks
       --permission admin_task_invoke
       --output file:{{ hort_timers_token_file }}
-    creates: "{{ hort_timers_token_file }}"
+  register: hort_timers_token_mint
+  changed_when: "'already exists' not in (hort_timers_token_mint.stderr | default(''))"
   environment: "{{ gitops_admin_env }}"
   when: hort_timers_any_admin_task | bool
 

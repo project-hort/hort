@@ -1,4 +1,4 @@
-# Wire secrets for `proxy.secretRef:`
+# Wire secrets for `UpstreamMapping.secretRef:`
 
 This guide is for operators who need to give `hort` an
 upstream-registry credential (a GHCR PAT, a private PyPI token, a
@@ -14,65 +14,58 @@ systemd `LoadCredential=` — to land the bytes in one of those two
 places. Hort's `SecretPort` reads them from there at
 resolve time.
 
-> **Status note.** The credentialed pull-
-> through path is live in production — the gitops apply pipeline
-> writes `repository_upstream_mappings` rows from declared envelopes
-> and the proxy resolver picks them up. Both wiring shapes are
-> supported:
->
-> - **`spec.proxy.secretRef:` inline on `kind: ArtifactRepository`** —
->   single-upstream proxy repositories. The shape documented in §1
->   below.
-> - **`spec.secretRef:` on a standalone `kind: UpstreamMapping`
->   envelope** — multi-upstream OCI mirrors fronting several
->   registries under different `pathPrefix` values. Identical
->   `SecretRef` shape, same wiring patterns (§2), same resolver. The
->   YAML body shape is documented in
->   `crates/hort-config/src/upstream_mapping.rs` and at a glance in
->   declare-gitops-config.md §6.
->
-> Pick the shape that matches the repository topology; the wiring
-> patterns in §2 are agnostic to which envelope the `secretRef:`
-> sits on.
+> **Status note.** The credentialed pull-through path is live in
+> production — the gitops apply pipeline writes
+> `repository_upstream_mappings` rows from declared envelopes and the
+> proxy resolver picks them up. There is exactly **one** wiring
+> shape: `spec.secretRef:` on a standalone `kind: UpstreamMapping`
+> envelope (§1 below). An earlier inline `spec.proxy.secretRef:` shape
+> on `kind: ArtifactRepository` was removed — it was parsed and
+> location-validated but never wired to a
+> `RepositoryUpstreamMapping` writer (accepted-at-apply, inert-at-
+> runtime); `ArtifactRepository.spec.proxy` today carries only
+> `upstreamUrl` / `indexUpstreamUrl` (`crates/hort-config/src/repository.rs`,
+> `ProxySpec`). See declare-gitops-config.md §6 for the full
+> `UpstreamMapping` schema at a glance.
 
 ---
 
 ## 1. The `secretRef:` shape
 
-Every pattern below ends in the same Hort-side YAML inside a
-`type: proxy` repository envelope:
+Every pattern below ends in the same Hort-side YAML: a standalone
+`kind: UpstreamMapping` envelope referencing an already-declared
+`type: proxy` repository:
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
-kind: ArtifactRepository
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
 metadata:
-  name: ghcr-mirror
+  name: ghcr-mirror-upstream
 spec:
-  name: "GHCR Mirror"
-  format: oci
-  type: proxy
-  storage:
-    backend: filesystem
-    path: /var/lib/hort-server/cas/ghcr-mirror
-  proxy:
-    upstreamUrl: "https://ghcr.io"
-    secretRef:
-      source: file                       # `file` or `env_var`
-      location: "/run/secrets/ghcr-token"
-  isPublic: true
-  replicationPriority: on_demand
+  repository: ghcr-mirror       # → resolves to repository_id; must
+                                # already exist as an ArtifactRepository
+  pathPrefix: ""                # "" for single-upstream formats
+  upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic                 # anonymous | bearer_challenge | basic
+    username: "REPLACE_ME_github_username"  # required for type=basic
+  secretRef:
+    source: file                # `file` or `env_var`
+    location: "/run/secrets/ghcr-token"
 ```
 
 Validation rules:
 
 - `source: file` — `location` MUST be an absolute path.
 - `source: env_var` — `location` MUST match `^[A-Z_][A-Z0-9_]*$`.
+- `secretRef` is **required** when `auth.type = basic` (the password
+  half of the Basic-auth pair); optional otherwise.
 - Reference existence is **not** checked at parse time. The first
   `resolve()` call at upstream-fetch time produces the error if the
   file or env var is missing.
 
-For the field shape in code see
-`crates/hort-config/src/repository.rs` (`ProxySpec`).
+For the full field shape in code see
+`crates/hort-config/src/upstream_mapping.rs` (`UpstreamMappingSpec`).
 
 ---
 
@@ -137,8 +130,17 @@ spec:
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/run/secrets/ghcr/ghcr-token"
@@ -169,8 +171,17 @@ on the operator side.
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: env_var
     location: "GHCR_TOKEN"
@@ -205,8 +216,17 @@ interval picks up upstream rotations.
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/vault/secrets/ghcr-token"
@@ -257,8 +277,17 @@ spec:
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/mnt/secrets/ghcr/ghcr-token"
@@ -289,8 +318,17 @@ Mount identically to 2.4 (`csi.driver: secrets-store.csi.k8s.io`,
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/mnt/secrets/ghcr/ghcr-token"
@@ -322,8 +360,17 @@ Mount identically to 2.4.
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/mnt/secrets/ghcr/ghcr-token"
@@ -361,8 +408,17 @@ Mount identically to 2.4.
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/mnt/secrets/ghcr/ghcr-token"
@@ -409,8 +465,17 @@ spec:
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/run/secrets/ghcr/ghcr-token"
@@ -448,8 +513,17 @@ stringData:
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: env_var
     location: "GHCR_TOKEN"
@@ -487,8 +561,17 @@ container.
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/run/secrets/ghcr-token"
@@ -530,8 +613,17 @@ Hort does not see the env var `$CREDENTIALS_DIRECTORY` — `secretRef:
 file` requires an absolute path. Hard-code the resolved path:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: file
     location: "/run/credentials/hort-server.service/ghcr-token"
@@ -555,8 +647,17 @@ cargo run -p hort-server
 Hort side:
 
 ```yaml
-proxy:
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: ghcr-mirror-upstream
+spec:
+  repository: ghcr-mirror
+  pathPrefix: ""
   upstreamUrl: "https://ghcr.io"
+  auth:
+    type: basic
+    username: "REPLACE_ME_github_username"
   secretRef:
     source: env_var
     location: "GHCR_TOKEN"

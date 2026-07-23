@@ -13,7 +13,7 @@
 # rationale). The alpha Keycloak realm defines only
 # one developer group, so both claims fan out from it; the
 # additive-claims grant shape is identical either way.
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ClaimMapping
 metadata:
   name: ci-pushers

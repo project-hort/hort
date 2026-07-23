@@ -101,10 +101,6 @@ worker:
       publicKeysFile: /etc/hort/provenance/cosign-keys.pem
 ```
 
-> The chart key above lands with the keyed-backend Helm wiring; until then set
-> the env var directly on the worker:
-> `HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE=/etc/hort/provenance/cosign-keys.pem`.
-
 The worker **refuses to boot** if the file is set but unreadable or contains no
 parseable P-256 public key. A `ScanPolicy` then selects the backend with
 `provenanceBackends: [cosign-key]` (no `provenanceIdentities` — they are **inert**
@@ -202,7 +198,7 @@ fail-closed — the proxy stays available on upstream flakiness).
 > v0.3 bundle.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: oci-verify-if-present
@@ -230,7 +226,7 @@ gate still applies). Unsigned, untrusted, or unverified artifacts stay
 quarantined. `required` never overrides an explicit Admin/Curator release.
 
 ```yaml
-apiVersion: project-hort.de/v1beta1
+apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
   name: oci-required
@@ -400,8 +396,10 @@ exemption — see
 
 - Worker boot log: `cosign provenance verifier health check OK (pinned
   trust root loaded + fresh)` and `ProvenanceVerifyHandler registered`.
-  If the flag is off you'll instead see `ProvenanceVerifyHandler not
-  registered: HORT_PROVENANCE_COSIGN_ENABLED is false`.
+  If neither backend is configured you'll instead see
+  `ProvenanceVerifyHandler not registered: neither
+  HORT_PROVENANCE_COSIGN_ENABLED (keyless cosign) nor
+  HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE (keyed cosign-key) is set`.
 - Metrics (see `docs/metrics-catalog.md`):
   - `hort_provenance_verify_total{backend="cosign", mode, result}` —
     `result ∈ {verified, rejected, no_attestation}`.

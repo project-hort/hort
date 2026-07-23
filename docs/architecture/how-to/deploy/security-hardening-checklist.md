@@ -626,7 +626,7 @@ Several are in-binary correctness gates with no operator-tunable surface.
   before `IpNet::contains` so `::ffff:10.0.0.5` matches the same
   allowlist entry as `10.0.0.5`.
 - **Chart default:** unconditional in the binary. The values key
-  `app.trustedProxyCidrs` (existing) is the operator input the new
+  `trustedProxyCidrs` (existing) is the operator input the new
   parser consumes.
 - **Operator action required:** **review your `trustedProxyCidrs`
   value.** The semantic of the setting is unchanged — list the CIDRs

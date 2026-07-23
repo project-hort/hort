@@ -1,0 +1,20 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: gha-release-read-cargo-virtual
+spec:
+  # gha-release resolves its crates' external dependencies through
+  # cargo-virtual during `cargo publish` (the publish job resolves the
+  # dependency graph even under --no-verify). cargo-virtual is private and
+  # its member aggregation resolves each member AS THE CALLER, so the
+  # publish identity needs read on the virtual repo (and on its crates-proxy
+  # member — see gha-release-read-crates-proxy) or the aggregated sparse
+  # index comes back empty and cargo reports "no matching package named
+  # <dep>". Keeps release-time dependency resolution fully within
+  # registry.hort.rs (vetted pull-through), never crates.io. Mirrors gha-ci's
+  # pull grants; write (hort-crates) does not imply read here.
+  subject:
+    kind: serviceAccount
+    name: gha-release
+  permission: read
+  repository: cargo-virtual

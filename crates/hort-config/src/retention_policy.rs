@@ -177,7 +177,7 @@ mod tests {
 
     fn yaml(name: &str, body: &str) -> String {
         format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: RetentionPolicy\n\
+            "apiVersion: project-hort.de/v1\nkind: RetentionPolicy\n\
              metadata:\n  name: {name}\nspec:{body}"
         )
     }
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_wrong_kind() {
-        let doc = "apiVersion: project-hort.de/v1beta1\nkind: ScanPolicy\n\
+        let doc = "apiVersion: project-hort.de/v1\nkind: ScanPolicy\n\
                    metadata:\n  name: x\nspec:\n  predicate:\n    AgeExceeds: 60\n  scope: AllRepos\n";
         let err = parse_retention_policy(&p(), doc.as_bytes()).unwrap_err();
         assert!(matches!(
@@ -284,7 +284,7 @@ mod tests {
   scope: AllRepos
 ";
         let doc = format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: RetentionPolicy\n\
+            "apiVersion: project-hort.de/v1\nkind: RetentionPolicy\n\
              metadata:\n  name: ''\nspec:{body}"
         );
         let err = parse_retention_policy(&p(), doc.as_bytes()).unwrap_err();

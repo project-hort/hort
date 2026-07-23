@@ -727,6 +727,18 @@ pub struct AppContext {
     /// the architect-skill rule that AppContext fields are either a
     /// port handle or a plain config value.
     pub upstream_projector_version_object_max_bytes: u64,
+    /// Bound (in seconds) on how long a cold OCI pull-through blob GET
+    /// will wait for its own artifact's async scan to release it before
+    /// falling back to the normal `503 + Retry-After` (issue #65).
+    /// Default value settled in `Config::from_env`
+    /// (`HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`, `10`). `0` disables
+    /// the bounded await. Consulted only in `hort-http-oci::blobs::serve`,
+    /// and only when the artifact is `Quarantined` AND its
+    /// `quarantine_deadline` has already elapsed — see that module for
+    /// the full ADR-0007-safety argument (the wait never changes the
+    /// release predicate; it only polls for the artifact's OWN already-
+    /// authorized release to land).
+    pub oci_pullthrough_release_wait_secs: u64,
     /// Authentication + RBAC wiring. `AuthContext::Disabled` preserves the
     /// anonymous pass-through — the router skips attaching
     /// `require_principal` and handlers keep their `Uuid::nil()` placeholder
@@ -931,6 +943,8 @@ pub struct AppContextParts {
     pub publish_body_limit_bytes: Option<usize>,
     /// See [`AppContext::upstream_projector_version_object_max_bytes`].
     pub upstream_projector_version_object_max_bytes: u64,
+    /// See [`AppContext::oci_pullthrough_release_wait_secs`].
+    pub oci_pullthrough_release_wait_secs: u64,
     pub auth: AuthContext,
     /// See [`AppContext::extra_trust_anchors`].
     pub extra_trust_anchors: Option<ExtraTrustAnchors>,
@@ -1025,6 +1039,7 @@ impl AppContext {
             publish_body_limit_bytes: parts.publish_body_limit_bytes,
             upstream_projector_version_object_max_bytes: parts
                 .upstream_projector_version_object_max_bytes,
+            oci_pullthrough_release_wait_secs: parts.oci_pullthrough_release_wait_secs,
             auth: parts.auth,
             extra_trust_anchors: parts.extra_trust_anchors,
             pat_cache: parts.pat_cache,

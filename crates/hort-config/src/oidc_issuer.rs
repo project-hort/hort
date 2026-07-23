@@ -252,7 +252,7 @@ mod tests {
 
     fn yaml(name: &str, body: &str) -> String {
         format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: OidcIssuer\nmetadata:\n  name: {name}\nspec:{body}"
+            "apiVersion: project-hort.de/v1\nkind: OidcIssuer\nmetadata:\n  name: {name}\nspec:{body}"
         )
     }
 
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_wrong_kind_envelope() {
-        let yaml_doc = "apiVersion: project-hort.de/v1beta1
+        let yaml_doc = "apiVersion: project-hort.de/v1
 kind: Role
 metadata:
   name: x
@@ -381,7 +381,7 @@ spec:
   audiences: [a]
 ";
         let yaml_doc = format!(
-            "apiVersion: project-hort.de/v1beta1\nkind: OidcIssuer\nmetadata:\n  name: ''\nspec:{body}"
+            "apiVersion: project-hort.de/v1\nkind: OidcIssuer\nmetadata:\n  name: ''\nspec:{body}"
         );
         let err = parse_oidc_issuer(&p(), yaml_doc.as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::EmptyMetadataName));
@@ -583,7 +583,7 @@ spec:
     #[test]
     fn validate_rejects_blank_metadata_name() {
         let env = Envelope {
-            api_version: crate::envelope::ApiVersion::V1Beta1,
+            api_version: crate::envelope::ApiVersion::V1,
             kind: Kind::OidcIssuer,
             metadata: crate::envelope::Metadata { name: "   ".into() },
             spec: OidcIssuerSpec {
