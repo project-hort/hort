@@ -47,26 +47,6 @@ fetch_token() {
 psql_one() { psql "${HORT_DB_DSN:?scenario used psql without HORT_DB_DSN (needs requires: db)}" -tAX -c "$1" 2>/dev/null | tr -d '[:space:]'; }
 psql_exec() { psql "${HORT_DB_DSN:?scenario used psql without HORT_DB_DSN}" -c "$1" 2>&1; }
 
-# assert_metric_ingest <format> — assert a successful-ingest metric is present.
-# Presence check, sound only on a FRESH stack (compose `down -v` -> `up` zeroes
-# the counter). On a long-lived external hort a stale tick would make it hollow,
-# and /metrics often isn't on the public port (deployment-topology), so:
-# it fails ONLY when METRICS_URL is reachable AND the metric is absent; when
-# METRICS_URL is unset or unreachable it logs a note and returns 0. The
-# publish->install round-trip the scenario already did is the real external gate.
-assert_metric_ingest() {
-  local fmt="$1" snap
-  if [ -z "${METRICS_URL:-}" ]; then log "  note: METRICS_URL unset — skip ingest-metric assert ($fmt)"; return 0; fi
-  if ! snap="$(curl -sf "$METRICS_URL" 2>/dev/null)"; then
-    log "  note: METRICS_URL ($METRICS_URL) unreachable — skip ingest-metric assert ($fmt)"; return 0
-  fi
-  if printf '%s' "$snap" | grep -Eq "^hort_ingest_total\{[^}]*format=\"${fmt}\"[^}]*result=\"success\"[^}]*\}"; then
-    pass "hort_ingest_total{format=\"$fmt\",result=\"success\"} present"
-  else
-    fail "ingest metric for $fmt" "no hort_ingest_total{format=\"$fmt\",result=\"success\"} at $METRICS_URL"
-  fi
-}
-
 # bounded_poll <label> <timeout_secs> <predicate> [interval_secs] — eval the
 # predicate string every interval until it succeeds (exit 0) or the timeout
 # elapses (returns 1, logs a timeout line). `eval` runs in THIS shell, so the
@@ -81,4 +61,38 @@ bounded_poll() {
     if [ "$(date +%s)" -ge "$deadline" ]; then log "  bounded_poll($label) timed out after ${timeout}s"; return 1; fi
     sleep "$interval"
   done
+}
+
+# assert_metric_ingest <format> — assert a successful-ingest metric is present.
+# Presence check, sound only on a FRESH stack (compose `down -v` -> `up` zeroes
+# the counter). On a long-lived external hort a stale tick would make it hollow,
+# and /metrics often isn't on the public port (deployment-topology), so:
+# it fails ONLY when METRICS_URL is reachable AND the metric is absent after
+# the poll below; when METRICS_URL is unset or unreachable it logs a note and
+# returns 0. The publish->install round-trip the scenario already did is the
+# real external gate.
+#
+# issue #79: a single point-in-time scrape flaked the v0.9.13 release gate
+# (clients/pypi failed attempt 1, passed an identical-commit re-run) — a
+# classic completion-vs-scrape timing race, the same class maven.sh's own
+# ingest-metric check independently diagnosed ("the line is present on the
+# same endpoint moments later from an idle probe"). Bounded-poll via the
+# shared `bounded_poll` idiom instead of one scrape: a passing run still hits
+# on the FIRST poll attempt (no slower than before), a slow-to-render run
+# gets up to 60s (2s interval) before this hard-fails. `$METRICS_URL` in the
+# predicate is deliberately deferred (escaped) rather than expanded here, so
+# the curl re-runs fresh on every poll attempt — mirrors maven.sh's own
+# bounded_poll predicate quoting for this exact metric.
+assert_metric_ingest() {
+  local fmt="$1"
+  if [ -z "${METRICS_URL:-}" ]; then log "  note: METRICS_URL unset — skip ingest-metric assert ($fmt)"; return 0; fi
+  if ! curl -sf -o /dev/null --max-time 5 "$METRICS_URL" 2>/dev/null; then
+    log "  note: METRICS_URL ($METRICS_URL) unreachable — skip ingest-metric assert ($fmt)"; return 0
+  fi
+  if bounded_poll "ingest-metric($fmt)" 60 \
+      "curl -sf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_ingest_total\{[^}]*format=\"${fmt}\"[^}]*result=\"success\"[^}]*\}'"; then
+    pass "hort_ingest_total{format=\"$fmt\",result=\"success\"} present"
+  else
+    fail "ingest metric for $fmt" "no hort_ingest_total{format=\"$fmt\",result=\"success\"} at $METRICS_URL after 60s poll"
+  fi
 }

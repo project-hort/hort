@@ -179,5 +179,18 @@ else
   fail "reader-token pypi upload expected 403" "got $STATUS"
 fi
 
+# issue #79: verified this ordering is sound against #72's Mode-2
+# ReleasedOnly cold-index bootstrap (the PyPI background-prefetch trigger
+# fired from a simple-index serve, crates/hort-http-pypi/src/simple_index.rs).
+# That trigger requires an upstream-mapped (proxy) repository subscribed to
+# TransitiveDeps/OnDistTagMove; PYPI_REPO_KEY (pypi-e2e) is `type: hosted`
+# with no upstream mapping at all (deploy/compose/example-config/
+# repositories/pypi-e2e.yaml), so the trigger is structurally inapplicable
+# here — it never fires for this scenario. The twine-upload ingest above is
+# also fully synchronous (`IngestUseCase::ingest_verified` is `.await`ed
+# in-request, not spawned), so by the time this assert runs — five more
+# assertions after the upload — the metric has long since landed. No
+# reorder needed; assert_metric_ingest's own bounded-poll (common.sh) covers
+# the residual completion-vs-scrape race regardless.
 assert_metric_ingest pypi
 summary

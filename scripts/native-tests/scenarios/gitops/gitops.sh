@@ -36,22 +36,31 @@ if [ "${_FAIL}" -gt 0 ]; then summary; fi
 
 # ---------------------------------------------------------------------
 # 2. Boot-apply metric fired with result=ok.
+#
+# issue #79 sibling sweep: same shape as assert_metric_ingest's
+# completion-vs-scrape race (a single point-in-time scrape of a metric
+# whose emission the scenario doesn't otherwise directly synchronise
+# with) — bounded_poll instead of one scrape. The boot-apply normally
+# completes long before this scenario container even starts (the
+# compose runner guarantees the stack is up first), so a real run
+# should hit on the first poll attempt; the bound is just headroom for
+# exporter-registration lag, not an expected wait.
 # ---------------------------------------------------------------------
 log ""
 log '--> hort_gitops_apply_total{result="ok"} fired during boot'
-SCRAPE=$(curl -sSf "${METRICS_URL}" 2>/dev/null || echo "")
-if printf '%s\n' "$SCRAPE" \
-    | grep -E '^hort_gitops_apply_total\{[^}]*result="ok"[^}]*\} +[1-9]' >/dev/null; then
+if bounded_poll "gitops apply_total(result=ok)" 15 \
+    "curl -sSf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_apply_total\{[^}]*result=\"ok\"[^}]*\} +[1-9]'"; then
     pass 'hort_gitops_apply_total{result=ok} >= 1'
 else
     fail 'hort_gitops_apply_total{result=ok} >= 1' \
-        "metric absent or zero — gitops boot may have skipped or failed silently"
+        "metric absent or zero after 15s poll — gitops boot may have skipped or failed silently"
 fi
 
-if printf '%s\n' "$SCRAPE" | grep -E '^hort_gitops_objects_total\{' >/dev/null; then
+if bounded_poll "gitops objects_total emitted" 15 \
+    "curl -sSf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_objects_total\{'"; then
     pass "hort_gitops_objects_total emitted at least once"
 else
-    fail "hort_gitops_objects_total emitted" "metric absent in scrape"
+    fail "hort_gitops_objects_total emitted" "metric absent in scrape after 15s poll"
 fi
 
 # ---------------------------------------------------------------------
