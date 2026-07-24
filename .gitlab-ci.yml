@@ -995,7 +995,7 @@ quality:site-build:
   # pins these jobs to the runner that holds the mirror secret.
   tags:
     - platform
-  image: quay.io/buildah/stable:v1.39
+  image: quay.io/buildah/stable:v1.43
   variables:
     STORAGE_DRIVER: vfs
     BUILDAH_FORMAT: docker
