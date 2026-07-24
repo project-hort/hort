@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # (via ensurepip) with a modern pip. An older stock Debian pip mishandled hort's
 # PEP 658/714 simple-index metadata ("TypeError: unhashable type: 'dict'"). Trixie
 # keeps Python 3.12, so this stays on 3.12 — matching run-e2e's proven PYPI_IMAGE.
-FROM python:3.12-slim-trixie
+FROM python:3.14-slim-trixie
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash curl ca-certificates jq git xz-utils \
