@@ -172,7 +172,7 @@ fi
 # `cveId:` lines only when it also declares `kind: Exclusion`, so a
 # same-named field on some other kind can never be mistaken for one.
 registry_exclusion_ids=$(
-    grep -lZ -r "^kind: Exclusion" "${gitops_root}" --include="*.yaml" 2>/dev/null \
+    { grep -lZ -r "^kind: Exclusion" "${gitops_root}" --include="*.yaml" 2>/dev/null || true; } \
         | xargs -0 -r grep -hoE '^[[:space:]]*cveId:[[:space:]]*[^[:space:]]+' \
         | awk '{print $2}' \
         | sort -u

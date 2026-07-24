@@ -61,11 +61,6 @@ ignore = [
     # `.cargo/audit.toml` for the full rationale.
     "RUSTSEC-2023-0071",
 
-    # lru 0.12.5 — `IterMut` Stacked-Borrows unsoundness. hort-app uses
-    # only `get`/`put`/`push` in `pat_cache`; never constructs an
-    # `IterMut`. See `.cargo/audit.toml` for the full rationale.
-    "RUSTSEC-2026-0002",
-
     # rustls-pemfile — unmaintained shim around `rustls-pki-types::pem`.
     # Only path is dev-dep `axum-server` for the mTLS / pinning test
     # servers; production migrated to `PemObject`.
