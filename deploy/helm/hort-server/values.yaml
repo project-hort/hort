@@ -1276,7 +1276,7 @@ scheduledTasks:
   # `docker.io/bitnamilegacy/*` as the documented migration path. The
   # image content (entrypoint, /bin/bash availability) is preserved,
   # so the chart's `command: [/bin/sh, -c, ...]` shape continues to work.
-  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.30"
+  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.33"
 
   # When `true`, force-rotate the cronjob-tasks svc-token on the next
   # helm upgrade. The bootstrap Job's init container passes `--rotate`
