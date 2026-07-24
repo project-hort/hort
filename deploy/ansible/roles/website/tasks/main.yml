@@ -129,8 +129,14 @@
     dest: "{{ website_root }}/"
     delete: true
     recursive: true
+    # NOTE: no raw --rsync-path here (first-deploy bug): a space-containing
+    # value in rsync_opts is rendered into the shell command unquoted and
+    # splits ("--rsync-path=sudo" + "rsync" -> remote runs bare `sudo
+    # --server ...` -> "unrecognized option"). The play's `become: true`
+    # already makes ansible inject a properly-quoted
+    # --rsync-path='sudo -u root rsync', which is all the remote-root rsync
+    # (and --chown) needs.
     rsync_opts:
-      - "--rsync-path=sudo rsync"
       - "--chown=www-data:www-data"
       - "--exclude=dl"
 
