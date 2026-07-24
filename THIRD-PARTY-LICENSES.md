@@ -165,7 +165,7 @@ the result instead.
 | fnv | 1.0.7 | MIT | https://github.com/servo/rust-fnv |
 | stable_deref_trait | 1.2.1 | MIT | https://github.com/storyyeller/stable_deref_trait |
 | stringprep | 0.1.5 | MIT | https://github.com/sfackler/rust-stringprep |
-| arc-swap | 1.9.1 | MIT | https://github.com/vorner/arc-swap |
+| arc-swap | 1.9.2 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.14 | MIT | https://github.com/hyperium/h2 |
 | http | 1.4.0 | MIT | https://github.com/hyperium/http |
@@ -379,8 +379,8 @@ the result instead.
 | async-recursion | 1.1.1 | MIT | https://github.com/dcchut/async-recursion |
 | rsa | 0.9.10 | MIT | https://github.com/RustCrypto/RSA |
 | adler2 | 2.0.1 | MIT | https://github.com/oyvindln/adler2 |
-| anyhow | 1.0.103 | MIT | https://github.com/dtolnay/anyhow |
-| async-trait | 0.1.89 | MIT | https://github.com/dtolnay/async-trait |
+| anyhow | 1.0.104 | MIT | https://github.com/dtolnay/anyhow |
+| async-trait | 0.1.91 | MIT | https://github.com/dtolnay/async-trait |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
 | concurrent-queue | 2.5.0 | MIT | https://github.com/smol-rs/concurrent-queue |
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
@@ -421,6 +421,7 @@ the result instead.
 | serde_repr | 0.1.20 | MIT | https://github.com/dtolnay/serde-repr |
 | serde_yaml | 0.9.34+deprecated | MIT | https://github.com/dtolnay/serde-yaml |
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
+| syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror-impl | 2.0.18 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
@@ -7917,7 +7918,7 @@ SOFTWARE.
 
 ```
 
-### arc-swap 1.9.1 — MIT
+### arc-swap 1.9.2 — MIT
 
 Repository: https://github.com/vorner/arc-swap
 
@@ -14308,7 +14309,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### anyhow 1.0.103 — MIT
+### anyhow 1.0.104 — MIT
 
 Repository: https://github.com/dtolnay/anyhow
 
@@ -14339,7 +14340,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### async-trait 0.1.89 — MIT
+### async-trait 0.1.91 — MIT
 
 Repository: https://github.com/dtolnay/async-trait
 
@@ -15580,6 +15581,37 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 ### syn 2.0.117 — MIT
+
+Repository: https://github.com/dtolnay/syn
+
+```text
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### syn 3.0.3 — MIT
 
 Repository: https://github.com/dtolnay/syn
 
