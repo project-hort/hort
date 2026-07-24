@@ -317,7 +317,7 @@ the result instead.
 | redis-protocol | 6.0.0 | MIT | https://github.com/aembke/redis-protocol.rs |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.12.5 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.1 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -12608,7 +12608,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.12.5 — MIT
+### lru 0.18.1 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
