@@ -924,7 +924,7 @@ quality:helm-template-test:
   # runner launches the script as `helm sh …` → `unknown command "sh"`; only
   # the docker executor overrides the entrypoint implicitly. Matches quality:sonar.
   image:
-    name: alpine/helm:3.17.1
+    name: alpine/helm:3.21.3
     entrypoint: [""]
   needs: []
   <<: *rules-code-changed
@@ -1253,7 +1253,7 @@ helm:lint-and-publish:
   # ENTRYPOINT ["helm"] must be overridden so a podman-executor runner runs the
   # job shell instead of `helm sh`.
   image:
-    name: alpine/helm:3.17.1
+    name: alpine/helm:3.21.3
     entrypoint: [""]
   needs:
     - job: build-images:hort-server
