@@ -21,7 +21,8 @@ Before `helm install` you need:
 - **Kubernetes ≥ 1.27.** PSS-restricted defaults (`runAsNonRoot`,
   `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem`) are
   applied unconditionally; older clusters need admission overrides.
-- **Helm v3.8+** for OCI-chart support; templates are linted against v3.17.
+- **Helm v3.8+** for OCI-chart support; templates are linted in CI against
+  v3.17 and verified compatible with v3.21 (issue #81).
 - **`kubectl`** with cluster-admin or namespace-admin in the target
   namespace.
 - **An OIDC provider** (recommended). Keycloak, Okta, Auth0, Azure
