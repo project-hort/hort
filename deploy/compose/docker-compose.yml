@@ -157,7 +157,7 @@ services:
     # volume root once at stack-up time so the non-root containers can
     # mkdir / write inside it. Pinning a tiny alpine image rather than
     # reusing hort-server keeps this layer cheap and root-only.
-    image: alpine:3.20
+    image: alpine:3.24
     container_name: hort-cas-init
     command: ["sh", "-c", "chown 65532:65532 /var/lib/hort-server/cas && chmod 0750 /var/lib/hort-server/cas"]
     user: "0:0"
