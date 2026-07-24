@@ -234,6 +234,27 @@ release-grade pipelines). `actor` is a poor discriminator —
 `workflow_dispatch` runs carry the dispatcher's username, making
 per-user matching brittle.
 
+> **Prefer a distinct `aud` over a synthetic GitHub Environment when
+> the only reason for the environment is to discriminate SAs (issue
+> #82).** A GitHub Environment gates approvals AND mints a
+> deployment record on every run that references it — fine when you
+> want the gate, wasteful noise when you don't. hort's own CI
+> originally declared a non-gating `environment: ci` on every
+> workflow job purely so its OIDC token would carry an `environment`
+> claim distinguishing it from the release pipeline's
+> `environment: release` (issue #64) — but that meant every CI run,
+> not just releases, stamped a GitHub deployment record for a gate
+> that never actually gated anything. The fix: request a **distinct
+> `aud`** per SA class instead (`core.getIDToken('<class-audience>')`
+> on GHA, `id_tokens.<name>.aud` on GitLab) and add each audience to
+> the issuer's `audiences` allow-list. `repository` + `aud` alone is
+> already a sufficient discriminator when no other SA in the same
+> repo requests the same audience — no environment, no deployment
+> record. Reserve `environment:` for claims that need the actual
+> GitHub Environment features (approval gates, branch/tag
+> protection) — `gha-release`'s `environment: release` stays for
+> exactly that reason.
+
 ### 3c. The workflow file
 
 End-to-end example pushing a wheel to a Hosted PyPI repository:
@@ -521,7 +542,10 @@ Two envelopes' claim sets are both subsets of the same JWT's
 claims. Add a discriminator to one envelope (e.g. tighten
 `environment` or `ref`) so the match is unambiguous. hort-server
 logs the SA-name candidates at INFO; check the log to see which
-envelopes are conflicting.
+envelopes are conflicting. Pinning `aud` per SA class (see the
+callout in §3b above) is usually the least disruptive fix — it adds
+a discriminator without touching `ref`/`environment`/`workflow`,
+and (unlike a GitHub Environment) never mints a deployment record.
 
 ### `signature_invalid`
 

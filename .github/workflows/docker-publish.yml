@@ -330,8 +330,10 @@ jobs:
   # `hort-oci` repo on registry.hort.rs. Gated by vars.HORT_PROXY_ENABLED ==
   # 'true' (default off), so it is a no-op until the instance is live — exactly
   # like the crates publish in release.yml. `environment: release` makes this
-  # job's OIDC token carry the `environment: release` claim that the gha-release
-  # ServiceAccount matches (developer/write on hort-oci). `cosign copy` (not
+  # job's OIDC token carry the `environment: release` claim, and hort-auth
+  # additionally requests audience `hort-server-release` (issue #82) — both
+  # discriminators together match the gha-release ServiceAccount
+  # (developer/write on hort-oci). `cosign copy` (not
   # crane/skopeo) carries the signatures + attestations along with the image, so
   # the mirrored copy verifies the same way the ghcr.io copy does. Requires the
   # protected `release` environment (Settings → Environments → release: tag-only
@@ -364,11 +366,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Authenticate to registry.hort.rs as the gha-release SA (environment:
-      # release ↔ SA claim). The action's docker login writes the registry.hort.rs
-      # credential that `cosign copy` reads from ~/.docker/config.json to push.
+      # release + audience: hort-server-release — issue #82). The action's
+      # docker login writes the registry.hort.rs credential that `cosign copy`
+      # reads from ~/.docker/config.json to push.
       - uses: ./.github/actions/hort-auth
         with:
           proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          audience: hort-server-release
 
       - name: Mirror images (with signatures + attestations) to hort-oci
         env:
@@ -439,11 +443,13 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Authenticate to registry.hort.rs as the gha-release SA (environment:
-      # release ↔ SA claim). The action's docker login writes the registry.hort.rs
-      # credential that `cosign copy` reads from ~/.docker/config.json to push.
+      # release + audience: hort-server-release — issue #82). The action's
+      # docker login writes the registry.hort.rs credential that `cosign copy`
+      # reads from ~/.docker/config.json to push.
       - uses: ./.github/actions/hort-auth
         with:
           proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          audience: hort-server-release
 
       - name: Resolve dex source tag (must match values.yaml auth.dex.image)
         id: dex_ref
@@ -692,6 +698,7 @@ jobs:
         uses: ./.github/actions/hort-auth
         with:
           proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          audience: hort-server-release
 
       - name: Log in to registry.hort.rs (Helm OCI)
         env:
