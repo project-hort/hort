@@ -189,7 +189,7 @@ workflow:
 # skipped" via a second copy of the path list.
 docs-only:ok:
   stage: test
-  image: alpine:3.20
+  image: alpine:3.24
   needs: []
   script:
     - "true"
@@ -879,7 +879,7 @@ quality:sonar:
 # scripts use only POSIX awk/sed.
 quality:chart-and-rust-pin-sync:
   stage: quality
-  image: alpine:3.20
+  image: alpine:3.24
   needs: []
   <<: *rules-code-changed
   before_script:
@@ -897,7 +897,7 @@ quality:chart-and-rust-pin-sync:
 # no needs:) — same weight class as the pin-sync gate above.
 quality:g1-attestation-gate:
   stage: quality
-  image: alpine:3.20
+  image: alpine:3.24
   needs: []
   <<: *rules-code-changed
   before_script:
