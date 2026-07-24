@@ -154,58 +154,64 @@ if [[ -n "${only_in_audit}" || -n "${only_in_deny}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Axis 2 (issue #80): build-side ignore <-> registry Exclusion parity.
+# Axis 2 (issue #80): registry Exclusions are a NUCLEAR OPTION (maintainer
+# principle, 2026-07-24): a build-side ignore in .cargo/audit.toml scopes a
+# risk acceptance to hort's OWN build with a usage-specific rationale; a
+# registry `kind: Exclusion` waives the finding for EVERY consumer pulling
+# through the registry. Mirroring build acceptances into the registry is
+# therefore NOT the expected state -- the remedy hierarchy when a
+# build-accepted dep is scan-rejected registry-side is: (1) upgrade the dep
+# off the vulnerable version (the #80 lru fix), (2) accept the crates-publish
+# friction, (3) a registry Exclusion only as an explicitly-justified last
+# resort. This axis enforces that:
+#   - build-ignores with no registry Exclusion are reported INFORMATIONALLY
+#     (they forecast possible registry-side rejection of a prefetched dep;
+#     that is the normal, intended state -- never a failure);
+#   - any `kind: Exclusion` object present in the gitops tree HARD-FAILS
+#     unless its file carries a `# NUCLEAR-OPTION-JUSTIFIED:` line with a
+#     rationale -- forcing the last-resort choice to be deliberate and
+#     reviewable, per file.
 # ---------------------------------------------------------------------------
-
-registry_only_exempt=$(extract_exemptions "${audit_toml}" "REGISTRY-EXEMPT")
-
-orphan_registry_markers=$(comm -23 <(echo "${registry_only_exempt}") <(echo "${audit_ids}") || true)
-if [[ -n "${orphan_registry_markers}" ]]; then
-    echo "Orphan exemption marker(s) (named ID not present in .cargo/audit.toml):" >&2
-    echo "  REGISTRY-EXEMPT: ${orphan_registry_markers}" >&2
-    failed=1
-fi
 
 # Every kind: Exclusion object anywhere under deploy/ansible/files/gitops/
 # (recursive -- the apply-time gitops loader walks the tree the same way,
-# see crates/hort-server/src/gitops_boot.rs). A file is scanned for
-# `cveId:` lines only when it also declares `kind: Exclusion`, so a
-# same-named field on some other kind can never be mistaken for one.
-registry_exclusion_ids=$(
-    { grep -lZ -r "^kind: Exclusion" "${gitops_root}" --include="*.yaml" 2>/dev/null || true; } \
-        | xargs -0 -r grep -hoE '^[[:space:]]*cveId:[[:space:]]*[^[:space:]]+' \
-        | awk '{print $2}' \
-        | sort -u
+# see crates/hort-server/src/gitops_boot.rs).
+exclusion_files=$(
+    { grep -l -r "^kind: Exclusion" "${gitops_root}" --include="*.yaml" 2>/dev/null || true; } | sort
 )
 
-audit_ids_needing_registry=$(comm -23 <(echo "${audit_ids}") <(echo "${registry_only_exempt}") || true)
+registry_exclusion_ids=""
+unjustified_exclusions=""
+if [[ -n "${exclusion_files}" ]]; then
+    registry_exclusion_ids=$(
+        printf '%s\n' "${exclusion_files}"             | xargs -r grep -hoE '^[[:space:]]*cveId:[[:space:]]*[^[:space:]]+'             | awk '{print $2}'             | sort -u
+    )
+    while IFS= read -r f; do
+        if ! grep -q "# NUCLEAR-OPTION-JUSTIFIED:" "${f}"; then
+            unjustified_exclusions+="${f}"$'\n'
+        fi
+    done <<< "${exclusion_files}"
+fi
 
-only_in_audit_no_registry=$(comm -23 <(echo "${audit_ids_needing_registry}") <(echo "${registry_exclusion_ids}") || true)
-only_in_registry_no_audit=$(comm -13 <(echo "${audit_ids}") <(echo "${registry_exclusion_ids}") || true)
-
-if [[ -n "${only_in_audit_no_registry}" ]]; then
-    echo "Build-side advisory ignore(s) with no registry Exclusion mirror:" >&2
-    while IFS= read -r id; do
-        echo "    - ${id}" >&2
-    done <<< "${only_in_audit_no_registry}"
+if [[ -n "${unjustified_exclusions}" ]]; then
+    echo "Registry-level kind: Exclusion object(s) WITHOUT a justification marker:" >&2
+    printf '%s' "${unjustified_exclusions}" | while IFS= read -r f; do
+        [[ -n "${f}" ]] && echo "    - ${f}" >&2
+    done
     echo "" >&2
-    echo "Add a matching kind: Exclusion under deploy/ansible/files/gitops/" >&2
-    echo "(see policies/exclusions/ for examples), or mark the .cargo/audit.toml" >&2
-    echo "entry REGISTRY-EXEMPT: <ID> with a one-line rationale if hort's own" >&2
-    echo "scan surface genuinely does not need to mirror this acceptance." >&2
+    echo "A registry Exclusion waives the finding for EVERY registry consumer" >&2
+    echo "-- a nuclear option. Prefer upgrading the dependency off the" >&2
+    echo "vulnerable version. If an Exclusion is genuinely the last resort," >&2
+    echo "add a '# NUCLEAR-OPTION-JUSTIFIED: <why upgrade/friction are not" >&2
+    echo "viable>' line to the file so the choice is deliberate and reviewable." >&2
     failed=1
 fi
 
-if [[ -n "${only_in_registry_no_audit}" ]]; then
-    echo "NOTE (warning only, not a failure): registry Exclusion(s) with no" >&2
-    echo "matching .cargo/audit.toml build-side acceptance -- the registry may" >&2
-    echo "legitimately exclude more than hort's own build ignores (or this is a" >&2
-    echo "GHSA alias of an already-covered RUSTSEC id -- this script does not" >&2
-    echo "resolve advisory aliases):" >&2
-    while IFS= read -r id; do
-        echo "    - ${id}" >&2
-    done <<< "${only_in_registry_no_audit}"
-fi
+# Informational forecast (never a failure): build-ignores are hort-build-scoped
+# acceptances; the registry scan may still reject these deps when prefetched,
+# which surfaces as crates-publish friction. The remedy is upgrading the dep.
+build_ignores_unmirrored=$(comm -23 <(echo "${audit_ids}") <(echo "${registry_exclusion_ids}") || true)
+unmirrored_count=$(echo "${build_ignores_unmirrored}" | grep -c . || true)
 
 if [[ "${failed}" -ne 0 ]]; then
     exit 1
@@ -214,10 +220,9 @@ fi
 audit_deny_count=$(echo "${audit_ids_synced}" | grep -c . || true)
 audit_only_count=$(echo "${audit_only_exempt}" | grep -c . || true)
 deny_only_count=$(echo "${deny_only_exempt}"  | grep -c . || true)
-registry_count=$(echo "${audit_ids_needing_registry}" | grep -c . || true)
-registry_exempt_count=$(echo "${registry_only_exempt}" | grep -c . || true)
+exclusion_count=$(echo "${registry_exclusion_ids}" | grep -c . || true)
 echo "Advisory ignore-list sync: OK (${audit_deny_count} audit<->deny shared ID(s);" \
      "${audit_only_count} AUDIT-ONLY; ${deny_only_count} DENY-ONLY;" \
-     "${registry_count} build-ignore(s) with a registry Exclusion mirror;" \
-     "${registry_exempt_count} REGISTRY-EXEMPT)"
+     "${exclusion_count} registry Exclusion(s), all justified;" \
+     "${unmirrored_count} build-ignore(s) not mirrored registry-side [normal state])"
 exit 0

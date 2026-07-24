@@ -26,7 +26,13 @@
 # acceptance with no registry-side mirror would let hort's own quarantine
 # gate reject the same package CI has already decided is safe to build
 # with, once CI's prefetch — now SA-token-authorized — warms it through
-# `crates-proxy`). An entry tagged `REGISTRY-EXEMPT: RUSTSEC-YYYY-NNNN`
+# `crates-proxy`). Build-side ignores are hort-build-scoped acceptances and
+# are deliberately NOT mirrored into registry-level Exclusions -- a registry
+# Exclusion waives the finding for EVERY registry consumer (a nuclear option;
+# maintainer principle, issue #80). If a build-accepted dep is ever
+# scan-rejected registry-side, the remedy is UPGRADING the dep off the
+# vulnerable version (the #80 lru fix), not a registry mirror. The historical
+# `REGISTRY-EXEMPT:` markers below are retained as per-dep context only
 # is intentionally **not** mirrored to a registry Exclusion — same
 # marker-naming convention as AUDIT-ONLY/DENY-ONLY.
 ignore = [
@@ -36,7 +42,7 @@ ignore = [
     # RUSTSEC-2026-0002 finding); also unreachable in the active build
     # graph (see the AUDIT-ONLY rationale below), so hort's own scan of
     # crates-proxy's dependency closure has no path to this crate at
-    # all. Revisit (add a registry Exclusion) if that ever changes.
+    # all. If it ever blocks registry-side, upgrade the dep (registry Exclusion = nuclear option, avoid).
     # proc-macro-error2 2.0.1 - unmaintained. Reachable ONLY through
     # `sigstore`'s DISABLED `cosign` feature, so it is NEVER compiled into any
     # hort binary:
@@ -58,7 +64,7 @@ ignore = [
 
     # REGISTRY-EXEMPT: RUSTSEC-2023-0071 — not observed to block a CI
     # prefetch/build (issue #80's prod evidence names only the lru /
-    # RUSTSEC-2026-0002 finding). Revisit (add a registry Exclusion) if
+    # RUSTSEC-2026-0002 finding). If it ever blocks registry-side, prefer upgrading the dep (registry Exclusion = nuclear option) —
     # hort's own crates-proxy scan of `rsa` is ever observed to
     # quarantine/reject it for a CI dependency build.
     # rsa 0.9.10 - Marvin Attack: a timing sidechannel that can leak an
@@ -98,7 +104,7 @@ ignore = [
 
     # REGISTRY-EXEMPT: RUSTSEC-2026-0194 — not observed to block a CI
     # prefetch/build (issue #80's prod evidence names only the lru /
-    # RUSTSEC-2026-0002 finding). Revisit (add a registry Exclusion) if
+    # RUSTSEC-2026-0002 finding). If it ever blocks registry-side, prefer upgrading the dep (registry Exclusion = nuclear option) —
     # hort's own crates-proxy scan of `quick-xml` is ever observed to
     # quarantine/reject it for a CI dependency build.
     # REGISTRY-EXEMPT: RUSTSEC-2026-0195 — same rationale as
