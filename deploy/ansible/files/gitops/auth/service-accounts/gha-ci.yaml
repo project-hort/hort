@@ -12,18 +12,37 @@ metadata:
 # crates-proxy, dockerhub-proxy, quay-proxy, npm-proxy).
 spec:
   federatedIdentities:
+    # LEGACY (issue #64, superseded by the aud-based FI below — issue #82).
+    # Scoped to the non-gating `ci` deployment environment (no protection
+    # rules — it existed only to stamp this claim) so this identity was
+    # disjoint from `gha-release`'s `environment: release` by construction:
+    # before #64, a bare repository-only claim was a SUBSET of gha-release's
+    # claim set, so a release-tagged token matched both SAs and the
+    # federated exchange failed closed on `multiple_sa_match` — blocking
+    # every release-publish path under HORT_PROXY_ENABLED.
+    #
+    # Kept during the #82 migration window (federatedIdentities is an array
+    # and ONE matching entry suffices — this is what makes the cutover
+    # outage-free): any in-flight workflow run still requesting the old
+    # default `hort-server` audience + `environment: ci` continues to
+    # resolve against this entry. No CI job requests this shape anymore as
+    # of #82 (all six + prefetch-warm now request audience
+    # `hort-server-ci` instead — see the aud-based FI below). Drop once the
+    # #82 cleanup follow-up confirms nothing still matches here.
     - issuer: github-actions          # references OidcIssuer metadata.name
       claims:
         repository: project-hort/hort # scope-narrowing: any workflow in this repo
-        # NOTE: scoped to the non-gating `ci` deployment environment (no
-        # protection rules — it exists only to stamp this claim) so this
-        # identity is disjoint from `gha-release`'s `environment: release`
-        # by construction. Before this, a bare repository-only claim was a
-        # SUBSET of gha-release's claim set, so a release-tagged token
-        # matched both SAs and the federated exchange failed closed on
-        # `multiple_sa_match` — blocking every release-publish path under
-        # HORT_PROXY_ENABLED. Every job authenticating as gha-ci MUST tag
-        # `environment: ci` (see the six jobs in ci.yml / feature-ci.yml);
-        # an untagged job's token carries no `environment` claim and would
-        # match neither SA (`no_sa_match`). Fixes #64.
         environment: ci
+    # CURRENT (issue #82): audience-based discrimination replaces
+    # `environment: ci` — that non-gating environment existed only to
+    # stamp a disjointness claim, but it also minted a GitHub deployment
+    # record on every single CI run (pure noise; no protection rules ever
+    # gated on it). Every CI job now requests the `hort-server-ci`
+    # audience explicitly (`hort-auth`'s required `audience` input /
+    # inline `core.getIDToken('hort-server-ci')`) instead. `aud` alone
+    # (paired with `repository`) is a sufficient discriminator here
+    # because `hort-server-ci` is never requested by any gha-release job.
+    - issuer: github-actions
+      claims:
+        repository: project-hort/hort
+        aud: hort-server-ci

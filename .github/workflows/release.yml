@@ -246,10 +246,13 @@ jobs:
   # is treated as disabled.
   #
   # The `environment: release` declaration causes this job's OIDC token to
-  # carry the `environment: release` claim, which is the exact discriminator
-  # that `gha-release` ServiceAccount matches (Task 2). Without this
-  # declaration the OIDC token lacks the `environment` claim and the exchange
-  # is rejected by hort with `no_sa_match`.
+  # carry the `environment: release` claim; hort-auth additionally requests
+  # audience `hort-server-release` (issue #82). Both discriminators together
+  # match `gha-release`'s ServiceAccount — belt-and-suspenders, not either
+  # alone. Without `environment: release` the OIDC token lacks the
+  # `environment` claim; without the matching audience the exchange is
+  # rejected by hort with `aud_mismatch` at the OidcIssuer gate before
+  # federatedIdentities matching is even reached.
   #
   # Protected environment setup (required before go-live — document in README):
   #   GitHub → Settings → Environments → release:
@@ -292,11 +295,14 @@ jobs:
         with:
           toolchain: stable
 
-      # Authenticate via the gha-release SA (environment: release ↔ SA claim).
-      # Writes CARGO_REGISTRIES_HORT_CRATES_TOKEN into the environment.
+      # Authenticate via the gha-release SA (environment: release AND
+      # audience: hort-server-release — issue #82 — both must match one of
+      # gha-release's federatedIdentities). Writes
+      # CARGO_REGISTRIES_HORT_CRATES_TOKEN into the environment.
       - uses: ./.github/actions/hort-auth
         with:
           proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
+          audience: hort-server-release
 
       # Publish in dependency order. hort-domain has no intra-workspace deps so
       # it goes first; each subsequent crate may depend on earlier entries.

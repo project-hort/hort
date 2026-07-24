@@ -14,13 +14,31 @@ metadata:
 # manifest back from hort-oci, and write does not imply read).
 spec:
   federatedIdentities:
+    # LEGACY (pre-#82). `environment: release` is emitted only when the
+    # GitHub Actions job targets a protected environment named "release".
+    # The environment enforces tag-only trigger + required reviewers — hort
+    # does not need a `ref:` glob because the environment gate is
+    # authoritative. (A ref glob would require exact-match anyway — globs
+    # are not supported by the SA claim matcher.) Unlike gha-ci, this
+    # identity never needed the #64 environment-as-discriminator workaround
+    # — `environment: release` was always a real protected gate, not a
+    # synthetic stamp. Kept during the #82 migration window (array +
+    # one-FI-suffices semantics) so any in-flight run still requesting the
+    # old default `hort-server` audience continues to resolve.
     - issuer: github-actions          # references OidcIssuer metadata.name
       claims:
         repository: project-hort/hort
-        # `environment: release` is emitted only when the GitHub Actions job
-        # targets a protected environment named "release". The environment
-        # enforces tag-only trigger + required reviewers — hort does not need
-        # a `ref:` glob because the environment gate is authoritative.
-        # (A ref glob would require exact-match anyway — globs are not
-        # supported by the SA claim matcher.)
         environment: release
+    # CURRENT (issue #82): the four release jobs (release.yml's
+    # hort-publish; docker-publish.yml's mirror-to-hort-oci,
+    # mirror-to-hort-base, publish-chart-registry-hort-rs) now ALSO request
+    # audience `hort-server-release` explicitly. `environment: release`
+    # stays — it is a real protected environment (tag-only + required
+    # reviewer), not a claim-stamping shim like gha-ci's retired
+    # `environment: ci` — so this FI is belt-and-suspenders alongside the
+    # legacy one above, not a replacement for the environment gate.
+    - issuer: github-actions
+      claims:
+        repository: project-hort/hort
+        environment: release
+        aud: hort-server-release
