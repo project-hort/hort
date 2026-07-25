@@ -270,7 +270,11 @@ variables:
       - .cargo/registry/index
       - .cargo/registry/cache
       - .cargo/git/db
-      - target/
+      # target/ intentionally NOT cached: sccache (RUST_SCCACHE_IMAGE + .sccache)
+      # is the compile cache. Caching target/ keyed on CI_COMMIT_REF_SLUG left a
+      # permanent multi-GB cache.zip per branch AND per release tag -- ~330G of
+      # mostly-dead archives on the runner's /cache. Keep only the small .cargo
+      # crate-source dirs; sccache handles compilation reuse.
 
 .rust-apt-deps: &rust-apt-deps
   - apt-get update -qq
