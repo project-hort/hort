@@ -29,6 +29,13 @@
 - name: Deploy the project-hort.de static site
   hosts: website
   become: true
+  # Flush the nginx validate+reload handlers even if a later task fails —
+  # without this, a mid-play failure (e.g. the first-deploy sync bug) leaves
+  # a templated-and-enabled vhost that nginx never loaded, and the next
+  # run's unchanged tasks never re-notify (observed on the first production
+  # deploy: the ACME challenge failed with a connection error because the
+  # port-80 vhost was never live).
+  force_handlers: true
   gather_facts: true
 
   vars:
@@ -47,6 +54,13 @@
 - name: Deploy the hort.rs static site
   hosts: website
   become: true
+  # Flush the nginx validate+reload handlers even if a later task fails —
+  # without this, a mid-play failure (e.g. the first-deploy sync bug) leaves
+  # a templated-and-enabled vhost that nginx never loaded, and the next
+  # run's unchanged tasks never re-notify (observed on the first production
+  # deploy: the ACME challenge failed with a connection error because the
+  # port-80 vhost was never live).
+  force_handlers: true
   gather_facts: true
 
   vars:
