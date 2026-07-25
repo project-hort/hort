@@ -125,7 +125,24 @@ workflow:
   - ".gitlab-ci.yml"
   - ".gitlab/**/*"
   - "sonar-project.properties"
-  - "deploy/**/*"
+  # deploy/ is split, not blanket-included (maintainer request, 2026-07-25:
+  # pure ansible/operator-config edits must not run the full Rust
+  # build+test). ONLY the deploy subtrees an actual CI job exercises count
+  # as code:
+  #   - deploy/helm/**            -> quality:helm-template-test + chart-pin-sync
+  #   - deploy/compose/**         -> E2E stack + example-config fixtures
+  #   - deploy/ansible/files/**   -> the gitops tree, walked by the Rust
+  #                                  public_deploy_gitops_tree guard test
+  #   - deploy/ansible/roles/fail2ban/** -> quality:fail2ban-regex-test
+  # Everything else under deploy/ansible/ (roles, playbooks, inventory,
+  # group_vars, README) has no CI coverage and rides the docs-only fast
+  # path. RULE: if a future CI job starts exercising another deploy
+  # subtree, add that subtree HERE in the same MR — a test-covered path
+  # missing from this list silently skips its gate on targeted MRs.
+  - "deploy/helm/**/*"
+  - "deploy/compose/**/*"
+  - "deploy/ansible/files/**/*"
+  - "deploy/ansible/roles/fail2ban/**/*"
   - "docker/**/*"
   - ".dockerignore"
   - "scripts/**/*"
