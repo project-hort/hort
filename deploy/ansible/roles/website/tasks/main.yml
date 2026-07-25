@@ -199,6 +199,21 @@
 # fine, it's the operator's deploy step, not the site build"). Idempotent
 # and additive: an existing dl/<tag>/ is left untouched (see the script's
 # own header comment for the immutability + fail-closed-verify mechanics).
+# cosign's keyless verify-blob writes its Sigstore/TUF trust-root cache to
+# $HOME/.sigstore. Under become_user: www-data, HOME is /var/www (root-owned,
+# not www-data-writable), so the cache mkdir fails BEFORE any signature check
+# and every verify fails (issue #83 — same class as the #74 trivy read-only
+# cache). Give the populate run a persistent, www-data-owned HOME so the TUF
+# root caches across runs instead of re-fetching.
+- name: Ensure the /dl/ populate cache dir exists (cosign TUF root home)
+  ansible.builtin.file:
+    path: /var/cache/hort-dl-archive
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0700"
+  when: website_dl_archive_enabled
+
 - name: Populate the permanent /dl/ version archive
   # Runs the CONTROL-NODE script ON THE TARGET HOST: the script module
   # transfers it to a remote temp and executes it there. `command` looked for
@@ -210,6 +225,9 @@
     cmd: "{{ website_repo_root }}/scripts/populate-dl-archive.sh {{ website_root }}/dl"
   become: true
   become_user: www-data
+  environment:
+    # Writable HOME for cosign's ~/.sigstore TUF cache (issue #83).
+    HOME: /var/cache/hort-dl-archive
   register: website_dl_result
   changed_when: "'0 new version(s) populated' not in website_dl_result.stdout"
   when: website_dl_archive_enabled
