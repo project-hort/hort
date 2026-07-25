@@ -200,7 +200,13 @@
 # and additive: an existing dl/<tag>/ is left untouched (see the script's
 # own header comment for the immutability + fail-closed-verify mechanics).
 - name: Populate the permanent /dl/ version archive
-  ansible.builtin.command:
+  # Runs the CONTROL-NODE script ON THE TARGET HOST: the script module
+  # transfers it to a remote temp and executes it there. `command` looked for
+  # website_repo_root (a control-node path, playbook_dir/../..) on the HOST,
+  # where it does not exist -> rc=2 "No such file or directory". The script is
+  # self-contained (needs only curl/jq/sha256sum/cosign on the host + the
+  # host's network to GitHub); its argument is the REMOTE dl root.
+  ansible.builtin.script:
     cmd: "{{ website_repo_root }}/scripts/populate-dl-archive.sh {{ website_root }}/dl"
   become: true
   become_user: www-data
