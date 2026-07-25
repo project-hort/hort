@@ -118,6 +118,26 @@
     - Validate nginx config
     - Reload nginx
 
+# The certbot role runs NEXT in this play and issues the cert via the webroot
+# ACME challenge, which the CA fetches over HTTP from this vhost's port-80
+# block (location /.well-known/acme-challenge/ -> /var/www/html). The
+# "Reload nginx" handler notified above is play-scoped and only flushes at the
+# END of the play — i.e. AFTER certbot has already run — so without an explicit
+# reload here the CA hits an nginx that has not loaded this vhost yet and the
+# challenge 404s (observed: project-hort.de webroot challenge "Error getting
+# validation data"). Reload explicitly, before certbot, so the ACME vhost is
+# live. Idempotent (a no-op reload is cheap), and it also recovers a host left
+# in the "vhost enabled but never reloaded" state by an earlier failed run,
+# where the deferred handler never fired.
+- name: Check nginx config before the pre-certbot reload
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Reload nginx so the {{ website_fqdn }} ACME vhost is live before certbot
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded
+
 # Mirrors the built tree exactly (--delete): a page removed from the source
 # docs on a prior build doesn't linger as an orphaned, unlinked file forever.
 # `--exclude=dl` is load-bearing for hort.rs (see the header comment) — the
