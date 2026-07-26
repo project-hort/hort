@@ -140,8 +140,8 @@ the result instead.
 | serde_urlencoded | 0.7.1 | MIT | https://github.com/nox/serde_urlencoded |
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
-| rustls-native-certs | 0.8.3 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.40 | MIT | https://github.com/rustls/rustls |
+| rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
+| rustls | 0.23.42 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -411,11 +411,11 @@ the result instead.
 | rustix | 1.1.4 | MIT | https://github.com/bytecodealliance/rustix |
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
-| serde | 1.0.228 | MIT | https://github.com/serde-rs/serde |
-| serde_core | 1.0.228 | MIT | https://github.com/serde-rs/serde |
-| serde_derive | 1.0.228 | MIT | https://github.com/serde-rs/serde |
+| serde | 1.0.229 | MIT | https://github.com/serde-rs/serde |
+| serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
+| serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_html_form | 0.2.8 | MIT | https://github.com/jplatte/serde_html_form |
-| serde_json | 1.0.149 | MIT | https://github.com/serde-rs/json |
+| serde_json | 1.0.151 | MIT | https://github.com/serde-rs/json |
 | serde_nanos | 0.1.4 | MIT | https://github.com/caspervonb/serde_nanos |
 | serde_path_to_error | 0.1.20 | MIT | https://github.com/dtolnay/path-to-error |
 | serde_repr | 0.1.20 | MIT | https://github.com/dtolnay/serde-repr |
@@ -7116,7 +7116,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls-native-certs 0.8.3 — MIT
+### rustls-native-certs 0.8.4 — MIT
 
 Repository: https://github.com/rustls/rustls-native-certs
 
@@ -7149,7 +7149,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.40 — MIT
+### rustls 0.23.42 — MIT
 
 Repository: https://github.com/rustls/rustls
 
@@ -15301,7 +15301,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde 1.0.228 — MIT
+### serde 1.0.229 — MIT
 
 Repository: https://github.com/serde-rs/serde
 
@@ -15332,7 +15332,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_core 1.0.228 — MIT
+### serde_core 1.0.229 — MIT
 
 Repository: https://github.com/serde-rs/serde
 
@@ -15363,7 +15363,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_derive 1.0.228 — MIT
+### serde_derive 1.0.229 — MIT
 
 Repository: https://github.com/serde-rs/serde
 
@@ -15425,7 +15425,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_json 1.0.149 — MIT
+### serde_json 1.0.151 — MIT
 
 Repository: https://github.com/serde-rs/json
 
