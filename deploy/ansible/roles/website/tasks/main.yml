@@ -214,15 +214,44 @@
     mode: "0700"
   when: website_dl_archive_enabled
 
+# The populate script is a CONTROL-NODE file that must run ON THE TARGET HOST
+# (it needs the host's own network path to GitHub, and website_repo_root is a
+# control-node path that does not exist on the host — a plain `command` against
+# it fails rc=2). The obvious answer, `ansible.builtin.script`, cannot be used
+# here: `script` + `become_user: www-data` makes Ansible grant the unprivileged
+# user access to its staged tempfile, and on hosts without the `acl` package it
+# falls back to a `chmod A+user:www-data:rx:allow` form GNU chmod rejects — the
+# handoff dies before the script ever runs (issue #83, second layer). `command`
+# + become_user works fine on this host (the cosign assert above is the proof),
+# so: stage the script to a fixed root-owned path as root, then `command` it as
+# www-data. Root-owned deliberately — the fail-closed verifying script is never
+# writable by the account that executes it.
+- name: Ensure the host-run deploy script dir exists
+  ansible.builtin.file:
+    path: /usr/local/lib/hort
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: website_dl_archive_enabled
+
+- name: Stage populate-dl-archive.sh on the host (root-owned)
+  ansible.builtin.copy:
+    src: "{{ website_repo_root }}/scripts/populate-dl-archive.sh"
+    dest: /usr/local/lib/hort/populate-dl-archive.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: website_dl_archive_enabled
+
 - name: Populate the permanent /dl/ version archive
-  # Runs the CONTROL-NODE script ON THE TARGET HOST: the script module
-  # transfers it to a remote temp and executes it there. `command` looked for
-  # website_repo_root (a control-node path, playbook_dir/../..) on the HOST,
-  # where it does not exist -> rc=2 "No such file or directory". The script is
-  # self-contained (needs only curl/jq/sha256sum/cosign on the host + the
-  # host's network to GitHub); its argument is the REMOTE dl root.
-  ansible.builtin.script:
-    cmd: "{{ website_repo_root }}/scripts/populate-dl-archive.sh {{ website_root }}/dl"
+  ansible.builtin.command:
+    cmd: "/usr/local/lib/hort/populate-dl-archive.sh {{ website_root }}/dl"
+    # A www-data-accessible cwd: with the connection user's home as cwd, the
+    # script's `find` cannot restore its initial working directory as www-data
+    # ("Failed to restore initial working directory: /home/…: Permission
+    # denied").
+    chdir: /var/cache/hort-dl-archive
   become: true
   become_user: www-data
   environment:
