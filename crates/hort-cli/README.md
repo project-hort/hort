@@ -15,8 +15,8 @@
 
 Login supports RFC 8628 device-flow, RFC 8252 loopback, and paste-token
 flows, with server-config auto-discovery. **Token storage is a plaintext
-`token` field in `~/.hort/config.toml`** (resolution precedence: CLI flag
-> env var `HORT_TOKEN` > config file), not an OS keychain — do not assume
+`token` field in `~/.hort/config.toml`** (resolution precedence: CLI flag >
+env var `HORT_TOKEN` > config file), not an OS keychain — do not assume
 keychain-backed storage when writing docs or support guidance for this
 crate. Session lifetime itself is governed by ADR 0013 (short-lived,
 IdP-backed, ≤1 h for admin-capable sessions) — that ADR governs token

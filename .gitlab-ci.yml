@@ -125,7 +125,24 @@ workflow:
   - ".gitlab-ci.yml"
   - ".gitlab/**/*"
   - "sonar-project.properties"
-  - "deploy/**/*"
+  # deploy/ is split, not blanket-included (maintainer request, 2026-07-25:
+  # pure ansible/operator-config edits must not run the full Rust
+  # build+test). ONLY the deploy subtrees an actual CI job exercises count
+  # as code:
+  #   - deploy/helm/**            -> quality:helm-template-test + chart-pin-sync
+  #   - deploy/compose/**         -> E2E stack + example-config fixtures
+  #   - deploy/ansible/files/**   -> the gitops tree, walked by the Rust
+  #                                  public_deploy_gitops_tree guard test
+  #   - deploy/ansible/roles/fail2ban/** -> quality:fail2ban-regex-test
+  # Everything else under deploy/ansible/ (roles, playbooks, inventory,
+  # group_vars, README) has no CI coverage and rides the docs-only fast
+  # path. RULE: if a future CI job starts exercising another deploy
+  # subtree, add that subtree HERE in the same MR — a test-covered path
+  # missing from this list silently skips its gate on targeted MRs.
+  - "deploy/helm/**/*"
+  - "deploy/compose/**/*"
+  - "deploy/ansible/files/**/*"
+  - "deploy/ansible/roles/fail2ban/**/*"
   - "docker/**/*"
   - ".dockerignore"
   - "scripts/**/*"
@@ -155,6 +172,30 @@ workflow:
     - if: $CI_COMMIT_BRANCH
       changes: *code-changed-paths
 
+# hort's static sites, project-hort.de (issue #78) + hort.rs (issue #77):
+# anything that can change scripts/build-site.sh's output for EITHER site —
+# the docs both are generated from, the root README (project-hort.de's
+# landing-page content source), the installer scripts + cosign.pin
+# (hort.rs's apex files, copied verbatim), the hort-cli README (one of
+# hort.rs's four doc sources), and the site chrome/generator itself.
+.site-changed-paths: &site-changed-paths
+  - "docs/architecture/**/*"
+  - "README.md"
+  - "crates/hort-cli/README.md"
+  - "install/**/*"
+  - "site/**/*"
+  - "scripts/build-site.sh"
+  - "scripts/site/**/*"
+  - "scripts/populate-dl-archive.sh"
+
+.rules-site-changed: &rules-site-changed
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *site-changed-paths
+    - if: $CI_COMMIT_BRANCH
+      changes: *site-changed-paths
+
 # Guaranteed-present, guaranteed-green job. GitLab's "pipelines must succeed"
 # merge-check trap: if every job in a doc-only pipeline is gated out, the
 # pipeline has zero jobs and some project settings then block the MR
@@ -165,7 +206,7 @@ workflow:
 # skipped" via a second copy of the path list.
 docs-only:ok:
   stage: test
-  image: alpine:3.20
+  image: alpine:3.24
   needs: []
   script:
     - "true"
@@ -270,7 +311,11 @@ variables:
       - .cargo/registry/index
       - .cargo/registry/cache
       - .cargo/git/db
-      - target/
+      # target/ intentionally NOT cached: sccache (RUST_SCCACHE_IMAGE + .sccache)
+      # is the compile cache. Caching target/ keyed on CI_COMMIT_REF_SLUG left a
+      # permanent multi-GB cache.zip per branch AND per release tag -- ~330G of
+      # mostly-dead archives on the runner's /cache. Keep only the small .cargo
+      # crate-source dirs; sccache handles compilation reuse.
 
 .rust-apt-deps: &rust-apt-deps
   - apt-get update -qq
@@ -855,7 +900,7 @@ quality:sonar:
 # scripts use only POSIX awk/sed.
 quality:chart-and-rust-pin-sync:
   stage: quality
-  image: alpine:3.20
+  image: alpine:3.24
   needs: []
   <<: *rules-code-changed
   before_script:
@@ -873,7 +918,7 @@ quality:chart-and-rust-pin-sync:
 # no needs:) — same weight class as the pin-sync gate above.
 quality:g1-attestation-gate:
   stage: quality
-  image: alpine:3.20
+  image: alpine:3.24
   needs: []
   <<: *rules-code-changed
   before_script:
@@ -900,7 +945,7 @@ quality:helm-template-test:
   # runner launches the script as `helm sh …` → `unknown command "sh"`; only
   # the docker executor overrides the entrypoint implicitly. Matches quality:sonar.
   image:
-    name: alpine/helm:3.17.1
+    name: alpine/helm:3.21.3
     entrypoint: [""]
   needs: []
   <<: *rules-code-changed
@@ -924,6 +969,35 @@ quality:fail2ban-regex-test:
   script:
     - bash scripts/test-fail2ban-regex.sh
 
+# project-hort.de static site (issue #78): builds site/dist/ and runs the
+# link-check that fails the build on any broken internal link or heading
+# anchor. Output is an artifact for manual review only — never committed
+# (site/dist/ is gitignored) and never deployed from here; deployment is the
+# ansible `website` role (deploy/ansible/roles/website/), run by the
+# operator. python3 is the ONLY tool this needs — see
+# scripts/site/generate.py's module docstring for why (no pandoc, no pip,
+# no npm-ecosystem SSG).
+quality:site-build:
+  stage: quality
+  image: debian:13-slim
+  needs: []
+  <<: *rules-site-changed
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends python3
+  script:
+    - ./scripts/build-site.sh
+    # populate-dl-archive.sh (issue #77) is not exercised by the site build
+    # itself (it runs host-side, at ansible-deploy time, against live
+    # GitHub releases — see its own header comment) — a syntax check here
+    # is the cheap CI-side guard against a change to it breaking the gate
+    # this path list also triggers on.
+    - bash -n scripts/populate-dl-archive.sh
+  artifacts:
+    paths:
+      - site/dist/
+    expire_in: 3 days
+
 # ===========================================================================
 # Stage 4: build-images — buildah + cosign sign for hort-server
 # ===========================================================================
@@ -942,7 +1016,7 @@ quality:fail2ban-regex-test:
   # pins these jobs to the runner that holds the mirror secret.
   tags:
     - platform
-  image: quay.io/buildah/stable:v1.39
+  image: quay.io/buildah/stable:v1.43
   variables:
     STORAGE_DRIVER: vfs
     BUILDAH_FORMAT: docker
@@ -1200,7 +1274,7 @@ helm:lint-and-publish:
   # ENTRYPOINT ["helm"] must be overridden so a podman-executor runner runs the
   # job shell instead of `helm sh`.
   image:
-    name: alpine/helm:3.17.1
+    name: alpine/helm:3.21.3
     entrypoint: [""]
   needs:
     - job: build-images:hort-server

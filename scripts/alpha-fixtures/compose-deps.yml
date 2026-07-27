@@ -65,7 +65,7 @@ services:
     # the gitops auth/ ClaimMapping fixtures). Dev-mode only: no TLS, no
     # persistence, no clustering.
     profiles: ["oidc"]
-    image: quay.io/keycloak/keycloak:26.6
+    image: quay.io/keycloak/keycloak:26.7
     container_name: hort-alpha-keycloak
     command:
       - start-dev

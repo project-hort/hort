@@ -32,7 +32,7 @@ the result instead.
 | kube | 3.1.0 | Apache-2.0 | https://github.com/kube-rs/kube |
 | metrics-exporter-prometheus | 0.18.3 | Apache-2.0 | https://github.com/metrics-rs/metrics |
 | pep440_rs | 0.7.3 | Apache-2.0 | https://github.com/konstin/pep440-rs |
-| rpassword | 7.5.2 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
+| rpassword | 7.5.4 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
 | rtoolbox | 0.0.5 | Apache-2.0 | https://github.com/conradkleinespel/rtoolbox |
 | ryu-js | 1.0.2 | Apache-2.0 | https://github.com/boa-dev/ryu-js |
 | ryu | 1.0.23 | Apache-2.0 | https://github.com/dtolnay/ryu |
@@ -123,15 +123,15 @@ the result instead.
 | hkdf | 0.12.4 | MIT | https://github.com/RustCrypto/KDFs/ |
 | poly1305 | 0.8.0 | MIT | https://github.com/RustCrypto/universal-hashes |
 | httparse | 1.10.1 | MIT | https://github.com/seanmonstar/httparse |
-| futures-channel | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-core | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-executor | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-io | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-macro | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-sink | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-task | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-util | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-channel | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-core | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-executor | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-io | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-macro | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-sink | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-task | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-util | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
 | hashbrown | 0.14.5 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.15.5 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.16.1 | MIT | https://github.com/rust-lang/hashbrown |
@@ -140,8 +140,8 @@ the result instead.
 | serde_urlencoded | 0.7.1 | MIT | https://github.com/nox/serde_urlencoded |
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
-| rustls-native-certs | 0.8.3 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.40 | MIT | https://github.com/rustls/rustls |
+| rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
+| rustls | 0.23.42 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -165,10 +165,10 @@ the result instead.
 | fnv | 1.0.7 | MIT | https://github.com/servo/rust-fnv |
 | stable_deref_trait | 1.2.1 | MIT | https://github.com/storyyeller/stable_deref_trait |
 | stringprep | 0.1.5 | MIT | https://github.com/sfackler/rust-stringprep |
-| arc-swap | 1.9.1 | MIT | https://github.com/vorner/arc-swap |
+| arc-swap | 1.9.2 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.14 | MIT | https://github.com/hyperium/h2 |
-| http | 1.4.0 | MIT | https://github.com/hyperium/http |
+| http | 1.4.2 | MIT | https://github.com/hyperium/http |
 | tokio-rustls | 0.26.4 | MIT | https://github.com/rustls/tokio-rustls |
 | signal-hook-registry | 1.4.8 | MIT | https://github.com/vorner/signal-hook |
 | cookie-factory | 0.3.2 | MIT | https://github.com/rust-bakery/cookie-factory |
@@ -246,7 +246,7 @@ the result instead.
 | cpufeatures | 0.3.0 | MIT | https://github.com/RustCrypto/utils |
 | password-hash | 0.6.1 | MIT | https://github.com/RustCrypto/traits |
 | metrics-exporter-prometheus | 0.18.3 | MIT | https://github.com/metrics-rs/metrics |
-| metrics-util | 0.20.3 | MIT | https://github.com/metrics-rs/metrics |
+| metrics-util | 0.20.4 | MIT | https://github.com/metrics-rs/metrics |
 | metrics | 0.24.6 | MIT | https://github.com/metrics-rs/metrics |
 | crypto-common | 0.1.7 | MIT | https://github.com/RustCrypto/traits |
 | crypto-bigint | 0.5.5 | MIT | https://github.com/RustCrypto/crypto-bigint |
@@ -278,10 +278,10 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.1 | MIT | https://github.com/clap-rs/clap |
-| clap_builder | 4.6.0 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.4 | MIT | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.2 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.5.55 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.1 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 0.7.7 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -317,7 +317,7 @@ the result instead.
 | redis-protocol | 6.0.0 | MIT | https://github.com/aembke/redis-protocol.rs |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.12.5 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.1 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -340,7 +340,7 @@ the result instead.
 | rustls-platform-verifier | 0.7.0 | MIT | https://github.com/rustls/rustls-platform-verifier |
 | matchit | 0.7.3 | MIT | https://github.com/ibraheemdev/matchit |
 | web-time | 1.1.0 | MIT | https://github.com/daxpedda/web-time |
-| chrono | 0.4.44 | MIT | https://github.com/chronotope/chrono |
+| chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.8.1 | MIT | https://github.com/boinkor-net/governor.git |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
 | object_store | 0.13.2 | MIT | https://github.com/apache/arrow-rs-object-store |
@@ -379,8 +379,8 @@ the result instead.
 | async-recursion | 1.1.1 | MIT | https://github.com/dcchut/async-recursion |
 | rsa | 0.9.10 | MIT | https://github.com/RustCrypto/RSA |
 | adler2 | 2.0.1 | MIT | https://github.com/oyvindln/adler2 |
-| anyhow | 1.0.103 | MIT | https://github.com/dtolnay/anyhow |
-| async-trait | 0.1.89 | MIT | https://github.com/dtolnay/async-trait |
+| anyhow | 1.0.104 | MIT | https://github.com/dtolnay/anyhow |
+| async-trait | 0.1.91 | MIT | https://github.com/dtolnay/async-trait |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
 | concurrent-queue | 2.5.0 | MIT | https://github.com/smol-rs/concurrent-queue |
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
@@ -411,20 +411,21 @@ the result instead.
 | rustix | 1.1.4 | MIT | https://github.com/bytecodealliance/rustix |
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
-| serde | 1.0.228 | MIT | https://github.com/serde-rs/serde |
-| serde_core | 1.0.228 | MIT | https://github.com/serde-rs/serde |
-| serde_derive | 1.0.228 | MIT | https://github.com/serde-rs/serde |
+| serde | 1.0.229 | MIT | https://github.com/serde-rs/serde |
+| serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
+| serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_html_form | 0.2.8 | MIT | https://github.com/jplatte/serde_html_form |
-| serde_json | 1.0.149 | MIT | https://github.com/serde-rs/json |
+| serde_json | 1.0.151 | MIT | https://github.com/serde-rs/json |
 | serde_nanos | 0.1.4 | MIT | https://github.com/caspervonb/serde_nanos |
 | serde_path_to_error | 0.1.20 | MIT | https://github.com/dtolnay/path-to-error |
 | serde_repr | 0.1.20 | MIT | https://github.com/dtolnay/serde-repr |
 | serde_yaml | 0.9.34+deprecated | MIT | https://github.com/dtolnay/serde-yaml |
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
+| syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror-impl | 2.0.18 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror-impl | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror | 2.0.18 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | unsafe-libyaml | 0.2.11 | MIT | https://github.com/dtolnay/unsafe-libyaml |
 | zmij | 1.0.21 | MIT | https://github.com/dtolnay/zmij |
@@ -3326,7 +3327,7 @@ limitations under the License.
 
 ```
 
-### rpassword 7.5.2 — Apache-2.0
+### rpassword 7.5.4 — Apache-2.0
 
 Repository: https://github.com/conradkleinespel/rpassword
 
@@ -6544,7 +6545,7 @@ THE SOFTWARE.
 
 ```
 
-### futures-channel 0.3.32 — MIT
+### futures-channel 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6578,7 +6579,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-core 0.3.32 — MIT
+### futures-core 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6612,7 +6613,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-executor 0.3.32 — MIT
+### futures-executor 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6646,7 +6647,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-io 0.3.32 — MIT
+### futures-io 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6680,7 +6681,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-macro 0.3.32 — MIT
+### futures-macro 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6714,7 +6715,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-sink 0.3.32 — MIT
+### futures-sink 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6748,7 +6749,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-task 0.3.32 — MIT
+### futures-task 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6782,7 +6783,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-util 0.3.32 — MIT
+### futures-util 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6816,7 +6817,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures 0.3.32 — MIT
+### futures 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -7115,7 +7116,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls-native-certs 0.8.3 — MIT
+### rustls-native-certs 0.8.4 — MIT
 
 Repository: https://github.com/rustls/rustls-native-certs
 
@@ -7148,7 +7149,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.40 — MIT
+### rustls 0.23.42 — MIT
 
 Repository: https://github.com/rustls/rustls
 
@@ -7917,7 +7918,7 @@ SOFTWARE.
 
 ```
 
-### arc-swap 1.9.1 — MIT
+### arc-swap 1.9.2 — MIT
 
 Repository: https://github.com/vorner/arc-swap
 
@@ -8016,7 +8017,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### http 1.4.0 — MIT
+### http 1.4.2 — MIT
 
 Repository: https://github.com/hyperium/http
 
@@ -10554,7 +10555,7 @@ SOFTWARE.
 
 ```
 
-### metrics-util 0.20.3 — MIT
+### metrics-util 0.20.4 — MIT
 
 Repository: https://github.com/metrics-rs/metrics
 
@@ -11546,7 +11547,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.1 — MIT
+### clap 4.6.4 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11573,7 +11574,7 @@ SOFTWARE.
 
 ```
 
-### clap_builder 4.6.0 — MIT
+### clap_builder 4.6.2 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11627,7 +11628,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.1 — MIT
+### clap_derive 4.6.4 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12608,7 +12609,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.12.5 — MIT
+### lru 0.18.1 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -13276,7 +13277,7 @@ SOFTWARE.
 
 ```
 
-### chrono 0.4.44 — MIT
+### chrono 0.4.45 — MIT
 
 Repository: https://github.com/chronotope/chrono
 
@@ -14308,7 +14309,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### anyhow 1.0.103 — MIT
+### anyhow 1.0.104 — MIT
 
 Repository: https://github.com/dtolnay/anyhow
 
@@ -14339,7 +14340,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### async-trait 0.1.89 — MIT
+### async-trait 0.1.91 — MIT
 
 Repository: https://github.com/dtolnay/async-trait
 
@@ -15300,7 +15301,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde 1.0.228 — MIT
+### serde 1.0.229 — MIT
 
 Repository: https://github.com/serde-rs/serde
 
@@ -15331,7 +15332,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_core 1.0.228 — MIT
+### serde_core 1.0.229 — MIT
 
 Repository: https://github.com/serde-rs/serde
 
@@ -15362,7 +15363,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_derive 1.0.228 — MIT
+### serde_derive 1.0.229 — MIT
 
 Repository: https://github.com/serde-rs/serde
 
@@ -15424,7 +15425,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_json 1.0.149 — MIT
+### serde_json 1.0.151 — MIT
 
 Repository: https://github.com/serde-rs/json
 
@@ -15610,6 +15611,37 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### syn 3.0.3 — MIT
+
+Repository: https://github.com/dtolnay/syn
+
+```text
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
 ### thiserror-impl 1.0.69 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
@@ -15641,7 +15673,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror-impl 2.0.18 — MIT
+### thiserror-impl 2.0.19 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
@@ -15703,7 +15735,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror 2.0.18 — MIT
+### thiserror 2.0.19 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 

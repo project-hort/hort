@@ -4,9 +4,15 @@ metadata:
   name: github-actions
 spec:
   issuerUrl: https://token.actions.githubusercontent.com
-  # The accepted `aud` allow-list. CI MUST request this audience
-  # (core.getIDToken('hort-server')); a default-audience token is rejected.
-  audiences: ["hort-server"]
+  # The accepted `aud` allow-list. Per-class audiences (issue #82) replace
+  # the old single shared `hort-server` default: CI jobs request
+  # `hort-server-ci`, release jobs request `hort-server-release`. Plain
+  # `hort-server` stays accepted during the migration window (any job
+  # still requesting the old default must keep resolving) — drop it once
+  # the #82 cleanup follow-up confirms no caller requests it anymore.
+  # A token requesting an audience outside this list is rejected with
+  # AudMismatch before federatedIdentities matching is even attempted.
+  audiences: ["hort-server", "hort-server-ci", "hort-server-release"]
   # Defaults (left implicit): allowedAlgorithms ["RS256"]; requireJti true
   # (fail-closed replay protection — GitHub Actions OIDC tokens carry `jti`);
   # jwksRefreshInterval 1h. JWKS is auto-discovered over TLS (system trust +

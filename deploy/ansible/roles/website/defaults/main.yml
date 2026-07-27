@@ -1,0 +1,34 @@
+---
+# website role defaults — hort's static sites (issues #78, #77). The role
+# is parameterized per invocation (website_fqdn + website_root) so the same
+# role serves either site (or both, on the same or different hosts) — see
+# deploy/ansible/site-website.yml, which invokes this role twice.
+
+# website_fqdn — the public FQDN served by this vhost. REQUIRED: must be
+#   set per invocation (project-hort.de and hort.rs are equally valid
+#   callers; defaulting to either would silently mask a missing override
+#   on the other). tasks/main.yml asserts this is defined and non-empty,
+#   mirroring the certbot role's le_email pattern.
+
+# Where the built static tree is deployed on the target host.
+website_root: "/var/www/{{ website_fqdn }}"
+
+# Repo checkout root, computed relative to this playbook. The operator runs
+# ansible-playbook from a checkout of the hort repo (same assumption the rest
+# of this ansible tree makes — see deploy/ansible/README.md prerequisites),
+# so `scripts/build-site.sh` and its output (`site/dist/`) are reachable on
+# the CONTROL node without any extra checkout step.
+website_repo_root: "{{ playbook_dir }}/../.."
+# `scripts/site/generate.py` builds each site into its own
+# `site/dist/<fqdn>/` subdirectory (see its SITES registry) — `--site
+# {{ website_fqdn }}` builds only this invocation's site, so deploying one
+# doesn't pay the (cheap but pointless) cost of rebuilding the other.
+website_build_script: "{{ website_repo_root }}/scripts/build-site.sh --site {{ website_fqdn }}"
+website_dist_dir: "{{ website_repo_root }}/site/dist/{{ website_fqdn }}"
+
+# hort.rs only (issue #77): populate the permanent /dl/ version archive via
+# scripts/populate-dl-archive.sh after the vhost is up. Off by default —
+# project-hort.de has no archive to populate. Requires cosign (>= v3.0,
+# matching install/cosign.pin) already on the TARGET host's PATH; this role
+# does not bootstrap it (see the script's own header comment for why).
+website_dl_archive_enabled: false

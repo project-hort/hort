@@ -62,7 +62,7 @@ inconsistent middle:
 | `ephemeralStore.backend` | `memory` (default) | `redis` (**forced** by schema) |
 
 Minimum required values for any install (schema-enforced at
-`helm install` — see [§5](#5-installtime-validation)):
+`helm install` — see [§5](#5-install-time-validation)):
 
 | Key | Why |
 |---|---|

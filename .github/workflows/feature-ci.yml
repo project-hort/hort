@@ -43,7 +43,6 @@ jobs:
   build-and-prefetch:
     name: 🌱 Build (upstream) + warm hort
     runs-on: ubuntu-latest
-    environment: ci   # non-gating; stamps the OIDC environment:ci claim gha-ci matches (#64)
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -55,16 +54,24 @@ jobs:
       # bearer via GitHub OIDC → hort /exchange (same call as the hort-auth
       # action), then prefetches the resolved registry deps. hort cascades
       # transitively, so the resolved set is sufficient to warm the tree.
-      - name: Request OIDC token (audience=hort-server)
+      # Audience hort-server-ci (issue #82) — replaces the old environment:ci
+      # claim + shared 'hort-server' audience; gha-ci's federatedIdentities
+      # matches on {repository, aud: hort-server-ci}.
+      - name: Request OIDC token (audience=hort-server-ci)
         id: oidc
         if: ${{ vars.HORT_PROXY_ENABLED == 'true' }}
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
-            const token = await core.getIDToken('hort-server');
+            const token = await core.getIDToken('hort-server-ci');
             core.setSecret(token);
             core.setOutput('token', token);
 
+      # Kept in sync with prefetch-warm.yml's copy (issue #80): that workflow
+      # runs this same batched prefetch on develop pushes + nightly, because
+      # feature branches are never pushed to this repository (they live on the
+      # internal GitLab) — this trigger never fires here. Both sides carry
+      # this note.
       - name: Prefetch resolved dependencies into hort
         if: ${{ vars.HORT_PROXY_ENABLED == 'true' }}
         env:

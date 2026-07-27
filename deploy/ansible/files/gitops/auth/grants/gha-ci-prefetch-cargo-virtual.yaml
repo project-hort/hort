@@ -1,0 +1,25 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: gha-ci-prefetch-cargo-virtual
+spec:
+  # Per-repo serviceAccount-subject grant: gha-ci (GitHub Actions CI pull
+  # identity) may prefetch cargo-virtual — the single cargo source CI/dev
+  # builds resolve against (see repositories/cargo-virtual.yaml). Permissions
+  # are flat (read does not imply prefetch — see gha-ci-read-cargo-virtual.yaml
+  # for the sibling read grant); both are required by
+  # SelfServicePrefetchUseCase's Read ∧ Prefetch RBAC gate
+  # (crates/hort-app/src/use_cases/self_service_prefetch_use_case.rs).
+  #
+  # Design: docs/ci/hort-quarantine-integration.md's "The hort side — a read
+  # + prefetch ServiceAccount (gitops)" — the CI prefetch caller is a
+  # read+prefetch-only, non-admin ServiceAccount bearer. Fixes issue #80's
+  # first-real-run blocker (POST /api/v1/repositories/cargo-virtual/prefetch
+  # denied with "token kind is not CliSession" before the token-kind gate
+  # itself was corrected to admit a grant-holding ServiceAccount — see that
+  # use case's Gate 1 doc comment).
+  subject:
+    kind: serviceAccount
+    name: gha-ci
+  permission: prefetch
+  repository: cargo-virtual

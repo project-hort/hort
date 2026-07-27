@@ -1,0 +1,262 @@
+---
+# website role — hort's static sites (issues #78, #77): a self-contained
+# nginx vhost serving a fully static, pre-built directory. Zero runtime
+# dependency on hort-server; no server-side execution at all. Parameterized
+# per invocation (website_fqdn/website_root/website_dist_dir) so the SAME
+# role deploys either project-hort.de or hort.rs — see
+# deploy/ansible/site-website.yml, which invokes it twice.
+#
+# Self-contained by design: unlike the registry `nginx` role (which is tuned
+# for hort-server's streaming/large-body/OIDC needs), this role installs its
+# own nginx and templates its own vhost, so it can be deployed to a host that
+# never runs hort-server at all — or to the same host, alongside it, without
+# any changes to the registry nginx role. It defines its own copies of the
+# small, generic "Validate nginx config" / "Reload nginx" handlers rather
+# than relying on the registry nginx role's handlers being present in the
+# same play.
+#
+# Content-deploy mechanism (v1, per backlog/048 "simplest robust
+# mechanism"): build the static site on the CONTROL node (the operator's own
+# checkout already has the repo — same assumption the rest of this ansible
+# tree makes) via scripts/build-site.sh, then rsync the built site/dist/
+# tree onto the target host with ansible.posix.synchronize. `--rsync-path=
+# sudo rsync` on the remote side lets an unprivileged SSH user write into
+# the root-owned website_root without a separate stage-then-become copy
+# step — this repo's ansible operator account already has (passwordless or
+# -K) sudo, per deploy/ansible/README.md's prerequisites.
+#
+# hort.rs's dl/ archive (issue #77) lives INSIDE website_root (so nginx
+# serves it with zero extra vhost config) but is populated by a completely
+# separate script/task, never by the site build above — the sync task's
+# `--exclude=dl` is load-bearing: without it, the site sync's `--delete`
+# would erase the entire permanent archive on every single deploy, since
+# scripts/build-site.sh's own output only ever contains a placeholder
+# dl/index.html, never the real per-tag directories.
+
+- name: Assert website_fqdn is defined and non-empty
+  ansible.builtin.assert:
+    that:
+      - website_fqdn is defined
+      - website_fqdn | length > 0
+    fail_msg: >-
+      website_fqdn must be set per invocation (e.g. project-hort.de or
+      hort.rs) — pass it as a role var from the playbook. There is no
+      default; see defaults/main.yml for why.
+
+- name: Build the static site on the control node
+  ansible.builtin.command:
+    cmd: "{{ website_build_script }}"
+    chdir: "{{ website_repo_root }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: true
+  register: website_build_result
+
+- name: Fail with the build's own output if the site build failed
+  ansible.builtin.fail:
+    msg: "{{ website_build_result.stdout }}\n{{ website_build_result.stderr }}"
+  when: website_build_result.rc != 0
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Install nginx and rsync
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - rsync
+    state: present
+    update_cache: true
+
+- name: Ensure nginx is started and enabled
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Ensure the website content root exists
+  ansible.builtin.file:
+    path: "{{ website_root }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+- name: Stat LE certificate (determines whether the 443 block is rendered)
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ website_fqdn }}/fullchain.pem"
+  register: website_cert_stat
+
+- name: Template static vhost (sites-available)
+  ansible.builtin.template:
+    src: static-vhost.conf.j2
+    dest: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    website_cert_exists: "{{ website_cert_stat.stat.exists }}"
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Enable static vhost (sites-enabled symlink)
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ website_fqdn }}.conf"
+    state: link
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+- name: Remove default nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify:
+    - Validate nginx config
+    - Reload nginx
+
+# The certbot role runs NEXT in this play and issues the cert via the webroot
+# ACME challenge, which the CA fetches over HTTP from this vhost's port-80
+# block (location /.well-known/acme-challenge/ -> /var/www/html). The
+# "Reload nginx" handler notified above is play-scoped and only flushes at the
+# END of the play — i.e. AFTER certbot has already run — so without an explicit
+# reload here the CA hits an nginx that has not loaded this vhost yet and the
+# challenge 404s (observed: project-hort.de webroot challenge "Error getting
+# validation data"). Reload explicitly, before certbot, so the ACME vhost is
+# live. Idempotent (a no-op reload is cheap), and it also recovers a host left
+# in the "vhost enabled but never reloaded" state by an earlier failed run,
+# where the deferred handler never fired.
+- name: Check nginx config before the pre-certbot reload
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Reload nginx so the {{ website_fqdn }} ACME vhost is live before certbot
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded
+
+# Mirrors the built tree exactly (--delete): a page removed from the source
+# docs on a prior build doesn't linger as an orphaned, unlinked file forever.
+# `--exclude=dl` is load-bearing for hort.rs (see the header comment) — the
+# permanent /dl/ archive is populated by a separate task below, never by
+# this sync, and must survive every site rebuild untouched.
+- name: Sync the built site to the target host
+  ansible.posix.synchronize:
+    src: "{{ website_dist_dir }}/"
+    dest: "{{ website_root }}/"
+    delete: true
+    recursive: true
+    # NOTE: no raw --rsync-path here (first-deploy bug): a space-containing
+    # value in rsync_opts is rendered into the shell command unquoted and
+    # splits ("--rsync-path=sudo" + "rsync" -> remote runs bare `sudo
+    # --server ...` -> "unrecognized option"). The play's `become: true`
+    # already makes ansible inject a properly-quoted
+    # --rsync-path='sudo -u root rsync', which is all the remote-root rsync
+    # (and --chown) needs.
+    rsync_opts:
+      - "--chown=www-data:www-data"
+      - "--exclude=dl"
+
+- name: Fix directory permissions after sync
+  ansible.builtin.file:
+    path: "{{ website_root }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+    recurse: true
+
+# ── hort.rs only: permanent /dl/ version archive (issue #77) ────────────────
+
+- name: Install jq (required by populate-dl-archive.sh)
+  ansible.builtin.apt:
+    name: jq
+    state: present
+  when: website_dl_archive_enabled
+
+- name: Assert cosign is present on this host (populate-dl-archive.sh does not bootstrap it)
+  ansible.builtin.command:
+    cmd: cosign version
+  become: true
+  become_user: www-data
+  changed_when: false
+  when: website_dl_archive_enabled
+
+- name: Ensure the dl/ archive root exists
+  ansible.builtin.file:
+    path: "{{ website_root }}/dl"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+  when: website_dl_archive_enabled
+
+# Runs ON THE TARGET HOST (not delegated) — it needs the host's own network
+# path to GitHub, per backlog/050 ("needs network on the host — that's
+# fine, it's the operator's deploy step, not the site build"). Idempotent
+# and additive: an existing dl/<tag>/ is left untouched (see the script's
+# own header comment for the immutability + fail-closed-verify mechanics).
+# cosign's keyless verify-blob writes its Sigstore/TUF trust-root cache to
+# $HOME/.sigstore. Under become_user: www-data, HOME is /var/www (root-owned,
+# not www-data-writable), so the cache mkdir fails BEFORE any signature check
+# and every verify fails (issue #83 — same class as the #74 trivy read-only
+# cache). Give the populate run a persistent, www-data-owned HOME so the TUF
+# root caches across runs instead of re-fetching.
+- name: Ensure the /dl/ populate cache dir exists (cosign TUF root home)
+  ansible.builtin.file:
+    path: /var/cache/hort-dl-archive
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0700"
+  when: website_dl_archive_enabled
+
+# The populate script is a CONTROL-NODE file that must run ON THE TARGET HOST
+# (it needs the host's own network path to GitHub, and website_repo_root is a
+# control-node path that does not exist on the host — a plain `command` against
+# it fails rc=2). The obvious answer, `ansible.builtin.script`, cannot be used
+# here: `script` + `become_user: www-data` makes Ansible grant the unprivileged
+# user access to its staged tempfile, and on hosts without the `acl` package it
+# falls back to a `chmod A+user:www-data:rx:allow` form GNU chmod rejects — the
+# handoff dies before the script ever runs (issue #83, second layer). `command`
+# + become_user works fine on this host (the cosign assert above is the proof),
+# so: stage the script to a fixed root-owned path as root, then `command` it as
+# www-data. Root-owned deliberately — the fail-closed verifying script is never
+# writable by the account that executes it.
+- name: Ensure the host-run deploy script dir exists
+  ansible.builtin.file:
+    path: /usr/local/lib/hort
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: website_dl_archive_enabled
+
+- name: Stage populate-dl-archive.sh on the host (root-owned)
+  ansible.builtin.copy:
+    src: "{{ website_repo_root }}/scripts/populate-dl-archive.sh"
+    dest: /usr/local/lib/hort/populate-dl-archive.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: website_dl_archive_enabled
+
+- name: Populate the permanent /dl/ version archive
+  ansible.builtin.command:
+    cmd: "/usr/local/lib/hort/populate-dl-archive.sh {{ website_root }}/dl"
+    # A www-data-accessible cwd: with the connection user's home as cwd, the
+    # script's `find` cannot restore its initial working directory as www-data
+    # ("Failed to restore initial working directory: /home/…: Permission
+    # denied").
+    chdir: /var/cache/hort-dl-archive
+  become: true
+  become_user: www-data
+  environment:
+    # Writable HOME for cosign's ~/.sigstore TUF cache (issue #83).
+    HOME: /var/cache/hort-dl-archive
+  register: website_dl_result
+  changed_when: "'0 new version(s) populated' not in website_dl_result.stdout"
+  when: website_dl_archive_enabled

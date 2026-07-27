@@ -1,0 +1,119 @@
+/* project-hort.de — shared stylesheet.
+ * Inline-CSS posture mirrors install/index.html: no external stylesheets,
+ * no CDN fonts, no JS. Served from the same origin as every page. */
+
+:root {
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  max-width: 48rem;
+  margin: 0 auto;
+  padding: 0 1rem 3rem;
+  color: #1a1a1a;
+  background: #fff;
+}
+
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, pre {
+  background: #f4f4f5;
+  border-radius: 6px;
+  font: 0.9em/1.4 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+}
+pre { padding: 1rem; overflow: auto; }
+code { padding: 0.1rem 0.35rem; }
+pre code { padding: 0; background: none; }
+
+h1, h2, h3, h4 { line-height: 1.25; }
+h1 { margin-bottom: 0.2rem; }
+h2 { margin-top: 2.2rem; border-bottom: 1px solid #e5e5e8; padding-bottom: 0.3rem; }
+h3 { margin-top: 1.6rem; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+  font-size: 0.95em;
+}
+th, td {
+  border: 1px solid #e5e5e8;
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+th { background: #f9f9fb; }
+
+blockquote {
+  margin: 1rem 0;
+  padding: 0.2rem 1rem;
+  border-left: 3px solid #d4d4d8;
+  color: #52525b;
+}
+
+hr { border: none; border-top: 1px solid #e5e5e8; margin: 2rem 0; }
+
+/* ── Site chrome ─────────────────────────────────────────────────────── */
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.2rem 0;
+  border-bottom: 1px solid #e5e5e8;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+.site-header .brand { font-weight: 700; font-size: 1.1rem; color: #1a1a1a; }
+.site-header .brand:hover { text-decoration: none; }
+.site-header nav a { margin-left: 1.2rem; }
+.site-header nav a:first-child { margin-left: 0; }
+
+.site-footer {
+  margin-top: 3rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid #e5e5e8;
+  color: #71717a;
+  font-size: 0.9em;
+}
+.site-footer a { color: #52525b; }
+
+.pillars { list-style: none; padding: 0; margin: 1.5rem 0; }
+.pillars li {
+  padding: 0.6rem 0 0.6rem 1.6rem;
+  position: relative;
+  border-bottom: 1px solid #f4f4f5;
+}
+.pillars li:before { content: "\2192"; position: absolute; left: 0; color: #2563eb; }
+
+.hero { margin: 1.5rem 0 2rem; }
+.hero .mnemonic { font-weight: 600; letter-spacing: 0.02em; }
+
+.cta { margin: 1.5rem 0; }
+.cta a {
+  display: inline-block;
+  padding: 0.55rem 1.1rem;
+  border-radius: 6px;
+  border: 1px solid #2563eb;
+  margin: 0.2rem 0.5rem 0.2rem 0;
+}
+.cta a.primary { background: #2563eb; color: #fff; }
+.cta a.secondary { color: #2563eb; }
+
+.docs-index ul { padding-left: 1.2rem; }
+.docs-index h3 { margin-top: 1.4rem; }
+
+.badge-status {
+  display: inline-block;
+  font-size: 0.85em;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}

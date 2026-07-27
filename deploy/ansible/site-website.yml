@@ -1,0 +1,81 @@
+---
+# hort's static sites (issues #78, #77): project-hort.de (landing +
+# operator docs) and hort.rs (CLI landing + user docs + the permanent /dl/
+# version archive). Both are self-contained, zero-runtime-dependency-on-
+# hort-server deployments of the SAME `website` role — this playbook can
+# run against the SAME host as site-native.yml/site-podman.yml or an
+# entirely separate one; nothing here reads registry_fqdn, hort_api_port,
+# or any other hort-server-specific variable.
+#
+# TWO SEPARATE PLAYS, not two `roles:` entries in one play — see
+# roles/website/handlers/main.yml's header comment for why this is load-
+# bearing (handler-name deduplication is per-play; collapsing both sites
+# into one play would break the second site's post-certbot vhost re-render).
+#
+# Role execution order (per site):
+#   website — installs nginx, builds that site (scripts/build-site.sh
+#             --site <fqdn>) on the control node and rsyncs it to the host,
+#             templates the port-80-only vhost (cert not yet issued), and
+#             (hort.rs only) populates the permanent /dl/ archive
+#   certbot — Let's Encrypt certificate issuance + renewal for that site's
+#             domain (certbot_fqdn / certbot_notify_handlers overridden so
+#             the shared certbot role certifies THIS domain and re-renders
+#             THIS vhost, not the registry one or the sibling site's)
+#
+# Required vars (group_vars/production/ or --extra-vars):
+#   le_email — Let's Encrypt registration email (same variable the registry
+#              playbooks use; certbot's own role asserts it's set)
+
+- name: Deploy the project-hort.de static site
+  hosts: website
+  become: true
+  # Flush the nginx validate+reload handlers even if a later task fails —
+  # without this, a mid-play failure (e.g. the first-deploy sync bug) leaves
+  # a templated-and-enabled vhost that nginx never loaded, and the next
+  # run's unchanged tasks never re-notify (observed on the first production
+  # deploy: the ACME challenge failed with a connection error because the
+  # port-80 vhost was never live).
+  force_handlers: true
+  gather_facts: true
+
+  vars:
+    website_fqdn: project-hort.de
+
+  roles:
+    - role: website
+    - role: certbot
+      vars:
+        certbot_fqdn: "{{ website_fqdn }}"
+        certbot_notify_handlers:
+          - "Render website vhost (cert present)"
+          - "Validate nginx config"
+          - "Reload nginx"
+
+- name: Deploy the hort.rs static site
+  hosts: website
+  become: true
+  # Flush the nginx validate+reload handlers even if a later task fails —
+  # without this, a mid-play failure (e.g. the first-deploy sync bug) leaves
+  # a templated-and-enabled vhost that nginx never loaded, and the next
+  # run's unchanged tasks never re-notify (observed on the first production
+  # deploy: the ACME challenge failed with a connection error because the
+  # port-80 vhost was never live).
+  force_handlers: true
+  gather_facts: true
+
+  vars:
+    website_fqdn: hort.rs
+    # The permanent CLI version archive (issue #77) — off by default in the
+    # role; this is the one site that wants it. Requires cosign already on
+    # this host's PATH (see roles/website/defaults/main.yml).
+    website_dl_archive_enabled: true
+
+  roles:
+    - role: website
+    - role: certbot
+      vars:
+        certbot_fqdn: "{{ website_fqdn }}"
+        certbot_notify_handlers:
+          - "Render website vhost (cert present)"
+          - "Validate nginx config"
+          - "Reload nginx"

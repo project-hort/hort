@@ -1,0 +1,74 @@
+# nginx vhost for {{ website_fqdn }}
+# Managed by Ansible — do not edit by hand.
+#
+# Fully static — no proxy_pass, no upstream, no server-side execution at
+# all. Modeled on the registry role's registry.hort.rs.conf.j2 for the
+# bootstrap/TLS shape (pre-cert HTTP-only -> cert-gated 443 block), but
+# stripped of everything specific to fronting hort-server (large-body /
+# streaming tuning, rate-limit zone, Dex path, OIDC).
+#
+# H1-invariant (pre-cert bootstrap), same as the registry vhost: when
+# website_cert_exists = false the cert-gated 443 block is omitted entirely
+# (written without Jinja delimiters here so this comment is not itself
+# parsed as a tag), so there is no "listen 443 ssl" reference to a missing
+# certificate.
+
+# ── {{ website_fqdn }} — port 80 (ACME + redirect) ───────────────────────────
+server {
+    listen 80;
+    server_name {{ website_fqdn }};
+    # Let certbot's webroot ACME challenge through on port 80;
+    # redirect everything else to HTTPS.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+{% if website_cert_exists %}
+# ── {{ website_fqdn }} — port 443 (TLS) ──────────────────────────────────────
+server {
+    listen 443 ssl;
+    server_name {{ website_fqdn }};
+
+    ssl_certificate     /etc/letsencrypt/live/{{ website_fqdn }}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{{ website_fqdn }}/privkey.pem;
+    # No ssl_dhparam — see registry.hort.rs.conf.j2's identical note: the
+    # webroot ACME model doesn't create ssl-dhparams.pem, and nginx
+    # 1.11.0+'s built-in ffdhe2048 default covers DHE suites; TLS 1.3 needs
+    # none at all.
+
+    ssl_protocols {{ nginx_ssl_protocols | default('TLSv1.2 TLSv1.3') }};
+    ssl_prefer_server_ciphers off;
+    ssl_ciphers {{ nginx_ssl_ciphers | default('ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305') }};
+    ssl_session_cache shared:le_website_SSL:10m;
+    ssl_session_timeout 1440m;
+    ssl_session_tickets off;
+
+    # HSTS — instruct browsers to use HTTPS for this domain for 2 years.
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # Security headers — static content, no cookies/auth, so this is a
+    # tighter posture than the registry vhost needs to allow (no
+    # Authorization header, no API responses).
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Content-Security-Policy "default-src 'self'" always;
+
+    # Suppress the nginx version (Server header / error pages).
+    server_tokens off;
+
+    access_log /var/log/nginx/{{ website_fqdn }}.access.log combined;
+    error_log  /var/log/nginx/{{ website_fqdn }}.error.log;
+
+    root {{ website_root }};
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+{% endif %}

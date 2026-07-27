@@ -1,0 +1,106 @@
+name: Prefetch warm (Cargo.lock → hort)
+# Warms the vetted hort cargo proxy with hort's EXACT Cargo.lock (issue #80).
+#
+# `release.yml`'s `hort-publish` resolves every locked dependency through the
+# vetted index (`cargo-virtual`, released_only). The lock's pinned versions
+# must therefore be pulled + quarantined + released BEFORE a release, or the
+# publish discovers misses serially (fail at the first miss → wait out a 24 h
+# quarantine → next miss — it never converges). The batched prefetch below
+# starts every missing dep's quarantine window IN PARALLEL: one window total.
+#
+# `feature-ci.yml` carries the identical step for feature branches — but this
+# repository's feature development happens on the internal GitLab (feature
+# branches are never pushed here), so that trigger never fires; develop/main
+# syncs and this schedule are the pushes this repo actually receives. Keep the
+# step in sync with feature-ci.yml's copy (both sides carry this note).
+#
+# SECURITY (why these triggers are safe to mint a hort bearer): `push` to
+# develop fires only for pushes to THIS repository (forks cannot push here),
+# `schedule`/`workflow_dispatch` run in this repository's own context. Do NOT
+# add `pull_request`/`pull_request_target` — fork code must never see the
+# credential (same rule as feature-ci.yml).
+#
+# Fire-and-forget: this workflow never gates anything. A failed warm means the
+# next release's crates-publish may hit cold deps — visible there, not here.
+on:
+  push:
+    branches: [develop]
+    paths:
+      - 'Cargo.lock'
+      - '.github/workflows/prefetch-warm.yml'
+  schedule:
+    # Nightly: covers a final cut >24 h after the last develop sync, quarantine
+    # expiry churn, and locks that arrived via means other than a develop push.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HORT_URL: https://registry.hort.rs
+  CARGO_SOURCE_REPO: cargo-virtual
+
+jobs:
+  prefetch-warm:
+    name: 🔥 Warm hort with the exact Cargo.lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # mint the GitHub OIDC token for hort federation
+    if: ${{ vars.HORT_PROXY_ENABLED == 'true' }}
+    steps:
+      # On `schedule`/`workflow_dispatch` the default ref is the default
+      # branch (main); the lock we must warm is develop's — the next
+      # release's lock (main's is a historical subset of it at promotion).
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: develop
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Audience hort-server-ci (issue #82) — replaces the old environment:ci
+      # claim + shared 'hort-server' audience; gha-ci's federatedIdentities
+      # matches on {repository, aud: hort-server-ci}.
+      - name: Request OIDC token (audience=hort-server-ci)
+        id: oidc
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const token = await core.getIDToken('hort-server-ci');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      # Identical mechanism to feature-ci.yml's "Prefetch resolved
+      # dependencies into hort" step (keep in sync — both sides note this):
+      # resolve the LOCKED graph, batch-POST it to the prefetch API. Every
+      # missing version starts its pull-through + quarantine immediately.
+      - name: Prefetch the exact Cargo.lock into hort
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -uo pipefail
+          token=$(curl -sSf -X POST "${HORT_URL}/api/v1/auth/exchange" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "subject_token=${OIDC_TOKEN}" \
+            --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            | jq -r '.access_token // empty') || true
+          if [ -z "${token:-}" ]; then
+            echo "::warning::hort token exchange failed — proxy not warmed this run (non-fatal)"
+            exit 0
+          fi
+          echo "::add-mask::${token}"
+
+          items=$(cargo metadata --format-version 1 --locked \
+            | jq -c '[.packages[]
+                      | select(.source != null and (.source | startswith("registry")))
+                      | {package: .name, version: .version}]')
+          echo "Prefetching $(printf '%s' "$items" | jq 'length') locked registry dependencies into hort/${CARGO_SOURCE_REPO}…"
+          curl -sS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "{\"items\": ${items}}" \
+            | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"' \
+            || echo "::warning::prefetch POST failed — proxy not warmed this run (non-fatal)"

@@ -239,6 +239,88 @@ ansible-playbook -i inventory/production/hosts.ini site-podman.yml \
   --ask-vault-pass --check --diff
 ```
 
+## hort's static sites: project-hort.de + hort.rs (issues #78, #77)
+
+Two fully static sites, one `website` ansible role — zero runtime
+dependency on hort-server. `site-website.yml` is **two plays**, both
+targeting the `[website]` inventory group (same host as `[hort]`, the same
+`[website]` host for both sites, or separate hosts — nothing in either play
+reads a hort-server-specific variable):
+
+- **project-hort.de** — landing + operator docs (issue #78).
+- **hort.rs** — CLI landing + user docs + the installer scripts at their
+  exact published apex paths (`/install-cli.sh`, `/install-cli.ps1`,
+  `/cosign.pin`) + the permanent `/dl/` version archive (issue #77).
+
+A single run deploys both:
+
+```bash
+ansible-playbook -i inventory/production/hosts.ini site-website.yml --ask-vault-pass
+```
+
+Re-run any time the docs, `README.md`, or the installer scripts change to
+redeploy — there is no separate "publish" step; the ansible run IS the
+publish step. (Use `--tags`/`--limit`, or edit the playbook's two plays
+temporarily, to deploy only one site.)
+
+**Prerequisites (both sites):**
+
+1. **DNS A records:** `project-hort.de` AND `hort.rs` must each resolve to
+   their target host's public IP before running the play (certbot's
+   webroot ACME challenge needs this per domain — same requirement as
+   `registry_fqdn`). This is the operator's step; the playbook does not
+   manage DNS.
+2. **`le_email`** in Vault (same variable the registry playbooks use —
+   certbot's role is shared across all three domains this ansible tree can
+   certify).
+3. **The control node needs a checkout of this repo**, `python3`, and
+   `rsync` on `PATH` — the `website` role builds each site's `site/dist/
+   <fqdn>/` locally (via `scripts/build-site.sh --site <fqdn>`) then
+   `ansible.posix.synchronize`s it to the target host. `python3` is the
+   only dependency the build itself has (see `scripts/site/generate.py`'s
+   module docstring for why); `rsync` is standard on virtually every
+   Linux/macOS control node already.
+
+**hort.rs only — the `/dl/` permanent version archive (issue #77):**
+
+4. **`cosign` (>= v3.0, matching `install/cosign.pin`) must already be
+   installed on the hort.rs TARGET host's `PATH`.** Unlike
+   `install-cli.sh` (which bootstraps a pinned cosign for an arbitrary
+   end-user machine), `scripts/populate-dl-archive.sh` assumes an
+   operator-controlled deploy host with cosign already trusted and
+   present — the role asserts this explicitly (`cosign version`) and fails
+   with an actionable message if it's missing. Install it however you
+   trust (matching the version in `install/cosign.pin`); this role does
+   not manage it.
+5. The target host needs its own outbound network path to `api.github.com`
+   / `github.com` — the archive backfill runs *on the host*, not the
+   control node (see `scripts/populate-dl-archive.sh`'s header comment for
+   why: it's the operator's deploy step, not the site build, and must
+   survive independently of every site rebuild).
+
+**Content-deploy mechanism (v1):** build-at-ansible-run-time. The `website`
+role runs `scripts/build-site.sh --site <fqdn>` on the **control node**
+(delegated, `run_once`), then `ansible.posix.synchronize`s the resulting
+`site/dist/<fqdn>/` onto the target host's `/var/www/<fqdn>` (`--delete`,
+so a page removed from the source docs doesn't linger as an orphan —
+`--exclude=dl` protects hort.rs's permanent archive from that same delete).
+This is the simplest robust option for a small, infrequently-changing
+static site — a push-based artifact pipeline (build in CI, publish to an
+object store, pull on deploy) would remove the "control node needs a
+checkout" prerequisite but is more moving parts than these sites currently
+need; revisit if the deploy cadence or site size grows enough to make the
+rsync-from-checkout model awkward.
+
+`/dl/` itself is populated by a **separate task**
+(`scripts/populate-dl-archive.sh`, run on the target host, gated by
+`website_dl_archive_enabled: true` for the hort.rs play only) that
+backfills every published GitHub release it doesn't already have — see the
+script's own header comment for the immutability + fail-closed-verify
+mechanics (an existing `dl/<tag>/` is never re-fetched or overwritten; a
+verification failure never places a partial/untrusted directory). It's
+safe and cheap to re-run on every deploy: already-archived tags are
+skipped outright.
+
 ## First admin (bootstrap-session)
 
 The playbook provisions only **non-admin** service accounts (see *Provisioned
@@ -306,6 +388,7 @@ privilege.
 | `certbot` | 4 | Let's Encrypt certificate issuance + renewal timer |
 | `fail2ban` | 4 | SSH + nginx auth brute-force protection |
 | `gitops` | 4 | Sync gitops config tree; restart hort-server; mint operator tokens |
+| `website` | 16 | project-hort.de + hort.rs static sites: build + rsync + self-contained nginx vhost + (hort.rs) `/dl/` archive populate (issues #78, #77) |
 
 ## certbot operations
 

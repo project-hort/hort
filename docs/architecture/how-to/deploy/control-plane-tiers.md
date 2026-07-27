@@ -19,7 +19,7 @@ The control-plane listener makes the segmentation a shipped, default,
 documented control. This document is that documentation.
 
 **This is defense-in-depth — never a substitute for authz.** See
-[§4](#4-defense-in-depth-framing-not-a-substitute-for-authz).
+[§4](#4-defense-in-depth-framing--not-a-substitute-for-authz).
 
 ---
 

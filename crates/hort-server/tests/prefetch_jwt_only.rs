@@ -249,6 +249,58 @@ fn cli_session_with_developer_claim_grant_authorizes_prefetch_200() {
     });
 }
 
+#[test]
+#[serial(hort_pg_db)]
+fn service_account_with_prefetch_grant_authorizes_prefetch_200() {
+    // issue #80, full-router variant of the use-case-level
+    // `service_account_with_prefetch_grant_succeeds_and_enqueues` test
+    // (crates/hort-app/src/use_cases/self_service_prefetch_use_case.rs)
+    // — same repo/grant shape as the CliSession test immediately above,
+    // only the token kind differs, exercising the real axum extractor +
+    // handler + use-case chain end-to-end for the CI ServiceAccount
+    // caller docs/ci/hort-quarantine-integration.md designs.
+    let prom_handle = PrometheusBuilder::new().build_recorder().handle();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let key = repo.key.clone();
+        let (router, mocks) =
+            build_router_with_rbac(evaluator_read_and_prefetch("gha-ci", repo_id), prom_handle);
+        mocks.repositories.insert(repo);
+        mocks
+            .repository_upstream_mappings
+            .upsert(mapping(repo_id))
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({
+            "items": [ { "package": "left-pad", "version": "1.0.0" } ],
+        });
+        let url = format!("/api/v1/repositories/{}/prefetch", key);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(url)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        auth_test::inject_principal(
+            &mut req,
+            caller_with_token_kind(&["gha-ci"], Some(TokenKind::ServiceAccount)),
+        );
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "ServiceAccount + Read+Prefetch grant must authorize prefetch (issue #80)",
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // 1. PAT → 403 + token_kind_denied tick exactly once
 // ---------------------------------------------------------------------------
@@ -291,8 +343,12 @@ fn pat_principal_returns_403_with_exact_reason_and_ticks_token_kind_denied_once(
             let resp = router.oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
             let body = body_string(resp).await;
+            // issue #80: prefetch's message widened to name both accepted
+            // kinds (CliSession or ServiceAccount) since the gate itself
+            // widened — a PAT caller is still rejected, just with the
+            // corrected message.
             assert!(
-                body.contains("this endpoint requires a CLI session token"),
+                body.contains("this endpoint requires a CLI session or service-account token"),
                 "exact reason string missing — body: {body}",
             );
         });

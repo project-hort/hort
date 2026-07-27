@@ -1,0 +1,41 @@
+---
+# Handlers run after all tasks notify them (at end of play or after
+# meta: flush_handlers). "Validate nginx config" is listed first in every
+# notify list so it runs before "Reload nginx" — Ansible executes handlers
+# in notification order but deduplicates, so a task that notifies both gets
+# validate -> reload as long as validate is registered first here. Mirrors
+# the registry nginx role's handlers/main.yml exactly (same shape,
+# deliberately duplicated rather than shared — see tasks/main.yml's header
+# comment for why this role is self-contained).
+#
+# IMPORTANT (issue #77): handlers are deduplicated by NAME within a single
+# PLAY. This role is invoked once per site (project-hort.de, hort.rs) —
+# deploy/ansible/site-website.yml MUST keep each invocation in its OWN play
+# (not two `roles:` entries in one play), or the second site's "Render
+# website vhost (cert present)" notification would collapse into the
+# first's single handler run at flush time, re-rendering the WRONG site's
+# vhost (or simply never firing for the second site at all).
+
+# Re-renders the vhost with the 443 block after the certbot role issues a
+# cert on a fresh host. Notified by the certbot role's cert-issuance task
+# via certbot_notify_handlers (handler names are play-scoped, so reachable
+# from any role in the same play — the site-website.yml playbook always runs
+# this role and certbot in the same play).
+- name: Render website vhost (cert present)
+  ansible.builtin.template:
+    src: static-vhost.conf.j2
+    dest: "/etc/nginx/sites-available/{{ website_fqdn }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    website_cert_exists: true
+
+- name: Validate nginx config
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Reload nginx
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

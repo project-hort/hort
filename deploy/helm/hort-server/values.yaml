@@ -242,7 +242,7 @@ auth:
     # also the pin `global.imageRegistry` (see above) rewrites onto
     # `<imageRegistry>/hort-base/dex:<tag>` when set — see
     # `hort-server.dex.image` in templates/_helpers.tpl.
-    image: "ghcr.io/dexidp/dex:v2.41.1"
+    image: "ghcr.io/dexidp/dex:v2.45.1"
     imagePullPolicy: IfNotPresent
     # The OIDC issuer URL Dex advertises AND that hort-server validates
     # against. MUST be reachable from both clients and the hort-server pod
@@ -1276,7 +1276,7 @@ scheduledTasks:
   # `docker.io/bitnamilegacy/*` as the documented migration path. The
   # image content (entrypoint, /bin/bash availability) is preserved,
   # so the chart's `command: [/bin/sh, -c, ...]` shape continues to work.
-  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.30"
+  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.33"
 
   # When `true`, force-rotate the cronjob-tasks svc-token on the next
   # helm upgrade. The bootstrap Job's init container passes `--rotate`

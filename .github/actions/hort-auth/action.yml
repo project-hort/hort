@@ -10,6 +10,15 @@ description: >
   not break CI.
 
 inputs:
+  audience:
+    description: >
+      Requested OIDC audience. MUST be one of `OidcIssuer.spec.audiences`
+      and match the `aud` claim of the target `ServiceAccount`'s
+      `federatedIdentities[]` entry — e.g. `hort-server-ci` for CI jobs,
+      `hort-server-release` for release jobs (issue #82). Required, no
+      default: every caller states its class explicitly rather than
+      falling back to a shared audience that no longer discriminates SAs.
+    required: true
   proxy_enabled:
     description: >
       Value of the `HORT_PROXY_ENABLED` repo variable, threaded in by the
@@ -57,15 +66,17 @@ runs:
         fi
 
     # ── OIDC token ─────────────────────────────────────────────────────────────
-    # audience MUST be 'hort-server' — this is what OidcIssuer.audiences
-    # validates against. A default-audience token is rejected with AudMismatch.
-    - name: Request OIDC token (audience=hort-server)
+    # audience is the caller-supplied `inputs.audience` — MUST be one of
+    # OidcIssuer.spec.audiences. A token requesting an audience outside that
+    # allow-list is rejected with AudMismatch (issue #82: per-class audiences
+    # replace the old shared 'hort-server' default + environment:ci claim).
+    - name: Request OIDC token (audience=${{ inputs.audience }})
       id: oidc
       if: steps.guard.outputs.enabled == 'true'
       uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
       with:
         script: |
-          const token = await core.getIDToken('hort-server');
+          const token = await core.getIDToken('${{ inputs.audience }}');
           core.setSecret(token);
           core.setOutput('oidc_token', token);
 
