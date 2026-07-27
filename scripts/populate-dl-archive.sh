@@ -230,3 +230,29 @@ echo "==> Regenerating ${DL_ROOT}/index.html"
   printf '</ul></body></html>\n'
 } > "${DL_ROOT}/index.html"
 echo "  wrote ${DL_ROOT}/index.html"
+
+# Per-version index pages (issue #85). Without one, nginx has no index file
+# for dl/<tag>/ and autoindex is off, so every version link on the archive
+# index 403s. Regenerated for EVERY version dir on EVERY run — including
+# long-populated ones — like the top-level index above: the append-only /
+# immutability contract (backlog/050) covers the *verified release assets*;
+# the index.html files are derived presentation, never verified and never
+# listed as assets, so regenerating them does not touch that contract.
+for dir in $(find "$DL_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -Vr); do
+  {
+    printf '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    printf '<title>hort-cli %s — hort.rs</title>' "$dir"
+    printf '<link rel="stylesheet" href="../../assets/style.css"></head><body>'
+    printf '<h1>hort-cli %s</h1>' "$dir"
+    printf '<p>Every binary ships with its <code>.sha256</code> checksum and <code>.bundle</code> cosign signature — verify per <a href="https://github.com/project-hort/hort/blob/main/install/README.md">install/README.md</a>. Back to the <a href="../">version index</a>.</p>'
+    printf '<ul>\n'
+    find "${DL_ROOT}/${dir}" -mindepth 1 -maxdepth 1 -type f ! -name index.html -printf '%f\n' \
+      | sort \
+      | while IFS= read -r f; do
+          size="$(numfmt --to=iec --suffix=B "$(stat -c %s "${DL_ROOT}/${dir}/${f}")")"
+          printf '<li><a href="%s">%s</a> <small>(%s)</small></li>\n' "$f" "$f" "$size"
+        done
+    printf '</ul></body></html>\n'
+  } > "${DL_ROOT}/${dir}/index.html"
+done
+echo "  wrote per-version index.html for $(find "$DL_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l) version dir(s)"
