@@ -32,7 +32,7 @@ the result instead.
 | kube | 3.1.0 | Apache-2.0 | https://github.com/kube-rs/kube |
 | metrics-exporter-prometheus | 0.18.3 | Apache-2.0 | https://github.com/metrics-rs/metrics |
 | pep440_rs | 0.7.3 | Apache-2.0 | https://github.com/konstin/pep440-rs |
-| rpassword | 7.5.2 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
+| rpassword | 7.5.4 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
 | rtoolbox | 0.0.5 | Apache-2.0 | https://github.com/conradkleinespel/rtoolbox |
 | ryu-js | 1.0.2 | Apache-2.0 | https://github.com/boa-dev/ryu-js |
 | ryu | 1.0.23 | Apache-2.0 | https://github.com/dtolnay/ryu |
@@ -123,15 +123,15 @@ the result instead.
 | hkdf | 0.12.4 | MIT | https://github.com/RustCrypto/KDFs/ |
 | poly1305 | 0.8.0 | MIT | https://github.com/RustCrypto/universal-hashes |
 | httparse | 1.10.1 | MIT | https://github.com/seanmonstar/httparse |
-| futures-channel | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-core | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-executor | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-io | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-macro | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-sink | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-task | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-util | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
-| futures | 0.3.32 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-channel | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-core | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-executor | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-io | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-macro | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-sink | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-task | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-util | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
 | hashbrown | 0.14.5 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.15.5 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.16.1 | MIT | https://github.com/rust-lang/hashbrown |
@@ -168,7 +168,7 @@ the result instead.
 | arc-swap | 1.9.2 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.14 | MIT | https://github.com/hyperium/h2 |
-| http | 1.4.0 | MIT | https://github.com/hyperium/http |
+| http | 1.4.2 | MIT | https://github.com/hyperium/http |
 | tokio-rustls | 0.26.4 | MIT | https://github.com/rustls/tokio-rustls |
 | signal-hook-registry | 1.4.8 | MIT | https://github.com/vorner/signal-hook |
 | cookie-factory | 0.3.2 | MIT | https://github.com/rust-bakery/cookie-factory |
@@ -246,7 +246,7 @@ the result instead.
 | cpufeatures | 0.3.0 | MIT | https://github.com/RustCrypto/utils |
 | password-hash | 0.6.1 | MIT | https://github.com/RustCrypto/traits |
 | metrics-exporter-prometheus | 0.18.3 | MIT | https://github.com/metrics-rs/metrics |
-| metrics-util | 0.20.3 | MIT | https://github.com/metrics-rs/metrics |
+| metrics-util | 0.20.4 | MIT | https://github.com/metrics-rs/metrics |
 | metrics | 0.24.6 | MIT | https://github.com/metrics-rs/metrics |
 | crypto-common | 0.1.7 | MIT | https://github.com/RustCrypto/traits |
 | crypto-bigint | 0.5.5 | MIT | https://github.com/RustCrypto/crypto-bigint |
@@ -278,10 +278,10 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.1 | MIT | https://github.com/clap-rs/clap |
-| clap_builder | 4.6.0 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.4 | MIT | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.2 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.5.55 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.1 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 0.7.7 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -340,7 +340,7 @@ the result instead.
 | rustls-platform-verifier | 0.7.0 | MIT | https://github.com/rustls/rustls-platform-verifier |
 | matchit | 0.7.3 | MIT | https://github.com/ibraheemdev/matchit |
 | web-time | 1.1.0 | MIT | https://github.com/daxpedda/web-time |
-| chrono | 0.4.44 | MIT | https://github.com/chronotope/chrono |
+| chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.8.1 | MIT | https://github.com/boinkor-net/governor.git |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
 | object_store | 0.13.2 | MIT | https://github.com/apache/arrow-rs-object-store |
@@ -423,9 +423,9 @@ the result instead.
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
 | syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror-impl | 2.0.18 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror-impl | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror | 2.0.18 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | unsafe-libyaml | 0.2.11 | MIT | https://github.com/dtolnay/unsafe-libyaml |
 | zmij | 1.0.21 | MIT | https://github.com/dtolnay/zmij |
@@ -3327,7 +3327,7 @@ limitations under the License.
 
 ```
 
-### rpassword 7.5.2 — Apache-2.0
+### rpassword 7.5.4 — Apache-2.0
 
 Repository: https://github.com/conradkleinespel/rpassword
 
@@ -6545,7 +6545,7 @@ THE SOFTWARE.
 
 ```
 
-### futures-channel 0.3.32 — MIT
+### futures-channel 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6579,7 +6579,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-core 0.3.32 — MIT
+### futures-core 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6613,7 +6613,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-executor 0.3.32 — MIT
+### futures-executor 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6647,7 +6647,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-io 0.3.32 — MIT
+### futures-io 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6681,7 +6681,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-macro 0.3.32 — MIT
+### futures-macro 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6715,7 +6715,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-sink 0.3.32 — MIT
+### futures-sink 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6749,7 +6749,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-task 0.3.32 — MIT
+### futures-task 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6783,7 +6783,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-util 0.3.32 — MIT
+### futures-util 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6817,7 +6817,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures 0.3.32 — MIT
+### futures 0.3.33 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -8017,7 +8017,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### http 1.4.0 — MIT
+### http 1.4.2 — MIT
 
 Repository: https://github.com/hyperium/http
 
@@ -10555,7 +10555,7 @@ SOFTWARE.
 
 ```
 
-### metrics-util 0.20.3 — MIT
+### metrics-util 0.20.4 — MIT
 
 Repository: https://github.com/metrics-rs/metrics
 
@@ -11547,7 +11547,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.1 — MIT
+### clap 4.6.4 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11574,7 +11574,7 @@ SOFTWARE.
 
 ```
 
-### clap_builder 4.6.0 — MIT
+### clap_builder 4.6.2 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11628,7 +11628,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.1 — MIT
+### clap_derive 4.6.4 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13277,7 +13277,7 @@ SOFTWARE.
 
 ```
 
-### chrono 0.4.44 — MIT
+### chrono 0.4.45 — MIT
 
 Repository: https://github.com/chronotope/chrono
 
@@ -15673,7 +15673,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror-impl 2.0.18 — MIT
+### thiserror-impl 2.0.19 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
@@ -15735,7 +15735,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror 2.0.18 — MIT
+### thiserror 2.0.19 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
