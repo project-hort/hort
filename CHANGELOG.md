@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-07-27
+
+### Added
+
+- **Self-hosted project websites.** [project-hort.de](https://project-hort.de)
+  (landing page + operator documentation) and [hort.rs](https://hort.rs)
+  (hort-cli page + user documentation) now build from this repo
+  (`scripts/build-site.sh`) and deploy via the `website` ansible role
+  (`deploy/ansible/site-website.yml`) — self-contained static sites with no
+  runtime dependency on hort-server. hort.rs additionally serves the
+  permanent, append-only `/dl/` version archive of hort-cli release
+  binaries; every archived asset is verified (SHA-256 + cosign keyless
+  signature, the installer's own parameters) before it is placed, and a
+  populated tag directory is never re-fetched or overwritten. (#77, #78)
+
+### Changed
+
+- **CI federation is discriminated by OIDC audience, not a GitHub
+  `environment:`.** The `gha-ci` / `gha-release` service accounts now match
+  on a dedicated `aud` claim (`hort-server-ci` / `hort-server-release`)
+  requested per workflow; the CI jobs drop the non-gating `environment: ci`
+  marker that minted a misleading GitHub deployment record on every routine
+  run. `environment: release` stays on the release jobs, where the
+  deployment records are meaningful. (#82)
+
+### Fixed
+
+- **The crates-publish release job can converge.** The vetted cargo proxy
+  was warmed only by ad-hoc traffic, so `cargo publish` discovered hort's
+  exact pinned dependency versions missing one 24-h quarantine window at a
+  time. A `prefetch-warm` workflow now warms the proxy with the exact
+  `Cargo.lock` on develop pushes and nightly (all misses quarantine in
+  parallel, one window total), and the self-service prefetch endpoint
+  accepts the spec-designed read+prefetch ServiceAccount caller instead of
+  rejecting every CI run with a 403. (#80)
+
+### Security
+
+- **`lru` upgraded 0.12.5 → 0.18.1, removing RUSTSEC-2026-0002 outright**
+  instead of accepting the advisory via build-side ignores or a registry
+  Exclusion. The advisory-sync guard now treats registry-level `Exclusion`s
+  as a hard-gated nuclear option (they waive a finding for *every* registry
+  consumer, not just hort's own build) — any Exclusion without an explicit
+  justification marker fails the gate. (#80)
+
 ## [0.9.13] - 2026-07-23
 
 ### Added
