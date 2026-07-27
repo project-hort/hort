@@ -35,6 +35,14 @@ The name captures the first four of these as a mnemonic:
 
 **HORT** = **H**ashed · **O**rigin · **R**epository · **T**rail
 
+## Project sites
+
+- **[project-hort.de](https://project-hort.de)** — the project landing page
+  and operator documentation.
+- **[hort.rs](https://hort.rs)** — the hort-cli page and user documentation,
+  plus the permanent version archive of signed CLI binaries at
+  [hort.rs/dl/](https://hort.rs/dl/).
+
 ## Status
 
 Hort is pre-1.0 and under active development, approaching a v1.0 release.
