@@ -45,6 +45,7 @@
 //! atomic two-phase write.
 
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use arc_swap::ArcSwap;
 use uuid::Uuid;
@@ -65,6 +66,18 @@ use hort_domain::types::IdempotencyKey;
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::rbac::RbacEvaluator;
+
+/// Bounded CAS-retry budget for the `TaskInvoked` append on the
+/// kind-routed audit stream (issue #86, mirroring the #62 SA-stream
+/// precedent in `ApiTokenUseCase`). Every non-destructive kind routes to
+/// the single global [`StreamId::authorization`] stream, so concurrent
+/// enqueues race the same `(stream, position)` unique index; a loser
+/// re-appends the same event (`ExpectedVersion::Any` means the adapter
+/// re-reads the tail itself on each attempt — no client-side expected-
+/// version bookkeeping is needed). 5 is generous headroom for realistic
+/// parallelism; exhausting it falls through to the existing
+/// compensating-delete-and-surface-the-error path unchanged.
+const TASK_AUDIT_APPEND_RETRY_ATTEMPTS: u32 = 5;
 
 /// Application use case for admin-task enqueue operations.
 pub struct TaskUseCase {
@@ -321,23 +334,65 @@ impl TaskUseCase {
         //    kind stays on `authorization()` (no behaviour change).
         let params_digest = TaskInvoked::compute_params_digest(params);
         let stream_id = Self::task_audit_stream(kind);
-        let append = AppendEvents {
-            stream_id: stream_id.clone(),
-            expected_version: ExpectedVersion::Any,
-            events: vec![EventToAppend::new(DomainEvent::TaskInvoked(TaskInvoked {
-                task_job_id: audit_job_id,
-                kind: kind.to_string(),
-                params_digest,
-                duplicate_of,
-            }))],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: Actor::Api(ApiActor {
-                user_id: actor.user_id,
-            }),
+        let event = DomainEvent::TaskInvoked(TaskInvoked {
+            task_job_id: audit_job_id,
+            kind: kind.to_string(),
+            params_digest,
+            duplicate_of,
+        });
+        let correlation_id = Uuid::new_v4();
+
+        // Bounded CAS retry (issue #86): `ExpectedVersion::Any` means the
+        // adapter re-reads the stream tail itself on every attempt, so a
+        // losing `DomainError::Conflict` is resolved by simply
+        // re-invoking `append` with a fresh `AppendEvents` — no
+        // client-side expected-version re-read is needed (contrast the
+        // #62 SA-stream precedent, which retries a *specific* expected
+        // version and therefore does re-read). Only `Conflict` is
+        // retried; any other error fails fast and consumes none of the
+        // budget.
+        let mut attempt: u32 = 0;
+        let append_result = loop {
+            let append = AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
+                causation_id: None,
+                actor: Actor::Api(ApiActor {
+                    user_id: actor.user_id,
+                }),
+            };
+            match self.events.append(append).await {
+                Ok(result) => break Ok(result),
+                Err(DomainError::Conflict(_)) if attempt + 1 < TASK_AUDIT_APPEND_RETRY_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(
+                        job_id = %audit_job_id,
+                        kind,
+                        attempt,
+                        "TaskInvoked append conflict — retrying with a fresh append",
+                    );
+                    let jitter_ms = u64::from(rand::random::<u8>() % 3);
+                    tokio::time::sleep(StdDuration::from_millis(
+                        u64::from(attempt) * 2 + jitter_ms,
+                    ))
+                    .await;
+                }
+                Err(err @ DomainError::Conflict(_)) => {
+                    tracing::warn!(
+                        job_id = %audit_job_id,
+                        kind,
+                        attempts = TASK_AUDIT_APPEND_RETRY_ATTEMPTS,
+                        "TaskInvoked append retry budget exhausted (transient contention)",
+                    );
+                    break Err(err);
+                }
+                Err(other) => break Err(other),
+            }
         };
 
-        if let Err(append_err) = self.events.append(append).await {
+        if let Err(append_err) = append_result {
             // 6. Compensating delete — best-effort; log the outcome but do
             //    NOT mask the original error.
             //
@@ -431,6 +486,7 @@ mod tests {
     use hort_domain::types::ContentHash;
 
     use crate::rbac::RbacEvaluator;
+    use crate::use_cases::test_support::MockEventStore;
 
     // -----------------------------------------------------------------------
     // Mock infrastructure
@@ -1383,5 +1439,159 @@ mod tests {
             payload.duplicate_of, None,
             "TaskInvoked.duplicate_of must be None on the fresh-enqueue branch"
         );
+    }
+
+    // -- Bounded CAS-retry on the TaskInvoked append (issue #86) ------------
+    //
+    // These use the shared `test_support::MockEventStore` (rather than the
+    // local `RecordingEventStore` above) because only the shared mock has
+    // the `fail_next_append` / `fail_all_appends` / one-shot-vs-persistent
+    // injection hooks the #62 precedent established for exercising a
+    // bounded retry loop.
+
+    /// A single `Conflict` on the first attempt is absorbed by the retry
+    /// loop: the second attempt (a fresh `AppendEvents`, same event)
+    /// succeeds, `enqueue` returns `Ok`, and the event lands durably
+    /// exactly once (the mock never records a failed attempt, so
+    /// `appended_batches().len() == 1` also proves the retry re-appends
+    /// rather than double-appending).
+    #[tokio::test]
+    async fn enqueue_retries_taskinvoked_append_once_on_conflict() {
+        let job_id = Uuid::new_v4();
+        let jobs = Arc::new(RecordingJobsRepository::new(job_id));
+        let events = Arc::new(MockEventStore::new());
+        events.fail_next_append(DomainError::Conflict(
+            "stream authorization concurrent append at position 0".into(),
+        ));
+        let use_case = TaskUseCase::new(
+            Arc::clone(&jobs) as _,
+            crate::event_store_publisher::wrap_for_test(Arc::clone(&events)),
+            rbac_with_task_invoke(),
+        );
+
+        let actor = caller_with_task_admin_role();
+        let outcome = use_case
+            .enqueue(&actor, "noop", &serde_json::json!({}), None)
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        assert_eq!(outcome, EnqueueOutcome::Enqueued { job_id });
+
+        let batches = events.appended_batches();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the winning append must land exactly once, not twice"
+        );
+        assert!(
+            jobs.delete_calls().is_empty(),
+            "a recovered append must never trigger the compensating delete"
+        );
+    }
+
+    /// Pathological contention — EVERY append attempt conflicts. The
+    /// bounded retry loop must exhaust
+    /// (`TASK_AUDIT_APPEND_RETRY_ATTEMPTS`) and fall through to exactly
+    /// today's failure behaviour: the error is surfaced, and — on the
+    /// fresh-enqueue branch — the compensating delete fires.
+    #[tokio::test]
+    async fn enqueue_exhausted_retry_surfaces_error_and_compensates_on_fresh_branch() {
+        let job_id = Uuid::new_v4();
+        let jobs = Arc::new(RecordingJobsRepository::new(job_id));
+        let events = Arc::new(MockEventStore::new());
+        events.fail_all_appends(DomainError::Conflict(
+            "stream authorization concurrent append at position 0".into(),
+        ));
+        let use_case = TaskUseCase::new(
+            Arc::clone(&jobs) as _,
+            crate::event_store_publisher::wrap_for_test(Arc::clone(&events)),
+            rbac_with_task_invoke(),
+        );
+
+        let actor = caller_with_task_admin_role();
+        let result = use_case
+            .enqueue(&actor, "noop", &serde_json::json!({}), None)
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Domain(DomainError::Conflict(_)))),
+            "exhaustion must surface the original Conflict error; got {result:?}"
+        );
+
+        assert!(
+            events.appended_batches().is_empty(),
+            "no TaskInvoked should be durably appended when every retry conflicts"
+        );
+        // Fresh-enqueue branch: exactly today's compensating-delete
+        // behaviour on append failure.
+        let delete_calls = jobs.delete_calls();
+        assert_eq!(delete_calls.len(), 1);
+        assert_eq!(delete_calls[0].job_id, job_id);
+    }
+
+    /// Same exhaustion as above, but on the `Duplicate` branch — the
+    /// existing compensating-delete gating (fresh-enqueue only) must be
+    /// unchanged by the retry: no delete on exhaustion either.
+    #[tokio::test]
+    async fn enqueue_exhausted_retry_does_not_compensate_on_duplicate_branch() {
+        let existing_id = Uuid::new_v4();
+        let jobs = Arc::new(RecordingJobsRepository::with_duplicate(existing_id));
+        let events = Arc::new(MockEventStore::new());
+        events.fail_all_appends(DomainError::Conflict(
+            "stream authorization concurrent append at position 0".into(),
+        ));
+        let use_case = TaskUseCase::new(
+            Arc::clone(&jobs) as _,
+            crate::event_store_publisher::wrap_for_test(Arc::clone(&events)),
+            rbac_with_task_invoke(),
+        );
+
+        let key = IdempotencyKey::try_from("cron:noop:2026-06-03").expect("valid");
+        let actor = caller_with_task_admin_role();
+        let result = use_case
+            .enqueue(&actor, "noop", &serde_json::json!({}), Some(&key))
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Domain(DomainError::Conflict(_)))),
+            "exhaustion must surface the original Conflict error; got {result:?}"
+        );
+
+        assert!(
+            jobs.delete_calls().is_empty(),
+            "the Duplicate branch must never compensate-delete, even on retry exhaustion"
+        );
+    }
+
+    /// A genuine (non-`Conflict`) append error must fail fast on the
+    /// FIRST attempt — no retry. Proven indirectly: `fail_next_append`
+    /// is one-shot, so if the loop retried, the second attempt would
+    /// hit the mock's default success path and `enqueue` would return
+    /// `Ok`; asserting `Err` here pins that no second attempt occurs.
+    #[tokio::test]
+    async fn enqueue_non_conflict_append_error_does_not_retry() {
+        let job_id = Uuid::new_v4();
+        let jobs = Arc::new(RecordingJobsRepository::new(job_id));
+        let events = Arc::new(MockEventStore::new());
+        events.fail_next_append(DomainError::Invariant("event store append down".into()));
+        let use_case = TaskUseCase::new(
+            Arc::clone(&jobs) as _,
+            crate::event_store_publisher::wrap_for_test(Arc::clone(&events)),
+            rbac_with_task_invoke(),
+        );
+
+        let actor = caller_with_task_admin_role();
+        let result = use_case
+            .enqueue(&actor, "noop", &serde_json::json!({}), None)
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Domain(DomainError::Invariant(_)))),
+            "a non-Conflict append error must propagate on the first attempt, unretried; \
+             got {result:?}"
+        );
+        assert!(
+            events.appended_batches().is_empty(),
+            "no TaskInvoked should be durably appended when the append itself fails"
+        );
+        let delete_calls = jobs.delete_calls();
+        assert_eq!(delete_calls.len(), 1);
+        assert_eq!(delete_calls[0].job_id, job_id);
     }
 }
