@@ -44,4 +44,7 @@ pub mod heartbeat;
 pub mod license;
 pub mod metrics_server;
 pub mod poll_loop;
+/// Bounded startup retry with backoff, used by `main.rs` around the
+/// one-shot composition-root app-context build (issue #86).
+pub mod startup_retry;
 pub mod telemetry;
