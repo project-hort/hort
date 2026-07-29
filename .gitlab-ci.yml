@@ -17,7 +17,7 @@
 # clippy-driver and llvm-cov instrumentation) and the buildah image builds compile
 # inside the Docker build, where RUSTC_WRAPPER doesn't reach.
 include:
-  - component: gitlab.kdp.kloni.cloud/idp/components-catalog/supply-chain/sccache@v0.7.0
+  - component: gitlab.kdp.kloni.cloud/idp/components-catalog/supply-chain/sccache@v0.8.0
 
 stages:
   - test
