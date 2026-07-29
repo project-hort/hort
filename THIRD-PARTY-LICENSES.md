@@ -288,9 +288,9 @@ the result instead.
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
 | serde_spanned | 1.1.1 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.1.4+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_parser | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_parser | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_writer | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
 | time-core | 0.1.8 | MIT | https://github.com/time-rs/time |
@@ -11817,7 +11817,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.1.3+spec-1.1.0 — MIT
+### toml 1.1.4+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -11871,7 +11871,7 @@ SOFTWARE.
 
 ```
 
-### toml_parser 1.1.2+spec-1.1.0 — MIT
+### toml_parser 1.1.3+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
