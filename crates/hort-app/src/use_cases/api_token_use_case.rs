@@ -56,7 +56,9 @@ use hort_domain::events::{
 };
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{
+    AppendEvents, AppendResult, EventStore, EventToAppend, ExpectedVersion,
+};
 use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::types::{Page, PageRequest};
 
@@ -64,8 +66,6 @@ use crate::argon2_hash::hash_token;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::labels;
 use crate::rbac::RbacEvaluator;
-
-use super::read_expected_version;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -170,13 +170,32 @@ const TOKEN_PREFIX_LEN: usize = 8;
 /// Lowercase base32 alphabet, RFC 4648 §6.
 const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-/// Bounded CAS-retry budget for the system-mint `ApiTokenIssued` append
-/// on the SA's user stream (issue #62). Parallel jobs minting for the
-/// same `ServiceAccount` race this append; a loser re-reads the fresh
-/// head and re-appends the same event. 5 is generous headroom for
-/// realistic parallelism — exhausting it means pathological contention,
-/// surfaced as [`ApiTokenError::Contended`] rather than a 500.
-const SA_STREAM_APPEND_RETRY_ATTEMPTS: u32 = 5;
+/// Bounded CAS-retry budget for every `StreamId::user(...)` append in
+/// this file (issue #87, superseding issue #62's SA-only version). The
+/// per-user stream has many `ExpectedVersion::Any` co-writers (the SA
+/// rotation reconciler, subscriptions, `AdminStatusChanged`,
+/// revocations), so ALL of these appends — not just the SA system-mint
+/// — race. None of them read the stream's *content* to make a
+/// decision (see [`append_any_with_conflict_retry`]'s doc), so every
+/// one appends at [`ExpectedVersion::Any`] and retries only a losing
+/// `DomainError::Conflict`. 5 is generous headroom for realistic
+/// parallelism — exhausting it means pathological contention, not an
+/// infrastructure fault.
+const USER_STREAM_APPEND_RETRY_ATTEMPTS: u32 = 5;
+
+/// `10ms * 4^(attempt-1)` (10/40/160/640ms across the 4 backoff gaps
+/// between 5 attempts) + 0–10ms jitter. Real headroom vs issue #62's
+/// original ~2ms/4ms/6ms/8ms (~20ms total) budget, which issue #87's
+/// triage found routinely exhausted under sustained co-writer bursts or
+/// elevated DB latency — the CAS protected no read-state decision, so
+/// the tiny original backoff was sized for "spread out same-tick
+/// retriers," not for surviving real contention. Worst-case total sleep
+/// is ~850ms + jitter, safely under 1s.
+fn user_stream_append_backoff(attempt: u32) -> StdDuration {
+    let base_ms = 10u64.saturating_mul(4u64.saturating_pow(attempt.saturating_sub(1)));
+    let jitter_ms = u64::from(rand::random::<u8>() % 11); // 0..=10ms
+    StdDuration::from_millis(base_ms + jitter_ms)
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -571,9 +590,11 @@ pub enum ApiTokenError {
     #[error("issuer requires a jti claim")]
     JtiRequired,
 
-    /// 503 — the SA-stream `ApiTokenIssued` append's bounded CAS-retry
+    /// 503 — the SA-stream `ApiTokenIssued` append's bounded retry
     /// budget was exhausted under concurrent-mint contention (issue
-    /// #62). **Transient, not an infrastructure fault**: the token row
+    /// #62; the retry itself was revised by issue #87 to drop the
+    /// needless expected-version read — the exhaustion mapping here is
+    /// unchanged). **Transient, not an infrastructure fault**: the token row
     /// is already persisted (`self.tokens.insert` succeeded once and is
     /// never retried); only the event append raced and lost every
     /// attempt. Distinct from [`Self::Infrastructure`] so callers can
@@ -654,21 +675,58 @@ pub struct ApiTokenUseCase {
     cli_session_revocation_denylist: Option<Arc<dyn EphemeralStore>>,
 }
 
-/// [`read_expected_version`] for the SA-stream `ApiTokenIssued` append,
-/// mapped to [`ApiTokenError::Infrastructure`]. Shared by the initial
-/// read and every CAS-retry re-read (issue #62) so the error-mapping
-/// logic exists at one call site instead of being duplicated per
-/// attempt.
-async fn read_sa_stream_expected_version(
+/// Bounded CAS-retry for an `ExpectedVersion::Any` append that protects
+/// NO decision made from the stream's content (issue #87). Every
+/// `StreamId::user(...)` append in this file fits that shape: none of
+/// them inspect the stream's prior events, they only ever needed a
+/// version NUMBER for the CAS write — and `ExpectedVersion::Any` means
+/// the adapter re-reads the tail itself on each attempt, so a losing
+/// `DomainError::Conflict` is resolved by simply re-invoking `append`
+/// with a fresh (byte-identical) `AppendEvents`, no client-side
+/// expected-version read at all (contrast the pre-#87 SA-mint shape,
+/// which read a *specific* expected version and re-read it on every
+/// retry).
+///
+/// `build` is called once per attempt to produce a fresh `AppendEvents`
+/// — callers close over the (already-built-once) event, correlation id,
+/// and actor, and just re-package them each call.
+///
+/// Retries ONLY `DomainError::Conflict`; any other error returns
+/// immediately, consuming none of the budget. On exhaustion, returns
+/// the final attempt's `DomainError::Conflict` verbatim — the SAME
+/// value an unretried single attempt would have produced — so callers
+/// can pattern-match `Err(DomainError::Conflict(_))` to detect
+/// exhaustion: a `Conflict` can only reach the caller after the retry
+/// budget is spent, since every intermediate `Conflict` is absorbed
+/// here; `Err(other)` means the very first attempt already failed for a
+/// different reason and was never retried.
+async fn append_any_with_conflict_retry(
     events: &dyn EventStore,
-    stream_id: &StreamId,
-) -> Result<ExpectedVersion, ApiTokenError> {
-    read_expected_version(events, stream_id, false)
-        .await
-        .map_err(|e| match e {
-            crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
-            other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
-        })
+    attempts: u32,
+    backoff: impl Fn(u32) -> StdDuration,
+    mut build: impl FnMut() -> AppendEvents,
+) -> hort_domain::error::DomainResult<AppendResult> {
+    let mut attempt: u32 = 1;
+    loop {
+        let batch = build();
+        let stream_id = batch.stream_id.clone();
+        match events.append(batch).await {
+            Ok(result) => return Ok(result),
+            Err(DomainError::Conflict(_)) if attempt < attempts => {
+                let delay = backoff(attempt);
+                tracing::debug!(
+                    %stream_id,
+                    attempt,
+                    attempts,
+                    delay_ms = delay.as_millis() as u64,
+                    "user-stream append conflict — retrying with a fresh append",
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 impl ApiTokenUseCase {
@@ -1088,22 +1146,24 @@ impl ApiTokenUseCase {
         // 8. Emit ApiTokenIssued on the token-owner's user stream,
         //    attributed to System.
         //
-        //    Bounded CAS retry (issue #62): parallel jobs minting for the
-        //    same ServiceAccount race this append — the loser's Postgres
-        //    unique-index rejection on `(stream_id, stream_position)`
-        //    surfaces as `DomainError::Conflict`. The event is
-        //    load-bearing (the subscription/event feed, the metrics
-        //    projection, and the audit join with
-        //    `ServiceAccountTokenRotated` on the same stream all read
-        //    it), so the fix retries the SAME append rather than
-        //    dropping it — mirroring
-        //    `ProvenanceOrchestrationUseCase::cascade_one`. Simpler than
-        //    that precedent: no idempotency re-check is needed here.
-        //    Each mint is a *distinct* token (`token.id` is fresh, and
-        //    the row is already inserted above and never retried) — a
-        //    conflict only ever means "re-read the fresh head and
-        //    re-append the same event," never "was this already
-        //    applied."
+        //    Bounded CAS retry (issue #62, revised by issue #87):
+        //    parallel jobs minting for the same ServiceAccount race this
+        //    append — the loser's Postgres unique-index rejection on
+        //    `(stream_id, stream_position)` surfaces as
+        //    `DomainError::Conflict`. The event is load-bearing (the
+        //    subscription/event feed, the metrics projection, and the
+        //    audit join with `ServiceAccountTokenRotated` on the same
+        //    stream all read it), so the fix retries the SAME append
+        //    rather than dropping it. Each mint is a *distinct* token
+        //    (`token.id` is fresh, and the row is already inserted
+        //    above and never retried) — a conflict only ever means
+        //    "re-append the same event," never "was this already
+        //    applied," so (issue #87) there is no read-state decision
+        //    to protect: the append is `ExpectedVersion::Any`, with no
+        //    client-side expected-version read at all (the #62-era
+        //    read-a-specific-version CAS protected nothing but its own
+        //    version number, and its ~20ms retry budget routinely
+        //    exhausted under sustained co-writer bursts — issue #87).
         let stream_id = StreamId::user(target.id);
         let event = DomainEvent::ApiTokenIssued(ApiTokenIssued {
             token_id: token.id,
@@ -1136,59 +1196,37 @@ impl ApiTokenUseCase {
                 .map(|fs| fs.subject.clone()),
         });
         let correlation_id = Uuid::new_v4();
-        let mut expected =
-            read_sa_stream_expected_version(self.events.as_ref(), &stream_id).await?;
-        let mut attempt: u32 = 0;
-        loop {
-            match self
-                .events
-                .append(AppendEvents {
-                    stream_id: stream_id.clone(),
-                    expected_version: expected,
-                    events: vec![EventToAppend::new(event.clone())],
-                    correlation_id,
-                    causation_id: None,
-                    actor: system_actor(),
-                })
-                .await
-            {
-                Ok(_) => break,
-                Err(DomainError::Conflict(_)) if attempt + 1 < SA_STREAM_APPEND_RETRY_ATTEMPTS => {
-                    attempt += 1;
-                    tracing::debug!(
-                        token_id = %token.id,
-                        user_id = %target.id,
-                        attempt,
-                        "API token issuance: SA-stream append conflict — \
-                         retrying with a fresh read",
-                    );
-                    // Tiny linear backoff + jitter so concurrent retriers
-                    // spread out instead of all re-colliding on the same
-                    // freshly-read head.
-                    let jitter_ms = u64::from(rand::random::<u8>() % 3);
-                    tokio::time::sleep(StdDuration::from_millis(
-                        u64::from(attempt) * 2 + jitter_ms,
-                    ))
-                    .await;
-                    expected =
-                        read_sa_stream_expected_version(self.events.as_ref(), &stream_id).await?;
-                }
-                Err(DomainError::Conflict(_)) => {
-                    // Retry budget exhausted — pathological contention,
-                    // not an infra fault. `warn!`, not `error!`: nothing
-                    // is broken, and the caller gets a retryable 503, not
-                    // a 500.
-                    tracing::warn!(
-                        token_id = %token.id,
-                        user_id = %target.id,
-                        attempts = SA_STREAM_APPEND_RETRY_ATTEMPTS,
-                        "API token issuance: SA-stream append retry budget \
-                         exhausted (transient contention)",
-                    );
-                    return Err(ApiTokenError::Contended);
-                }
-                Err(other) => return Err(ApiTokenError::Infrastructure(other)),
+        match append_any_with_conflict_retry(
+            self.events.as_ref(),
+            USER_STREAM_APPEND_RETRY_ATTEMPTS,
+            user_stream_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
+                causation_id: None,
+                actor: system_actor(),
+            },
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(DomainError::Conflict(_)) => {
+                // Retry budget exhausted — pathological contention,
+                // not an infra fault. `warn!`, not `error!`: nothing
+                // is broken, and the caller gets a retryable 503, not
+                // a 500.
+                tracing::warn!(
+                    token_id = %token.id,
+                    user_id = %target.id,
+                    attempts = USER_STREAM_APPEND_RETRY_ATTEMPTS,
+                    "API token issuance: SA-stream append retry budget \
+                     exhausted (transient contention)",
+                );
+                return Err(ApiTokenError::Contended);
             }
+            Err(other) => return Err(ApiTokenError::Infrastructure(other)),
         }
 
         tracing::info!(
@@ -1357,14 +1395,12 @@ impl ApiTokenUseCase {
         self.tokens.insert(&token).await?;
 
         // 8. Emit ApiTokenIssued on the token-owner's user stream,
-        //    attributed to System.
+        //    attributed to System. `ExpectedVersion::Any` + bounded
+        //    conflict-retry (issue #87): this append protects no
+        //    decision made from the stream's content, so — like the
+        //    SA system-mint above — it needs a version NUMBER, not a
+        //    read.
         let stream_id = StreamId::user(target.id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
-                other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
-            })?;
         let event = DomainEvent::ApiTokenIssued(ApiTokenIssued {
             token_id: token.id,
             user_id: target.id,
@@ -1380,16 +1416,21 @@ impl ApiTokenUseCase {
             source_jti: None,
             source_sub: None,
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            USER_STREAM_APPEND_RETRY_ATTEMPTS,
+            user_stream_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: system_actor(),
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         tracing::info!(
             token_id = %token.id,
@@ -1678,13 +1719,10 @@ impl ApiTokenUseCase {
         // and must stay auditable even though the credential is now a
         // stateless JWT.
         let now = Utc::now();
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #87):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(target.id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
-                other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
-            })?;
         let event = DomainEvent::ApiTokenIssued(ApiTokenIssued {
             token_id: jti,
             user_id: target.id,
@@ -1705,16 +1743,21 @@ impl ApiTokenUseCase {
             source_jti: None,
             source_sub: None,
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            USER_STREAM_APPEND_RETRY_ATTEMPTS,
+            user_stream_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
-                actor: hort_domain::events::Actor::Api(actor),
-            })
-            .await?;
+                actor: hort_domain::events::Actor::Api(actor.clone()),
+            },
+        )
+        .await?;
 
         Ok(IssuedToken {
             id: jti,
@@ -1843,13 +1886,10 @@ impl ApiTokenUseCase {
         self.tokens.insert(&token).await?;
 
         // 9. Emit ApiTokenIssued on the token-owner's user stream.
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #87):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(target.id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
-                other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
-            })?;
         let minted_by_admin_id = if actor.user_id == target.id {
             None
         } else {
@@ -1883,16 +1923,21 @@ impl ApiTokenUseCase {
                 .as_ref()
                 .map(|fs| fs.subject.clone()),
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            USER_STREAM_APPEND_RETRY_ATTEMPTS,
+            user_stream_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: hort_domain::events::Actor::Api(actor.clone()),
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         tracing::info!(
             token_id = %token.id,
@@ -2228,13 +2273,10 @@ impl ApiTokenUseCase {
         request: &IssueTokenRequest,
         denial_reason: DenialReason,
     ) -> Result<(), ApiTokenError> {
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #87):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(actor_user_id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
-                other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
-            })?;
         let event = DomainEvent::ApiTokenIssuanceDenied(ApiTokenIssuanceDenied {
             target_user_id,
             requested_kind,
@@ -2243,18 +2285,23 @@ impl ApiTokenUseCase {
             denial_reason,
             at: Utc::now(),
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            USER_STREAM_APPEND_RETRY_ATTEMPTS,
+            user_stream_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: hort_domain::events::Actor::Api(ApiActor {
                     user_id: actor_user_id,
                 }),
-            })
-            .await?;
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -2288,13 +2335,10 @@ impl ApiTokenUseCase {
         self.tokens.revoke(token_id).await?;
 
         // Emit ApiTokenRevoked on the token-owner's user stream.
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #87):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(token.user_id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::Domain(d) => ApiTokenError::Infrastructure(d),
-                other => ApiTokenError::Infrastructure(DomainError::Invariant(other.to_string())),
-            })?;
         let revoked_by_admin_id = if admin_authority && actor.user_id != token.user_id {
             Some(actor.user_id)
         } else {
@@ -2307,16 +2351,21 @@ impl ApiTokenUseCase {
             reason: RevokeReason::OperatorRequest,
             at: Utc::now(),
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            USER_STREAM_APPEND_RETRY_ATTEMPTS,
+            user_stream_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: hort_domain::events::Actor::Api(actor.clone()),
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         let actor_kind = if admin_authority && actor.user_id != token.user_id {
             "admin"
@@ -3067,6 +3116,57 @@ mod tests {
         assert_eq!(count_denials(&events), 0);
     }
 
+    /// Issue #87: `issue_inner` (the shared opaque-token append site for
+    /// self-mint / admin-mint / federation issuance) also protects no
+    /// stream-content decision. A single conflict is absorbed
+    /// transparently.
+    #[tokio::test(start_paused = true)]
+    async fn issue_self_token_retries_append_once_on_conflict() {
+        let (caller, rbac) = full_grants_principal();
+        let (uc, tokens, users, events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        events.fail_next_append(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let issued = uc
+            .issue_self_token(&caller, make_request_pat())
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        assert!(issued.plaintext.starts_with("hort_pat_"));
+        assert_eq!(tokens.inserts().len(), 1);
+        assert_eq!(events.appended_batches().len(), 1);
+        assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #87: pathological contention exhausts the retry budget;
+    /// `issue_inner` has no `Contended` special-case, so the final
+    /// `Conflict` propagates via `?` into `Infrastructure` exactly as an
+    /// unretried single attempt would have before #87.
+    #[tokio::test(start_paused = true)]
+    async fn issue_self_token_exhausted_retry_returns_infrastructure() {
+        let (caller, rbac) = full_grants_principal();
+        let (uc, tokens, users, events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        events.fail_all_appends(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let err = uc
+            .issue_self_token(&caller, make_request_pat())
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(err, ApiTokenError::Infrastructure(DomainError::Conflict(_))),
+            "got {err:?}"
+        );
+        // Row already inserted before the append loop runs (unchanged).
+        assert_eq!(tokens.inserts().len(), 1);
+        assert!(events.appended_batches().is_empty());
+    }
+
     // ---------- IssuedToken.name ----------
 
     /// The issuance response shape includes
@@ -3121,6 +3221,68 @@ mod tests {
             DenialReason::CapExceedsAuthority
         ));
         assert_eq!(count_issuances(&events), 0);
+    }
+
+    /// Issue #87: `emit_denial`'s append (the requesting-actor-stream
+    /// audit trail for a refused issuance) also protects no
+    /// stream-content decision. A single conflict is absorbed
+    /// transparently and the caller still observes the intended
+    /// `CapExceedsAuthority` denial.
+    #[tokio::test(start_paused = true)]
+    async fn emit_denial_retries_append_once_on_conflict() {
+        let (caller, rbac) = principal_with_grants(vec![(Permission::Read, None)]);
+        let (uc, tokens, users, events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        events.fail_next_append(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+        let request = IssueTokenRequest {
+            declared_permissions: vec![Permission::Write],
+            repository_ids: Some(vec![Uuid::from_u128(0xA)]),
+            ..make_request_pat()
+        };
+
+        let err = uc.issue_self_token(&caller, request).await.unwrap_err();
+        assert!(
+            matches!(err, ApiTokenError::CapExceedsAuthority { .. }),
+            "the retry must be transparent — the caller still sees the \
+             intended denial, not an infra error; got {err:?}"
+        );
+        assert!(tokens.inserts().is_empty());
+        assert_eq!(events.appended_batches().len(), 1);
+        assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #87: pathological contention on the denial-audit append
+    /// exhausts the retry budget. `emit_denial` has no `Contended`
+    /// special-case, so its final `Conflict` propagates via `?` — and,
+    /// because `run_issuance_gates` awaits `emit_denial` BEFORE
+    /// returning `CapExceedsAuthority`, the infra error masks the
+    /// intended denial exactly as an unretried single attempt would
+    /// have before #87 (pre-existing masking behaviour, unchanged by
+    /// this fix).
+    #[tokio::test(start_paused = true)]
+    async fn emit_denial_exhausted_retry_masks_denial_with_infrastructure() {
+        let (caller, rbac) = principal_with_grants(vec![(Permission::Read, None)]);
+        let (uc, _tokens, users, events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        events.fail_all_appends(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+        let request = IssueTokenRequest {
+            declared_permissions: vec![Permission::Write],
+            repository_ids: Some(vec![Uuid::from_u128(0xA)]),
+            ..make_request_pat()
+        };
+
+        let err = uc.issue_self_token(&caller, request).await.unwrap_err();
+        assert!(
+            matches!(err, ApiTokenError::Infrastructure(DomainError::Conflict(_))),
+            "got {err:?}"
+        );
+        assert!(events.appended_batches().is_empty());
     }
 
     // ---------- service-account self-mint ----------
@@ -3510,16 +3672,28 @@ mod tests {
         let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
         // No admin minted this — the field carries None.
         assert!(event.minted_by_admin_id.is_none());
+
+        // Issue #87: `ExpectedVersion::Any` needs no client-side
+        // expected-version read at all — the pre-#87 shape read the
+        // stream once just to get a version number. Pin the round-trip
+        // reduction directly.
+        assert_eq!(
+            events.read_stream_call_count(),
+            0,
+            "the mint path must never call read_stream anymore"
+        );
     }
 
-    /// Issue #62: two concurrent mints for the same `ServiceAccount`
+    /// Issue #62/#87: two concurrent mints for the same `ServiceAccount`
     /// race the SA-stream append; the loser's first attempt hits
-    /// `DomainError::Conflict`. The bounded CAS-retry loop must re-read
-    /// the head and re-append the SAME event, succeeding on the second
-    /// try — the token row is inserted exactly once (never retried) and
-    /// `ApiTokenIssued` is durably appended exactly once (the failed
-    /// first attempt is never recorded).
-    #[tokio::test]
+    /// `DomainError::Conflict`. The bounded retry loop must re-invoke
+    /// `append` with a fresh (byte-identical) `AppendEvents` — no
+    /// client-side read at all, since #87 dropped the expected-version
+    /// CAS — succeeding on the second try. The token row is inserted
+    /// exactly once (never retried) and `ApiTokenIssued` is durably
+    /// appended exactly once (the failed first attempt is never
+    /// recorded).
+    #[tokio::test(start_paused = true)]
     async fn issue_for_service_account_system_retries_append_once_on_conflict() {
         let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
         users.insert(user(true));
@@ -3549,15 +3723,25 @@ mod tests {
         );
         let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
         assert_eq!(event.kind, TokenKind::ServiceAccount);
+
+        // Issue #87: no expected-version read, ever — not on the first
+        // attempt, not on the retry.
+        assert_eq!(
+            events.read_stream_call_count(),
+            0,
+            "ExpectedVersion::Any needs no client-side read, even on retry"
+        );
     }
 
-    /// Issue #62: pathological contention — EVERY append attempt
+    /// Issue #62/#87: pathological contention — EVERY append attempt
     /// conflicts. The bounded retry loop must exhaust
-    /// (`SA_STREAM_APPEND_RETRY_ATTEMPTS`) and return the dedicated
+    /// (`USER_STREAM_APPEND_RETRY_ATTEMPTS`) and return the dedicated
     /// [`ApiTokenError::Contended`] variant, NOT `Infrastructure` (the
     /// distinction the federation handler's 503-vs-500 mapping depends
-    /// on) — and must never durably append the event.
-    #[tokio::test]
+    /// on) — and must never durably append the event. Paused clock: 4
+    /// real backoff sleeps (up to ~850ms) would otherwise slow this
+    /// test for no reason.
+    #[tokio::test(start_paused = true)]
     async fn issue_for_service_account_system_exhausted_retry_returns_contended() {
         let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
         users.insert(user(true));
@@ -3581,36 +3765,10 @@ mod tests {
             events.appended_batches().is_empty(),
             "no ApiTokenIssued should be durably appended when every retry conflicts"
         );
-    }
-
-    /// A GENUINE infra failure on the SA-stream expected-version read
-    /// (`read_sa_stream_expected_version`, shared by the initial read
-    /// and every CAS-retry re-read) must propagate as `Infrastructure`
-    /// immediately — never absorbed by the conflict-retry loop, and
-    /// never confused with `Contended` (that variant is reserved for
-    /// exhausted `Conflict`s on the append side, not a read-side
-    /// outage).
-    #[tokio::test]
-    async fn issue_for_service_account_system_read_infra_error_propagates() {
-        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
-        users.insert(user(true));
-        events.fail_next_read_stream(DomainError::Invariant("event store read down".into()));
-
-        let err = uc
-            .issue_for_service_account_system(Uuid::from_u128(0xACE), make_request_system())
-            .await
-            .expect_err("a genuine read-side outage must fail the mint");
-        assert!(
-            matches!(err, ApiTokenError::Infrastructure(_)),
-            "a read-side outage is Infrastructure, not Contended — got {err:?}"
-        );
-        // Step 7 (token persist) already ran before step 8's read — the
-        // same event-less-token strand a real outage here still leaves,
-        // same as before this fix (only the append side gained a retry).
-        assert_eq!(tokens.inserts().len(), 1);
-        assert!(
-            events.appended_batches().is_empty(),
-            "the append loop must never be entered when the expected-version read fails"
+        assert_eq!(
+            events.read_stream_call_count(),
+            0,
+            "ExpectedVersion::Any needs no client-side read, even on exhaustion"
         );
     }
 
@@ -3767,6 +3925,64 @@ mod tests {
         let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
         assert!(event.minted_by_admin_id.is_none());
         assert_eq!(event.kind, TokenKind::Pat);
+    }
+
+    /// Issue #87: this append (a sibling of the SA-mint) also protects no
+    /// stream-content decision, so it gets the same `Any` + bounded-retry
+    /// treatment. A single conflict is absorbed transparently.
+    #[tokio::test(start_paused = true)]
+    async fn issue_for_bootstrap_admin_system_retries_append_once_on_conflict() {
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+        events.fail_next_append(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let issued = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                full_admin_cap(),
+                3600,
+            )
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        assert!(issued.plaintext.starts_with("hort_pat_"));
+        assert_eq!(tokens.inserts().len(), 1);
+        assert_eq!(events.appended_batches().len(), 1);
+        assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #87: pathological contention on this sibling exhausts the
+    /// retry budget exactly like the SA-mint case, but — unlike the
+    /// SA-mint's dedicated `Contended` mapping — this call site has no
+    /// special-cased exhaustion handling: the final `Conflict` simply
+    /// propagates via `?` into `ApiTokenError::Infrastructure`, same as
+    /// an unretried single attempt would have produced before #87.
+    #[tokio::test(start_paused = true)]
+    async fn issue_for_bootstrap_admin_system_exhausted_retry_returns_infrastructure() {
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+        events.fail_all_appends(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let err = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-admin".into(),
+                full_admin_cap(),
+                3600,
+            )
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(err, ApiTokenError::Infrastructure(DomainError::Conflict(_))),
+            "got {err:?}"
+        );
+        // The row is inserted before the append loop runs (unchanged).
+        assert_eq!(tokens.inserts().len(), 1);
+        assert!(events.appended_batches().is_empty());
     }
 
     #[tokio::test]
@@ -4403,6 +4619,100 @@ mod tests {
         assert_eq!(revoked.token_id, token.id);
         assert_eq!(revoked.user_id, Uuid::from_u128(0xACE));
         assert!(revoked.revoked_by_admin_id.is_none());
+    }
+
+    /// Issue #87: `revoke`'s `ApiTokenRevoked` append also protects no
+    /// stream-content decision. A single conflict is absorbed
+    /// transparently.
+    #[tokio::test(start_paused = true)]
+    async fn revoke_retries_append_once_on_conflict() {
+        let (uc, tokens, _, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        let token = ApiToken {
+            id: Uuid::from_u128(0xF1),
+            user_id: Uuid::from_u128(0xACE),
+            name: "n".into(),
+            description: None,
+            kind: TokenKind::Pat,
+            token_hash: "$argon2id$v=19$m=19456,t=2,p=1$abc$def".into(),
+            token_prefix: "abcdefgh".into(),
+            declared_permissions: vec![Permission::Read],
+            repository_ids: None,
+            expires_at: None,
+            revoked_at: None,
+            last_used_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+            created_by_user_id: Uuid::from_u128(0xACE),
+            created_at: Utc::now(),
+        };
+        tokens.seed_token(token.clone());
+        events.fail_next_append(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        uc.revoke(
+            ApiActor {
+                user_id: Uuid::from_u128(0xACE),
+            },
+            token.id,
+            false,
+        )
+        .await
+        .expect("a single conflict must be absorbed by the retry loop");
+        assert_eq!(tokens.revokes(), vec![token.id]);
+        assert_eq!(events.appended_batches().len(), 1);
+        assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #87: pathological contention exhausts the retry budget;
+    /// `revoke` has no `Contended` special-case, so the final `Conflict`
+    /// propagates via `?` into `Infrastructure` exactly as an unretried
+    /// single attempt would have before #87. The DB-side revoke
+    /// (`self.tokens.revoke`) already ran and is never rolled back —
+    /// same pre-existing compensating-action gap this fix does not
+    /// touch.
+    #[tokio::test(start_paused = true)]
+    async fn revoke_exhausted_retry_returns_infrastructure() {
+        let (uc, tokens, _, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        let token = ApiToken {
+            id: Uuid::from_u128(0xF1),
+            user_id: Uuid::from_u128(0xACE),
+            name: "n".into(),
+            description: None,
+            kind: TokenKind::Pat,
+            token_hash: "$argon2id$v=19$m=19456,t=2,p=1$abc$def".into(),
+            token_prefix: "abcdefgh".into(),
+            declared_permissions: vec![Permission::Read],
+            repository_ids: None,
+            expires_at: None,
+            revoked_at: None,
+            last_used_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+            created_by_user_id: Uuid::from_u128(0xACE),
+            created_at: Utc::now(),
+        };
+        tokens.seed_token(token.clone());
+        events.fail_all_appends(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let err = uc
+            .revoke(
+                ApiActor {
+                    user_id: Uuid::from_u128(0xACE),
+                },
+                token.id,
+                false,
+            )
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(err, ApiTokenError::Infrastructure(DomainError::Conflict(_))),
+            "got {err:?}"
+        );
+        assert_eq!(tokens.revokes(), vec![token.id]);
+        assert!(events.appended_batches().is_empty());
     }
 
     #[tokio::test]
@@ -5779,6 +6089,60 @@ mod tests {
         assert_eq!(event.kind, TokenKind::CliSession);
         assert_eq!(event.repository_ids, None);
         assert_eq!(count_denials(&events), 0);
+    }
+
+    /// Issue #87: the CLI-session issuance audit append is the
+    /// highest-traffic `StreamId::user(...)` write in this file (every
+    /// `/exchange` login) — a single conflict must be absorbed
+    /// transparently, with no client-side read at all.
+    #[tokio::test(start_paused = true)]
+    async fn issue_cli_session_retries_append_once_on_conflict() {
+        let (uc, tokens, users, events, _signer, _denylist, caller) = make_cli_session_use_case();
+        users.insert(user(false));
+        events.fail_next_append(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let issued = uc
+            .issue_cli_session(
+                &caller,
+                make_cli_request(Some("hort-cli/0.4.2"), "203.0.113.7"),
+            )
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        assert_eq!(issued.kind, TokenKind::CliSession);
+        assert!(
+            tokens.inserts().is_empty(),
+            "CliSession never persists a row"
+        );
+        assert_eq!(events.appended_batches().len(), 1);
+        assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #87: pathological contention exhausts the retry budget;
+    /// this sibling has no `Contended` special-case, so the final
+    /// `Conflict` propagates via `?` into `Infrastructure` exactly as an
+    /// unretried single attempt would have before #87.
+    #[tokio::test(start_paused = true)]
+    async fn issue_cli_session_exhausted_retry_returns_infrastructure() {
+        let (uc, _tokens, users, events, _signer, _denylist, caller) = make_cli_session_use_case();
+        users.insert(user(false));
+        events.fail_all_appends(DomainError::Conflict(
+            "stream user-<uuid> concurrent append at position 0".into(),
+        ));
+
+        let err = uc
+            .issue_cli_session(
+                &caller,
+                make_cli_request(Some("hort-cli/0.4.2"), "203.0.113.7"),
+            )
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(err, ApiTokenError::Infrastructure(DomainError::Conflict(_))),
+            "got {err:?}"
+        );
+        assert!(events.appended_batches().is_empty());
     }
 
     // -- exchange-time cap derivation -----------------------------------------
