@@ -1886,6 +1886,11 @@ pub struct MockEventStore {
     /// retry loop absorbs; a `read_stream` failure is a real infra
     /// error that must propagate immediately.
     fail_next_read_stream: Mutex<Option<DomainError>>,
+    /// Total `read_stream` invocations, including failed ones. Lets
+    /// tests pin a "no read round-trip on this path anymore" claim
+    /// (issue #87: `ExpectedVersion::Any` appends need no
+    /// client-side expected-version read at all).
+    read_stream_calls: AtomicUsize,
 }
 
 impl MockEventStore {
@@ -1899,7 +1904,13 @@ impl MockEventStore {
             fail_all_appends: Mutex::new(None),
             stream_after_next_read: Mutex::new(HashMap::new()),
             fail_next_read_stream: Mutex::new(None),
+            read_stream_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Total `read_stream` invocations so far (including failed ones).
+    pub fn read_stream_call_count(&self) -> usize {
+        self.read_stream_calls.load(Ordering::SeqCst)
     }
 
     /// Arm the NEXT `append` to fail once with `err`. Consumed on fire.
@@ -1996,6 +2007,7 @@ impl EventStore for MockEventStore {
         _from: ReadFrom,
         max_count: u64,
     ) -> BoxFut<'_, DomainResult<Vec<PersistedEvent>>> {
+        self.read_stream_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(err) = self.fail_next_read_stream.lock().unwrap().take() {
             return Box::pin(async move { Err(err) });
         }
