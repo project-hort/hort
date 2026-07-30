@@ -34,13 +34,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use uuid::Uuid;
-
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
-use hort_domain::entities::scan_policy::ScanPolicyProjection;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::DomainError;
-use hort_domain::events::PolicyScope;
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
@@ -58,6 +54,7 @@ use crate::metrics::{
     emit_scan_terminal, observe_scan_duration, SbomExtractionResult, ScanFailureResult,
     ScanJobsResult, ScanTerminalResult,
 };
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 
 /// True when a scanner backend's error
@@ -272,9 +269,9 @@ impl ScanOrchestrationUseCase {
         //     `DefaultPolicy::block_on_critical_default_backends`,
         //     which is `["trivy"]` so out-of-the-box deployments scan
         //     with Trivy.
-        let policy = self
-            .resolve_active_policy_for_repo(artifact.repository_id)
-            .await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
+                .await?;
         let backends: Vec<String> = match policy.as_ref() {
             Some(p) if !p.scan_backends.is_empty() => p.scan_backends.clone(),
             Some(_) => {
@@ -695,38 +692,18 @@ impl ScanOrchestrationUseCase {
             Ok(a) => a.repository_id,
             Err(_) => return "(none)".to_string(),
         };
-        let backends = match self.resolve_active_policy_for_repo(repo_id).await {
-            Ok(Some(p)) if !p.scan_backends.is_empty() => p.scan_backends,
-            Ok(Some(_)) => Vec::new(),
-            Ok(None) => DefaultPolicy::block_on_critical_default_backends(),
-            Err(_) => return "(none)".to_string(),
-        };
+        let backends =
+            match resolve_active_policy_for_repo(&*self.policy_projections, repo_id).await {
+                Ok(Some(p)) if !p.scan_backends.is_empty() => p.scan_backends,
+                Ok(Some(_)) => Vec::new(),
+                Ok(None) => DefaultPolicy::block_on_critical_default_backends(),
+                Err(_) => return "(none)".to_string(),
+            };
         if backends.is_empty() {
             "(none)".to_string()
         } else {
             backends.join(",")
         }
-    }
-
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policy_projections.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
     }
 }
 

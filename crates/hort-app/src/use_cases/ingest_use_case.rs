@@ -11,7 +11,7 @@ use hort_domain::entities::scan_policy::{ProvenanceMode, ScanPolicyProjection};
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     Actor, ApiActor, ArtifactIngested, ChecksumMismatch, ChecksumVerified, DomainEvent,
-    IngestSource, PolicyScope, ScanRequested, StreamId,
+    IngestSource, ScanRequested, StreamId,
 };
 use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
 use hort_domain::policy::scan::DefaultPolicy;
@@ -40,6 +40,7 @@ use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
 use crate::use_cases::multi_hash::{
     Sha1DigestHandle, Sha1HashingRead, Sha512DigestHandle, Sha512HashingRead,
 };
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_expected_version,
     EVENT_APPEND_RETRY_ATTEMPTS,
@@ -631,38 +632,6 @@ impl IngestUseCase {
     ) -> Self {
         self.provenance_capable_formats = Arc::new(formats.into_iter().collect());
         self
-    }
-
-    /// Resolve the active `ScanPolicy` (if any)
-    /// that applies to `repo_id`. Repo-scoped policies take precedence
-    /// over `Global`; a single repo can have at most one repo-scoped
-    /// policy active at a time (enforced by
-    /// `idx_policy_projections_active_name` from `005_policy.sql`).
-    ///
-    /// Mirrors `ScanOrchestrationUseCase::resolve_active_policy_for_repo`
-    /// — the logic is duplicated rather than shared to keep
-    /// `IngestUseCase` and `ScanOrchestrationUseCase` independent at the
-    /// API surface (a future refactor could lift the helper into
-    /// `crate::policy` if a third caller surfaces).
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policy_projections.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
     }
 
     /// Resolve the `repository` metric label. When the repository-label flag
@@ -2741,25 +2710,25 @@ impl IngestUseCase {
         // post-commit `enqueue_scan` call sees the same outcome as the
         // appended `ScanRequested` event (no race where the policy is
         // archived between event-append and jobs-row insert).
-        let matched_policy: Option<ScanPolicyProjection> = self
-            .resolve_active_policy_for_repo(repository_id)
-            .await
-            .unwrap_or_else(|e| {
-                // Policy-lookup failure is non-fatal: log + treat as
-                // "no policy applies". The artifact still ingests; an
-                // operator can manually rescan once the projection is
-                // back. Aborting the ingest on a projection-read
-                // failure would make scanning a hard dependency of
-                // ingest, which the design explicitly avoids.
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    repository_id = %repository_id,
-                    error = %e,
-                    "ingest: policy_projections.list_active failed; \
-                     skipping scan auto-enqueue (artifact still ingests)",
-                );
-                None
-            });
+        let matched_policy: Option<ScanPolicyProjection> =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
+                .await
+                .unwrap_or_else(|e| {
+                    // Policy-lookup failure is non-fatal: log + treat as
+                    // "no policy applies". The artifact still ingests; an
+                    // operator can manually rescan once the projection is
+                    // back. Aborting the ingest on a projection-read
+                    // failure would make scanning a hard dependency of
+                    // ingest, which the design explicitly avoids.
+                    tracing::warn!(
+                        artifact_id = %artifact_id,
+                        repository_id = %repository_id,
+                        error = %e,
+                        "ingest: policy_projections.list_active failed; \
+                         skipping scan auto-enqueue (artifact still ingests)",
+                    );
+                    None
+                });
         // Does a scan run for this ingest? A matched
         // operator policy decides via its own `scan_backends` (an empty
         // list = scanning waived by the operator); with no operator
@@ -11609,6 +11578,7 @@ mod tests {
         use hort_domain::entities::scan_policy::{
             NegligibleAction, ProvenanceMode, SeverityThreshold,
         };
+        use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
             policy_id: Uuid::new_v4(),
             name: format!("scan-gated-ingest-test-{}", Uuid::new_v4()),
@@ -12304,6 +12274,7 @@ mod tests {
     /// A provenance policy projection (global scope) at the requested mode.
     fn provenance_policy(mode: ProvenanceMode) -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{NegligibleAction, SeverityThreshold};
+        use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
             policy_id: Uuid::new_v4(),
             name: format!("prov-test-{}", Uuid::new_v4()),

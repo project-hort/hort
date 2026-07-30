@@ -39,8 +39,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
-use hort_domain::entities::scan_policy::{ProvenanceMode, ScanPolicyProjection};
-use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource, PolicyScope};
+use hort_domain::entities::scan_policy::ProvenanceMode;
+use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource};
 use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -65,6 +65,7 @@ use tokio_util::io::StreamReader;
 
 use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::read_expected_version;
 
 /// The `kind` filter used to read cosign attestation bundles off the
@@ -221,9 +222,9 @@ impl ProvenanceOrchestrationUseCase {
 
         // Resolve the policy (repo-scoped → global). Mode drives every
         // downstream decision.
-        let policy = self
-            .resolve_active_policy_for_repo(artifact.repository_id)
-            .await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
+                .await?;
         let mode = policy
             .as_ref()
             .map(|p| p.provenance_mode)
@@ -1447,29 +1448,6 @@ impl ProvenanceOrchestrationUseCase {
                     .await
             }
         }
-    }
-
-    /// Resolve the active `ScanPolicy` for `repo_id` (repo-scoped wins over
-    /// global). Mirrors `ScanOrchestrationUseCase::resolve_active_policy_for_repo`.
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policy_projections.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
     }
 }
 

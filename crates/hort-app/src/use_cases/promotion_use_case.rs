@@ -3,12 +3,11 @@ use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
 
-use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
+use hort_domain::entities::scan_policy::ExclusionProjection;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     Actor, ApiActor, ApprovalDecided, ApprovalDecision, ApprovalRequested, ArtifactPromoted,
-    DomainEvent, PolicyEvaluated, PolicyResult, PolicyScope, PromotionRejected, PromotionRequested,
-    StreamId,
+    DomainEvent, PolicyEvaluated, PolicyResult, PromotionRejected, PromotionRequested, StreamId,
 };
 use hort_domain::policy::{evaluate_promotion, PromotionOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
@@ -23,6 +22,7 @@ use crate::error::AppResult;
 use crate::metrics::{
     emit_policy_evaluation, emit_policy_violations, policy_decision_point, PolicyEvaluationResult,
 };
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::{read_expected_version, scan_history, CallerPrivileges};
 
 /// Application use case for artifact promotion operations.
@@ -207,7 +207,8 @@ impl PromotionUseCase {
 
         let target_repo = self.repositories.find_by_id(target_repo_id).await?;
 
-        let policy = self.resolve_active_policy_for_repo(target_repo_id).await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, target_repo_id).await?;
         let exclusions: Vec<ExclusionProjection> = match &policy {
             Some(p) => {
                 self.policy_projections
@@ -554,35 +555,6 @@ impl PromotionUseCase {
             .await?;
 
         Ok(())
-    }
-
-    /// Resolve the active scan policy for `repo_id`.
-    ///
-    /// Repo-scoped wins over global; absent both, the caller passes
-    /// `None` to the evaluator and `DefaultPolicy::block_on_critical`
-    /// supplies the threshold. Mirrors
-    /// [`QuarantineUseCase::resolve_active_policy_for_repo`](crate::use_cases::quarantine_use_case::QuarantineUseCase)
-    /// — the two implementations share the same resolution logic and
-    /// should be extracted into a shared helper if a third caller appears.
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policy_projections.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
     }
 }
 

@@ -68,6 +68,9 @@ pub mod pat_validation_use_case;
 // Admin-only read of the patch-candidate quarantine surface. See
 // `docs/architecture/how-to/quarantine-patch-release.md`.
 pub mod patch_candidate_use_case;
+// Shared active-scan-policy resolver (issue #76, item 1/2) — extracted
+// from seven private, byte-identical copies. See module docs.
+pub(crate) mod policy_resolution;
 pub mod policy_use_case;
 // Prefetch trigger `on_dist_tag_move`
 // (`docs/architecture/explanation/prefetch-pipeline.md`).
