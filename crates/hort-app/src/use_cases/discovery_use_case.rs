@@ -99,9 +99,7 @@ use hort_domain::entities::discovery::{
     DiscoveryListing, DiscoveryVersionEntry, DiscoveryVersionStatus,
 };
 use hort_domain::entities::rbac::Permission;
-use hort_domain::entities::scan_policy::ScanPolicyProjection;
 use hort_domain::error::DomainError;
-use hort_domain::events::PolicyScope;
 use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
@@ -112,6 +110,7 @@ use crate::error::{AppError, AppResult};
 use crate::metrics::{emit_discovery_list_versions, values, DiscoveryResult, UpstreamFetchError};
 use crate::ports::upstream_metadata::UpstreamMetadataPort;
 use crate::rbac::RbacEvaluator;
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 
 // Exact wording propagated verbatim to the client through
 // `AppError::Domain(DomainError::Validation(_))`. The inbound layer maps
@@ -273,7 +272,7 @@ impl DiscoveryUseCase {
         // each quarantined row's anchor becomes its live deadline
         // (`anchor + duration`). Absent policy → the quarantine-by-default
         // duration (ADR 0007).
-        let policy = self.resolve_active_policy_for_repo(repository.id).await?;
+        let policy = resolve_active_policy_for_repo(&*self.policies, repository.id).await?;
         let quarantine_duration = chrono::Duration::seconds(
             policy
                 .as_ref()
@@ -389,32 +388,6 @@ impl DiscoveryUseCase {
         emit_discovery_list_versions(&format_label, &repository_label, DiscoveryResult::Success);
         Ok(listing)
     }
-
-    /// Resolve the active `ScanPolicy` for `repo_id` — repo-scoped wins
-    /// over `Global`. Mirrors `IngestUseCase::resolve_active_policy_for_repo`
-    /// (the logic is duplicated per use case because that helper is
-    /// `pub(crate)` to `ingest_use_case`; see also
-    /// `SeedImportUseCase::resolve_active_policy_for_repo`).
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: uuid::Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self
-            .policies
-            .list_active()
-            .await
-            .map_err(AppError::Domain)?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => repo_scoped = Some(projection),
-                PolicyScope::Global if global.is_none() => global = Some(projection),
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
-    }
 }
 
 /// Pure status-overlay assembly — separate function so unit tests can
@@ -502,6 +475,8 @@ mod tests {
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
     use hort_domain::entities::repository::Repository;
+    use hort_domain::entities::scan_policy::ScanPolicyProjection;
+    use hort_domain::events::PolicyScope;
     use hort_domain::ports::repository_upstream_mapping_repository::{
         RepositoryUpstreamMapping, UpstreamAuth,
     };

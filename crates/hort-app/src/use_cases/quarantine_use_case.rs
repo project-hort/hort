@@ -6,12 +6,12 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{
     Artifact, ProvenanceClearance, QuarantineStatus, ReleaseAuthorization,
 };
-use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
+use hort_domain::entities::scan_policy::ExclusionProjection;
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
     Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PolicyEvaluated,
-    PolicyResult, PolicyScope, ReleaseReason, ScanCompleted, StreamId, NO_POLICY,
+    PolicyResult, ReleaseReason, ScanCompleted, StreamId, NO_POLICY,
 };
 use hort_domain::policy::scan_delta::compute_added_findings;
 use hort_domain::policy::{
@@ -27,6 +27,7 @@ use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInva
 
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::ingest_use_case::CLEARANCE_VERIFY_PRIORITY;
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
@@ -384,9 +385,9 @@ impl QuarantineUseCase {
 
         // Step 3 — load artifact + resolve policy + exclusions + coords.
         let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
-        let policy = self
-            .resolve_active_policy_for_repo(artifact.repository_id)
-            .await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
+                .await?;
         let exclusions: Vec<ExclusionProjection> = match &policy {
             Some(p) => {
                 self.policy_projections
@@ -1054,37 +1055,6 @@ impl QuarantineUseCase {
         })
     }
 
-    /// Resolve the active scan policy for `repo_id`.
-    ///
-    /// Repo-scoped wins over global; absent both, the caller passes
-    /// `None` to the evaluator and `DefaultPolicy::block_on_critical`
-    /// supplies the threshold. v1 simplification: scan the projection
-    /// list once per call. If projection counts grow past low-thousands
-    /// a dedicated `find_for_repo` port method becomes the next step;
-    /// today it is overhead the contention path doesn't notice. The
-    /// helper is private and may be extracted to a shared module if a
-    /// second caller appears.
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policy_projections.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
-    }
-
     /// #65 — whether `artifact`'s quarantine window has genuinely
     /// elapsed, using the SAME anchor + resolved-policy-duration
     /// computation ([`resolve_active_policy_for_repo`] +
@@ -1117,9 +1087,9 @@ impl QuarantineUseCase {
         let Some(anchor) = artifact.quarantine_window_start else {
             return Ok(false);
         };
-        let policy = self
-            .resolve_active_policy_for_repo(artifact.repository_id)
-            .await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
+                .await?;
         let duration_secs = policy
             .map(|p| p.quarantine_duration_secs)
             .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
@@ -1167,7 +1137,8 @@ impl QuarantineUseCase {
             return Ok(Some(ReleaseAuthorization::ScanSucceeded));
         }
 
-        let policy = self.resolve_active_policy_for_repo(repository_id).await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
         if matches!(policy, Some(p) if p.scan_backends.is_empty()) {
             return Ok(Some(ReleaseAuthorization::ScanWaived));
         }
@@ -1200,7 +1171,8 @@ impl QuarantineUseCase {
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> AppResult<ProvenanceClearance> {
-        let policy = self.resolve_active_policy_for_repo(repository_id).await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
         let mode = policy
             .as_ref()
             .map(|p| p.provenance_mode)
