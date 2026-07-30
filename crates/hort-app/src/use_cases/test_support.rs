@@ -780,6 +780,12 @@ pub struct MockPolicyProjectionRepository {
     /// tests that must exercise the policy-resolution-error degraded
     /// path inside `scanner_label_for_failed`.
     next_list_active_error: Mutex<Option<DomainError>>,
+    /// Total `list_active` invocations, including failed ones. Lets
+    /// tests pin a "zero policy-port I/O on this path" claim (issue
+    /// #76 item 2/2: `ArtifactUseCase::hydrate_quarantine_deadline`
+    /// must never call `list_active` for a non-`Quarantined` or
+    /// anchor-less artifact).
+    list_active_calls: AtomicUsize,
 }
 
 impl MockPolicyProjectionRepository {
@@ -796,7 +802,13 @@ impl MockPolicyProjectionRepository {
             next_delete_exclusion_error: Mutex::new(None),
             next_list_exclusions_error: Mutex::new(None),
             next_list_active_error: Mutex::new(None),
+            list_active_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Total `list_active` invocations so far (including failed ones).
+    pub fn list_active_call_count(&self) -> usize {
+        self.list_active_calls.load(Ordering::SeqCst)
     }
 
     /// Seed an active projection. Mirrors a successful prior `upsert`.
@@ -890,6 +902,7 @@ impl PolicyProjectionRepository for MockPolicyProjectionRepository {
     }
 
     fn list_active(&self) -> BoxFuture<'_, DomainResult<Vec<ScanPolicyProjection>>> {
+        self.list_active_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = self.next_list_active_error.lock().unwrap().take() {
             return Box::pin(async move { Err(e) });
         }

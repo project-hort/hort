@@ -10,10 +10,12 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, ArtifactDownloaded, DomainEvent, DownloadActor, StreamId};
+use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{
@@ -25,6 +27,7 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_download_audit_dropped, labels, values, DownloadAuditDropResult, DownloadResult,
 };
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::repository_access::{AccessLevel, RepositoryAccessUseCase};
 
 /// Opt-in download-audit gate.
@@ -65,6 +68,18 @@ pub struct ArtifactUseCase {
     /// emit logic short-circuits. Wired via [`Self::with_audit_events`]
     /// (production composition root only).
     audit_events: Option<DownloadAuditGate>,
+    /// Composed for [`Self::hydrate_quarantine_deadline`] (issue #76
+    /// item 2/2). Same optional-builder shape as
+    /// [`Self::repository_access`] / [`Self::artifact_metadata`]:
+    /// `None` for call sites that never construct a `Quarantined`
+    /// artifact (the overwhelming majority of this file's own tests),
+    /// which fall back to [`DefaultPolicy::quarantine_duration_secs`]
+    /// exactly as the wired-but-no-active-policy case does — a plain
+    /// `ArtifactUseCase::new(..)` never reaches a code path that would
+    /// observe the difference between "unwired" and "wired with no
+    /// policy configured". The production composition root always
+    /// wires this via [`Self::with_policy_projections`].
+    policy_projections: Option<Arc<dyn PolicyProjectionRepository>>,
 }
 
 impl ArtifactUseCase {
@@ -82,7 +97,23 @@ impl ArtifactUseCase {
             repository_access: None,
             artifact_metadata: None,
             audit_events: None,
+            policy_projections: None,
         }
+    }
+
+    /// Wire the [`PolicyProjectionRepository`] port consumed by
+    /// [`Self::hydrate_quarantine_deadline`] (issue #76 item 2/2). See
+    /// [`Self::with_repository_access`] for the optional-field
+    /// rationale — the production composition root always calls this;
+    /// tests that never construct a `Quarantined` artifact through
+    /// `find_visible_by_path` / `find_visible_by_id` can skip it.
+    #[must_use]
+    pub fn with_policy_projections(
+        mut self,
+        policy_projections: Arc<dyn PolicyProjectionRepository>,
+    ) -> Self {
+        self.policy_projections = Some(policy_projections);
+        self
     }
 
     /// Enable opt-in download-audit emits.
@@ -546,7 +577,7 @@ impl ArtifactUseCase {
             .resolve(repo_key, actor, AccessLevel::Read)
             .await?;
         match self.artifacts.find_by_path(repo.id, path).await? {
-            Some(a) => Ok((repo, Self::hydrate_quarantine_deadline(a))),
+            Some(a) => Ok((repo, self.hydrate_quarantine_deadline(a).await?)),
             None => Err(AppError::Domain(DomainError::NotFound {
                 entity: "Artifact",
                 // Carry both repo + path so logs can reconstruct the
@@ -568,15 +599,55 @@ impl ArtifactUseCase {
     ///
     /// The stored column is the immutable window **anchor**
     /// (`quarantine_window_start`); the deadline is
-    /// `effective_quarantine_deadline(anchor, duration)`. `ArtifactUseCase`
-    /// holds no `ScanPolicy` projection port, so this hydration uses the
-    /// anchor as the deadline directly — correct while the ingest path
-    /// still stamps `now + duration` into the column. Once the ingest
-    /// stores the bare ingest-time anchor and wires policy-duration
-    /// resolution, the duration-aware computation lands with it.
-    fn hydrate_quarantine_deadline(mut artifact: Artifact) -> Artifact {
-        artifact.quarantine_deadline = artifact.quarantine_window_start;
-        artifact
+    /// `effective_quarantine_deadline(anchor, duration)`.
+    ///
+    /// Issue #76 item 2/2: resolves the REAL policy-duration (via the
+    /// shared [`resolve_active_policy_for_repo`] helper, item 1/2) ONLY
+    /// when `quarantine_status == Quarantined` AND
+    /// `quarantine_window_start.is_some()` — every other status returns
+    /// `quarantine_deadline = None` and makes ZERO policy-port calls, so
+    /// the happy (non-quarantined) read path pays no extra I/O. Before
+    /// this, `ArtifactUseCase` held no `ScanPolicy` projection port and
+    /// used the bare anchor as an approximation of the deadline
+    /// (`anchor + 0`, effectively clamping every `Retry-After` to
+    /// whatever floor the consuming handler applied) regardless of
+    /// status; that approximation is gone.
+    ///
+    /// Absent an active policy (or [`Self::policy_projections`] unwired
+    /// — a test-only state; the composition root always wires it), the
+    /// duration falls back to [`DefaultPolicy::quarantine_duration_secs`]
+    /// (ADR 0007 quarantine-by-default posture) — the SAME default
+    /// [`QuarantineUseCase::is_window_elapsed`](crate::use_cases::quarantine_use_case::QuarantineUseCase::is_window_elapsed)
+    /// uses. This method is READ-PATH ONLY: it never appends an event
+    /// and is never consulted by the release predicate
+    /// (`QuarantineUseCase::is_window_elapsed`, untouched by this
+    /// change) — see that method's own doc for why the two signals are
+    /// deliberately distinct.
+    async fn hydrate_quarantine_deadline(&self, mut artifact: Artifact) -> AppResult<Artifact> {
+        artifact.quarantine_deadline =
+            match (artifact.quarantine_status, artifact.quarantine_window_start) {
+                (QuarantineStatus::Quarantined, Some(anchor)) => {
+                    let duration_secs = match self.policy_projections.as_deref() {
+                        Some(policy_projections) => {
+                            let policy = resolve_active_policy_for_repo(
+                                policy_projections,
+                                artifact.repository_id,
+                            )
+                            .await?;
+                            policy
+                                .map(|p| p.quarantine_duration_secs)
+                                .unwrap_or_else(DefaultPolicy::quarantine_duration_secs)
+                        }
+                        None => DefaultPolicy::quarantine_duration_secs(),
+                    };
+                    Some(effective_quarantine_deadline(
+                        anchor,
+                        chrono::Duration::seconds(duration_secs),
+                    ))
+                }
+                _ => None,
+            };
+        Ok(artifact)
     }
 
     /// Same shape, by artifact id. Loads the artifact, then re-checks
@@ -619,7 +690,7 @@ impl ArtifactUseCase {
             }
             Err(other) => return Err(other),
         };
-        Ok((repo, Self::hydrate_quarantine_deadline(artifact)))
+        Ok((repo, self.hydrate_quarantine_deadline(artifact).await?))
     }
 
     /// Repo-scoped hash lookup. Caller supplies a pre-authz'd
@@ -2243,7 +2314,8 @@ mod visibility_extension_tests {
     use crate::use_cases::repository_access::{AccessLevel, RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{
         sample_artifact, sample_repository, MockArtifactMetadataRepository, MockArtifactRepository,
-        MockRepositoryRepository, MockStoragePort, StubFormatHandler, VALID_SHA256,
+        MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
+        StubFormatHandler, VALID_SHA256,
     };
 
     // -- helpers -----------------------------------------------------------
@@ -2368,6 +2440,199 @@ mod visibility_extension_tests {
             .unwrap();
         assert_eq!(got_repo.key, "alpha");
         assert_eq!(got_artifact.id, a.id);
+    }
+
+    // -- hydrate_quarantine_deadline (issue #76 item 2/2) -------------------
+
+    fn repo_scoped_policy(
+        repo_id: Uuid,
+        duration_secs: i64,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        };
+        use hort_domain::events::PolicyScope;
+
+        ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: format!("test-policy-{}", Uuid::new_v4()),
+            scope: PolicyScope::Repository(repo_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs: duration_secs,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::VerifyIfPresent,
+            provenance_backends: vec!["cosign".to_string()],
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            stream_version: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Quarantined + anchored + an active repo-scoped policy: the
+    /// hydrated deadline is `anchor + policy.quarantine_duration_secs`,
+    /// NOT the bare anchor the pre-#76 approximation used.
+    #[tokio::test]
+    async fn hydrate_quarantine_deadline_quarantined_with_repo_policy_uses_policy_duration() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_policy(repo_id, 600));
+
+        let anchor = Utc::now() - chrono::Duration::minutes(5);
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(anchor);
+        artifacts.insert(a.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies.clone());
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert_eq!(
+            got.quarantine_deadline,
+            Some(anchor + chrono::Duration::seconds(600))
+        );
+        assert_eq!(policies.list_active_call_count(), 1);
+    }
+
+    /// Quarantined + anchored, no active policy for the repo: the
+    /// duration falls back to `DefaultPolicy::quarantine_duration_secs`
+    /// (ADR 0007), still computed from the real anchor.
+    #[tokio::test]
+    async fn hydrate_quarantine_deadline_quarantined_no_policy_uses_default_duration() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let anchor = Utc::now() - chrono::Duration::minutes(5);
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(anchor);
+        artifacts.insert(a.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies.clone());
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert_eq!(
+            got.quarantine_deadline,
+            Some(anchor + chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs()))
+        );
+        assert_eq!(policies.list_active_call_count(), 1);
+    }
+
+    /// Non-`Quarantined` status: `quarantine_deadline` is `None` and
+    /// the policy port is NEVER called — the happy read path pays zero
+    /// extra I/O (issue #76's explicit hard boundary).
+    #[tokio::test]
+    async fn hydrate_quarantine_deadline_non_quarantined_returns_none_with_zero_policy_calls() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Released;
+        // A stale/leftover anchor must not leak into the deadline for a
+        // non-Quarantined status — the pre-#76 code unconditionally
+        // copied the anchor regardless of status.
+        a.quarantine_window_start = Some(Utc::now() - chrono::Duration::days(1));
+        artifacts.insert(a.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies.clone());
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert_eq!(got.quarantine_deadline, None);
+        assert_eq!(
+            policies.list_active_call_count(),
+            0,
+            "non-Quarantined status must never call the policy port"
+        );
+    }
+
+    /// `Quarantined` but no anchor (a row mid-transition / legacy data):
+    /// `quarantine_deadline` is `None` and the policy port is never
+    /// called.
+    #[tokio::test]
+    async fn hydrate_quarantine_deadline_quarantined_without_anchor_returns_none_with_zero_policy_calls(
+    ) {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = None;
+        artifacts.insert(a.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies.clone());
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert_eq!(got.quarantine_deadline, None);
+        assert_eq!(policies.list_active_call_count(), 0);
+    }
+
+    /// The `policy_projections` port unwired (test-only state; the
+    /// composition root always wires it): falls back to
+    /// `DefaultPolicy::quarantine_duration_secs` exactly as the
+    /// wired-but-no-active-policy case does, without erroring.
+    #[tokio::test]
+    async fn hydrate_quarantine_deadline_unwired_policy_port_uses_default_duration() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let anchor = Utc::now() - chrono::Duration::minutes(5);
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(anchor);
+        artifacts.insert(a.clone());
+
+        // No .with_policy_projections(..) — deliberately unwired.
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert_eq!(
+            got.quarantine_deadline,
+            Some(anchor + chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs()))
+        );
     }
 
     #[tokio::test]

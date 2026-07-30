@@ -2561,7 +2561,12 @@ pub async fn build_app_context(
         // Opt-in per-(repo, UTC-date)
         // download-audit emit. Fail-open; no-op unless the served
         // repository has `download_audit_enabled = true`.
-        .with_audit_events(event_publisher.clone()),
+        .with_audit_events(event_publisher.clone())
+        // Issue #76 item 2/2: resolves the real policy-duration for
+        // `hydrate_quarantine_deadline` (the `find_visible_by_path` /
+        // `find_visible_by_id` read paths) instead of the pre-#76 bare-
+        // anchor approximation.
+        .with_policy_projections(policy_projections.clone()),
     );
 
     // `CurationUseCase` backing the
