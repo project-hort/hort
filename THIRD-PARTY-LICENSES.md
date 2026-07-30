@@ -141,7 +141,7 @@ the result instead.
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
 | rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.42 | MIT | https://github.com/rustls/rustls |
+| rustls | 0.23.43 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -343,6 +343,11 @@ the result instead.
 | chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.8.1 | MIT | https://github.com/boinkor-net/governor.git |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
+| objc2-app-kit | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-encode | 4.1.0 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
 | object_store | 0.13.2 | MIT | https://github.com/apache/arrow-rs-object-store |
 | typed-path | 0.9.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | whoami | 1.6.1 | MIT | https://github.com/ardaku/whoami |
@@ -455,7 +460,7 @@ the result instead.
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 10.3.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.40.0 | MIT | https://github.com/aws/aws-lc-rs |
-| webbrowser | 1.2.1 | MIT | https://github.com/amodm/webbrowser-rs |
+| webbrowser | 1.2.2 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | hdrhistogram | 7.5.4 | MIT | https://github.com/HdrHistogram/HdrHistogram_rust.git |
@@ -7149,7 +7154,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.42 — MIT
+### rustls 0.23.43 — MIT
 
 Repository: https://github.com/rustls/rustls
 
@@ -13355,6 +13360,136 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
+### objc2-app-kit 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2-core-foundation 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2-encode 4.1.0 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2-foundation 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2 0.6.4 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
 ### object_store 0.13.2 — MIT
 
 Repository: https://github.com/apache/arrow-rs-object-store
@@ -16599,7 +16734,7 @@ SOFTWARE.
 
 ```
 
-### webbrowser 1.2.1 — MIT
+### webbrowser 1.2.2 — MIT
 
 Repository: https://github.com/amodm/webbrowser-rs
 
