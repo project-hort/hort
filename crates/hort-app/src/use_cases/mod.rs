@@ -180,11 +180,15 @@ pub use policy_use_case::{
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+use std::time::Duration as StdDuration;
+
 use uuid::Uuid;
 
-use hort_domain::error::DomainError;
-use hort_domain::events::StreamId;
-use hort_domain::ports::event_store::{EventStore, ExpectedVersion, ReadFrom};
+use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::events::{StreamCategory, StreamId};
+use hort_domain::ports::event_store::{
+    AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom,
+};
 
 use crate::error::{AppError, AppResult};
 
@@ -197,11 +201,55 @@ const STREAM_EVENT_CAP: u64 = 200;
 ///
 /// When `enforce_cap` is true, returns `DomainError::Conflict` if the stream
 /// exceeds [`STREAM_EVENT_CAP`] events.
+///
+/// # Structural guard (issue #88)
+///
+/// The read here is a **capped forward-scan**
+/// (`read_stream(_, ReadFrom::Start, STREAM_EVENT_CAP + 1)`), which is
+/// correct ONLY for a stream that is bounded by design — today,
+/// exclusively [`StreamCategory::Artifact`] (`STREAM_EVENT_CAP` is that
+/// category's own intended abuse guard: an artifact's lifecycle
+/// realistically never approaches a few dozen events, let alone 200).
+/// For any OTHER (unbounded) stream category, a stream that has grown
+/// past `STREAM_EVENT_CAP + 1` events makes `.last()` return a STALE
+/// position instead of the true tail — every subsequent
+/// `ExpectedVersion::Exact` append then fails `Conflict` deterministically
+/// and permanently (issue #87 was the production instance: the per-user
+/// `ApiTokenIssued` stream; issue #88 is the cross-cutting audit that
+/// found and fixed every other such caller).
+///
+/// This function therefore REJECTS any non-`Artifact` `stream_id` up
+/// front, before doing any I/O — making "derive a version from this
+/// capped read for an unbounded stream" a hard runtime error rather
+/// than a silent staleness bug. An unbounded-stream caller must use
+/// `ExpectedVersion::Any` + [`append_any_with_conflict_retry`] instead
+/// (the append protects no decision made from stream content in every
+/// audited case — see `backlog/056-expected-version-capped-read-audit.md`).
+///
+/// This is a deliberate, narrower alternative to adding a new
+/// `EventStore` port method for a true-tail read (the backlog's other
+/// suggested option): a port addition would require updating every
+/// `EventStore` mock across the workspace (a dozen-plus implementors),
+/// for a capability no audited caller actually needs — every unbounded
+/// stream in this audit turned out to be decision-free, so `Any` +
+/// retry closes the bug with a strictly smaller blast radius.
 pub(crate) async fn read_expected_version(
     events: &dyn EventStore,
     stream_id: &StreamId,
     enforce_cap: bool,
 ) -> AppResult<ExpectedVersion> {
+    if stream_id.category != StreamCategory::Artifact {
+        return Err(DomainError::Invariant(format!(
+            "read_expected_version called on non-artifact stream {stream_id} \
+             (category {:?}) — capped forward-scan version derivation is only \
+             correct for the bounded per-artifact lifecycle stream; use \
+             ExpectedVersion::Any + append_any_with_conflict_retry for any \
+             other (unbounded) stream category (issue #88)",
+            stream_id.category
+        ))
+        .into());
+    }
+
     let stream_events = events
         .read_stream(stream_id, ReadFrom::Start, STREAM_EVENT_CAP + 1)
         .await?;
@@ -217,6 +265,76 @@ pub(crate) async fn read_expected_version(
         Some(last) => ExpectedVersion::Exact(last.stream_position),
         None => ExpectedVersion::NoStream,
     })
+}
+
+/// Bounded CAS-retry budget shared by every `ExpectedVersion::Any` append
+/// that protects no decision made from the target stream's content
+/// (issue #87, promoted here for issue #88 — a second and third file
+/// needed the identical helper, crossing the 3+ dup rule: see
+/// `api_token_use_case.rs`'s original `append_any_with_conflict_retry`,
+/// now used by `subscription_use_case.rs` and `ingest_use_case.rs` too).
+pub(crate) const EVENT_APPEND_RETRY_ATTEMPTS: u32 = 5;
+
+/// `10ms * 4^(attempt-1)` (10/40/160/640ms across the 4 backoff gaps
+/// between 5 attempts) + 0–10ms jitter. Worst-case total sleep is
+/// ~850ms + jitter — real headroom vs. issue #62's original ~20ms
+/// budget, which issue #87's triage found routinely exhausted under
+/// sustained co-writer bursts or elevated DB latency.
+pub(crate) fn event_append_backoff(attempt: u32) -> StdDuration {
+    let base_ms = 10u64.saturating_mul(4u64.saturating_pow(attempt.saturating_sub(1)));
+    let jitter_ms = u64::from(rand::random::<u8>() % 11); // 0..=10ms
+    StdDuration::from_millis(base_ms + jitter_ms)
+}
+
+/// Bounded CAS-retry for an `ExpectedVersion::Any` append that protects
+/// NO decision made from the stream's content (issue #87/#88). Every
+/// caller of this helper fits that shape: none inspect the stream's
+/// prior events, they only ever needed a version NUMBER for the CAS
+/// write — and `ExpectedVersion::Any` means the adapter re-reads the
+/// tail itself on each attempt, so a losing `DomainError::Conflict` is
+/// resolved by simply re-invoking `append` with a fresh (byte-identical)
+/// `AppendEvents`, no client-side expected-version read at all.
+///
+/// `build` is called once per attempt to produce a fresh `AppendEvents`
+/// — callers close over the (already-built-once) event, correlation id,
+/// and actor, and just re-package them each call.
+///
+/// Retries ONLY `DomainError::Conflict`; any other error returns
+/// immediately, consuming none of the budget. On exhaustion, returns
+/// the final attempt's `DomainError::Conflict` verbatim — the SAME
+/// value an unretried single attempt would have produced — so callers
+/// can pattern-match `Err(DomainError::Conflict(_))` to detect
+/// exhaustion: a `Conflict` can only reach the caller after the retry
+/// budget is spent, since every intermediate `Conflict` is absorbed
+/// here; `Err(other)` means the very first attempt already failed for a
+/// different reason and was never retried.
+pub(crate) async fn append_any_with_conflict_retry(
+    events: &dyn EventStore,
+    attempts: u32,
+    backoff: impl Fn(u32) -> StdDuration,
+    mut build: impl FnMut() -> AppendEvents,
+) -> DomainResult<AppendResult> {
+    let mut attempt: u32 = 1;
+    loop {
+        let batch = build();
+        let stream_id = batch.stream_id.clone();
+        match events.append(batch).await {
+            Ok(result) => return Ok(result),
+            Err(DomainError::Conflict(_)) if attempt < attempts => {
+                let delay = backoff(attempt);
+                tracing::debug!(
+                    %stream_id,
+                    attempt,
+                    attempts,
+                    delay_ms = delay.as_millis() as u64,
+                    "append conflict — retrying with a fresh append",
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Verified caller privileges, constructed by the inbound adapter from the
@@ -387,6 +505,142 @@ mod read_expected_version_tests {
             .await
             .unwrap();
         assert_eq!(version, ExpectedVersion::Exact(199));
+    }
+
+    /// Issue #88 structural guard: `read_expected_version`'s capped
+    /// forward-scan is only a correct version source for the bounded
+    /// per-artifact stream. Any other category must be rejected up
+    /// front — pinning this is the "fails if a future caller derives a
+    /// version from a capped read [on an unbounded stream]" acceptance
+    /// criterion. No I/O happens: the mock is never seeded, so a
+    /// passing test also proves the guard fires BEFORE the read.
+    #[tokio::test]
+    async fn rejects_non_artifact_stream_category() {
+        let events = Arc::new(MockEventStore::new());
+        let stream_id = StreamId::user(Uuid::new_v4());
+
+        let err = read_expected_version(&*events, &stream_id, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-artifact stream"), "got {err}");
+        assert_eq!(
+            events.read_stream_call_count(),
+            0,
+            "the category guard must fire before any read_stream I/O"
+        );
+    }
+}
+
+#[cfg(test)]
+mod append_any_with_conflict_retry_tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use hort_domain::events::{system_actor, AuthenticationAttempted, DomainEvent, StreamId};
+    use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
+
+    use super::*;
+    use crate::use_cases::test_support::*;
+
+    fn dummy_event() -> DomainEvent {
+        DomainEvent::AuthenticationAttempted(AuthenticationAttempted {
+            client_ip: "127.0.0.1".parse().unwrap(),
+            result: "local_invalid_credentials".into(),
+            external_id_if_decoded: None,
+            at: Utc::now(),
+        })
+    }
+
+    fn no_op_backoff(_attempt: u32) -> StdDuration {
+        StdDuration::ZERO
+    }
+
+    fn make_batch(stream_id: StreamId, event: DomainEvent, correlation_id: Uuid) -> AppendEvents {
+        AppendEvents {
+            stream_id,
+            expected_version: ExpectedVersion::Any,
+            events: vec![EventToAppend::new(event)],
+            correlation_id,
+            causation_id: None,
+            actor: system_actor(),
+        }
+    }
+
+    /// A single conflict is absorbed transparently — the second attempt
+    /// (a fresh, byte-identical `AppendEvents`) succeeds.
+    #[tokio::test]
+    async fn retries_once_on_conflict() {
+        let events = Arc::new(MockEventStore::new());
+        events.fail_next_append(DomainError::Conflict("concurrent append".into()));
+        let stream_id = StreamId::user(Uuid::new_v4());
+        let event = dummy_event();
+        let correlation_id = Uuid::new_v4();
+
+        append_any_with_conflict_retry(&*events, 5, no_op_backoff, || {
+            make_batch(stream_id.clone(), event.clone(), correlation_id)
+        })
+        .await
+        .expect("a single conflict must be absorbed by the retry loop");
+
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the winning append must land exactly once, not twice"
+        );
+    }
+
+    /// Pathological contention — every attempt conflicts. The bounded
+    /// loop must exhaust at `attempts` and return the final `Conflict`
+    /// verbatim (never masked, never turned into a different variant).
+    #[tokio::test]
+    async fn exhausts_after_bound_and_returns_final_conflict() {
+        let events = Arc::new(MockEventStore::new());
+        events.fail_all_appends(DomainError::Conflict("concurrent append".into()));
+        let stream_id = StreamId::user(Uuid::new_v4());
+        let event = dummy_event();
+        let correlation_id = Uuid::new_v4();
+
+        let err = append_any_with_conflict_retry(&*events, 3, no_op_backoff, || {
+            make_batch(stream_id.clone(), event.clone(), correlation_id)
+        })
+        .await
+        .expect_err("every attempt conflicting must exhaust the retry budget");
+
+        assert!(matches!(err, DomainError::Conflict(_)), "got {err:?}");
+        assert!(events.appended_batches().is_empty());
+    }
+
+    /// A non-`Conflict` error fails fast on the FIRST attempt — no
+    /// retry, no budget consumed.
+    #[tokio::test]
+    async fn non_conflict_error_does_not_retry() {
+        let events = Arc::new(MockEventStore::new());
+        events.fail_next_append(DomainError::Invariant("event store down".into()));
+        let stream_id = StreamId::user(Uuid::new_v4());
+        let event = dummy_event();
+        let correlation_id = Uuid::new_v4();
+
+        let err = append_any_with_conflict_retry(&*events, 5, no_op_backoff, || {
+            make_batch(stream_id.clone(), event.clone(), correlation_id)
+        })
+        .await
+        .expect_err("a non-Conflict error must propagate immediately");
+
+        assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
+        assert!(events.appended_batches().is_empty());
+    }
+
+    /// `event_append_backoff`'s documented shape: 10/40/160/640ms
+    /// across attempts 1..4, monotonically increasing.
+    #[test]
+    fn event_append_backoff_matches_documented_schedule() {
+        let ms = |d: StdDuration| d.as_millis() as u64;
+        assert!((10..=20).contains(&ms(event_append_backoff(1))));
+        assert!((40..=50).contains(&ms(event_append_backoff(2))));
+        assert!((160..=170).contains(&ms(event_append_backoff(3))));
+        assert!((640..=650).contains(&ms(event_append_backoff(4))));
     }
 }
 
