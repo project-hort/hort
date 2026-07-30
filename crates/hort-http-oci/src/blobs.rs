@@ -213,18 +213,25 @@ pub(super) fn parse_range_header(value: &str, size: u64) -> Result<ByteRange, Ra
 ///
 /// The elapsed check is [`QuarantineUseCase::is_window_elapsed`], NOT a
 /// direct read of `artifact.quarantine_deadline` as hydrated by
-/// [`hort_app::use_cases::artifact_use_case::ArtifactUseCase::find_visible_by_path`].
-/// That hydration sets `quarantine_deadline = quarantine_window_start`
-/// (the bare ingest-time anchor, no duration added — `ArtifactUseCase`
-/// holds no policy-projection port), so it reads as "elapsed" for every
-/// `Quarantined` artifact almost immediately, including one under a
-/// genuine, still-running, multi-minute (or longer) hold. Using that
-/// signal here would silently defeat this whole section's safety
-/// argument. `QuarantineUseCase::is_window_elapsed` resolves the real
-/// matched-policy duration (the same computation the `record_scan_result`
-/// inline fast-path and the `release_expired` sweep use), so a
-/// still-running hold correctly reads as NOT elapsed and this function
-/// returns immediately without waiting.
+/// `ArtifactUseCase::find_visible_by_path`. Since issue #76 item 2/2,
+/// that hydration DOES resolve the real matched-policy duration (via
+/// the same `resolve_active_policy_for_repo` +
+/// `effective_quarantine_deadline` computation `is_window_elapsed`
+/// uses) — it is no longer the bare-anchor approximation this comment
+/// used to warn about. The two signals can still diverge, though:
+/// `quarantine_deadline` is a transient, non-persisted field that ONLY
+/// `find_visible_by_path` / `find_visible_by_id` populate at hydration
+/// time. The `artifact` reaching this function comes from
+/// `ArtifactUseCase::get_by_id` inside this same function's own poll
+/// loop below (see "Await mechanism") — `get_by_id` never hydrates the
+/// field, so it would read as `None` (or a stale value from
+/// whenever/if the artifact was last hydrated) rather than the live
+/// answer. `QuarantineUseCase::is_window_elapsed` resolves the real
+/// matched-policy duration fresh, on every call, regardless of how the
+/// artifact reached this function (the same computation the
+/// `record_scan_result` inline fast-path and the `release_expired`
+/// sweep use), so a still-running hold correctly reads as NOT elapsed
+/// and this function returns immediately without waiting.
 ///
 /// # Await mechanism: poll, not subscribe
 ///
@@ -1378,10 +1385,17 @@ mod tests {
         a.size_bytes = content.len() as i64;
         a.quarantine_status = status;
         if matches!(status, QuarantineStatus::Quarantined) {
-            // Anchor stored on the row; the transient computed deadline
-            // is what `check_quarantine` reads for `Retry-After`.
+            // Only the anchor is meaningful here: `ArtifactUseCase::
+            // hydrate_quarantine_deadline` (invoked by `find_visible_by_path`
+            // on every read) recomputes `quarantine_deadline` from this
+            // anchor + the resolved policy duration — no active policy in
+            // this harness, so it resolves to `DefaultPolicy::
+            // quarantine_duration_secs` (24h). A `quarantine_deadline` set
+            // directly here would be discarded before `serve()` ever sees
+            // it, so this helper does not set one (see
+            // `seed_blob_with_deadline`'s doc for a caller that needs a
+            // specific deadline value via `is_window_elapsed` instead).
             a.quarantine_window_start = Some(Utc::now());
-            a.quarantine_deadline = Some(Utc::now() + chrono::Duration::seconds(120));
         }
         let id = a.id;
         artifacts.insert(a);
@@ -1397,11 +1411,18 @@ mod tests {
     ///
     /// `quarantine_window_start` — not `quarantine_deadline` — is what
     /// actually reaches the handler: `ArtifactUseCase::hydrate_quarantine_deadline`
-    /// (invoked by `find_visible_by_path` on every read) unconditionally
-    /// overwrites `quarantine_deadline` with `quarantine_window_start`.
-    /// So `deadline` here is written to `quarantine_window_start`; any
-    /// `quarantine_deadline` set directly on the fixture would be
-    /// discarded before `serve()` ever sees it.
+    /// (invoked by `find_visible_by_path` on every read) recomputes and
+    /// overwrites `quarantine_deadline` from `quarantine_window_start`
+    /// (issue #76: `anchor + resolved-policy-duration`, no active
+    /// policy in this harness → `DefaultPolicy::quarantine_duration_secs`,
+    /// 24h). So `deadline` here is written to `quarantine_window_start`;
+    /// any `quarantine_deadline` set directly on the fixture would be
+    /// discarded before `serve()` ever sees it. Callers that need a
+    /// SPECIFIC, exactly-controlled `quarantine_deadline` for a
+    /// past-vs-future distinction should keep using
+    /// [`QuarantineUseCase::is_window_elapsed`]'s own resolution path
+    /// (unaffected by this fixture) rather than relying on this
+    /// hydrated field's exact value.
     fn seed_blob_with_deadline(
         artifacts: &MockArtifactRepository,
         storage: &MockStoragePort,
@@ -1699,10 +1720,16 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let retry_after = retry_after.expect("Retry-After header missing");
         let secs: i64 = retry_after.parse().unwrap();
-        // Seeded with 120 seconds of window; allow for clock drift.
+        // Issue #76: the harness wires no active scan policy, so
+        // `ArtifactUseCase::hydrate_quarantine_deadline` resolves
+        // `anchor + DefaultPolicy::quarantine_duration_secs()` (24h) —
+        // a real, multi-hour observation window, not the pre-#76 bare-
+        // anchor clamp-to-1s. Allow a little slack for clock drift /
+        // test execution time between seeding and the response.
+        let default_secs = hort_domain::policy::DefaultPolicy::quarantine_duration_secs();
         assert!(
-            (1..=120).contains(&secs),
-            "Retry-After out of expected range: {secs}"
+            (default_secs - 5..=default_secs).contains(&secs),
+            "Retry-After out of expected range: {secs} (expected close to {default_secs})"
         );
         // Assert body shape so a regression to TOOMANYREQUESTS /
         // mis-aligned status+code pair would be caught.

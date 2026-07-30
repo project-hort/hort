@@ -1717,10 +1717,14 @@ mod tests {
         a.size_bytes = content.len() as i64;
         a.quarantine_status = status;
         if matches!(status, QuarantineStatus::Quarantined) {
-            // Anchor stored on the row; the transient computed deadline
-            // is what `check_quarantine` reads for `Retry-After`.
+            // Only the anchor is meaningful here: `ArtifactUseCase::
+            // hydrate_quarantine_deadline` (invoked by `find_visible_by_path`
+            // on every read) recomputes `quarantine_deadline` from this
+            // anchor + the resolved policy duration — no active policy in
+            // this harness, so it resolves to `DefaultPolicy::
+            // quarantine_duration_secs` (24h). A `quarantine_deadline` set
+            // directly here would be discarded before `serve()` ever sees it.
             a.quarantine_window_start = Some(Utc::now());
-            a.quarantine_deadline = Some(Utc::now() + chrono::Duration::seconds(120));
         }
         let id = a.id;
         artifacts.insert(a);
@@ -2307,7 +2311,17 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let retry_after = retry_after.expect("Retry-After header missing");
         let secs: i64 = retry_after.parse().unwrap();
-        assert!((1..=120).contains(&secs));
+        // Issue #76: the harness wires no active scan policy, so
+        // `ArtifactUseCase::hydrate_quarantine_deadline` resolves
+        // `anchor + DefaultPolicy::quarantine_duration_secs()` (24h) —
+        // a real, multi-hour observation window, not the pre-#76 bare-
+        // anchor clamp-to-1s. Allow a little slack for clock drift /
+        // test execution time between seeding and the response.
+        let default_secs = hort_domain::policy::DefaultPolicy::quarantine_duration_secs();
+        assert!(
+            (default_secs - 5..=default_secs).contains(&secs),
+            "Retry-After out of expected range: {secs} (expected close to {default_secs})"
+        );
         // Assert body shape so a regression to TOOMANYREQUESTS /
         // mis-aligned status+code pair would be caught.
         assert_eq!(content_type.as_deref(), Some("application/json"));
