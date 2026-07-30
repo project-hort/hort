@@ -56,9 +56,7 @@ use hort_domain::events::{
 };
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, EventToAppend, ExpectedVersion,
-};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::types::{Page, PageRequest};
 
@@ -181,21 +179,17 @@ const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// `DomainError::Conflict`. 5 is generous headroom for realistic
 /// parallelism — exhausting it means pathological contention, not an
 /// infrastructure fault.
-const USER_STREAM_APPEND_RETRY_ATTEMPTS: u32 = 5;
-
-/// `10ms * 4^(attempt-1)` (10/40/160/640ms across the 4 backoff gaps
-/// between 5 attempts) + 0–10ms jitter. Real headroom vs issue #62's
-/// original ~2ms/4ms/6ms/8ms (~20ms total) budget, which issue #87's
-/// triage found routinely exhausted under sustained co-writer bursts or
-/// elevated DB latency — the CAS protected no read-state decision, so
-/// the tiny original backoff was sized for "spread out same-tick
-/// retriers," not for surviving real contention. Worst-case total sleep
-/// is ~850ms + jitter, safely under 1s.
-fn user_stream_append_backoff(attempt: u32) -> StdDuration {
-    let base_ms = 10u64.saturating_mul(4u64.saturating_pow(attempt.saturating_sub(1)));
-    let jitter_ms = u64::from(rand::random::<u8>() % 11); // 0..=10ms
-    StdDuration::from_millis(base_ms + jitter_ms)
-}
+///
+/// Promoted to `crate::use_cases::{EVENT_APPEND_RETRY_ATTEMPTS,
+/// event_append_backoff, append_any_with_conflict_retry}` for issue
+/// #88 — `subscription_use_case.rs` and `ingest_use_case.rs` needed the
+/// identical helper (3+ dup rule); this file re-exports the names
+/// locally under their original identifiers so none of the six call
+/// sites below had to change.
+use super::{
+    append_any_with_conflict_retry, event_append_backoff as user_stream_append_backoff,
+    EVENT_APPEND_RETRY_ATTEMPTS as USER_STREAM_APPEND_RETRY_ATTEMPTS,
+};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -673,60 +667,6 @@ pub struct ApiTokenUseCase {
     /// Keys are `cli-session-revoked:{jti}` with TTL = remaining-until-
     /// `exp`, so the set self-bounds.
     cli_session_revocation_denylist: Option<Arc<dyn EphemeralStore>>,
-}
-
-/// Bounded CAS-retry for an `ExpectedVersion::Any` append that protects
-/// NO decision made from the stream's content (issue #87). Every
-/// `StreamId::user(...)` append in this file fits that shape: none of
-/// them inspect the stream's prior events, they only ever needed a
-/// version NUMBER for the CAS write — and `ExpectedVersion::Any` means
-/// the adapter re-reads the tail itself on each attempt, so a losing
-/// `DomainError::Conflict` is resolved by simply re-invoking `append`
-/// with a fresh (byte-identical) `AppendEvents`, no client-side
-/// expected-version read at all (contrast the pre-#87 SA-mint shape,
-/// which read a *specific* expected version and re-read it on every
-/// retry).
-///
-/// `build` is called once per attempt to produce a fresh `AppendEvents`
-/// — callers close over the (already-built-once) event, correlation id,
-/// and actor, and just re-package them each call.
-///
-/// Retries ONLY `DomainError::Conflict`; any other error returns
-/// immediately, consuming none of the budget. On exhaustion, returns
-/// the final attempt's `DomainError::Conflict` verbatim — the SAME
-/// value an unretried single attempt would have produced — so callers
-/// can pattern-match `Err(DomainError::Conflict(_))` to detect
-/// exhaustion: a `Conflict` can only reach the caller after the retry
-/// budget is spent, since every intermediate `Conflict` is absorbed
-/// here; `Err(other)` means the very first attempt already failed for a
-/// different reason and was never retried.
-async fn append_any_with_conflict_retry(
-    events: &dyn EventStore,
-    attempts: u32,
-    backoff: impl Fn(u32) -> StdDuration,
-    mut build: impl FnMut() -> AppendEvents,
-) -> hort_domain::error::DomainResult<AppendResult> {
-    let mut attempt: u32 = 1;
-    loop {
-        let batch = build();
-        let stream_id = batch.stream_id.clone();
-        match events.append(batch).await {
-            Ok(result) => return Ok(result),
-            Err(DomainError::Conflict(_)) if attempt < attempts => {
-                let delay = backoff(attempt);
-                tracing::debug!(
-                    %stream_id,
-                    attempt,
-                    attempts,
-                    delay_ms = delay.as_millis() as u64,
-                    "user-stream append conflict — retrying with a fresh append",
-                );
-                tokio::time::sleep(delay).await;
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 impl ApiTokenUseCase {

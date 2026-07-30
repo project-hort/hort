@@ -19,7 +19,7 @@ use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueu
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 
 use crate::event_store_publisher::EventStorePublisher;
 use hort_domain::ports::format_handler::{FormatHandler, MetadataStrategy};
@@ -40,7 +40,10 @@ use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
 use crate::use_cases::multi_hash::{
     Sha1DigestHandle, Sha1HashingRead, Sha512DigestHandle, Sha512HashingRead,
 };
-use crate::use_cases::read_expected_version;
+use crate::use_cases::{
+    append_any_with_conflict_retry, event_append_backoff, read_expected_version,
+    EVENT_APPEND_RETRY_ATTEMPTS,
+};
 
 /// Enqueue priority for **clearance-gating** `provenance-verify` jobs — the
 /// signature-arrival hook and the expiry backstop. Set to the cron/sweep tier
@@ -2184,7 +2187,6 @@ impl IngestUseCase {
         event: DomainEvent,
         actor: Actor,
     ) -> AppResult<()> {
-        let stream_id = StreamId::repository(repository_id);
         // Repository streams are long-lived aggregates that accumulate
         // audit events forever. The workspace-wide `STREAM_EVENT_CAP`
         // is calibrated for *artifact* streams (finite lifecycle, ~5–10
@@ -2192,23 +2194,38 @@ impl IngestUseCase {
         // `ChecksumMismatch` events past the 200th — exactly when an
         // audit trail matters most (sustained tampering = many events).
         // The "auditors run … get zero rows by design" invariant
-        // requires uncapped emission on the repository aggregate, so
-        // this caller passes `enforce_cap=false`.
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
+        // requires uncapped emission on the repository aggregate.
+        //
+        // Issue #88: this unbounded stream must NOT derive its append
+        // version from `read_expected_version`'s capped forward-scan —
+        // past 201 accumulated events (exactly the "sustained tampering"
+        // case above) that read returns a STALE position and every
+        // subsequent append fails `Conflict` deterministically and
+        // permanently (the #87-class bug, on this stream instead of the
+        // per-user one). This append protects no decision made from the
+        // stream's content (a generic single-event audit append), so it
+        // uses `ExpectedVersion::Any` + bounded conflict-retry instead —
+        // no client-side expected-version read at all.
+        let stream_id = StreamId::repository(repository_id);
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            &*self.events,
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
                 events: vec![EventToAppend {
                     event_id: Uuid::new_v4(),
-                    event,
+                    event: event.clone(),
                 }],
-                correlation_id: Uuid::new_v4(),
+                correlation_id,
                 causation_id: None,
-                actor,
-            })
-            .await
-            .map_err(AppError::Domain)?;
+                actor: actor.clone(),
+            },
+        )
+        .await
+        .map_err(AppError::Domain)?;
         Ok(())
     }
 
@@ -11439,52 +11456,34 @@ mod tests {
     /// stream is a long-lived aggregate that accumulates
     /// `ChecksumMismatch` audit events forever. The workspace-wide
     /// `STREAM_EVENT_CAP` (200) is calibrated for *artifact* streams
-    /// (finite lifecycle, ~5–10 events). Capping the audit stream would
+    /// (finite lifecycle, ~5–10 events); capping the audit stream would
     /// silently drop mismatch events past the 200th — exactly when an
-    /// audit trail matters most (sustained tampering = many events). The
-    /// "auditors run … get zero rows by design" invariant requires
-    /// uncapped emission on the repository aggregate.
+    /// audit trail matters most (sustained tampering = many events).
     ///
-    /// This test seeds STREAM_EVENT_CAP+1 (201) prior events on a
-    /// repository stream — i.e. the stream is *already past* the cap
-    /// when the test starts — and then drives 49 more `ChecksumMismatch`
-    /// appends through `append_repository_event`, for a total audit
-    /// history of STREAM_EVENT_CAP + 50 = 250 events. With
-    /// `enforce_cap=true` (the bug), every one of these calls fails
-    /// `Conflict("stream … exceeds 200-event cap")` because the cap
-    /// gate triggers when stream length is strictly greater than the
-    /// cap. With `enforce_cap=false` (the fix), all 49 succeed and the
-    /// audit history grows unbounded as the invariant requires.
+    /// Issue #88 revised the mechanism entirely: `append_repository_event`
+    /// no longer calls `read_expected_version` (whose capped forward-scan
+    /// is only correct for a *bounded* stream) at all — it appends at
+    /// `ExpectedVersion::Any` with bounded conflict-retry. This test
+    /// drives 250 (`STREAM_EVENT_CAP + 50`) consecutive `ChecksumMismatch`
+    /// appends and asserts every one succeeds AND that zero `read_stream`
+    /// calls ever happen — the strongest possible pin against the
+    /// capped-read staleness bug recurring on this stream (a real,
+    /// unbounded-past-201-events repository stream would have made every
+    /// append past #201 fail `Conflict` under the pre-#88 mechanism, since
+    /// that mechanism's version-number read was a truncated,
+    /// increasingly-stale scan-from-start — see the mod.rs doc on
+    /// `read_expected_version` for the full mechanism).
     #[tokio::test]
     async fn repository_audit_stream_accepts_more_than_stream_event_cap_events() {
         use crate::use_cases::STREAM_EVENT_CAP;
-        use hort_domain::events::PersistedEvent;
-        use hort_domain::ports::event_store::ReadFrom;
 
         let repo = pypi_repository();
         let repo_id = repo.id;
         let (uc, _artifacts, events, _lifecycle, _storage, repos) = make_use_case();
         repos.insert(repo);
 
-        // Seed STREAM_EVENT_CAP + 1 (201) prior audit events on the
-        // repository stream. The mock's `read_expected_version` reads
-        // these via `read_stream`; with 201 events the cap check
-        // (`stream_events.len() > STREAM_EVENT_CAP`) trips on every
-        // single append when `enforce_cap=true`. The fix is the only
-        // thing that lets the next append succeed.
-        let stream_id = StreamId::repository(repo_id);
-        let prior = STREAM_EVENT_CAP + 1;
-        let seeded: Vec<PersistedEvent> = (0..prior)
-            .map(|pos| dummy_persisted_event(&stream_id, repo_id, pos))
-            .collect();
-        events.set_stream(&stream_id, seeded);
-
-        // Drive 49 ChecksumMismatch appends past the cap. With the
-        // `enforce_cap=true` bug every call returns `Conflict`; with
-        // the fix every call returns `Ok(())`. Total audit history at
-        // the end is STREAM_EVENT_CAP + 50 = 250 events.
-        let extra = 49_u64;
-        for _ in 0..extra {
+        let total = STREAM_EVENT_CAP + 50;
+        for _ in 0..total {
             let evt = ChecksumMismatch {
                 repository_id: repo_id,
                 coords: sample_coords(),
@@ -11499,37 +11498,105 @@ mod tests {
                 Actor::Api(api_actor()),
             )
             .await
-            .expect("audit-stream append must succeed past STREAM_EVENT_CAP");
+            .expect("audit-stream append must succeed arbitrarily far past STREAM_EVENT_CAP");
         }
 
-        // All `extra` new appends landed on the Repository stream and
-        // all are ChecksumMismatch — the audit invariant.
+        // All `total` appends landed on the Repository stream and all
+        // are ChecksumMismatch — the audit invariant.
         let appended = events.appended_batches();
-        let new_mismatches = appended
+        let mismatches = appended
             .iter()
             .filter(|b| b.stream_id.category == StreamCategory::Repository)
             .flat_map(|b| b.events.iter())
             .filter(|e| matches!(e.event, DomainEvent::ChecksumMismatch(_)))
             .count() as u64;
         assert_eq!(
-            new_mismatches, extra,
-            "expected {extra} new ChecksumMismatch appends past the cap"
+            mismatches, total,
+            "expected all {total} ChecksumMismatch appends to land, unbounded"
         );
 
-        // The repository audit history — seeded prior + new appends —
-        // totals STREAM_EVENT_CAP + 50 = 250 events, which is strictly
-        // past the workspace cap. That an append at this depth was
-        // accepted at all is exactly the unbounded-audit invariant.
-        let seeded_count = events
-            .read_stream(&stream_id, ReadFrom::Start, 1000)
-            .await
-            .expect("read_stream must not fail")
-            .len() as u64;
+        // Issue #88's actual regression pin: no client-side
+        // expected-version read ever happens on this path anymore, so
+        // there is no capped scan left to go stale.
         assert_eq!(
-            seeded_count + new_mismatches,
-            STREAM_EVENT_CAP + 50,
-            "audit stream must total STREAM_EVENT_CAP + 50 events"
+            events.read_stream_call_count(),
+            0,
+            "append_repository_event must never call read_stream"
         );
+    }
+
+    /// Issue #88: a single conflict on the repository-stream append is
+    /// absorbed transparently by the bounded retry.
+    #[tokio::test(start_paused = true)]
+    async fn append_repository_event_retries_once_on_conflict() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let (uc, _artifacts, events, _lifecycle, _storage, repos) = make_use_case();
+        repos.insert(repo);
+        events.fail_next_append(DomainError::Conflict(
+            "stream repository concurrent append at position 0".into(),
+        ));
+
+        let evt = ChecksumMismatch {
+            repository_id: repo_id,
+            coords: sample_coords(),
+            format: "pypi".into(),
+            algorithm: HashAlgorithm::Sha256,
+            upstream_value: "deadbeef".into(),
+            computed_value: "cafef00d".into(),
+        };
+        uc.append_repository_event(
+            repo_id,
+            DomainEvent::ChecksumMismatch(evt),
+            Actor::Api(api_actor()),
+        )
+        .await
+        .expect("a single conflict must be absorbed by the retry loop");
+
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the winning append must land exactly once, not twice"
+        );
+        assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #88: pathological contention exhausts the retry budget; the
+    /// final `Conflict` propagates as `AppError::Domain(Conflict)` — no
+    /// `Contended` special-case exists on this path (unlike the SA-mint's
+    /// #62 federation mapping), matching today's plain error-propagation
+    /// shape.
+    #[tokio::test(start_paused = true)]
+    async fn append_repository_event_exhausted_retry_returns_conflict_error() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let (uc, _artifacts, events, _lifecycle, _storage, repos) = make_use_case();
+        repos.insert(repo);
+        events.fail_all_appends(DomainError::Conflict(
+            "stream repository concurrent append at position 0".into(),
+        ));
+
+        let evt = ChecksumMismatch {
+            repository_id: repo_id,
+            coords: sample_coords(),
+            format: "pypi".into(),
+            algorithm: HashAlgorithm::Sha256,
+            upstream_value: "deadbeef".into(),
+            computed_value: "cafef00d".into(),
+        };
+        let err = uc
+            .append_repository_event(
+                repo_id,
+                DomainEvent::ChecksumMismatch(evt),
+                Actor::Api(api_actor()),
+            )
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Conflict(_))),
+            "got {err:?}"
+        );
+        assert!(events.appended_batches().is_empty());
     }
 
     // ----- Ingest-time scan auto-enqueue ---------------------------------
