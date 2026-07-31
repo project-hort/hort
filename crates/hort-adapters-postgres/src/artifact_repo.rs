@@ -837,6 +837,53 @@ impl PgArtifactRepository {
 
         Ok(())
     }
+
+    /// Column-scoped UPDATE for a verdict transition (scan / provenance —
+    /// issue #90). Writes ONLY `quarantine_status` + `updated_at`, never
+    /// the full row: verdict application follows a slow scan-execution /
+    /// bundle-fetch round trip after the artifact was loaded, so the
+    /// caller's in-memory snapshot of every OTHER column (most critically
+    /// `quarantine_window_start`, the quarantine anchor) can be stale by
+    /// commit time. A full-row `save_in_tx` write-back would clobber
+    /// whatever a concurrently-committed transition wrote to those columns
+    /// in the meantime. Errors `NotFound` if the artifact row does not
+    /// exist — a verdict can only ever apply to an already-ingested
+    /// artifact.
+    pub(crate) async fn save_verdict_status_in_tx(
+        &self,
+        tx: &mut PgUnitOfWork,
+        artifact_id: Uuid,
+        quarantine_status: QuarantineStatus,
+        updated_at: DateTime<Utc>,
+    ) -> DomainResult<()> {
+        tracing::debug!(
+            entity = "Artifact",
+            id = %artifact_id,
+            "save_verdict_status_in_tx"
+        );
+        let quarantine_str = match quarantine_status {
+            QuarantineStatus::None => None,
+            other => Some(other.to_string()),
+        };
+
+        let result = sqlx::query(
+            "UPDATE artifacts SET quarantine_status = $1, updated_at = $2 WHERE id = $3",
+        )
+        .bind(quarantine_str)
+        .bind(updated_at)
+        .bind(artifact_id)
+        .execute(tx.conn())
+        .await
+        .map_err(|e| map_sqlx_error(&e, "Artifact", &artifact_id.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(DomainError::NotFound {
+                entity: "Artifact",
+                id: artifact_id.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,6 +1506,145 @@ mod tests {
         );
 
         cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// issue #90 — `save_verdict_status_in_tx` must write ONLY
+    /// `quarantine_status` + `updated_at`, never the full row: a verdict
+    /// commit (scan / provenance) built from a snapshot loaded before a
+    /// concurrent transition landed must not clobber that transition's
+    /// columns — most critically `quarantine_window_start`, the
+    /// quarantine anchor. Pins the real Postgres UPDATE against every
+    /// other artifact column, not just the anchor.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn save_verdict_status_in_tx_does_not_clobber_other_columns() {
+        use crate::event_store::PgEventStore;
+        use hort_domain::entities::artifact::Artifact;
+
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let repo_id = seed_repo(&pool).await;
+
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+
+        // Seed a full row via the ordinary full-row write path — as if
+        // ingest had committed it, already carrying a quarantine anchor
+        // (simulating the concurrent quarantine transition having
+        // already landed by the time the verdict commit below runs).
+        let id = Uuid::new_v4();
+        let sha256 = deterministic_hex64(0xFEED_0090);
+        let anchor: DateTime<Utc> = "2025-06-01T00:00:00Z".parse().unwrap();
+        let original_updated_at: DateTime<Utc> = "2025-06-01T00:00:00Z".parse().unwrap();
+        let artifact = Artifact {
+            id,
+            repository_id: repo_id,
+            name: "verdict-pkg".into(),
+            name_as_published: "verdict-pkg".into(),
+            version: Some("1.0.0".into()),
+            path: format!("verdict-pkg/1.0.0/{id}.tar.gz"),
+            size_bytes: 1234,
+            sha256_checksum: sha256.parse().unwrap(),
+            sha1_checksum: Some("a".repeat(40)),
+            md5_checksum: Some("b".repeat(32)),
+            content_type: "application/octet-stream".into(),
+            quarantine_status: QuarantineStatus::Quarantined,
+            rejection_reason: None,
+            quarantine_window_start: Some(anchor),
+            quarantine_deadline: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            is_deleted: false,
+            created_at: original_updated_at,
+            updated_at: original_updated_at,
+        };
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        repo.save_in_tx(&mut uow, &artifact)
+            .await
+            .expect("save_in_tx (seed)");
+        uow.commit().await.expect("commit (seed)");
+
+        // The verdict commit: column-scoped write, deciding Rejected.
+        // Deliberately does NOT thread `quarantine_window_start` — that's
+        // the whole point of the method under test.
+        let verdict_updated_at: DateTime<Utc> = "2025-06-01T01:00:00Z".parse().unwrap();
+        let mut uow = event_store
+            .begin_unit_of_work()
+            .await
+            .expect("begin uow (verdict)");
+        repo.save_verdict_status_in_tx(
+            &mut uow,
+            id,
+            QuarantineStatus::Rejected,
+            verdict_updated_at,
+        )
+        .await
+        .expect("save_verdict_status_in_tx");
+        uow.commit().await.expect("commit (verdict)");
+
+        let saved = repo.find_by_id(id).await.expect("find_by_id");
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Rejected,
+            "the verdict's own status change must land"
+        );
+        assert_eq!(
+            saved.updated_at, verdict_updated_at,
+            "updated_at must reflect the verdict commit"
+        );
+        assert_eq!(
+            saved.quarantine_window_start,
+            Some(anchor),
+            "the anchor must survive — a column-scoped verdict commit must not clobber it"
+        );
+        // Every other column, unrelated to the verdict, must also be
+        // untouched — a regression to a full-row UPSERT would clobber
+        // these too since the caller of a real verdict commit typically
+        // holds a stale in-memory snapshot for them.
+        assert_eq!(saved.name, artifact.name);
+        assert_eq!(saved.version, artifact.version);
+        assert_eq!(saved.path, artifact.path);
+        assert_eq!(saved.size_bytes, artifact.size_bytes);
+        assert_eq!(saved.sha256_checksum, artifact.sha256_checksum);
+        assert_eq!(saved.sha1_checksum, artifact.sha1_checksum);
+        assert_eq!(saved.md5_checksum, artifact.md5_checksum);
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// issue #90 — `save_verdict_status_in_tx` errors `NotFound` rather
+    /// than silently no-op-ing when the artifact row does not exist (a
+    /// verdict can only ever apply to an already-ingested artifact; a
+    /// missing row is an invariant violation, not a benign skip).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn save_verdict_status_in_tx_errors_not_found_on_missing_row() {
+        use crate::event_store::PgEventStore;
+
+        let pool = maybe_pool()
+            .await
+            .expect("DATABASE_URL required for this test");
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        let err = repo
+            .save_verdict_status_in_tx(
+                &mut uow,
+                Uuid::new_v4(),
+                QuarantineStatus::Rejected,
+                Utc::now(),
+            )
+            .await
+            .expect_err("missing row must error, not silently no-op");
+        assert!(matches!(err, DomainError::NotFound { .. }));
     }
 
     // ---------------------------------------------------------------------

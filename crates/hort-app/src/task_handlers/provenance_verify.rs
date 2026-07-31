@@ -75,6 +75,22 @@ impl TaskHandler for ProvenanceVerifyHandler {
             // is internal to the use case; a returned `Ok(_)` outcome means
             // the verdict was applied (or skipped) cleanly.
             match self.orchestration.verify_artifact(parsed.artifact_id).await {
+                // Bounded defense-in-depth requeue (issue #90) — see
+                // `ProvenanceOrchestrationUseCase::apply_verdict`. Not a
+                // failure: signal the dispatcher to retry with its normal
+                // backoff (`compute_backoff`) rather than record a
+                // terminal result on the job row.
+                Ok(ProvenanceRunOutcome::RequeuedNoAnchor) => {
+                    tracing::debug!(
+                        artifact_id = %parsed.artifact_id,
+                        "provenance: requeueing — None-status, anchor-less, \
+                         recently-ingested artifact",
+                    );
+                    Ok(TaskOutcome::fail(
+                        "provenance-verify: anchor-less recently-ingested artifact — requeueing",
+                        true,
+                    ))
+                }
                 Ok(outcome) => {
                     // Record the compact per-artifact verdict on the job's
                     // `result_summary`, including the previously-silent
@@ -115,15 +131,22 @@ impl TaskHandler for ProvenanceVerifyHandler {
 /// Map a [`ProvenanceRunOutcome`] to the compact `result_summary` label
 /// written on the job row. The closed
 /// taxonomy is `verified` / `rejected:<reason>` / `no_attestation` /
-/// `held_pending_signature` / `skipped:<why>`; `<reason>` reuses the
-/// metrics-catalog wire string so the
+/// `held_pending_signature` / `skipped:<why>` / `requeued:<why>`;
+/// `<reason>` reuses the metrics-catalog wire string so the
 /// `result_summary` trail and the `hort_provenance_reject_total{reason}`
 /// series agree. Pure — testable without the use case.
+///
+/// `RequeuedNoAnchor` never actually reaches the job row via this mapper —
+/// `run` intercepts it before calling `result_summary_label` and returns a
+/// retryable `TaskOutcome::Failed` instead of `Completed` (see `run`
+/// above) — but the arm keeps this match exhaustive and the label testable
+/// in isolation.
 fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
     match outcome {
         ProvenanceRunOutcome::SkippedOff => "skipped:off".to_string(),
         ProvenanceRunOutcome::SkippedNoVerifier => "skipped:no_verifier".to_string(),
         ProvenanceRunOutcome::SkippedAlreadyCleared => "skipped:already_cleared".to_string(),
+        ProvenanceRunOutcome::RequeuedNoAnchor => "requeued:no_anchor".to_string(),
         ProvenanceRunOutcome::Applied { verdict, .. } => match verdict {
             ProvenanceVerdictSummary::Verified => "verified".to_string(),
             ProvenanceVerdictSummary::Rejected(reason) => {
@@ -369,6 +392,100 @@ mod tests {
         assert_eq!(summary, serde_json::json!({ "result": "no_attestation" }));
     }
 
+    /// issue #90 bounded-requeue: a `None`-status, anchor-less,
+    /// recently-ingested artifact under `Required` + `NoAttestation` must
+    /// produce a retryable `TaskOutcome::Failed`, NOT `Completed` — the
+    /// dispatcher's normal backoff must re-run the verify rather than the
+    /// job being recorded done with a `requeued:no_anchor` result on the
+    /// row. `build_handler` always seeds `QuarantineStatus::Quarantined`
+    /// (irrelevant to the other fixtures), so this test builds its own
+    /// artifact directly.
+    #[tokio::test]
+    async fn requeued_no_anchor_is_a_retryable_failure_not_completed() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let repositories = Arc::new(MockRepositoryRepository::new());
+        let projections = Arc::new(MockPolicyProjectionRepository::new());
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let events = Arc::new(MockEventStore::new());
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let upstream_proxy = Arc::new(MockUpstreamProxy::new());
+        let upstream_resolver = Arc::new(MockUpstreamResolver::new());
+
+        let mut repo: Repository = sample_repository();
+        repo.format = RepositoryFormat::Oci;
+        let repository_id = repo.id;
+        repositories.insert(repo);
+
+        // None status, no anchor, created just now — exactly the TOCTOU
+        // shape a racing worker would have observed pre-fix.
+        let mut artifact: Artifact = sample_artifact(QuarantineStatus::None);
+        artifact.repository_id = repository_id;
+        let content_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(PAYLOAD))
+            .parse()
+            .expect("valid sha256");
+        artifact.sha256_checksum = content_hash.clone();
+        artifact.quarantine_window_start = None;
+        artifact.created_at = chrono::Utc::now();
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        storage.insert_content(content_hash, PAYLOAD.to_vec());
+
+        let mut p = ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: "test-policy".to_string(),
+            scope: PolicyScope::Repository(repository_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs: 0,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::Required,
+            provenance_backends: vec!["cosign".to_string()],
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            stream_version: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        p.scan_backends = vec!["trivy".to_string()];
+        projections.insert(p);
+
+        // No seeded oci_subject referrer → the verifier sees an empty
+        // bundle set → NoAttestation, regardless of the stub's payload.
+        let uc = Arc::new(ProvenanceOrchestrationUseCase::new(
+            artifacts,
+            repositories,
+            projections,
+            content_references,
+            storage,
+            lifecycle,
+            crate::event_store_publisher::wrap_for_test(events),
+            vec![Arc::new(StubPort(ProvenanceVerdict::no_attestation())) as Arc<dyn ProvenancePort>],
+            upstream_proxy,
+            upstream_resolver,
+        ));
+        let handler = ProvenanceVerifyHandler::new(uc);
+
+        let params = serde_json::json!({ "artifact_id": artifact_id });
+        match handler.run(&params, ctx()).await.expect("Ok") {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(
+                    retry,
+                    "must be retryable — the dispatcher's normal backoff re-runs it"
+                );
+                assert!(
+                    reason.contains("requeue"),
+                    "reason should be human-readable: {reason}"
+                );
+            }
+            other => panic!("expected a retryable Failed outcome, got {other:?}"),
+        }
+    }
+
     /// A verified signature writes `result = "verified"`.
     #[tokio::test]
     async fn verified_writes_result_summary() {
@@ -410,6 +527,19 @@ mod tests {
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         };
         assert_eq!(result_summary_label(&outcome), "held_pending_signature");
+    }
+
+    /// The issue #90 bounded-requeue outcome maps to the distinct
+    /// `requeued:no_anchor` label. Pure-mapper assertion — `run`
+    /// intercepts this outcome before ever calling `result_summary_label`
+    /// (see `requeued_no_anchor_is_a_retryable_failure_not_completed`
+    /// below), so this only pins the mapper staying exhaustive/testable.
+    #[test]
+    fn requeued_no_anchor_maps_to_result_summary_label() {
+        assert_eq!(
+            result_summary_label(&ProvenanceRunOutcome::RequeuedNoAnchor),
+            "requeued:no_anchor"
+        );
     }
 
     /// An already-cleared artifact (its own earlier verification or a

@@ -2058,6 +2058,87 @@ mod tests {
 
     // -- Tests ----------------------------------------------------------------
 
+    /// issue #90 facet 2 — a scan-verdict commit built from a stale
+    /// in-memory `Artifact` snapshot (captured before a concurrently-
+    /// committed quarantine transition landed) must not clobber the anchor
+    /// that other transition just wrote. `commit_scan_result_with_score`'s
+    /// artifact-state write is column-scoped (`quarantine_status` only);
+    /// a full-row write-back (the pre-fix `save_in_tx` shape) would zero
+    /// `quarantine_window_start` back out. Mirrors
+    /// `provenance_verdict_commit_does_not_clobber_concurrently_written_anchor`
+    /// in `provenance_orchestration_tests.rs` for the scan-verdict path.
+    #[tokio::test]
+    async fn scan_verdict_commit_does_not_clobber_concurrently_written_anchor() {
+        let (_uc, artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
+
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &_repositories, QuarantineStatus::Quarantined);
+
+        // A STALE in-memory snapshot — as if `record_scan_result` loaded
+        // the artifact BEFORE the concurrent quarantine transition below
+        // landed: `None` status, no anchor.
+        let mut stale = artifacts.get(artifact_id).unwrap();
+        stale.quarantine_status = QuarantineStatus::None;
+        stale.quarantine_window_start = None;
+
+        // The concurrent quarantine transition commits, setting the
+        // anchor — AFTER the stale snapshot above was captured.
+        let anchor = Utc::now();
+        let mut current = artifacts.get(artifact_id).unwrap();
+        current.quarantine_status = QuarantineStatus::Quarantined;
+        current.quarantine_window_start = Some(anchor);
+        artifacts.insert(current);
+
+        // The (stale) scan-verdict commit now runs, deciding Rejected
+        // from its OWN stale view — exactly the shape
+        // `Artifact::reject_from_scan` would have produced on `stale`.
+        stale.quarantine_status = QuarantineStatus::Rejected;
+        let event = DomainEvent::ScanCompleted(ScanCompleted {
+            artifact_id,
+            scanner: "trivy".to_string(),
+            finding_count: 1,
+            severity_summary: SeveritySummary {
+                critical: 1,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: None,
+        });
+        lifecycle
+            .commit_scan_result_with_score(
+                &stale,
+                AppendEvents {
+                    stream_id: StreamId::artifact(artifact_id),
+                    expected_version: ExpectedVersion::Any,
+                    events: vec![EventToAppend::new(event)],
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: system_actor(),
+                },
+                &[],
+                Utc::now(),
+                None,
+                None,
+            )
+            .await
+            .expect("commit_scan_result_with_score");
+
+        let saved = artifacts.get(artifact_id).unwrap();
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Rejected,
+            "the verdict's own status change must land"
+        );
+        assert_eq!(
+            saved.quarantine_window_start,
+            Some(anchor),
+            "the concurrently-committed anchor must survive — a column-scoped verdict commit \
+             must not clobber it with the stale snapshot's None"
+        );
+    }
+
     #[tokio::test]
     async fn quarantine_artifact_success() {
         let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();

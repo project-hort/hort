@@ -2317,6 +2317,27 @@ impl MockArtifactLifecycle {
     pub fn fail_next_commit(&self, err: DomainError) {
         self.next_error.lock().unwrap().push_back(err);
     }
+
+    /// Merge only `quarantine_status` (+ `updated_at`) from `verdict` onto
+    /// whatever the mock repo currently holds for this id, falling back to
+    /// `verdict` itself when the id is unseeded. Mirrors the Postgres
+    /// adapter's column-scoped verdict UPDATE (issue #90): a verdict
+    /// commit (`commit_provenance_verdict` / `commit_scan_result_with_score`)
+    /// must never clobber a column a concurrently-recorded transition
+    /// wrote in the meantime — most critically `quarantine_window_start`.
+    /// Used to populate `self.artifacts` (the queryable "persisted
+    /// projection" simulation); `self.transitions` still records the
+    /// caller's verbatim snapshot so existing assertions on "what the use
+    /// case decided to commit" are unaffected.
+    fn merge_verdict_status(&self, verdict: &Artifact) -> Artifact {
+        let mut current = self
+            .artifacts
+            .get(verdict.id)
+            .unwrap_or_else(|| verdict.clone());
+        current.quarantine_status = verdict.quarantine_status;
+        current.updated_at = verdict.updated_at;
+        current
+    }
 }
 
 impl ArtifactLifecyclePort for MockArtifactLifecycle {
@@ -2346,6 +2367,38 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             .unwrap()
             .push((artifact.clone(), events, metadata));
         self.artifacts.insert(artifact.clone());
+        Box::pin(async move {
+            Ok(AppendResult {
+                stream_position: count.saturating_sub(1),
+                global_positions: (0..count).collect(),
+            })
+        })
+    }
+
+    /// Override the lossy default so the mock applies the SAME
+    /// column-scoped-write semantics as the real Postgres adapter's
+    /// `commit_provenance_verdict` (issue #90): only `quarantine_status` +
+    /// `updated_at` land on the queryable mock repo, so a racing verdict
+    /// commit built from a stale `Artifact` snapshot cannot clobber
+    /// `quarantine_window_start` (or any other column) a concurrently
+    /// recorded transition wrote. `self.transitions` still records the
+    /// caller's verbatim snapshot — existing assertions on "what the use
+    /// case decided to commit" are unaffected; only the queryable
+    /// `self.artifacts` projection gets the merge.
+    fn commit_provenance_verdict<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+        events: AppendEvents,
+    ) -> BoxFut<'a, DomainResult<AppendResult>> {
+        if let Some(err) = self.next_error.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        let count = events.events.len() as u64;
+        self.transitions
+            .lock()
+            .unwrap()
+            .push((artifact.clone(), events, None));
+        self.artifacts.insert(self.merge_verdict_status(artifact));
         Box::pin(async move {
             Ok(AppendResult {
                 stream_position: count.saturating_sub(1),
@@ -2481,7 +2534,12 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             .lock()
             .unwrap()
             .push((artifact_clone.clone(), events_clone.clone(), None));
-        self.artifacts.insert(artifact_clone);
+        // Column-scoped merge (issue #90) — see `merge_verdict_status`:
+        // this is a verdict commit, so only `quarantine_status` +
+        // `updated_at` land on the queryable mock repo, never a full-row
+        // overwrite of a possibly-stale snapshot.
+        self.artifacts
+            .insert(self.merge_verdict_status(&artifact_clone));
 
         let event_store = self.event_store.lock().unwrap().clone();
         let scan_findings = self.scan_findings.lock().unwrap().clone();
