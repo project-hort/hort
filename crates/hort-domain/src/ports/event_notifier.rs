@@ -81,13 +81,19 @@ pub enum NotifyFailureReason {
     /// NATS JetStream `PublishAck` did not arrive within the ack-timeout
     /// window.
     AckTimeout,
-    /// NATS broker explicitly rejected the publish — typically the
-    /// configured subject does not match any stream (NoResponders /
-    /// `PublishErrorKind::StreamNotFound` / explicit broker NAK).
-    /// Distinct from [`ConnectionLost`] so dashboards can tell
-    /// "misrouted subscription" from "broker unreachable" — the
-    /// remediation is operator-side (fix the stream/subject mapping),
-    /// not transport-side.
+    /// NATS broker explicitly rejected the publish, OR the client
+    /// itself refused to send a message that would have been
+    /// rejected — typically the configured subject does not match any
+    /// stream (NoResponders / `PublishErrorKind::StreamNotFound` /
+    /// explicit broker NAK), or the payload exceeds the server's
+    /// negotiated max size (`PublishErrorKind::MaxPayloadExceeded`,
+    /// `async-nats` 0.49+ — a client-side pre-flight check, not a
+    /// broker round-trip, but the same "permanent for this
+    /// message/config" shape). Distinct from [`ConnectionLost`] so
+    /// dashboards can tell "misrouted subscription" / "oversized
+    /// event" from "broker unreachable" — the remediation is
+    /// operator-side (fix the stream/subject mapping, or the payload
+    /// size / server config), not transport-side.
     ///
     /// Surfaced in tracing spans only — the
     /// `hort_notify_delivery_total{result}` cardinality stays at the

@@ -26,12 +26,13 @@
 //! - On timeout → [`NotifyOutcome::Failed`] with
 //!   [`NotifyFailureReason::AckTimeout`].
 //! - On broker-side rejection — `PublishErrorKind::StreamNotFound`,
-//!   `WrongLastMessageId`, `WrongLastSequence`, `MaxAckPending`, or an
-//!   `Other` whose `to_string()` matches the broker "no responders /
-//!   no stream" wording → [`NotifyOutcome::Failed`] with
+//!   `WrongLastMessageId`, `WrongLastSequence`, `MaxAckPending`, a
+//!   CLIENT-SIDE `MaxPayloadExceeded` pre-flight check (`async-nats`
+//!   0.49+), or an `Other` whose `to_string()` matches the broker "no
+//!   responders / no stream" wording → [`NotifyOutcome::Failed`] with
 //!   [`NotifyFailureReason::NatsNak`]. These are operator-visible
-//!   stream-configuration issues, not transport outages — the
-//!   distinction matters for dashboards.
+//!   stream-configuration / message-size issues, not transport
+//!   outages — the distinction matters for dashboards.
 //! - On transport-level failure (broker unreachable, broken pipe,
 //!   client `Other`) → [`NotifyOutcome::Failed`] with
 //!   [`NotifyFailureReason::ConnectionLost`].
@@ -461,12 +462,15 @@ async fn deliver(
 /// Earlier implementations mapped everything-not-timeout to
 /// `ConnectionLost`, hiding the difference between a misconfigured
 /// subject and a broker outage. The mapping below is the API surface
-/// of `async-nats` 0.48 (`PublishErrorKind` is the exported enum;
+/// of `async-nats` 0.50 (`PublishErrorKind` is the exported enum;
 /// `PublishError::kind()` returns it by value — see
-/// `async-nats-0.48.0/src/jetstream/context.rs:1822`).
+/// `async-nats-0.50.0/src/jetstream/context.rs:1835`).
 ///
-/// **NAK family.** Broker accepted the wire but rejected the publish
-/// at the JetStream layer:
+/// **NAK family.** Either the broker accepted the wire and rejected
+/// the publish at the JetStream layer, or (for `MaxPayloadExceeded`
+/// only) the client itself refused to send — both are permanent,
+/// operator-visible outcomes for THIS message/config, never a
+/// transport blip a bare retry would fix:
 /// - `StreamNotFound` — the configured subject does not match any
 ///   stream (the "no responders" condition).
 /// - `WrongLastMessageId` / `WrongLastSequence` — broker rejected the
@@ -474,6 +478,16 @@ async fn deliver(
 ///   configuration mismatch.
 /// - `MaxAckPending` — stream's `MaxAckPending` reached; operator
 ///   needs to widen the limit or consumers need to ack faster.
+/// - `MaxPayloadExceeded` (added in `async-nats` 0.49, "add max
+///   payload validation where it was missing") — a CLIENT-SIDE
+///   pre-flight check: `Context::send_publish` rejects the message
+///   before taking an ack permit or touching the network, "else the
+///   publish is sent and we wait for an ack that never arrives" (the
+///   upstream's own comment at `jetstream/context.rs:493-494`). The
+///   connection is fine; this specific payload (plus headers) exceeds
+///   the server's negotiated `max_payload` — retrying the identical
+///   payload will deterministically fail again, so it belongs in the
+///   permanent NAK bucket, not `ConnectionLost`.
 /// - `Other` whose `to_string()` matches the literal "no responders"
 ///   wording surfaced by the NATS server when the JetStream API
 ///   route has no listening server (defensive fallback for future
@@ -486,7 +500,8 @@ fn classify_publish_error(e: &PublishError) -> NotifyFailureReason {
         PublishErrorKind::StreamNotFound
         | PublishErrorKind::WrongLastMessageId
         | PublishErrorKind::WrongLastSequence
-        | PublishErrorKind::MaxAckPending => NotifyFailureReason::NatsNak,
+        | PublishErrorKind::MaxAckPending
+        | PublishErrorKind::MaxPayloadExceeded => NotifyFailureReason::NatsNak,
         PublishErrorKind::TimedOut | PublishErrorKind::BrokenPipe => {
             NotifyFailureReason::ConnectionLost
         }
@@ -645,6 +660,22 @@ mod tests {
     #[test]
     fn classify_max_ack_pending_is_nats_nak() {
         let e = PublishError::new(PublishErrorKind::MaxAckPending);
+        assert_eq!(classify_publish_error(&e), NotifyFailureReason::NatsNak);
+    }
+
+    /// Issue #89 (`async-nats` 0.48 → 0.50): `MaxPayloadExceeded` is a
+    /// new variant (added in 0.49, "add max payload validation where
+    /// it was missing"). It is a CLIENT-SIDE pre-flight rejection
+    /// (`Context::send_publish` checks payload size before taking an
+    /// ack permit or touching the network), not a broker round-trip —
+    /// but it is permanent for this message (retrying the identical
+    /// payload always fails again) and operator-visible (fix the
+    /// payload size or the server's `max_payload` config), so it
+    /// belongs in the same NAK bucket as the broker-rejection variants,
+    /// not `ConnectionLost`.
+    #[test]
+    fn classify_max_payload_exceeded_is_nats_nak() {
+        let e = PublishError::new(PublishErrorKind::MaxPayloadExceeded);
         assert_eq!(classify_publish_error(&e), NotifyFailureReason::NatsNak);
     }
 
