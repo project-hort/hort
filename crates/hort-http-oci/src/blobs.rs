@@ -543,16 +543,33 @@ pub(super) async fn serve(
             .resolve_granted_write(repo_key, actor)
             .await
             .is_ok();
-    if !write_authorized_existence_probe {
-        if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
-            return resp;
+    // Exhaustive match (issue #92) — no wildcard arm, so a future
+    // `QuarantineStatus` variant is a compile error here, not a
+    // fall-through 500/200. `None` / `Released` continue to the happy
+    // path below; every other arm returns.
+    match artifact.quarantine_status {
+        QuarantineStatus::None | QuarantineStatus::Released => {}
+        QuarantineStatus::Quarantined => {
+            if !write_authorized_existence_probe {
+                return quarantine::check_quarantine(&artifact, repo_key);
+            }
+            // else: ADR 0039 §10 write-authorized existence probe —
+            // fall through, but ONLY the HEAD branch below actually
+            // serves it (`write_authorized_existence_probe` requires
+            // `head`); a GET still cannot reach here with the flag set.
         }
-    }
-    if matches!(artifact.quarantine_status, QuarantineStatus::Rejected) {
-        return OciError::BlobUnknown {
-            digest: format!("sha256:{}", hash.as_ref()),
+        QuarantineStatus::Rejected => {
+            return OciError::BlobUnknown {
+                digest: format!("sha256:{}", hash.as_ref()),
+            }
+            .into_response();
         }
-        .into_response();
+        // Fail closed for EVERY caller, including write-granted (no
+        // HEAD-only probe extension) — issue #92, backlog 057 item 2.
+        // No `Retry-After`: this hold has no self-resolving deadline.
+        QuarantineStatus::ScanIndeterminate => {
+            return quarantine::check_scan_indeterminate();
+        }
     }
 
     // 6. Range honour. Parse the Range header AFTER the quarantine /
@@ -2172,6 +2189,234 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+    }
+
+    // -- ScanIndeterminate (issue #92) -------------------------------------
+    //
+    // Unlike Quarantined, ScanIndeterminate has NO ADR 0039 probe
+    // exemption: every caller — anonymous, pull-scoped, write-granted —
+    // gets the same 503, on GET and HEAD alike (not even the HEAD-only
+    // existence probe a pusher's pre-flight relies on for Quarantined),
+    // with NO Retry-After (no self-resolving deadline). The state ×
+    // {GET, HEAD} × {anonymous, pull-scoped, write-granted} matrix below
+    // pins that fail-closed-for-everyone shape (backlog 057 item 4).
+
+    /// Common assertions for every `ScanIndeterminate` response in this
+    /// section — mirrors `manifests.rs`'s
+    /// `assert_scan_indeterminate_response` so the two surfaces are
+    /// directly comparable.
+    async fn assert_scan_indeterminate_response(resp: Response) {
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().get("retry-after").is_none(),
+            "ScanIndeterminate must never carry Retry-After"
+        );
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(
+            parsed["errors"][0]["message"],
+            "artifact scan result is indeterminate"
+        );
+    }
+
+    /// Drive `serve()` for a `ScanIndeterminate` blob in a public OCI
+    /// repo. Mirrors `quarantined_blob_serve_status` exactly (same
+    /// harness, same write-grant wiring), returning the full response so
+    /// callers can assert on headers, not just status.
+    fn scan_indeterminate_blob_response(head: bool, actor: Option<&CallerPrincipal>) -> Response {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            // `ci-pusher` Write grant wired the same as the Quarantined
+            // suite — a write-granted caller must NOT be exempted here,
+            // unlike Quarantined's HEAD-only existence probe.
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                actor,
+            )
+            .await
+        })
+    }
+
+    #[test]
+    fn scan_indeterminate_blob_get_anonymous_returns_503() {
+        let resp = scan_indeterminate_blob_response(/* head = */ false, None);
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_blob_head_anonymous_returns_503() {
+        // HEAD/GET parity — HEAD must not short-circuit to 200.
+        let resp = scan_indeterminate_blob_response(/* head = */ true, None);
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_blob_get_write_granted_still_returns_503() {
+        let principal = principal_with_claim("ci-pusher");
+        let resp = scan_indeterminate_blob_response(/* head = */ false, Some(&principal));
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_blob_head_write_granted_still_returns_503() {
+        // The exact case Quarantined WOULD exempt (ADR 0039 §10
+        // write-authorized existence probe) — ScanIndeterminate must not.
+        let principal = principal_with_claim("ci-pusher");
+        let resp = scan_indeterminate_blob_response(/* head = */ true, Some(&principal));
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_blob_pull_scoped_cap_read_only_returns_503() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xB5CA1);
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let resp = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            let ctx = user_grant_ctx(&h.ctx, h.repositories.clone(), uid, &[Permission::Read]);
+            let principal = pull_scoped_cap_principal(uid);
+            serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await
+        });
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_blob_pull_scoped_cap_with_write_grant_still_returns_503() {
+        // The exact cap-token shape that DOES exempt a Quarantined blob's
+        // HEAD existence probe
+        // (`head_blob_quarantined_pull_scoped_cap_with_write_grant_reports_exists`)
+        // must NOT exempt ScanIndeterminate.
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xB5CA2);
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let resp = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            let ctx = user_grant_ctx(
+                &h.ctx,
+                h.repositories.clone(),
+                uid,
+                &[Permission::Read, Permission::Write],
+            );
+            let principal = pull_scoped_cap_principal(uid);
+            serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ true,
+                Some(&principal),
+            )
+            .await
+        });
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_blob_with_range_still_returns_503_before_range_parsing() {
+        // The state gate must fire BEFORE Range parsing — 503 wins over
+        // 416/206 (backlog 057 item 4, mirrors
+        // `get_blob_quarantined_with_range_still_returns_503`).
+        let content = b"scanning content bytes".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let (status, retry_after) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            let router = blob_router(h.ctx);
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(axum::http::header::RANGE, "bytes=0-3")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp.headers().get("retry-after").is_some();
+            (status, retry_after)
+        });
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !retry_after,
+            "ScanIndeterminate must never carry Retry-After"
+        );
     }
 
     // -- Cross-repo isolation ---------------------------------------------
