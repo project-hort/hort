@@ -3054,7 +3054,7 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature` |
+| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `requeued_no_anchor` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
 
 Both counters are emitted at exactly **one layer** — the orchestration
@@ -3076,8 +3076,21 @@ NetworkPolicy (see the how-to
 `docs/architecture/how-to/enable-provenance-verification.md` → *Worker
 metrics*). The companion per-job `result_summary`
 (`verified` / `rejected:<reason>` / `no_attestation` /
-`held_pending_signature` / `skipped:<why>`) is
+`held_pending_signature` / `skipped:<why>` / `requeued:<why>`) is
 the per-artifact trail and is **not** a metric.
+
+**`requeued_no_anchor`** (issue #90 defense-in-depth): a `NoAttestation`
+verdict under `Required` on a `None`-status, anchor-less, recently-ingested
+artifact — the exact shape a job racing the ingest+quarantine commit would
+have observed pre-fix (`IngestUseCase::ingest_inner` now commits both
+atomically). No verdict is applied; the task handler returns a retryable
+`TaskOutcome::Failed` instead of `Completed`, so the job re-runs with the
+dispatcher's normal backoff. Bounded by a short grace window from the
+artifact's `created_at` (`PROVENANCE_ANCHOR_GRACE_SECS`); past it the SAME
+shape (a steady-state PERMISSIVE artifact, `quarantine_duration_secs == 0`,
+which is never quarantined) resolves to `no_attestation` / `rejected` as
+before. This is the ONLY `result` value that does not correspond to an
+applied verdict — see `ProvenanceOrchestrationUseCase::apply_verdict`.
 
 The verify counter ticks on every applied verdict;
 the reject counter ticks **alongside** it (in addition, not instead) only

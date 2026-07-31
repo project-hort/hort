@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::{Artifact, ArtifactMetadata};
+use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::event_store::{AppendEvents, AppendResult};
@@ -104,6 +104,16 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
 
     /// Atomic scan-result dual-write, score upsert, and (when an SBOM
     /// was extracted) `sbom_components` REPLACE for the artifact.
+    ///
+    /// The artifact-state write is column-scoped (`quarantine_status` +
+    /// `updated_at` only), NOT the full-row `save_in_tx` — this is a
+    /// verdict commit (issue #90): the artifact was loaded at the top of
+    /// `record_scan_result`, before findings validation, policy
+    /// resolution, and the findings-blob CAS write, so the in-memory
+    /// snapshot's other columns (most critically
+    /// `quarantine_window_start`) can be stale by the time this commits.
+    /// A full-row write-back would clobber whatever a
+    /// concurrently-committed transition wrote to those columns.
     fn commit_scan_result_with_score<'a>(
         &'a self,
         artifact: &'a Artifact,
@@ -120,7 +130,14 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
             let mut uow = self.event_store.begin_unit_of_work().await?;
 
             let result = self.event_store.append_in_tx(&mut uow, events).await?;
-            self.artifact_repo.save_in_tx(&mut uow, &artifact).await?;
+            self.artifact_repo
+                .save_verdict_status_in_tx(
+                    &mut uow,
+                    artifact.id,
+                    artifact.quarantine_status,
+                    artifact.updated_at,
+                )
+                .await?;
 
             sqlx::query("UPDATE artifacts SET last_scan_at = $1 WHERE id = $2")
                 .bind(last_scan_at)
@@ -216,6 +233,34 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
                     }
                 }
             }
+
+            uow.commit().await?;
+            Ok(result)
+        })
+    }
+
+    /// Atomic provenance-verdict transition (`ProvenanceVerified` /
+    /// `ProvenanceRejected`). Column-scoped artifact write — see
+    /// [`ArtifactLifecyclePort::commit_provenance_verdict`] (issue #90):
+    /// unlike [`Self::commit_transition`], this writes ONLY
+    /// `quarantine_status` (+ `updated_at`), never the full row, so it
+    /// cannot clobber a concurrently-committed transition's other columns
+    /// (most critically `quarantine_window_start`).
+    fn commit_provenance_verdict<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+        events: AppendEvents,
+    ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+        let artifact_id = artifact.id;
+        let quarantine_status: QuarantineStatus = artifact.quarantine_status;
+        let updated_at = artifact.updated_at;
+        Box::pin(async move {
+            let mut uow = self.event_store.begin_unit_of_work().await?;
+
+            let result = self.event_store.append_in_tx(&mut uow, events).await?;
+            self.artifact_repo
+                .save_verdict_status_in_tx(&mut uow, artifact_id, quarantine_status, updated_at)
+                .await?;
 
             uow.commit().await?;
             Ok(result)

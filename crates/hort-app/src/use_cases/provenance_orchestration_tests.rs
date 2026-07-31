@@ -832,11 +832,16 @@ async fn required_unsigned_window_closed_rejects_unsigned() {
 }
 
 // ---------------------------------------------------------------------------
-// Required + unsigned + MISSING quarantine_window_start → window_open = false
-// (defensive-only branch, design §2 S1/S4). The ingest path always
-// quarantines an OCI subject before enqueuing the verify, so a `None` anchor
-// is a mis-ordered / defensive run; it must resolve fail-closed-safely to a
-// CLOSED window (terminal reject) rather than HOLD indefinitely. Even with a
+// Required + unsigned + MISSING quarantine_window_start on an ALREADY
+// `Quarantined` artifact → window_open = false (defensive-only branch,
+// design §2 S1/S4). `Quarantined` status with a `None` anchor is an
+// anomalous/corrupted shape — `Artifact::quarantine` always sets both
+// together — not the issue #90 TOCTOU symptom (which shows `None` status;
+// see `required_unsigned_none_status_*` below, the bounded-requeue
+// defense-in-depth). This anomalous shape must still resolve
+// fail-closed-safely to a CLOSED window (terminal reject) rather than HOLD
+// indefinitely — the `commit_provenance_verdict` bounded-requeue guard only
+// engages for `QuarantineStatus::None`, so it is inert here. Even with a
 // wide (24h) configured duration, the absent anchor ⇒ no window ⇒ reject.
 // ---------------------------------------------------------------------------
 
@@ -877,6 +882,203 @@ async fn required_unsigned_missing_window_start_resolves_closed_and_rejects() {
         panic!("expected ProvenanceRejected");
     };
     assert_eq!(ev.reason, ProvenanceRejectReason::Unsigned);
+}
+
+// ---------------------------------------------------------------------------
+// issue #90 — bounded requeue defense-in-depth. Required + unsigned + a
+// `None`-status, anchor-less, RECENTLY-INGESTED artifact must NOT resolve
+// terminally: this is the exact shape a job racing the (now-atomic)
+// ingest+quarantine commit would have observed pre-fix. Past the grace
+// window the SAME shape (permissive `quarantine_duration_secs == 0`, which
+// never quarantines — a legitimate permanent `None`-status steady state)
+// still resolves to the pre-existing terminal behavior.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn required_unsigned_none_status_young_artifact_requeues_instead_of_rejecting() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 24 * 3600);
+    // None status, no anchor, created just now — exactly the TOCTOU shape.
+    let mut artifact = f.artifacts.get(f.artifact_id).unwrap();
+    artifact.quarantine_status = QuarantineStatus::None;
+    artifact.quarantine_window_start = None;
+    artifact.created_at = chrono::Utc::now();
+    f.artifacts.insert(artifact);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::RequeuedNoAnchor,
+        "a None-status, anchor-less, recently-ingested artifact must requeue, not terminally \
+         reject — it may be mid-transition to Quarantined",
+    );
+
+    // No verdict was applied: no event committed, no state transition.
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "the bounded-requeue guard must short-circuit before any commit"
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::None,
+        "status must be untouched by the requeue"
+    );
+}
+
+#[tokio::test]
+async fn required_unsigned_none_status_old_artifact_past_grace_still_rejects() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 24 * 3600);
+    // Same None-status/no-anchor shape, but ingested well outside the grace
+    // window — the steady-state permissive-policy case, not a transient
+    // race. Must fall through to the pre-existing terminal resolution.
+    let mut artifact = f.artifacts.get(f.artifact_id).unwrap();
+    artifact.quarantine_status = QuarantineStatus::None;
+    artifact.quarantine_window_start = None;
+    artifact.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    f.artifacts.insert(artifact);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::Unsigned),
+        },
+        "past the grace window the None-status/no-anchor shape resolves terminally, exactly as \
+         it did before issue #90 (a permissive-policy artifact never gets an anchor)",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+    let transitions = f.lifecycle.committed_transitions();
+    assert_eq!(transitions.len(), 1);
+    let DomainEvent::ProvenanceRejected(ev) = &transitions[0].1.events[0].event else {
+        panic!("expected ProvenanceRejected");
+    };
+    assert_eq!(ev.reason, ProvenanceRejectReason::Unsigned);
+}
+
+// The bounded-requeue guard is scoped to `NoAttestation` ONLY — a forged
+// signature on a young, `None`-status artifact must still reject
+// IMMEDIATELY, not get a free pass via requeue. Proves the guard cannot be
+// used to stall out a genuine bad-signature rejection.
+#[tokio::test]
+async fn required_young_none_status_forged_signature_still_rejects_immediately() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::rejected(ProvenanceRejectReason::UntrustedIdentity),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![sample_pattern()],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 24 * 3600);
+    seed_bundle(&f, b"forged-bundle-bytes");
+    // Same young/None-status/no-anchor shape as the requeue test above —
+    // the only difference is the verifier's verdict.
+    let mut artifact = f.artifacts.get(f.artifact_id).unwrap();
+    artifact.quarantine_status = QuarantineStatus::None;
+    artifact.quarantine_window_start = None;
+    artifact.created_at = chrono::Utc::now();
+    f.artifacts.insert(artifact);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::UntrustedIdentity),
+        },
+        "a forged/untrusted signature must reject immediately — the requeue guard only ever \
+         applies to NoAttestation, never to a Rejected verdict",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+}
+
+// ---------------------------------------------------------------------------
+// issue #90 facet 2 — a provenance-verdict commit built from a stale
+// in-memory `Artifact` snapshot (captured before a concurrently-committed
+// quarantine transition landed) must not clobber the anchor that other
+// transition just wrote. `commit_provenance_verdict` is column-scoped
+// (`quarantine_status` only); a full-row write-back (the pre-fix
+// `commit_transition` shape) would zero `quarantine_window_start` back out.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn provenance_verdict_commit_does_not_clobber_concurrently_written_anchor() {
+    let f = build(RepositoryFormat::Oci, None, vec![], vec![]);
+
+    // A STALE in-memory snapshot — as if `verify_artifact` loaded the
+    // artifact BEFORE the concurrent quarantine transition below landed:
+    // `None` status, no anchor.
+    let mut stale = f.artifacts.get(f.artifact_id).unwrap();
+    stale.quarantine_status = QuarantineStatus::None;
+    stale.quarantine_window_start = None;
+
+    // The concurrent quarantine transition commits, setting the anchor —
+    // AFTER the stale snapshot above was captured.
+    let anchor = chrono::Utc::now();
+    let mut current = f.artifacts.get(f.artifact_id).unwrap();
+    current.quarantine_status = QuarantineStatus::Quarantined;
+    current.quarantine_window_start = Some(anchor);
+    f.artifacts.insert(current);
+
+    // The (stale) verdict commit now runs, deciding Rejected from its OWN
+    // stale view — exactly the shape `Artifact::complete_provenance`'s
+    // `Rejected` arm would have produced on `stale`.
+    stale.quarantine_status = QuarantineStatus::Rejected;
+    let event = DomainEvent::ProvenanceRejected(hort_domain::events::ProvenanceRejected {
+        artifact_id: f.artifact_id,
+        content_hash: f.content_hash.clone(),
+        backend: "(policy)".to_string(),
+        reason: ProvenanceRejectReason::Unsigned,
+    });
+    f.lifecycle
+        .commit_provenance_verdict(
+            &stale,
+            AppendEvents {
+                stream_id: StreamId::artifact(f.artifact_id),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event)],
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+            },
+        )
+        .await
+        .expect("commit_provenance_verdict");
+
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Rejected,
+        "the verdict's own status change must land"
+    );
+    assert_eq!(
+        saved.quarantine_window_start,
+        Some(anchor),
+        "the concurrently-committed anchor must survive — a column-scoped verdict commit must \
+         not clobber it with the stale snapshot's None"
+    );
 }
 
 // ---------------------------------------------------------------------------

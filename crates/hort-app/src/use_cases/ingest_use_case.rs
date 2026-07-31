@@ -2788,6 +2788,185 @@ impl IngestUseCase {
                 .provenance_capable_formats
                 .contains(&scan_enqueue_format);
 
+        // 6. Quarantine decision — resolved BEFORE the first commit so
+        // `ArtifactIngested` + `ScanRequested` (+ provenance-gate enqueue) +
+        // `ArtifactQuarantined` land in ONE atomic transition (issue #90,
+        // TOCTOU fix). This used to be a SEPARATE commit made after the
+        // ingest transition had already landed; a scan/provenance-verify
+        // worker could pick up the just-enqueued job in the gap between the
+        // two commits and observe an anchor-less, `None`-status artifact
+        // that was actually seconds away from being quarantined — the
+        // no-strand crash-gap guarantee `commit_transition_with_enqueues`
+        // gives the enqueues now also covers this transition, since it
+        // rides the same append.
+        //
+        // Quarantine-by-default (ADR 0007). The matched
+        // `ScanPolicy.quarantine_duration_secs` is the single source of
+        // truth for the observation-window length; with NO matched
+        // policy, [`DefaultPolicy::quarantine_duration_secs`] (24h)
+        // fires. The artifact transitions `None → Quarantined` whenever
+        // the resolved duration is `> 0`. `Some(0)` on an operator
+        // policy is the explicit **permissive** opt-out and is honoured
+        // verbatim — it does NOT fall back to the default.
+        //
+        // **Permissive mode** (operator `quarantine_duration_secs == 0`):
+        // skip the quarantine step entirely. The artifact stays in
+        // `None` — downloadable per `Artifact::is_downloadable` — and
+        // the scan runs concurrently. Bad findings transition the
+        // artifact straight to `Rejected` via the relaxed
+        // `Artifact::reject_from_scan`. This is the only way to
+        // honour `quarantineDuration: 0` literally without forcing a
+        // race between the scan and the `release_expired` sweep.
+        //
+        // `matched_policy.map(...).unwrap_or_else(default)` is shaped
+        // to ensure `Some(0)` on an operator policy stays at 0 — only
+        // an *absent* policy falls through to the Default.
+        let policy_source_is_default = matched_policy.is_none();
+        let effective_duration_secs: i64 = matched_policy
+            .as_ref()
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+
+        // `Some((anchor, anchor_clamp_fired, is_referenced_descendant,
+        // publish_anchored))` iff this ingest quarantines. Threaded to the
+        // post-commit observability block further down — the transition
+        // itself lands atomically with `ArtifactIngested` in the single
+        // commit below; only the logs/metrics fire late.
+        let mut quarantine_fired: Option<(DateTime<Utc>, bool, bool, bool)> = None;
+
+        if effective_duration_secs > 0 {
+            // Referenced-tree descendant zero-window carve-out (#46 Item
+            // 2, design doc §4 final shape + §4a). A SCOPED carve-out of
+            // ADR 0007, NOT a reversal — see the anchor resolution below.
+            //
+            // This artifact is a "referenced-tree descendant" iff it is
+            // already a `content_references` **target** of some other,
+            // already-ingested artifact — a child manifest (`kind =
+            // "oci_index_member"`), a referrer's subject (`kind =
+            // "oci_subject"`), or a config/layer blob (`kind =
+            // "oci_config"` / `"oci_layer"`, #46 Item 1). Excludes the
+            // two self-referencing refcount kinds `primary_content` /
+            // `metadata_blob` — every artifact's OWN ingest writes a
+            // `primary_content` row targeting **its own** hash (see
+            // `ingest_direct_writes_primary_content_refcount`), so an
+            // unfiltered "is this hash a target of ANY kind" check would
+            // match every single artifact against itself and always
+            // fire. Those two kinds are this artifact's own bookkeeping,
+            // never "some other already-ingested artifact references
+            // me." This lookup does NOT depend on this ingest's OWN
+            // `content_references` rows (written post-commit, below) — it
+            // only ever matches rows written by OTHER, already-ingested
+            // artifacts, so resolving it before this ingest's own commit
+            // is safe.
+            let is_referenced_descendant = match self
+                .content_references
+                .find_by_target(repository_id, &artifact.sha256_checksum, None)
+                .await
+            {
+                Ok(refs) => refs
+                    .iter()
+                    .any(|r| r.kind != "primary_content" && r.kind != "metadata_blob"),
+                Err(e) => {
+                    // Fail-safe, not fail-closed-on-scan: a lookup error
+                    // degrades to "not a descendant", i.e. the artifact
+                    // keeps its normal full window — the MORE
+                    // conservative outcome, never the zero-window one.
+                    tracing::warn!(
+                        artifact_id = %artifact.id,
+                        %repository_id,
+                        error = %e,
+                        "content_references target lookup failed; treating as non-descendant \
+                         (full window, fail-safe)"
+                    );
+                    false
+                }
+            };
+
+            // Resolve the quarantine-window anchor
+            // (`quarantine_window_start`). Three cases:
+            //
+            // - **Referenced-tree descendant** (checked first —
+            //   supersedes the opt-in below) — anchor = `ingested_at -
+            //   effective_duration`, so the live-computed deadline
+            //   (`anchor + duration`) equals `ingested_at` exactly: a
+            //   zero-length window. The RELEASE PREDICATE is completely
+            //   unchanged (`Artifact::release` still requires its own
+            //   `ScanSucceeded`/`ScanWaived` authority — ADR 0007's two
+            //   impossible failure modes stay impossible); this only
+            //   removes the *timer* wait, so the descendant's own clean
+            //   scan trips the existing event-driven fast-path release in
+            //   `QuarantineUseCase::record_scan_result` instead of
+            //   waiting out a window that provides no additional
+            //   observation (§4a: no in-window rescan exists, so the
+            //   window is pure latency for every artifact, not
+            //   protection).
+            // - **Opt-in fired** — the serving `RepositoryUpstreamMapping`
+            //   has `trust_upstream_publish_time = true` AND the format
+            //   adapter extracted a non-`None` `upstream_published_at`:
+            //   anchor = `min(upstream_published_at, ingested_at)`. The
+            //   `min` is the **future-skew clamp** — a claimed
+            //   publish time *after* ingest is physically impossible, so
+            //   a buggy/malicious upstream cannot extend its own
+            //   quarantine into the future via the opt-in.
+            // - **Default** — anchor = `ingested_at` (the ingest anchor).
+            //   Covers: opt-in `false`, direct upload (always passes
+            //   `false`), pull-through with no extractable publish
+            //   hint, and a `None` payload value.
+            //
+            // Invariant: store the **anchor**, never a precomputed
+            // deadline. The release sweep and the proxy-503 read
+            // path compute the deadline live via
+            // `effective_quarantine_deadline(anchor, duration)`, so a
+            // later policy edit of `quarantineDuration` takes effect on
+            // the existing artifact's window without a backfill
+            // migration.
+            let (anchor, anchor_clamp_fired): (DateTime<Utc>, bool) = if is_referenced_descendant {
+                (
+                    now - chrono::Duration::seconds(effective_duration_secs),
+                    false,
+                )
+            } else if trust_upstream_publish_time {
+                match upstream_published_at {
+                    Some(upstream_ts) => {
+                        let clamped = std::cmp::min(upstream_ts, now);
+                        (clamped, upstream_ts > now)
+                    }
+                    // Opt-in is on, but the format couldn't extract a
+                    // hint for this artifact — best-effort degrades
+                    // to the ingest anchor.
+                    None => (now, false),
+                }
+            } else {
+                (now, false)
+            };
+
+            // `is_referenced_descendant` supersedes the opt-in above, so
+            // it must also supersede this flag — the anchor did not come
+            // from `upstream_published_at` on that path, even if the
+            // opt-in happens to also be configured for this repo.
+            let publish_anchored = !is_referenced_descendant
+                && trust_upstream_publish_time
+                && upstream_published_at.is_some();
+
+            let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
+                (
+                    InnerIngestError::Other(AppError::Domain(e)),
+                    Some(repo_key.clone()),
+                    None,
+                )
+            })?;
+            events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
+                quarantine_event,
+            )));
+
+            quarantine_fired = Some((
+                anchor,
+                anchor_clamp_fired,
+                is_referenced_descendant,
+                publish_anchored,
+            ));
+        }
+
         let mut enqueues: Vec<IngestEnqueue> = Vec::new();
         if scan_will_run {
             enqueues.push(IngestEnqueue::Scan {
@@ -3110,181 +3289,15 @@ impl IngestUseCase {
             "ingested"
         );
 
-        // 6. Optionally quarantine.
-        //
-        // Quarantine-by-default (ADR 0007). The matched
-        // `ScanPolicy.quarantine_duration_secs` is the single source of
-        // truth for the observation-window length; with NO matched
-        // policy, [`DefaultPolicy::quarantine_duration_secs`] (24h)
-        // fires. The artifact transitions `None → Quarantined` whenever
-        // the resolved duration is `> 0`. `Some(0)` on an operator
-        // policy is the explicit **permissive** opt-out and is honoured
-        // verbatim — it does NOT fall back to the default.
-        //
-        // **Permissive mode** (operator `quarantine_duration_secs == 0`):
-        // skip the quarantine step entirely. The artifact stays in
-        // `None` — downloadable per `Artifact::is_downloadable` — and
-        // the scan runs concurrently. Bad findings transition the
-        // artifact straight to `Rejected` via the relaxed
-        // `Artifact::reject_from_scan`. This is the only way to
-        // honour `quarantineDuration: 0` literally without forcing a
-        // race between the scan and the `release_expired` sweep.
-        //
-        // `matched_policy.map(...).unwrap_or_else(default)` is shaped
-        // to ensure `Some(0)` on an operator policy stays at 0 — only
-        // an *absent* policy falls through to the Default.
-        let policy_source_is_default = matched_policy.is_none();
-        let effective_duration_secs: i64 = matched_policy
-            .as_ref()
-            .map(|p| p.quarantine_duration_secs)
-            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
-
-        if effective_duration_secs > 0 {
-            // Referenced-tree descendant zero-window carve-out (#46 Item
-            // 2, design doc §4 final shape + §4a). A SCOPED carve-out of
-            // ADR 0007, NOT a reversal — see the anchor resolution below.
-            //
-            // This artifact is a "referenced-tree descendant" iff it is
-            // already a `content_references` **target** of some other,
-            // already-ingested artifact — a child manifest (`kind =
-            // "oci_index_member"`), a referrer's subject (`kind =
-            // "oci_subject"`), or a config/layer blob (`kind =
-            // "oci_config"` / `"oci_layer"`, #46 Item 1). Excludes the
-            // two self-referencing refcount kinds `primary_content` /
-            // `metadata_blob` — every artifact's OWN ingest writes a
-            // `primary_content` row targeting **its own** hash (see
-            // `ingest_direct_writes_primary_content_refcount`), so an
-            // unfiltered "is this hash a target of ANY kind" check would
-            // match every single artifact against itself and always
-            // fire. Those two kinds are this artifact's own bookkeeping,
-            // never "some other already-ingested artifact references
-            // me."
-            let is_referenced_descendant = match self
-                .content_references
-                .find_by_target(repository_id, &artifact.sha256_checksum, None)
-                .await
-            {
-                Ok(refs) => refs
-                    .iter()
-                    .any(|r| r.kind != "primary_content" && r.kind != "metadata_blob"),
-                Err(e) => {
-                    // Fail-safe, not fail-closed-on-scan: a lookup error
-                    // degrades to "not a descendant", i.e. the artifact
-                    // keeps its normal full window — the MORE
-                    // conservative outcome, never the zero-window one.
-                    tracing::warn!(
-                        artifact_id = %artifact.id,
-                        %repository_id,
-                        error = %e,
-                        "content_references target lookup failed; treating as non-descendant \
-                         (full window, fail-safe)"
-                    );
-                    false
-                }
-            };
-
-            // Resolve the quarantine-window anchor
-            // (`quarantine_window_start`). Three cases:
-            //
-            // - **Referenced-tree descendant** (checked first —
-            //   supersedes the opt-in below) — anchor = `ingested_at -
-            //   effective_duration`, so the live-computed deadline
-            //   (`anchor + duration`) equals `ingested_at` exactly: a
-            //   zero-length window. The RELEASE PREDICATE is completely
-            //   unchanged (`Artifact::release` still requires its own
-            //   `ScanSucceeded`/`ScanWaived` authority — ADR 0007's two
-            //   impossible failure modes stay impossible); this only
-            //   removes the *timer* wait, so the descendant's own clean
-            //   scan trips the existing event-driven fast-path release in
-            //   `QuarantineUseCase::record_scan_result` instead of
-            //   waiting out a window that provides no additional
-            //   observation (§4a: no in-window rescan exists, so the
-            //   window is pure latency for every artifact, not
-            //   protection).
-            // - **Opt-in fired** — the serving `RepositoryUpstreamMapping`
-            //   has `trust_upstream_publish_time = true` AND the format
-            //   adapter extracted a non-`None` `upstream_published_at`:
-            //   anchor = `min(upstream_published_at, ingested_at)`. The
-            //   `min` is the **future-skew clamp** — a claimed
-            //   publish time *after* ingest is physically impossible, so
-            //   a buggy/malicious upstream cannot extend its own
-            //   quarantine into the future via the opt-in.
-            // - **Default** — anchor = `ingested_at` (the ingest anchor).
-            //   Covers: opt-in `false`, direct upload (always passes
-            //   `false`), pull-through with no extractable publish
-            //   hint, and a `None` payload value.
-            //
-            // Invariant: store the **anchor**, never a precomputed
-            // deadline. The release sweep and the proxy-503 read
-            // path compute the deadline live via
-            // `effective_quarantine_deadline(anchor, duration)`, so a
-            // later policy edit of `quarantineDuration` takes effect on
-            // the existing artifact's window without a backfill
-            // migration.
-            let (anchor, anchor_clamp_fired): (DateTime<Utc>, bool) = if is_referenced_descendant {
-                (
-                    now - chrono::Duration::seconds(effective_duration_secs),
-                    false,
-                )
-            } else if trust_upstream_publish_time {
-                match upstream_published_at {
-                    Some(upstream_ts) => {
-                        let clamped = std::cmp::min(upstream_ts, now);
-                        (clamped, upstream_ts > now)
-                    }
-                    // Opt-in is on, but the format couldn't extract a
-                    // hint for this artifact — best-effort degrades
-                    // to the ingest anchor.
-                    None => (now, false),
-                }
-            } else {
-                (now, false)
-            };
-
-            // `is_referenced_descendant` supersedes the opt-in above, so
-            // it must also supersede this flag — the anchor did not come
-            // from `upstream_published_at` on that path, even if the
-            // opt-in happens to also be configured for this repo.
-            let publish_anchored = !is_referenced_descendant
-                && trust_upstream_publish_time
-                && upstream_published_at.is_some();
-
-            let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
-                (
-                    InnerIngestError::Other(AppError::Domain(e)),
-                    Some(repo_key.clone()),
-                    None,
-                )
-            })?;
-
-            let expected_version = read_expected_version(&*self.events, &stream_id, true)
-                .await
-                .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
-
-            self.lifecycle
-                .commit_transition(
-                    &artifact,
-                    AppendEvents {
-                        stream_id,
-                        expected_version,
-                        events: vec![EventToAppend::new(DomainEvent::ArtifactQuarantined(
-                            quarantine_event,
-                        ))],
-                        correlation_id,
-                        causation_id: None,
-                        actor: hort_domain::events::system_actor(),
-                    },
-                    None, // metadata was persisted on the preceding ingest transition
-                )
-                .await
-                .map_err(|e| {
-                    (
-                        InnerIngestError::Other(AppError::Domain(e)),
-                        Some(repo_key.clone()),
-                        None,
-                    )
-                })?;
-
+        // Quarantine observability. The transition itself already landed
+        // atomically with `ArtifactIngested` (+ `ScanRequested` /
+        // provenance-gate enqueue) in the single commit above — see the
+        // quarantine-decision block before that commit (issue #90). Only
+        // the logs/metrics fire here, gated on whether that decision
+        // actually quarantined (`Some`).
+        if let Some((anchor, anchor_clamp_fired, is_referenced_descendant, publish_anchored)) =
+            quarantine_fired
+        {
             // Observability for the default-policy fire.
             // Operator-policy-driven quarantines retain their existing
             // log line; the default fire gets a distinct `policy_source`
@@ -5367,16 +5380,21 @@ mod tests {
                      (between {before:?} and {after:?})"
                 );
 
-                // Two transitions: ArtifactIngested + ArtifactQuarantined.
+                // Single transition (issue #90): ArtifactIngested +
+                // ScanRequested (DefaultPolicy scans by default) +
+                // ArtifactQuarantined all land in ONE atomic
+                // commit_transition_with_enqueues append — no job
+                // enqueued by this commit can ever observe an
+                // anchor-less snapshot.
                 let transitions = lifecycle.committed_transitions();
-                assert_eq!(transitions.len(), 2);
-                assert!(matches!(
-                    &transitions[0].1.events[0].event,
-                    DomainEvent::ArtifactIngested(_)
-                ));
-                let q_event = match &transitions[1].1.events[0].event {
-                    DomainEvent::ArtifactQuarantined(q) => q,
-                    other => panic!("expected ArtifactQuarantined, got {other:?}"),
+                assert_eq!(transitions.len(), 1);
+                let events = &transitions[0].1.events;
+                assert!(matches!(events[0].event, DomainEvent::ArtifactIngested(_)));
+                let Some(q_event) = events.iter().find_map(|e| match &e.event {
+                    DomainEvent::ArtifactQuarantined(q) => Some(q),
+                    _ => None,
+                }) else {
+                    panic!("expected ArtifactQuarantined in the single transition")
                 };
                 // The persisted event must carry the anchor (not the
                 // deadline) — the fast-path / sweep both
@@ -5427,12 +5445,16 @@ mod tests {
                     .expect("quarantine_window_start set under strict policy");
                 assert!(anchor >= before && anchor <= after);
 
+                // Single transition (issue #90) — see
+                // `ingest_default_no_policy_quarantines` for the full
+                // rationale.
                 let transitions = lifecycle.committed_transitions();
-                assert_eq!(transitions.len(), 2);
-                assert!(matches!(
-                    &transitions[1].1.events[0].event,
-                    DomainEvent::ArtifactQuarantined(_)
-                ));
+                assert_eq!(transitions.len(), 1);
+                assert!(transitions[0]
+                    .1
+                    .events
+                    .iter()
+                    .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_))));
             });
         });
 
@@ -11732,40 +11754,36 @@ mod tests {
                 .await
                 .expect("ingest must succeed with valid upstream digest");
 
-            // Event-side assertion: ScanRequested joins the same
-            // commit_transition batch as ArtifactIngested + ChecksumVerified.
-            // Since the seeded `global_scan_policy()` carries
-            // `quarantine_duration_secs = 24 * 3600` (strict mode), a
-            // second `commit_transition` lands the `ArtifactQuarantined`
-            // event — the quarantine transition is policy-driven
-            // (`quarantine_duration_secs` on the matched policy).
+            // Structural invariant (issue #90): ScanRequested AND the
+            // policy-driven ArtifactQuarantined (the seeded
+            // `global_scan_policy()` carries `quarantine_duration_secs =
+            // 24 * 3600`, strict mode) land in the SAME
+            // `commit_transition_with_enqueues` append as ArtifactIngested
+            // + ChecksumVerified — ONE atomic transition, not two. A scan
+            // job enqueued by this commit can therefore never observe an
+            // anchor-less snapshot of the artifact it was enqueued for.
             let transitions = lifecycle.committed_transitions();
             assert_eq!(
                 transitions.len(),
-                2,
-                "two commit_transition calls in strict mode: ingest batch + quarantine batch"
+                1,
+                "single transition: ingest + scan-request + quarantine all land atomically"
             );
-            let kinds_ingest: Vec<&str> = transitions[0]
+            let kinds: Vec<&str> = transitions[0]
                 .1
                 .events
                 .iter()
                 .map(|e| e.event.event_type())
                 .collect();
             assert_eq!(
-                kinds_ingest,
-                vec!["ArtifactIngested", "ChecksumVerified", "ScanRequested"],
-                "ScanRequested must land atomically with the ingest events",
-            );
-            let kinds_quarantine: Vec<&str> = transitions[1]
-                .1
-                .events
-                .iter()
-                .map(|e| e.event.event_type())
-                .collect();
-            assert_eq!(
-                kinds_quarantine,
-                vec!["ArtifactQuarantined"],
-                "policy-driven quarantine must follow the ingest batch",
+                kinds,
+                vec![
+                    "ArtifactIngested",
+                    "ChecksumVerified",
+                    "ScanRequested",
+                    "ArtifactQuarantined",
+                ],
+                "single-transition event order: Ingested, ChecksumVerified, ScanRequested, \
+                 Quarantined",
             );
 
             // The scan job is enqueued ATOMICALLY with the transition (no
@@ -11860,10 +11878,11 @@ mod tests {
         //      out-of-the-box deployments are quarantine-by-default.
         //
         // An earlier shape of this test asserted "DefaultPolicy has no
-        // quarantine hold" → exactly 1 commit. That clause has been
-        // retired; the assertion now mirrors the strict-policy shape
-        // (ingest commit + quarantine commit) plus the
-        // `scanner="default"` attribution.
+        // quarantine hold" → exactly 1 commit with no quarantine. A later
+        // shape asserted 2 commits (ingest commit + quarantine commit).
+        // Issue #90 folds the quarantine transition into the ingest
+        // commit — the assertion now mirrors the single-transition shape
+        // plus the `scanner="default"` attribution.
         let repo = pypi_repository();
         let repo_id = repo.id;
         let content: &[u8] = b"clean payload";
@@ -11892,26 +11911,28 @@ mod tests {
                 .await
                 .expect("ingest must succeed");
 
-            // Default-policy fire: two commits, with the second being
-            // the policy-driven `ArtifactQuarantined`.
+            // Default-policy fire: ONE transition (issue #90) carrying
+            // both the scan-request and the policy-driven
+            // `ArtifactQuarantined`.
             let transitions = lifecycle.committed_transitions();
             assert_eq!(
                 transitions.len(),
-                2,
-                "no operator policy: DefaultPolicy fires (ingest batch + quarantine batch)",
+                1,
+                "no operator policy: DefaultPolicy fires within the single ingest transition",
             );
-            let (_a, ingest_batch, _meta) = &transitions[0];
-            let kinds_ingest: Vec<&str> = ingest_batch
-                .events
-                .iter()
-                .map(|e| e.event.event_type())
-                .collect();
+            let (_a, batch, _meta) = &transitions[0];
+            let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
             assert_eq!(
-                kinds_ingest,
-                vec!["ArtifactIngested", "ChecksumVerified", "ScanRequested"],
-                "ScanRequested must be appended under the DefaultPolicy fallback",
+                kinds,
+                vec![
+                    "ArtifactIngested",
+                    "ChecksumVerified",
+                    "ScanRequested",
+                    "ArtifactQuarantined",
+                ],
+                "ScanRequested + the DefaultPolicy quarantine both land atomically with ingest",
             );
-            let scanner = ingest_batch
+            let scanner = batch
                 .events
                 .iter()
                 .find_map(|e| match &e.event {
@@ -11922,18 +11943,6 @@ mod tests {
             assert_eq!(
                 scanner, "default",
                 "scanner attribution is \"default\" when DefaultPolicy fired",
-            );
-
-            let kinds_quarantine: Vec<&str> = transitions[1]
-                .1
-                .events
-                .iter()
-                .map(|e| e.event.event_type())
-                .collect();
-            assert_eq!(
-                kinds_quarantine,
-                vec!["ArtifactQuarantined"],
-                "DefaultPolicy (quarantine-by-default, ADR 0007) drives a quarantine transition",
             );
 
             let scans = lifecycle.scan_enqueues();
