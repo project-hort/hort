@@ -387,12 +387,11 @@ the result instead.
 | anyhow | 1.0.104 | MIT | https://github.com/dtolnay/anyhow |
 | async-trait | 0.1.91 | MIT | https://github.com/dtolnay/async-trait |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
-| concurrent-queue | 2.5.0 | MIT | https://github.com/smol-rs/concurrent-queue |
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
 | displaydoc | 0.2.5 | MIT | https://github.com/yaahc/displaydoc |
 | dyn-clone | 1.0.20 | MIT | https://github.com/dtolnay/dyn-clone |
 | etcetera | 0.8.0 | MIT | https://github.com/lunacookies/etcetera |
-| event-listener | 5.4.1 | MIT | https://github.com/smol-rs/event-listener |
+| event-listener | 5.4.2 | MIT | https://github.com/smol-rs/event-listener |
 | fastrand | 2.4.1 | MIT | https://github.com/smol-rs/fastrand |
 | group | 0.13.0 | MIT | https://github.com/zkcrypto/group |
 | home | 0.5.12 | MIT | https://github.com/rust-lang/cargo |
@@ -14537,37 +14536,6 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### concurrent-queue 2.5.0 — MIT
-
-Repository: https://github.com/smol-rs/concurrent-queue
-
-```text
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
 ### curve25519-dalek-derive 0.1.1 — MIT
 
 Repository: https://github.com/dalek-cryptography/curve25519-dalek
@@ -14692,7 +14660,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### event-listener 5.4.1 — MIT
+### event-listener 5.4.2 — MIT
 
 Repository: https://github.com/smol-rs/event-listener
 
