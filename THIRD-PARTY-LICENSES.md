@@ -278,8 +278,8 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.4 | MIT | https://github.com/clap-rs/clap |
-| clap_builder | 4.6.2 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.5 | MIT | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.5 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.5.55 | MIT | https://github.com/clap-rs/clap |
 | clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 0.7.7 | MIT | https://github.com/clap-rs/clap |
@@ -11551,7 +11551,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.4 — MIT
+### clap 4.6.5 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11578,7 +11578,7 @@ SOFTWARE.
 
 ```
 
-### clap_builder 4.6.2 — MIT
+### clap_builder 4.6.5 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
