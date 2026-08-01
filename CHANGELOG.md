@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-08-01
+
+### Changed
+
+- **`async-nats` 0.48 → 0.50.** Oversized event payloads now surface the
+  new `MaxPayloadExceeded` error explicitly instead of a generic publish
+  failure. (#89)
+
+### Fixed
+
+- **Freshly-pushed OCI artifacts are no longer terminally rejected by the
+  provenance gate.** A race between the ingest transition and the
+  provenance-verify worker let the verifier observe an artifact before its
+  quarantine-window anchor was written; under `provenance_mode: Required`
+  this terminally rejected a uniform ~25–31 % of first-party signed pushes
+  as `Unsigned` within milliseconds of the push — manifest 404 by digest,
+  dangling tags, failed `cosign sign` — with no API path to release them.
+  Ingest now commits `ArtifactIngested` + `ArtifactQuarantined` in one
+  transition (no enqueued job can observe an anchor-less artifact), the
+  verifier requeues instead of rejecting when a young artifact still shows
+  no anchor, and scan/provenance verdict commits are column-scoped so they
+  can no longer overwrite a concurrent transition's quarantine columns
+  with a stale snapshot. (#90)
+- **`scan_indeterminate` artifacts serve an honest 503 on the OCI
+  surface.** Previously HEAD returned 200 (to every caller) while GET
+  failed with a 500 — a fail-closed policy hold miscategorized as a server
+  fault, and a HEAD/GET parity break. Both OCI read gates now match
+  exhaustively per artifact state; the 503 carries no `Retry-After` (the
+  hold has no self-resolving deadline) and no write-authorized hold-read
+  exemption. (#92)
+- **Proxy 503 `Retry-After` reflects the real quarantine deadline** instead
+  of clamping to ~1 second — the observation-window deadline is resolved
+  against the active scan policy's configured duration. (#76)
+- **CI token minting no longer fails with 503 "SA-stream append retry
+  budget exhausted"** under concurrent service-account mints. (#87)
+- **Versioned event-store appends on streams past 201 events no longer
+  fail permanently** — expected-version derivation no longer reads a
+  capped stream prefix; every unbounded-stream caller was audited and
+  fixed. (#88)
+- **Large image pushes complete** — chunked OCI blob uploads no longer die
+  at the ~60 s gateway timeout. (#86)
+- **hort.rs `/dl/` version-archive directories no longer return 403** for
+  the archive page's download links. (#85)
+
+### Security
+
+- `event-listener` 5.4.1 → 5.4.2 (RUSTSEC-2026-0221). (#90, #92)
+
 ## [0.9.14] - 2026-07-27
 
 ### Added
