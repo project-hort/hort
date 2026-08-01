@@ -331,8 +331,17 @@ impl ApplyConfigUseCase {
         reason: String,
         actor: Actor,
     ) -> AppResult<()> {
+        // Issue #88: `curation_per_repo` is a long-lived, per-repository
+        // aggregate — both ingest-time `Warn` decisions and every
+        // retroactive-evaluation hit over the repository's whole
+        // lifetime land here, so it is NOT bounded like a per-artifact
+        // stream. `read_expected_version`'s capped forward-scan is only
+        // correct for a bounded stream (see its doc); this append also
+        // protects no decision made from the stream's content (a
+        // generic single-event audit append), so it uses
+        // `ExpectedVersion::Any` + bounded conflict-retry instead — no
+        // client-side expected-version read at all.
         let stream_id = StreamId::curation_per_repo(repository_id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
         let event = CurationApplied {
             repository_id,
             coords,
@@ -342,16 +351,23 @@ impl ApplyConfigUseCase {
             reason,
             trigger: CurationTrigger::Retroactive,
         };
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::CurationApplied(event))],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            &*self.events,
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(DomainEvent::CurationApplied(
+                    event.clone(),
+                ))],
+                correlation_id,
                 causation_id: None,
-                actor,
-            })
-            .await?;
+                actor: actor.clone(),
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -1111,6 +1127,83 @@ mod tests {
             }
         }
         assert!(found, "expected CurationApplied(Warn) on curation stream");
+    }
+
+    /// Issue #88: `append_curation_applied`'s append protects no
+    /// stream-content decision (the `curation_per_repo` stream is a
+    /// long-lived per-repository aggregate, not bounded like an
+    /// artifact stream). A single conflict is absorbed transparently —
+    /// the retroactive Warn pass still completes.
+    #[tokio::test(start_paused = true)]
+    async fn append_curation_applied_retries_once_on_conflict() {
+        let h = build_harness();
+        let repo_id = seed_repo(&h.repos, "npm-public", RepositoryFormat::Npm);
+        seed_active_artifact(
+            &h.artifacts,
+            repo_id,
+            "moment",
+            hort_domain::entities::artifact::QuarantineStatus::Released,
+        );
+
+        let mut desired = DesiredState::default();
+        desired
+            .curation_rules
+            .push(rule_env("warn-moment", "allow", "moment", "trusted"));
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+        link_rule_after_apply(&h, "warn-moment", repo_id).await;
+
+        h.events.schedule_conflict_on_next_append();
+
+        let mut desired = DesiredState::default();
+        desired
+            .curation_rules
+            .push(rule_env("warn-moment", "warn", "moment", "deprecated"));
+        let report =
+            h.uc.apply(desired, env_oidc())
+                .await
+                .expect("a single conflict must be absorbed by the retry loop");
+        assert_eq!(report.retro_warn_count, 1);
+    }
+
+    /// Issue #88: pathological contention exhausts the retry budget;
+    /// the final `Conflict` maps to `AppError::ConcurrentModification`
+    /// via the existing `map_concurrent_modification` boundary — the
+    /// SAME mapping an unretried single attempt would have produced
+    /// (strict-atomic abort), unchanged by this fix.
+    #[tokio::test(start_paused = true)]
+    async fn append_curation_applied_exhausted_retry_aborts_strict_atomic() {
+        let h = build_harness();
+        let repo_id = seed_repo(&h.repos, "npm-public", RepositoryFormat::Npm);
+        seed_active_artifact(
+            &h.artifacts,
+            repo_id,
+            "moment",
+            hort_domain::entities::artifact::QuarantineStatus::Released,
+        );
+
+        let mut desired = DesiredState::default();
+        desired
+            .curation_rules
+            .push(rule_env("warn-moment", "allow", "moment", "trusted"));
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+        link_rule_after_apply(&h, "warn-moment", repo_id).await;
+
+        for _ in 0..EVENT_APPEND_RETRY_ATTEMPTS {
+            h.events.schedule_conflict_on_next_append();
+        }
+
+        let mut desired = DesiredState::default();
+        desired
+            .curation_rules
+            .push(rule_env("warn-moment", "warn", "moment", "deprecated"));
+        let err =
+            h.uc.apply(desired, env_oidc())
+                .await
+                .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(err, AppError::ConcurrentModification(_)),
+            "got {err:?}"
+        );
     }
 
     /// `list_active_for_repo` excludes `Rejected` artifacts; the

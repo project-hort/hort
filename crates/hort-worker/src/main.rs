@@ -13,6 +13,7 @@
 //! [`hort_worker::heartbeat`].
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
@@ -22,7 +23,21 @@ use tokio_util::sync::CancellationToken;
 use hort_worker::cli::{Cli, Command};
 use hort_worker::composition;
 use hort_worker::config::WorkerConfig;
+use hort_worker::startup_retry::retry_with_backoff;
 use hort_worker::{extra_ca, healthcheck, heartbeat, metrics_server, telemetry};
+
+/// Bounded retry budget for the composition-root app-context build
+/// (issue #86): a transient postgres DNS blip at boot otherwise kills
+/// the process outright, and k8s crash-loops it. 5 attempts with the
+/// backoff below cap at ~30s total — generous enough to ride out a
+/// transient blip, short enough that a genuine misconfiguration still
+/// fails fast relative to a crash-loop's own restart backoff.
+const WORKER_BOOT_RETRY_ATTEMPTS: u32 = 5;
+
+/// `2s, 4s, 8s, 16s` between the 5 attempts (sum = 30s).
+fn worker_boot_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(attempt))
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -98,13 +113,23 @@ async fn run_dispatcher() -> anyhow::Result<()> {
     //    adapter (and any future reqwest-using adapter the worker
     //    constructs); the merged-bundle path flows into the scanner
     //    adapters' `SSL_CERT_FILE` Command env.
-    let composition::BuildOutput { ctx, dispatcher } = composition::build_app_context(
-        &cfg,
-        extra_ca.anchors.as_ref(),
-        extra_ca.subprocess_bundle_path.as_deref(),
-    )
-    .await
-    .context("building worker app context")?;
+    //
+    //    Bounded retry with backoff (issue #86): at boot there is no
+    //    state yet to corrupt, so every failure here — DNS blip,
+    //    genuine misconfig, anything else — is retried uniformly up to
+    //    the bound; error strings are never classified. Exhaustion
+    //    propagates the last attempt's error exactly as an unretried
+    //    call would have, via the same `.context(...)` below.
+    let composition::BuildOutput { ctx, dispatcher } =
+        retry_with_backoff(WORKER_BOOT_RETRY_ATTEMPTS, worker_boot_backoff, || {
+            composition::build_app_context(
+                &cfg,
+                extra_ca.anchors.as_ref(),
+                extra_ca.subprocess_bundle_path.as_deref(),
+            )
+        })
+        .await
+        .context("building worker app context")?;
 
     tracing::info!(
         scanners = ?ctx.scanners,

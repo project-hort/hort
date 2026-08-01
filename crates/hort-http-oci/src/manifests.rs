@@ -294,16 +294,32 @@ pub(super) async fn serve(
                 .resolve_granted_write(repo_key, actor)
                 .await
                 .is_ok();
-    if !write_authorized_hold_read {
-        if let Some(resp) = quarantine::check_quarantine(&artifact, repo_key) {
-            return resp;
+    // Exhaustive match (issue #92) — no wildcard arm, so a future
+    // `QuarantineStatus` variant is a compile error here, not a
+    // fall-through 500/200. `None` / `Released` continue to the happy
+    // path below; every other arm returns.
+    match artifact.quarantine_status {
+        QuarantineStatus::None | QuarantineStatus::Released => {}
+        QuarantineStatus::Quarantined => {
+            if !write_authorized_hold_read {
+                return quarantine::check_quarantine(&artifact, repo_key);
+            }
+            // else: ADR 0039 §10 write-authorized hold-read — fall
+            // through to serve the manifest (HEAD and GET alike).
         }
-    }
-    if matches!(artifact.quarantine_status, QuarantineStatus::Rejected) {
-        return OciError::ManifestUnknown {
-            reference: reference.to_string(),
+        QuarantineStatus::Rejected => {
+            return OciError::ManifestUnknown {
+                reference: reference.to_string(),
+            }
+            .into_response();
         }
-        .into_response();
+        // Fail closed for EVERY caller, including write-granted — the
+        // ADR 0039 §10 hold-read exemption above does NOT extend here
+        // (issue #92, backlog 057 item 2). No `Retry-After`: this hold
+        // has no self-resolving deadline.
+        QuarantineStatus::ScanIndeterminate => {
+            return quarantine::check_scan_indeterminate();
+        }
     }
 
     // 5. Media-type + content negotiation. The stored type comes from
@@ -1717,10 +1733,14 @@ mod tests {
         a.size_bytes = content.len() as i64;
         a.quarantine_status = status;
         if matches!(status, QuarantineStatus::Quarantined) {
-            // Anchor stored on the row; the transient computed deadline
-            // is what `check_quarantine` reads for `Retry-After`.
+            // Only the anchor is meaningful here: `ArtifactUseCase::
+            // hydrate_quarantine_deadline` (invoked by `find_visible_by_path`
+            // on every read) recomputes `quarantine_deadline` from this
+            // anchor + the resolved policy duration — no active policy in
+            // this harness, so it resolves to `DefaultPolicy::
+            // quarantine_duration_secs` (24h). A `quarantine_deadline` set
+            // directly here would be discarded before `serve()` ever sees it.
             a.quarantine_window_start = Some(Utc::now());
-            a.quarantine_deadline = Some(Utc::now() + chrono::Duration::seconds(120));
         }
         let id = a.id;
         artifacts.insert(a);
@@ -2307,7 +2327,17 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let retry_after = retry_after.expect("Retry-After header missing");
         let secs: i64 = retry_after.parse().unwrap();
-        assert!((1..=120).contains(&secs));
+        // Issue #76: the harness wires no active scan policy, so
+        // `ArtifactUseCase::hydrate_quarantine_deadline` resolves
+        // `anchor + DefaultPolicy::quarantine_duration_secs()` (24h) —
+        // a real, multi-hour observation window, not the pre-#76 bare-
+        // anchor clamp-to-1s. Allow a little slack for clock drift /
+        // test execution time between seeding and the response.
+        let default_secs = hort_domain::policy::DefaultPolicy::quarantine_duration_secs();
+        assert!(
+            (default_secs - 5..=default_secs).contains(&secs),
+            "Retry-After out of expected range: {secs} (expected close to {default_secs})"
+        );
         // Assert body shape so a regression to TOOMANYREQUESTS /
         // mis-aligned status+code pair would be caught.
         assert_eq!(content_type.as_deref(), Some("application/json"));
@@ -2794,6 +2824,199 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+    }
+
+    // ---------------- ScanIndeterminate (issue #92) ----------------
+    //
+    // Unlike Quarantined, ScanIndeterminate has NO ADR 0039 hold-read
+    // exemption: every caller — anonymous, pull-scoped, write-granted —
+    // gets the same 503, on GET and HEAD alike, with NO Retry-After (no
+    // self-resolving deadline; exit is admin action or a successful
+    // rescan). The state × {GET, HEAD} × {anonymous, pull-scoped,
+    // write-granted} matrix below pins that fail-closed-for-everyone
+    // shape (backlog 057 item 4).
+
+    /// Common assertions for every `ScanIndeterminate` response in this
+    /// section: 503, `UNAVAILABLE` code, the scan-indeterminate detail
+    /// message, and — the property that most distinguishes this state
+    /// from `Quarantined` — NO `Retry-After` header.
+    async fn assert_scan_indeterminate_response(resp: Response) {
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().get("retry-after").is_none(),
+            "ScanIndeterminate must never carry Retry-After"
+        );
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(
+            parsed["errors"][0]["message"],
+            "artifact scan result is indeterminate"
+        );
+    }
+
+    /// Drive `serve()` for a digest-referenced `ScanIndeterminate`
+    /// manifest in a public OCI repo. Mirrors
+    /// `quarantined_manifest_serve_status` exactly (same harness, same
+    /// write-grant wiring) so the two states are directly comparable —
+    /// the only variable across this section's tests is `head` +
+    /// `actor`.
+    fn scan_indeterminate_manifest_response(
+        head: bool,
+        actor: Option<&CallerPrincipal>,
+    ) -> Response {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            // `ci-pusher` Write grant wired the same as the Quarantined
+            // suite — a write-granted caller must NOT be exempted here,
+            // unlike Quarantined.
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                actor,
+            )
+            .await
+        })
+    }
+
+    #[test]
+    fn scan_indeterminate_manifest_get_anonymous_returns_503() {
+        let resp = scan_indeterminate_manifest_response(/* head = */ false, None);
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_manifest_head_anonymous_returns_503() {
+        // HEAD/GET parity — HEAD must not short-circuit to 200.
+        let resp = scan_indeterminate_manifest_response(/* head = */ true, None);
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_manifest_get_write_granted_still_returns_503() {
+        let principal = principal_with_claim("ci-pusher");
+        let resp = scan_indeterminate_manifest_response(/* head = */ false, Some(&principal));
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_manifest_head_write_granted_still_returns_503() {
+        // The exact case Quarantined WOULD exempt (ADR 0039 §10
+        // write-authorized hold-read) — ScanIndeterminate must not.
+        let principal = principal_with_claim("ci-pusher");
+        let resp = scan_indeterminate_manifest_response(/* head = */ true, Some(&principal));
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_manifest_pull_scoped_cap_read_only_returns_503() {
+        use hort_domain::entities::rbac::Permission;
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let uid = Uuid::from_u128(0xC5CA1);
+        let resp = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            let ctx = user_grant_ctx(&h.ctx, h.repositories.clone(), uid, &[Permission::Read]);
+            let principal = pull_scoped_cap_principal(uid);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await
+        });
+        run(assert_scan_indeterminate_response(resp));
+    }
+
+    #[test]
+    fn scan_indeterminate_manifest_pull_scoped_cap_with_write_grant_still_returns_503() {
+        // The exact cap-token shape that DOES exempt a Quarantined
+        // manifest (`quarantined_manifest_pull_scoped_cap_with_write_grant_serves`)
+        // must NOT exempt ScanIndeterminate.
+        use hort_domain::entities::rbac::Permission;
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let uid = Uuid::from_u128(0xC5CA2);
+        let resp = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            let ctx = user_grant_ctx(
+                &h.ctx,
+                h.repositories.clone(),
+                uid,
+                &[Permission::Read, Permission::Write],
+            );
+            let principal = pull_scoped_cap_principal(uid);
+            serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ true,
+                Some(&principal),
+            )
+            .await
+        });
+        run(assert_scan_indeterminate_response(resp));
     }
 
     // ---------------- Default media type fallback ----------------

@@ -114,6 +114,18 @@ pub enum OciError {
     /// `TOOMANYREQUESTS` (HTTP 429) to avoid overloading rate-limit-
     /// adaptive retry heuristics in strict clients like Artifactory.
     Quarantined { retry_after_seconds: i64 },
+    /// 503 — the artifact's scan result is indeterminate (the scanner
+    /// exhausted its retries without a decision; ADR 0007's fail-closed
+    /// terminal state — issue #6). Unlike [`Self::Quarantined`], this
+    /// hold has no self-resolving deadline (exit is admin override or a
+    /// successful rescan, not the passage of time), so this variant
+    /// deliberately does NOT carry `retry_after_seconds` and emits no
+    /// `Retry-After` header. Fail-closed for every caller, including a
+    /// write-granted one — the ADR 0039 §10 push-then-sign / dedup
+    /// hold-read exemptions that apply to `Quarantined` do NOT extend
+    /// here (issue #92). Code is `UNAVAILABLE` — the same spec-extension
+    /// as `Quarantined`; no new OCI error code.
+    ScanIndeterminate,
     /// 503 — a transient server-side contention hold. The OCI
     /// three-phase blob-upload `initiate` returns this when the
     /// per-`(repo, principal)` session-cap reconcile CAS loop exhausted
@@ -239,6 +251,7 @@ impl OciError {
             Self::DigestInvalid { .. } => "DIGEST_INVALID",
             Self::ManifestNotAcceptable { .. } => "MANIFEST_UNKNOWN",
             Self::Quarantined { .. } => "UNAVAILABLE",
+            Self::ScanIndeterminate => "UNAVAILABLE",
             Self::Unavailable { .. } => "UNAVAILABLE",
             Self::Internal => "INTERNAL",
             Self::BlobUploadUnknown { .. } => "BLOB_UPLOAD_UNKNOWN",
@@ -271,6 +284,7 @@ impl OciError {
             Self::DigestInvalid { .. } => StatusCode::BAD_REQUEST,
             Self::ManifestNotAcceptable { .. } => StatusCode::NOT_ACCEPTABLE,
             Self::Quarantined { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ScanIndeterminate => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BlobUploadUnknown { .. } => StatusCode::NOT_FOUND,
@@ -300,6 +314,7 @@ impl OciError {
             Self::DigestInvalid { message } => message.clone(),
             Self::ManifestNotAcceptable { .. } => "manifest media type not acceptable".to_string(),
             Self::Quarantined { .. } => "artifact is quarantined".to_string(),
+            Self::ScanIndeterminate => "artifact scan result is indeterminate".to_string(),
             Self::Unavailable { .. } => "service temporarily unavailable".to_string(),
             Self::Internal => "internal error".to_string(),
             Self::BlobUploadUnknown { .. } => "blob upload session unknown".to_string(),
@@ -345,6 +360,10 @@ impl OciError {
             } => Some(serde_json::json!({
                 "retry_after_seconds": retry_after_seconds,
             })),
+            // No `retry_after_seconds` — this hold has no self-resolving
+            // deadline (see the variant doc). `null` on the wire, same
+            // shape as `Unsupported` / `Internal`.
+            Self::ScanIndeterminate => None,
             Self::Unavailable {
                 retry_after_seconds,
             } => Some(serde_json::json!({
@@ -426,6 +445,9 @@ impl IntoResponse for OciError {
             Self::TooManyRequests {
                 retry_after_seconds,
             } => Some(*retry_after_seconds),
+            // `ScanIndeterminate` deliberately falls here: no
+            // self-resolving deadline, so no `Retry-After` (see the
+            // variant doc).
             _ => None,
         };
         // `Range` header is set on 416 responses — the client uses it
@@ -695,6 +717,30 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
         assert_eq!(parsed["errors"][0]["detail"]["retry_after_seconds"], 15);
+    }
+
+    #[tokio::test]
+    async fn scan_indeterminate_is_503_with_unavailable_code_and_no_retry_after() {
+        // Issue #92: same `UNAVAILABLE` spec-extension code as
+        // `Quarantined`, but — unlike `Quarantined` / `Unavailable` — NO
+        // `Retry-After` header: this hold has no self-resolving
+        // deadline.
+        let response = OciError::ScanIndeterminate.into_response();
+        let status = response.status();
+        assert!(
+            response.headers().get("Retry-After").is_none(),
+            "ScanIndeterminate must never carry Retry-After"
+        );
+        let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(
+            parsed["errors"][0]["message"],
+            "artifact scan result is indeterminate"
+        );
+        assert!(parsed["errors"][0]["detail"].is_null());
     }
 
     #[tokio::test]

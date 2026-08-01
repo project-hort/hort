@@ -23,8 +23,8 @@ the result instead.
 | prost-types | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | prost | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | ring | 0.17.14 | Apache-2.0 | https://github.com/briansmith/ring |
-| async-nats | 0.48.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
-| aws-lc-sys | 0.40.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
+| async-nats | 0.50.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
+| aws-lc-sys | 0.43.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
 | blake3 | 1.8.5 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
 | constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
 | kube-client | 3.1.0 | Apache-2.0 | https://github.com/kube-rs/kube |
@@ -43,7 +43,7 @@ the result instead.
 | matchit | 0.7.3 | BSD-3-Clause | https://github.com/ibraheemdev/matchit |
 | subtle | 2.6.1 | BSD-3-Clause | https://github.com/dalek-cryptography/subtle |
 | ed25519-dalek | 2.2.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek |
-| aws-lc-sys | 0.40.0 | BSD-3-Clause | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.43.0 | BSD-3-Clause | https://github.com/aws/aws-lc-rs |
 | curve25519-dalek | 4.1.3 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | sha1_smol | 1.0.1 | BSD-3-Clause | https://github.com/mitsuhiko/sha1-smol |
 | encoding_rs | 0.8.35 | BSD-3-Clause | https://github.com/hsivonen/encoding_rs |
@@ -54,8 +54,8 @@ the result instead.
 | simple_asn1 | 0.6.4 | ISC | https://github.com/acw/simple_asn1 |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | rustls-webpki | 0.103.13 | ISC | https://github.com/rustls/webpki |
-| aws-lc-rs | 1.16.3 | ISC | https://github.com/aws/aws-lc-rs |
-| aws-lc-sys | 0.40.0 | ISC | https://github.com/aws/aws-lc-rs |
+| aws-lc-rs | 1.17.3 | ISC | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.43.0 | ISC | https://github.com/aws/aws-lc-rs |
 | serde_yaml_ng | 0.10.0 | MIT | https://github.com/acatton/serde-yaml-ng |
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
 | quanta | 0.12.6 | MIT | https://github.com/metrics-rs/quanta |
@@ -141,7 +141,7 @@ the result instead.
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
 | rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.42 | MIT | https://github.com/rustls/rustls |
+| rustls | 0.23.43 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -278,8 +278,8 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.4 | MIT | https://github.com/clap-rs/clap |
-| clap_builder | 4.6.2 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.5 | MIT | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.5 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.5.55 | MIT | https://github.com/clap-rs/clap |
 | clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 0.7.7 | MIT | https://github.com/clap-rs/clap |
@@ -288,10 +288,10 @@ the result instead.
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
 | serde_spanned | 1.1.1 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.1.4+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_parser | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_writer | 1.1.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_parser | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_writer | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
 | time-core | 0.1.8 | MIT | https://github.com/time-rs/time |
 | time-macros | 0.2.27 | MIT | https://github.com/time-rs/time |
@@ -343,6 +343,11 @@ the result instead.
 | chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.8.1 | MIT | https://github.com/boinkor-net/governor.git |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
+| objc2-app-kit | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-encode | 4.1.0 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
 | object_store | 0.13.2 | MIT | https://github.com/apache/arrow-rs-object-store |
 | typed-path | 0.9.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | whoami | 1.6.1 | MIT | https://github.com/ardaku/whoami |
@@ -365,8 +370,8 @@ the result instead.
 | windows_x86_64_gnu | 0.48.5 | MIT | https://github.com/microsoft/windows-rs |
 | windows_x86_64_gnu | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
 | windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
-| tokio-stream | 0.1.18 | MIT | https://github.com/tokio-rs/tokio |
-| tokio-util | 0.7.18 | MIT | https://github.com/tokio-rs/tokio |
+| tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
+| tokio-util | 0.7.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio | 1.52.3 | MIT | https://github.com/tokio-rs/tokio |
 | simd-adler32 | 0.3.9 | MIT | https://github.com/mcountryman/simd-adler32 |
 | miniz_oxide | 0.8.9 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
@@ -382,12 +387,11 @@ the result instead.
 | anyhow | 1.0.104 | MIT | https://github.com/dtolnay/anyhow |
 | async-trait | 0.1.91 | MIT | https://github.com/dtolnay/async-trait |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
-| concurrent-queue | 2.5.0 | MIT | https://github.com/smol-rs/concurrent-queue |
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
 | displaydoc | 0.2.5 | MIT | https://github.com/yaahc/displaydoc |
 | dyn-clone | 1.0.20 | MIT | https://github.com/dtolnay/dyn-clone |
 | etcetera | 0.8.0 | MIT | https://github.com/lunacookies/etcetera |
-| event-listener | 5.4.1 | MIT | https://github.com/smol-rs/event-listener |
+| event-listener | 5.4.2 | MIT | https://github.com/smol-rs/event-listener |
 | fastrand | 2.4.1 | MIT | https://github.com/smol-rs/fastrand |
 | group | 0.13.0 | MIT | https://github.com/zkcrypto/group |
 | home | 0.5.12 | MIT | https://github.com/rust-lang/cargo |
@@ -454,8 +458,8 @@ the result instead.
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 10.3.0 | MIT | https://github.com/Keats/jsonwebtoken |
-| aws-lc-sys | 0.40.0 | MIT | https://github.com/aws/aws-lc-rs |
-| webbrowser | 1.2.1 | MIT | https://github.com/amodm/webbrowser-rs |
+| aws-lc-sys | 0.43.0 | MIT | https://github.com/aws/aws-lc-rs |
+| webbrowser | 1.2.2 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | hdrhistogram | 7.5.4 | MIT | https://github.com/HdrHistogram/HdrHistogram_rust.git |
@@ -2598,7 +2602,7 @@ limitations under the License.
 
 ```
 
-### async-nats 0.48.0 — Apache-2.0
+### async-nats 0.50.0 — Apache-2.0
 
 Repository: https://github.com/nats-io/nats.rs
 
@@ -2679,7 +2683,7 @@ limitations under the License.
 
 ```
 
-### aws-lc-sys 0.40.0 — Apache-2.0
+### aws-lc-sys 0.43.0 — Apache-2.0
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -4038,7 +4042,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### aws-lc-sys 0.40.0 — BSD-3-Clause
+### aws-lc-sys 0.43.0 — BSD-3-Clause
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -4378,7 +4382,7 @@ third-party/chromium/LICENSE.
 
 ```
 
-### aws-lc-rs 1.16.3 — ISC
+### aws-lc-rs 1.17.3 — ISC
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -4394,7 +4398,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND ISC DISCLAIMS ALL WARRANTIES WITH
 
 ```
 
-### aws-lc-sys 0.40.0 — ISC
+### aws-lc-sys 0.43.0 — ISC
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -7149,7 +7153,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.42 — MIT
+### rustls 0.23.43 — MIT
 
 Repository: https://github.com/rustls/rustls
 
@@ -11547,7 +11551,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.4 — MIT
+### clap 4.6.5 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11574,7 +11578,7 @@ SOFTWARE.
 
 ```
 
-### clap_builder 4.6.2 — MIT
+### clap_builder 4.6.5 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11817,7 +11821,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.1.2+spec-1.1.0 — MIT
+### toml 1.1.4+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -11871,7 +11875,7 @@ SOFTWARE.
 
 ```
 
-### toml_parser 1.1.2+spec-1.1.0 — MIT
+### toml_parser 1.1.3+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -11898,7 +11902,7 @@ SOFTWARE.
 
 ```
 
-### toml_writer 1.1.1+spec-1.1.0 — MIT
+### toml_writer 1.1.2+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13355,6 +13359,136 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
+### objc2-app-kit 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2-core-foundation 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2-encode 4.1.0 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2-foundation 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### objc2 0.6.4 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
 ### object_store 0.13.2 — MIT
 
 Repository: https://github.com/apache/arrow-rs-object-store
@@ -13927,7 +14061,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### tokio-stream 0.1.18 — MIT
+### tokio-stream 0.1.19 — MIT
 
 Repository: https://github.com/tokio-rs/tokio
 
@@ -13956,7 +14090,7 @@ SOFTWARE.
 
 ```
 
-### tokio-util 0.7.18 — MIT
+### tokio-util 0.7.19 — MIT
 
 Repository: https://github.com/tokio-rs/tokio
 
@@ -14402,37 +14536,6 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### concurrent-queue 2.5.0 — MIT
-
-Repository: https://github.com/smol-rs/concurrent-queue
-
-```text
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
 ### curve25519-dalek-derive 0.1.1 — MIT
 
 Repository: https://github.com/dalek-cryptography/curve25519-dalek
@@ -14557,7 +14660,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### event-listener 5.4.1 — MIT
+### event-listener 5.4.2 — MIT
 
 Repository: https://github.com/smol-rs/event-listener
 
@@ -16569,7 +16672,7 @@ SOFTWARE.
 
 ```
 
-### aws-lc-sys 0.40.0 — MIT
+### aws-lc-sys 0.43.0 — MIT
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -16599,7 +16702,7 @@ SOFTWARE.
 
 ```
 
-### webbrowser 1.2.1 — MIT
+### webbrowser 1.2.2 — MIT
 
 Repository: https://github.com/amodm/webbrowser-rs
 

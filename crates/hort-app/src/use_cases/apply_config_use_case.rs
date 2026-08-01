@@ -281,6 +281,9 @@ impl UpstreamHostAllowlist {
 use crate::use_cases::read_expected_version;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use crate::use_cases::{
+    append_any_with_conflict_retry, event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS,
+};
+use crate::use_cases::{
     AddExclusionCommand, CreatePolicyCommand, FieldChange, PolicyUseCase, RemoveExclusionCommand,
     UpdatePolicyCommand,
 };

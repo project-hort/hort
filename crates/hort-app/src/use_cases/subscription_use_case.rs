@@ -48,18 +48,19 @@ use hort_domain::events::{
     SubscriptionDisabled, SubscriptionPaused, SubscriptionResumed, SubscriptionUpdated,
     TargetKindWire,
 };
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::subscription_repository::SubscriptionRepository;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
 use hort_domain::types::{Page, PageRequest};
 
-use crate::error::AppError;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{emit_ssrf_block, ssrf_reason_label};
 use crate::rbac::RbacEvaluator;
-use crate::use_cases::read_expected_version;
+use crate::use_cases::{
+    append_any_with_conflict_retry, event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS,
+};
 
 // ---------------------------------------------------------------------------
 // SubscriptionUseCaseConfig
@@ -603,10 +604,10 @@ impl SubscriptionUseCase {
         }
 
         // 8. Emit SubscriptionCreated on owner's user stream.
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #88):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(sub.owner_user_id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(app_to_use_case_err)?;
         let snapshot_claims_count = sub.snapshot_claims.len() as u32;
         let event = DomainEvent::SubscriptionCreated(SubscriptionCreated {
             subscription_id: sub.id.0,
@@ -616,18 +617,23 @@ impl SubscriptionUseCase {
             snapshot_claims_count,
             at: now,
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: hort_domain::events::Actor::Api(ApiActor {
                     user_id: principal.user_id,
                 }),
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         tracing::info!(
             subscription_id = %sub.id.0,
@@ -715,10 +721,10 @@ impl SubscriptionUseCase {
         attempted_filter_summary: FilterSummary,
         denial_reason: SubscriptionDenialReason,
     ) -> Result<(), SubscriptionError> {
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #88):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(principal.user_id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(app_to_use_case_err)?;
         let event = DomainEvent::SubscriptionCreationDenied(SubscriptionCreationDenied {
             requesting_user_id: principal.user_id,
             requested_target_kind: target_kind,
@@ -726,18 +732,23 @@ impl SubscriptionUseCase {
             denial_reason,
             at: Utc::now(),
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: hort_domain::events::Actor::Api(ApiActor {
                     user_id: principal.user_id,
                 }),
-            })
-            .await?;
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -961,10 +972,10 @@ impl SubscriptionUseCase {
         self.subscriptions.update(&sub).await?;
 
         let now = Utc::now();
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #88):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(sub.owner_user_id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(app_to_use_case_err)?;
         let event = DomainEvent::SubscriptionUpdated(SubscriptionUpdated {
             subscription_id: sub.id.0,
             owner_user_id: sub.owner_user_id,
@@ -972,18 +983,23 @@ impl SubscriptionUseCase {
             snapshot_claims_count,
             at: now,
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: hort_domain::events::Actor::Api(ApiActor {
                     user_id: principal.user_id,
                 }),
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         tracing::info!(
             subscription_id = %sub.id.0,
@@ -1109,26 +1125,31 @@ impl SubscriptionUseCase {
         sub.state = SubscriptionState::Disabled { reason, since: now };
         self.subscriptions.update(&sub).await?;
 
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #88):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(sub.owner_user_id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(app_to_use_case_err)?;
         let event = DomainEvent::SubscriptionDisabled(SubscriptionDisabled {
             subscription_id: sub.id.0,
             owner_user_id: sub.owner_user_id,
             reason,
             at: now,
         });
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: system_actor(),
-            })
-            .await?;
+            },
+        )
+        .await?;
         tracing::info!(
             subscription_id = %sub.id.0,
             owner_user_id = %sub.owner_user_id,
@@ -1190,22 +1211,27 @@ impl SubscriptionUseCase {
         principal: &CallerPrincipal,
         event: DomainEvent,
     ) -> Result<(), SubscriptionError> {
+        // `ExpectedVersion::Any` + bounded conflict-retry (issue #88):
+        // this append protects no decision made from the stream's
+        // content — see `append_any_with_conflict_retry`'s doc.
         let stream_id = StreamId::user(sub.owner_user_id);
-        let expected = read_expected_version(self.events.as_ref(), &stream_id, false)
-            .await
-            .map_err(app_to_use_case_err)?;
-        self.events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: expected,
-                events: vec![EventToAppend::new(event)],
-                correlation_id: Uuid::new_v4(),
+        let correlation_id = Uuid::new_v4();
+        append_any_with_conflict_retry(
+            self.events.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
                 causation_id: None,
                 actor: hort_domain::events::Actor::Api(ApiActor {
                     user_id: principal.user_id,
                 }),
-            })
-            .await?;
+            },
+        )
+        .await?;
         Ok(())
     }
 }
@@ -1275,15 +1301,6 @@ fn domain_to_validation(e: DomainError) -> SubscriptionError {
     match e {
         DomainError::Validation(m) => SubscriptionError::Validation(m),
         other => SubscriptionError::Infrastructure(other),
-    }
-}
-
-/// `read_expected_version` returns `AppError`; collapse it into the
-/// use-case error envelope.
-fn app_to_use_case_err(e: AppError) -> SubscriptionError {
-    match e {
-        AppError::Domain(d) => SubscriptionError::Infrastructure(d),
-        other => SubscriptionError::Infrastructure(DomainError::Invariant(other.to_string())),
     }
 }
 
@@ -1703,6 +1720,57 @@ mod tests {
             .unwrap();
         let (stream_id, _, _) = last_appended_event(&fx.events);
         assert_eq!(stream_id, StreamId::user(actor.user_id));
+    }
+
+    /// Issue #88: `create`'s `SubscriptionCreated` append protects no
+    /// stream-content decision, so a single conflict is absorbed
+    /// transparently.
+    #[tokio::test(start_paused = true)]
+    async fn create_retries_append_once_on_conflict() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        fx.events.fail_next_append(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        fx.uc
+            .create(&actor, req("ci-relay", https_target(), filter_owned()))
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        assert_eq!(fx.events.appended_batches().len(), 1);
+        assert_eq!(fx.events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #88: pathological contention exhausts the retry budget;
+    /// `create` has no special-cased exhaustion mapping, so the final
+    /// `Conflict` propagates as `SubscriptionError::Infrastructure`.
+    #[tokio::test(start_paused = true)]
+    async fn create_exhausted_retry_returns_infrastructure() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        fx.events.fail_all_appends(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        let err = fx
+            .uc
+            .create(&actor, req("ci-relay", https_target(), filter_owned()))
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(
+                err,
+                SubscriptionError::Infrastructure(DomainError::Conflict(_))
+            ),
+            "got {err:?}"
+        );
+        assert!(fx.events.appended_batches().is_empty());
     }
 
     #[tokio::test]
@@ -2231,6 +2299,73 @@ mod tests {
         assert!(matches!(event, DomainEvent::SubscriptionCreationDenied(_)));
         assert_eq!(stream_id, StreamId::user(actor.user_id));
         assert_ne!(stream_id, StreamId::user(Uuid::new_v4()));
+    }
+
+    /// Issue #88: `emit_denial`'s append protects no stream-content
+    /// decision. A single conflict is absorbed transparently and the
+    /// caller still observes the intended duplicate-name denial.
+    #[tokio::test(start_paused = true)]
+    async fn emit_denial_retries_append_once_on_conflict() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        fx.uc
+            .create(&actor, req("dup", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_next_append(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        let err = fx
+            .uc
+            .create(&actor, req("dup", https_target(), filter_owned()))
+            .await
+            .expect_err("duplicate name must still be denied");
+        assert!(
+            matches!(err, SubscriptionError::DuplicateName),
+            "got {err:?}"
+        );
+        let (_, event, _) = last_appended_event(&fx.events);
+        assert!(matches!(event, DomainEvent::SubscriptionCreationDenied(_)));
+    }
+
+    /// Issue #88: pathological contention on the denial-audit append
+    /// exhausts the retry budget. Because `create` awaits `emit_denial`
+    /// BEFORE returning `DuplicateName`, the infra error masks the
+    /// intended denial exactly as an unretried single attempt would have
+    /// before #88 (pre-existing masking behaviour, unchanged by this fix
+    /// — mirrors the `ApiTokenIssuanceDenied` precedent in
+    /// `api_token_use_case.rs`).
+    #[tokio::test(start_paused = true)]
+    async fn emit_denial_exhausted_retry_masks_denial_with_infrastructure() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        fx.uc
+            .create(&actor, req("dup", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_all_appends(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        let err = fx
+            .uc
+            .create(&actor, req("dup", https_target(), filter_owned()))
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(
+                err,
+                SubscriptionError::Infrastructure(DomainError::Conflict(_))
+            ),
+            "got {err:?}"
+        );
     }
 
     // ---- SSRF block + metric ---------------------------------------------
@@ -2874,6 +3009,75 @@ mod tests {
         }
     }
 
+    /// Issue #88: `update`'s `SubscriptionUpdated` append protects no
+    /// stream-content decision. A single conflict is absorbed
+    /// transparently.
+    #[tokio::test(start_paused = true)]
+    async fn update_retries_append_once_on_conflict() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        let sub = fx
+            .uc
+            .create(&actor, req("u", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_next_append(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        let upd = UpdateSubscriptionRequest {
+            name: Some("renamed".into()),
+            ..Default::default()
+        };
+        fx.uc
+            .update(&actor, sub.id, upd)
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        let (_, event, _) = last_appended_event(&fx.events);
+        assert!(matches!(event, DomainEvent::SubscriptionUpdated(_)));
+        assert_eq!(fx.events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #88: pathological contention exhausts the retry budget;
+    /// `update` has no special-cased exhaustion mapping, so the final
+    /// `Conflict` propagates as `SubscriptionError::Infrastructure`.
+    #[tokio::test(start_paused = true)]
+    async fn update_exhausted_retry_returns_infrastructure() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        let sub = fx
+            .uc
+            .create(&actor, req("u", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_all_appends(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        let upd = UpdateSubscriptionRequest {
+            name: Some("renamed".into()),
+            ..Default::default()
+        };
+        let err = fx
+            .uc
+            .update(&actor, sub.id, upd)
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(
+                err,
+                SubscriptionError::Infrastructure(DomainError::Conflict(_))
+            ),
+            "got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn update_changing_state_emits_updated_event_with_state_field() {
         let actor = caller_with_roles(&["dev"]);
@@ -2982,6 +3186,67 @@ mod tests {
         fx.uc.pause(&actor, sub.id).await.unwrap();
         let (_, event, _) = last_appended_event(&fx.events);
         assert!(matches!(event, DomainEvent::SubscriptionPaused(_)));
+    }
+
+    /// Issue #88: `emit_lifecycle` (shared by pause/resume/delete)
+    /// protects no stream-content decision. A single conflict is
+    /// absorbed transparently — exercised here via `pause`.
+    #[tokio::test(start_paused = true)]
+    async fn emit_lifecycle_retries_append_once_on_conflict() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        let sub = fx
+            .uc
+            .create(&actor, req("p", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_next_append(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        fx.uc
+            .pause(&actor, sub.id)
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        let (_, event, _) = last_appended_event(&fx.events);
+        assert!(matches!(event, DomainEvent::SubscriptionPaused(_)));
+        assert_eq!(fx.events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #88: pathological contention exhausts the retry budget;
+    /// `emit_lifecycle` has no special-cased exhaustion mapping, so the
+    /// final `Conflict` propagates as `SubscriptionError::Infrastructure`.
+    #[tokio::test(start_paused = true)]
+    async fn emit_lifecycle_exhausted_retry_returns_infrastructure() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        let sub = fx
+            .uc
+            .create(&actor, req("p", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_all_appends(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        let err = fx
+            .uc
+            .pause(&actor, sub.id)
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(
+                err,
+                SubscriptionError::Infrastructure(DomainError::Conflict(_))
+            ),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3158,6 +3423,67 @@ mod tests {
         assert!(matches!(event, DomainEvent::SubscriptionDisabled(_)));
         // System actor (not Api).
         assert!(matches!(actor_field, Actor::Internal(_)));
+    }
+
+    /// Issue #88: `disable`'s `SubscriptionDisabled` append protects no
+    /// stream-content decision. A single conflict is absorbed
+    /// transparently.
+    #[tokio::test(start_paused = true)]
+    async fn disable_retries_append_once_on_conflict() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        let sub = fx
+            .uc
+            .create(&actor, req("x", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_next_append(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        fx.uc
+            .disable(sub.id, DisableReason::DeliveryFailureBudgetExhausted)
+            .await
+            .expect("a single conflict must be absorbed by the retry loop");
+        let (_, event, _) = last_appended_event(&fx.events);
+        assert!(matches!(event, DomainEvent::SubscriptionDisabled(_)));
+        assert_eq!(fx.events.read_stream_call_count(), 0);
+    }
+
+    /// Issue #88: pathological contention exhausts the retry budget;
+    /// `disable` has no special-cased exhaustion mapping, so the final
+    /// `Conflict` propagates as `SubscriptionError::Infrastructure`.
+    #[tokio::test(start_paused = true)]
+    async fn disable_exhausted_retry_returns_infrastructure() {
+        let actor = caller_with_roles(&["dev"]);
+        let fx = wire(
+            empty_eval(),
+            Arc::new(MockWebhookTargetGuard::allow()),
+            default_cfg(),
+        );
+        let sub = fx
+            .uc
+            .create(&actor, req("x", https_target(), filter_owned()))
+            .await
+            .unwrap();
+        fx.events.fail_all_appends(DomainError::Conflict(
+            "stream user concurrent append at position 0".into(),
+        ));
+        let err = fx
+            .uc
+            .disable(sub.id, DisableReason::DeliveryFailureBudgetExhausted)
+            .await
+            .expect_err("every attempt conflicting must exhaust the retry budget");
+        assert!(
+            matches!(
+                err,
+                SubscriptionError::Infrastructure(DomainError::Conflict(_))
+            ),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

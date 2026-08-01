@@ -2034,7 +2034,7 @@ pub fn emit_policy_violations(
 // ---------------------------------------------------------------------------
 
 /// `result` label value for `hort_provenance_verify_total`. Closed
-/// taxonomy of 4. String values are normative — they appear
+/// taxonomy of 5. String values are normative — they appear
 /// verbatim in `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceVerifyResult {
@@ -2055,6 +2055,14 @@ pub enum ProvenanceVerifyResult {
     /// signed. Separable from `no_attestation` so operators can see images
     /// *waiting to be signed* distinctly from *allowed unsigned*.
     HeldPendingSignature,
+    /// `NoAttestation`×`Required` with a `None` `quarantine_window_start`
+    /// on a `None`-status, recently-ingested artifact (issue #90
+    /// defense-in-depth): no terminal verdict is applied — the task
+    /// handler requeues the job with the dispatcher's normal backoff
+    /// instead. Bounded by a short grace window from `created_at`; past
+    /// it the artifact falls through to `rejected` / `no_attestation` as
+    /// before.
+    RequeuedNoAnchor,
 }
 
 impl ProvenanceVerifyResult {
@@ -2066,6 +2074,7 @@ impl ProvenanceVerifyResult {
             Self::Rejected => "rejected",
             Self::NoAttestation => "no_attestation",
             Self::HeldPendingSignature => "held_pending_signature",
+            Self::RequeuedNoAnchor => "requeued_no_anchor",
         }
     }
 }

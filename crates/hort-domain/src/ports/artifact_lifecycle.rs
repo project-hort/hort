@@ -185,6 +185,33 @@ pub trait ArtifactLifecyclePort: Send + Sync {
         let _ = enqueues;
         self.commit_transition(artifact, events, metadata)
     }
+
+    /// Atomically append a **provenance-verdict** transition
+    /// (`ProvenanceVerified` / `ProvenanceRejected`) and persist ONLY the
+    /// `quarantine_status` column — never the artifact's full row.
+    ///
+    /// `commit_transition` persists the caller's full in-memory `Artifact`
+    /// snapshot. Provenance-verdict application follows a slow bundle-fetch
+    /// / CAS-read round trip after the artifact was first loaded, so that
+    /// snapshot can be stale by the time this commits; a full-row
+    /// write-back would clobber any column a concurrently-committed
+    /// transition wrote in the meantime — most critically
+    /// `quarantine_window_start`, the quarantine anchor (issue #90). This
+    /// method writes `artifact.quarantine_status` (+ `updated_at`) and
+    /// nothing else, so a concurrently-committed transition's other
+    /// columns survive.
+    ///
+    /// ## Default impl — test doubles only
+    ///
+    /// Forwards to [`Self::commit_transition`] (full-row write). Production
+    /// adapters MUST override it.
+    fn commit_provenance_verdict<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+        events: AppendEvents,
+    ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+        self.commit_transition(artifact, events, None)
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +425,93 @@ mod tests {
             .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The defaulted `commit_provenance_verdict` forwards to
+    /// `commit_transition` with `metadata: None` — the test-double-only
+    /// behaviour (production adapters override to a column-scoped write,
+    /// issue #90).
+    #[tokio::test]
+    async fn default_commit_provenance_verdict_forwards_to_commit_transition() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingLifecycle {
+            calls: Arc<AtomicUsize>,
+        }
+        impl ArtifactLifecyclePort for CountingLifecycle {
+            fn commit_transition(
+                &self,
+                _artifact: &Artifact,
+                _events: AppendEvents,
+                metadata: Option<ArtifactMetadata>,
+            ) -> BoxFuture<'_, DomainResult<AppendResult>> {
+                assert!(
+                    metadata.is_none(),
+                    "commit_provenance_verdict's default must forward metadata: None"
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(AppendResult {
+                        stream_position: 0,
+                        global_positions: vec![0],
+                    })
+                })
+            }
+            fn commit_scan_result_with_score<'a>(
+                &'a self,
+                _artifact: &'a Artifact,
+                _events: AppendEvents,
+                _scan_findings_rows: &'a [ScanFindingsRow],
+                _last_scan_at: DateTime<Utc>,
+                _score_delta: Option<(Uuid, ScoreDelta)>,
+                _sbom_components: Option<&'a [SbomComponent]>,
+            ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+                Box::pin(async { unreachable!() })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let l = CountingLifecycle {
+            calls: calls.clone(),
+        };
+
+        let artifact = Artifact {
+            id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            name: "n".into(),
+            name_as_published: "n".into(),
+            version: None,
+            path: "/".into(),
+            size_bytes: 0,
+            sha256_checksum: "a".repeat(64).parse().unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: crate::entities::artifact::QuarantineStatus::Rejected,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            is_deleted: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let events = AppendEvents {
+            stream_id: crate::events::StreamId::artifact(Uuid::nil()),
+            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
+            events: vec![],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: crate::events::system_actor(),
+        };
+
+        l.commit_provenance_verdict(&artifact, events)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// `commit_scan_result_with_score` is

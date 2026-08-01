@@ -39,8 +39,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
-use hort_domain::entities::scan_policy::{ProvenanceMode, ScanPolicyProjection};
-use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource, PolicyScope};
+use hort_domain::entities::scan_policy::ProvenanceMode;
+use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource};
 use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -65,6 +65,7 @@ use tokio_util::io::StreamReader;
 
 use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::read_expected_version;
 
 /// The `kind` filter used to read cosign attestation bundles off the
@@ -93,6 +94,22 @@ const FETCH_ATTEMPTS: u32 = 3;
 /// `release_clearance` (the release gate's own clearance read); every
 /// artifact stream begins well within this bound.
 const STREAM_READ_LIMIT: u64 = 200;
+
+/// Bounded grace window (issue #90 defense-in-depth) — see `apply_verdict`.
+/// A `NoAttestation`×`Required` verdict on a `None`-status, anchor-less
+/// artifact requeues instead of terminally rejecting only while the
+/// artifact is younger than this. `IngestUseCase::ingest_inner` now commits
+/// `ArtifactIngested` + `ArtifactQuarantined` atomically, so a job it
+/// enqueues can never observe this shape from THAT race anymore — this
+/// grace window exists purely as a backstop against any other/future
+/// dual-commit path exhibiting the same symptom, and against clock/replica
+/// skew. A steady-state PERMISSIVE artifact (`quarantine_duration_secs ==
+/// 0`) shows the identical shape forever, so the window must stay short:
+/// generous enough for a couple of the dispatcher's own retries
+/// (`DEFAULT_BACKOFF_SECS = 30`, doubling) to land, short enough that a
+/// permissive artifact still resolves to its correct terminal decision
+/// within a few minutes, not indefinitely.
+const PROVENANCE_ANCHOR_GRACE_SECS: i64 = 300;
 
 /// The verdict reached on an `Applied` run, surfaced to the task handler
 /// so it can record a compact per-artifact `result_summary` on the job
@@ -154,6 +171,14 @@ pub enum ProvenanceRunOutcome {
         event_appended: bool,
         verdict: ProvenanceVerdictSummary,
     },
+    /// Defense-in-depth bounded requeue (issue #90): a `NoAttestation`
+    /// verdict under `Required` on a `None`-status, anchor-less,
+    /// recently-ingested artifact. No verdict was applied — no event, no
+    /// state transition — the task handler maps this to a retryable
+    /// `TaskOutcome::Failed` so the dispatcher re-runs the verify with its
+    /// normal backoff once the (expected, imminent) quarantine commit
+    /// lands. See [`PROVENANCE_ANCHOR_GRACE_SECS`].
+    RequeuedNoAnchor,
 }
 
 /// Provenance-orchestration use case (mirror of `ScanOrchestrationUseCase`).
@@ -221,9 +246,9 @@ impl ProvenanceOrchestrationUseCase {
 
         // Resolve the policy (repo-scoped → global). Mode drives every
         // downstream decision.
-        let policy = self
-            .resolve_active_policy_for_repo(artifact.repository_id)
-            .await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
+                .await?;
         let mode = policy
             .as_ref()
             .map(|p| p.provenance_mode)
@@ -238,14 +263,23 @@ impl ProvenanceOrchestrationUseCase {
         // `ScanPolicy.quarantineDuration` (or the default), through the SAME
         // `effective_quarantine_deadline` helper the release sweep uses.
         //
-        // A missing `quarantine_window_start` resolves `window_open = false`:
-        // the ingest path always quarantines an OCI subject before enqueuing
-        // the verify, so a `None` anchor here is a defensive / mis-ordered run
-        // only — and a defensive run must not HOLD indefinitely (no anchor ⇒
-        // no window ⇒ terminal). `window_open` gates only the
-        // `NoAttestation × Required` arm in `complete_provenance`; the expiry
-        // backstop (`release_expired`) re-runs the verify after the deadline,
-        // where this resolves to `false` by construction.
+        // A missing `quarantine_window_start` resolves `window_open = false`.
+        // `IngestUseCase::ingest_inner` commits `ArtifactIngested` +
+        // `ArtifactQuarantined` (+ this job's own enqueue) atomically in
+        // ONE transition (issue #90) whenever the resolved policy actually
+        // quarantines, so a job it enqueues can never observe a `None`
+        // anchor mid-transition — a `None` anchor here means either (a)
+        // this artifact's policy is PERMISSIVE (`quarantine_duration_secs
+        // == 0`, ingest never quarantines it — a legitimate, permanent
+        // `None`-status steady state, not a race) or (b) a residual race
+        // in some other/future dual-commit path. `apply_verdict`'s bounded
+        // requeue (`PROVENANCE_ANCHOR_GRACE_SECS`) is the defense-in-depth
+        // backstop for (b); a defensive run past that grace window must
+        // not HOLD indefinitely (no anchor ⇒ no window ⇒ terminal).
+        // `window_open` gates only the `NoAttestation × Required` arm in
+        // `complete_provenance`; the expiry backstop (`release_expired`)
+        // re-runs the verify after the deadline, where this resolves to
+        // `false` by construction.
         let effective_duration_secs: i64 = policy
             .as_ref()
             .map(|p| p.quarantine_duration_secs)
@@ -1275,6 +1309,48 @@ impl ProvenanceOrchestrationUseCase {
         mode: ProvenanceMode,
         window_open: bool,
     ) -> AppResult<ProvenanceRunOutcome> {
+        // Defense-in-depth bounded requeue (issue #90). A `NoAttestation`
+        // verdict under `Required` with a `None` `quarantine_window_start`
+        // on an artifact whose status is STILL `None` is the exact
+        // symptom of the ingest TOCTOU this issue fixed: the artifact may
+        // be mid-transition to `Quarantined` by a commit that just hasn't
+        // landed yet (or a residual race in some other/future dual-commit
+        // path — `IngestUseCase::ingest_inner` itself now commits
+        // `ArtifactIngested` + `ArtifactQuarantined` atomically, so a job
+        // IT enqueues can no longer observe this shape). Requeue instead
+        // of resolving `window_open = false` → terminal, but ONLY while
+        // the artifact is younger than `PROVENANCE_ANCHOR_GRACE_SECS` — a
+        // steady-state PERMISSIVE artifact (`quarantine_duration_secs ==
+        // 0`) shows this exact shape too, but FOREVER (it is never
+        // quarantined), so past the grace window this falls through to
+        // the existing terminal resolution below (ADR 0007's "no anchor ⇒
+        // no indefinite hold" rationale stands).
+        if mode == ProvenanceMode::Required
+            && !window_open
+            && artifact.quarantine_status == QuarantineStatus::None
+            && artifact.quarantine_window_start.is_none()
+            && matches!(
+                verdict.outcome,
+                hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
+            )
+            && chrono::Utc::now() - artifact.created_at
+                < chrono::Duration::seconds(PROVENANCE_ANCHOR_GRACE_SECS)
+        {
+            tracing::info!(
+                artifact_id = %artifact.id,
+                backend = %backend,
+                "provenance: NoAttestation×Required on a None-status, anchor-less, \
+                 recently-ingested artifact — requeueing instead of terminal reject \
+                 (bounded defense-in-depth, issue #90)",
+            );
+            crate::metrics::emit_provenance_verify(
+                backend,
+                mode,
+                crate::metrics::ProvenanceVerifyResult::RequeuedNoAnchor,
+            );
+            return Ok(ProvenanceRunOutcome::RequeuedNoAnchor);
+        }
+
         // Under `Required` an unsigned-but-still-in-window artifact is HELD
         // (issue #13): `complete_provenance` returns `Ok(None)` and leaves
         // the status `Quarantined` → the release gate reads it as `Pending`
@@ -1373,8 +1449,15 @@ impl ProvenanceOrchestrationUseCase {
         let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
         let correlation_id = Uuid::new_v4();
 
+        // Column-scoped verdict commit (issue #90): `artifact` was loaded
+        // at the top of `verify_artifact`, before the bundle fetch / CAS
+        // preimage read / verifier dispatch round trip — by now its
+        // snapshot of every column but `quarantine_status` can be stale.
+        // `commit_provenance_verdict` writes only `quarantine_status`, so
+        // a concurrently-committed transition's `quarantine_window_start`
+        // (the quarantine anchor) survives.
         self.lifecycle
-            .commit_transition(
+            .commit_provenance_verdict(
                 &artifact,
                 AppendEvents {
                     stream_id,
@@ -1384,7 +1467,6 @@ impl ProvenanceOrchestrationUseCase {
                     causation_id: None,
                     actor: system_actor(),
                 },
-                None,
             )
             .await?;
 
@@ -1447,29 +1529,6 @@ impl ProvenanceOrchestrationUseCase {
                     .await
             }
         }
-    }
-
-    /// Resolve the active `ScanPolicy` for `repo_id` (repo-scoped wins over
-    /// global). Mirrors `ScanOrchestrationUseCase::resolve_active_policy_for_repo`.
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policy_projections.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
     }
 }
 

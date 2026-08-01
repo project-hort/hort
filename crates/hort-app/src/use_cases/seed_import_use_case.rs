@@ -73,7 +73,7 @@ use uuid::Uuid;
 
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::entities::scan_policy::ScanPolicyProjection;
-use hort_domain::events::{ApiActor, PolicyScope};
+use hort_domain::events::ApiActor;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
@@ -82,6 +82,7 @@ use hort_domain::types::{ArtifactCoords, ContentHash};
 
 use crate::error::{AppError, AppResult};
 use crate::use_cases::ingest_use_case::{IngestUseCase, RegisterExistingCasBlobRequest};
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 
 /// Fallback `quarantine_duration_secs` when no `ScanPolicy` matches the
 /// repository. 24 hours.
@@ -202,32 +203,6 @@ impl SeedImportUseCase {
         }
     }
 
-    /// Resolve the active `ScanPolicy` for the given repo — repo-scoped
-    /// takes precedence over `Global`. Mirrors
-    /// `IngestUseCase::resolve_active_policy_for_repo` exactly (the
-    /// logic is duplicated rather than shared because that helper is
-    /// `pub(crate)` to `ingest_use_case`).
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policies.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
-    }
-
     /// Compute the backdated `quarantine_window_start` anchor for a
     /// given repo's effective duration.
     ///
@@ -325,7 +300,7 @@ impl SeedImportUseCase {
     ) -> AppResult<RunOneOutcome> {
         // 1. Repo exists + active policy lookup.
         let repo = self.repositories.find_by_id(item.repository_id).await?;
-        let policy = self.resolve_active_policy_for_repo(repo.id).await?;
+        let policy = resolve_active_policy_for_repo(&*self.policies, repo.id).await?;
         let anchor = self.compute_backdated_anchor(now, policy.as_ref());
 
         // 2. Format handler dispatch by format_key.
@@ -417,7 +392,7 @@ mod tests {
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::Repository;
     use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
-    use hort_domain::events::DomainEvent;
+    use hort_domain::events::{DomainEvent, PolicyScope};
 
     use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
     use crate::use_cases::ingest_use_case::IngestUseCase;
@@ -858,57 +833,9 @@ mod tests {
         assert!(lifecycle.committed_transitions().is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // resolve_active_policy_for_repo — repo-scoped takes precedence
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn resolve_policy_returns_repo_scoped_over_global() {
-        let (uc, _a, _l, _s, _r, policies) = make_use_case();
-        let repo_id = Uuid::new_v4();
-
-        // Both a Global and a Repository-scoped policy active.
-        let mut global = sample_projection();
-        global.scope = PolicyScope::Global;
-        global.quarantine_duration_secs = 7200;
-        let mut scoped = sample_projection();
-        scoped.scope = PolicyScope::Repository(repo_id);
-        scoped.quarantine_duration_secs = 600;
-        policies.insert(global);
-        policies.insert(scoped);
-
-        let resolved = uc
-            .resolve_active_policy_for_repo(repo_id)
-            .await
-            .unwrap()
-            .expect("a policy resolves");
-        assert!(matches!(resolved.scope, PolicyScope::Repository(_)));
-        assert_eq!(resolved.quarantine_duration_secs, 600);
-    }
-
-    #[tokio::test]
-    async fn resolve_policy_returns_global_when_no_repo_scoped() {
-        let (uc, _a, _l, _s, _r, policies) = make_use_case();
-        let mut global = sample_projection();
-        global.scope = PolicyScope::Global;
-        global.quarantine_duration_secs = 3600;
-        policies.insert(global);
-
-        let resolved = uc
-            .resolve_active_policy_for_repo(Uuid::new_v4())
-            .await
-            .unwrap()
-            .expect("a policy resolves");
-        assert!(matches!(resolved.scope, PolicyScope::Global));
-    }
-
-    #[tokio::test]
-    async fn resolve_policy_returns_none_when_nothing_matches() {
-        let (uc, _a, _l, _s, _r, _p) = make_use_case();
-        let resolved = uc
-            .resolve_active_policy_for_repo(Uuid::new_v4())
-            .await
-            .unwrap();
-        assert!(resolved.is_none());
-    }
+    // `resolve_active_policy_for_repo`'s own selection semantics
+    // (repo-scoped beats global; global fallback; absent → None) moved
+    // to `policy_resolution::tests` when the helper was extracted
+    // (issue #76) — this file no longer owns a private copy to test in
+    // isolation.
 }

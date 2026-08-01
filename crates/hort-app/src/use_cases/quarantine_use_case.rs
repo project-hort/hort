@@ -6,12 +6,12 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{
     Artifact, ProvenanceClearance, QuarantineStatus, ReleaseAuthorization,
 };
-use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
+use hort_domain::entities::scan_policy::ExclusionProjection;
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
     Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PolicyEvaluated,
-    PolicyResult, PolicyScope, ReleaseReason, ScanCompleted, StreamId, NO_POLICY,
+    PolicyResult, ReleaseReason, ScanCompleted, StreamId, NO_POLICY,
 };
 use hort_domain::policy::scan_delta::compute_added_findings;
 use hort_domain::policy::{
@@ -27,6 +27,7 @@ use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInva
 
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::ingest_use_case::CLEARANCE_VERIFY_PRIORITY;
+use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
@@ -384,9 +385,9 @@ impl QuarantineUseCase {
 
         // Step 3 — load artifact + resolve policy + exclusions + coords.
         let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
-        let policy = self
-            .resolve_active_policy_for_repo(artifact.repository_id)
-            .await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
+                .await?;
         let exclusions: Vec<ExclusionProjection> = match &policy {
             Some(p) => {
                 self.policy_projections
@@ -1054,37 +1055,6 @@ impl QuarantineUseCase {
         })
     }
 
-    /// Resolve the active scan policy for `repo_id`.
-    ///
-    /// Repo-scoped wins over global; absent both, the caller passes
-    /// `None` to the evaluator and `DefaultPolicy::block_on_critical`
-    /// supplies the threshold. v1 simplification: scan the projection
-    /// list once per call. If projection counts grow past low-thousands
-    /// a dedicated `find_for_repo` port method becomes the next step;
-    /// today it is overhead the contention path doesn't notice. The
-    /// helper is private and may be extracted to a shared module if a
-    /// second caller appears.
-    async fn resolve_active_policy_for_repo(
-        &self,
-        repo_id: Uuid,
-    ) -> AppResult<Option<ScanPolicyProjection>> {
-        let active = self.policy_projections.list_active().await?;
-        let mut repo_scoped: Option<ScanPolicyProjection> = None;
-        let mut global: Option<ScanPolicyProjection> = None;
-        for projection in active {
-            match &projection.scope {
-                PolicyScope::Repository(id) if *id == repo_id => {
-                    repo_scoped = Some(projection);
-                }
-                PolicyScope::Global if global.is_none() => {
-                    global = Some(projection);
-                }
-                _ => {}
-            }
-        }
-        Ok(repo_scoped.or(global))
-    }
-
     /// #65 — whether `artifact`'s quarantine window has genuinely
     /// elapsed, using the SAME anchor + resolved-policy-duration
     /// computation ([`resolve_active_policy_for_repo`] +
@@ -1117,9 +1087,9 @@ impl QuarantineUseCase {
         let Some(anchor) = artifact.quarantine_window_start else {
             return Ok(false);
         };
-        let policy = self
-            .resolve_active_policy_for_repo(artifact.repository_id)
-            .await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
+                .await?;
         let duration_secs = policy
             .map(|p| p.quarantine_duration_secs)
             .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
@@ -1167,7 +1137,8 @@ impl QuarantineUseCase {
             return Ok(Some(ReleaseAuthorization::ScanSucceeded));
         }
 
-        let policy = self.resolve_active_policy_for_repo(repository_id).await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
         if matches!(policy, Some(p) if p.scan_backends.is_empty()) {
             return Ok(Some(ReleaseAuthorization::ScanWaived));
         }
@@ -1200,7 +1171,8 @@ impl QuarantineUseCase {
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> AppResult<ProvenanceClearance> {
-        let policy = self.resolve_active_policy_for_repo(repository_id).await?;
+        let policy =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
         let mode = policy
             .as_ref()
             .map(|p| p.provenance_mode)
@@ -2085,6 +2057,87 @@ mod tests {
     }
 
     // -- Tests ----------------------------------------------------------------
+
+    /// issue #90 facet 2 — a scan-verdict commit built from a stale
+    /// in-memory `Artifact` snapshot (captured before a concurrently-
+    /// committed quarantine transition landed) must not clobber the anchor
+    /// that other transition just wrote. `commit_scan_result_with_score`'s
+    /// artifact-state write is column-scoped (`quarantine_status` only);
+    /// a full-row write-back (the pre-fix `save_in_tx` shape) would zero
+    /// `quarantine_window_start` back out. Mirrors
+    /// `provenance_verdict_commit_does_not_clobber_concurrently_written_anchor`
+    /// in `provenance_orchestration_tests.rs` for the scan-verdict path.
+    #[tokio::test]
+    async fn scan_verdict_commit_does_not_clobber_concurrently_written_anchor() {
+        let (_uc, artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
+
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &_repositories, QuarantineStatus::Quarantined);
+
+        // A STALE in-memory snapshot — as if `record_scan_result` loaded
+        // the artifact BEFORE the concurrent quarantine transition below
+        // landed: `None` status, no anchor.
+        let mut stale = artifacts.get(artifact_id).unwrap();
+        stale.quarantine_status = QuarantineStatus::None;
+        stale.quarantine_window_start = None;
+
+        // The concurrent quarantine transition commits, setting the
+        // anchor — AFTER the stale snapshot above was captured.
+        let anchor = Utc::now();
+        let mut current = artifacts.get(artifact_id).unwrap();
+        current.quarantine_status = QuarantineStatus::Quarantined;
+        current.quarantine_window_start = Some(anchor);
+        artifacts.insert(current);
+
+        // The (stale) scan-verdict commit now runs, deciding Rejected
+        // from its OWN stale view — exactly the shape
+        // `Artifact::reject_from_scan` would have produced on `stale`.
+        stale.quarantine_status = QuarantineStatus::Rejected;
+        let event = DomainEvent::ScanCompleted(ScanCompleted {
+            artifact_id,
+            scanner: "trivy".to_string(),
+            finding_count: 1,
+            severity_summary: SeveritySummary {
+                critical: 1,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: None,
+        });
+        lifecycle
+            .commit_scan_result_with_score(
+                &stale,
+                AppendEvents {
+                    stream_id: StreamId::artifact(artifact_id),
+                    expected_version: ExpectedVersion::Any,
+                    events: vec![EventToAppend::new(event)],
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: system_actor(),
+                },
+                &[],
+                Utc::now(),
+                None,
+                None,
+            )
+            .await
+            .expect("commit_scan_result_with_score");
+
+        let saved = artifacts.get(artifact_id).unwrap();
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Rejected,
+            "the verdict's own status change must land"
+        );
+        assert_eq!(
+            saved.quarantine_window_start,
+            Some(anchor),
+            "the concurrently-committed anchor must survive — a column-scoped verdict commit \
+             must not clobber it with the stale snapshot's None"
+        );
+    }
 
     #[tokio::test]
     async fn quarantine_artifact_success() {
