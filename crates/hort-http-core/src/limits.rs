@@ -6,7 +6,6 @@
 //! literals. The rationale behind each number is documented on the
 //! constant itself.
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Path, RawPathParams};
 use axum::http::header::CONTENT_TYPE;
@@ -163,7 +162,6 @@ impl<T> BoundedPath<T> {
     }
 }
 
-#[async_trait]
 impl<T, S> FromRequestParts<S> for BoundedPath<T>
 where
     T: DeserializeOwned + Send + 'static,
@@ -307,11 +305,14 @@ mod tests {
 
     fn router() -> Router {
         Router::new()
-            .route("/one/:repo_key", get(echo_single))
-            .route("/two/:repo_key/:project", get(echo_tuple_two))
-            .route("/three/:repo_key/:project/:filename", get(echo_tuple_three))
+            .route("/one/{repo_key}", get(echo_single))
+            .route("/two/{repo_key}/{project}", get(echo_tuple_two))
             .route(
-                "/four/:repo_key/:scope/:name/:filename",
+                "/three/{repo_key}/{project}/{filename}",
+                get(echo_tuple_three),
+            )
+            .route(
+                "/four/{repo_key}/{scope}/{name}/{filename}",
                 get(echo_tuple_four),
             )
     }
@@ -481,8 +482,8 @@ mod tests {
 
     fn typed_router() -> Router {
         Router::new()
-            .route("/typed/:id", get(echo_integer))
-            .route("/named/:repo_key/:project", get(echo_named_struct))
+            .route("/typed/{id}", get(echo_integer))
+            .route("/named/{repo_key}/{project}", get(echo_named_struct))
     }
 
     #[tokio::test]

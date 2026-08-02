@@ -2833,6 +2833,7 @@ FtBmFfStik03XAfEPVCRWBMc
 
         tokio::spawn(async move {
             let _ = axum_server::from_tcp_rustls(std_listener, tls_config)
+                .expect("from_tcp_rustls with a non-blocking std listener")
                 .serve(app.into_make_service())
                 .await;
         });

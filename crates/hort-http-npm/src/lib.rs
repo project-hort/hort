@@ -104,14 +104,17 @@ pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
     // disambiguates by segment count, but ordering first preserves intent
     // and guards against a future matcher rule change.
     Router::new()
-        .route("/:repo_key/:scope/:name/-/:filename", get(download_scoped))
         .route(
-            "/:repo_key/:scope/:name",
+            "/{repo_key}/{scope}/{name}/-/{filename}",
+            get(download_scoped),
+        )
+        .route(
+            "/{repo_key}/{scope}/{name}",
             get(packument_scoped).put(publish_scoped),
         )
-        .route("/:repo_key/:name/-/:filename", get(download_unscoped))
+        .route("/{repo_key}/{name}/-/{filename}", get(download_unscoped))
         .route(
-            "/:repo_key/:name",
+            "/{repo_key}/{name}",
             get(packument_unscoped).put(publish_unscoped),
         )
         // Body limit applies to every route; GET requests carry no body, so

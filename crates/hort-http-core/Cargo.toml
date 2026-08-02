@@ -61,11 +61,6 @@ chrono                      = { workspace = true }
 postcard                    = { workspace = true }
 # Basic-auth header decoding in `middleware::auth::extract_basic_credentials`.
 base64                      = "0.22"
-# `#[async_trait]` impls on `FromRequestParts` extractors in
-# `limits::BoundedPath` and `authz::extractors::{AdminPrincipal, WriteRepoAccess, ReadRepoAccess}`.
-# axum 0.7's `FromRequestParts` still requires the macro — a future axum
-# bump would let us drop it.
-async-trait                 = "0.1"
 
 [dev-dependencies]
 tokio                        = { workspace = true, features = ["test-util"] }

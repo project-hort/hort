@@ -383,7 +383,7 @@ pub fn oci_routes_with_config(
 
     let upload_router: Router<Arc<AppContext>> = Router::new()
         .route(
-            "/v2/:repo_key/*tail",
+            "/v2/{repo_key}/{*tail}",
             axum::routing::post(uploads::post_upload_dispatch)
                 .patch(uploads::patch_upload_dispatch)
                 .put(put_dispatch),
@@ -415,7 +415,7 @@ pub fn oci_routes_with_config(
         // `/v2/:repo_key/_catalog` here rather than into the pull
         // dispatcher.
         .route(
-            "/v2/:repo_key/_catalog",
+            "/v2/{repo_key}/_catalog",
             axum::routing::get(catalog::get_repo_catalog),
         )
         // Pull dispatcher (blob + manifest + tags list). Wildcard
@@ -423,7 +423,7 @@ pub fn oci_routes_with_config(
         // method-dispatched between manifest delete and upload-session
         // cancel (`/blobs/uploads/<uuid>`).
         .route(
-            "/v2/:repo_key/*tail",
+            "/v2/{repo_key}/{*tail}",
             axum::routing::get(get_pull)
                 .head(head_pull)
                 .delete(delete_dispatch),

@@ -87,7 +87,7 @@ pub fn router() -> Router<Arc<AppContext>> {
     // Extension layer.
     Router::new()
         .route(
-            "/v2/:repo_key/*tail",
+            "/v2/{repo_key}/{*tail}",
             axum::routing::post(post_upload_dispatch)
                 .patch(patch_upload_dispatch)
                 .put(put_upload_dispatch)
@@ -1397,7 +1397,7 @@ mod tests {
             // means the latest Extension wins for the inner handler.
             let router_handle = Router::new()
                 .route(
-                    "/v2/:repo_key/*tail",
+                    "/v2/{repo_key}/{*tail}",
                     axum::routing::post(post_upload_dispatch)
                         .patch(patch_upload_dispatch)
                         .put(put_upload_dispatch),

@@ -169,7 +169,7 @@ pub(crate) const MAX_BLOB_REFERENCES: usize = 1024;
 #[cfg(test)]
 fn router() -> Router<Arc<AppContext>> {
     Router::new().route(
-        "/v2/:repo_key/*tail",
+        "/v2/{repo_key}/{*tail}",
         axum::routing::put(put_manifest_dispatch).delete(delete_manifest_dispatch),
     )
 }

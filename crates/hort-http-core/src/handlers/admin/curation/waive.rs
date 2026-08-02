@@ -211,7 +211,7 @@ mod tests {
         );
         let router = Router::new()
             .route(
-                "/api/v1/admin/curation/quarantine/:artifact_id/waive",
+                "/api/v1/admin/curation/quarantine/{artifact_id}/waive",
                 post(post_waive),
             )
             .with_state(ctx);

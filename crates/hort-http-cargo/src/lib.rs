@@ -80,22 +80,25 @@ pub fn cargo_routes() -> Router<Arc<AppContext>> {
 /// sending hundreds of megabytes.
 pub(crate) fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
     Router::new()
-        .route("/:repo_key/config.json", get(config_json))
+        .route("/{repo_key}/config.json", get(config_json))
         .route(
-            "/:repo_key/api/v1/crates/:name/:version/download",
+            "/{repo_key}/api/v1/crates/{name}/{version}/download",
             get(download),
         )
         .route(
-            "/:repo_key/api/v1/crates/new",
+            "/{repo_key}/api/v1/crates/new",
             put(publish).layer(DefaultBodyLimit::max(limit)),
         )
-        .route("/:repo_key/1/:crate_name", get(sparse_index))
-        .route("/:repo_key/2/:crate_name", get(sparse_index))
+        .route("/{repo_key}/1/{crate_name}", get(sparse_index))
+        .route("/{repo_key}/2/{crate_name}", get(sparse_index))
         .route(
-            "/:repo_key/3/:first_char/:crate_name",
+            "/{repo_key}/3/{first_char}/{crate_name}",
             get(sparse_index_with_first_char),
         )
-        .route("/:repo_key/:aa/:bb/:crate_name", get(sparse_index_4plus))
+        .route(
+            "/{repo_key}/{aa}/{bb}/{crate_name}",
+            get(sparse_index_4plus),
+        )
 }
 
 // ---------------------------------------------------------------------------

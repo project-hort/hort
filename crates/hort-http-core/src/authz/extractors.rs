@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Path};
 use axum::http::header::CONTENT_TYPE;
@@ -203,7 +202,6 @@ pub struct DeleteRepoAccess {
 /// move per rejection.
 type RejectResponse = Box<Response>;
 
-#[async_trait]
 impl FromRequestParts<Arc<AppContext>> for AdminPrincipal {
     type Rejection = Response;
 
@@ -217,7 +215,6 @@ impl FromRequestParts<Arc<AppContext>> for AdminPrincipal {
     }
 }
 
-#[async_trait]
 impl FromRequestParts<Arc<AppContext>> for CurateOrAdminPrincipal {
     type Rejection = Response;
 
@@ -263,7 +260,6 @@ impl FromRequestParts<Arc<AppContext>> for CurateOrAdminPrincipal {
     }
 }
 
-#[async_trait]
 impl FromRequestParts<Arc<AppContext>> for AuthenticatedCaller {
     type Rejection = Response;
 
@@ -276,7 +272,6 @@ impl FromRequestParts<Arc<AppContext>> for AuthenticatedCaller {
     }
 }
 
-#[async_trait]
 impl FromRequestParts<Arc<AppContext>> for WriteRepoAccess {
     type Rejection = Response;
 
@@ -302,7 +297,6 @@ impl FromRequestParts<Arc<AppContext>> for WriteRepoAccess {
     }
 }
 
-#[async_trait]
 impl FromRequestParts<Arc<AppContext>> for ReadRepoAccess {
     type Rejection = Response;
 
@@ -328,7 +322,6 @@ impl FromRequestParts<Arc<AppContext>> for ReadRepoAccess {
     }
 }
 
-#[async_trait]
 impl FromRequestParts<Arc<AppContext>> for DeleteRepoAccess {
     type Rejection = Response;
 
@@ -1137,19 +1130,19 @@ mod tests {
 
     fn write_router(ctx: Arc<AppContext>) -> Router {
         Router::new()
-            .route("/:repo_key/upload", get(write_handler))
+            .route("/{repo_key}/upload", get(write_handler))
             .with_state(ctx)
     }
 
     fn read_router(ctx: Arc<AppContext>) -> Router {
         Router::new()
-            .route("/:repo_key/read", get(read_handler))
+            .route("/{repo_key}/read", get(read_handler))
             .with_state(ctx)
     }
 
     fn delete_router(ctx: Arc<AppContext>) -> Router {
         Router::new()
-            .route("/:repo_key/delete", get(delete_handler))
+            .route("/{repo_key}/delete", get(delete_handler))
             .with_state(ctx)
     }
 

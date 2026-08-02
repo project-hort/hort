@@ -1459,7 +1459,7 @@ mod tests {
         let snap = capture(|| {
             rt(async {
                 let router = Router::new()
-                    .route("/pypi/:repo_key/", post(unauthorized_handler))
+                    .route("/pypi/{repo_key}/", post(unauthorized_handler))
                     .layer(auth_rate_limit_layer(&cfg));
                 let ip = trust("10.0.0.4");
                 let _ = router
@@ -1480,7 +1480,7 @@ mod tests {
         let v = find_counter(
             &entries,
             HORT_RATE_LIMIT_REJECTS_TOTAL,
-            &[("scope", SCOPE_AUTH), ("path", "/pypi/:repo_key/")],
+            &[("scope", SCOPE_AUTH), ("path", "/pypi/{repo_key}/")],
         )
         .expect("expected series with route-template path label");
         assert!(matches!(v, DebugValue::Counter(n) if *n == 1));

@@ -1690,7 +1690,7 @@ mod tests {
     fn manifest_router(ctx: Arc<AppContext>) -> Router {
         Router::new()
             .route(
-                "/v2/:repo_key/*tail",
+                "/v2/{repo_key}/{*tail}",
                 axum::routing::get(super::super::get_pull).head(super::super::head_pull),
             )
             .with_state(ctx)

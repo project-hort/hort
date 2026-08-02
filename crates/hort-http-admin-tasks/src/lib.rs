@@ -101,5 +101,5 @@ pub fn router() -> Router<Arc<AppContext>> {
         )
         // --- list + get ---
         .route("/", get(list_tasks))
-        .route("/:id", get(get_task))
+        .route("/{id}", get(get_task))
 }
