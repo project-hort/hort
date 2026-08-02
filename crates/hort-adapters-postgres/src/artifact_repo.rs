@@ -888,9 +888,12 @@ impl PgArtifactRepository {
 
 // ---------------------------------------------------------------------------
 // Tests — DB-backed integration tests covering pagination + LIMIT bounds.
-// Marked `#[ignore]` so they run only via `cargo test -- --ignored` when
-// `DATABASE_URL` is wired; running them without the env var panics rather
-// than silently passing.
+// Runtime self-skip (issue #94): `maybe_pool()` returns `None` when
+// `DATABASE_URL` is unset, and each test does
+// `let Some(pool) = maybe_pool().await else { return; };` — a clean,
+// fast no-op under plain `cargo test`, full execution when
+// `DATABASE_URL` is wired (e.g. `test:integration` CI). Every DB-touching
+// test carries `#[serial(hort_pg_db)]`.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1039,11 +1042,10 @@ mod tests {
     /// `items.len() == limit` AND the total reflects the full row set.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_by_name_in_repo_caps_at_default_page_size() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         // Seed 50 versions, request the first 20 (PageRequest::default).
         seed_artifacts_with_name(&pool, repo_id, "many", 50).await;
@@ -1068,11 +1070,10 @@ mod tests {
     ///     zero-padded so lexicographic == numeric).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_by_name_in_repo_paginates_through_all_results() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         seed_artifacts_with_name(&pool, repo_id, "walk", 75).await;
 
@@ -1109,11 +1110,10 @@ mod tests {
     /// boundary by binding `page.limit` directly.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_by_name_in_repo_max_page_size_capped() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         // Seed enough to hit the cap; 1500 > 1000 = MAX_LIMIT.
         seed_artifacts_with_name(&pool, repo_id, "cap", 1_500).await;
@@ -1137,11 +1137,10 @@ mod tests {
     /// exactly the cap and flips `truncated`.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_repo_truncates_at_limit_list_max_items() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         // Seed cap + 1 active artifacts.
         seed_active_artifacts(&pool, repo_id, LIMIT_LIST_MAX_ITEMS as usize + 1).await;
@@ -1162,11 +1161,10 @@ mod tests {
     /// false-positive truncation signal.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_repo_does_not_truncate_below_cap() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         seed_active_artifacts(&pool, repo_id, 2_000).await;
 
@@ -1249,11 +1247,10 @@ mod tests {
     /// contract.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn package_version_status_returns_repo_scoped_pairs_excluding_deleted_and_null_version() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_a = seed_repo(&pool).await;
         let repo_b = seed_repo(&pool).await;
 
@@ -1371,11 +1368,10 @@ mod tests {
     /// "lookup failure".
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn package_version_status_unknown_package_returns_empty_vec() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let r = PgArtifactRepository::new(pool.clone());
         let triples = r
@@ -1400,14 +1396,13 @@ mod tests {
     /// untrusted value verbatim for audit.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn artifact_upstream_published_at_round_trips() {
         use crate::event_store::PgEventStore;
         use hort_domain::entities::artifact::Artifact;
 
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
 
         // Construct an event store so we can mint a unit-of-work for
@@ -1517,14 +1512,13 @@ mod tests {
     /// other artifact column, not just the anchor.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn save_verdict_status_in_tx_does_not_clobber_other_columns() {
         use crate::event_store::PgEventStore;
         use hort_domain::entities::artifact::Artifact;
 
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
 
         let event_store = PgEventStore::new(pool.clone())
@@ -1622,13 +1616,12 @@ mod tests {
     /// missing row is an invariant violation, not a benign skip).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn save_verdict_status_in_tx_errors_not_found_on_missing_row() {
         use crate::event_store::PgEventStore;
 
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
@@ -1715,11 +1708,10 @@ mod tests {
     /// candidate set yields summary all-zero).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_returns_empty_when_no_wheels_exist() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let r = PgArtifactRepository::new(pool.clone());
         let got = r
@@ -1736,11 +1728,10 @@ mod tests {
     /// The query MUST return exactly the two un-backfilled wheels.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_excludes_wheels_with_ref_and_sdists() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
 
         // Two wheels with no wheel_metadata row — candidates.
@@ -1781,11 +1772,10 @@ mod tests {
     /// batch on the next invocation).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_honours_limit() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         for seed in 200..205 {
             let _ =
@@ -1809,11 +1799,10 @@ mod tests {
     /// rest of the read path.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_excludes_soft_deleted_wheels() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
 
         let live = seed_artifact_at_path(&pool, repo, "files/live.whl", 300).await;
@@ -1850,11 +1839,10 @@ mod tests {
     /// reserve a name.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_canonical_name_by_collision_key_folds_both_separators() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let r = PgArtifactRepository::new(pool.clone());
 
         // Stored HYPHEN form is found by the folded key.
@@ -1981,11 +1969,10 @@ mod tests {
     /// via `PageRequest`, and reports the full in-scope `total`.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_policy_filters_status_and_paginates() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         let policy_id = seed_global_policy(&pool).await;
 
@@ -2061,11 +2048,10 @@ mod tests {
     /// `list_rejected_for_policy`'s precedence rule).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_policy_global_excludes_repo_shadowed_by_scoped_policy() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let global_policy = seed_global_policy(&pool).await;
         let shadowed_repo = seed_repo(&pool).await;
         let plain_repo = seed_repo(&pool).await;

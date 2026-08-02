@@ -1438,10 +1438,11 @@ mod tests {
     /// `claim_scan_jobs` and assert the in-memory `ScanJob` exposes
     /// both fields.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn row_to_scan_job_populates_trigger_source_cron_and_priority_10() {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
-        let pool = PgPool::connect(&db_url).await.expect("connect to Postgres");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
 
         let artifact_id = Uuid::new_v4();
         let repository_id = Uuid::new_v4();
@@ -1472,22 +1473,17 @@ mod tests {
             .expect("seeded row in claim batch");
         assert_eq!(job.trigger_source, TriggerSource::Cron);
         assert_eq!(job.priority, 10);
-
-        sqlx::query("DELETE FROM public.jobs WHERE id = $1")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
     }
 
     /// Ingest path inserts with the column default `priority=0` and an
     /// explicit `trigger_source='ingest'`. The mapper must round-trip
     /// both unchanged.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn row_to_scan_job_populates_default_ingest_trigger_source_and_priority_0() {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
-        let pool = PgPool::connect(&db_url).await.expect("connect to Postgres");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
 
         let artifact_id = Uuid::new_v4();
         let repository_id = Uuid::new_v4();
@@ -1518,12 +1514,6 @@ mod tests {
             .expect("seeded row in claim batch");
         assert_eq!(job.trigger_source, TriggerSource::Ingest);
         assert_eq!(job.priority, 0);
-
-        sqlx::query("DELETE FROM public.jobs WHERE id = $1")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
     }
 
     // ---- sort_claimed_jobs (cross-kind variant) --------------------------
@@ -1587,22 +1577,40 @@ mod tests {
 
     // -- Integration tests (gated on DATABASE_URL) ---------------------------
     //
-    // Run with:
-    //   DATABASE_URL=postgresql://... cargo test -p hort-adapters-postgres -- --ignored
+    // Runtime self-skip (issue #94): `maybe_pool()` returns `None` when
+    // `DATABASE_URL` is unset, and each test does
+    // `let Some(pool) = maybe_pool().await else { return; };` — a clean,
+    // fast no-op under plain `cargo test`, full execution when
+    // `DATABASE_URL` is wired:
+    //   DATABASE_URL=postgresql://... cargo test -p hort-adapters-postgres
 
     /// `PgJobsRepository::enqueue_task` inserts a row and returns a Uuid;
     /// the row exists in `jobs` with the expected columns.
+    ///
+    /// `trigger_source` must be one of the values
+    /// `migrations/009_scan_jobs_and_findings.sql`'s `jobs_trigger_source_check`
+    /// CHECK constraint allows (`manual`, `cron`, `advisory`, `ingest`,
+    /// `seed-import`, `prefetch`, `self_service`, `scheduled`) — a
+    /// deterministic failure on any correctly-migrated DB otherwise
+    /// (issue #94). `'manual'` is the operator-triggered case this
+    /// ad-hoc enqueue actually represents.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn enqueue_task_inserts_row_and_returns_uuid() {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
-        let pool = PgPool::connect(&db_url).await.expect("connect to Postgres");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = PgJobsRepository::new(pool.clone());
 
         let params = serde_json::json!({"dry_run": true});
-        let actor_id = Some(Uuid::new_v4());
+        // `actor_id` is a nullable FK to `users(id)` (issue #94: a random
+        // UUID here violates `jobs_actor_id_fkey` on any correctly-
+        // migrated DB — this test only asserts the row/columns, not
+        // actor attribution, so `None` (system-triggered) is the
+        // correct fixture, not a seeded user row).
+        let actor_id = None;
         let outcome = repo
-            .enqueue_task("noop", &params, actor_id, 0, "integration-test", None)
+            .enqueue_task("noop", &params, actor_id, 0, "manual", None)
             .await
             .expect("enqueue_task failed");
 
@@ -1624,13 +1632,6 @@ mod tests {
 
         assert_eq!(kind, "noop");
         assert_eq!(status, "pending");
-
-        // Clean up — remove the test row.
-        sqlx::query("DELETE FROM public.jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup failed");
     }
 
     // -----------------------------------------------------------------
