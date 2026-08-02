@@ -54,9 +54,9 @@ pub mod exclusions;
 /// error rather than a 403 at runtime).
 pub fn policies_routes() -> Router<Arc<AppContext>> {
     Router::new()
-        .route("/:policy_id/exclusions", post(exclusions::post_exclusion))
+        .route("/{policy_id}/exclusions", post(exclusions::post_exclusion))
         .route(
-            "/:policy_id/exclusions/:cve_id",
+            "/{policy_id}/exclusions/{cve_id}",
             delete(exclusions::delete_exclusion),
         )
 }

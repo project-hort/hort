@@ -153,7 +153,7 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let app: Router = Router::new()
-                        .route("/echo/:id", get(ok_handler))
+                        .route("/echo/{id}", get(ok_handler))
                         .layer(axum::middleware::from_fn(http_metrics_middleware));
 
                     let response = app
@@ -201,7 +201,7 @@ mod tests {
             &entries,
             MetricKind::Counter,
             "hort_http_requests_received_total",
-            &[("method", "GET"), ("path", "/echo/:id")],
+            &[("method", "GET"), ("path", "/echo/{id}")],
         )
         .expect("hort_http_requests_received_total with matched path missing");
         match value {
@@ -219,7 +219,7 @@ mod tests {
             &entries,
             MetricKind::Counter,
             "hort_http_responses_total",
-            &[("method", "GET"), ("path", "/echo/:id"), ("status", "200")],
+            &[("method", "GET"), ("path", "/echo/{id}"), ("status", "200")],
         )
         .expect("hort_http_responses_total with status=200 missing");
         match value {
@@ -237,7 +237,7 @@ mod tests {
             &entries,
             MetricKind::Histogram,
             "hort_http_request_duration_seconds",
-            &[("method", "GET"), ("path", "/echo/:id")],
+            &[("method", "GET"), ("path", "/echo/{id}")],
         )
         .expect("hort_http_request_duration_seconds missing");
         match value {
@@ -257,7 +257,7 @@ mod tests {
             &entries,
             MetricKind::Gauge,
             "hort_http_requests_in_flight",
-            &[("method", "GET"), ("path", "/echo/:id")],
+            &[("method", "GET"), ("path", "/echo/{id}")],
         )
         .expect("hort_http_requests_in_flight gauge missing");
         match value {
@@ -318,7 +318,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
 
         metrics::with_local_recorder(&recorder, || {
-            let _g = InFlightGuard::new("GET".to_string(), "/echo/:id".to_string());
+            let _g = InFlightGuard::new("GET".to_string(), "/echo/{id}".to_string());
             // Guard drops at end of scope, firing -1.0 decrement.
         });
 
@@ -327,7 +327,7 @@ mod tests {
             &entries,
             MetricKind::Gauge,
             "hort_http_requests_in_flight",
-            &[("method", "GET"), ("path", "/echo/:id")],
+            &[("method", "GET"), ("path", "/echo/{id}")],
         )
         .expect("hort_http_requests_in_flight gauge missing");
         match value {

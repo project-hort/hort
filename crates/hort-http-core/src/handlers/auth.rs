@@ -362,7 +362,6 @@ async fn render_cells(
 /// `api_tokens.rs`; factored here to keep `whoami_handler` thin.
 pub struct AuthenticatedPrincipalExtractor(pub AuthenticatedPrincipal);
 
-#[async_trait::async_trait]
 impl axum::extract::FromRequestParts<Arc<AppContext>> for AuthenticatedPrincipalExtractor {
     type Rejection = Response;
 

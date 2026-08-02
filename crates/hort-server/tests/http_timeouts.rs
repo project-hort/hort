@@ -180,7 +180,7 @@ async fn oci_upload_route_exempted_from_global_request_deadline() {
     // OCI upload subtree gets the long timeout.
     let oci_uploads: Router = Router::new()
         .route(
-            "/v2/:repo/blobs/uploads/:uuid",
+            "/v2/{repo}/blobs/uploads/{uuid}",
             patch(|| async {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 StatusCode::ACCEPTED

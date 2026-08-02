@@ -84,7 +84,7 @@ use serve::MetadataLevel;
 /// under `/maven`.
 pub fn maven_routes() -> Router<Arc<AppContext>> {
     Router::new().route(
-        "/:repo_key/*artifact_path",
+        "/{repo_key}/{*artifact_path}",
         get(download)
             .head(download)
             .put(upload.layer(DefaultBodyLimit::max(DEFAULT_PUBLISH_BODY_LIMIT))),

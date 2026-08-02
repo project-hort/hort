@@ -559,7 +559,7 @@ mod tests {
             "hort_http_responses_total not present in scrape output:\n{body_text}"
         );
         assert!(
-            body_text.contains("path=\"/pypi/:repo_key/simple/:project/:filename\""),
+            body_text.contains("path=\"/pypi/{repo_key}/simple/{project}/{filename}\""),
             "matched route template missing in scrape output:\n{body_text}"
         );
         assert!(
@@ -940,12 +940,12 @@ mod tests {
         assert_ne!(
             control_admin_mint,
             StatusCode::NOT_FOUND,
-            "POST /api/v1/admin/users/:id/tokens must be routed on the control listener"
+            "POST /api/v1/admin/users/{{id}}/tokens must be routed on the control listener"
         );
         assert_ne!(
             control_admin_revoke,
             StatusCode::NOT_FOUND,
-            "DELETE /api/v1/admin/tokens/:id must be routed on the control listener"
+            "DELETE /api/v1/admin/tokens/{{id}} must be routed on the control listener"
         );
         assert_eq!(
             control_self_mint,
@@ -956,13 +956,13 @@ mod tests {
         assert_eq!(
             main_admin_mint,
             StatusCode::NOT_FOUND,
-            "POST /api/v1/admin/users/:id/tokens must be removed from the public listener \
+            "POST /api/v1/admin/users/{{id}}/tokens must be removed from the public listener \
              when the control split is ON"
         );
         assert_eq!(
             main_admin_revoke,
             StatusCode::NOT_FOUND,
-            "DELETE /api/v1/admin/tokens/:id must be removed from the public listener \
+            "DELETE /api/v1/admin/tokens/{{id}} must be removed from the public listener \
              when the control split is ON"
         );
         assert_ne!(

@@ -91,12 +91,12 @@ pub fn pypi_routes() -> Router<Arc<AppContext>> {
 pub fn pypi_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
     Router::new()
         .route(
-            "/:repo_key/",
+            "/{repo_key}/",
             post(upload).layer(DefaultBodyLimit::max(limit)),
         )
-        .route("/:repo_key/simple/", get(simple_root))
-        .route("/:repo_key/simple/:project/", get(simple_project))
-        .route("/:repo_key/simple/:project/:filename", get(download))
+        .route("/{repo_key}/simple/", get(simple_root))
+        .route("/{repo_key}/simple/{project}/", get(simple_project))
+        .route("/{repo_key}/simple/{project}/{filename}", get(download))
 }
 
 // ---------------------------------------------------------------------------
@@ -4570,12 +4570,12 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!("no hort_http_responses_total line with a /pypi/ path label:\n{scrape_body}")
             });
-        // The path label must be a ROUTE TEMPLATE — contains `:repo_key`,
-        // `:project`, or `:filename` — not the concrete URL.
+        // The path label must be a ROUTE TEMPLATE — contains `{repo_key}`,
+        // `{project}`, or `{filename}` — not the concrete URL.
         assert!(
-            http_resp_line.contains(":repo_key")
-                || http_resp_line.contains(":project")
-                || http_resp_line.contains(":filename"),
+            http_resp_line.contains("{repo_key}")
+                || http_resp_line.contains("{project}")
+                || http_resp_line.contains("{filename}"),
             "path label is not a route template:\n{http_resp_line}\n\nFull scrape:\n{scrape_body}"
         );
         // Concrete URL must not have leaked.

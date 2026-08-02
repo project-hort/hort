@@ -44,6 +44,6 @@ rcgen       = "0.13"
 # `axum-server` provides `bind_rustls` for the in-process HTTPS JWKS test
 # server. wiremock does not speak TLS, so we stand up a minimal
 # TLS-aware listener for the extra-CA positive/negative test pair.
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 axum        = { workspace = true }
 rustls      = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }

@@ -29,11 +29,11 @@ use crate::handlers::{get_repo_score, list_repo_scores, rescan};
 /// - `POST /api/v1/artifacts/:id/rescan`
 pub fn routes() -> Router<Arc<AppContext>> {
     Router::new()
-        .route("/repositories/:name/security-score", get(get_repo_score))
+        .route("/repositories/{name}/security-score", get(get_repo_score))
         .route("/security-score", get(list_repo_scores))
         // Per-artifact "rescan now" trigger. Distinct from the admin-task
         // surface (`/api/v1/admin/tasks/{kind}`): this endpoint targets a
         // specific artifact and gates on `Permission::Write` against that
         // artifact's parent repo, NOT `Permission::AdminTaskInvoke`.
-        .route("/artifacts/:id/rescan", post(rescan))
+        .route("/artifacts/{id}/rescan", post(rescan))
 }

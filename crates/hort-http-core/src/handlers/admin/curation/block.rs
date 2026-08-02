@@ -183,7 +183,7 @@ mod tests {
         );
         let router = Router::new()
             .route(
-                "/api/v1/admin/curation/quarantine/:artifact_id/block",
+                "/api/v1/admin/curation/quarantine/{artifact_id}/block",
                 post(post_block),
             )
             .with_state(ctx);

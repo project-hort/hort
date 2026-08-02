@@ -61,7 +61,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -98,7 +97,6 @@ use crate::middleware::auth::AuthenticatedPrincipal;
 /// detection.
 struct AuthenticatedCaller(CallerPrincipal);
 
-#[async_trait]
 impl FromRequestParts<Arc<AppContext>> for AuthenticatedCaller {
     type Rejection = Response;
 
@@ -150,7 +148,7 @@ pub fn api_token_routes() -> Router<Arc<AppContext>> {
     Router::new()
         .route("/users/me/tokens", post(post_self_token))
         .route("/users/me/tokens", get(get_self_tokens))
-        .route("/users/me/tokens/:id", delete(delete_self_token))
+        .route("/users/me/tokens/{id}", delete(delete_self_token))
 }
 
 /// Build the CONTROL-PLANE admin native-API-token route tree.
@@ -170,10 +168,10 @@ pub fn api_token_routes() -> Router<Arc<AppContext>> {
 pub fn admin_token_routes() -> Router<Arc<AppContext>> {
     Router::new()
         .route(
-            "/admin/users/:user_id/tokens",
+            "/admin/users/{user_id}/tokens",
             post(post_admin_service_account_token),
         )
-        .route("/admin/tokens/:id", delete(delete_admin_token))
+        .route("/admin/tokens/{id}", delete(delete_admin_token))
 }
 
 // ---------------------------------------------------------------------------

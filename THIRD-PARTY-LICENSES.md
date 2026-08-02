@@ -40,7 +40,7 @@ the result instead.
 | sigstore_protobuf_specs | 0.5.1 | Apache-2.0 | https://github.com/sigstore/protobuf-specs |
 | sync_wrapper | 1.0.2 | Apache-2.0 | https://github.com/Actyx/sync_wrapper |
 | arrayref | 0.3.9 | BSD-2-Clause | https://github.com/droundy/arrayref |
-| matchit | 0.7.3 | BSD-3-Clause | https://github.com/ibraheemdev/matchit |
+| matchit | 0.8.4 | BSD-3-Clause | https://github.com/ibraheemdev/matchit |
 | subtle | 2.6.1 | BSD-3-Clause | https://github.com/dalek-cryptography/subtle |
 | ed25519-dalek | 2.2.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek |
 | aws-lc-sys | 0.43.0 | BSD-3-Clause | https://github.com/aws/aws-lc-rs |
@@ -197,7 +197,6 @@ the result instead.
 | rand_core | 0.10.1 | MIT | https://github.com/rust-random/rand_core |
 | getrandom | 0.4.2 | MIT | https://github.com/rust-random/getrandom |
 | postcard | 1.1.3 | MIT | https://github.com/jamesmunns/postcard |
-| axum | 0.7.9 | MIT | https://github.com/tokio-rs/axum |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
 | sharded-slab | 0.1.7 | MIT | https://github.com/hawkw/sharded-slab |
 | matchers | 0.2.0 | MIT | https://github.com/hawkw/matchers |
@@ -216,10 +215,12 @@ the result instead.
 | tower-layer | 0.3.3 | MIT | https://github.com/tower-rs/tower |
 | tower-service | 0.3.3 | MIT | https://github.com/tower-rs/tower |
 | tower | 0.5.3 | MIT | https://github.com/tower-rs/tower |
+| axum | 0.8.9 | MIT | https://github.com/tokio-rs/axum |
 | snafu-derive | 0.8.9 | MIT | https://github.com/shepmaster/snafu |
 | snafu | 0.8.9 | MIT | https://github.com/shepmaster/snafu |
 | universal-hash | 0.5.1 | MIT | https://github.com/RustCrypto/traits |
 | tower-http | 0.6.10 | MIT | https://github.com/tower-rs/tower-http |
+| tower-http | 0.7.0 | MIT | https://github.com/tower-rs/tower-http |
 | crypto_secretbox | 0.1.1 | MIT | https://github.com/RustCrypto/nacl-compat/tree/master/crypto_secretbox |
 | http-body | 1.0.1 | MIT | https://github.com/hyperium/http-body |
 | http-body-util | 0.1.3 | MIT | https://github.com/hyperium/http-body |
@@ -309,8 +310,7 @@ the result instead.
 | rand_chacha | 0.9.0 | MIT | https://github.com/rust-random/rand |
 | rand_core | 0.6.4 | MIT | https://github.com/rust-random/rand |
 | rand_core | 0.9.5 | MIT | https://github.com/rust-random/rand |
-| axum-core | 0.4.5 | MIT | https://github.com/tokio-rs/axum |
-| axum-extra | 0.9.6 | MIT | https://github.com/tokio-rs/axum |
+| axum-extra | 0.12.6 | MIT | https://github.com/tokio-rs/axum |
 | zerocopy | 0.8.48 | MIT | https://github.com/google/zerocopy |
 | fred-macros | 0.1.0 | MIT | https://github.com/aembke/fred-macros |
 | fred | 10.1.0 | MIT | https://github.com/aembke/fred.rs |
@@ -333,12 +333,13 @@ the result instead.
 | no-std-compat | 0.4.1 | MIT | https://gitlab.com/jD91mZM2/no-std-compat |
 | zeroize_derive | 1.4.3 | MIT | https://github.com/RustCrypto/utils/tree/master/zeroize/derive |
 | secrecy | 0.10.3 | MIT | https://github.com/iqlusioninc/crates/tree/main/secrecy |
+| axum-core | 0.5.6 | MIT | https://github.com/tokio-rs/axum |
 | hashbag | 0.1.13 | MIT | https://github.com/jonhoo/hashbag.git |
 | spinning_top | 0.3.0 | MIT | https://github.com/rust-osdev/spinning_top |
 | multer | 3.1.0 | MIT | https://github.com/rwf2/multer |
 | tinyvec_macros | 0.1.1 | MIT | https://github.com/Soveu/tinyvec_macros |
 | rustls-platform-verifier | 0.7.0 | MIT | https://github.com/rustls/rustls-platform-verifier |
-| matchit | 0.7.3 | MIT | https://github.com/ibraheemdev/matchit |
+| matchit | 0.8.4 | MIT | https://github.com/ibraheemdev/matchit |
 | web-time | 1.1.0 | MIT | https://github.com/daxpedda/web-time |
 | chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.8.1 | MIT | https://github.com/boinkor-net/governor.git |
@@ -3932,7 +3933,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### matchit 0.7.3 — BSD-3-Clause
+### matchit 0.8.4 — BSD-3-Clause
 
 Repository: https://github.com/ibraheemdev/matchit
 
@@ -8958,39 +8959,6 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### axum 0.7.9 — MIT
-
-Repository: https://github.com/tokio-rs/axum
-
-```text
-Copyright (c) 2019 Axum Contributors
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
 ### slab 0.4.12 — MIT
 
 Repository: https://github.com/tokio-rs/slab
@@ -9574,6 +9542,39 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### axum 0.8.9 — MIT
+
+Repository: https://github.com/tokio-rs/axum
+
+```text
+Copyright (c) 2019 axum Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
 ### snafu-derive 0.8.9 — MIT
 
 Repository: https://github.com/shepmaster/snafu
@@ -9674,6 +9675,39 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 ### tower-http 0.6.10 — MIT
+
+Repository: https://github.com/tower-rs/tower-http
+
+```text
+Copyright (c) 2019-2021 Tower Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### tower-http 0.7.0 — MIT
 
 Repository: https://github.com/tower-rs/tower-http
 
@@ -12437,27 +12471,12 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### axum-core 0.4.5 — MIT
+### axum-extra 0.12.6 — MIT
 
 Repository: https://github.com/tokio-rs/axum
 
 ```text
-Copyright 2021 Axum Contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### axum-extra 0.9.6 — MIT
-
-Repository: https://github.com/tokio-rs/axum
-
-```text
-Copyright 2021 Axum Contributors
+Copyright 2021 axum Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
@@ -13078,6 +13097,40 @@ SOFTWARE.
 
 ```
 
+### axum-core 0.5.6 — MIT
+
+Repository: https://github.com/tokio-rs/axum
+
+```text
+MIT License
+
+Copyright (c) 2019–2025 axum Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
 ### hashbag 0.1.13 — MIT
 
 Repository: https://github.com/jonhoo/hashbag.git
@@ -13223,7 +13276,7 @@ SOFTWARE.
 
 ```
 
-### matchit 0.7.3 — MIT
+### matchit 0.8.4 — MIT
 
 Repository: https://github.com/ibraheemdev/matchit
 

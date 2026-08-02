@@ -94,7 +94,7 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         // GET exists so external tooling has a way to resolve
         // `:repo_id` from a stable key (UUIDs are minted at first
         // apply, so operators can't hard-code them).
-        .route("/repositories/:key", get(get_repository_by_key))
+        .route("/repositories/{key}", get(get_repository_by_key))
         // Admin-only read of the patch-candidate
         // quarantine surface. Mounted before `post_quarantine_release`
         // so the `/quarantine/*` routes group by path. The handler is
@@ -110,7 +110,7 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         // ≤ 512-byte `justification` in the JSON body so the emitted
         // `ArtifactReleased` event identifies who and why.
         .route(
-            "/quarantine/:artifact_id/release",
+            "/quarantine/{artifact_id}/release",
             post(post_quarantine_release),
         )
         // Admin-only effective-permissions
@@ -121,7 +121,7 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         // operator-discipline cost (ADR 0012;
         // docs/architecture/how-to/operate/claim-based-rbac.md).
         .route(
-            "/users/:user_id/effective-permissions",
+            "/users/{user_id}/effective-permissions",
             get(get_user_effective_permissions),
         )
         // Admin-only what-if RBAC resolver. Takes a
