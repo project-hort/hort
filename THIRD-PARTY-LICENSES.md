@@ -90,16 +90,16 @@ the result instead.
 | num-integer | 0.1.46 | MIT | https://github.com/rust-num/num-integer |
 | num-iter | 0.1.45 | MIT | https://github.com/rust-num/num-iter |
 | num-traits | 0.2.19 | MIT | https://github.com/rust-num/num-traits |
-| regex-automata | 0.4.14 | MIT | https://github.com/rust-lang/regex |
-| regex-syntax | 0.8.10 | MIT | https://github.com/rust-lang/regex |
-| regex | 1.12.3 | MIT | https://github.com/rust-lang/regex |
+| regex-automata | 0.4.16 | MIT | https://github.com/rust-lang/regex |
+| regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
+| regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.23.1 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.24.0 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
 | flate2 | 1.1.9 | MIT | https://github.com/rust-lang/flate2-rs |
-| hyper | 1.9.0 | MIT | https://github.com/hyperium/hyper |
+| hyper | 1.11.0 | MIT | https://github.com/hyperium/hyper |
 | unicase | 2.9.0 | MIT | https://github.com/seanmonstar/unicase |
 | either | 1.15.0 | MIT | https://github.com/rayon-rs/either |
 | itertools | 0.10.5 | MIT | https://github.com/rust-itertools/itertools |
@@ -147,7 +147,7 @@ the result instead.
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot_core | 0.9.12 | MIT | https://github.com/Amanieu/parking_lot |
 | thread_local | 1.1.9 | MIT | https://github.com/Amanieu/thread_local-rs |
-| humantime | 2.3.0 | MIT | https://github.com/chronotope/humantime |
+| humantime | 2.4.0 | MIT | https://github.com/chronotope/humantime |
 | serde-value | 0.7.0 | MIT | https://github.com/arcnmx/serde-value |
 | indexmap | 2.14.0 | MIT | https://github.com/indexmap-rs/indexmap |
 | equivalent | 1.0.2 | MIT | https://github.com/indexmap-rs/equivalent |
@@ -168,13 +168,13 @@ the result instead.
 | arc-swap | 1.9.2 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.14 | MIT | https://github.com/hyperium/h2 |
-| http | 1.4.2 | MIT | https://github.com/hyperium/http |
+| http | 1.5.0 | MIT | https://github.com/hyperium/http |
 | tokio-rustls | 0.26.4 | MIT | https://github.com/rustls/tokio-rustls |
 | signal-hook-registry | 1.4.8 | MIT | https://github.com/vorner/signal-hook |
 | cookie-factory | 0.3.2 | MIT | https://github.com/rust-bakery/cookie-factory |
 | digest | 0.11.3 | MIT | https://github.com/RustCrypto/traits |
 | aes | 0.8.4 | MIT | https://github.com/RustCrypto/block-ciphers |
-| bytes | 1.11.1 | MIT | https://github.com/tokio-rs/bytes |
+| bytes | 1.12.1 | MIT | https://github.com/tokio-rs/bytes |
 | rand_xoshiro | 0.7.0 | MIT | https://github.com/rust-random/rngs |
 | smallvec | 1.15.1 | MIT | https://github.com/servo/rust-smallvec |
 | directories | 6.0.0 | MIT | https://github.com/soc/directories-rs |
@@ -195,6 +195,7 @@ the result instead.
 | getrandom | 0.3.4 | MIT | https://github.com/rust-random/getrandom |
 | signature | 3.0.0 | MIT | https://github.com/RustCrypto/traits |
 | rand_core | 0.10.1 | MIT | https://github.com/rust-random/rand_core |
+| zeroize | 1.9.0 | MIT | https://github.com/RustCrypto/utils |
 | getrandom | 0.4.2 | MIT | https://github.com/rust-random/getrandom |
 | postcard | 1.1.3 | MIT | https://github.com/jamesmunns/postcard |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
@@ -225,6 +226,7 @@ the result instead.
 | http-body | 1.0.1 | MIT | https://github.com/hyperium/http-body |
 | http-body-util | 0.1.3 | MIT | https://github.com/hyperium/http-body |
 | chacha20 | 0.10.0 | MIT | https://github.com/RustCrypto/stream-ciphers |
+| zeroize_derive | 1.5.0 | MIT | https://github.com/RustCrypto/utils |
 | salsa20 | 0.11.0 | MIT | https://github.com/RustCrypto/stream-ciphers |
 | iana-time-zone | 0.1.65 | MIT | https://github.com/strawlab/iana-time-zone |
 | sqlx-core | 0.8.6 | MIT | https://github.com/launchbadge/sqlx |
@@ -266,7 +268,7 @@ the result instead.
 | inout | 0.2.2 | MIT | https://github.com/RustCrypto/utils |
 | cmov | 0.5.4 | MIT | https://github.com/RustCrypto/utils |
 | hybrid-array | 0.4.12 | MIT | https://github.com/RustCrypto/hybrid-array |
-| rustls-pki-types | 1.14.1 | MIT | https://github.com/rustls/pki-types |
+| rustls-pki-types | 1.15.1 | MIT | https://github.com/rustls/pki-types |
 | powerfmt | 0.2.0 | MIT | https://github.com/jhpratt/powerfmt |
 | hyper-util | 0.1.20 | MIT | https://github.com/hyperium/hyper-util |
 | deranged | 0.5.8 | MIT | https://github.com/jhpratt/deranged |
@@ -326,12 +328,10 @@ the result instead.
 | crc | 3.4.0 | MIT | https://github.com/mrhooray/crc-rs.git |
 | openidconnect | 4.0.1 | MIT | https://github.com/ramosbugs/openidconnect-rs |
 | crc32fast | 1.5.0 | MIT | https://github.com/srijs/rust-crc32fast |
-| zeroize | 1.8.2 | MIT | https://github.com/RustCrypto/utils |
-| dashmap | 6.1.0 | MIT | https://github.com/xacrimon/dashmap |
+| dashmap | 6.2.1 | MIT | https://github.com/xacrimon/dashmap |
 | crc-catalog | 2.5.0 | MIT | https://github.com/akhilles/crc-catalog.git |
 | tokio-macros | 2.7.0 | MIT | https://github.com/tokio-rs/tokio |
 | no-std-compat | 0.4.1 | MIT | https://gitlab.com/jD91mZM2/no-std-compat |
-| zeroize_derive | 1.4.3 | MIT | https://github.com/RustCrypto/utils/tree/master/zeroize/derive |
 | secrecy | 0.10.3 | MIT | https://github.com/iqlusioninc/crates/tree/main/secrecy |
 | axum-core | 0.5.6 | MIT | https://github.com/tokio-rs/axum |
 | hashbag | 0.1.13 | MIT | https://github.com/jonhoo/hashbag.git |
@@ -373,7 +373,7 @@ the result instead.
 | windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio-util | 0.7.19 | MIT | https://github.com/tokio-rs/tokio |
-| tokio | 1.52.3 | MIT | https://github.com/tokio-rs/tokio |
+| tokio | 1.53.1 | MIT | https://github.com/tokio-rs/tokio |
 | simd-adler32 | 0.3.9 | MIT | https://github.com/mcountryman/simd-adler32 |
 | miniz_oxide | 0.8.9 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | ident_case | 1.0.1 | MIT | https://github.com/TedDriggs/ident_case |
@@ -458,7 +458,7 @@ the result instead.
 | security-framework-sys | 2.17.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
-| jsonwebtoken | 10.3.0 | MIT | https://github.com/Keats/jsonwebtoken |
+| jsonwebtoken | 10.4.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.43.0 | MIT | https://github.com/aws/aws-lc-rs |
 | webbrowser | 1.2.2 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
@@ -5515,7 +5515,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex-automata 0.4.14 — MIT
+### regex-automata 0.4.16 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -5548,7 +5548,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex-syntax 0.8.10 — MIT
+### regex-syntax 0.8.11 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -5581,7 +5581,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex 1.12.3 — MIT
+### regex 1.13.1 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -5647,7 +5647,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.23.1 — MIT
+### uuid 1.24.0 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -5802,7 +5802,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### hyper 1.9.0 — MIT
+### hyper 1.11.0 — MIT
 
 Repository: https://github.com/hyperium/hyper
 
@@ -7346,7 +7346,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### humantime 2.3.0 — MIT
+### humantime 2.4.0 — MIT
 
 Repository: https://github.com/chronotope/humantime
 
@@ -8022,7 +8022,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### http 1.4.2 — MIT
+### http 1.5.0 — MIT
 
 Repository: https://github.com/hyperium/http
 
@@ -8216,7 +8216,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### bytes 1.11.1 — MIT
+### bytes 1.12.1 — MIT
 
 Repository: https://github.com/tokio-rs/bytes
 
@@ -8865,6 +8865,39 @@ Repository: https://github.com/rust-random/rand_core
 
 ```text
 Copyright (c) 2018-2026 The Rand Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### zeroize 1.9.0 — MIT
+
+Repository: https://github.com/RustCrypto/utils
+
+```text
+Copyright (c) 2018-2026 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -9842,6 +9875,39 @@ DEALINGS IN THE SOFTWARE.
 ### chacha20 0.10.0 — MIT
 
 Repository: https://github.com/RustCrypto/stream-ciphers
+
+```text
+Copyright (c) 2019-2026 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### zeroize_derive 1.5.0 — MIT
+
+Repository: https://github.com/RustCrypto/utils
 
 ```text
 Copyright (c) 2019-2026 The RustCrypto Project Developers
@@ -11210,7 +11276,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls-pki-types 1.14.1 — MIT
+### rustls-pki-types 1.15.1 — MIT
 
 Repository: https://github.com/rustls/pki-types
 
@@ -12893,36 +12959,7 @@ SOFTWARE.
 
 ```
 
-### zeroize 1.8.2 — MIT
-
-Repository: https://github.com/RustCrypto/utils
-
-```text
-MIT License
-
-Copyright (c) 2018-2021 The RustCrypto Project Developers
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the &quot;Software&quot;), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-### dashmap 6.1.0 — MIT
+### dashmap 6.2.1 — MIT
 
 Repository: https://github.com/xacrimon/dashmap
 
@@ -13018,35 +13055,6 @@ Repository: https://gitlab.com/jD91mZM2/no-std-compat
 MIT License
 
 Copyright (c) 2019 jD91mZM2
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the &quot;Software&quot;), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-### zeroize_derive 1.4.3 — MIT
-
-Repository: https://github.com/RustCrypto/utils/tree/master/zeroize/derive
-
-```text
-MIT License
-
-Copyright (c) 2019-2023 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the &quot;Software&quot;), to deal
@@ -14172,7 +14180,7 @@ SOFTWARE.
 
 ```
 
-### tokio 1.52.3 — MIT
+### tokio 1.53.1 — MIT
 
 Repository: https://github.com/tokio-rs/tokio
 
@@ -16696,7 +16704,7 @@ SOFTWARE.
 
 ```
 
-### jsonwebtoken 10.3.0 — MIT
+### jsonwebtoken 10.4.0 — MIT
 
 Repository: https://github.com/Keats/jsonwebtoken
 
