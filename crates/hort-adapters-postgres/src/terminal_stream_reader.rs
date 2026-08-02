@@ -242,11 +242,10 @@ mod tests {
 
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn enumerates_min_max_and_tail_event_type_and_parses_category() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL must be set for #[ignore]'d DB tests");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let aid = Uuid::new_v4();
         let sid = StreamId::artifact(aid).to_string();
         purge_stream(&pool, &sid).await;
@@ -273,11 +272,10 @@ mod tests {
 
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn meta_stream_is_excluded_in_sql() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL must be set for #[ignore]'d DB tests");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let meta = StreamId::eventstore_retention().to_string();
         purge_stream(&pool, &meta).await;
         append_event(&pool, &meta, "admin", 0, "StreamSealed", ts(100)).await;
@@ -295,14 +293,13 @@ mod tests {
 
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn tail_is_max_stream_position_not_max_stored_at() {
         // A later stream_position with an EARLIER stored_at must still
         // be the tail (clock skew tolerance — the architect note on
         // PersistedEvent.stored_at being non-monotonic).
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL must be set for #[ignore]'d DB tests");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let aid = Uuid::new_v4();
         let sid = StreamId::artifact(aid).to_string();
         purge_stream(&pool, &sid).await;

@@ -1741,13 +1741,13 @@ mod tests {
     /// table-owner connection (a privileged adversary the trigger +
     /// REVOKE cannot stop) and confirm verification now fails.
     ///
-    /// `#[ignore]` mirrors the file's existing Tier-2 idiom: the
-    /// privileged UPDATE needs the owner role, not the `hort_app_role`
-    /// `maybe_pool()` provides, so the tamper step is skipped unless a
-    /// DB is present; the no-DB tests above already prove detection.
+    /// `maybe_pool()`'s runtime self-skip mirrors the file's existing
+    /// Tier-2 idiom: the privileged UPDATE needs the owner role, not the
+    /// `hort_app_role` `maybe_pool()` provides, so the tamper step is
+    /// skipped unless a DB is present; the no-DB tests above already
+    /// prove detection.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL — runs in Tier 2 only"]
     async fn db_appended_chain_persists_and_detects_tamper() {
         let Some(pool) = maybe_pool().await else {
             return;
@@ -1922,7 +1922,6 @@ mod tests {
     /// handle, fail on any task error.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL — runs in Tier 2 only"]
     async fn b15_concurrent_any_appends_form_a_verifiable_chain() {
         let Some(pool) = maybe_pool().await else {
             return;
@@ -2151,9 +2150,10 @@ mod tests {
     // logic lives in the pure `hort-domain` verifier core).
     //
     // The no-DB tests run in Tier 1 (offline verifier model). The
-    // DB-backed tests (`#[ignore]`, Tier 2 via `DATABASE_URL`) exercise
-    // the real append+remove transaction and the ordering / abort /
-    // archive-parity / idempotency invariants end-to-end.
+    // DB-backed tests (runtime self-skip via `maybe_pool()`, Tier 2 via
+    // `DATABASE_URL`) exercise the real append+remove transaction and
+    // the ordering / abort / archive-parity / idempotency invariants
+    // end-to-end.
     // -----------------------------------------------------------------
     use hort_domain::events::{
         verify_against_checkpoint, AnchorBreak, AnchorVerdict, Checkpoint, SealedStreamRecord,
@@ -2323,7 +2323,6 @@ mod tests {
     /// end-to-end through the real `seal_and_remove` transaction.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL — runs in Tier 2 only"]
     async fn b9_db_tombstone_appended_before_rows_removed() {
         let Some(pool) = maybe_pool().await else {
             return;
@@ -2459,7 +2458,6 @@ mod tests {
     /// proving removal never precedes a durable tombstone.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL — runs in Tier 2 only"]
     async fn b9_db_tombstone_append_failure_aborts_delete_no_rows_removed() {
         // `maybe_pool()` runs migrations and backs the squatter + the
         // post-assertions. It MUST NOT carry the short `lock_timeout` —
@@ -2470,9 +2468,28 @@ mod tests {
         // Dedicated store pool with a bounded per-connection
         // `lock_timeout` (see the test doc-comment for why this is the
         // only correct fix and why it is test-scoped, not production).
+        //
+        // MUST target the SAME isolated database `pool` is connected to
+        // (issue #94 diagnosis) — `maybe_pool()` / `isolated_db_from`
+        // creates a fresh, per-test `hort_test_<epoch>_<uuid>` database
+        // and `pool` connects to THAT, not to the raw `DATABASE_URL`
+        // target. Re-reading `env::var("DATABASE_URL")` here (the
+        // pre-fix shape) built `store_pool` against the ORIGINAL,
+        // shared `DATABASE_URL` database instead — a completely
+        // different database than the one `pool` squats on. The
+        // squatter's reserved position was therefore never in the
+        // emitter's actual write path: the emitter's tombstone append
+        // landed, uncontended, in the shared database (polluting it
+        // with a stray `StreamSealed` row on every run), while this
+        // test's own post-assertions read back an empty isolated
+        // database — `delete_stream` returned `Ok` near-instantly
+        // instead of hitting the injected lock-timeout failure.
+        // `pool.connect_options()` carries the isolated database's
+        // connection info; cloning it (rather than a fresh
+        // `PgConnectOptions::parse`) guarantees both pools target the
+        // identical database.
         use sqlx::postgres::PgPoolOptions;
         use sqlx::Executor;
-        let url = env::var("DATABASE_URL").expect("maybe_pool() returned Some");
         let store_pool = PgPoolOptions::new()
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
@@ -2480,7 +2497,7 @@ mod tests {
                     Ok::<(), sqlx::Error>(())
                 })
             })
-            .connect(&url)
+            .connect_with((*pool.connect_options()).clone())
             .await
             .expect("connect store pool with bounded lock_timeout");
         let store = PgEventStore::new(store_pool).await.unwrap();
@@ -2584,7 +2601,6 @@ mod tests {
     /// does not exist would itself be misleading audit).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL — runs in Tier 2 only"]
     async fn b9_db_absent_stream_is_idempotent_noop_no_tombstone() {
         let Some(pool) = maybe_pool().await else {
             return;
@@ -2630,7 +2646,6 @@ mod tests {
     /// only the trace differs.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL — runs in Tier 2 only"]
     async fn b9_db_archive_stream_parity_with_delete() {
         let Some(pool) = maybe_pool().await else {
             return;
