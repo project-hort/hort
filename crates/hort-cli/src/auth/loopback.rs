@@ -49,7 +49,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use rand::RngCore;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -157,10 +159,10 @@ impl Drop for PkcePair {
 }
 
 impl PkcePair {
-    /// Generate a fresh PKCE pair. Uses `OsRng` for cryptographic randomness.
+    /// Generate a fresh PKCE pair. Uses `SysRng` for cryptographic randomness.
     fn generate() -> Self {
         let mut raw = [0u8; PKCE_VERIFIER_BYTES];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        UnwrapErr(SysRng).fill_bytes(&mut raw);
         let verifier = URL_SAFE_NO_PAD.encode(raw);
         // The buffer of raw bytes is sensitive; zeroize it before drop.
         let mut raw_z = raw;
@@ -200,7 +202,7 @@ impl Drop for StateValue {
 impl StateValue {
     fn generate() -> Self {
         let mut bytes = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        UnwrapErr(SysRng).fill_bytes(&mut bytes);
         let raw = URL_SAFE_NO_PAD.encode(bytes);
         Self { raw }
     }
@@ -642,7 +644,7 @@ mod tests {
     #[test]
     fn state_generate_produces_distinct_values() {
         // Cheap sanity check: 32 distinct 128-bit draws never collide in
-        // practice. If this test ever flakes, OsRng is broken.
+        // practice. If this test ever flakes, SysRng is broken.
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         for _ in 0..32 {

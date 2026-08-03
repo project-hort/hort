@@ -815,9 +815,9 @@ fn parse_worker_id() -> String {
 /// that two workers booting in the same second within the same pod
 /// don't collide; small enough that the worker id stays short in logs.
 fn random_hex_suffix() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let n: u32 = rng.gen();
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let n: u32 = rng.random();
     format!("{n:08x}")
 }
 

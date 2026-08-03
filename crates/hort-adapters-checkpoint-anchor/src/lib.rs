@@ -591,7 +591,7 @@ mod tests {
     use object_store::ObjectStoreExt;
 
     fn keypair() -> (SigningKey, String) {
-        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng));
         let pem = sk
             .verifying_key()
             .to_public_key_pem(LineEnding::LF)
@@ -905,7 +905,7 @@ mod tests {
     /// PEM **private** key (for the emitter) + the matching SPKI PEM
     /// **public** key (for the reader). The two are a real keypair.
     fn signing_keypair_pems() -> (String, String) {
-        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng));
         let priv_pem = sk
             .to_pkcs8_pem(LineEnding::LF)
             .expect("encode PKCS#8 PEM")

@@ -193,7 +193,7 @@ password-hash = { version = "0.5", features = ["alloc"] }
 # composition can load the secret from a Kubernetes-mounted file without a
 # separate PEM parser. `rand_core` enables generating a fresh keypair in
 # tests.
-ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "pem"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "rand_core", "pem"] }
 
 # Checksums
 sha2 = "0.10"
@@ -321,7 +321,7 @@ async-trait = "0.1"
 # Randomness (scrub sampling). Kept workspace-level because the scrubber is
 # the only current consumer; adding per-crate avoids a version skew when a
 # future feature needs the same source.
-rand = "0.8"
+rand = "0.10"
 
 # LRU cache for the PAT validation cache. `PatCache` wraps
 # `lru::LruCache<CacheKey, CachedEntry>` plus a `HashMap<Uuid, CacheKey>`

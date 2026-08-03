@@ -1158,7 +1158,9 @@ mod tests {
             // Wire a fresh OCI signing key — the presence of the slot
             // is what flips the challenge path to Bearer.
             let sk = OciTokenSigningKey::new(
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+                ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                    rand::rngs::SysRng,
+                )),
                 None,
             );
             let ctx = with_oci_signing_key(&ctx, Some(Arc::new(sk)));
@@ -1228,7 +1230,9 @@ mod tests {
         use hort_http_core::test_support::with_oci_public_base_url;
         let parsed = run(async {
             let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
-            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            ));
             let signing = OciTokenSigningKey::new(sk, None);
 
             // Mint a token outside the test, then exercise the verify
@@ -1283,8 +1287,12 @@ mod tests {
         let status = run(async {
             let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
             // Active key: SK_A. JWT will be signed by SK_B (attacker).
-            let active = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-            let attacker = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let active = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            ));
+            let attacker = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            ));
             let active_signing = Arc::new(OciTokenSigningKey::new(active, None));
             let attacker_signing = OciTokenSigningKey::new(attacker, None);
             let claims = hort_app::oci_token_signing::OciAccessClaims {
@@ -1507,7 +1515,9 @@ mod tests {
         let (status, www, api) = run(async {
             let ctx = enabled_auth_ctx_no_tokens();
             let sk = OciTokenSigningKey::new(
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+                ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                    rand::rngs::SysRng,
+                )),
                 None,
             );
             let ctx = with_oci_signing_key(&ctx, Some(Arc::new(sk)));
@@ -1601,7 +1611,9 @@ mod tests {
                 let (ctx, _mocks) = build_mock_ctx(handle); // AuthContext::Disabled
                 let ctx = if key_wired {
                     let sk = OciTokenSigningKey::new(
-                        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+                        ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                            rand::rngs::SysRng,
+                        )),
                         None,
                     );
                     with_oci_signing_key(&ctx, Some(Arc::new(sk)))
@@ -1679,7 +1691,9 @@ mod tests {
         let (status, www) = run(async {
             let ctx = enabled_auth_ctx_no_tokens();
             let sk = OciTokenSigningKey::new(
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+                ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                    rand::rngs::SysRng,
+                )),
                 None,
             );
             let ctx = with_oci_signing_key(&ctx, Some(Arc::new(sk)));
@@ -1754,7 +1768,9 @@ mod tests {
         let www = run(async {
             let ctx = enabled_auth_ctx_no_tokens();
             let sk = OciTokenSigningKey::new(
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+                ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                    rand::rngs::SysRng,
+                )),
                 None,
             );
             let ctx = with_oci_signing_key(&ctx, Some(Arc::new(sk)));
@@ -1792,7 +1808,9 @@ mod tests {
         let www = run(async {
             let ctx = enabled_auth_ctx_no_tokens();
             let sk = OciTokenSigningKey::new(
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+                ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                    rand::rngs::SysRng,
+                )),
                 None,
             );
             let ctx = with_oci_signing_key(&ctx, Some(Arc::new(sk)));
