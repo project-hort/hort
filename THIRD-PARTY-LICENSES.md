@@ -470,7 +470,7 @@ the result instead.
 | security-framework-sys | 2.17.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
-| jsonwebtoken | 10.4.0 | MIT | https://github.com/Keats/jsonwebtoken |
+| jsonwebtoken | 11.0.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.43.0 | MIT | https://github.com/aws/aws-lc-rs |
 | webbrowser | 1.2.2 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
@@ -17104,7 +17104,7 @@ SOFTWARE.
 
 ```
 
-### jsonwebtoken 10.4.0 — MIT
+### jsonwebtoken 11.0.0 — MIT
 
 Repository: https://github.com/Keats/jsonwebtoken
 
