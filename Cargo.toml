@@ -393,19 +393,24 @@ mockito = "1"
 #     `Api::<T>::namespaced`, `PatchParams::apply`, etc. — the surface this
 #     adapter touches. The default `runtime` (controller / watcher) feature
 #     is excluded because the CronJob + admin-task model was chosen over a
-#     controller-runtime reconciler.
+#     controller-runtime reconciler. `default-features = false` also drops
+#     kube 4's new default `ring` rustls-crypto-provider feature — fine,
+#     since the workspace installs the `aws-lc-rs` default `CryptoProvider`
+#     process-wide (ADR 0010) before any TLS connection is made, and kube's
+#     `rustls-tls` feature itself does not hard-require `ring`/`aws-lc-rs`
+#     at compile time (only `hyper-rustls`'s own already-resolved provider).
 #   - `gzip` is excluded — kube-rs's optional gzip is for very large watch
 #     streams; we do single Secret reads + writes.
-# Pinned to the latest 3.x crates.io line (3.1.0 as of 2026-03).
-kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"] }
+# Pinned to the latest 4.x crates.io line (4.2.0 as of 2026-08).
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls"] }
 #
 # `k8s-openapi` is the generated Kubernetes API type registry. The
 # `latest` feature selects the newest Kubernetes API version supported
-# by the chosen `k8s-openapi` release (currently `v1_34` — a Kubernetes
+# by the chosen `k8s-openapi` release (currently `v1_36` — a Kubernetes
 # server >= 1.27 honours the `core/v1` Secret shape unchanged, so the
 # adapter does not bind us to a specific cluster minor). Pinned to
-# 0.27.x (the major used by kube 3.1.x).
-k8s-openapi = { version = "0.27", features = ["latest"] }
+# 0.28.x (the major used by kube 4.2.x).
+k8s-openapi = { version = "0.28", features = ["latest"] }
 
 # Masked terminal input for `hort-cli auth login`. Reads the token without
 # echoing it to the terminal (uses platform `termios` / `ReadConsole`
