@@ -53,7 +53,7 @@ futures      = { workspace = true }
 # `oci_bearer_auth` middleware decodes `Authorization: Basic <base64>`
 # headers to recover the IdP JWT stored in the password slot
 # (legacy / twine-compatible flow).
-base64       = "0.22"
+base64       = "0.23"
 # `CachingResolver` holds the
 # `HashMap<Uuid, Vec<RepositoryUpstreamMapping>>` snapshot in an
 # `ArcSwap` so the request-path read is lock-free and the background

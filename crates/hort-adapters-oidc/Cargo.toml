@@ -19,7 +19,7 @@ hort-domain     = { path = "../hort-domain" }
 # decoding is the documented workaround. Same crate version as the rest
 # of the workspace (`hort-formats`, `hort-http-npm`, `hort-http-oci`,
 # `hort-adapters-upstream-http`).
-base64        = "0.22"
+base64        = "0.23"
 bytes         = { workspace = true }
 chrono        = { workspace = true }
 futures       = { workspace = true }

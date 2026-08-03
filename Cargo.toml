@@ -164,7 +164,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 # Testing — serialises tests that share global DB state (the gitops
 # `permission_grants` partition full-replace). See the hort-adapters-postgres
 # permission_grant_repo `save_managed_*` tests.
-serial_test = "3"
+serial_test = "4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -173,7 +173,7 @@ serde_json = "1.0"
 # v0.3 bundle carries (keyed provenance, ADR 0039 §8), and the pagination
 # cursor. Workspace-pinned so hort-domain (pure signature-material extraction)
 # and hort-app (orchestration) resolve one version.
-base64 = "0.22"
+base64 = "0.23"
 # YAML — active community fork of the archived `serde_yaml`. Swapped
 # `serde_yml` → `serde_yaml_ng` to drop the transitive `libyml` advisories
 # RUSTSEC-2025-0067 / RUSTSEC-2025-0068. Promoted to workspace level so
@@ -242,7 +242,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # per-ecosystem `all.zip` bulk feeds. `default-features = false` +
 # `deflate` keeps the dep minimal (no AES/zstd we don't need); the OSV
 # archives use deflate exclusively.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # gzip (de)compression. `flate2`'s `GzDecoder` decompresses npm `.tgz` /
 # cargo `.crate` archives inside
 # `hort-formats::archive_bounds::read_tar_gz_entry`. `deny.toml:183-189`

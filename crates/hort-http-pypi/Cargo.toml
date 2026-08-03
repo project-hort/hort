@@ -37,7 +37,7 @@ async-trait  = { workspace = true }
 # `base64` is not a workspace dep but is already pulled in transitively
 # at v0.22; pinning a direct entry at the same major keeps the cache
 # module's encoding choice explicit at the crate boundary.
-base64       = "0.22"
+base64       = "0.23"
 # HTML link rewriting in the simple-index proxy.
 # A regex over `<a ... href="..."...>` avoids dragging in a
 # full HTML parser for what is a tiny, well-formed PEP 503 surface.

@@ -283,9 +283,8 @@ the result instead.
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
 | clap | 4.6.5 | MIT | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.5 | MIT | https://github.com/clap-rs/clap |
-| clap_complete | 4.5.55 | MIT | https://github.com/clap-rs/clap |
+| clap_complete | 4.6.8 | MIT | https://github.com/clap-rs/clap |
 | clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
-| clap_lex | 0.7.7 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
@@ -304,7 +303,7 @@ the result instead.
 | tar | 0.4.46 | MIT | https://github.com/composefs/tar-rs |
 | arrayvec | 0.7.6 | MIT | https://github.com/bluss/arrayvec |
 | synstructure | 0.13.2 | MIT | https://github.com/mystor/synstructure |
-| ipnet | 2.12.0 | MIT | https://github.com/krisprice/ipnet |
+| ipnet | 2.12.1 | MIT | https://github.com/krisprice/ipnet |
 | rand | 0.10.1 | MIT | https://github.com/rust-random/rand |
 | rand | 0.8.6 | MIT | https://github.com/rust-random/rand |
 | rand | 0.9.4 | MIT | https://github.com/rust-random/rand |
@@ -331,7 +330,6 @@ the result instead.
 | dashmap | 6.2.1 | MIT | https://github.com/xacrimon/dashmap |
 | crc-catalog | 2.5.0 | MIT | https://github.com/akhilles/crc-catalog.git |
 | tokio-macros | 2.7.0 | MIT | https://github.com/tokio-rs/tokio |
-| no-std-compat | 0.4.1 | MIT | https://gitlab.com/jD91mZM2/no-std-compat |
 | secrecy | 0.10.3 | MIT | https://github.com/iqlusioninc/crates/tree/main/secrecy |
 | axum-core | 0.5.6 | MIT | https://github.com/tokio-rs/axum |
 | hashbag | 0.1.13 | MIT | https://github.com/jonhoo/hashbag.git |
@@ -342,7 +340,7 @@ the result instead.
 | matchit | 0.8.4 | MIT | https://github.com/ibraheemdev/matchit |
 | web-time | 1.1.0 | MIT | https://github.com/daxpedda/web-time |
 | chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
-| governor | 0.8.1 | MIT | https://github.com/boinkor-net/governor.git |
+| governor | 0.10.4 | MIT | https://github.com/boinkor-net/governor.git |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
 | objc2-app-kit | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
@@ -431,6 +429,7 @@ the result instead.
 | thiserror-impl | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
+| typed-path | 0.12.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | unsafe-libyaml | 0.2.11 | MIT | https://github.com/dtolnay/unsafe-libyaml |
 | zmij | 1.0.21 | MIT | https://github.com/dtolnay/zmij |
@@ -438,7 +437,7 @@ the result instead.
 | winnow | 1.0.2 | MIT | https://github.com/winnow-rs/winnow |
 | tinyvec | 1.11.0 | MIT | https://github.com/Lokathor/tinyvec |
 | spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
-| zip | 2.4.2 | MIT | https://github.com/zip-rs/zip2.git |
+| zip | 8.6.0 | MIT | https://github.com/zip-rs/zip2 |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
 | endian-type | 0.1.2 | MIT | https://github.com/Lolirofle/endian-type.git |
 | base64 | 0.21.7 | MIT | https://github.com/marshallpierce/rust-base64 |
@@ -454,7 +453,7 @@ the result instead.
 | raw-cpuid | 11.6.0 | MIT | https://github.com/gz/rust-cpuid |
 | nibble_vec | 0.1.0 | MIT | https://github.com/michaelsproul/rust_nibble_vec |
 | radix_trie | 0.2.1 | MIT | https://github.com/michaelsproul/rust_radix_trie |
-| shlex | 1.3.0 | MIT | https://github.com/comex/rust-shlex |
+| shlex | 2.0.1 | MIT | https://github.com/comex/rust-shlex |
 | security-framework-sys | 2.17.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
@@ -478,6 +477,7 @@ the result instead.
 | crossbeam-epoch | 0.9.20 | MIT | https://github.com/crossbeam-rs/crossbeam |
 | crossbeam-queue | 0.3.12 | MIT | https://github.com/crossbeam-rs/crossbeam |
 | crossbeam-utils | 0.8.21 | MIT | https://github.com/crossbeam-rs/crossbeam |
+| base64 | 0.23.0 | MIT | https://github.com/marshallpierce/rust-base64 |
 | nu-ansi-term | 0.50.3 | MIT | https://github.com/nushell/nu-ansi-term |
 | mime_guess | 2.0.5 | MIT | https://github.com/abonander/mime_guess |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git |
@@ -504,6 +504,7 @@ the result instead.
 | zerotrie | 0.2.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec-derive | 0.11.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec | 0.11.6 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| zlib-rs | 0.6.6 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
 | foldhash | 0.1.5 | Zlib | https://github.com/orlp/foldhash |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash |
 
@@ -11705,7 +11706,7 @@ SOFTWARE.
 
 ```
 
-### clap_complete 4.5.55 — MIT
+### clap_complete 4.6.8 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11733,33 +11734,6 @@ SOFTWARE.
 ```
 
 ### clap_derive 4.6.4 — MIT
-
-Repository: https://github.com/clap-rs/clap
-
-```text
-Copyright (c) Individual contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the &quot;Software&quot;), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-### clap_lex 0.7.7 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12284,7 +12258,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
-### ipnet 2.12.0 — MIT
+### ipnet 2.12.1 — MIT
 
 Repository: https://github.com/krisprice/ipnet
 
@@ -13047,35 +13021,6 @@ SOFTWARE.
 
 ```
 
-### no-std-compat 0.4.1 — MIT
-
-Repository: https://gitlab.com/jD91mZM2/no-std-compat
-
-```text
-MIT License
-
-Copyright (c) 2019 jD91mZM2
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the &quot;Software&quot;), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
 ### secrecy 0.10.3 — MIT
 
 Repository: https://github.com/iqlusioninc/crates/tree/main/secrecy
@@ -13368,7 +13313,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### governor 0.8.1 — MIT
+### governor 0.10.4 — MIT
 
 Repository: https://github.com/boinkor-net/governor.git
 
@@ -15930,6 +15875,37 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### typed-path 0.12.3 — MIT
+
+Repository: https://github.com/chipsenkbeil/typed-path
+
+```text
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
 ### unicode-ident 1.0.24 — MIT
 
 Repository: https://github.com/dtolnay/unicode-ident
@@ -16121,9 +16097,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### zip 2.4.2 — MIT
+### zip 8.6.0 — MIT
 
-Repository: https://github.com/zip-rs/zip2.git
+Repository: https://github.com/zip-rs/zip2
 
 ```text
 The MIT License (MIT)
@@ -16148,8 +16124,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Some files in the &quot;tests/data&quot; subdirectory of this repository are under other
-licences; see files named LICENSE.*.txt for details.
 ```
 
 ### typenum 1.20.0 — MIT
@@ -16589,7 +16563,7 @@ THE SOFTWARE.
 
 ```
 
-### shlex 1.3.0 — MIT
+### shlex 2.0.1 — MIT
 
 Repository: https://github.com/comex/rust-shlex
 
@@ -17307,6 +17281,35 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+```
+
+### base64 0.23.0 — MIT
+
+Repository: https://github.com/marshallpierce/rust-base64
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2025 Alice Maz, Marshall Pierce
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ```
 
@@ -18887,6 +18890,33 @@ SPDX-License-Identifier: Unicode-3.0
 
 Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
+
+```
+
+### zlib-rs 0.6.6 — Zlib
+
+Repository: https://github.com/trifectatechfoundation/zlib-rs
+
+```text
+(C) 2024 Trifecta Tech Foundation 
+
+This software is provided &#x27;as-is&#x27;, without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+
+3. This notice may not be removed or altered from any source distribution.
 
 ```
 
