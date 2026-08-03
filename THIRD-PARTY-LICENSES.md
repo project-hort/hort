@@ -15,7 +15,7 @@ the result instead.
 | --- | --- | --- | --- |
 | nonzero_ext | 0.3.0 | Apache-2.0 | https://github.com/antifuchs/nonzero_ext |
 | flagset | 0.4.7 | Apache-2.0 | https://github.com/enarx/flagset |
-| k8s-openapi | 0.27.1 | Apache-2.0 | https://github.com/Arnavion/k8s-openapi |
+| k8s-openapi | 0.28.0 | Apache-2.0 | https://github.com/Arnavion/k8s-openapi |
 | sigstore-protobuf-specs-derive | 0.0.1 | Apache-2.0 | https://github.com/sigstore/protobuf-specs |
 | zopfli | 0.8.3 | Apache-2.0 | https://github.com/zopfli-rs/zopfli |
 | sketches-ddsketch | 0.3.1 | Apache-2.0 | https://github.com/mheffner/rust-sketches-ddsketch |
@@ -27,9 +27,9 @@ the result instead.
 | aws-lc-sys | 0.43.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
 | blake3 | 1.8.5 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
 | constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
-| kube-client | 3.1.0 | Apache-2.0 | https://github.com/kube-rs/kube |
-| kube-core | 3.1.0 | Apache-2.0 | https://github.com/kube-rs/kube |
-| kube | 3.1.0 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube-client | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube-core | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
 | metrics-exporter-prometheus | 0.18.3 | Apache-2.0 | https://github.com/metrics-rs/metrics |
 | pep440_rs | 0.7.3 | Apache-2.0 | https://github.com/konstin/pep440-rs |
 | rpassword | 7.5.4 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
@@ -179,6 +179,7 @@ the result instead.
 | bytes | 1.12.1 | MIT | https://github.com/tokio-rs/bytes |
 | rand_xoshiro | 0.7.0 | MIT | https://github.com/rust-random/rngs |
 | smallvec | 1.15.1 | MIT | https://github.com/servo/rust-smallvec |
+| ahash | 0.8.12 | MIT | https://github.com/tkaitchuck/ahash |
 | directories | 6.0.0 | MIT | https://github.com/soc/directories-rs |
 | want | 0.3.1 | MIT | https://github.com/seanmonstar/want |
 | block-buffer | 0.10.4 | MIT | https://github.com/RustCrypto/utils |
@@ -284,6 +285,7 @@ the result instead.
 | system-configuration-sys | 0.6.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | system-configuration | 0.7.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | ctutils | 0.4.2 | MIT | https://github.com/RustCrypto/utils |
+| annotate-snippets | 0.12.16 | MIT | https://github.com/rust-lang/annotate-snippets-rs |
 | anstream | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-parse | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -319,6 +321,7 @@ the result instead.
 | rand_chacha | 0.9.0 | MIT | https://github.com/rust-random/rand |
 | rand_core | 0.6.4 | MIT | https://github.com/rust-random/rand |
 | rand_core | 0.9.5 | MIT | https://github.com/rust-random/rand |
+| nohash-hasher | 0.2.0 | MIT | https://github.com/paritytech/nohash-hasher |
 | axum-extra | 0.12.6 | MIT | https://github.com/tokio-rs/axum |
 | zerocopy | 0.8.48 | MIT | https://github.com/google/zerocopy |
 | fred-macros | 0.1.0 | MIT | https://github.com/aembke/fred-macros |
@@ -349,6 +352,7 @@ the result instead.
 | web-time | 1.1.0 | MIT | https://github.com/daxpedda/web-time |
 | chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.10.4 | MIT | https://github.com/boinkor-net/governor.git |
+| granit-parser | 0.0.7 | MIT | https://github.com/bourumir-wyngs/granit-parser |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
 | objc2-app-kit | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
@@ -422,6 +426,7 @@ the result instead.
 | rustix | 1.1.4 | MIT | https://github.com/bytecodealliance/rustix |
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
+| serde-saphyr | 0.0.29 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
 | serde | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
@@ -430,7 +435,6 @@ the result instead.
 | serde_nanos | 0.1.4 | MIT | https://github.com/caspervonb/serde_nanos |
 | serde_path_to_error | 0.1.20 | MIT | https://github.com/dtolnay/path-to-error |
 | serde_repr | 0.1.20 | MIT | https://github.com/dtolnay/serde-repr |
-| serde_yaml | 0.9.34+deprecated | MIT | https://github.com/dtolnay/serde-yaml |
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
 | syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
@@ -452,6 +456,7 @@ the result instead.
 | base64 | 0.22.1 | MIT | https://github.com/marshallpierce/rust-base64 |
 | aho-corasick | 1.1.4 | MIT | https://github.com/BurntSushi/aho-corasick |
 | byteorder | 1.5.0 | MIT | https://github.com/BurntSushi/byteorder |
+| encoding_rs_io | 0.1.7 | MIT | https://github.com/BurntSushi/encoding_rs_io |
 | globset | 0.4.18 | MIT | https://github.com/BurntSushi/ripgrep/tree/master/crates/globset |
 | jiff | 0.2.24 | MIT | https://github.com/BurntSushi/jiff |
 | memchr | 2.8.0 | MIT | https://github.com/BurntSushi/memchr |
@@ -478,6 +483,7 @@ the result instead.
 | evmap | 11.0.0 | MIT | https://github.com/jonhoo/evmap.git |
 | left-right | 0.11.7 | MIT | https://github.com/jonhoo/left-right.git |
 | ff | 0.13.1 | MIT | https://github.com/zkcrypto/ff |
+| arraydeque | 0.5.1 | MIT | https://github.com/andylokandy/arraydeque |
 | async-compression | 0.4.42 | MIT | https://github.com/Nullus157/async-compression |
 | compression-codecs | 0.4.38 | MIT | https://github.com/Nullus157/async-compression |
 | compression-core | 0.4.32 | MIT | https://github.com/Nullus157/async-compression |
@@ -938,7 +944,7 @@ Repository: https://github.com/enarx/flagset
 
 ```
 
-### k8s-openapi 0.27.1 — Apache-2.0
+### k8s-openapi 0.28.0 — Apache-2.0
 
 Repository: https://github.com/Arnavion/k8s-openapi
 
@@ -2936,7 +2942,7 @@ limitations under the License.
 
 ```
 
-### kube-client 3.1.0 — Apache-2.0
+### kube-client 4.2.0 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -3017,7 +3023,7 @@ limitations under the License.
 
 ```
 
-### kube-core 3.1.0 — Apache-2.0
+### kube-core 4.2.0 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -3098,7 +3104,7 @@ limitations under the License.
 
 ```
 
-### kube 3.1.0 — Apache-2.0
+### kube 4.2.0 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -8397,6 +8403,39 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### ahash 0.8.12 — MIT
+
+Repository: https://github.com/tkaitchuck/ahash
+
+```text
+Copyright (c) 2018 Tom Kaitchuck
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
 ### directories 6.0.0 — MIT
 
 Repository: https://github.com/soc/directories-rs
@@ -11796,6 +11835,33 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### annotate-snippets 0.12.16 — MIT
+
+Repository: https://github.com/rust-lang/annotate-snippets-rs
+
+```text
+Copyright (c) Individual contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
 ### anstream 1.0.0 — MIT
 
 Repository: https://github.com/rust-cli/anstyle.git
@@ -12790,6 +12856,32 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### nohash-hasher 0.2.0 — MIT
+
+Repository: https://github.com/paritytech/nohash-hasher
+
+```text
+Copyright 2018 Parity Technologies (UK) Ltd.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the &quot;Software&quot;), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
 ### axum-extra 0.12.6 — MIT
 
 Repository: https://github.com/tokio-rs/axum
@@ -13595,6 +13687,32 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 ### governor 0.10.4 — MIT
 
 Repository: https://github.com/boinkor-net/governor.git
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### granit-parser 0.0.7 — MIT
+
+Repository: https://github.com/bourumir-wyngs/granit-parser
 
 ```text
 MIT License
@@ -15689,6 +15807,37 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### serde-saphyr 0.0.29 — MIT
+
+Repository: https://github.com/bourumir-wyngs/serde-saphyr
+
+```text
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
 ### serde 1.0.229 — MIT
 
 Repository: https://github.com/serde-rs/serde
@@ -15909,37 +16058,6 @@ DEALINGS IN THE SOFTWARE.
 ### serde_repr 0.1.20 — MIT
 
 Repository: https://github.com/dtolnay/serde-repr
-
-```text
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### serde_yaml 0.9.34+deprecated — MIT
-
-Repository: https://github.com/dtolnay/serde-yaml
 
 ```text
 Permission is hereby granted, free of charge, to any
@@ -16554,6 +16672,35 @@ THE SOFTWARE.
 ### byteorder 1.5.0 — MIT
 
 Repository: https://github.com/BurntSushi/byteorder
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+```
+
+### encoding_rs_io 0.1.7 — MIT
+
+Repository: https://github.com/BurntSushi/encoding_rs_io
 
 ```text
 The MIT License (MIT)
@@ -17339,6 +17486,35 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+```
+
+### arraydeque 0.5.1 — MIT
+
+Repository: https://github.com/andylokandy/arraydeque
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2018 Andy Lok &lt;andylokandy@hotmail.com&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ```
 
