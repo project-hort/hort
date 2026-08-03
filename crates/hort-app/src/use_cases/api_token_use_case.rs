@@ -42,7 +42,7 @@ use std::time::Duration as StdDuration;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
-use rand::RngCore;
+use rand::Rng;
 use uuid::Uuid;
 
 use hort_domain::entities::api_token::{ApiToken, TokenKind};
@@ -2570,7 +2570,7 @@ fn emit_session_admin_issuance_metric(result_label: &'static str) {
 /// reach for it via the `pub(crate)` boundary.
 pub(crate) fn generate_token_plaintext(kind: TokenKind) -> (String, String) {
     let mut bytes = [0u8; TOKEN_BODY_RAW_BYTES];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let body = encode_base32_lowercase(&bytes);
     debug_assert_eq!(body.len(), TOKEN_BODY_LEN);
     let kind_prefix = match kind {
@@ -5775,8 +5775,7 @@ mod tests {
     /// keypair, plus the denylist store, both shareable.
     fn cli_session_rig() -> (Arc<CliSessionTokenSigner>, Arc<DenylistMockStore>) {
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut rand::rng());
         let key = Arc::new(OciTokenSigningKey::new(sk, None));
         let signer = Arc::new(CliSessionTokenSigner::new(
             key,

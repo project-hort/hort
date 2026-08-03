@@ -1567,7 +1567,7 @@ mod tests {
 
         // -- Signing key — fresh per-test so tests stay independent.
         let signing_key = Arc::new(OciTokenSigningKey::new(
-            SigningKey::generate(&mut rand::rngs::OsRng),
+            SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
             None,
         ));
         let cfg =
@@ -2860,7 +2860,7 @@ mod tests {
     fn verify_inbound_valid_token_is_verified() {
         let snap = capture_async(|| async {
             let signing = Arc::new(OciTokenSigningKey::new(
-                SigningKey::generate(&mut rand::rngs::OsRng),
+                SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
                 None,
             ));
             let jwt = mint_token(&signing, "hort.test", 300);
@@ -2891,11 +2891,13 @@ mod tests {
     fn verify_inbound_foreign_token_is_not_our_token() {
         let snap = capture_async(|| async {
             let active = Arc::new(OciTokenSigningKey::new(
-                SigningKey::generate(&mut rand::rngs::OsRng),
+                SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
                 None,
             ));
-            let attacker =
-                OciTokenSigningKey::new(SigningKey::generate(&mut rand::rngs::OsRng), None);
+            let attacker = OciTokenSigningKey::new(
+                SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
+                None,
+            );
             let foreign = mint_token(&attacker, "hort.test", 300);
             let uc = make_verify_uc(active, "hort.test");
             assert!(matches!(
@@ -2924,7 +2926,7 @@ mod tests {
     fn verify_inbound_expired_token_is_rejected_expired() {
         let snap = capture_async(|| async {
             let signing = Arc::new(OciTokenSigningKey::new(
-                SigningKey::generate(&mut rand::rngs::OsRng),
+                SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
                 None,
             ));
             let jwt = mint_token(&signing, "hort.test", -10); // already expired
@@ -2948,7 +2950,7 @@ mod tests {
     fn verify_inbound_wrong_audience_is_rejected_invalid_audience() {
         let snap = capture_async(|| async {
             let signing = Arc::new(OciTokenSigningKey::new(
-                SigningKey::generate(&mut rand::rngs::OsRng),
+                SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
                 None,
             ));
             // Token minted for a DIFFERENT aud than the use case config.

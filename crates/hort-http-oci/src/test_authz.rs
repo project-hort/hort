@@ -124,7 +124,7 @@ pub(crate) fn denied_ctx_bearer(
 
     let ctx = denied_ctx(base, repositories);
     let sk = OciTokenSigningKey::new(
-        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+        ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
         None,
     );
     let ctx = with_oci_signing_key(&ctx, Some(Arc::new(sk)));

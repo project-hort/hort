@@ -405,12 +405,13 @@ mod tests {
 
     use ed25519_dalek::pkcs8::EncodePrivateKey;
     use ed25519_dalek::pkcs8::EncodePublicKey;
-    use rand::rngs::OsRng;
+    use rand::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
 
-    /// Build a fresh keypair via `OsRng`. Used as a building block by
+    /// Build a fresh keypair via `SysRng`. Used as a building block by
     /// every test below.
     fn fresh_signing_key() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+        SigningKey::generate(&mut UnwrapErr(SysRng))
     }
 
     fn sample_claims() -> OciAccessClaims {
