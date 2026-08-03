@@ -64,4 +64,4 @@ hex = { workspace = true }
 # Same fixture pattern as upstream-http / advisory-osv: generate a
 # self-signed root in-process for the extra-CA regression test, no
 # committed PEM fixtures.
-rcgen = "0.13"
+rcgen = "0.14"

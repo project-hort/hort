@@ -6060,8 +6060,9 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "hort test leaf".to_string());
         let leaf_key = rcgen::KeyPair::generate().expect("generate leaf keypair");
+        let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
         let leaf = leaf_params
-            .signed_by(&leaf_key, &ca, &ca_key)
+            .signed_by(&leaf_key, &ca_issuer)
             .expect("CA-sign leaf cert");
 
         let ca_pem = ca.pem();

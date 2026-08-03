@@ -43,4 +43,4 @@ hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
 # Same fixture pattern as hort-adapters-upstream-http: generate a self-
 # signed root in-process for the extra-CA regression test, no committed
 # PEM fixtures.
-rcgen        = "0.13"
+rcgen        = "0.14"
