@@ -181,7 +181,7 @@ base64 = "0.23"
 serde_yaml_ng = "0.10"
 
 # Authentication
-jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # Argon2id replaces bcrypt for both password and PAT hashing. `bcrypt` is
 # removed from the workspace entirely; a CI grep gate (`no_bcrypt` guard)
 # keeps it out. `password-hash` ships with `argon2` and provides the PHC
