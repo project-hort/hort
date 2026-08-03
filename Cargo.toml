@@ -238,7 +238,6 @@ uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-cron = "0.15"
 # ZIP archive parsing — the advisory-watch handler streams OSV
 # per-ecosystem `all.zip` bulk feeds. `default-features = false` +
 # `deflate` keeps the dep minimal (no AES/zstd we don't need); the OSV
@@ -350,9 +349,6 @@ url = "2.5"
 
 # IP CIDR parsing (HORT_TRUSTED_PROXY_CIDRS allowlist)
 ipnet = "2.11"
-
-# SMTP email delivery
-lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
 # Recursive directory walk — gitops boot scans `$HORT_CONFIG_DIR/**/*.yaml`.
 # Promoted to workspace deps so any future caller shares the version pin.
 walkdir = "2"
