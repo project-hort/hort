@@ -2771,8 +2771,9 @@ FtBmFfStik03XAfEPVCRWBMc
             .distinguished_name
             .push(rcgen::DnType::CommonName, "oidc-test-leaf".to_string());
         let leaf_key = rcgen::KeyPair::generate().expect("generate leaf keypair");
+        let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
         let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .signed_by(&leaf_key, &ca_issuer)
             .expect("sign leaf cert with CA");
 
         (ca_cert.pem(), leaf_cert.pem(), leaf_key.serialize_pem())
