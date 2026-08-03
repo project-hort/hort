@@ -80,4 +80,4 @@ wiremock = "0.6"
 # encodes the checkpoint root + signature into the signed-note envelope.
 # Both are dev-deps in sibling adapter crates (oidc / upstream-http / k8s).
 aws-lc-rs = "1.16"
-base64 = "0.22"
+base64 = "0.23"

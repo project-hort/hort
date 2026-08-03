@@ -27,7 +27,7 @@ urlencoding   = "2"
 # parser decodes it to raw bytes before hex-encoding for
 # `UpstreamPublishedChecksum`. Not a workspace dep but pulled in
 # transitively at v0.22 (matches the other crates that pin it directly).
-base64        = "0.22"
+base64        = "0.23"
 # All ZIP extraction must go through
 # hort-formats::archive_bounds::iter_zip_entries (see ADR 0006). This is
 # the only crate in the workspace permitted to depend on `zip` directly

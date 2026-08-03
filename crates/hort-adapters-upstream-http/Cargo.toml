@@ -33,7 +33,7 @@ uuid       = { workspace = true }
 # the request path reads through `.load()` and the background refresh
 # task swaps atomically. See `docs/architecture/how-to/oci-pull-through.md`.
 arc-swap   = { workspace = true }
-base64     = "0.22"
+base64     = "0.23"
 thiserror  = { workspace = true }
 # Wrap every intermediate string in the Basic-auth header construction
 # in `Zeroizing<String>` to mirror the Bearer path's credential-hygiene
