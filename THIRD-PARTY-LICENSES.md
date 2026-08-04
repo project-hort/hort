@@ -314,7 +314,7 @@ the result instead.
 | arrayvec | 0.7.6 | MIT | https://github.com/bluss/arrayvec |
 | synstructure | 0.13.2 | MIT | https://github.com/mystor/synstructure |
 | ipnet | 2.12.1 | MIT | https://github.com/krisprice/ipnet |
-| rand | 0.10.1 | MIT | https://github.com/rust-random/rand |
+| rand | 0.10.2 | MIT | https://github.com/rust-random/rand |
 | rand | 0.8.6 | MIT | https://github.com/rust-random/rand |
 | rand | 0.9.4 | MIT | https://github.com/rust-random/rand |
 | rand_chacha | 0.3.1 | MIT | https://github.com/rust-random/rand |
@@ -329,7 +329,7 @@ the result instead.
 | redis-protocol | 6.0.0 | MIT | https://github.com/aembke/redis-protocol.rs |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.18.1 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.2 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -472,7 +472,7 @@ the result instead.
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 11.0.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.43.0 | MIT | https://github.com/aws/aws-lc-rs |
-| webbrowser | 1.2.2 | MIT | https://github.com/amodm/webbrowser-rs |
+| webbrowser | 1.2.3 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | hdrhistogram | 7.5.4 | MIT | https://github.com/HdrHistogram/HdrHistogram_rust.git |
@@ -12618,7 +12618,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
-### rand 0.10.1 — MIT
+### rand 0.10.2 — MIT
 
 Repository: https://github.com/rust-random/rand
 
@@ -13043,7 +13043,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.18.1 — MIT
+### lru 0.18.2 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -17163,7 +17163,7 @@ SOFTWARE.
 
 ```
 
-### webbrowser 1.2.2 — MIT
+### webbrowser 1.2.3 — MIT
 
 Repository: https://github.com/amodm/webbrowser-rs
 
