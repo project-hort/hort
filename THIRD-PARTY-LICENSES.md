@@ -106,6 +106,7 @@ the result instead.
 | either | 1.15.0 | MIT | https://github.com/rayon-rs/either |
 | itertools | 0.10.5 | MIT | https://github.com/rust-itertools/itertools |
 | itertools | 0.14.0 | MIT | https://github.com/rust-itertools/itertools |
+| itertools | 0.15.0 | MIT | https://github.com/rust-itertools/itertools |
 | serde_with | 3.20.0 | MIT | https://github.com/jonasbb/serde_with/ |
 | serde_with_macros | 3.20.0 | MIT | https://github.com/jonasbb/serde_with/ |
 | ordered-float | 2.10.1 | MIT | https://github.com/reem/rust-ordered-float |
@@ -156,8 +157,8 @@ the result instead.
 | scopeguard | 1.2.0 | MIT | https://github.com/bluss/scopeguard |
 | cipher | 0.4.4 | MIT | https://github.com/RustCrypto/traits |
 | cipher | 0.5.2 | MIT | https://github.com/RustCrypto/traits |
-| reqwest | 0.12.28 | MIT | https://github.com/seanmonstar/reqwest |
 | reqwest | 0.13.4 | MIT | https://github.com/seanmonstar/reqwest |
+| md-5 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | sha2 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | digest | 0.10.7 | MIT | https://github.com/RustCrypto/traits |
 | hmac | 0.12.1 | MIT | https://github.com/RustCrypto/MACs |
@@ -327,6 +328,7 @@ the result instead.
 | fred-macros | 0.1.0 | MIT | https://github.com/aembke/fred-macros |
 | fred | 10.1.0 | MIT | https://github.com/aembke/fred.rs |
 | redis-protocol | 6.0.0 | MIT | https://github.com/aembke/redis-protocol.rs |
+| crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
 | lru | 0.18.2 | MIT | https://github.com/jeromefroe/lru-rs.git |
@@ -359,7 +361,7 @@ the result instead.
 | objc2-encode | 4.1.0 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
-| object_store | 0.13.2 | MIT | https://github.com/apache/arrow-rs-object-store |
+| object_store | 0.14.1 | MIT | https://github.com/apache/arrow-rs-object-store |
 | typed-path | 0.9.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | whoami | 1.6.1 | MIT | https://github.com/ardaku/whoami |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT | https://github.com/retep998/winapi-rs |
@@ -448,6 +450,7 @@ the result instead.
 | allocator-api2 | 0.2.21 | MIT | https://github.com/zakarumych/allocator-api2 |
 | winnow | 1.0.2 | MIT | https://github.com/winnow-rs/winnow |
 | tinyvec | 1.11.0 | MIT | https://github.com/Lokathor/tinyvec |
+| spin | 0.10.1 | MIT | https://github.com/mvdnes/spin-rs.git |
 | spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
 | zip | 8.6.0 | MIT | https://github.com/zip-rs/zip2 |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
@@ -462,6 +465,7 @@ the result instead.
 | memchr | 2.8.0 | MIT | https://github.com/BurntSushi/memchr |
 | ucd-trie | 0.1.7 | MIT | https://github.com/BurntSushi/ucd-generate |
 | walkdir | 2.5.0 | MIT | https://github.com/BurntSushi/walkdir |
+| nix | 0.31.3 | MIT | https://github.com/nix-rust/nix |
 | strsim | 0.11.1 | MIT | https://github.com/rapidfuzz/strsim-rs |
 | raw-cpuid | 11.6.0 | MIT | https://github.com/gz/rust-cpuid |
 | nibble_vec | 0.1.0 | MIT | https://github.com/michaelsproul/rust_nibble_vec |
@@ -495,7 +499,7 @@ the result instead.
 | nu-ansi-term | 0.50.3 | MIT | https://github.com/nushell/nu-ansi-term |
 | mime_guess | 2.0.5 | MIT | https://github.com/abonander/mime_guess |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git |
-| quick-xml | 0.39.4 | MIT | https://github.com/tafia/quick-xml |
+| quick-xml | 0.41.0 | MIT | https://github.com/tafia/quick-xml |
 | hashlink | 0.10.0 | MIT | https://github.com/kyren/hashlink |
 | urlencoding | 2.1.3 | MIT | https://github.com/kornelski/rust_urlencoding |
 | option-ext | 0.2.0 | MPL-2.0 | https://github.com/soc/option-ext.git |
@@ -6044,6 +6048,39 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### itertools 0.15.0 — MIT
+
+Repository: https://github.com/rust-itertools/itertools
+
+```text
+Copyright (c) 2015
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
 ### serde_with 3.20.0 — MIT
 
 Repository: https://github.com/jonasbb/serde_with/
@@ -7660,34 +7697,6 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### reqwest 0.12.28 — MIT
-
-Repository: https://github.com/seanmonstar/reqwest
-
-```text
-Copyright (c) 2016-2025 Sean McArthur
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the &quot;Software&quot;), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-
-
-```
-
 ### reqwest 0.13.4 — MIT
 
 Repository: https://github.com/seanmonstar/reqwest
@@ -7713,6 +7722,42 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
+
+```
+
+### md-5 0.11.0 — MIT
+
+Repository: https://github.com/RustCrypto/hashes
+
+```text
+Copyright (c) 2016-2026 The RustCrypto Project Developers
+Copyright (c) 2016 Artyom Pavlov
+Copyright (c) 2009-2013 Mozilla Foundation
+Copyright (c) 2006-2009 Graydon Hoare
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -12977,6 +13022,32 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
+### crc-fast 1.10.0 — MIT
+
+Repository: https://github.com/awesomized/crc-fast-rust
+
+```text
+Copyright 2025 Don MacAskill
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the &quot;Software&quot;), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
 ### encoding_rs 0.8.35 — MIT
 
 Repository: https://github.com/hsivonen/encoding_rs
@@ -13892,7 +13963,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### object_store 0.13.2 — MIT
+### object_store 0.14.1 — MIT
 
 Repository: https://github.com/apache/arrow-rs-object-store
 
@@ -16466,6 +16537,34 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
+### spin 0.10.1 — MIT
+
+Repository: https://github.com/mvdnes/spin-rs.git
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2014 Mathijs van de Nes
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ### spin 0.9.9 — MIT
 
 Repository: https://github.com/mvdnes/spin-rs.git
@@ -16851,6 +16950,35 @@ Repository: https://github.com/BurntSushi/walkdir
 The MIT License (MIT)
 
 Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+```
+
+### nix 0.31.3 — MIT
+
+Repository: https://github.com/nix-rust/nix
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Carl Lerche + nix-rust Authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the &quot;Software&quot;), to deal
@@ -17856,7 +17984,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### quick-xml 0.39.4 — MIT
+### quick-xml 0.41.0 — MIT
 
 Repository: https://github.com/tafia/quick-xml
 

@@ -44,9 +44,9 @@ zeroize    = { workspace = true }
 
 # Outbound mTLS / custom CA / cert-pinning support (ADR 0010 — see
 # `docs/architecture/how-to/deploy/extra-ca-bundle.md`).
-# `rustls` 0.23 is the version reqwest 0.12's `rustls-tls-native-roots`
-# feature already pulls in transitively; pinning to the same crate edition
-# keeps `use_preconfigured_tls(rustls::ClientConfig)` type-compatible.
+# `rustls` 0.23 is the version reqwest 0.13's `rustls` feature already pulls
+# in transitively; pinning to the same crate edition keeps
+# `use_preconfigured_tls(rustls::ClientConfig)` type-compatible.
 # `aws_lc_rs` is the workspace-standard crypto provider (FIPS-tracked,
 # aligns with `jsonwebtoken`'s `aws_lc_rs` feature).
 # `tls12` is required for the WebPkiServerVerifier builder to support our
@@ -60,11 +60,17 @@ rustls          = { version = "0.23", default-features = false, features = ["std
 # `PrivateKeyDer::from_pem_slice` for keys via the same trust-anchor
 # parser, with no separate maintenance surface.
 rustls-pki-types = { version = "1", features = ["std"] }
-# OS native root CA store — same source reqwest's `rustls-tls-native-roots`
-# feature uses via this crate's transitive tree. Replacing `webpki-roots`
-# here makes the per-mapping rustls path consistent with the base reqwest
-# client: an operator who installs a corporate CA into the OS trust store
-# sees it work for both paths (ADR 0010).
+# OS native root CA store for the per-mapping `build_rustls_client_config`
+# path (`tls_config.rs`), called directly via `rustls_native_certs::
+# load_native_certs()` — this path builds its own `rustls::ClientConfig`
+# for mTLS/pinning/custom-CA mappings and has never depended on reqwest's
+# own TLS backend choice. reqwest 0.13's own `rustls` feature no longer
+# uses this crate directly — it delegates to `rustls-platform-verifier`,
+# which (on Linux) uses `rustls-native-certs` as its own implementation
+# detail, so both paths still bottom out at the same OS trust store on the
+# platforms hort ships on (ADR 0010). Replacing `webpki-roots` here (vs.
+# a bundled Mozilla root set) keeps this path reading the OS trust store
+# an operator actually manages, same as the base reqwest client.
 # Version 0.8 matches what reqwest already pulls transitively (verified via
 # `cargo tree`). Net dep delta is zero new transitive crates.
 rustls-native-certs = "0.8"

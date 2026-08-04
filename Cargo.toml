@@ -212,7 +212,7 @@ hex = "0.4"
 blake3 = "1"
 
 # S3 storage using Apache object_store crate (supports custom CA certs for TLS)
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 
 # HTTP types (used for presigned URL methods)
 http = "1"
@@ -264,16 +264,18 @@ humantime = "2"
 
 # HTTP client (for proxy repos).
 #
-# Pinned to 0.12 to align with the transitive `reqwest` brought in by
-# `object_store`. As of 2026-Q1 the latest released
-# `object_store` (0.13.2) still depends on `reqwest ^0.12`; pulling in our
-# direct `reqwest = "0.13"` resulted in two `reqwest` versions in the binary
-# with two different TLS verifier paths (`rustls-platform-verifier` for 0.13
-# vs `rustls-native-certs` for the 0.12 transitive). That made TLS-trust
-# debugging materially harder and forced audit tooling to scan two
-# transitive trees. Re-bump to `0.13` once `object_store` releases a
-# `reqwest 0.13` line.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls-native-roots"] }
+# Bumped to 0.13 (batch 7, #102) in lockstep with `object_store` 0.14 (which
+# requires `reqwest ^0.13`), unifying the graph onto a single `reqwest`
+# version and TLS verifier path — resolving the dual-reqwest state the
+# previous 0.12 pin (see git history) was deliberately holding to avoid.
+# `rustls-tls-native-roots` doesn't exist as a feature in 0.13: 0.13 collapsed
+# the native-roots/webpki-roots choice into a single `rustls` feature backed
+# by `rustls-platform-verifier` (OS-native trust store, same "system roots +
+# `HORT_EXTRA_CA_BUNDLE`" guarantee ADR 0010 requires — verified against the
+# 0.13.4 source: `add_root_certificate` calls route into
+# `rustls_platform_verifier::Verifier::new_with_extra_roots`, which layers
+# extra roots on top of the platform store rather than replacing it).
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls"] }
 
 # URL encoding
 serde_urlencoded = "0.7"

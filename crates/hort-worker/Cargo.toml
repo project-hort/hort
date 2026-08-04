@@ -38,9 +38,13 @@ hort-adapters-scanner-osv      = { path = "../hort-adapters-scanner-osv" }
 hort-adapters-advisory-osv     = { path = "../hort-adapters-advisory-osv" }
 # The cosign/Sigstore ProvenancePort adapter is wired into hort-worker
 # ONLY (NOT hort-server). hort-server activates the `{"oci"}`
-# capable-format set as plain data and never depends on this crate, so
-# sigstore's transitive reqwest 0.13 stays out of the server binary
-# (verified via `cargo tree`).
+# capable-format set as plain data and never depends on this crate
+# (verified via `cargo tree`). Since batch 7 (#102) unified the workspace
+# `reqwest` pin onto 0.13 (matching what `sigstore` already pulled
+# transitively), this is no longer a dual-reqwest-avoidance boundary —
+# reqwest 0.13 is the single version everywhere now — just a plain
+# crate-graph isolation (the sigstore/cosign verification stack has no
+# reason to link into the server binary).
 hort-adapters-provenance-sigstore = { path = "../hort-adapters-provenance-sigstore" }
 # Keyed (pinned-public-key) cosign verifier — the `cosign-key` ProvenancePort
 # (ADR 0039). Minimal p256 surface, not the sigstore PKI crate.
