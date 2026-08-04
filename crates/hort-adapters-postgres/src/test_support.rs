@@ -96,7 +96,7 @@ async fn sweep_stale_databases(admin: &mut PgConnection) {
                      ELSE true END)"
     );
 
-    let Ok(rows) = sqlx::query_scalar::<_, String>(&sql)
+    let Ok(rows) = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
         .fetch_all(&mut *admin)
         .await
     else {
@@ -107,7 +107,9 @@ async fn sweep_stale_databases(admin: &mut PgConnection) {
         // connection arriving between the query and here makes this
         // fail, which is exactly the outcome we want — skip it.
         let _ = admin
-            .execute(format!("DROP DATABASE IF EXISTS \"{name}\"").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS \"{name}\""
+            )))
             .await;
     }
 }
@@ -148,7 +150,7 @@ pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
     sweep_stale_databases(&mut admin).await;
 
     admin
-        .execute(format!("CREATE DATABASE \"{db}\"").as_str())
+        .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db}\"")))
         .await
         .ok()?;
     let _ = admin.close().await;

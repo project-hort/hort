@@ -35,7 +35,7 @@ impl UserRepository for PgUserRepository {
         Box::pin(async move {
             tracing::debug!(entity = "User", %id, "find_by_id");
             let sql = format!("SELECT {SELECT_COLS} FROM users WHERE id = $1");
-            let row: UserRow = sqlx::query_as(&sql)
+            let row: UserRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(id)
                 .fetch_one(&self.pool)
                 .await
@@ -49,7 +49,7 @@ impl UserRepository for PgUserRepository {
         Box::pin(async move {
             tracing::debug!(entity = "User", username = %username, "find_by_username");
             let sql = format!("SELECT {SELECT_COLS} FROM users WHERE username = $1");
-            let row: Option<UserRow> = sqlx::query_as(&sql)
+            let row: Option<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&username)
                 .fetch_optional(&self.pool)
                 .await
@@ -63,7 +63,7 @@ impl UserRepository for PgUserRepository {
         Box::pin(async move {
             tracing::debug!(entity = "User", email = %email, "find_by_email");
             let sql = format!("SELECT {SELECT_COLS} FROM users WHERE email = $1");
-            let row: Option<UserRow> = sqlx::query_as(&sql)
+            let row: Option<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&email)
                 .fetch_optional(&self.pool)
                 .await
@@ -79,7 +79,7 @@ impl UserRepository for PgUserRepository {
             tracing::debug!(entity = "User", "list");
             let sql =
                 format!("SELECT {SELECT_COLS} FROM users ORDER BY username OFFSET $1 LIMIT $2");
-            let rows: Vec<UserRow> = sqlx::query_as(&sql)
+            let rows: Vec<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(offset)
                 .bind(limit)
                 .fetch_all(&self.pool)
@@ -187,7 +187,7 @@ impl UserRepository for PgUserRepository {
                 // Mirrors `api_token_repo.rs:319-324`.
                 let payload = format!("'user:{}'", user.id);
                 let notify_sql = format!("NOTIFY api_token_revocation, {payload}");
-                sqlx::query(&notify_sql)
+                sqlx::query(sqlx::AssertSqlSafe(notify_sql))
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| map_sqlx_error(&e, "User", &user.username))?;
@@ -239,7 +239,7 @@ impl UserRepository for PgUserRepository {
                  WHERE auth_provider = $1::auth_provider AND external_id = $2 \
                  LIMIT 1"
             );
-            let row: Option<UserRow> = sqlx::query_as(&sql)
+            let row: Option<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&auth_provider_str)
                 .bind(&external_id)
                 .fetch_optional(&self.pool)

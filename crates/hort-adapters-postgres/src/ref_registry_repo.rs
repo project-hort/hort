@@ -139,7 +139,7 @@ impl RefRegistryPort for PgRefRegistry {
                 "SELECT {SELECT_COLS} FROM mutable_refs \
                  WHERE repository_id = $1 AND namespace = $2 AND ref_name = $3"
             );
-            let row: MutableRefRow = sqlx::query_as(&sql)
+            let row: MutableRefRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(repo)
                 .bind(&namespace)
                 .bind(&ref_name)
@@ -166,7 +166,7 @@ impl RefRegistryPort for PgRefRegistry {
                  WHERE repository_id = $1 AND namespace = $2 \
                  ORDER BY ref_name"
             );
-            let rows: Vec<MutableRefRow> = sqlx::query_as(&sql)
+            let rows: Vec<MutableRefRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(repo)
                 .bind(&namespace)
                 .fetch_all(&self.pool)
@@ -206,7 +206,7 @@ impl RefRegistryPort for PgRefRegistry {
                            AND target_hash = $2 \
                          ORDER BY namespace, ref_name"
                     );
-                    let rows: Vec<MutableRefRow> = sqlx::query_as(&sql)
+                    let rows: Vec<MutableRefRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                         .bind(repo)
                         .bind(hash.as_ref())
                         .fetch_all(&self.pool)
@@ -230,7 +230,7 @@ impl RefRegistryPort for PgRefRegistry {
                            AND target_version = $2 \
                          ORDER BY namespace, ref_name"
                     );
-                    let rows: Vec<MutableRefRow> = sqlx::query_as(&sql)
+                    let rows: Vec<MutableRefRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                         .bind(repo)
                         .bind(version)
                         .fetch_all(&self.pool)

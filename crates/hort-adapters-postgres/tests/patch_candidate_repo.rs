@@ -61,7 +61,7 @@ async fn seed_repo(pool: &PgPool, format_literal: &'static str) -> Uuid {
                'local_only'::replication_priority
            )"#
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .bind(&key)
         .bind(&key)

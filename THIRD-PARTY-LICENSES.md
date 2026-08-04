@@ -49,7 +49,6 @@ the result instead.
 | curve25519-dalek | 4.1.3 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | sha1_smol | 1.0.1 | BSD-3-Clause | https://github.com/mitsuhiko/sha1-smol |
 | encoding_rs | 0.8.35 | BSD-3-Clause | https://github.com/hsivonen/encoding_rs |
-| webpki-roots | 0.26.11 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roots |
 | webpki-roots | 1.0.7 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roots |
 | untrusted | 0.7.1 | ISC | https://github.com/briansmith/untrusted |
 | untrusted | 0.9.0 | ISC | https://github.com/briansmith/untrusted |
@@ -61,6 +60,7 @@ the result instead.
 | serde_yaml_ng | 0.10.0 | MIT | https://github.com/acatton/serde-yaml-ng |
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
 | quanta | 0.12.6 | MIT | https://github.com/metrics-rs/quanta |
+| sqlx | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | md-5 | 0.10.6 | MIT | https://github.com/RustCrypto/hashes |
 | sha1 | 0.10.6 | MIT | https://github.com/RustCrypto/hashes |
 | sha2 | 0.10.9 | MIT | https://github.com/RustCrypto/hashes |
@@ -124,6 +124,7 @@ the result instead.
 | blake2 | 0.10.6 | MIT | https://github.com/RustCrypto/hashes |
 | winapi | 0.3.9 | MIT | https://github.com/retep998/winapi-rs |
 | hkdf | 0.12.4 | MIT | https://github.com/RustCrypto/KDFs/ |
+| hkdf | 0.13.0 | MIT | https://github.com/RustCrypto/KDFs/ |
 | poly1305 | 0.8.0 | MIT | https://github.com/RustCrypto/universal-hashes |
 | httparse | 1.10.1 | MIT | https://github.com/seanmonstar/httparse |
 | futures-channel | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
@@ -136,7 +137,6 @@ the result instead.
 | futures-util | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
 | futures | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
 | hashbrown | 0.14.5 | MIT | https://github.com/rust-lang/hashbrown |
-| hashbrown | 0.15.5 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.16.1 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.17.1 | MIT | https://github.com/rust-lang/hashbrown |
 | crc16 | 0.4.0 | MIT | https://github.com/blackbeam/rust-crc16 |
@@ -234,11 +234,6 @@ the result instead.
 | zeroize_derive | 1.5.0 | MIT | https://github.com/RustCrypto/utils |
 | salsa20 | 0.11.0 | MIT | https://github.com/RustCrypto/stream-ciphers |
 | iana-time-zone | 0.1.65 | MIT | https://github.com/strawlab/iana-time-zone |
-| sqlx-core | 0.8.6 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-macros-core | 0.8.6 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-macros | 0.8.6 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-postgres | 0.8.6 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx | 0.8.6 | MIT | https://github.com/launchbadge/sqlx |
 | tls_codec | 0.4.2 | MIT | https://github.com/RustCrypto/formats |
 | tls_codec_derive | 0.4.2 | MIT | https://github.com/RustCrypto/formats |
 | p384 | 0.13.1 | MIT | https://github.com/RustCrypto/elliptic-curves/tree/master/p384 |
@@ -362,8 +357,12 @@ the result instead.
 | objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
 | object_store | 0.14.1 | MIT | https://github.com/apache/arrow-rs-object-store |
+| sqlx-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-macros-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-macros | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-postgres | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | typed-path | 0.9.3 | MIT | https://github.com/chipsenkbeil/typed-path |
-| whoami | 1.6.1 | MIT | https://github.com/ardaku/whoami |
+| whoami | 2.1.2 | MIT | https://github.com/ardaku/whoami |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT | https://github.com/retep998/winapi-rs |
 | windows-core | 0.62.2 | MIT | https://github.com/microsoft/windows-rs |
 | windows-implement | 0.60.2 | MIT | https://github.com/microsoft/windows-rs |
@@ -372,15 +371,12 @@ the result instead.
 | windows-registry | 0.6.1 | MIT | https://github.com/microsoft/windows-rs |
 | windows-result | 0.4.1 | MIT | https://github.com/microsoft/windows-rs |
 | windows-strings | 0.5.1 | MIT | https://github.com/microsoft/windows-rs |
-| windows-sys | 0.48.0 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.52.0 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.59.0 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.60.2 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.61.2 | MIT | https://github.com/microsoft/windows-rs |
-| windows-targets | 0.48.5 | MIT | https://github.com/microsoft/windows-rs |
 | windows-targets | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
 | windows-targets | 0.53.5 | MIT | https://github.com/microsoft/windows-rs |
-| windows_x86_64_gnu | 0.48.5 | MIT | https://github.com/microsoft/windows-rs |
 | windows_x86_64_gnu | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
 | windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
@@ -403,11 +399,10 @@ the result instead.
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
 | displaydoc | 0.2.5 | MIT | https://github.com/yaahc/displaydoc |
 | dyn-clone | 1.0.20 | MIT | https://github.com/dtolnay/dyn-clone |
-| etcetera | 0.8.0 | MIT | https://github.com/lunacookies/etcetera |
+| etcetera | 0.11.0 | MIT | https://github.com/lunacookies/etcetera |
 | event-listener | 5.4.2 | MIT | https://github.com/smol-rs/event-listener |
 | fastrand | 2.4.1 | MIT | https://github.com/smol-rs/fastrand |
 | group | 0.13.0 | MIT | https://github.com/zkcrypto/group |
-| home | 0.5.12 | MIT | https://github.com/rust-lang/cargo |
 | itoa | 1.0.18 | MIT | https://github.com/dtolnay/itoa |
 | linux-raw-sys | 0.12.1 | MIT | https://github.com/sunfishcode/linux-raw-sys |
 | minimal-lexical | 0.2.1 | MIT | https://github.com/Alexhuszagh/minimal-lexical |
@@ -500,7 +495,7 @@ the result instead.
 | mime_guess | 2.0.5 | MIT | https://github.com/abonander/mime_guess |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git |
 | quick-xml | 0.41.0 | MIT | https://github.com/tafia/quick-xml |
-| hashlink | 0.10.0 | MIT | https://github.com/kyren/hashlink |
+| hashlink | 0.11.1 | MIT | https://github.com/djc/hashlink |
 | urlencoding | 2.1.3 | MIT | https://github.com/kornelski/rust_urlencoding |
 | option-ext | 0.2.0 | MPL-2.0 | https://github.com/soc/option-ext.git |
 | unicode-ident | 1.0.24 | Unicode-3.0 | https://github.com/dtolnay/unicode-ident |
@@ -523,7 +518,6 @@ the result instead.
 | zerovec-derive | 0.11.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec | 0.11.6 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zlib-rs | 0.6.6 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
-| foldhash | 0.1.5 | Zlib | https://github.com/orlp/foldhash |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash |
 
 ## License texts
@@ -4226,75 +4220,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### webpki-roots 0.26.11 — CDLA-Permissive-2.0
-
-Repository: https://github.com/rustls/webpki-roots
-
-```text
-# Community Data License Agreement - Permissive - Version 2.0
-
-This is the Community Data License Agreement - Permissive, Version
-2.0 (the &quot;agreement&quot;). Data Provider(s) and Data Recipient(s) agree
-as follows:
-
-## 1. Provision of the Data
-
-1.1. A Data Recipient may use, modify, and share the Data made
-available by Data Provider(s) under this agreement if that Data
-Recipient follows the terms of this agreement.
-
-1.2. This agreement does not impose any restriction on a Data
-Recipient&#x27;s use, modification, or sharing of any portions of the
-Data that are in the public domain or that may be used, modified,
-or shared under any other legal exception or limitation.
-
-## 2. Conditions for Sharing Data
-
-2.1. A Data Recipient may share Data, with or without modifications, so
-long as the Data Recipient makes available the text of this agreement
-with the shared Data.
-
-## 3. No Restrictions on Results
-
-3.1. This agreement does not impose any restriction or obligations
-with respect to the use, modification, or sharing of Results.
-
-## 4. No Warranty; Limitation of Liability
-
-4.1. All Data Recipients receive the Data subject to the following
-terms:
-
-THE DATA IS PROVIDED ON AN &quot;AS IS&quot; BASIS, WITHOUT REPRESENTATIONS,
-WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED
-INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OR CONDITIONS OF TITLE,
-NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
-
-NO DATA PROVIDER SHALL HAVE ANY LIABILITY FOR ANY DIRECT, INDIRECT,
-INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING
-WITHOUT LIMITATION LOST PROFITS), HOWEVER CAUSED AND ON ANY THEORY OF
-LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE DATA OR RESULTS,
-EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
-
-## 5. Definitions
-
-5.1. &quot;Data&quot; means the material received by a Data Recipient under
-this agreement.
-
-5.2. &quot;Data Provider&quot; means any person who is the source of Data
-provided under this agreement and in reliance on a Data Recipient&#x27;s
-agreement to its terms.
-
-5.3. &quot;Data Recipient&quot; means any person who receives Data directly
-or indirectly from a Data Provider and agrees to the terms of this
-agreement.
-
-5.4. &quot;Results&quot; means any outcome obtained by computational analysis
-of Data, including for example machine learning models and models&#x27;
-insights.
-
-```
-
 ### webpki-roots 1.0.7 — CDLA-Permissive-2.0
 
 Repository: https://github.com/rustls/webpki-roots
@@ -4589,6 +4514,40 @@ Repository: https://github.com/metrics-rs/quanta
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
+```
+
+### sqlx 0.9.0 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ```
 
@@ -6614,6 +6573,40 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
+### hkdf 0.13.0 — MIT
+
+Repository: https://github.com/RustCrypto/KDFs/
+
+```text
+Copyright (c) 2015-2018 Vlad Filippov
+Copyright (c) 2018-2021 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
 ### poly1305 0.8.0 — MIT
 
 Repository: https://github.com/RustCrypto/universal-hashes
@@ -6982,39 +6975,6 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 ### hashbrown 0.14.5 — MIT
-
-Repository: https://github.com/rust-lang/hashbrown
-
-```text
-Copyright (c) 2016 Amanieu d&#x27;Antras
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### hashbrown 0.15.5 — MIT
 
 Repository: https://github.com/rust-lang/hashbrown
 
@@ -10177,171 +10137,6 @@ Repository: https://github.com/strawlab/iana-time-zone
 
 ```text
 Copyright (c) 2020 Andrew D. Straw
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-core 0.8.6 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-Copyright (c) 2020 LaunchBadge, LLC
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-macros-core 0.8.6 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-Copyright (c) 2020 LaunchBadge, LLC
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-macros 0.8.6 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-Copyright (c) 2020 LaunchBadge, LLC
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-postgres 0.8.6 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-Copyright (c) 2020 LaunchBadge, LLC
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx 0.8.6 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-Copyright (c) 2020 LaunchBadge, LLC
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -13989,6 +13784,110 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
+### sqlx-core 0.9.0 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-macros-core 0.9.0 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-macros 0.9.0 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-postgres 0.9.0 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
 ### typed-path 0.9.3 — MIT
 
 Repository: https://github.com/chipsenkbeil/typed-path
@@ -14015,7 +13914,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### whoami 1.6.1 — MIT
+### whoami 2.1.2 — MIT
 
 Repository: https://github.com/ardaku/whoami
 
@@ -14249,32 +14148,6 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### windows-sys 0.48.0 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
 ### windows-sys 0.52.0 — MIT
 
 Repository: https://github.com/microsoft/windows-rs
@@ -14379,32 +14252,6 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### windows-targets 0.48.5 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
 ### windows-targets 0.52.6 — MIT
 
 Repository: https://github.com/microsoft/windows-rs
@@ -14432,32 +14279,6 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ### windows-targets 0.53.5 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### windows_x86_64_gnu 0.48.5 — MIT
 
 Repository: https://github.com/microsoft/windows-rs
 
@@ -15103,7 +14924,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### etcetera 0.8.0 — MIT
+### etcetera 0.11.0 — MIT
 
 Repository: https://github.com/lunacookies/etcetera
 
@@ -15199,37 +15020,6 @@ DEALINGS IN THE SOFTWARE.
 ### group 0.13.0 — MIT
 
 Repository: https://github.com/zkcrypto/group
-
-```text
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-```
-
-### home 0.5.12 — MIT
-
-Repository: https://github.com/rust-lang/cargo
 
 ```text
 Permission is hereby granted, free of charge, to any
@@ -18015,9 +17805,9 @@ THE SOFTWARE.
 
 ```
 
-### hashlink 0.10.0 — MIT
+### hashlink 0.11.1 — MIT
 
-Repository: https://github.com/kyren/hashlink
+Repository: https://github.com/djc/hashlink
 
 ```text
 This work is derived in part from the &#x60;linked-hash-map&#x60; crate, Copyright (c)
@@ -19501,32 +19291,6 @@ freely, subject to the following restrictions:
 
 3. This notice may not be removed or altered from any source distribution.
 
-```
-
-### foldhash 0.1.5 — Zlib
-
-Repository: https://github.com/orlp/foldhash
-
-```text
-Copyright (c) 2024 Orson Peters
-
-This software is provided &#x27;as-is&#x27;, without any express or implied warranty. In
-no event will the authors be held liable for any damages arising from the use of
-this software.
-
-Permission is granted to anyone to use this software for any purpose, including
-commercial applications, and to alter it and redistribute it freely, subject to
-the following restrictions:
-
-1. The origin of this software must not be misrepresented; you must not claim
-    that you wrote the original software. If you use this software in a product,
-    an acknowledgment in the product documentation would be appreciated but is
-    not required.
-
-2. Altered source versions must be plainly marked as such, and must not be
-    misrepresented as being the original software.
-
-3. This notice may not be removed or altered from any source distribution.
 ```
 
 ### foldhash 0.2.0 — Zlib

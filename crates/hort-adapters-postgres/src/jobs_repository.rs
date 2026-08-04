@@ -535,7 +535,7 @@ impl JobsRepository for PgJobsRepository {
                  WHERE id IN (SELECT id FROM claimed)\n\
                  RETURNING {RETURNING_COLS}"
             );
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(limit)
                 .bind(&worker_id)
                 .bind(interval)
@@ -920,7 +920,7 @@ impl JobsRepository for PgJobsRepository {
                  LIMIT ${bind_idx}"
             );
 
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             if let Some(c) = cursor {
                 q = q.bind(c);
             }
@@ -1102,7 +1102,7 @@ impl JobsRepository for PgJobsRepository {
                      RETURNING id",
                     placeholders = placeholders.join(", "),
                 );
-                let mut q = sqlx::query_scalar::<_, Uuid>(&sql);
+                let mut q = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql));
                 for r in &kind_rows {
                     q = q
                         .bind(&r.kind)

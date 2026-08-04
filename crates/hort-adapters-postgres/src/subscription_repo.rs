@@ -896,7 +896,7 @@ async fn emit_subscription_change_notify(
         crate::subscription_change_listener::SUBSCRIPTION_CHANGES_CHANNEL,
         payload
     );
-    sqlx::query(&notify_sql)
+    sqlx::query(sqlx::AssertSqlSafe(notify_sql))
         .execute(&mut **tx)
         .await
         .map_err(|e| map_sqlx_error(&e, "Subscription", &subscription_id.to_string()))?;
@@ -1001,7 +1001,7 @@ impl SubscriptionRepository for PgSubscriptionRepository {
         Box::pin(async move {
             tracing::debug!(entity = "Subscription", subscription_id = %id.0, "find_by_id");
             let sql = format!("SELECT {SELECT_COLS} FROM subscriptions WHERE id = $1");
-            let row: SubscriptionRow = sqlx::query_as(&sql)
+            let row: SubscriptionRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(id.0)
                 .fetch_one(&self.pool)
                 .await
@@ -1022,7 +1022,7 @@ impl SubscriptionRepository for PgSubscriptionRepository {
                 "SELECT {SELECT_COLS} FROM subscriptions \
                  WHERE owner_user_id = $1 AND name = $2 LIMIT 1"
             );
-            let row: Option<SubscriptionRow> = sqlx::query_as(&sql)
+            let row: Option<SubscriptionRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(owner)
                 .bind(&name)
                 .fetch_optional(&self.pool)
@@ -1045,7 +1045,7 @@ impl SubscriptionRepository for PgSubscriptionRepository {
                 "SELECT {SELECT_COLS} FROM subscriptions WHERE owner_user_id = $1 \
                  ORDER BY created_at DESC OFFSET $2 LIMIT $3"
             );
-            let rows: Vec<SubscriptionRow> = sqlx::query_as(&sql)
+            let rows: Vec<SubscriptionRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(owner)
                 .bind(offset)
                 .bind(limit)
@@ -1078,7 +1078,7 @@ impl SubscriptionRepository for PgSubscriptionRepository {
                 "SELECT {SELECT_COLS} FROM subscriptions WHERE state = 'active' \
                  ORDER BY created_at ASC"
             );
-            let rows: Vec<SubscriptionRow> = sqlx::query_as(&sql)
+            let rows: Vec<SubscriptionRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Subscription", "list_active"))?;

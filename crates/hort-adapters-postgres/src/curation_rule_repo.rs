@@ -97,7 +97,7 @@ impl CurationRuleRepository for PgCurationRuleRepository {
         Box::pin(async move {
             tracing::debug!(entity = "curation_rule", name = %name, "find_by_name");
             let sql = format!("SELECT {SELECT_COLS} FROM curation_rules WHERE name = $1 LIMIT 1");
-            let row: Option<CurationRuleRow> = sqlx::query_as(&sql)
+            let row: Option<CurationRuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&name)
                 .fetch_optional(&self.pool)
                 .await
@@ -113,7 +113,7 @@ impl CurationRuleRepository for PgCurationRuleRepository {
         Box::pin(async move {
             tracing::debug!(entity = "curation_rule", %id, "find_by_id");
             let sql = format!("SELECT {SELECT_COLS} FROM curation_rules WHERE id = $1 LIMIT 1");
-            let row: Option<CurationRuleRow> = sqlx::query_as(&sql)
+            let row: Option<CurationRuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await
@@ -132,13 +132,13 @@ impl CurationRuleRepository for PgCurationRuleRepository {
                 %repository_id,
                 "list_for_repo"
             );
-            let rows: Vec<CurationRuleRow> = sqlx::query_as(&format!(
+            let rows: Vec<CurationRuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 r#"SELECT {SELECT_COLS}
                    FROM curation_rules cr
                    JOIN repository_curation_rules rcr ON rcr.curation_rule_id = cr.id
                    WHERE rcr.repository_id = $1
                    ORDER BY cr.name"#
-            ))
+            )))
             .bind(repository_id)
             .fetch_all(&self.pool)
             .await
@@ -153,12 +153,12 @@ impl CurationRuleRepository for PgCurationRuleRepository {
     fn list_managed_by_gitops(&self) -> BoxFuture<'_, DomainResult<Vec<CurationRule>>> {
         Box::pin(async move {
             tracing::debug!(entity = "curation_rule", "list_managed_by_gitops");
-            let rows: Vec<CurationRuleRow> = sqlx::query_as(&format!(
+            let rows: Vec<CurationRuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 r#"SELECT {SELECT_COLS}
                    FROM curation_rules
                    WHERE managed_by = 'gitops'
                    ORDER BY name"#
-            ))
+            )))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {

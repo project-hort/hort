@@ -62,7 +62,7 @@ impl OidcIssuerRepository for PgOidcIssuerRepository {
         Box::pin(async move {
             tracing::debug!(entity = "oidc_issuer", "list");
             let sql = format!("SELECT {SELECT_COLS} FROM oidc_issuers ORDER BY name");
-            let rows: Vec<OidcIssuerRow> = sqlx::query_as(&sql)
+            let rows: Vec<OidcIssuerRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| {
@@ -78,7 +78,7 @@ impl OidcIssuerRepository for PgOidcIssuerRepository {
         Box::pin(async move {
             tracing::debug!(entity = "oidc_issuer", name = %name, "get_by_name");
             let sql = format!("SELECT {SELECT_COLS} FROM oidc_issuers WHERE name = $1 LIMIT 1");
-            let row: Option<OidcIssuerRow> = sqlx::query_as(&sql)
+            let row: Option<OidcIssuerRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&name)
                 .fetch_optional(&self.pool)
                 .await
@@ -96,7 +96,7 @@ impl OidcIssuerRepository for PgOidcIssuerRepository {
             tracing::debug!(entity = "oidc_issuer", "get_by_issuer_url");
             let sql =
                 format!("SELECT {SELECT_COLS} FROM oidc_issuers WHERE issuer_url = $1 LIMIT 1");
-            let row: Option<OidcIssuerRow> = sqlx::query_as(&sql)
+            let row: Option<OidcIssuerRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&url)
                 .fetch_optional(&self.pool)
                 .await

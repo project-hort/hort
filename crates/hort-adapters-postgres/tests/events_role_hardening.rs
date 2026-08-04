@@ -103,12 +103,12 @@ async fn create_app_user(admin: &PgPool) -> (String, String) {
     let password = format!("pw_{suffix}");
     let create = format!("CREATE USER {user} WITH NOSUPERUSER LOGIN PASSWORD '{password}'");
     admin
-        .execute(create.as_str())
+        .execute(sqlx::AssertSqlSafe(create))
         .await
         .expect("CREATE USER (test app user)");
     let grant = format!("GRANT hort_app_role TO {user}");
     admin
-        .execute(grant.as_str())
+        .execute(sqlx::AssertSqlSafe(grant))
         .await
         .expect("GRANT hort_app_role TO test user");
     (user, password)
@@ -127,12 +127,12 @@ async fn create_admin_user(admin: &PgPool) -> (String, String) {
     let password = format!("pw_{suffix}");
     let create = format!("CREATE USER {user} WITH NOSUPERUSER LOGIN PASSWORD '{password}'");
     admin
-        .execute(create.as_str())
+        .execute(sqlx::AssertSqlSafe(create))
         .await
         .expect("CREATE USER (test admin user)");
     let grant = format!("GRANT hort_admin TO {user}");
     admin
-        .execute(grant.as_str())
+        .execute(sqlx::AssertSqlSafe(grant))
         .await
         .expect("GRANT hort_admin TO test user");
     (user, password)
@@ -143,9 +143,9 @@ async fn create_admin_user(admin: &PgPool) -> (String, String) {
 /// the real test failure).
 async fn drop_user(admin: &PgPool, user: &str) {
     let revoke = format!("REVOKE hort_app_role FROM {user}");
-    let _ = admin.execute(revoke.as_str()).await;
+    let _ = admin.execute(sqlx::AssertSqlSafe(revoke)).await;
     let drop = format!("DROP USER IF EXISTS {user}");
-    if let Err(e) = admin.execute(drop.as_str()).await {
+    if let Err(e) = admin.execute(sqlx::AssertSqlSafe(drop)).await {
         eprintln!("warning: failed to drop test user {user}: {e}");
     }
 }
@@ -375,7 +375,7 @@ async fn startup_probe_refuses_when_app_role_holds_update() {
     // to revoke.
     let grant = format!("GRANT UPDATE ON events TO {user}");
     admin
-        .execute(grant.as_str())
+        .execute(sqlx::AssertSqlSafe(grant))
         .await
         .expect("GRANT UPDATE for fault injection");
 
@@ -405,7 +405,7 @@ async fn startup_probe_refuses_when_app_role_holds_update() {
     });
 
     let revoke = format!("REVOKE UPDATE ON events FROM {user}");
-    let _ = admin.execute(revoke.as_str()).await;
+    let _ = admin.execute(sqlx::AssertSqlSafe(revoke)).await;
     drop_user(&admin, &user).await;
 
     let count = counter_value(

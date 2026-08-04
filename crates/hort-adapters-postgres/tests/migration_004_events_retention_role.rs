@@ -121,9 +121,9 @@ async fn create_user(admin: &PgPool, roles: &[&str]) -> (String, String) {
     let user = format!("hort_test_b9_{suffix}");
     let password = format!("pw_{suffix}");
     admin
-        .execute(
-            format!("CREATE USER {user} WITH NOSUPERUSER LOGIN PASSWORD '{password}'").as_str(),
-        )
+        .execute(sqlx::AssertSqlSafe(format!(
+            "CREATE USER {user} WITH NOSUPERUSER LOGIN PASSWORD '{password}'"
+        )))
         .await
         .expect("CREATE USER (test user)");
     for r in roles {
@@ -143,7 +143,7 @@ async fn create_user(admin: &PgPool, roles: &[&str]) -> (String, String) {
             format!("GRANT {r} TO {user}")
         };
         admin
-            .execute(grant.as_str())
+            .execute(sqlx::AssertSqlSafe(grant))
             .await
             .expect("GRANT role TO test user");
     }
@@ -153,7 +153,7 @@ async fn create_user(admin: &PgPool, roles: &[&str]) -> (String, String) {
 /// Drop a previously-minted test user (best-effort teardown).
 async fn drop_user(admin: &PgPool, user: &str) {
     let drop = format!("DROP USER IF EXISTS {user}");
-    if let Err(e) = admin.execute(drop.as_str()).await {
+    if let Err(e) = admin.execute(sqlx::AssertSqlSafe(drop)).await {
         eprintln!("warning: failed to drop test user {user}: {e}");
     }
 }
