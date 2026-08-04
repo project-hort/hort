@@ -1,0 +1,25 @@
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: oci-proxy-quarantine-e2e-quarantine
+spec:
+  # Deliberately QUARANTINING, and deliberately NON-ZERO (24h) — see
+  # scripts/native-tests/scenarios/quarantine/proxy-multiarch-zero-window.sh's
+  # header comment for the full "hollowness trap" rationale: with
+  # quarantineDuration: 0s (as on oci-mirror-e2e), `created_at` and
+  # `created_at - duration` are the same instant, so the scenario's
+  # index-vs-child window-differential assertion would pass regardless of
+  # whether the #46 Item 2 zero-window carve-out actually fires. `scanBackends:
+  # []` keeps the hold purely time-based (same rationale as
+  # oci-quarantine-e2e-quarantine.yaml): the compose stack runs no
+  # hort-worker, so no scan would ever complete anyway. (Repo-scoped, so no
+  # other scenario is affected.)
+  scope:
+    repository: oci-proxy-quarantine-e2e
+  severityThreshold: critical
+  quarantineDuration: 24h
+  requireApproval: false
+  # Provenance off for e2e (no per-ingest verify job).
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}
