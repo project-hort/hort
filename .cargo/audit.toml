@@ -101,37 +101,4 @@ ignore = [
     # once axum-server (or hyper-rustls) migrate to the same successor
     # API.
     "RUSTSEC-2025-0134",
-
-    # REGISTRY-EXEMPT: RUSTSEC-2026-0194 — not observed to block a CI
-    # prefetch/build (issue #80's prod evidence names only the lru /
-    # RUSTSEC-2026-0002 finding). If it ever blocks registry-side, prefer upgrading the dep (registry Exclusion = nuclear option) —
-    # hort's own crates-proxy scan of `quick-xml` is ever observed to
-    # quarantine/reject it for a CI dependency build.
-    # REGISTRY-EXEMPT: RUSTSEC-2026-0195 — same rationale as
-    # RUSTSEC-2026-0194 immediately above (one finding pair, one crate).
-    # quick-xml 0.39.4 - two high-severity DoS advisories (both 2026-06-29):
-    #   RUSTSEC-2026-0194 - quadratic run time checking a start tag for
-    #     duplicate attribute names.
-    #   RUSTSEC-2026-0195 - unbounded namespace-declaration allocation in
-    #     `NsReader` enabling memory-exhaustion DoS.
-    # The fix is quick-xml >= 0.41.0, but NO `object_store` release adopts it
-    # yet: our pinned `object_store` 0.13.2 requires `quick-xml ^0.39.0`, and
-    # even the latest `object_store` 0.14.0 requires `^0.40.1` (i.e. < 0.41.0),
-    # which is STILL in the vulnerable range. So no `cargo update`, `[patch]`,
-    # or `object_store` bump clears these today - there is simply no compatible
-    # upstream release. (Bumping to `object_store` 0.14 would also drag the
-    # `reqwest 0.13` double-TLS-verifier problem the root `Cargo.toml`
-    # deliberately pins against, for no security gain.)
-    # Risk is bounded: `quick-xml` is reached ONLY through `object_store`
-    # parsing XML *responses from the operator-configured S3/Azure backend*
-    # (ListObjects, multipart, error XML), fetched over TLS verified per
-    # ADR 0010. Both advisories are DoS requiring crafted XML, so exploitation
-    # needs a hostile / MITM'd storage endpoint - NOT reachable from the
-    # artifact push/pull path by an external user. Time-boxed risk acceptance.
-    # REVISIT TRIGGER: drop BOTH IDs the instant an `object_store` release
-    # depends on `quick-xml >= 0.41.0` (then `cargo update -p object_store
-    # -p quick-xml`). Active-graph (object_store is built into hort-server /
-    # hort-worker), so MIRRORED in `deny.toml` (NOT AUDIT-ONLY).
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
