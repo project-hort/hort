@@ -473,7 +473,7 @@ impl EventStore for PgEventStore {
                    ORDER BY stream_position ASC
                    LIMIT $3"#
             );
-            let rows: Vec<EventRow> = sqlx::query_as(&sql)
+            let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&stream_id_str)
                 .bind(after_position)
                 .bind(limit)
@@ -519,7 +519,7 @@ impl EventStore for PgEventStore {
                    ORDER BY global_position ASC
                    LIMIT $3"#
             );
-            let rows: Vec<EventRow> = sqlx::query_as(&sql)
+            let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(cat_str)
                 .bind(after_global)
                 .bind(limit)
@@ -1588,10 +1588,10 @@ mod tests {
     /// Tier-2 DB chain tests so the reconstruction is written once and
     /// stays identical to the production verifier's mechanism.
     async fn read_back_owned_rows(pool: &PgPool, stream_id: &str) -> Vec<OwnedDbRow> {
-        let event_rows: Vec<EventRow> = sqlx::query_as(&format!(
+        let event_rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             r#"SELECT {EVENT_COLS}
                FROM events WHERE stream_id = $1 ORDER BY stream_position ASC"#
-        ))
+        )))
         .bind(stream_id)
         .fetch_all(pool)
         .await

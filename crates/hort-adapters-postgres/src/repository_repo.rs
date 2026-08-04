@@ -84,7 +84,7 @@ impl RepositoryRepository for PgRepositoryRepository {
         Box::pin(async move {
             tracing::debug!(entity = "Repository", %id, "find_by_id");
             let sql = format!("SELECT {SELECT_COLS} FROM repositories WHERE id = $1");
-            let row: RepositoryRowWithRules = sqlx::query_as(&sql)
+            let row: RepositoryRowWithRules = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(id)
                 .fetch_one(&self.pool)
                 .await
@@ -98,7 +98,7 @@ impl RepositoryRepository for PgRepositoryRepository {
         Box::pin(async move {
             tracing::debug!(entity = "Repository", key = %key, "find_by_key");
             let sql = format!("SELECT {SELECT_COLS} FROM repositories WHERE key = $1");
-            let row: RepositoryRowWithRules = sqlx::query_as(&sql)
+            let row: RepositoryRowWithRules = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&key)
                 .fetch_one(&self.pool)
                 .await
@@ -127,7 +127,7 @@ impl RepositoryRepository for PgRepositoryRepository {
                    ORDER BY name
                    OFFSET $2 LIMIT $3"#
             );
-            let rows: Vec<RepositoryRowWithRules> = sqlx::query_as(&sql)
+            let rows: Vec<RepositoryRowWithRules> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&search)
                 .bind(offset)
                 .bind(limit)
@@ -331,7 +331,7 @@ impl RepositoryRepository for PgRepositoryRepository {
                        WHERE virtual_repo_id = $1 AND member_repo_id = repositories.id
                    )"#
             );
-            let rows: Vec<RepositoryRowWithRules> = sqlx::query_as(&sql)
+            let rows: Vec<RepositoryRowWithRules> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(virtual_repo_id)
                 .fetch_all(&self.pool)
                 .await

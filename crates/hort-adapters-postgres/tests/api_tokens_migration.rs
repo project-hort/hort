@@ -192,7 +192,9 @@ async fn idempotent_after_rollback() {
             .await
             .expect("connect to the `postgres` maintenance database");
         (&mut admin)
-            .execute(format!("CREATE DATABASE \"{throwaway}\"").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "CREATE DATABASE \"{throwaway}\""
+            )))
             .await
             .expect("create throwaway database for the rollback test");
         admin.close().await.ok();
@@ -249,7 +251,9 @@ async fn idempotent_after_rollback() {
         .await
         .expect("reconnect to drop the throwaway database");
     (&mut admin)
-        .execute(format!("DROP DATABASE IF EXISTS \"{throwaway}\" WITH (FORCE)").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS \"{throwaway}\" WITH (FORCE)"
+        )))
         .await
         .expect("drop the throwaway database");
     admin.close().await.ok();

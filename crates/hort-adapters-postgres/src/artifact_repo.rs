@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgArguments;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
@@ -102,7 +102,7 @@ impl ArtifactRepository for PgArtifactRepository {
         Box::pin(async move {
             tracing::debug!(entity = "Artifact", %id, "find_by_id");
             let sql = format!("SELECT {SELECT_COLS} FROM artifacts WHERE id = $1");
-            let row: ArtifactRow = sqlx::query_as(&sql)
+            let row: ArtifactRow = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(id)
                 .fetch_one(&self.pool)
                 .await
@@ -120,7 +120,7 @@ impl ArtifactRepository for PgArtifactRepository {
             tracing::debug!(entity = "Artifact", sha256 = %sha256, "find_by_checksum");
             let sql =
                 format!("SELECT {SELECT_COLS} FROM artifacts WHERE checksum_sha256 = $1 LIMIT 1");
-            let row: Option<ArtifactRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(&sha256)
                 .fetch_optional(&self.pool)
                 .await
@@ -146,7 +146,7 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE repository_id = $1 AND checksum_sha256 = $2 LIMIT 1"
             );
-            let row: Option<ArtifactRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&sha256)
                 .fetch_optional(&self.pool)
@@ -172,7 +172,7 @@ impl ArtifactRepository for PgArtifactRepository {
                    ORDER BY name, version
                    OFFSET $2 LIMIT $3"#
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(offset)
                 .bind(limit)
@@ -229,7 +229,7 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts WHERE repository_id = $1 AND path = $2"
             );
-            let row: Option<ArtifactRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&path)
                 .fetch_optional(&self.pool)
@@ -303,7 +303,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY version \
                  OFFSET $3 LIMIT $4"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&name)
                 .bind(offset)
@@ -357,7 +357,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY version \
                  OFFSET $3 LIMIT $4"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&raw)
                 .bind(offset)
@@ -458,7 +458,7 @@ impl ArtifactRepository for PgArtifactRepository {
                    AND is_deleted = false \
                  LIMIT $2"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(cap + 1)
                 .fetch_all(&self.pool)
@@ -625,7 +625,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY id \
                  LIMIT $2"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(&kind)
                 .bind(limit)
                 .fetch_all(&self.pool)
@@ -708,7 +708,7 @@ impl ArtifactRepository for PgArtifactRepository {
                      )
                    LIMIT $2"#
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(policy_id)
                 .bind(cap + 1)
                 .fetch_all(&self.pool)
@@ -784,7 +784,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY a.id \
                  OFFSET $2 LIMIT $3"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(policy_id)
                 .bind(offset)
                 .bind(limit)
@@ -793,7 +793,7 @@ impl ArtifactRepository for PgArtifactRepository {
                 .map_err(|e| map_sqlx_error(&e, "Artifact", "list_active_for_policy"))?;
 
             let count_sql = format!("SELECT COUNT(*) FROM artifacts a WHERE {SCOPE_PREDICATE}");
-            let total: Option<i64> = sqlx::query_scalar(&count_sql)
+            let total: Option<i64> = sqlx::query_scalar(AssertSqlSafe(count_sql))
                 .bind(policy_id)
                 .fetch_one(&self.pool)
                 .await

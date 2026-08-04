@@ -1767,7 +1767,7 @@ fn apply_lock_timeout(pool_options: PgPoolOptions, ms: u64) -> PgPoolOptions {
         Box::pin(async move {
             // `ms: u64` — safe to interpolate; see fn doc.
             let sql = format!("SET lock_timeout = '{ms}'");
-            if let Err(err) = conn.execute(sql.as_str()).await {
+            if let Err(err) = conn.execute(sqlx::AssertSqlSafe(sql)).await {
                 tracing::warn!(
                     lock_timeout_ms = ms,
                     error = %err,

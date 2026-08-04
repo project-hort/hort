@@ -68,7 +68,7 @@ async fn create_temp_db(admin: &PgPool) -> (String, PgPool) {
     // hex-only UUID and the prefix is a literal.
     let create = format!("CREATE DATABASE \"{db_name}\"");
     admin
-        .execute(create.as_str())
+        .execute(sqlx::AssertSqlSafe(create))
         .await
         .expect("CREATE DATABASE (temp)");
     let url = temp_db_url(&db_name).expect("DATABASE_URL parses");
@@ -87,7 +87,7 @@ async fn drop_temp_db(admin: &PgPool, db_name: &str, db_pool: PgPool) {
     // flakiness on busy CI hosts.
     let drop_sql = format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)");
     for attempt in 0..5 {
-        match admin.execute(drop_sql.as_str()).await {
+        match admin.execute(sqlx::AssertSqlSafe(drop_sql.clone())).await {
             Ok(_) => return,
             Err(e) if attempt < 4 => {
                 eprintln!("DROP DATABASE {db_name} attempt {attempt} failed: {e}; retrying");
@@ -307,15 +307,15 @@ async fn permission_denied_bails_with_grant_message() {
     let password = format!("pw_{suffix}");
     let create_role =
         format!("CREATE USER \"{role}\" WITH NOSUPERUSER LOGIN PASSWORD '{password}'");
-    pool.execute(create_role.as_str())
+    pool.execute(sqlx::AssertSqlSafe(create_role))
         .await
         .expect("CREATE USER (locked role)");
     let grant_connect = format!("GRANT CONNECT ON DATABASE \"{db_name}\" TO \"{role}\"");
-    pool.execute(grant_connect.as_str())
+    pool.execute(sqlx::AssertSqlSafe(grant_connect))
         .await
         .expect("GRANT CONNECT");
     let grant_usage = format!("GRANT USAGE ON SCHEMA public TO \"{role}\"");
-    pool.execute(grant_usage.as_str())
+    pool.execute(sqlx::AssertSqlSafe(grant_usage))
         .await
         .expect("GRANT USAGE");
     // Ensure the role explicitly cannot read the bookkeeping table —
@@ -325,7 +325,7 @@ async fn permission_denied_bails_with_grant_message() {
         .await
         .expect("REVOKE ALL FROM PUBLIC");
     let revoke = format!("REVOKE ALL ON _sqlx_migrations FROM \"{role}\"");
-    pool.execute(revoke.as_str())
+    pool.execute(sqlx::AssertSqlSafe(revoke))
         .await
         .expect("REVOKE ALL on _sqlx_migrations from locked role");
 
@@ -354,6 +354,6 @@ async fn permission_denied_bails_with_grant_message() {
 
     locked_pool.close().await;
     let drop_role = format!("DROP USER IF EXISTS \"{role}\"");
-    let _ = pool.execute(drop_role.as_str()).await;
+    let _ = pool.execute(sqlx::AssertSqlSafe(drop_role)).await;
     drop_temp_db(&admin, &db_name, pool).await;
 }

@@ -48,7 +48,7 @@ impl ArtifactMetadataRepository for PgArtifactMetadataRepository {
         Box::pin(async move {
             tracing::debug!(entity = "ArtifactMetadata", %artifact_id, "find_by_artifact_id");
             let sql = format!("SELECT {SELECT_COLS} FROM artifact_metadata WHERE artifact_id = $1");
-            let row: Option<ArtifactMetadataRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactMetadataRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(artifact_id)
                 .fetch_optional(&self.pool)
                 .await
@@ -73,7 +73,7 @@ impl ArtifactMetadataRepository for PgArtifactMetadataRepository {
             }
             let sql =
                 format!("SELECT {SELECT_COLS} FROM artifact_metadata WHERE artifact_id = ANY($1)");
-            let rows: Vec<ArtifactMetadataRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactMetadataRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&ids)
                 .fetch_all(&self.pool)
                 .await

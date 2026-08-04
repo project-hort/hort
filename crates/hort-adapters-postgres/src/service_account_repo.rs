@@ -87,28 +87,28 @@ impl ServiceAccountRepository for PgServiceAccountRepository {
             // Three bulk queries: SA rows, FI rows, FR rows. Composed
             // in Rust by service_account_id — avoids the N+1 a per-SA
             // lookup loop would produce.
-            let sa_rows: Vec<ServiceAccountRow> = sqlx::query_as(&format!(
+            let sa_rows: Vec<ServiceAccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {SA_SELECT_COLS} FROM service_accounts ORDER BY name"
-            ))
+            )))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "service_accounts list");
                 DomainError::Invariant(format!("service_accounts list: {e}"))
             })?;
-            let fi_rows: Vec<FederatedIdentityRow> = sqlx::query_as(&format!(
+            let fi_rows: Vec<FederatedIdentityRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {FI_SELECT_COLS} FROM service_account_federated_identities \
                  ORDER BY service_account_id, position"
-            ))
+            )))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "service_account_federated_identities list");
                 DomainError::Invariant(format!("service_account_federated_identities list: {e}"))
             })?;
-            let fr_rows: Vec<FallbackRotationRow> = sqlx::query_as(&format!(
+            let fr_rows: Vec<FallbackRotationRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {FR_SELECT_COLS} FROM service_account_fallback_rotations"
-            ))
+            )))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
@@ -145,9 +145,9 @@ impl ServiceAccountRepository for PgServiceAccountRepository {
         let name = name.to_string();
         Box::pin(async move {
             tracing::debug!(entity = "service_account", name = %name, "get_by_name");
-            let sa_row: Option<ServiceAccountRow> = sqlx::query_as(&format!(
+            let sa_row: Option<ServiceAccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {SA_SELECT_COLS} FROM service_accounts WHERE name = $1 LIMIT 1"
-            ))
+            )))
             .bind(&name)
             .fetch_optional(&self.pool)
             .await
@@ -160,10 +160,10 @@ impl ServiceAccountRepository for PgServiceAccountRepository {
             };
             let sa_id = sa_row.id;
 
-            let fi_rows: Vec<FederatedIdentityRow> = sqlx::query_as(&format!(
+            let fi_rows: Vec<FederatedIdentityRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {FI_SELECT_COLS} FROM service_account_federated_identities \
                  WHERE service_account_id = $1 ORDER BY position"
-            ))
+            )))
             .bind(sa_id)
             .fetch_all(&self.pool)
             .await
@@ -172,10 +172,10 @@ impl ServiceAccountRepository for PgServiceAccountRepository {
                 DomainError::Invariant(format!("service_account_federated_identities get: {e}"))
             })?;
 
-            let fr_row: Option<FallbackRotationRow> = sqlx::query_as(&format!(
+            let fr_row: Option<FallbackRotationRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {FR_SELECT_COLS} FROM service_account_fallback_rotations \
                  WHERE service_account_id = $1 LIMIT 1"
-            ))
+            )))
             .bind(sa_id)
             .fetch_optional(&self.pool)
             .await

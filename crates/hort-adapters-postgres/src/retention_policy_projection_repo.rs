@@ -114,7 +114,7 @@ impl RetentionPolicyProjectionRepository for PgRetentionPolicyProjectionReposito
         Box::pin(async move {
             tracing::debug!(entity = "retention_policy", "list_active");
             let sql = format!("{SELECT_COLS} WHERE archived = false ORDER BY name");
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_query_err(&e, "list_active"))?;
@@ -129,7 +129,7 @@ impl RetentionPolicyProjectionRepository for PgRetentionPolicyProjectionReposito
         Box::pin(async move {
             tracing::debug!(entity = "retention_policy", lookup_key = %name, "find_by_name");
             let sql = format!("{SELECT_COLS} WHERE name = $1 AND archived = false");
-            let row = sqlx::query(&sql)
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(&name)
                 .fetch_optional(&self.pool)
                 .await
@@ -158,7 +158,7 @@ impl RetentionPolicyProjectionRepository for PgRetentionPolicyProjectionReposito
             let sql = format!(
                 "{SELECT_COLS} WHERE name = $1 ORDER BY archived ASC, created_at DESC LIMIT 1"
             );
-            let row = sqlx::query(&sql)
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(&name)
                 .fetch_optional(&self.pool)
                 .await
@@ -171,7 +171,7 @@ impl RetentionPolicyProjectionRepository for PgRetentionPolicyProjectionReposito
         Box::pin(async move {
             tracing::debug!(entity = "retention_policy", "list_active_rows");
             let sql = format!("{SELECT_COLS} WHERE archived = false ORDER BY name");
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_query_err(&e, "list_active_rows"))?;

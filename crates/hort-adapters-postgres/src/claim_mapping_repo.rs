@@ -81,7 +81,7 @@ impl ClaimMappingRepository for PgClaimMappingRepository {
                 "SELECT {CLAIM_MAPPING_SELECT_COLS} FROM claim_mappings \
                  ORDER BY idp_group, claim"
             );
-            let rows: Vec<ClaimMappingRow> = sqlx::query_as(&sql)
+            let rows: Vec<ClaimMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "ClaimMapping", "list_all"))?;
@@ -96,7 +96,7 @@ impl ClaimMappingRepository for PgClaimMappingRepository {
                 "SELECT {CLAIM_MAPPING_SELECT_COLS} FROM claim_mappings \
                  WHERE managed_by = 'gitops' ORDER BY idp_group, claim"
             );
-            let rows: Vec<ClaimMappingRow> = sqlx::query_as(&sql)
+            let rows: Vec<ClaimMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "ClaimMapping", "list_managed_by_gitops"))?;

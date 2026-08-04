@@ -254,7 +254,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                     WHERE repository_id = $1
                     ORDER BY created_at ASC, id ASC"#
             );
-            let rows: Vec<UpstreamMappingRow> = sqlx::query_as(&sql)
+            let rows: Vec<UpstreamMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(repository_id)
                 .fetch_all(&self.pool)
                 .await
@@ -273,7 +273,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                      FROM repository_upstream_mappings
                     ORDER BY repository_id ASC, created_at ASC, id ASC"#
             );
-            let rows: Vec<UpstreamMappingRow> = sqlx::query_as(&sql)
+            let rows: Vec<UpstreamMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "RepositoryUpstreamMapping", "*"))?;
@@ -409,7 +409,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                     WHERE managed_by = 'gitops'
                     ORDER BY repository_id ASC, path_prefix ASC, id ASC"#
             );
-            let rows: Vec<UpstreamMappingRow> = sqlx::query_as(&sql)
+            let rows: Vec<UpstreamMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "RepositoryUpstreamMapping", "managed"))?;

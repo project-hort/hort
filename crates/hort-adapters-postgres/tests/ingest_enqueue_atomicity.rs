@@ -148,7 +148,7 @@ fn ingest_events(a: &Artifact) -> AppendEvents {
     }
 }
 
-async fn count(pool: &PgPool, sql: &str, id: Uuid) -> i64 {
+async fn count(pool: &PgPool, sql: &'static str, id: Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>(sql)
         .bind(id)
         .fetch_one(pool)

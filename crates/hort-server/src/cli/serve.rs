@@ -220,7 +220,7 @@ async fn run_async() -> anyhow::Result<()> {
             Box::pin(async move {
                 // `ms: u64` — safe to interpolate; see comment above.
                 let sql = format!("SET statement_timeout = {ms}");
-                if let Err(err) = conn.execute(sql.as_str()).await {
+                if let Err(err) = conn.execute(sqlx::AssertSqlSafe(sql)).await {
                     // Preserve the pool but flag the problem so operators
                     // see that the timeout they configured is not in
                     // force on this connection.

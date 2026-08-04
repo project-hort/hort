@@ -53,7 +53,7 @@ async fn create_temp_db(admin: &PgPool) -> (String, PgPool) {
     let db_name = format!("hort_test_harden_{suffix}");
     let create = format!("CREATE DATABASE \"{db_name}\"");
     admin
-        .execute(create.as_str())
+        .execute(sqlx::AssertSqlSafe(create))
         .await
         .expect("CREATE DATABASE (temp)");
     let url = temp_db_url(&db_name).expect("DATABASE_URL parses");
@@ -65,7 +65,7 @@ async fn drop_temp_db(admin: &PgPool, db_name: &str, db_pool: PgPool) {
     db_pool.close().await;
     let drop_sql = format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)");
     for attempt in 0..5 {
-        match admin.execute(drop_sql.as_str()).await {
+        match admin.execute(sqlx::AssertSqlSafe(drop_sql.clone())).await {
             Ok(_) => return,
             Err(e) if attempt < 4 => {
                 eprintln!("DROP DATABASE {db_name} attempt {attempt} failed: {e}; retrying");
@@ -122,14 +122,16 @@ async fn migrate_run_self_heals_after_operator_grant_drift() {
     let suffix = Uuid::new_v4().simple().to_string();
     let role = format!("hort_test_app_{suffix}");
     let password = format!("pw_{suffix}");
-    pool.execute(
-        format!("CREATE USER \"{role}\" WITH NOSUPERUSER LOGIN PASSWORD '{password}'").as_str(),
-    )
+    pool.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE USER \"{role}\" WITH NOSUPERUSER LOGIN PASSWORD '{password}'"
+    )))
     .await
     .expect("CREATE USER (probe member)");
-    pool.execute(format!("GRANT hort_app_role TO \"{role}\"").as_str())
-        .await
-        .expect("GRANT hort_app_role to probe member");
+    pool.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT hort_app_role TO \"{role}\""
+    )))
+    .await
+    .expect("GRANT hort_app_role to probe member");
 
     // Simulate operator drift: a bulk GRANT meant to give
     // hort_app_role read/write on the projection tables, accidentally
@@ -179,9 +181,11 @@ async fn migrate_run_self_heals_after_operator_grant_drift() {
     );
 
     // Teardown.
-    pool.execute(format!("DROP USER IF EXISTS \"{role}\"").as_str())
-        .await
-        .ok();
+    pool.execute(sqlx::AssertSqlSafe(format!(
+        "DROP USER IF EXISTS \"{role}\""
+    )))
+    .await
+    .ok();
     drop_temp_db(&admin, &db_name, pool).await;
 }
 

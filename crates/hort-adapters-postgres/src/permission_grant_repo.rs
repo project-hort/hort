@@ -186,7 +186,7 @@ impl PermissionGrantRepository for PgPermissionGrantRepository {
         Box::pin(async move {
             tracing::debug!(entity = "PermissionGrant", "list_all");
             let sql = format!("SELECT {GRANT_SELECT_COLS} FROM permission_grants");
-            let rows: Vec<PermissionGrantRow> = sqlx::query_as(&sql)
+            let rows: Vec<PermissionGrantRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "PermissionGrant", "list_all"))?;
@@ -201,7 +201,7 @@ impl PermissionGrantRepository for PgPermissionGrantRepository {
                 "SELECT {GRANT_SELECT_COLS} FROM permission_grants \
                  WHERE managed_by = 'gitops'"
             );
-            let rows: Vec<PermissionGrantRow> = sqlx::query_as(&sql)
+            let rows: Vec<PermissionGrantRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "PermissionGrant", "list_managed_by_gitops"))?;

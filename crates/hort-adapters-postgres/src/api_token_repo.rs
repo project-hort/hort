@@ -184,7 +184,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
             tracing::debug!(entity = "ApiToken", "find_by_prefix");
             let sql =
                 format!("SELECT {SELECT_COLS} FROM api_tokens WHERE token_prefix = $1 LIMIT 1");
-            let row: Option<ApiTokenRow> = sqlx::query_as(&sql)
+            let row: Option<ApiTokenRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&prefix)
                 .fetch_optional(&self.pool)
                 .await
@@ -197,7 +197,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
         Box::pin(async move {
             tracing::debug!(entity = "ApiToken", token_id = %id, "find_by_id");
             let sql = format!("SELECT {SELECT_COLS} FROM api_tokens WHERE id = $1");
-            let row: ApiTokenRow = sqlx::query_as(&sql)
+            let row: ApiTokenRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(id)
                 .fetch_one(&self.pool)
                 .await
@@ -219,7 +219,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
                 "SELECT {SELECT_COLS} FROM api_tokens WHERE user_id = $1 \
                  ORDER BY created_at DESC OFFSET $2 LIMIT $3"
             );
-            let rows: Vec<ApiTokenRow> = sqlx::query_as(&sql)
+            let rows: Vec<ApiTokenRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(user_id)
                 .bind(offset)
                 .bind(limit)
@@ -316,7 +316,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
             // string from `Display`, no embedded quotes possible.
             let payload = format!("'{token_id}'");
             let notify_sql = format!("NOTIFY api_token_revocation, {payload}");
-            sqlx::query(&notify_sql)
+            sqlx::query(sqlx::AssertSqlSafe(notify_sql))
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "ApiToken", &token_id.to_string()))?;
