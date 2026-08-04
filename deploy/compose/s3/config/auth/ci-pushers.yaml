@@ -1,0 +1,14 @@
+# ClaimMapping: IdP group `test-developers` ALSO resolves to the
+# `ci-pusher` claim, so a `test-developers` member's resolved claim set is
+# [developer, ci-pusher] — the two-claim subject the dev-*-oci-s3-e2e grants
+# require. Copied verbatim from example-config/auth/ci-pushers.yaml; see
+# that file's header comment for the "why two claims from one group" e2e
+# contrivance, and docker-compose.s3.yml's hort-server volumes comment for
+# why this overlay cannot just reuse example-config/ directly.
+apiVersion: project-hort.de/v1beta1
+kind: ClaimMapping
+metadata:
+  name: ci-pushers
+spec:
+  idpGroup: test-developers
+  claim: ci-pusher

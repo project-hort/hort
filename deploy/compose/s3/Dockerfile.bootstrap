@@ -1,0 +1,9 @@
+# deploy/compose/s3/Dockerfile.bootstrap
+#
+# Tiny image for the `garage-bootstrap` one-shot service in
+# docker-compose.s3.yml: curl + jq, nothing else. Drives the Garage v2 Admin
+# API (see garage-bootstrap.sh's header comment for why the Admin API rather
+# than the `garage` CLI — the short version: `dxflrs/garage` is a shell-free
+# scratch image).
+FROM alpine:3.20
+RUN apk add --no-cache curl jq

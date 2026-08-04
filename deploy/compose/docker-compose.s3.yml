@@ -1,0 +1,147 @@
+# S3/Garage overlay — layered on top of docker-compose.yml.
+#
+#   docker compose -f deploy/compose/docker-compose.yml \
+#                   -f deploy/compose/docker-compose.s3.yml up -d
+#
+# Driven by the native-tests runner:
+#
+#   ./scripts/native-tests/run.sh --hort=compose --compose-overlay=s3 \
+#       --group storage
+#
+# (see scripts/native-tests/scenarios/storage/s3-multipart-blob.sh — the one
+# scenario this overlay exists for. Run scoped to `--group storage` /
+# `--scenario storage/s3-multipart-blob`: this overlay reconfigures
+# hort-server onto a from-scratch gitops config tree (see below), so the rest
+# of the native-tests suite — whose repos live only in the base
+# `example-config/` — is NOT expected to pass unfiltered against this
+# overlay. That is intentional, not a gap: issue #54 / backlog/036 explicitly
+# drops the "run every scenario group against both backends" matrix; this
+# overlay is for the one targeted multipart scenario, not a general-purpose
+# S3 stack.)
+#
+# Why an overlay and not edits to docker-compose.yml: the base stack is the
+# shared dev/smoke surface for every other native test, and stays on
+# `HORT_STORAGE_BACKEND=filesystem` (same rationale as the federation/
+# native-tokens overlays — an unrelated smoke must not pay this cost).
+#
+# ---------------------------------------------------------------------------
+# Garage bootstrap: see garage-bootstrap.sh's header comment for why this
+# drives the Admin API (HTTP) rather than the `garage` CLI — the short
+# version: `dxflrs/garage` is a shell-free scratch image, and there is no
+# capture-output-into-the-next-command facility across docker-compose
+# services (the CLI-based bootstrap in `.agents/manifest.yaml` / the sbx
+# sidecar relies on its host orchestrator for exactly that capture step,
+# which docker-compose does not have).
+#
+# Garage config traps (learned the hard way in #53, see s3_multipart.rs and
+# .agents/manifest.yaml — do not rediscover):
+#   - rpc_secret must be 32 hex-encoded bytes (64 hex chars).
+#   - access-key id is "GK" + 12 hex-encoded bytes; secret key is 32
+#     hex-encoded bytes. Plain "dev..." placeholders are rejected at import.
+#   - Pin the Garage image tag to match production (v2.2.0) rather than
+#     floating.
+#
+# Fixed dev/CI-only credentials below (garage.toml mirrors these — single
+# source of truth is this file's env values; garage.toml's copies are
+# comments-linked back here). Deterministic, not secret — derived as
+# sha256(ascii-label) so the derivation is trivially reproducible and
+# obviously a fixture, not a real credential:
+#   GARAGE_BUCKET      hort-s3-e2e-cas
+#   GARAGE_ACCESS_KEY  GK + sha256("hort-s3-overlay-access-key")[:24]
+#   GARAGE_SECRET_KEY  sha256("hort-s3-overlay-secret-key")
+#   GARAGE_ADMIN_TOKEN sha256("hort-s3-overlay-admin-token")[:32]
+#   (rpc_secret, garage.toml only)  sha256("hort-s3-overlay-rpc-secret")
+
+services:
+  garage:
+    image: dxflrs/garage:v2.2.0
+    container_name: hort-garage
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "1.0"
+    volumes:
+      - ./s3/garage.toml:/etc/garage.toml:ro
+    # No healthcheck: the image is shell-free (scratch), so no CMD-shell
+    # probe is possible. Readiness is gated by garage-bootstrap's own poll
+    # of the admin API (same idiom as the base file's keycloak-ready).
+
+  garage-bootstrap:
+    container_name: hort-garage-bootstrap
+    # Tiny local image: alpine + curl + jq, nothing else (see
+    # s3/Dockerfile.bootstrap). The bootstrap script itself is bind-mounted
+    # rather than COPYed in, so it stays easy to read/diff.
+    build:
+      context: ./s3
+      dockerfile: Dockerfile.bootstrap
+    depends_on:
+      - garage
+    environment:
+      GARAGE_ADMIN_TOKEN: "7f3bedb74c41b903c2fd5cbf83344325"
+      GARAGE_BUCKET: "hort-s3-e2e-cas"
+      GARAGE_ACCESS_KEY: "GK531c18318126a5b19200d1d5"
+      GARAGE_SECRET_KEY: "74ce9e6d6f2bc6ec1f0a900c5c7094f72b36df81028fd0d7d736baf09015d840"
+    volumes:
+      - ./s3/garage-bootstrap.sh:/bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    restart: "no"
+
+  hort-server:
+    # `depends_on` uses the long (mapping) syntax, which docker-compose
+    # merges per-key across `-f` files (unlike `volumes:`, a sequence,
+    # which is replaced wholesale — see the volumes comment below). So
+    # only the NEW dependency needs adding here; the base file's
+    # postgres/keycloak-ready/hort-server-migrate/cas-init entries are
+    # kept automatically (same pattern as docker-compose.federation.yml's
+    # `fed-issuer`-only override).
+    depends_on:
+      garage-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      HORT_STORAGE_BACKEND: "s3"
+      HORT_STORAGE_S3_BUCKET: "hort-s3-e2e-cas"
+      HORT_STORAGE_S3_FORCE_PATH_STYLE: "true"
+      # Plaintext in-network endpoint (no TLS-terminating proxy in this
+      # dev/CI stack — same posture as HORT_PUBLIC_BASE_URL in the base
+      # file); the allow-http opt-in is required by the endpoint-scheme
+      # cross-check in config.rs.
+      HORT_STORAGE_S3_ALLOW_HTTP: "true"
+      AWS_ENDPOINT_URL_S3: "http://garage:3900"
+      AWS_REGION: "garage"
+      AWS_ACCESS_KEY_ID: "GK531c18318126a5b19200d1d5"
+      AWS_SECRET_ACCESS_KEY: "74ce9e6d6f2bc6ec1f0a900c5c7094f72b36df81028fd0d7d736baf09015d840"
+    volumes:
+      # Full re-declaration (docker-compose replaces the `volumes:` list
+      # wholesale per service on override, not merged by target path — same
+      # note as the federation overlay). The gitops config mount points at a
+      # DEDICATED tree (./s3/config), not the base example-config/: every
+      # repository in example-config hardcodes `storage: { backend:
+      # filesystem, ... }`, and hort-app's apply-time per-repo-vs-effective-
+      # global-backend cross-check (crates/hort-app/src/storage_backend.rs)
+      # rejects that combination against an HORT_STORAGE_BACKEND=s3
+      # deployment — fatally: it is an Apply-class gitops-boot error, so
+      # hort-server crashes (not the read-only-class "park and stay
+      # inspectable" path). Mounting example-config unmodified under this
+      # overlay would make hort-server crash-loop before any scenario runs.
+      # ./s3/config declares one repo with NO storage.backend override — the
+      # documented honest path (hort-config StorageSpec's own doc comment:
+      # omitting the block inherits the deployment's effective backend) —
+      # so it has nothing to conflict with.
+      - cas:/var/lib/hort-server/cas
+      - ./s3/config:/etc/hort/config:ro
+
+  hort-worker:
+    depends_on:
+      garage-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      # Mirrors hort-server's CAS selector — the worker streams artifact
+      # bytes from the same backend the server wrote them to (same
+      # rationale as the base file's filesystem mount comment).
+      HORT_STORAGE_BACKEND: "s3"
+      HORT_STORAGE_S3_BUCKET: "hort-s3-e2e-cas"
+      HORT_STORAGE_S3_FORCE_PATH_STYLE: "true"
+      HORT_STORAGE_S3_ALLOW_HTTP: "true"
+      AWS_ENDPOINT_URL_S3: "http://garage:3900"
+      AWS_REGION: "garage"
+      AWS_ACCESS_KEY_ID: "GK531c18318126a5b19200d1d5"
+      AWS_SECRET_ACCESS_KEY: "74ce9e6d6f2bc6ec1f0a900c5c7094f72b36df81028fd0d7d736baf09015d840"

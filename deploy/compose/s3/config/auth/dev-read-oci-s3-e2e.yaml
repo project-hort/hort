@@ -1,0 +1,13 @@
+# PermissionGrant: [developer, ci-pusher] -> read oci-s3-e2e
+# Mirrors example-config/auth/dev-read-oci-e2e.yaml — dev-user pulls the
+# just-pushed blob back (scripts/native-tests/scenarios/storage/s3-multipart-blob.sh).
+apiVersion: project-hort.de/v1beta1
+kind: PermissionGrant
+metadata:
+  name: dev-read-oci-s3-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: oci-s3-e2e
