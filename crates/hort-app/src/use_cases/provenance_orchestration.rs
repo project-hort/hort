@@ -1265,6 +1265,22 @@ impl ProvenanceOrchestrationUseCase {
     /// version-conflict retry re-appends through the identical path;
     /// returns the raw [`DomainResult`] so the caller can match the
     /// event store's `Conflict` shape before converting to `AppError`.
+    ///
+    /// Routed through Item 1's verdict-scoped conditional write
+    /// (`commit_provenance_verdict`), NOT `commit_transition` (issue #108
+    /// H2c): the previous full-row `save_in_tx` write-back could clobber
+    /// any column a concurrent writer changed on `constituent`'s stale
+    /// in-memory snapshot — the exact hazard #90 already removed from the
+    /// two primary verdict paths, left here on the cascade. `prior_status`
+    /// is `constituent.quarantine_status` as loaded by `cascade_one` — the
+    /// SAME status the artifact is still in here, since
+    /// `Artifact::cascade_provenance_clearance` takes `&self` and never
+    /// mutates it (only the domain GUARD reads it, requiring
+    /// `Quarantined`). So `artifact.quarantine_status == prior_status`
+    /// always on this path, and Item 1's skip-unchanged rule always fires:
+    /// the cascade's `ProvenanceVerified` event still appends, but NO
+    /// status-column write happens at all — the full-row clobber vector
+    /// is gone.
     async fn commit_cascade_event(
         &self,
         constituent: &Artifact,
@@ -1272,7 +1288,7 @@ impl ProvenanceOrchestrationUseCase {
         expected_version: ExpectedVersion,
     ) -> hort_domain::error::DomainResult<()> {
         self.lifecycle
-            .commit_transition(
+            .commit_provenance_verdict(
                 constituent,
                 AppendEvents {
                     stream_id: hort_domain::events::StreamId::artifact(constituent.id),
@@ -1282,7 +1298,7 @@ impl ProvenanceOrchestrationUseCase {
                     causation_id: None,
                     actor: system_actor(),
                 },
-                None,
+                constituent.quarantine_status,
             )
             .await
             .map(|_| ())
