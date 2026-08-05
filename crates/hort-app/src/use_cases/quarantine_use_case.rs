@@ -1145,11 +1145,23 @@ impl QuarantineUseCase {
     /// so expiry can never become a release authority.
     ///
     /// Order:
-    /// 1. A successful [`DomainEvent::ScanCompleted`] anywhere on the
-    ///    artifact stream ⇒ [`ReleaseAuthorization::ScanSucceeded`].
-    ///    Terminal scan *failure* emits `ScanIndeterminate`, not
-    ///    `ScanCompleted`, so the mere presence of a
-    ///    `ScanCompleted` is exactly "a successful scan exists".
+    /// 1. A **successful** [`DomainEvent::ScanCompleted`] on the artifact
+    ///    stream ⇒ [`ReleaseAuthorization::ScanSucceeded`]. "Successful"
+    ///    (issue #108 H3 / ADR 0007) means: the LATEST `ScanCompleted` on
+    ///    the stream carries `finding_count == 0`, AND no
+    ///    `ArtifactRejected` appears LATER on the stream than that
+    ///    `ScanCompleted`. Mere *presence* of a `ScanCompleted` is NOT
+    ///    sufficient — the rejecting-scan branch of `record_scan_result`
+    ///    ALSO emits `ScanCompleted` (with `finding_count > 0`), first in
+    ///    its batch, immediately before the `ArtifactRejected` that makes
+    ///    the verdict terminal. A presence-only check would treat that
+    ///    dirty scan's own rejection record as a release authority for
+    ///    the very artifact it just condemned. (Terminal scanner
+    ///    *execution* failure is a different event, `ScanIndeterminate`
+    ///    — that one genuinely never satisfies this predicate, since it
+    ///    isn't a `ScanCompleted` at all; the conflation this comment
+    ///    used to make was between "the scanner ran" and "the artifact
+    ///    passed", not between execution failure and success.)
     /// 2. Else, resolve the artifact's `ScanPolicy`; if it exists AND
     ///    `scan_backends == []` (operator declared this scope unscanned)
     ///    ⇒ [`ReleaseAuthorization::ScanWaived`].
@@ -1168,11 +1180,26 @@ impl QuarantineUseCase {
             .events
             .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
             .await?;
-        if persisted
-            .iter()
-            .any(|e| matches!(e.event, DomainEvent::ScanCompleted(_)))
-        {
-            return Ok(Some(ReleaseAuthorization::ScanSucceeded));
+
+        // The LATEST ScanCompleted's index (stream order — `read_stream`
+        // returns ascending `stream_position`), so "no ArtifactRejected
+        // later than it" can be checked over exactly the suffix after it.
+        let latest_scan_completed =
+            persisted
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, e)| match &e.event {
+                    DomainEvent::ScanCompleted(sc) => Some((idx, sc)),
+                    _ => None,
+                });
+        if let Some((idx, scan_completed)) = latest_scan_completed {
+            let rejected_after = persisted[idx + 1..]
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)));
+            if scan_completed.finding_count == 0 && !rejected_after {
+                return Ok(Some(ReleaseAuthorization::ScanSucceeded));
+            }
         }
 
         let policy =
@@ -2040,6 +2067,72 @@ mod tests {
             stored_at: Utc::now(),
         };
         events.set_stream(&stream_id, vec![quarantined, scan_completed]);
+    }
+
+    /// Build a `ScanCompleted` [`PersistedEvent`] at `position` —
+    /// `finding_count == 0` is the clean/successful shape,
+    /// `finding_count > 0` is the dirty shape a rejecting scan ALSO
+    /// emits (first in its batch, before the paired `ArtifactRejected`).
+    /// Shared by the issue #108 H3 authority-derivation matrix tests
+    /// below, which (unlike [`seed_stream_with_scan_completed`]) need
+    /// full control over which events land at which position.
+    fn scan_completed_event(
+        artifact_id: Uuid,
+        position: u64,
+        finding_count: u32,
+    ) -> PersistedEvent {
+        let stream_id = StreamId::artifact(artifact_id);
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id,
+            stream_position: position,
+            global_position: position + 1,
+            event: DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "trivy".into(),
+                finding_count,
+                severity_summary: SeveritySummary {
+                    critical: u32::from(finding_count > 0),
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                    negligible: 0,
+                },
+                findings_blob: if finding_count > 0 {
+                    Some("f".repeat(64).parse().unwrap())
+                } else {
+                    None
+                },
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    /// Build an `ArtifactRejected{rejected_by: Scanner}`
+    /// [`PersistedEvent`] at `position` — the event a dirty-verdict scan
+    /// appends immediately after its own `ScanCompleted`.
+    fn rejected_event(artifact_id: Uuid, position: u64) -> PersistedEvent {
+        let stream_id = StreamId::artifact(artifact_id);
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id,
+            stream_position: position,
+            global_position: position + 1,
+            event: DomainEvent::ArtifactRejected(hort_domain::events::ArtifactRejected {
+                artifact_id,
+                rejected_by: hort_domain::events::RejectionReason::Scanner,
+                reason: "critical severity finding".into(),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
     }
 
     /// Seed an active repo-scoped policy whose
@@ -3961,6 +4054,109 @@ mod tests {
         assert!(ev.released_by_user_id.is_none());
         assert!(ev.justification.is_none());
         assert_eq!(batch.actor, timer_actor());
+    }
+
+    // -----------------------------------------------------------------
+    // issue #108 H3 — release authority derives from the LATEST verdict,
+    // not the mere presence of a ScanCompleted. The rejecting-scan branch
+    // of `record_scan_result` ALSO emits `ScanCompleted` (finding_count >
+    // 0), immediately before the `ArtifactRejected` that makes the
+    // verdict terminal; a presence-only check treated that record as a
+    // release authority for the very artifact it just condemned.
+    // -----------------------------------------------------------------
+
+    /// The latest (and only) `ScanCompleted` is DIRTY (`finding_count >
+    /// 0`), immediately followed by `ArtifactRejected` — exactly the
+    /// batch shape `record_scan_result`'s reject branch commits. Must NOT
+    /// construct `ScanSucceeded`: no authority is resolvable (no waiver
+    /// policy seeded either), so the candidate stays quarantined.
+    #[tokio::test]
+    async fn release_expired_denies_release_when_latest_scan_is_dirty() {
+        let (uc, artifacts, events, _lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(artifact_id, 1, 3),
+                rejected_event(artifact_id, 2),
+            ],
+        );
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "a dirty latest ScanCompleted must never authorize release, even though a \
+             ScanCompleted IS present on the stream — issue #108 H3"
+        );
+    }
+
+    /// The latest `ScanCompleted` is CLEAN, but an `ArtifactRejected`
+    /// appears LATER on the stream than it (e.g. an admin/curation reject
+    /// landed after a clean scan). Must NOT construct `ScanSucceeded` —
+    /// the clean scan is stale with respect to the subsequent rejection.
+    #[tokio::test]
+    async fn release_expired_denies_release_when_clean_scan_followed_by_later_reject() {
+        let (uc, artifacts, events, _lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(artifact_id, 1, 0),
+                rejected_event(artifact_id, 2),
+            ],
+        );
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "a clean ScanCompleted followed by a LATER ArtifactRejected must not authorize \
+             release — issue #108 H3"
+        );
+    }
+
+    /// An EARLIER dirty scan + reject, then a LATER clean rescan with no
+    /// further reject after it: the latest `ScanCompleted` (clean) has no
+    /// `ArtifactRejected` after it on the stream, so `ScanSucceeded` DOES
+    /// apply — the predicate is about the latest verdict, not "was there
+    /// ever a rejection anywhere on the stream".
+    #[tokio::test]
+    async fn release_expired_releases_via_scan_succeeded_after_a_later_clean_rescan() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(artifact_id, 1, 3),
+                rejected_event(artifact_id, 2),
+                scan_completed_event(artifact_id, 3, 0),
+            ],
+        );
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "the LATEST ScanCompleted is clean and nothing rejects after it — issue #108 H3 \
+             looks at the latest verdict, not stream-wide presence of any rejection"
+        );
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Released
+        );
     }
 
     /// A candidate whose resolved `ScanPolicy` has
