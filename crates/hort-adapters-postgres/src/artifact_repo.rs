@@ -838,51 +838,105 @@ impl PgArtifactRepository {
         Ok(())
     }
 
-    /// Column-scoped UPDATE for a verdict transition (scan / provenance —
-    /// issue #90). Writes ONLY `quarantine_status` + `updated_at`, never
-    /// the full row: verdict application follows a slow scan-execution /
+    /// Column-scoped, **prior-status-conditional** UPDATE for a verdict
+    /// transition (scan / provenance — issues #90 and #108).
+    ///
+    /// Writes ONLY `quarantine_status` + `updated_at`, never the full row
+    /// (#90): verdict application follows a slow scan-execution /
     /// bundle-fetch round trip after the artifact was loaded, so the
     /// caller's in-memory snapshot of every OTHER column (most critically
     /// `quarantine_window_start`, the quarantine anchor) can be stale by
     /// commit time. A full-row `save_in_tx` write-back would clobber
     /// whatever a concurrently-committed transition wrote to those columns
-    /// in the meantime. Errors `NotFound` if the artifact row does not
-    /// exist — a verdict can only ever apply to an already-ingested
-    /// artifact.
+    /// in the meantime.
+    ///
+    /// #90 left `quarantine_status` ITSELF — the security-load-bearing
+    /// column — written unconditionally from that same stale snapshot, so
+    /// a signed image that also tripped a scan policy could resurrect
+    /// `Rejected → Quarantined` and then timer-release (#108 H2b). The
+    /// UPDATE is therefore predicated on the row still holding the status
+    /// the caller LOADED (`prior_status`), via `IS NOT DISTINCT FROM` —
+    /// NOT `=` — because `QuarantineStatus::None` is stored as SQL `NULL`
+    /// and `NULL = NULL` is `NULL`, never true.
+    ///
+    /// ## The zero-rows split
+    ///
+    /// Zero affected rows is ambiguous — the id may be absent, or present
+    /// with a changed status — and the two must NOT collapse: a
+    /// genuinely-absent id is [`DomainError::NotFound`] (a verdict can
+    /// only apply to an already-ingested artifact), while a present row
+    /// whose status moved under us is [`DomainError::Conflict`] (the
+    /// losing verdict is re-derivable; the caller retries or re-runs).
+    /// A single statement disambiguates race-free: the `existing` CTE
+    /// reads the pre-UPDATE row under the SAME statement snapshot as the
+    /// `updated` CTE's write, so no other transaction can commit between
+    /// the two reads (a follow-up `SELECT` after the UPDATE could, and
+    /// would misreport a concurrently-deleted row as `NotFound` when it
+    /// was really a `Conflict`).
     pub(crate) async fn save_verdict_status_in_tx(
         &self,
         tx: &mut PgUnitOfWork,
         artifact_id: Uuid,
         quarantine_status: QuarantineStatus,
         updated_at: DateTime<Utc>,
+        prior_status: QuarantineStatus,
     ) -> DomainResult<()> {
         tracing::debug!(
             entity = "Artifact",
             id = %artifact_id,
             "save_verdict_status_in_tx"
         );
-        let quarantine_str = match quarantine_status {
+        let to_sql = |s: QuarantineStatus| match s {
             QuarantineStatus::None => None,
             other => Some(other.to_string()),
         };
+        let quarantine_str = to_sql(quarantine_status);
+        let prior_str = to_sql(prior_status);
 
-        let result = sqlx::query(
-            "UPDATE artifacts SET quarantine_status = $1, updated_at = $2 WHERE id = $3",
+        let (existed, updated): (bool, bool) = sqlx::query_as(
+            "WITH existing AS (
+                 SELECT 1 FROM artifacts WHERE id = $3
+             ),
+             updated AS (
+                 UPDATE artifacts SET quarantine_status = $1, updated_at = $2
+                 WHERE id = $3 AND quarantine_status IS NOT DISTINCT FROM $4
+                 RETURNING 1
+             )
+             SELECT EXISTS (SELECT 1 FROM existing), EXISTS (SELECT 1 FROM updated)",
         )
         .bind(quarantine_str)
         .bind(updated_at)
         .bind(artifact_id)
-        .execute(tx.conn())
+        .bind(prior_str)
+        .fetch_one(tx.conn())
         .await
         .map_err(|e| map_sqlx_error(&e, "Artifact", &artifact_id.to_string()))?;
 
-        if result.rows_affected() == 0 {
+        if updated {
+            return Ok(());
+        }
+        if !existed {
             return Err(DomainError::NotFound {
                 entity: "Artifact",
                 id: artifact_id.to_string(),
             });
         }
-        Ok(())
+        // Present, but its status is no longer `prior_status` — a
+        // concurrent verdict/transition won. Fail closed: the stale
+        // verdict must not overwrite the newer status. `warn!` (not
+        // `error!`) — recoverable and expected under contention, matching
+        // the `commit_transition` conflict convention.
+        tracing::warn!(
+            entity = "Artifact",
+            id = %artifact_id,
+            ?prior_status,
+            attempted = ?quarantine_status,
+            "verdict status write conflicted: quarantine_status changed since load"
+        );
+        Err(DomainError::Conflict(format!(
+            "artifact {artifact_id} quarantine_status changed concurrently \
+             (expected {prior_status}); verdict not applied"
+        )))
     }
 }
 
@@ -1575,6 +1629,9 @@ mod tests {
             id,
             QuarantineStatus::Rejected,
             verdict_updated_at,
+            // Prior status == what the seed row holds, so the #108
+            // conditional predicate matches and the write proceeds.
+            QuarantineStatus::Quarantined,
         )
         .await
         .expect("save_verdict_status_in_tx");
@@ -1634,10 +1691,157 @@ mod tests {
                 Uuid::new_v4(),
                 QuarantineStatus::Rejected,
                 Utc::now(),
+                QuarantineStatus::Quarantined,
             )
             .await
             .expect_err("missing row must error, not silently no-op");
-        assert!(matches!(err, DomainError::NotFound { .. }));
+        assert!(
+            matches!(err, DomainError::NotFound { .. }),
+            "an ABSENT id must stay NotFound — issue #108 added a Conflict arm for a \
+             PRESENT row whose status moved, and the two must not collapse; got {err:?}"
+        );
+    }
+
+    /// Seed one artifact row at `status` and return its id. Shared by the
+    /// #108 conditional-UPDATE tests below.
+    #[cfg(test)]
+    async fn seed_artifact_at_status(
+        pool: &PgPool,
+        repo_id: Uuid,
+        seed: usize,
+        status: QuarantineStatus,
+    ) -> (Uuid, DateTime<Utc>) {
+        use crate::event_store::PgEventStore;
+        use hort_domain::entities::artifact::Artifact;
+
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+        let id = Uuid::new_v4();
+        let anchor: DateTime<Utc> = "2025-06-01T00:00:00Z".parse().unwrap();
+        let artifact = Artifact {
+            id,
+            repository_id: repo_id,
+            name: "cond-pkg".into(),
+            name_as_published: "cond-pkg".into(),
+            version: Some("1.0.0".into()),
+            path: format!("cond-pkg/1.0.0/{id}.tar.gz"),
+            size_bytes: 42,
+            sha256_checksum: deterministic_hex64(seed).parse().unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: status,
+            rejection_reason: None,
+            quarantine_window_start: Some(anchor),
+            quarantine_deadline: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            is_deleted: false,
+            created_at: anchor,
+            updated_at: anchor,
+        };
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        repo.save_in_tx(&mut uow, &artifact)
+            .await
+            .expect("save_in_tx (seed)");
+        uow.commit().await.expect("commit (seed)");
+        (id, anchor)
+    }
+
+    /// issue #108 H2b — the conditional UPDATE must REFUSE a write whose
+    /// `prior_status` no longer matches the persisted row, and must
+    /// report that as `Conflict`, NOT `NotFound` (the row is present) and
+    /// certainly not by overwriting. This is the projection-layer backstop
+    /// behind the event-store OCC: it fires even when the append itself
+    /// did not conflict.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_verdict_status_in_tx_conflicts_when_prior_status_changed() {
+        use crate::event_store::PgEventStore;
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        // Persisted row is `Rejected` (as if a scan verdict just landed).
+        let (id, _anchor) =
+            seed_artifact_at_status(&pool, repo_id, 0xFEED_0108, QuarantineStatus::Rejected).await;
+
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+
+        // A stale verdict that LOADED `Quarantined` tries to write.
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        let err = repo
+            .save_verdict_status_in_tx(
+                &mut uow,
+                id,
+                QuarantineStatus::Released,
+                Utc::now(),
+                QuarantineStatus::Quarantined,
+            )
+            .await
+            .expect_err("a changed prior status must refuse the write");
+        drop(uow);
+
+        assert!(
+            matches!(err, DomainError::Conflict(_)),
+            "a PRESENT row whose status moved must be Conflict, not NotFound — the split is \
+             the whole point of the CTE; got {err:?}"
+        );
+        let saved = repo.find_by_id(id).await.expect("find_by_id");
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Rejected,
+            "the persisted status must be left exactly as the concurrent writer left it"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// issue #108 H2b — `QuarantineStatus::None` is stored as SQL `NULL`,
+    /// and `NULL = NULL` is `NULL` (never true), so the predicate MUST use
+    /// `IS NOT DISTINCT FROM`. A plain `=` would make every
+    /// `None`-prior-status verdict spuriously `Conflict`. Pins that the
+    /// NULL-prior case MATCHES and the write lands.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_verdict_status_in_tx_matches_null_prior_status() {
+        use crate::event_store::PgEventStore;
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        // Persisted row is `None` → the column is SQL NULL.
+        let (id, _anchor) =
+            seed_artifact_at_status(&pool, repo_id, 0xFEED_0109, QuarantineStatus::None).await;
+
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        repo.save_verdict_status_in_tx(
+            &mut uow,
+            id,
+            QuarantineStatus::Rejected,
+            Utc::now(),
+            QuarantineStatus::None,
+        )
+        .await
+        .expect("a NULL prior status must MATCH via IS NOT DISTINCT FROM, not spuriously conflict");
+        uow.commit().await.expect("commit");
+
+        let saved = repo.find_by_id(id).await.expect("find_by_id");
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+
+        cleanup_repo(&pool, repo_id).await;
     }
 
     // ---------------------------------------------------------------------

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::entities::artifact::{Artifact, ArtifactMetadata};
+use crate::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use crate::error::DomainResult;
 use crate::ports::event_store::{AppendEvents, AppendResult};
 use crate::ports::repo_security_score_repository::ScoreDelta;
@@ -124,6 +124,19 @@ pub trait ArtifactLifecyclePort: Send + Sync {
     /// to fall back to a per-row + transition path. Forcing every
     /// `ArtifactLifecyclePort` impl to implement this method removes
     /// the string-match dispatch.
+    ///
+    /// `prior_status` is the `quarantine_status` the caller **loaded**,
+    /// before the domain transition mutated `artifact` — see
+    /// [`Self::commit_provenance_verdict`]'s doc for the full
+    /// skip-unchanged / conditional-write contract both verdict methods
+    /// share (issue #108 H2b).
+    ///
+    /// `too_many_arguments`: 8 with `&self` — the scan dual-write's
+    /// irreducible payload (events + findings + `last_scan_at` + score +
+    /// SBOM) plus #108's `prior_status` guard. Bundling into a struct
+    /// would churn every impl and call site for no behavioural gain; each
+    /// parameter is already individually documented above.
+    #[allow(clippy::too_many_arguments)]
     fn commit_scan_result_with_score<'a>(
         &'a self,
         artifact: &'a Artifact,
@@ -132,6 +145,7 @@ pub trait ArtifactLifecyclePort: Send + Sync {
         last_scan_at: DateTime<Utc>,
         score_delta: Option<(Uuid, ScoreDelta)>,
         sbom_components: Option<&'a [SbomComponent]>,
+        prior_status: QuarantineStatus,
     ) -> BoxFuture<'a, DomainResult<AppendResult>>;
 
     /// Atomically commit a **creation transition** and enqueue its
@@ -201,15 +215,51 @@ pub trait ArtifactLifecyclePort: Send + Sync {
     /// nothing else, so a concurrently-committed transition's other
     /// columns survive.
     ///
+    /// ## `prior_status` — the status-column guard (issue #108 H2b)
+    ///
+    /// #90 (above) scoped the write to the status column, which protected
+    /// every OTHER column from the stale snapshot — but left
+    /// `quarantine_status` itself, the security-load-bearing column,
+    /// written unconditionally from that same stale snapshot. A signed
+    /// image that also trips a scan policy could therefore resurrect
+    /// `Rejected → Quarantined` and timer-release.
+    ///
+    /// `prior_status` is the `quarantine_status` the caller **loaded**,
+    /// before the domain transition mutated `artifact`. Implementations
+    /// MUST honour both halves of the contract:
+    ///
+    /// 1. **Skip-unchanged.** When `artifact.quarantine_status ==
+    ///    prior_status` the transition did not change the status (the
+    ///    `ProvenanceVerified` case — the artifact stays `Quarantined`),
+    ///    so the status column MUST NOT be written at all. This removes
+    ///    the revert vector at the source, independent of any timing
+    ///    window: there is simply no write to lose a race with.
+    /// 2. **Conditional write.** Otherwise the write MUST be conditional
+    ///    on the persisted row still holding `prior_status` (`WHERE id =
+    ///    $ AND quarantine_status IS NOT DISTINCT FROM $prior`). A
+    ///    present row whose status has since changed MUST fail
+    ///    [`DomainError::Conflict`] — NOT be overwritten, and NOT be
+    ///    reported as [`DomainError::NotFound`] (which stays reserved for
+    ///    a genuinely absent id).
+    ///
+    /// This is defense-in-depth *behind* the event-store OCC: both verdict
+    /// paths append to the same `StreamId::artifact(id)`, so a concurrent
+    /// verdict's append already makes the later append fail `Conflict`
+    /// before the projection write is reached. The conditional UPDATE
+    /// catches any future path whose append does not conflict.
+    ///
     /// ## Default impl — test doubles only
     ///
-    /// Forwards to [`Self::commit_transition`] (full-row write). Production
-    /// adapters MUST override it.
+    /// Forwards to [`Self::commit_transition`] (full-row write, and
+    /// therefore honouring NEITHER guarantee above). Production adapters
+    /// MUST override it.
     fn commit_provenance_verdict<'a>(
         &'a self,
         artifact: &'a Artifact,
         events: AppendEvents,
+        prior_status: QuarantineStatus,
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+        let _ = prior_status;
         self.commit_transition(artifact, events, None)
     }
 }
@@ -257,6 +307,7 @@ mod tests {
             // `commit_scan_result_with_score`
             // is deliberately not defaulted; this stub is unreachable in the
             // current test (which only drives `commit_transition_with_score`).
+            #[allow(clippy::too_many_arguments)]
             fn commit_scan_result_with_score<'a>(
                 &'a self,
                 _artifact: &'a Artifact,
@@ -265,6 +316,7 @@ mod tests {
                 _last_scan_at: DateTime<Utc>,
                 _score_delta: Option<(Uuid, ScoreDelta)>,
                 _sbom_components: Option<&'a [SbomComponent]>,
+                _prior_status: QuarantineStatus,
             ) -> BoxFuture<'a, DomainResult<AppendResult>> {
                 Box::pin(async { unreachable!() })
             }
@@ -287,7 +339,7 @@ mod tests {
             sha1_checksum: None,
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
-            quarantine_status: crate::entities::artifact::QuarantineStatus::None,
+            quarantine_status: QuarantineStatus::None,
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
@@ -352,6 +404,7 @@ mod tests {
                     })
                 })
             }
+            #[allow(clippy::too_many_arguments)]
             fn commit_scan_result_with_score<'a>(
                 &'a self,
                 _artifact: &'a Artifact,
@@ -360,6 +413,7 @@ mod tests {
                 _last_scan_at: DateTime<Utc>,
                 _score_delta: Option<(Uuid, ScoreDelta)>,
                 _sbom_components: Option<&'a [SbomComponent]>,
+                _prior_status: QuarantineStatus,
             ) -> BoxFuture<'a, DomainResult<AppendResult>> {
                 Box::pin(async { unreachable!() })
             }
@@ -396,7 +450,7 @@ mod tests {
             sha1_checksum: None,
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
-            quarantine_status: crate::entities::artifact::QuarantineStatus::None,
+            quarantine_status: QuarantineStatus::None,
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
@@ -458,6 +512,7 @@ mod tests {
                     })
                 })
             }
+            #[allow(clippy::too_many_arguments)]
             fn commit_scan_result_with_score<'a>(
                 &'a self,
                 _artifact: &'a Artifact,
@@ -466,6 +521,7 @@ mod tests {
                 _last_scan_at: DateTime<Utc>,
                 _score_delta: Option<(Uuid, ScoreDelta)>,
                 _sbom_components: Option<&'a [SbomComponent]>,
+                _prior_status: QuarantineStatus,
             ) -> BoxFuture<'a, DomainResult<AppendResult>> {
                 Box::pin(async { unreachable!() })
             }
@@ -488,7 +544,7 @@ mod tests {
             sha1_checksum: None,
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
-            quarantine_status: crate::entities::artifact::QuarantineStatus::Rejected,
+            quarantine_status: QuarantineStatus::Rejected,
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
@@ -507,7 +563,7 @@ mod tests {
             actor: crate::events::system_actor(),
         };
 
-        l.commit_provenance_verdict(&artifact, events)
+        l.commit_provenance_verdict(&artifact, events, QuarantineStatus::None)
             .await
             .unwrap();
 
@@ -538,6 +594,7 @@ mod tests {
                 Box::pin(async { unreachable!() })
             }
 
+            #[allow(clippy::too_many_arguments)]
             fn commit_scan_result_with_score<'a>(
                 &'a self,
                 _artifact: &'a Artifact,
@@ -546,6 +603,7 @@ mod tests {
                 _last_scan_at: DateTime<Utc>,
                 _score_delta: Option<(Uuid, ScoreDelta)>,
                 _sbom_components: Option<&'a [SbomComponent]>,
+                _prior_status: QuarantineStatus,
             ) -> BoxFuture<'a, DomainResult<AppendResult>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async {
@@ -573,7 +631,7 @@ mod tests {
             sha1_checksum: None,
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
-            quarantine_status: crate::entities::artifact::QuarantineStatus::None,
+            quarantine_status: QuarantineStatus::None,
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
@@ -591,9 +649,17 @@ mod tests {
             causation_id: None,
             actor: crate::events::system_actor(),
         };
-        l.commit_scan_result_with_score(&artifact, events, &[], Utc::now(), None, None)
-            .await
-            .unwrap();
+        l.commit_scan_result_with_score(
+            &artifact,
+            events,
+            &[],
+            Utc::now(),
+            None,
+            None,
+            QuarantineStatus::None,
+        )
+        .await
+        .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -621,6 +687,7 @@ mod tests {
                 Box::pin(async { unreachable!() })
             }
 
+            #[allow(clippy::too_many_arguments)]
             fn commit_scan_result_with_score<'a>(
                 &'a self,
                 _artifact: &'a Artifact,
@@ -629,6 +696,7 @@ mod tests {
                 _last_scan_at: DateTime<Utc>,
                 _score_delta: Option<(Uuid, ScoreDelta)>,
                 sbom_components: Option<&'a [SbomComponent]>,
+                _prior_status: QuarantineStatus,
             ) -> BoxFuture<'a, DomainResult<AppendResult>> {
                 match sbom_components {
                     None => self.none_calls.fetch_add(1, Ordering::SeqCst),
@@ -664,7 +732,7 @@ mod tests {
             sha1_checksum: None,
             md5_checksum: None,
             content_type: "application/octet-stream".into(),
-            quarantine_status: crate::entities::artifact::QuarantineStatus::None,
+            quarantine_status: QuarantineStatus::None,
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
@@ -683,9 +751,17 @@ mod tests {
             actor: crate::events::system_actor(),
         };
 
-        l.commit_scan_result_with_score(&artifact, events.clone(), &[], Utc::now(), None, None)
-            .await
-            .unwrap();
+        l.commit_scan_result_with_score(
+            &artifact,
+            events.clone(),
+            &[],
+            Utc::now(),
+            None,
+            None,
+            QuarantineStatus::None,
+        )
+        .await
+        .unwrap();
         l.commit_scan_result_with_score(
             &artifact,
             events.clone(),
@@ -693,6 +769,7 @@ mod tests {
             Utc::now(),
             None,
             Some(&[]),
+            QuarantineStatus::None,
         )
         .await
         .unwrap();
@@ -705,9 +782,17 @@ mod tests {
             direct_dependency: true,
         };
         let comps = [comp];
-        l.commit_scan_result_with_score(&artifact, events, &[], Utc::now(), None, Some(&comps))
-            .await
-            .unwrap();
+        l.commit_scan_result_with_score(
+            &artifact,
+            events,
+            &[],
+            Utc::now(),
+            None,
+            Some(&comps),
+            QuarantineStatus::None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(none_calls.load(Ordering::SeqCst), 1);
         assert_eq!(some_empty_calls.load(Ordering::SeqCst), 1);

@@ -431,6 +431,7 @@ async fn commit_scan_result_constraint_violation_rolls_back_event_append() {
             Utc::now(),
             None,
             Some(&bad_components),
+            artifact.quarantine_status,
         )
         .await;
     assert!(
