@@ -129,7 +129,8 @@ pub struct CurateOrAdminPrincipal(pub CallerPrincipal);
 /// two-leg precedence). A scraper `ServiceAccount` is not an admin and an
 /// admin credential is not implicitly a scrape credential; an operator who
 /// needs both holds two explicit grants. See
-/// `docs/plans/113-metrics-readmetrics-grant.md` §2 D3.
+/// `docs/adr/0052-scoped-metrics-read-capability.md` (D3, the orthogonality
+/// decision, recorded there as landed).
 ///
 /// **Orthogonality is enforced end-to-end (closed by item 2b).** The
 /// shared [`RbacEvaluator::authorize`](hort_app::rbac::RbacEvaluator::authorize)

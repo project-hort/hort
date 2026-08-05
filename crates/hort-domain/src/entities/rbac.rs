@@ -59,10 +59,9 @@ pub enum Permission {
     /// `'read_metrics'`. Granted via the audited `ApplyConfigUseCase` apply
     /// path to a dedicated scraper `ServiceAccount` (non-admin). Orthogonal
     /// to `Admin` — an admin caller does not implicitly hold this grant, and
-    /// a scraper does not implicitly hold admin authority. See issue #113 and
-    /// `docs/plans/113-metrics-readmetrics-grant.md` §4 (the standing ADR for
-    /// this capability is authored by backlog Item 6, under whatever number
-    /// is next-free at that time).
+    /// a scraper does not implicitly hold admin authority. See issue #113
+    /// and `docs/adr/0052-scoped-metrics-read-capability.md`, the standing
+    /// decision record for this capability.
     ReadMetrics,
 }
 

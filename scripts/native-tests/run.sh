@@ -106,18 +106,58 @@ COMPOSE_FILE="$REPO_ROOT/deploy/compose/docker-compose.yml"
 COMPOSE_NETWORK="hort_default"
 IMAGE="hort-test-client:dev"
 KC_DISCOVERY="http://localhost:25082/realms/hort/.well-known/openid-configuration"
+# Host-mapped Keycloak token endpoint + hort-server base — same realm/client
+# `lib/common.sh`'s `fetch_token` uses from inside a scenario container, just
+# reached from the HOST instead of the compose network. Used only by
+# `mint_metrics_token` below.
+HOST_KC_TOKEN_URL="http://localhost:25082/realms/hort/protocol/openid-connect/token"
+HOST_HORT="http://localhost:25080"
 # Readiness probe for hort-server itself. NOT `/metrics` — that endpoint
 # unconditionally requires a bearer carrying `read_metrics` (#113 item 3,
 # no anonymous-scrape opt-out), so an anonymous readiness curl against it
 # would 401 forever and never observe "up". `/healthz` on the main
 # listener is anonymous by design (kubelet-probe shape) and proves the
 # same thing: the binary finished booting and is accepting connections.
-HOST_HEALTHZ="http://localhost:25080/healthz"
+HOST_HEALTHZ="${HOST_HORT}/healthz"
 
 # Context is the repo root: the Dockerfile's stage 1 builds hort-cli from the
 # workspace (.dockerignore keeps target/.git out, so the context stays small).
 build_image() { docker build -q -f "$SCRIPT_DIR/Dockerfile.client" -t "$IMAGE" "$REPO_ROOT" >/dev/null; }
 now() { date +%s; }
+
+# mint_metrics_token -> prints a read_metrics-granted bearer for the
+# `metrics-scraper` ServiceAccount (deploy/compose/example-config/service-
+# accounts/metrics-scraper.yaml + the paired serviceAccount-subject
+# PermissionGrant in auth/metrics-scraper-read-metrics.yaml), or prints
+# nothing and returns non-zero on any failed step. Host-side (curl +
+# `compose exec postgres psql`) — mirrors
+# scenarios/quarantine/provenance-push-then-sign.sh's admin-mint pattern
+# for the provenance-ci SA, but runs ONCE per harness run (here) instead
+# of once per scenario, since every /metrics-scraping scenario needs the
+# SAME bearer. #113 item 5 — restores the assertion power the anon-hatch
+# retirement (#113 item 3) took away from every METRICS_URL call site.
+mint_metrics_token() {
+  local admin_token sa_uid token
+  admin_token="$(curl -sS -X POST "$HOST_KC_TOKEN_URL" \
+    -d grant_type=password -d client_id=hort-server \
+    -d client_secret=hort-server-secret-dev-only \
+    -d username=admin -d password=admin 2>/dev/null | jq -r '.access_token // empty')"
+  [ -n "$admin_token" ] || { echo "mint_metrics_token: could not fetch admin Keycloak token" >&2; return 1; }
+  sa_uid="$(docker compose "${CA[@]}" exec -T postgres \
+    psql -U registry -d artifact_registry -tAX \
+    -c "SELECT id FROM users WHERE username='sa:metrics-scraper';" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$sa_uid" ] || {
+    echo "mint_metrics_token: no users row 'sa:metrics-scraper' — " \
+         "deploy/compose/example-config/service-accounts/metrics-scraper.yaml not applied?" >&2
+    return 1
+  }
+  token="$(curl -sS -X POST \
+    -H "Authorization: Bearer ${admin_token}" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"metrics-scraper-e2e-$(date +%s)\",\"declared_permissions\":[\"read_metrics\"],\"expires_in_days\":1}" \
+    "${HOST_HORT}/api/v1/admin/users/${sa_uid}/tokens" 2>/dev/null | jq -r '.token // empty')"
+  [ -n "$token" ] || { echo "mint_metrics_token: admin-mint POST returned no token" >&2; return 1; }
+  printf '%s' "$token"
+}
 wait_url() { local u="$1" t="${2:-120}"; local d=$(( $(now)+t )); until curl -fsS -o /dev/null "$u" 2>/dev/null; do [ "$(now)" -ge "$d" ] && return 1; sleep 2; done; }
 
 # Base compose file + any `--compose-overlay=<o>` files (provenance/federation/wiremock).
@@ -154,13 +194,27 @@ if [ "$HORT_MODE" = "compose" ]; then
   IN_HORT="http://hort-server:8080"; IN_KC="http://keycloak:8080/realms/hort"; IN_METRICS="http://hort-server:9090/metrics"
   NET_ARGS=(--network "$COMPOSE_NETWORK")
   DB_DSN="postgres://registry:registry@postgres:5432/artifact_registry"
+  # Harness setup (#113 item 5): mint the read_metrics bearer ONCE for the
+  # whole run — compose mode always has the gitops-applied metrics-scraper
+  # SA (deploy/compose/example-config) and DB/Keycloak access to mint it.
+  # A failure here is an infra problem, not a per-scenario skip condition —
+  # every scenario in the METRICS_URL call-site inventory now needs this
+  # token to scrape anything, so fail the whole run loudly rather than let
+  # ~10 scenarios silently degrade to "unauthenticated / always-skip".
+  IN_METRICS_TOKEN="$(mint_metrics_token)" || { echo "could not mint the read_metrics scrape token" >&2; exit 1; }
 else
   : "${HORT_URL:?external mode needs HORT_URL}"; : "${KEYCLOAK_URL:?external mode needs KEYCLOAK_URL}"
   build_image
   # External /metrics is usually an internal control-plane port, not on HORT_URL;
   # leave IN_METRICS empty unless the caller set METRICS_URL → assert_metric_ingest
-  # then skips rather than failing on a 404 (S2).
+  # then skips rather than failing on a 404 (S2). METRICS_TOKEN mirrors it:
+  # external mode has no gitops-managed metrics-scraper SA to admin-mint
+  # against, so the caller supplies a pre-minted read_metrics-granted
+  # bearer via the METRICS_TOKEN env var if they want the scrape
+  # assertions to run authenticated; unset means they stay skipped exactly
+  # like the METRICS_URL-unset case already did pre-#113.
   IN_HORT="$HORT_URL"; IN_KC="$KEYCLOAK_URL"; IN_METRICS="${METRICS_URL:-}"
+  IN_METRICS_TOKEN="${METRICS_TOKEN:-}"
   NET_ARGS=(); DB_DSN="${HORT_DB_DSN:-}"
 fi
 
@@ -176,6 +230,7 @@ run_one() {  # group name path
   # external stack's posture.
   docker run --rm --add-host=host.docker.internal:host-gateway "${NET_ARGS[@]}" \
     -e HORT_URL="$IN_HORT" -e KEYCLOAK_URL="$IN_KC" -e METRICS_URL="$IN_METRICS" \
+    -e METRICS_TOKEN="$IN_METRICS_TOKEN" \
     -e HORT_DB_DSN="$DB_DSN" \
     -e HORT_COMPOSE_OVERLAYS="${OVERLAYS[*]:-${HORT_COMPOSE_OVERLAYS:-}}" \
     -v "$SCRIPT_DIR":/work:ro -e FIXTURES=/work/fixtures \

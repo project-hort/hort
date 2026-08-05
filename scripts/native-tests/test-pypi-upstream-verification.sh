@@ -87,6 +87,18 @@ set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-http://hort-server:8080}"
 METRICS_URL="${METRICS_URL:-http://hort-server:9090/metrics}"
+# #113 item 5: /metrics unconditionally requires a read_metrics bearer
+# (no anon-scrape opt-out — item 3). These standalone diagnostic scripts
+# are not part of the run.sh-orchestrated harness (no CI wiring, no DB/
+# compose-exec plumbing here) — Item 5 does not auto-mint a token for
+# them. Set METRICS_TOKEN yourself (e.g. `hort-server admin
+# issue-svc-token --name metrics-scraper --permission read_metrics`
+# via `docker compose exec hort-server`) to run the metric checks
+# authenticated; unset, the curl below now 401s (same empty-metric
+# fallback as before, `|| true`).
+METRICS_TOKEN="${METRICS_TOKEN:-}"
+METRICS_AUTH_HEADER=()
+if [ -n "$METRICS_TOKEN" ]; then METRICS_AUTH_HEADER=(-H "Authorization: Bearer ${METRICS_TOKEN}"); fi
 PYPI_REPO_KEY="${PYPI_REPO_KEY:-pypi-upstream-e2e}"
 WIREMOCK_HAPPY_URL="${WIREMOCK_HAPPY_URL:-http://wiremock-pypi-upstream:8080}"
 
@@ -209,7 +221,7 @@ rm -f "$LOOKUP_TMP"
 # pipefail aborts under set -e; awk's regex match always exits 0).
 # ---------------------------------------------------------------------
 read_verified_metric() {
-    curl -sf "$METRICS_URL" 2>/dev/null \
+    curl -sf "${METRICS_AUTH_HEADER[@]}" "$METRICS_URL" 2>/dev/null \
         | awk '/^hort_upstream_checksum_total\{[^}]*format="pypi"[^}]*result="verified"[^}]*\}/ { s += $NF } END { printf "%d\n", (s+0) }' \
         || true
 }
