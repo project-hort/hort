@@ -81,12 +81,17 @@ pub struct ResolvedAuthority {
     pub resolved_claims: Vec<String>,
     /// The `(repository, permission)` cells the resolved claim set holds.
     /// Empty when `global_admin` is `true` (the marker stands in for the
-    /// full authority — never an enumeration of every
-    /// repository) OR when the claims hold no grant.
+    /// full authority — never an enumeration of every repository) OR when
+    /// the claims hold no grant. **One exception (#113 / D3):**
+    /// `Permission::ReadMetrics` is carved out of the admin marker, so
+    /// `effective_grants` may carry an explicit `ReadMetrics` entry even
+    /// when `global_admin` is `true`, if the resolved claims also hold that
+    /// grant — see [`RbacEvaluator::effective_grants`].
     pub effective_grants: Vec<ResolvedGrant>,
     /// `true` ⇒ the resolved claim set includes the `admin` claim (a group
     /// mapped to `admin` via a `ClaimMapping`); the authority is a full
-    /// admin and `effective_grants` is empty (the marker).
+    /// admin and `effective_grants` is empty, EXCEPT for a possible
+    /// explicit `ReadMetrics` entry (see `effective_grants` above).
     pub global_admin: bool,
 }
 
@@ -526,6 +531,43 @@ mod tests {
         assert!(
             out.effective_grants.is_empty(),
             "the admin marker stands in for the full authority — never an enumeration"
+        );
+    }
+
+    /// #113 / D3 sweep: `ReadMetrics` is carved out of the admin marker, so
+    /// an admin-mapped group's what-if resolution surfaces an explicit
+    /// `ReadMetrics` cell when the resolved claim also holds that grant —
+    /// this use case's direct pass-through of `RbacEvaluator::effective_grants`
+    /// (no cells-vs-marker branching of its own) must not silently drop it.
+    #[tokio::test]
+    async fn group_mapped_to_admin_claim_with_read_metrics_grant_surfaces_cell() {
+        let mappings = Arc::new(MockClaimMappingRepo::new());
+        mappings.seed(vec![mapping("platform-admins", "admin")]);
+        let grants = Arc::new(MockGrantRepo::new());
+        grants.seed(vec![
+            claims_grant(&["developer"], None, Permission::Read),
+            claims_grant(&["admin"], None, Permission::ReadMetrics),
+        ]);
+
+        let uc = build(mappings, grants);
+        let out = uc
+            .resolve(
+                api_actor(),
+                admin_privileges(),
+                groups(&["platform-admins"]),
+            )
+            .await
+            .expect("admin-claim group resolves");
+
+        assert!(out.global_admin);
+        assert_eq!(
+            out.effective_grants,
+            vec![ResolvedGrant {
+                repository_id: None,
+                permission: Permission::ReadMetrics,
+            }],
+            "the marker still covers Read (not enumerated), but the explicit \
+             ReadMetrics grant surfaces alongside global_admin: true"
         );
     }
 
