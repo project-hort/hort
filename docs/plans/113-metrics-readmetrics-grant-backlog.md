@@ -3,7 +3,7 @@
 PR-sized items, dependency-ordered. Design doc: `113-metrics-readmetrics-grant.md`.
 All work lands on `agent/113-metrics-readmetrics-grant`. Items 1–2 are the
 domain/schema foundation; 2b closes the evaluator gap found during Item 2
-review; 3 is the gate; 4 is the ADR + docs distillation (must land before main
+review; 2c the whoami reporting follow-up; 3 is the gate; 4 is the ADR + docs distillation (must land before main
 merge, per D7).
 
 ## Item 1 — `Permission::ReadMetrics` domain variant + migration 016
@@ -86,6 +86,41 @@ short-circuit ~line 249, `effective_grants` marker short-circuit ~line 325, the
   forward-motion instructions) and becomes the permanent orthogonality guard.
 - 100% `hort-app` coverage on the changed branches.
 
+## Item 2c — whoami surfaces the admin × `ReadMetrics` exception (wire-contract fix)
+
+**Added during Item 2b review (2026-08-05).** Item 2b makes `effective_grants()`
+carry an explicit `ReadMetrics` cell for admins, but the whoami HTTP handler
+(`hort-http-core/src/handlers/auth.rs::resolve_effective_grants`) discards
+`grant_set.cells` on the uncapped-admin path and returns the bare
+`{"global_admin": true}` marker — so an admin's whoami cannot distinguish
+"holds `read_metrics`" from "doesn't." Reporting-accuracy gap only;
+`authorize()` is already correct.
+
+**Wire-shape DECISION (architect, 2026-08-05):** extend the marker variant
+additively — `WhoamiEffectiveGrants::GlobalAdmin { global_admin: true,
+read_metrics: bool }` — rather than falling through to `Cells` when an
+exception cell exists (which would hide global-admin status from clients
+whenever the grant is held). Additive JSON field; existing clients unaffected.
+
+**Design doc section:** §2 D3 (orthogonality decision, reporting consistency)
+**Read first:** `crates/hort-http-core/src/handlers/auth.rs`
+(`resolve_effective_grants`, `WhoamiEffectiveGrants`), Item 2b's
+`effective_grants` semantics in `crates/hort-app/src/rbac.rs`, the capped-admin
+branch (`cap_cells`) for whether the cap path needs the same treatment
+**Acceptance:**
+- `WhoamiEffectiveGrants::GlobalAdmin` gains `read_metrics: bool`, populated
+  from the `ReadMetrics` cell(s) in `grant_set.cells` on the uncapped-admin
+  path; serialization is additive (existing fields unchanged).
+- Capped-admin path audited: cap cells already re-pass `authorize()` per Item
+  2b's `derive_cli_session_cap` fix — confirm (test) that a capped admin whose
+  cap advertises `read_metrics` actually held the grant at mint time, and that
+  the whoami cap rendering needs no parallel field (document why if so).
+- Tests: uncapped admin with grant → `read_metrics: true`; without →
+  `read_metrics: false`; non-admin path byte-identical.
+- API docs (whoami reference) updated with the new field + the one-permission
+  exception rationale.
+- ≥85% coverage on new `hort-http-core` code.
+
 ## Item 3 — Serve `/metrics` admin-listener-only; drop public-main-listener carve-out; retire the anon hatch
 
 **Design doc section:** §2 D4, D5
@@ -134,6 +169,6 @@ but must reflect their final shapes before merge.
 ```
 
 ## Sequencing / notes
-- Merge order: 1 → 2 → 2b → 3, with 4 landing before the develop→main promotion (D7 delete of `docs/plans/`).
+- Merge order: 1 → 2 → 2b → 2c → 3, with 4 landing before the develop→main promotion (D7 delete of `docs/plans/`).
 - Not architecture-eroding: no new port, no `AppContext` field, no adapter import in a format crate, no release-gate interaction. One additive migration.
 - Pre-push gate per CLAUDE.md (`cargo fmt/clippy/test --workspace`, `cargo audit`, `cargo deny`); migration adds a non-workspace-crate-free change so no attribution regen needed.

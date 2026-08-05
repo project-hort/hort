@@ -131,19 +131,14 @@ pub struct CurateOrAdminPrincipal(pub CallerPrincipal);
 /// needs both holds two explicit grants. See
 /// `docs/plans/113-metrics-readmetrics-grant.md` §2 D3.
 ///
-/// **KNOWN GAP (flagged, not fixed by this extractor):** the shared
-/// [`RbacEvaluator::authorize`](hort_app::rbac::RbacEvaluator::authorize) →
-/// `user_grants_authorize` short-circuit still treats the `"admin"` claim
-/// as satisfying *every* `Permission`, `ReadMetrics` included — this
-/// extractor cannot override that from the outside. So today an
-/// `admin`-claim principal *does* pass this gate without an explicit
-/// `read_metrics` grant, which contradicts the D3 decision above. Closing
-/// that requires a `ReadMetrics` carve-out inside `RbacEvaluator` itself
-/// (and a matching fix in `effective_grants`, which shares the same
-/// admin-marker short-circuit and is asserted consistent with `authorize`
-/// by the `effective_grants_agrees_with_authorize_per_cell` test) —
-/// deliberately deferred out of this change; see the handover report for
-/// #113 item 2.
+/// **Orthogonality is enforced end-to-end (closed by item 2b).** The
+/// shared [`RbacEvaluator::authorize`](hort_app::rbac::RbacEvaluator::authorize)
+/// → `user_grants_authorize` admin-claim short-circuit carves
+/// `Permission::ReadMetrics` out (unlike every other permission) — see
+/// `hort-app/src/rbac.rs`. An `admin`-claim principal without an explicit
+/// `read_metrics` grant is denied by this extractor; see the permanent
+/// regression guard `metrics_reader_admin_claim_without_explicit_grant_is_denied`
+/// below.
 ///
 /// Under Disabled, grants unconditionally and logs an info-level audit
 /// line. RBAC enforcement resumes when `AuthContext::Enabled`.
@@ -1689,26 +1684,20 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// **KNOWN GAP vs the D3 "orthogonal, no Admin fall-through" decision**
-    /// (see the [`MetricsReaderPrincipal`] doc comment). This extractor's
-    /// own control flow never tries `Permission::Admin` as a fallback —
-    /// but `RbacEvaluator::user_grants_authorize`'s pre-existing `"admin"`
-    /// claim short-circuit is unconditional across every `Permission`
-    /// variant (see `DeleteRepoAccess`'s doc comment for the same
-    /// short-circuit accepted for `Permission::Delete`), so an
-    /// admin-claim principal reaches this extractor without an explicit
-    /// `read_metrics` grant and is allowed. This test PINS today's actual
-    /// behavior (200) — it does NOT assert the decided policy (403) — so a
-    /// future change to `RbacEvaluator` that closes the gap fails this
-    /// test loudly and must update it alongside the fix, rather than the
-    /// gap silently persisting unnoticed. Closing it requires a
-    /// `ReadMetrics` carve-out in `RbacEvaluator` (both `authorize` and
-    /// `effective_grants`, which the `effective_grants_agrees_with_authorize_per_cell`
-    /// test asserts stay consistent) — deferred out of this change; see the
-    /// #113 item 2 handover report for the two remediation options put to
-    /// the architect.
+    /// **Permanent orthogonality guard (#113 / D3, closed by item 2b).**
+    /// This extractor's own control flow never tries `Permission::Admin` as
+    /// a fallback, and — since item 2b —
+    /// `RbacEvaluator::user_grants_authorize`'s `"admin"` claim
+    /// short-circuit carves `Permission::ReadMetrics` out too (unlike
+    /// every other permission; see `DeleteRepoAccess`'s doc comment for
+    /// the short-circuit still accepted there), so an admin-claim
+    /// principal WITHOUT an explicit `read_metrics` grant is now denied
+    /// end-to-end through this extractor. This test used to pin the
+    /// pre-2b gap (200, not the decided 403) as
+    /// `metrics_reader_admin_claim_short_circuits_pending_113_evaluator_carveout`;
+    /// flipped now that the carve-out landed in `hort-app/src/rbac.rs`.
     #[test]
-    fn metrics_reader_admin_claim_short_circuits_pending_113_evaluator_carveout() {
+    fn metrics_reader_admin_claim_without_explicit_grant_is_denied() {
         let status = run_async(async {
             let repos = Arc::new(MockRepositoryRepository::new());
             // No explicit read_metrics grant anywhere in this evaluator.
@@ -1719,10 +1708,9 @@ mod tests {
         });
         assert_eq!(
             status,
-            StatusCode::OK,
-            "if this now fails with 403, the RbacEvaluator carve-out has landed — \
-             update this test's assertion and doc comment instead of treating the \
-             failure as a regression"
+            StatusCode::FORBIDDEN,
+            "an admin-claim principal without an explicit read_metrics grant \
+             must be denied — orthogonality is DECIDED (#113 / D3)"
         );
     }
 

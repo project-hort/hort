@@ -33,16 +33,23 @@ use hort_domain::entities::rbac::{ClaimMapping, GrantSubject, Permission, Permis
 /// "everything") when the inputs resolve to admin — `claims` contains the
 /// synthetic `admin` claim OR `is_admin` is set. The list is **never** an
 /// enumeration of every repository (unbounded, useless); the marker stands
-/// in for the full authority.
+/// in for the full authority — with ONE exception: `Permission::ReadMetrics`
+/// (#113 / D3) is deliberately excluded from the marker, so `cells` may
+/// carry an explicit `(repo, ReadMetrics)` entry alongside
+/// `is_global_admin: true` when the admin also holds that grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveGrantSet {
-    /// `true` ⇒ the authority set is a full admin: `cells` is empty and the
-    /// marker means "holds everything". `false` ⇒ `cells` is the exact
-    /// held footprint (possibly empty = holds nothing).
+    /// `true` ⇒ the authority set is a full admin: `cells` is empty for
+    /// every permission except `ReadMetrics` and the marker means "holds
+    /// everything else". `false` ⇒ `cells` is the exact held footprint
+    /// (possibly empty = holds nothing).
     pub is_global_admin: bool,
     /// `(None, perm)` = global grant; `(Some(repo), perm)` = per-repo.
     /// De-duplicated, insertion-order preserved. Empty + `!is_global_admin`
-    /// = the authority set holds nothing.
+    /// = the authority set holds nothing. When `is_global_admin` is `true`
+    /// this is empty UNLESS the admin also holds an explicit
+    /// `ReadMetrics` grant, in which case that one cell is present — see
+    /// [`RbacEvaluator::effective_grants`].
     pub cells: Vec<(Option<Uuid>, Permission)>,
 }
 
@@ -246,7 +253,16 @@ impl RbacEvaluator {
         // set. One source of truth at evaluation time; `User.is_admin` is
         // DB metadata kept in sync with the synthetic `admin` claim by
         // construction.
-        if principal.claims.iter().any(|c| c == "admin") {
+        //
+        // `Permission::ReadMetrics` is excluded from this short-circuit
+        // (#113 / design doc §2 D3, DECIDED 2026-08-05: orthogonal — an
+        // admin does not implicitly hold `ReadMetrics`, and a scraper does
+        // not implicitly hold admin authority). Every other permission
+        // keeps the short-circuit unchanged. Falls through to the ordinary
+        // grant scan below, identical to a non-admin principal — a
+        // `read_metrics` grant on the `admin` claim (or on any claim/user
+        // the admin also carries) still authorizes it there.
+        if permission != Permission::ReadMetrics && principal.claims.iter().any(|c| c == "admin") {
             // B1 (ADR 0036): a cap-bound native token (Pat/ServiceAccount) carrying
             // the admin claim MUST also carry a cap — `authenticate_pat` always
             // constructs `Some(cap)`. A `None` cap here is an anomalous construction;
@@ -297,13 +313,22 @@ impl RbacEvaluator {
     ///   so an `is_admin` Local user — or a group mapped to
     ///   the `admin` claim — short-circuits.
     ///
-    /// # Admin short-circuit (a marker, never an enumeration)
+    /// # Admin short-circuit (a marker, almost never an enumeration)
     ///
     /// When `claims` contains the case-sensitive lowercase `"admin"` claim
-    /// OR `is_admin` is set, the result is
-    /// `EffectiveGrantSet { is_global_admin: true, cells: vec![] }`. A full
-    /// admin holds every authority; enumerating every repository would be
-    /// unbounded and useless, so the marker stands in for it.
+    /// OR `is_admin` is set, `is_global_admin` is `true` and `cells` is
+    /// empty for every permission EXCEPT `Permission::ReadMetrics` (#113 /
+    /// design doc §2 D3, DECIDED 2026-08-05: orthogonal — an admin does not
+    /// implicitly hold `ReadMetrics`). A full admin holds every OTHER
+    /// authority; enumerating every repository for those would be
+    /// unbounded and useless, so the marker stands in for them. An explicit
+    /// `read_metrics` grant the admin also holds still surfaces as an
+    /// ordinary `(repo, ReadMetrics)` cell — mirroring
+    /// [`Self::user_grants_authorize`]'s matching carve-out exactly, so an
+    /// admin's self-view here never claims authority `authorize()` would
+    /// actually deny (the "one authority source" invariant this function
+    /// exists to uphold — see
+    /// `effective_grants_agrees_with_authorize_per_cell`).
     ///
     /// # Cap-agnostic by design
     ///
@@ -319,18 +344,20 @@ impl RbacEvaluator {
         user_id: Option<Uuid>,
         is_admin: bool,
     ) -> EffectiveGrantSet {
-        // Admin short-circuit — `claims` carries the synthetic `admin`
-        // claim, OR `is_admin` folds it in. Marker
-        // only: never enumerate every repository.
-        if is_admin || claims.iter().any(|c| c == "admin") {
-            return EffectiveGrantSet {
-                is_global_admin: true,
-                cells: Vec::new(),
-            };
-        }
+        // `claims` carries the synthetic `admin` claim, OR `is_admin`
+        // folds it in.
+        let is_global_admin = is_admin || claims.iter().any(|c| c == "admin");
 
         let mut cells: Vec<(Option<Uuid>, Permission)> = Vec::new();
         for grant in self.grants.iter() {
+            // Marker-only for a global admin on every permission except
+            // `ReadMetrics` — never enumerate what the marker already
+            // covers. A non-admin scans every permission (this condition
+            // is always `false` when `is_global_admin` is `false`,
+            // reproducing the pre-carve-out behavior exactly).
+            if is_global_admin && grant.permission != Permission::ReadMetrics {
+                continue;
+            }
             if !subject_matches(&grant.subject, claims, user_id) {
                 continue;
             }
@@ -340,7 +367,7 @@ impl RbacEvaluator {
             }
         }
         EffectiveGrantSet {
-            is_global_admin: false,
+            is_global_admin,
             cells,
         }
     }
@@ -432,12 +459,25 @@ impl RbacEvaluator {
         requested_permissions: &[Permission],
     ) -> Option<TokenCap> {
         // Admin short-circuit — a full admin holds every requested
-        // permission globally. Mirror the existing global-cap request shape
-        // (`repository_ids: None`) so the clamp's global branch + the ≤1h
-        // admin gate run UNCHANGED. Dedup keeps the cap shape stable if a
+        // permission globally, EXCEPT `Permission::ReadMetrics` (#113 /
+        // D3): reuse `user_grants_authorize`'s matching carve-out directly
+        // so a requested `ReadMetrics` only survives into the cap when the
+        // admin also holds an explicit `read_metrics` grant — otherwise
+        // the "valid by construction" invariant below (every cap cell
+        // re-passes `authorize()`) would be false the moment
+        // `user_grants_authorize` denies it. Mirror the existing
+        // global-cap request shape (`repository_ids: None`) so the
+        // clamp's global branch + the ≤1h admin gate run UNCHANGED for
+        // every other permission. Dedup keeps the cap shape stable if a
         // caller repeats a permission.
         if principal.claims.iter().any(|c| c == "admin") {
-            let permissions = dedup_preserving_order(requested_permissions);
+            let permissions: Vec<Permission> = dedup_preserving_order(requested_permissions)
+                .into_iter()
+                .filter(|&p| {
+                    p != Permission::ReadMetrics
+                        || self.user_grants_authorize(principal, Permission::ReadMetrics, None)
+                })
+                .collect();
             if permissions.is_empty() {
                 return None;
             }
@@ -851,6 +891,53 @@ mod tests {
                 "admin short-circuit failed for {perm:?} with repo"
             );
         }
+    }
+
+    /// #113 / D3: `Permission::ReadMetrics` is the ONE exception to the
+    /// admin short-circuit — an admin-claim principal without an explicit
+    /// `read_metrics` grant is denied, unlike every permission in
+    /// `authorize_admin_claim_short_circuits_for_all_permissions` above.
+    #[test]
+    fn authorize_admin_claim_without_explicit_grant_denies_read_metrics() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal(&["admin"]);
+        assert!(
+            !eval.authorize(&p, Permission::ReadMetrics, None),
+            "admin claim must NOT implicitly satisfy ReadMetrics"
+        );
+        assert!(
+            !eval.authorize(&p, Permission::ReadMetrics, Some(Uuid::new_v4())),
+            "admin claim must NOT implicitly satisfy ReadMetrics with a repo id either \
+             (ReadMetrics is global-only, but the carve-out must hold regardless of the \
+             repository_id argument shape)"
+        );
+    }
+
+    /// The carve-out falls through to the ordinary grant scan — an
+    /// explicit `read_metrics` grant on a claim the admin principal also
+    /// carries still authorizes it, exactly like a non-admin principal.
+    #[test]
+    fn authorize_admin_claim_with_explicit_grant_allows_read_metrics() {
+        let eval = RbacEvaluator::new(vec![claims_grant(
+            &["admin"],
+            None,
+            Permission::ReadMetrics,
+        )]);
+        let p = principal(&["admin"]);
+        assert!(eval.authorize(&p, Permission::ReadMetrics, None));
+    }
+
+    /// The B1 fail-closed cap arm (ADR 0036) is INSIDE the admin
+    /// short-circuit block — since `ReadMetrics` never enters that block,
+    /// a Pat/ServiceAccount admin principal with `token_cap: None` denied
+    /// by B1 for every other permission is denied `ReadMetrics` too, but
+    /// via the ordinary "no grant" path, not the B1 branch. Pin that the
+    /// carve-out doesn't accidentally bypass B1's intent (still denied).
+    #[test]
+    fn authorize_admin_claim_read_metrics_b1_pat_none_cap_still_denied_without_grant() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_kind_cap(&["admin"], Some(TokenKind::Pat), None);
+        assert!(!eval.authorize(&p, Permission::ReadMetrics, None));
     }
 
     #[test]
@@ -1601,6 +1688,73 @@ mod tests {
         );
     }
 
+    /// #113 / D3: an admin's derived cap silently drops a requested
+    /// `ReadMetrics` when there's no explicit `read_metrics` grant — every
+    /// OTHER requested permission still survives unconditionally via the
+    /// admin short-circuit. This keeps "every cell of the returned cap
+    /// re-passes `authorize()`" true: `authorize()` denies `ReadMetrics`
+    /// for this same principal (see
+    /// `authorize_admin_claim_without_explicit_grant_denies_read_metrics`),
+    /// so the cap must not claim it either.
+    #[test]
+    fn derive_cap_admin_without_read_metrics_grant_drops_it_keeps_others() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal(&["admin"]);
+        let cap = eval
+            .derive_cli_session_cap(
+                &p,
+                &[Permission::ReadMetrics, Permission::Read, Permission::Write],
+            )
+            .expect("admin still derives a cap for the non-ReadMetrics permissions");
+        assert_eq!(cap.repository_ids, None);
+        assert_eq!(
+            cap.permissions,
+            vec![Permission::Read, Permission::Write],
+            "ReadMetrics dropped, Read/Write survive unconditionally"
+        );
+        for perm in &cap.permissions {
+            assert!(
+                eval.authorize(&p, *perm, None),
+                "every surviving cap cell must re-authorize: {perm:?}"
+            );
+        }
+    }
+
+    /// Companion: an admin who ALSO holds an explicit `read_metrics` grant
+    /// gets it in the derived cap like any other requested permission.
+    #[test]
+    fn derive_cap_admin_with_read_metrics_grant_includes_it() {
+        let eval = RbacEvaluator::new(vec![claims_grant(
+            &["admin"],
+            None,
+            Permission::ReadMetrics,
+        )]);
+        let p = principal(&["admin"]);
+        let cap = eval
+            .derive_cli_session_cap(&p, &[Permission::ReadMetrics, Permission::Read])
+            .expect("admin with the explicit grant derives a cap including ReadMetrics");
+        assert_eq!(
+            cap.permissions,
+            vec![Permission::ReadMetrics, Permission::Read]
+        );
+    }
+
+    /// Requesting ONLY `ReadMetrics` as an admin without the explicit
+    /// grant yields the same "zero effective authority" `None` an
+    /// ordinary caller with no grants at all would get — not a cap with an
+    /// empty `permissions` vec (which the doc comment on
+    /// `derive_cli_session_cap` explicitly forbids: "minting an empty-cap
+    /// token would silently authorize nothing while looking like a
+    /// success").
+    #[test]
+    fn derive_cap_admin_requesting_only_read_metrics_without_grant_yields_none() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal(&["admin"]);
+        assert!(eval
+            .derive_cli_session_cap(&p, &[Permission::ReadMetrics])
+            .is_none());
+    }
+
     #[test]
     fn derive_cap_global_grants_yield_global_cap() {
         // A non-admin holding every requested permission GLOBALLY (a
@@ -1978,6 +2132,44 @@ mod tests {
         assert!(result.cells.is_empty());
     }
 
+    /// #113 / D3: the ONE exception to "marker means never enumerate" — an
+    /// admin who ALSO holds an explicit `read_metrics` grant sees that one
+    /// cell surfaced alongside `is_global_admin: true`, so the self-view
+    /// agrees with what `authorize()` actually grants for `/metrics`.
+    #[test]
+    fn effective_grants_admin_with_explicit_read_metrics_grant_surfaces_cell() {
+        let eval = RbacEvaluator::new(vec![
+            claims_grant(&["admin"], Some(Uuid::new_v4()), Permission::Write),
+            claims_grant(&["admin"], None, Permission::ReadMetrics),
+        ]);
+        let result = eval.effective_grants(&claims_vec(&["admin"]), None, false);
+        assert!(result.is_global_admin);
+        assert_eq!(
+            result.cells,
+            vec![(None, Permission::ReadMetrics)],
+            "only the explicit ReadMetrics grant surfaces — the Write grant \
+             stays covered by the marker, never enumerated"
+        );
+    }
+
+    /// Companion to the above: without an explicit `read_metrics` grant,
+    /// an admin's `cells` stays empty even though other permissions are
+    /// granted — the marker still covers everything except ReadMetrics.
+    #[test]
+    fn effective_grants_admin_without_read_metrics_grant_yields_empty_cells() {
+        let eval = RbacEvaluator::new(vec![claims_grant(
+            &["admin"],
+            None,
+            Permission::AdminTaskInvoke,
+        )]);
+        let result = eval.effective_grants(&claims_vec(&["admin"]), None, false);
+        assert!(result.is_global_admin);
+        assert!(
+            result.cells.is_empty(),
+            "no ReadMetrics grant held — cells must stay empty, marker covers the rest"
+        );
+    }
+
     #[test]
     fn effective_grants_admin_short_circuit_case_sensitive() {
         // Mirrors `authorize`: only the lowercase `"admin"` claim
@@ -2155,6 +2347,50 @@ mod tests {
                 (Some(repo), Permission::Write),
                 (Some(repo), Permission::Delete),
             ]
+        );
+
+        // -- Admin-marker × ReadMetrics — granted -----------------------
+        //
+        // #113 / D3: the ONE case where `is_global_admin: true` carries a
+        // non-empty `cells`. The surfaced cell must ALSO re-authorize, and
+        // every OTHER permission (covered by the marker, never enumerated)
+        // must still authorize via the unmodified admin short-circuit.
+        let admin_uid = Uuid::new_v4();
+        let admin_p = principal_with_id(admin_uid, &["admin"]);
+        let eval_granted = RbacEvaluator::new(vec![
+            claims_grant(&["admin"], None, Permission::Write),
+            claims_grant(&["admin"], None, Permission::ReadMetrics),
+        ]);
+        let granted = eval_granted.effective_grants(&admin_p.claims, Some(admin_p.user_id), false);
+        assert!(granted.is_global_admin);
+        assert_eq!(granted.cells, vec![(None, Permission::ReadMetrics)]);
+        for (cell_repo, perm) in &granted.cells {
+            assert!(
+                eval_granted.authorize(&admin_p, *perm, *cell_repo),
+                "admin ReadMetrics cell ({cell_repo:?}, {perm:?}) must re-authorize"
+            );
+        }
+        assert!(
+            eval_granted.authorize(&admin_p, Permission::Write, None),
+            "Write stays marker-covered (not enumerated) but authorize() still grants it"
+        );
+
+        // -- Admin-marker × ReadMetrics — ungranted ----------------------
+        //
+        // `cells` is empty (same as the pre-carve-out marker shape), and
+        // `authorize()` must agree by denying ReadMetrics — the one
+        // permission where empty cells no longer means "holds it via the
+        // marker".
+        let eval_ungranted =
+            RbacEvaluator::new(vec![claims_grant(&["admin"], None, Permission::Write)]);
+        let ungranted =
+            eval_ungranted.effective_grants(&admin_p.claims, Some(admin_p.user_id), false);
+        assert!(ungranted.is_global_admin);
+        assert!(ungranted.cells.is_empty());
+        assert!(
+            !eval_ungranted.authorize(&admin_p, Permission::ReadMetrics, None),
+            "empty cells for an admin must NOT be read as holding ReadMetrics — \
+             authorize() denies it, matching the carve-out"
         );
     }
 }
