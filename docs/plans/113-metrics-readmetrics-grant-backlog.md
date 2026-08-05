@@ -37,7 +37,7 @@ refine with the user before coding.
 **Acceptance:**
 - `MetricsReaderPrincipal(pub CallerPrincipal)` mirrors `AdminPrincipal`, authorizing `Permission::ReadMetrics` with `repository = None` and a `PERMISSION_READ_METRICS` label.
 - `render_metrics` takes `_reader: MetricsReaderPrincipal`.
-- Tests (via `build_mock_ctx`): anonymous → 401; authenticated no-grant → 403; `read_metrics`-granted → 200; **and an explicit `AuthContext::BearerOnly` case** (closes #113 under the disabled-provider + native-tokens config, cf. #109). Admin-without-`read_metrics` → 403 (orthogonality; flag for the human if they prefer an Admin short-circuit — see §2 D3 open question).
+- Tests (via `build_mock_ctx`): anonymous → 401; authenticated no-grant → 403; `read_metrics`-granted → 200; **and an explicit `AuthContext::BearerOnly` case** (closes #113 under the disabled-provider + native-tokens config, cf. #109). **Admin-without-`read_metrics` → 403** — orthogonality is DECIDED (human, 2026-08-05); the extractor has no `Admin` fall-through.
 - `read_metrics` denial logs `info!` (not `err`); test or manual note confirms the tracing level.
 - ≥85% coverage on new `hort-http-core` code.
 

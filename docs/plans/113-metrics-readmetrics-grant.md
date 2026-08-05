@@ -98,12 +98,11 @@ impl FromRequestParts<Arc<AppContext>> for MetricsReaderPrincipal {
 }
 ```
 
-`render_metrics` takes `_reader: MetricsReaderPrincipal`. Admin does **not**
-implicitly satisfy it (a scraper is not an admin, and an admin is not a scraper);
-if operators want an admin to also scrape, they grant that SA `read_metrics`
-explicitly. (Open refinement question for the human: should `Admin` short-circuit
-`ReadMetrics` for operational convenience? Default proposal: **no** — keep the
-capabilities orthogonal, matching the "admin is not the bar" decision.)
+`render_metrics` takes `_reader: MetricsReaderPrincipal`. **DECIDED (human,
+2026-08-05): orthogonal — `Admin` does NOT implicitly satisfy `ReadMetrics`.**
+A scraper is not an admin and an admin is not a scraper; an admin who also
+needs to scrape holds the `read_metrics` grant explicitly. The extractor
+authorizes `ReadMetrics` only, with no `Admin` fall-through.
 
 ### D4 — Serve `/metrics` on the admin/observability listener only; drop the public-main-listener mount
 
@@ -118,8 +117,9 @@ removed; document the change in the chart + `docs/`.
 
 ### D5 — Retire the `HORT_METRICS_REQUIRE_AUTH=false` anonymous escape hatch
 
-The legacy hatch serves the same repo-labelled exposition with authz removed
-entirely — inconsistent with D1–D4. Remove it. If a genuinely-open scrape is
+**DECIDED (human, 2026-08-05): remove outright now** (no deprecation cycle,
+pre-v1.0). The legacy hatch serves the same repo-labelled exposition with authz
+removed entirely — inconsistent with D1–D4. Remove it. If a genuinely-open scrape is
 ever needed (fully-isolated network), that is an operator decision expressed by
 *not granting* a network path, not by a server flag that disables authz. Record
 the removal in the ADR (reversing a prior escape hatch) and the auth surface.
