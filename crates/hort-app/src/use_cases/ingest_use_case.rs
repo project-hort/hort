@@ -41,6 +41,7 @@ use crate::use_cases::multi_hash::{
     Sha1DigestHandle, Sha1HashingRead, Sha512DigestHandle, Sha512HashingRead,
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_expected_version,
     EVENT_APPEND_RETRY_ATTEMPTS,
@@ -2844,33 +2845,37 @@ impl IngestUseCase {
             // already-ingested artifact — a child manifest (`kind =
             // "oci_index_member"`), a referrer's subject (`kind =
             // "oci_subject"`), or a config/layer blob (`kind =
-            // "oci_config"` / `"oci_layer"`, #46 Item 1). Excludes the
-            // two self-referencing refcount kinds `primary_content` /
-            // `metadata_blob` — every artifact's OWN ingest writes a
-            // `primary_content` row targeting **its own** hash (see
-            // `ingest_direct_writes_primary_content_refcount`), so an
-            // unfiltered "is this hash a target of ANY kind" check would
-            // match every single artifact against itself and always
-            // fire. Those two kinds are this artifact's own bookkeeping,
-            // never "some other already-ingested artifact references
-            // me." This lookup does NOT depend on this ingest's OWN
-            // `content_references` rows (written post-commit, below) — it
-            // only ever matches rows written by OTHER, already-ingested
-            // artifacts, so resolving it before this ingest's own commit
-            // is safe.
+            // "oci_config"` / `"oci_layer"`, #46 Item 1). The predicate
+            // itself lives in
+            // [`crate::use_cases::referenced_descendant::is_referenced_tree_descendant`]
+            // — shared verbatim with the provenance orchestrator's
+            // `NoAttestation × Required` hold (issue #115 item 3) so the
+            // two can never drift; see that module for why the
+            // self-referential kinds are excluded. This lookup does NOT
+            // depend on this ingest's OWN `content_references` rows
+            // (written post-commit, below) — it only ever matches rows
+            // written by OTHER, already-ingested artifacts, so resolving
+            // it before this ingest's own commit is safe.
             let is_referenced_descendant = match self
                 .content_references
                 .find_by_target(repository_id, &artifact.sha256_checksum, None)
                 .await
             {
-                Ok(refs) => refs
-                    .iter()
-                    .any(|r| r.kind != "primary_content" && r.kind != "metadata_blob"),
+                Ok(refs) => is_referenced_tree_descendant(&refs),
                 Err(e) => {
                     // Fail-safe, not fail-closed-on-scan: a lookup error
                     // degrades to "not a descendant", i.e. the artifact
                     // keeps its normal full window — the MORE
                     // conservative outcome, never the zero-window one.
+                    //
+                    // NOTE the deliberate asymmetry with the provenance
+                    // orchestrator's use of the SAME predicate, which
+                    // PROPAGATES its lookup error instead: there `false`
+                    // means "no descendant hold" and falls toward TERMINAL
+                    // rejection (the unsafe direction). Here `false` falls
+                    // toward a longer hold. Same predicate, opposite
+                    // safe-default — see `referenced_descendant`'s module
+                    // doc.
                     tracing::warn!(
                         artifact_id = %artifact.id,
                         %repository_id,

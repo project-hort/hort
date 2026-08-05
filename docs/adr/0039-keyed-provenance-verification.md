@@ -386,9 +386,43 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
     subject), the skip first re-drives the idempotent cascade with the
     stored event's signer, so re-signing heals a constituent whose
     cascaded append was lost; a cascaded clearance never re-walks bytes.
-    The never-signed path is unchanged: an unsigned
-    root cascades nothing, and it and its constituents reject `Unsigned` at
-    expiry exactly as before.
+
+    **The verify-BEFORE-cascade race (issue #115, amended 2026-08-05).**
+    `SkippedAlreadyCleared` guards one ordering — a re-verify landing
+    *after* the cascade. The inverse ordering was open: a constituent
+    verified *before* its subject's cascade ran. OCI pull-through writes
+    `oci_config`/`oci_layer` edges before the blobs are pulled, so every
+    layer ingests as a **zero-window referenced-tree descendant** (ADR 0007
+    / issue #46) and immediately enqueues its own `provenance-verify`. That
+    verify finds no bundle — cosign signs only the top-level digest — and
+    under `Required` with `window_open == false` it terminally rejected the
+    layer as `Unsigned` *before* the subject was even verified. The cascade
+    then hit the "terminal is terminal" refusal on an artifact it should
+    have cleared, and the signed image was permanently unpullable.
+
+    Closed at the **verdict layer** (not by skipping the ingest enqueue —
+    that would leave the S4 backstop and duplicate S3 enqueues able to
+    reject through the same door, the exact mistake `SkippedAlreadyCleared`
+    exists to prevent): `Artifact::complete_provenance`'s
+    `NoAttestation × Required` arm now holds on `window_open ||
+    is_referenced_descendant`. **The cascade is therefore guaranteed to
+    find its constituents in `Quarantined`, never terminally rejected**, in
+    either ordering — which is what makes the §11 cascade's
+    `Quarantined`-only precondition satisfiable in practice. A descendant's
+    provenance authority is its parent's signature; it can never carry an
+    attestation of its own, so "unsigned at expiry" is not a meaningful
+    verdict for it. Scoped exactly like `window_open`: a forged /
+    untrusted / digest-mismatch signature on a descendant still rejects
+    terminally.
+
+    The never-signed path is **amended accordingly**: an unsigned root
+    still cascades nothing, but its constituents now stay **held
+    `Quarantined`** (503, `Pending` at the release gate) instead of
+    rejecting `Unsigned` at expiry. Fail-closed either way — and unlike
+    the terminal rejection it replaces, recoverable: sign the root, the S3
+    hook re-verifies the subject, and the cascade clears the constituents.
+    The **root itself** is unchanged — it is not a descendant, so it still
+    rejects `Unsigned` at expiry.
 
 ## Consequences
 

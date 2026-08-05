@@ -115,6 +115,10 @@ pub mod self_service_prefetch_use_case;
 // HARD PREREQUISITE for `PurgeUseCase`, whose start-gate
 // refuses to run until this sweep has converged at least once.
 pub mod refcount_reconcile_use_case;
+// Shared referenced-tree-descendant predicate (issue #115 item 3) —
+// one definition for BOTH the ingest zero-window anchor carve-out (#46)
+// and the provenance orchestrator's `NoAttestation × Required` hold.
+pub(crate) mod referenced_descendant;
 pub mod repository_access;
 pub mod repository_use_case;
 // Seed-import cutover path.
