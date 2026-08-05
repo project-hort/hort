@@ -103,11 +103,19 @@ public hostname of the operator's edge.
   access. Setting `metrics.bindAddr: ""` unbinds the admin listener
   entirely — `/metrics` becomes unreachable on any listener, not a
   fallback to the main router.
-- **Operator action required:** grant a scraper principal
-  `Permission::ReadMetrics` (a claim-scoped `PermissionGrant`, see
-  ADR 0012) and configure a `ServiceMonitor` with `bearerTokenSecret`
-  pointing at that principal's token if scraping from outside the pod
-  (see `install.md` Appendix).
+- **Operator action required:** provision a dedicated **non-admin**
+  scraper `ServiceAccount` plus an **unscoped** `read_metrics`
+  `PermissionGrant`, and wire the credential into your scraper.
+  Step-by-step (both delivery models, plus the Prometheus-Operator
+  caveat):
+  [`../operate/metrics-scraper-service-account.md`](../operate/metrics-scraper-service-account.md).
+  Two shapes to get right: the grant's `subject` must be
+  `kind: serviceAccount` (an unscoped **claim**-subject grant is
+  rejected at apply by the `wildcard-repo-non-admin` linter rule), and
+  `repository:` must be omitted (`read_metrics` is global). Note
+  `Permission::Admin` does **not** imply `read_metrics` — an admin
+  credential is not a scrape credential
+  ([ADR 0052](../../../adr/0052-scoped-metrics-read-capability.md)).
 - **Verify post-install:**
   ```bash
   curl -i http://<svc-or-ingress>/metrics
@@ -125,7 +133,9 @@ public hostname of the operator's edge.
   metrics port is defense-in-depth only, never a substitute for the
   grant. Deployments that relied on the old anonymous-scrape relaxation
   must instead issue a `read_metrics`-granted bearer to the scraper and
-  wire it via `ServiceMonitor.bearerTokenSecret`.
+  wire it via `ServiceMonitor.bearerTokenSecret` — see
+  [`../operate/metrics-scraper-service-account.md`](../operate/metrics-scraper-service-account.md)
+  for the migration path.
 
 ### SSRF redirect-hop revalidation
 

@@ -65,6 +65,7 @@ Start here if you want to know **why** the system looks the way it does.
 ### Operate
 
 - [Claim-based RBAC](how-to/operate/claim-based-rbac.md)
+- [Provision a Prometheus scraper ServiceAccount for `/metrics`](how-to/operate/metrics-scraper-service-account.md)
 - [OCI image-pull secret / token](how-to/operate/oci-imagepull-secret-token.md)
 - [Public supply-chain deployment](how-to/operate/public-supply-chain-deployment.md)
 

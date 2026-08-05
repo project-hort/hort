@@ -419,7 +419,13 @@ Prometheus scrape configuration.
 `/metrics` is served EXCLUSIVELY by the dedicated admin listener and
 always requires a bearer carrying the `read_metrics` grant — there is no
 main-router mount and no operator opt-out of the grant check (#113 item
-3). `bindAddr` controls whether that listener binds at all:
+3, [ADR 0052](../../../adr/0052-scoped-metrics-read-capability.md)).
+None of the keys below provision that grant: the chart deliberately
+ships no scraper identity. To make a scrape actually work you must
+declare a non-admin scraper `ServiceAccount` + an unscoped
+`read_metrics` grant through the gitops apply path —
+[`../operate/metrics-scraper-service-account.md`](../operate/metrics-scraper-service-account.md)
+is the recipe. `bindAddr` controls whether that listener binds at all:
 
 - **`bindAddr: "127.0.0.1:9090"` (default)** — dedicated listener
   bound to the pod's loopback. Container + Service ports for
@@ -438,6 +444,16 @@ main-router mount and no operator opt-out of the grant check (#113 item
 `bindAddr` to be non-empty (the ServiceMonitor scrapes the dedicated
 metrics Service port). The chart fails `helm template` / `helm
 install` with an explicit message if these conditions are not met.
+
+The rendered ServiceMonitor carries **no** authentication — the chart
+cannot guess your token-issuance mechanism, so it does not invent one.
+Extend it with `bearerTokenSecret` (or `authorization.credentials`)
+pointing at a Secret holding a `read_metrics`-granted bearer; the
+rotation-into-a-Secret model, and why a sidecar-written
+`credentials_file` cannot be referenced from a ServiceMonitor CR, are
+covered in
+[`../operate/metrics-scraper-service-account.md`](../operate/metrics-scraper-service-account.md)
+§5.
 
 ### `control`
 
