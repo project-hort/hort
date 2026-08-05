@@ -779,6 +779,7 @@ mod tests {
     use uuid::Uuid;
 
     use hort_app::use_cases::test_support::sample_repository;
+    use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
     use hort_domain::error::DomainError;
@@ -1896,6 +1897,134 @@ mod tests {
             "expected ≥1 follower_waited_hit (concurrent coalesce); \
              got {follower_waited_hit}, snap: {snap:?}"
         );
+    }
+
+    /// A repo-scoped, quarantining, scanning `ScanPolicy` for `repo_id`
+    /// — repo-scoped wins over `build_mock_ctx`'s pre-seeded permissive-
+    /// global default, so seeding one per repo does not interact with
+    /// the other repo in the same test.
+    fn quarantining_policy(
+        repo_id: Uuid,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        };
+        use hort_domain::events::PolicyScope;
+        let now = Utc::now();
+        ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: format!("item3-follower-regression-{repo_id}"),
+            scope: PolicyScope::Repository(repo_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs: 3600,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::Off,
+            provenance_backends: Vec::new(),
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            stream_version: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Issue #107 Item 3 pin (d) — pins that the shared-inner-fn fix
+    /// (`register_by_hash_inner`, `hort-app`) reaches a NON-OCI format
+    /// crate too. Same shape as `blobs.rs`'s
+    /// `cross_repo_follower_quarantines_target_row_under_active_policy`:
+    /// races the SAME wheel content hash across TWO DIFFERENT target
+    /// repos (PyPI's `blob_dedup_key = DedupKey::blob_by_hash` is ALSO
+    /// keyed purely by hash, not by repo), so whichever caller loses the
+    /// coalesce race lands in `try_upstream_file_pull`'s `Ok(None)`
+    /// post-coalesce arm — the cross-repo follower branch that calls
+    /// `register_existing_cas_blob` instead of `ingest_verified`.
+    ///
+    /// The harness reaches the SAME `register_by_hash_inner` gate the
+    /// OCI pin exercises (no PyPI-specific harness limitation
+    /// encountered — `try_upstream_file_pull`'s follower arm calls the
+    /// identical `IngestUseCase::register_existing_cas_blob` OCI's
+    /// follower arm does, and `build_mock_ctx`'s `MockPorts` exposes
+    /// `policy_projections` uniformly across every format crate's test
+    /// module).
+    #[test]
+    fn cross_repo_follower_quarantines_target_row_under_active_policy() {
+        let (r1, r2) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (ctx, mocks) = build_mock_ctx(handle());
+                let repo_a = pypi_repo("repo-a");
+                let repo_b = pypi_repo("repo-b");
+                mocks.repositories.insert(repo_a.clone());
+                mocks.repositories.insert(repo_b.clone());
+                mocks
+                    .policy_projections
+                    .insert(quarantining_policy(repo_a.id));
+                mocks
+                    .policy_projections
+                    .insert(quarantining_policy(repo_b.id));
+                seed_mapping(&mocks, repo_a.id, "");
+                seed_mapping(&mocks, repo_b.id, "");
+
+                let body_bytes = b"the actual wheel body for item3 pin (d)".to_vec();
+                let sha = sha256_hex(&body_bytes);
+                let wheel_url =
+                    "https://files.pythonhosted.org/packages/abc/requests-2.31.0-py3-none-any.whl";
+                let json = pypi_json("requests-2.31.0-py3-none-any.whl", &sha, wheel_url);
+                mocks
+                    .upstream_proxy
+                    .insert_metadata("", "/pypi/requests/2.31.0/json", json);
+                mocks
+                    .upstream_proxy
+                    .insert_artifact("", wheel_url, body_bytes.clone());
+
+                let ctx_a = ctx.clone();
+                let repo_a2 = repo_a.clone();
+                let h1 = tokio::spawn(async move {
+                    try_upstream_file_pull(
+                        &ctx_a,
+                        &repo_a2,
+                        "requests",
+                        "requests-2.31.0-py3-none-any.whl",
+                    )
+                    .await
+                });
+                let ctx_b = ctx.clone();
+                let repo_b2 = repo_b.clone();
+                let h2 = tokio::spawn(async move {
+                    try_upstream_file_pull(
+                        &ctx_b,
+                        &repo_b2,
+                        "requests",
+                        "requests-2.31.0-py3-none-any.whl",
+                    )
+                    .await
+                });
+
+                (h1.await.unwrap(), h2.await.unwrap())
+            });
+
+        for (label, outcome) in [("repo-a", r1), ("repo-b", r2)] {
+            match outcome {
+                Ok(artifact) => {
+                    assert_eq!(
+                        artifact.quarantine_status,
+                        QuarantineStatus::Quarantined,
+                        "issue #107 Item 1: {label}'s row must be Quarantined under its \
+                         active policy regardless of whether {label} won the coalesce race \
+                         (leader, via ingest_verified) or lost it (follower, via \
+                         register_by_hash_inner) — pre-#107 only the leader's row quarantined"
+                    );
+                }
+                Err(e) => panic!("{label} must succeed; got {e:?}"),
+            }
+        }
     }
 
     /// Negative-cache test: the wrapped JSON metadata fetch fails
