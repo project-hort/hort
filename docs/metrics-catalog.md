@@ -230,7 +230,7 @@ attached to the router in that mode.
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|-----------------|
-| `hort_authz_decisions_total` | counter | `result`, `permission` | — | `result` ∈ `allow`, `deny` / `permission` ∈ `read`, `write`, `delete`, `admin`, `curate` |
+| `hort_authz_decisions_total` | counter | `result`, `permission` | — | `result` ∈ `allow`, `deny` / `permission` ∈ `read`, `write`, `delete`, `admin`, `curate`, `read_metrics` |
 | `hort_http_404_repo_lookups_total` | counter | `format` | — | `format` ∈ known [`RepositoryFormat`](../crates/hort-domain/src/entities/repository.rs) values + sentinel `unknown` |
 
 Emission of `hort_authz_decisions_total` moved from per-handler helpers
@@ -248,7 +248,7 @@ call's inputs + decision:
   suppressed on deny — it is the audit trail and complements this
   metric.
 - `permission` mirrors the [`Permission`](../crates/hort-domain/src/entities/rbac.rs)
-  enum's lowercase spelling. Values are `{read, write, delete, admin, curate}`.
+  enum's lowercase spelling. Values are `{read, write, delete, admin, curate, read_metrics}`.
   `delete` is emitted via the `DeleteRepoAccess` extractor; the OCI
   `DELETE /v2/<name>/manifests/<reference>` endpoint is currently the
   only production path that emits `permission="delete"`. Cancel/finalize
