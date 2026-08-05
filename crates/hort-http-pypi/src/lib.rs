@@ -4429,13 +4429,17 @@ mod tests {
 
     /// End-to-end PyPI metrics verification + forbidden-label regression.
     ///
-    /// Drives upload → download → `/metrics` through the real `build_router`
-    /// stack with a **local** Prometheus recorder (no global install) and a
-    /// real `FilesystemStorage` adapter backed by a tempdir. Asserts that a
-    /// counter from every observability layer — HTTP middleware,
-    /// ingest use case, download use case, storage adapter put, and
-    /// storage adapter get — appears in the scrape output with the
-    /// expected label shape.
+    /// Drives upload → download through the real middleware-wrapped router
+    /// with a **local** Prometheus recorder (no global install) and a real
+    /// `FilesystemStorage` adapter backed by a tempdir, then renders that
+    /// SAME recorder's handle directly — `/metrics` itself is served
+    /// exclusively by `hort-server::http::build_admin_router` (#113 item 3),
+    /// outside this crate's dependency graph, so this test scrapes the
+    /// recorder rather than routing an HTTP request through a route this
+    /// crate has no business mounting. Asserts that a counter from every
+    /// observability layer — HTTP middleware, ingest use case, download use
+    /// case, storage adapter put, and storage adapter get — appears in the
+    /// render output with the expected label shape.
     ///
     /// Forbidden-label regression: the scrape body must not contain any of
     /// the high-cardinality label keys `artifact_id`, `user_id`,
@@ -4496,7 +4500,7 @@ mod tests {
                         "/pypi",
                         pypi_routes_with_publish_limit(DEFAULT_PUBLISH_BODY_LIMIT),
                     );
-                    let router = wrap_with_middleware(ctx.clone(), inner, true, true);
+                    let router = wrap_with_middleware(ctx.clone(), inner);
 
                     // --- 1. Upload via multipart POST -----------------------
                     let boundary = "----hortboundary9x7";
@@ -4543,33 +4547,16 @@ mod tests {
                     let body = to_bytes(download_res.into_body(), 64 * 1024).await.unwrap();
                     assert_eq!(&body[..], payload);
 
-                    // --- 3. Scrape /metrics ---------------------------------
-                    // `render_metrics` requires `MetricsReaderPrincipal`
-                    // (`Permission::ReadMetrics`, #113 item 2). The mock ctx
-                    // is `AuthContext::Disabled`, under which `authorize()`
-                    // grants unconditionally — but `extract_principal` still
-                    // needs a principal in extensions, and `Disabled` skips
-                    // the whole auth-dispatch layer, so no middleware
-                    // populates it. Inject one directly, mirroring
-                    // `require_principal`'s slot shape.
-                    let mut scrape_req = Request::get("/metrics").body(Body::empty()).unwrap();
-                    hort_http_core::middleware::auth::test_support::inject_principal(
-                        &mut scrape_req,
-                        CallerPrincipal {
-                            user_id: Uuid::new_v4(),
-                            external_id: "test:scraper".into(),
-                            username: "scraper".into(),
-                            email: "scraper@example.com".into(),
-                            claims: vec![],
-                            token_kind: None,
-                            issued_at: Utc::now(),
-                            token_cap: None,
-                        },
-                    );
-                    let scrape = router.oneshot(scrape_req).await.unwrap();
-                    assert_eq!(scrape.status(), StatusCode::OK);
-                    let scrape_bytes = to_bytes(scrape.into_body(), 128 * 1024).await.unwrap();
-                    String::from_utf8(scrape_bytes.to_vec()).unwrap()
+                    // --- 3. Render the recorder directly --------------------
+                    // `/metrics` is no longer reachable through any router
+                    // this crate builds (#113 item 3 — admin-listener-only,
+                    // exclusively `hort-server::http::build_admin_router`).
+                    // The upload/download requests above recorded into the
+                    // SAME local recorder `handle` regardless of which
+                    // router served them, so rendering it directly is
+                    // equivalent to what `render_metrics` would have
+                    // returned.
+                    handle.render()
                 })
         });
 

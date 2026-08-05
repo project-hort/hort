@@ -129,31 +129,6 @@ fn legacy_group_mappings_path_is_set() -> bool {
         .unwrap_or(false)
 }
 
-/// Emit a startup `WARN` when the operator
-/// has opted out of `/metrics` authentication via
-/// `HORT_METRICS_REQUIRE_AUTH=false`. The endpoint reveals repository
-/// names, error ratios, and traffic shape; opting out re-opens the
-/// reconnaissance vector the lockdown closes. Operators who knowingly
-/// take that trade-off (legacy Prometheus scrape configs that cannot
-/// supply a bearer token) at minimum get a structured `env_var` field
-/// so log shippers can alert on it.
-///
-/// Called once at boot, AFTER `telemetry::init_tracing` so the
-/// emission reaches the subscriber.
-fn warn_metrics_auth_bypass(metrics_require_auth: bool) {
-    if !metrics_require_auth {
-        tracing::warn!(
-            env_var = "HORT_METRICS_REQUIRE_AUTH",
-            value = "false",
-            "metrics endpoint authentication is DISABLED. The /metrics scrape endpoint \
-             reveals repository names, auth-failure rates, and traffic shape — opting out \
-             of auth re-opens the reconnaissance vector the auth requirement closes. \
-             Restrict the listener at the network layer (NetworkPolicy / firewall) or \
-             unset HORT_METRICS_REQUIRE_AUTH to re-enable the default 401."
-        );
-    }
-}
-
 /// Synchronous entry point for `hort-server serve`. Delegates to the
 /// shared [`super::run_with_runtime`] helper, which builds a Tokio
 /// runtime, runs [`run_async`], and translates the result into an
@@ -192,11 +167,6 @@ async fn run_async() -> anyhow::Result<()> {
     // `Config::from_env`) because the subscriber must be live for the
     // warn to reach stderr / the log shipper.
     warn_legacy_group_mappings_path_set();
-
-    // 1c. Surface the security trade-off
-    // when `HORT_METRICS_REQUIRE_AUTH=false`. Same subscriber-must-be-live
-    // ordering rationale as the deprecation warning above.
-    warn_metrics_auth_bypass(cfg.metrics_require_auth);
 
     // 2. Prometheus recorder. Any metric emitted before this is lost.
     let metrics_handle = telemetry::install_prometheus()?;
@@ -905,31 +875,32 @@ async fn run_async() -> anyhow::Result<()> {
         }
     };
 
-    // 7. Serve. Split routers when HORT_METRICS_BIND is set so /metrics is
-    //    only exposed on the admin listener.
+    // 7. Serve. `/metrics` is NEVER mounted on the main API router (#113
+    //    item 3 — no dev-mode main-listener fallback). It is served
+    //    exclusively by the admin listener, which only binds — and
+    //    therefore `/metrics` only exists — when `HORT_METRICS_BIND` is
+    //    set. An operator who leaves it unset gets no `/metrics` anywhere,
+    //    not an anonymous or accidentally-public one.
     let api_listener = tokio::net::TcpListener::bind(cfg.api_bind_addr)
         .await
         .context("binding API listener")?;
     info!(addr = %cfg.api_bind_addr, "API listening");
 
     // Optional internal-only control-plane
-    // listener, mirroring the `HORT_METRICS_BIND` split. Bound+built
-    // BEFORE the metrics-branch below because both branches move `ctx`
-    // (the metrics branch via `build_admin_router(ctx, ...)`, the
-    // single-listener branch via `build_router_with_oci_config(ctx,
-    // ...)`), so the control router's `ctx.clone()` has to happen
-    // first. When `HORT_CONTROL_BIND` is unset, `control_split` stays
-    // `false` and the control routes remain on the main router —
-    // no migration. The composition
-    // root logs what was wired (Observability rule — no per-handler
-    // logging). Token-generation + artifact-pull routes are NEVER
-    // moved here: they are public by requirement.
+    // listener. Bound+built BEFORE the main API router below because both
+    // it and the admin listener below need their own `ctx.clone()`, and
+    // the main router build takes final ownership of `ctx`. When
+    // `HORT_CONTROL_BIND` is unset, `control_split` stays `false` and the
+    // control routes remain on the main router — no migration. The
+    // composition root logs what was wired (Observability rule — no
+    // per-handler logging). Token-generation + artifact-pull routes are
+    // NEVER moved here: they are public by requirement.
     let control_split = cfg.control_bind_addr.is_some();
     let control_bound = if let Some(control_addr) = cfg.control_bind_addr {
         let control_listener = tokio::net::TcpListener::bind(control_addr)
             .await
             .context("binding control-plane listener")?;
-        let control_router = build_control_router(ctx.clone(), cfg.metrics_require_auth);
+        let control_router = build_control_router(ctx.clone());
         info!(
             addr = %control_addr,
             "HORT_CONTROL_BIND set — control plane (/admin, /api/v1/admin/*, \
@@ -945,151 +916,100 @@ async fn run_async() -> anyhow::Result<()> {
         None
     };
 
-    if let Some(metrics_addr) = cfg.metrics_bind_addr {
+    // Optional admin/observability listener carrying `/metrics`
+    // (`MetricsReaderPrincipal`-gated, see `build_admin_router`). Bound
+    // BEFORE the main API router below for the same `ctx.clone()`-ordering
+    // reason as the control listener above.
+    let admin_bound = if let Some(metrics_addr) = cfg.metrics_bind_addr {
         let admin_listener = tokio::net::TcpListener::bind(metrics_addr)
             .await
             .context("binding admin listener")?;
         info!(addr = %metrics_addr, "admin /metrics listening");
-
-        let oci_cfg = hort_http_oci::OciHttpConfig {
-            legacy_catalog_enabled: cfg.oci_legacy_catalog_enabled,
-            // Per-`(repo,
-            // principal)` outstanding-session cap.
-            max_sessions_per_principal: cfg.oci_max_sessions_per_principal,
-            // Session max-age — set TTL + admit age-prune threshold.
-            session_max_age_secs: cfg.oci_session_max_age_secs,
-        };
-        // Metrics auth posture. The flag
-        // is the same one threaded into the main listener below; the
-        // admin router enforces it via its own `require_principal`
-        // layer (see `build_admin_router`), independent of the public
-        // router's per-path carve-out.
-        let api = build_router_with_oci_config(
-            ctx.clone(),
-            false,
-            &oci_cfg,
-            cfg.metrics_require_auth,
-            cfg.enable_token_exchange,
-            control_split,
-        );
-        let admin = build_admin_router(ctx, cfg.metrics_require_auth);
-
-        // `axum::serve(...)` is replaced
-        // with `serve_with_hyper_util` so we can configure
-        // `http1_header_read_timeout` (the slowloris kill) and the
-        // HTTP/2 keep-alive knobs that hyper otherwise leaves at
-        // permissive defaults. The function consumes the listener +
-        // router and runs an explicit accept loop atop
-        // `hyper_util::server::conn::auto::Builder`. Both API and
-        // admin listeners take a fresh shutdown-token clone so a
-        // single SIGTERM fans out to both serve futures + the
-        // background refresh tasks.
-        //
-        // `serve_with_hyper_util` calls `into_make_service_with_connect_info::<SocketAddr>`
-        // internally so the peer SocketAddr is injected as a
-        // `ConnectInfo<SocketAddr>` extension on every request — the
-        // `request_trust_layer` reads it from there. Behaviour
-        // matches the prior `axum::serve(...).with_graceful_shutdown(...)`
-        // call modulo the new transport timeouts.
-        let api_token = shutdown_handle.token();
-        let admin_token = shutdown_handle.token();
-        let api_future = serve_with_hyper_util(api_listener, api, http_timeouts, api_token);
-        let admin_future = serve_with_hyper_util(admin_listener, admin, http_timeouts, admin_token);
-
-        // Third serve future for the optional
-        // control listener. Always a concrete future so `try_join!`
-        // stays homogeneous; resolves immediately to `Ok(())` when
-        // `HORT_CONTROL_BIND` is unset (zero behaviour change). A single
-        // SIGTERM fans out to this listener too via its own token clone.
-        let control_token = shutdown_handle.token();
-        let control_future = async move {
-            match control_bound {
-                Some((listener, router)) => {
-                    serve_with_hyper_util(listener, router, http_timeouts, control_token).await
-                }
-                None => Ok(()),
-            }
-        };
-
-        // Wall-clock cap on the
-        // graceful-shutdown wait. Without it, a stuck handler (frozen
-        // DB pool, hung upstream) could block `try_join!` forever and
-        // force an orchestrator-issued SIGKILL to escalate, leaving
-        // in-flight uploads in undefined state. The wrapper bounds the
-        // wait at `HORT_SHUTDOWN_GRACE_SECS` (default 60s); on timeout
-        // it emits a single `tracing::warn!(target: "hort::shutdown",
-        // ...)` carrying the in-flight request count read off the
-        // Prometheus registry, then returns Ok so the process exits
-        // cleanly. Inner errors propagate untouched on the clean path.
-        //
-        // The deadline is armed only after `shutdown_signal` resolves
-        // — pre-fix the wrapper armed the timer at process start and
-        // fired at boot+grace regardless of SIGTERM, killing the
-        // listener and presenting as a Kubernetes restart-loop. The
-        // shutdown signal is a fresh clone of the shutdown token;
-        // it resolves on SIGTERM/SIGINT in production.
-        let grace = Duration::from_secs(cfg.shutdown_grace_secs);
-        let in_flight_reader = make_prometheus_inflight_reader(metrics_handle_for_shutdown);
-        let deadline_token = shutdown_handle.token();
-        let shutdown_signal = async move { deadline_token.cancelled().await };
-        let serve_future = async move {
-            tokio::try_join!(api_future, admin_future, control_future).context("serving")?;
-            Ok::<(), anyhow::Error>(())
-        };
-        run_with_shutdown_deadline(serve_future, shutdown_signal, grace, in_flight_reader).await?;
+        let admin_router = build_admin_router(ctx.clone());
+        Some((admin_listener, admin_router))
     } else {
-        info!("HORT_METRICS_BIND not set — /metrics served on main router (dev mode)");
-        let oci_cfg = hort_http_oci::OciHttpConfig {
-            legacy_catalog_enabled: cfg.oci_legacy_catalog_enabled,
-            // Per-`(repo,
-            // principal)` outstanding-session cap.
-            max_sessions_per_principal: cfg.oci_max_sessions_per_principal,
-            // Session max-age — set TTL + admit age-prune threshold.
-            session_max_age_secs: cfg.oci_session_max_age_secs,
-        };
-        // Single-listener mode still
-        // honours the metrics-auth posture: the auth dispatch carves
-        // `/metrics` out to `require_principal` when the flag is set.
-        let router = build_router_with_oci_config(
-            ctx,
-            true,
-            &oci_cfg,
-            cfg.metrics_require_auth,
-            cfg.enable_token_exchange,
-            control_split,
-        );
-        let token = shutdown_handle.token();
+        info!("HORT_METRICS_BIND not set — /metrics not exposed on any listener");
+        None
+    };
 
-        // Optional control listener in the
-        // single-(metrics-on-main)-listener topology too. Same
-        // homogeneous-future shape as the split branch: a concrete
-        // future that resolves to `Ok(())` immediately when
-        // `HORT_CONTROL_BIND` is unset (zero behaviour change).
-        let control_token = shutdown_handle.token();
-        let control_future = async move {
-            match control_bound {
-                Some((listener, ctrl_router)) => {
-                    serve_with_hyper_util(listener, ctrl_router, http_timeouts, control_token).await
-                }
-                None => Ok(()),
+    let oci_cfg = hort_http_oci::OciHttpConfig {
+        legacy_catalog_enabled: cfg.oci_legacy_catalog_enabled,
+        // Per-`(repo,
+        // principal)` outstanding-session cap.
+        max_sessions_per_principal: cfg.oci_max_sessions_per_principal,
+        // Session max-age — set TTL + admit age-prune threshold.
+        session_max_age_secs: cfg.oci_session_max_age_secs,
+    };
+    let api = build_router_with_oci_config(ctx, &oci_cfg, cfg.enable_token_exchange, control_split);
+
+    // `axum::serve(...)` is replaced
+    // with `serve_with_hyper_util` so we can configure
+    // `http1_header_read_timeout` (the slowloris kill) and the
+    // HTTP/2 keep-alive knobs that hyper otherwise leaves at
+    // permissive defaults. The function consumes the listener +
+    // router and runs an explicit accept loop atop
+    // `hyper_util::server::conn::auto::Builder`. Every listener takes a
+    // fresh shutdown-token clone so a single SIGTERM fans out to all of
+    // them plus the background refresh tasks.
+    //
+    // `serve_with_hyper_util` calls `into_make_service_with_connect_info::<SocketAddr>`
+    // internally so the peer SocketAddr is injected as a
+    // `ConnectInfo<SocketAddr>` extension on every request — the
+    // `request_trust_layer` reads it from there. Behaviour
+    // matches the prior `axum::serve(...).with_graceful_shutdown(...)`
+    // call modulo the new transport timeouts.
+    let api_token = shutdown_handle.token();
+    let api_future = serve_with_hyper_util(api_listener, api, http_timeouts, api_token);
+
+    // Homogeneous optional-listener futures: both the control and admin
+    // listeners resolve immediately to `Ok(())` when unbound, so
+    // `try_join!` below stays a fixed three-future shape regardless of
+    // which optional listeners the operator enabled.
+    let control_token = shutdown_handle.token();
+    let control_future = async move {
+        match control_bound {
+            Some((listener, router)) => {
+                serve_with_hyper_util(listener, router, http_timeouts, control_token).await
             }
-        };
+            None => Ok(()),
+        }
+    };
+    let admin_token = shutdown_handle.token();
+    let admin_future = async move {
+        match admin_bound {
+            Some((listener, router)) => {
+                serve_with_hyper_util(listener, router, http_timeouts, admin_token).await
+            }
+            None => Ok(()),
+        }
+    };
 
-        // Same shutdown-deadline wrap as the
-        // split-listener branch above. See that branch for the full
-        // rationale; the call site is mirrored so the contract holds
-        // regardless of which listener topology the operator picks.
-        let grace = Duration::from_secs(cfg.shutdown_grace_secs);
-        let in_flight_reader = make_prometheus_inflight_reader(metrics_handle_for_shutdown);
-        let deadline_token = shutdown_handle.token();
-        let shutdown_signal = async move { deadline_token.cancelled().await };
-        let api_future = serve_with_hyper_util(api_listener, router, http_timeouts, token);
-        let serve_future = async move {
-            tokio::try_join!(api_future, control_future).context("serving")?;
-            Ok::<(), anyhow::Error>(())
-        };
-        run_with_shutdown_deadline(serve_future, shutdown_signal, grace, in_flight_reader).await?;
-    }
+    // Wall-clock cap on the
+    // graceful-shutdown wait. Without it, a stuck handler (frozen
+    // DB pool, hung upstream) could block `try_join!` forever and
+    // force an orchestrator-issued SIGKILL to escalate, leaving
+    // in-flight uploads in undefined state. The wrapper bounds the
+    // wait at `HORT_SHUTDOWN_GRACE_SECS` (default 60s); on timeout
+    // it emits a single `tracing::warn!(target: "hort::shutdown",
+    // ...)` carrying the in-flight request count read off the
+    // Prometheus registry, then returns Ok so the process exits
+    // cleanly. Inner errors propagate untouched on the clean path.
+    //
+    // The deadline is armed only after `shutdown_signal` resolves
+    // — pre-fix the wrapper armed the timer at process start and
+    // fired at boot+grace regardless of SIGTERM, killing the
+    // listener and presenting as a Kubernetes restart-loop. The
+    // shutdown signal is a fresh clone of the shutdown token;
+    // it resolves on SIGTERM/SIGINT in production.
+    let grace = Duration::from_secs(cfg.shutdown_grace_secs);
+    let in_flight_reader = make_prometheus_inflight_reader(metrics_handle_for_shutdown);
+    let deadline_token = shutdown_handle.token();
+    let shutdown_signal = async move { deadline_token.cancelled().await };
+    let serve_future = async move {
+        tokio::try_join!(api_future, admin_future, control_future).context("serving")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    run_with_shutdown_deadline(serve_future, shutdown_signal, grace, in_flight_reader).await?;
 
     // Drain the refresh task. When axum returns the shutdown token is
     // already cancelled (that's why serve stopped) — the refresh task
@@ -1254,35 +1174,5 @@ mod tests {
                 ))
             }
         });
-    }
-
-    // `HORT_METRICS_REQUIRE_AUTH=false`
-    // emits a startup `WARN`. The structured `env_var` field is the
-    // load-bearing piece for log-shipper alerting. The default-true
-    // case must NOT emit any warn line referencing this env var.
-    #[traced_test]
-    #[test]
-    fn metrics_auth_bypass_emits_startup_warn() {
-        warn_metrics_auth_bypass(false);
-
-        assert!(
-            logs_contain("env_var=\"HORT_METRICS_REQUIRE_AUTH\""),
-            "expected metrics-bypass warning to carry env_var=HORT_METRICS_REQUIRE_AUTH"
-        );
-        assert!(
-            logs_contain("metrics endpoint authentication is DISABLED"),
-            "expected the documented bypass-warning lede"
-        );
-    }
-
-    #[traced_test]
-    #[test]
-    fn metrics_auth_default_emits_no_bypass_warn() {
-        warn_metrics_auth_bypass(true);
-
-        assert!(
-            !logs_contain("env_var=\"HORT_METRICS_REQUIRE_AUTH\""),
-            "no metrics-bypass warning should be emitted when require_auth is true"
-        );
     }
 }

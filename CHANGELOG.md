@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`/metrics` is now admin-listener-only and gated by a dedicated
+  `read_metrics` grant, with no anonymous-scrape opt-out.** The main
+  public listener no longer serves `/metrics` under any configuration
+  (previously reachable there when `HORT_METRICS_BIND` was unset); the
+  admin listener's `/metrics` route now requires
+  `Permission::ReadMetrics` rather than bare authentication. (#113)
+
+### Removed
+
+- **`HORT_METRICS_REQUIRE_AUTH` / Helm `metrics.requireAuth`.** The
+  anonymous-scrape escape hatch is retired end-to-end (config, chart,
+  docs) — a caller must always present a bearer carrying the
+  `read_metrics` grant. Setting the removed env var is silently
+  ignored; a values file setting `metrics.requireAuth` is rejected by
+  chart schema validation. (#113)
+
 ## [0.9.15] - 2026-08-01
 
 ### Changed

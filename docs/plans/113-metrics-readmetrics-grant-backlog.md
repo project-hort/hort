@@ -168,7 +168,33 @@ Confirm acceptance, refine with the user, then write. Can proceed in parallel wi
 but must reflect their final shapes before merge.
 ```
 
+## Item 5 — Test harnesses gain a `read_metrics`-granted scrape identity (restore metric assertions)
+
+**Design doc section:** §2 D1–D3 (consequence closure; groomed from directive-005 report escalations #1 + #2)
+**Read first:** `handover/archive/005-113-item3-report.md` (escalations section — full call-site inventory), `scripts/native-tests/lib/common.sh` (`assert_metric_ingest` ~88-90), `scripts/native-tests/scenarios/proxy/pull-dedup.sh` (~66-67, the guard shape), `scripts/alpha-fixtures/alpha.env`, `scripts/alpha-fixtures/gitops-config/` (the existing `prefetch` grant for `dev-user` — the pattern to mirror), `docs/architecture/how-to/alpha-testing-runbook.md` §4.d/§9.a
+**Context:** Since Item 2 landed on `develop`, every anonymous `/metrics` scrape denies (401/403), so ~10 native-test scenarios' metric-content assertions silently degrade to skip (their non-2xx guards skip, not fail) and the alpha runbook's metrics assertions describe a precondition with no runnable fixture path. Same root gap: no harness has a `read_metrics`-granted identity.
+**Acceptance:**
+- Alpha fixtures: a `read_metrics` grant lands in `scripts/alpha-fixtures/gitops-config/` (mirroring the existing `dev-user` `prefetch` grant shape); `alpha.env` sets `HORT_METRICS_BIND`; the runbook §4.d/§9.a assertions and triage-cheatsheet row become runnable commands again (no fabricated commands — they must work against the fixtures).
+- Native tests: harness setup mints/derives a `read_metrics`-granted bearer (gitops fixture grant + the harness's existing token plumbing); `lib/common.sh`'s `assert_metric_ingest` and every per-scenario `curl … "$METRICS_URL"` call site send `Authorization`. With the granted token available, a non-2xx scrape is a **fail** (assertion power restored); the skip guard remains only for the genuinely-absent case (`METRICS_URL` unset, e.g. external-hort mode).
+- Report inventories every `METRICS_URL` curl call site + disposition (the directive-005 report's escalation #2 list is the starting inventory).
+- Shellcheck-clean; scenario contract conformance; workspace gate green (script-only change — gate covers the repo).
+
+### Starter prompt
+```
+/hort-architect
+
+Implement Item 5 of docs/plans/113-metrics-readmetrics-grant-backlog.md (groomed from the
+directive-005 report's escalations #1+#2 — read that report's escalation section first for
+the full call-site inventory). Give both test harnesses a read_metrics-granted scrape
+identity: (a) alpha fixtures — add the grant to scripts/alpha-fixtures/gitops-config/
+mirroring the dev-user prefetch grant, set HORT_METRICS_BIND in alpha.env, make the
+runbook §4.d/§9.a metrics assertions runnable again; (b) native tests — mint a granted
+bearer in harness setup and thread Authorization through lib/common.sh assert_metric_ingest
+and every scenario METRICS_URL curl, flipping the non-2xx guard from skip to fail when the
+token exists (keep skip only when METRICS_URL is unset). Confirm acceptance, then implement.
+```
+
 ## Sequencing / notes
-- Merge order: 1 → 2 → 2b → 2c → 3, with 4 landing before the develop→main promotion (D7 delete of `docs/plans/`).
+- Merge order: 1 → 2 → 2b → 2c → 3, with 4 landing before the develop→main promotion (D7 delete of `docs/plans/`). Item 5 (harness scrape identity) closes the coverage gap Items 2/3 opened — dispatch after Item 3 merges; independent of Item 4.
 - Not architecture-eroding: no new port, no `AppContext` field, no adapter import in a format crate, no release-gate interaction. One additive migration.
 - Pre-push gate per CLAUDE.md (`cargo fmt/clippy/test --workspace`, `cargo audit`, `cargo deny`); migration adds a non-workspace-crate-free change so no attribution regen needed.

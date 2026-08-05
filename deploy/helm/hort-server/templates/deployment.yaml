@@ -234,8 +234,6 @@ spec:
               value: {{ .Values.upstream.userAgent | quote }}
             {{- end }}
             # ----- Metrics -----
-            - name: HORT_METRICS_REQUIRE_AUTH
-              value: {{ .Values.metrics.requireAuth | quote }}
             {{- if .Values.metrics.bindAddr }}
             - name: HORT_METRICS_BIND
               value: {{ .Values.metrics.bindAddr | quote }}
