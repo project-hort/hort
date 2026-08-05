@@ -60,6 +60,10 @@ const PERMISSION_DELETE: &str = "delete";
 /// — the metric tracks "decisions on the curator surface", not
 /// "the curator role was the one consulted".
 const PERMISSION_CURATE: &str = "curate";
+/// Label used by [`MetricsReaderPrincipal`] for the `GET /metrics` scrape
+/// gate. The catalog (`docs/metrics-catalog.md`) admits `read_metrics` as a
+/// sixth `permission` label value (issue #113).
+const PERMISSION_READ_METRICS: &str = "read_metrics";
 const RESULT_ALLOW: &str = "allow";
 const RESULT_DENY: &str = "deny";
 
@@ -110,6 +114,41 @@ pub struct AdminPrincipal(pub CallerPrincipal);
 /// line. RBAC enforcement resumes when `AuthContext::Enabled`.
 #[derive(Debug, Clone)]
 pub struct CurateOrAdminPrincipal(pub CallerPrincipal);
+
+/// Asserts the caller carries `Permission::ReadMetrics`. Gates
+/// `GET /metrics` (issue #113 — the Prometheus exposition carries
+/// repository-labelled cardinality and must not be readable by every
+/// authenticated principal).
+///
+/// Payload is the validated [`CallerPrincipal`] for downstream logging /
+/// audit.
+///
+/// **Orthogonal to [`AdminPrincipal`] — DECIDED (human, 2026-08-05).** This
+/// extractor authorizes `Permission::ReadMetrics` only, with no `Admin`
+/// fall-through in its own control flow (unlike [`CurateOrAdminPrincipal`]'s
+/// two-leg precedence). A scraper `ServiceAccount` is not an admin and an
+/// admin credential is not implicitly a scrape credential; an operator who
+/// needs both holds two explicit grants. See
+/// `docs/plans/113-metrics-readmetrics-grant.md` §2 D3.
+///
+/// **KNOWN GAP (flagged, not fixed by this extractor):** the shared
+/// [`RbacEvaluator::authorize`](hort_app::rbac::RbacEvaluator::authorize) →
+/// `user_grants_authorize` short-circuit still treats the `"admin"` claim
+/// as satisfying *every* `Permission`, `ReadMetrics` included — this
+/// extractor cannot override that from the outside. So today an
+/// `admin`-claim principal *does* pass this gate without an explicit
+/// `read_metrics` grant, which contradicts the D3 decision above. Closing
+/// that requires a `ReadMetrics` carve-out inside `RbacEvaluator` itself
+/// (and a matching fix in `effective_grants`, which shares the same
+/// admin-marker short-circuit and is asserted consistent with `authorize`
+/// by the `effective_grants_agrees_with_authorize_per_cell` test) —
+/// deliberately deferred out of this change; see the handover report for
+/// #113 item 2.
+///
+/// Under Disabled, grants unconditionally and logs an info-level audit
+/// line. RBAC enforcement resumes when `AuthContext::Enabled`.
+#[derive(Debug, Clone)]
+pub struct MetricsReaderPrincipal(pub CallerPrincipal);
 
 /// Asserts the caller is authenticated. Does NOT check any permission —
 /// "any authenticated user can call this" is the contract. Use for
@@ -211,6 +250,26 @@ impl FromRequestParts<Arc<AppContext>> for AdminPrincipal {
     ) -> Result<Self, Self::Rejection> {
         let principal = extract_principal(parts, state).map_err(|b| *b)?;
         authorize(state, &principal, Permission::Admin, None, PERMISSION_ADMIN).map_err(|b| *b)?;
+        Ok(Self(principal))
+    }
+}
+
+impl FromRequestParts<Arc<AppContext>> for MetricsReaderPrincipal {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppContext>,
+    ) -> Result<Self, Self::Rejection> {
+        let principal = extract_principal(parts, state).map_err(|b| *b)?;
+        authorize(
+            state,
+            &principal,
+            Permission::ReadMetrics,
+            None,
+            PERMISSION_READ_METRICS,
+        )
+        .map_err(|b| *b)?;
         Ok(Self(principal))
     }
 }
@@ -1422,6 +1481,249 @@ mod tests {
                 crate::middleware::auth::extract_optional_principal,
             ))
             .with_state(ctx)
+    }
+
+    // ================================================================
+    // MetricsReaderPrincipal
+    // ================================================================
+
+    async fn metrics_reader_handler(_extractor: MetricsReaderPrincipal) -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("ok"))
+            .unwrap()
+    }
+
+    fn metrics_reader_router(ctx: Arc<AppContext>) -> Router {
+        Router::new()
+            .route("/metrics", get(metrics_reader_handler))
+            .with_state(ctx)
+    }
+
+    /// Build an RBAC evaluator where the `scraper` claim carries the
+    /// global (`repository_id = None`) `read_metrics` grant — the
+    /// scraper-`ServiceAccount` shape D3 describes.
+    fn rbac_with_read_metrics_grant() -> RbacEvaluator {
+        let grant = PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(vec!["scraper".into()]),
+            repository_id: None,
+            permission: Permission::ReadMetrics,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        };
+        RbacEvaluator::new(vec![grant])
+    }
+
+    /// Shortcut: a `BearerOnly` auth context over the supplied roles +
+    /// grants — the `HORT_AUTH_PROVIDER=disabled` +
+    /// `HORT_NATIVE_TOKENS_ENABLED=true` shape (#109). Mirrors
+    /// `enabled_auth` but returns the sibling variant; `authorize()`'s
+    /// `Enabled { rbac, .. } | BearerOnly { rbac, .. }` match arm treats
+    /// both identically for the RBAC leg, so this proves the extractor
+    /// doesn't hard-code `Enabled` and silently miss `BearerOnly`.
+    fn bearer_only_auth(rbac: RbacEvaluator) -> AuthContext {
+        use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
+        use hort_app::use_cases::test_support::MockIdentityProvider;
+        use hort_domain::ports::identity_provider::IdentityProvider;
+        use hort_domain::ports::user_repository::UserRepository;
+
+        let idp = Arc::new(MockIdentityProvider::new());
+        let users = Arc::new(MockUserRepository::new());
+        let authenticate = Arc::new(AuthenticateUseCase::new(
+            idp as Arc<dyn IdentityProvider>,
+            users as Arc<dyn UserRepository>,
+            vec![] as Vec<ClaimMapping>,
+        ));
+        AuthContext::BearerOnly {
+            authenticate,
+            rbac: Arc::new(arc_swap::ArcSwap::from_pointee(rbac)),
+        }
+    }
+
+    #[test]
+    fn metrics_reader_extractor_allows_read_metrics_grant() {
+        let (snap, status) = capture(|| {
+            run_async(async {
+                let repos = Arc::new(MockRepositoryRepository::new());
+                let ctx = ctx_with_repos(repos, enabled_auth(rbac_with_read_metrics_grant()));
+                let router = metrics_reader_router(ctx);
+                let req = request_with_principal("/metrics", Some(principal(&["scraper"])));
+                let resp = router.oneshot(req).await.unwrap();
+                resp.status()
+            })
+        });
+        assert_eq!(status, StatusCode::OK);
+        let entries = snap.into_vec();
+        let v = find(
+            &entries,
+            MetricKind::Counter,
+            "hort_authz_decisions_total",
+            &[("permission", "read_metrics"), ("result", "allow")],
+        )
+        .expect("read_metrics/allow counter absent");
+        assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    #[test]
+    fn metrics_reader_extractor_denies_no_grant_with_403() {
+        let (snap, body_and_status) = capture(|| {
+            run_async(async {
+                let repos = Arc::new(MockRepositoryRepository::new());
+                let ctx = ctx_with_repos(repos, enabled_auth(rbac_with_read_metrics_grant()));
+                let router = metrics_reader_router(ctx);
+                // Authenticated, but the "reader" claim doesn't carry
+                // the read_metrics grant (only "scraper" does).
+                let req = request_with_principal("/metrics", Some(principal(&["reader"])));
+                let resp = router.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = to_bytes(resp.into_body(), 1024).await.unwrap().to_vec();
+                (status, body)
+            })
+        });
+        let (status, body) = body_and_status;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body_str = String::from_utf8(body).unwrap();
+        assert_eq!(body_str, r#"{"error":"insufficient permissions"}"#);
+        let entries = snap.into_vec();
+        let v = find(
+            &entries,
+            MetricKind::Counter,
+            "hort_authz_decisions_total",
+            &[("permission", "read_metrics"), ("result", "deny")],
+        )
+        .expect("read_metrics/deny counter absent");
+        assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    /// §5 of the design doc: a `read_metrics` denial is an audit-trail
+    /// record (who tried to scrape without the grant), not an error
+    /// condition — the shared `authorize()` helper logs deny at
+    /// `tracing::info!`, never `err`/`ERROR`. Pins the level explicitly
+    /// rather than relying on the shared helper's behavior staying
+    /// correct implicitly.
+    #[tracing_test::traced_test]
+    #[test]
+    fn metrics_reader_denial_logs_at_info_not_error() {
+        run_async(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let ctx = ctx_with_repos(repos, enabled_auth(rbac_with_read_metrics_grant()));
+            let router = metrics_reader_router(ctx);
+            let req = request_with_principal("/metrics", Some(principal(&["reader"])));
+            router.oneshot(req).await.unwrap()
+        });
+        assert!(
+            logs_contain("authorization denied"),
+            "deny log line missing"
+        );
+        logs_assert(|lines: &[&str]| {
+            let deny_lines: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("authorization denied") && l.contains("read_metrics"))
+                .collect();
+            if deny_lines.is_empty() {
+                return Err("no read_metrics deny log line captured".to_string());
+            }
+            for line in &deny_lines {
+                if !line.contains("INFO") {
+                    return Err(format!("expected INFO level, got: {line}"));
+                }
+                if line.contains("ERROR") || line.contains("WARN") {
+                    return Err(format!("deny log must not be ERROR/WARN: {line}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// Anonymous scrape → 401, not the pre-#113 200 leak. Mirrors
+    /// `admin_extractor_returns_401_on_optional_principal_none` — GETs
+    /// carry `Option<AuthenticatedPrincipal>`, so "auth ran, no bearer
+    /// presented" is `Some(None)`, not a missing slot.
+    #[test]
+    fn metrics_reader_extractor_returns_401_when_anonymous() {
+        let status = run_async(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let ctx = ctx_with_repos(repos, enabled_auth(rbac_with_read_metrics_grant()));
+            let router = metrics_reader_router(ctx);
+            let mut req = HttpRequest::get("/metrics").body(Body::empty()).unwrap();
+            req.extensions_mut()
+                .insert::<Option<AuthenticatedPrincipal>>(None);
+            router.oneshot(req).await.unwrap().status()
+        });
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// #109/#113: under `AuthContext::BearerOnly` (disabled OIDC provider +
+    /// native tokens enabled), the extractor must still enforce the
+    /// `read_metrics` grant — the leak this closes is specifically that
+    /// `require_principal` (authN only) does not distinguish `Enabled` from
+    /// `BearerOnly`, so an authenticated-but-ungranted BearerOnly caller
+    /// must deny exactly like the `Enabled` case above.
+    #[test]
+    fn metrics_reader_extractor_denies_no_grant_under_bearer_only() {
+        let status = run_async(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let ctx = ctx_with_repos(repos, bearer_only_auth(rbac_with_read_metrics_grant()));
+            let router = metrics_reader_router(ctx);
+            let req = request_with_principal("/metrics", Some(principal(&["reader"])));
+            router.oneshot(req).await.unwrap().status()
+        });
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// #109/#113: the BearerOnly companion to the allow-path test above —
+    /// a `read_metrics`-granted caller under `BearerOnly` still reaches
+    /// 200, proving the RBAC leg (not just the deny leg) is exercised
+    /// identically to `Enabled`.
+    #[test]
+    fn metrics_reader_extractor_allows_read_metrics_grant_under_bearer_only() {
+        let status = run_async(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let ctx = ctx_with_repos(repos, bearer_only_auth(rbac_with_read_metrics_grant()));
+            let router = metrics_reader_router(ctx);
+            let req = request_with_principal("/metrics", Some(principal(&["scraper"])));
+            router.oneshot(req).await.unwrap().status()
+        });
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// **KNOWN GAP vs the D3 "orthogonal, no Admin fall-through" decision**
+    /// (see the [`MetricsReaderPrincipal`] doc comment). This extractor's
+    /// own control flow never tries `Permission::Admin` as a fallback —
+    /// but `RbacEvaluator::user_grants_authorize`'s pre-existing `"admin"`
+    /// claim short-circuit is unconditional across every `Permission`
+    /// variant (see `DeleteRepoAccess`'s doc comment for the same
+    /// short-circuit accepted for `Permission::Delete`), so an
+    /// admin-claim principal reaches this extractor without an explicit
+    /// `read_metrics` grant and is allowed. This test PINS today's actual
+    /// behavior (200) — it does NOT assert the decided policy (403) — so a
+    /// future change to `RbacEvaluator` that closes the gap fails this
+    /// test loudly and must update it alongside the fix, rather than the
+    /// gap silently persisting unnoticed. Closing it requires a
+    /// `ReadMetrics` carve-out in `RbacEvaluator` (both `authorize` and
+    /// `effective_grants`, which the `effective_grants_agrees_with_authorize_per_cell`
+    /// test asserts stay consistent) — deferred out of this change; see the
+    /// #113 item 2 handover report for the two remediation options put to
+    /// the architect.
+    #[test]
+    fn metrics_reader_admin_claim_short_circuits_pending_113_evaluator_carveout() {
+        let status = run_async(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            // No explicit read_metrics grant anywhere in this evaluator.
+            let ctx = ctx_with_repos(repos, enabled_auth(RbacEvaluator::new(Vec::new())));
+            let router = metrics_reader_router(ctx);
+            let req = request_with_principal("/metrics", Some(principal(&["admin"])));
+            router.oneshot(req).await.unwrap().status()
+        });
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "if this now fails with 403, the RbacEvaluator carve-out has landed — \
+             update this test's assertion and doc comment instead of treating the \
+             failure as a regression"
+        );
     }
 
     // ================================================================

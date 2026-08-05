@@ -7,8 +7,11 @@
 //! 2. Anonymous `GET /metrics` on the main listener returns 401 by
 //!    default when the operator runs single-listener (no
 //!    `HORT_METRICS_BIND`).
-//! 3. `HORT_METRICS_REQUIRE_AUTH=false` re-permits anonymous scraping
-//!    for legacy deployments.
+//! 3. `HORT_METRICS_REQUIRE_AUTH=false` no longer re-permits anonymous
+//!    scraping as of #113 item 2 — `render_metrics` now unconditionally
+//!    requires `Permission::ReadMetrics` regardless of this flag. See the
+//!    test's own doc comment for exactly what it pins in the interim
+//!    before item 3 removes the flag outright.
 //! 4. `HORT_METRICS_PUBLIC_BIND` gates the `0.0.0.0` bind refusal at
 //!    config-parse time.
 //!
@@ -158,12 +161,24 @@ fn anonymous_get_metrics_on_main_listener_returns_401_by_default() {
     );
 }
 
-/// **RED → GREEN regression test, acceptance bar (c) — bypass.**
-///
-/// Setting `metrics_require_auth=false` re-permits anonymous scraping.
-/// Operators with legacy Prometheus configs that cannot supply a
-/// bearer token use this escape hatch (the WARN log is asserted
-/// separately at config-parse time).
+/// **Superseded by #113 item 2 — `metrics_require_auth=false` no longer
+/// yields an anonymous 200.** Before item 2, `render_metrics` had no
+/// permission check of its own, so `metrics_require_auth=false`'s only
+/// effect — routing `/metrics` through `extract_optional_principal`
+/// instead of `require_principal` — was sufficient to let an anonymous
+/// caller through the handler. Item 2 added `MetricsReaderPrincipal`
+/// (`Permission::ReadMetrics`) directly on `render_metrics`, unconditional
+/// on this flag; the flag now controls only whether a *missing* principal
+/// is rejected at the auth-dispatch layer (401, main listener) or is never
+/// even given a chance to authenticate because no principal-extracting
+/// layer runs at all (500 router-wiring response, admin listener — see
+/// `build_admin_router`'s `require_auth && ctx.auth.has_auth()` gate).
+/// Either way the exposition is no longer reachable anonymously — the flag
+/// stopped being a working bypass the moment item 2 landed, ahead of its
+/// formal removal in item 3 (design doc D5, "retire the
+/// `HORT_METRICS_REQUIRE_AUTH=false` anonymous escape hatch"). This test
+/// now pins that transitional reality instead of the pre-item-2 bypass;
+/// item 3 deletes both the flag and this test.
 #[test]
 fn anonymous_get_metrics_allowed_when_require_auth_is_false() {
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -193,12 +208,16 @@ fn anonymous_get_metrics_allowed_when_require_auth_is_false() {
 
     assert_eq!(
         admin_status,
-        StatusCode::OK,
-        "admin /metrics must allow anonymous when require_auth=false"
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "admin listener attaches no principal-extracting layer at all when \
+         require_auth=false, so MetricsReaderPrincipal's extract_principal hits \
+         its router-wiring-bug branch, not an RBAC deny"
     );
     assert_eq!(
         main_status,
-        StatusCode::OK,
-        "main /metrics must allow anonymous when require_auth=false"
+        StatusCode::UNAUTHORIZED,
+        "main listener still runs extract_optional_principal when \
+         require_auth=false, which writes Some(None) for an anonymous caller; \
+         MetricsReaderPrincipal reads that as authenticated-but-token-absent"
     );
 }

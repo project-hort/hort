@@ -4544,10 +4544,29 @@ mod tests {
                     assert_eq!(&body[..], payload);
 
                     // --- 3. Scrape /metrics ---------------------------------
-                    let scrape = router
-                        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
-                        .await
-                        .unwrap();
+                    // `render_metrics` requires `MetricsReaderPrincipal`
+                    // (`Permission::ReadMetrics`, #113 item 2). The mock ctx
+                    // is `AuthContext::Disabled`, under which `authorize()`
+                    // grants unconditionally — but `extract_principal` still
+                    // needs a principal in extensions, and `Disabled` skips
+                    // the whole auth-dispatch layer, so no middleware
+                    // populates it. Inject one directly, mirroring
+                    // `require_principal`'s slot shape.
+                    let mut scrape_req = Request::get("/metrics").body(Body::empty()).unwrap();
+                    hort_http_core::middleware::auth::test_support::inject_principal(
+                        &mut scrape_req,
+                        CallerPrincipal {
+                            user_id: Uuid::new_v4(),
+                            external_id: "test:scraper".into(),
+                            username: "scraper".into(),
+                            email: "scraper@example.com".into(),
+                            claims: vec![],
+                            token_kind: None,
+                            issued_at: Utc::now(),
+                            token_cap: None,
+                        },
+                    );
+                    let scrape = router.oneshot(scrape_req).await.unwrap();
                     assert_eq!(scrape.status(), StatusCode::OK);
                     let scrape_bytes = to_bytes(scrape.into_body(), 128 * 1024).await.unwrap();
                     String::from_utf8(scrape_bytes.to_vec()).unwrap()
