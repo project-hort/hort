@@ -158,9 +158,16 @@ modes fit (`crates/hort-config/src/service_account.rs`):
   sibling finding #111). Prometheus needs a small sidecar to run the
   `POST /api/v1/auth/exchange` (RFC 8693) and refresh a `credentials_file`.
 
-Model A is the worked example in Item 4; Model B is documented as the
-pure-workload-identity alternative. (Provisioning-model preference is an open
-refinement question for the human on #113.)
+**Both modes are supported** (human decision, #113). **Model B is the featured
+worked example** in Item 4 (the operator manages Hort + Prometheus from one Flux
+repo and prefers no secret at rest); Model A is the documented alternative.
+Model B needs **no new Hort code**: the exchange is the existing
+`docs/architecture/how-to/federate-k8s-workload-identity.md` flow, and the
+exchanged `TokenKind::ServiceAccount` bearer carries the SA's grant snapshot —
+so an SA holding the unscoped `read_metrics` grant yields a scrape-only token.
+The only runtime piece is a ~10-line refresh loop (project SA JWT → POST
+`/auth/exchange` → write `credentials_file`), not Hort-specific; Prometheus
+scrapes via `authorization.credentials_file`.
 
 ## §4 Auth-catalog & ADR
 
