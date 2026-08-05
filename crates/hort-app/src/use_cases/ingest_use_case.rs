@@ -3824,6 +3824,13 @@ impl IngestUseCase {
             });
         }
 
+        // Captured now (not read off `repo.format` again later) because
+        // `ArtifactMetadata { format: repo.format, .. }` below MOVES
+        // `repo.format` out of `repo` (`RepositoryFormat` is `Clone`, not
+        // `Copy`). Mirrors `ingest_inner`'s own early
+        // `scan_enqueue_format` capture (~line 2662) — same reason there.
+        let scan_enqueue_format = repo.format.to_string();
+
         // Idempotence guard — same-path dedup. If an artifact already
         // sits at `(repository_id, coords.path)`, we must not emit a
         // second `ArtifactIngested` for the same logical location.
@@ -4039,18 +4046,50 @@ impl IngestUseCase {
         // 1. Transition the in-memory artifact to `Quarantined` with
         //    the backdated anchor (`Artifact::quarantine` sets
         //    `quarantine_window_start = anchor`).
-        // 2. Append `ArtifactQuarantined` to the same stream as a
-        //    follow-on commit (mirrors `ingest_inner`'s strict-mode
-        //    quarantine step at the bottom of step 6).
+        // 2. Resolve the SAME scan/provenance enqueue gate `ingest_inner`
+        //    computes (issue #115 defect (a) — see `commit_transition_with_enqueues`
+        //    below), so this seed-imported artifact is never quarantined
+        //    without ALSO being scanned. Before this fix the follow-on
+        //    commit landed only `ArtifactQuarantined` with no scan
+        //    enqueue — no rescan-sweep candidate list picks up an
+        //    artifact with no job row at all (`select_eligible` requires
+        //    `released`/`NULL`; `select_stranded` requires a *failed*
+        //    job row), so every seed-imported artifact under a scanning
+        //    policy 503'd forever. Widening `select_stranded` to also
+        //    recover pre-existing job-less rows is #115 Item 2 — this is
+        //    the at-source fix so no NEW ones strand.
+        // 3. Append `ArtifactQuarantined` + the gated `ScanRequested` to
+        //    the same stream as ONE follow-on commit, atomic with the
+        //    job-row enqueues (mirrors `ingest_inner`'s strict-mode
+        //    quarantine step at the bottom of step 6 — same
+        //    `commit_transition_with_enqueues` no-strand guarantee,
+        //    ADR 0002/0004).
         //
         // **Not** `ScanWaived`, **not** permissive. A dirty scan still
         // transitions the artifact to `Rejected` via
         // `Artifact::reject_from_scan`; the release authority gate
-        // is unchanged. This path stamps only the *time* anchor.
+        // is unchanged. This path stamps the *time* anchor AND now
+        // requests the scan/provenance verdicts that authority depends
+        // on.
+        //
+        // Consequence (issue #115 design doc §2 D1, intentional and
+        // policy-consistent, not a bug): seeding unsigned content into a
+        // repo with `provenance_mode: Required` and a provenance-capable
+        // format now resolves to an IMMEDIATE terminal
+        // `Rejected{Unsigned}` — the backdated anchor means
+        // `window_open` is already `false` by the time the enqueued
+        // `provenance-verify` job runs, and this artifact is never a
+        // referenced-tree descendant (seed-import has no
+        // `content_references` target from another already-ingested
+        // artifact), so neither hold carve-out applies. `Required` means
+        // unsigned content does not release, seeded or not; operators
+        // seed unsigned content into non-`Required` repos.
         //
         // Every existing non-seed caller passes
-        // `quarantine_anchor_override = None`; the block is a no-op
-        // for them.
+        // `quarantine_anchor_override = None`; this whole block —
+        // including the policy resolution and gate derivation below — is
+        // a no-op for them (#107 generalises the `None` callers'
+        // own Gate-2 exposure separately; this item does not touch them).
         if let Some(anchor) = quarantine_anchor_override {
             let quarantine_event =
                 artifact
@@ -4060,6 +4099,78 @@ impl IngestUseCase {
                         repo_key: Some(repo_key.clone()),
                     })?;
 
+            // Resolve the active policy for the target repo — IDENTICAL
+            // derivation to `ingest_inner` (~line 2705), including the
+            // same non-fatal fail-open-to-"no policy" handling on a
+            // projection-read error: aborting the seed-import on a
+            // transient policy-read failure would make scanning a hard
+            // dependency of seed-import, which the design explicitly
+            // avoids (the artifact still quarantines; an operator can
+            // manually rescan once the projection is back).
+            let matched_policy: Option<ScanPolicyProjection> =
+                resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            artifact_id = %artifact_id,
+                            repository_id = %repository_id,
+                            error = %e,
+                            "seed-import: policy_projections.list_active failed; \
+                             skipping scan auto-enqueue (artifact still quarantines)",
+                        );
+                        None
+                    });
+
+            // `scan_will_run` / `provenance_will_run` — EXACT same
+            // derivations as `ingest_inner` (~lines 2732, 2779). A
+            // `scan_backends: []` policy (or no operator policy plus an
+            // empty `DefaultPolicy`, which never happens today but is
+            // handled identically for parity) enqueues nothing; release
+            // then proceeds via the unchanged `ScanWaived` authority.
+            let scan_will_run = match matched_policy.as_ref() {
+                Some(p) => !p.scan_backends.is_empty(),
+                None => !DefaultPolicy::block_on_critical_default_backends().is_empty(),
+            };
+            let provenance_mode = matched_policy
+                .as_ref()
+                .map(|p| p.provenance_mode)
+                .unwrap_or_default();
+            let provenance_will_run = provenance_mode != ProvenanceMode::Off
+                && self
+                    .provenance_capable_formats
+                    .contains(&scan_enqueue_format);
+
+            let mut events = vec![EventToAppend::new(DomainEvent::ArtifactQuarantined(
+                quarantine_event,
+            ))];
+            if scan_will_run {
+                events.push(EventToAppend {
+                    event_id: Uuid::new_v4(),
+                    event: DomainEvent::ScanRequested(ScanRequested {
+                        artifact_id,
+                        scanner: matched_policy
+                            .as_ref()
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| "default".to_string()),
+                    }),
+                });
+            }
+
+            let mut enqueues: Vec<IngestEnqueue> = Vec::new();
+            if scan_will_run {
+                enqueues.push(IngestEnqueue::Scan {
+                    format: scan_enqueue_format.clone(),
+                    priority: 0, // default tier, mirrors ingest_inner's ingest-time enqueue
+                    trigger_source: "seed-import".to_string(),
+                });
+            }
+            if provenance_will_run {
+                enqueues.push(IngestEnqueue::ProvenanceVerify {
+                    priority: 0,
+                    trigger_source: "seed-import".to_string(),
+                });
+            }
+
             let expected_version = read_expected_version(&*self.events, &stream_id, true)
                 .await
                 .map_err(|e| RegisterError::Other {
@@ -4068,14 +4179,12 @@ impl IngestUseCase {
                 })?;
 
             self.lifecycle
-                .commit_transition(
+                .commit_transition_with_enqueues(
                     &artifact,
                     AppendEvents {
                         stream_id,
                         expected_version,
-                        events: vec![EventToAppend::new(DomainEvent::ArtifactQuarantined(
-                            quarantine_event,
-                        ))],
+                        events,
                         correlation_id,
                         causation_id: None,
                         // System actor — the seed-import path is operator-
@@ -4085,6 +4194,7 @@ impl IngestUseCase {
                         actor: hort_domain::events::system_actor(),
                     },
                     None, // metadata was persisted on the preceding ingest transition
+                    &enqueues,
                 )
                 .await
                 .map_err(|e| RegisterError::Other {
@@ -4095,7 +4205,9 @@ impl IngestUseCase {
             tracing::info!(
                 %artifact_id,
                 %anchor,
-                "seed-import quarantine stamped (backdated anchor)"
+                scan_will_run,
+                provenance_will_run,
+                "seed-import quarantine stamped (backdated anchor); scan/provenance gate resolved"
             );
         }
 
@@ -7841,6 +7953,87 @@ mod tests {
                 "expected a domain error from the delegate, got {err:?}"
             );
             assert!(lifecycle.committed_transitions().is_empty());
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // #115 Item 1 — seed cutover (`seed_import_quarantine_anchor:
+    // Some(anchor)`) policy-lookup-failure fail-open branch.
+    //
+    // The other seed-branch acceptance tests (scan enqueued under a
+    // scanning policy, nothing enqueued under scan_backends:[],
+    // provenance enqueued iff mode != Off && capable format, atomicity)
+    // live in `seed_import_use_case.rs`, driven through
+    // `SeedImportUseCase::run` end-to-end. THIS ONE test calls
+    // `register_existing_cas_blob` directly instead: `SeedImportUseCase
+    // ::run_one` performs its OWN, EARLIER `resolve_active_policy_for_repo`
+    // call (for the backdated-anchor duration) before ever reaching
+    // `register_by_hash_inner`, and `MockPolicyProjectionRepository::
+    // fail_next_list_active` is single-shot — injecting a failure through
+    // `SeedImportUseCase::run` would be consumed by that unrelated earlier
+    // call, never reaching the branch this item actually added. Calling
+    // `register_existing_cas_blob` directly isolates the ONE
+    // `resolve_active_policy_for_repo` call this item's code makes.
+    // -----------------------------------------------------------------
+
+    /// Error path: a policy-projection lookup failure inside the seed
+    /// cutover's enqueue-gate resolution degrades to "no policy"
+    /// (`matched_policy = None`) — same non-fatal fail-open handling as
+    /// `ingest_inner`'s identical branch (~line 2705). The artifact still
+    /// quarantines (the quarantine transition itself does not depend on
+    /// policy resolution), and the DEFAULT policy's non-empty
+    /// `scan_backends` (`["trivy"]`) still fires — a transient
+    /// projection-read hiccup must never silently strand a fresh
+    /// seed-imported artifact with no scan ever requested (the exact
+    /// defect this item closes).
+    #[test]
+    fn seed_cutover_policy_lookup_failure_falls_back_to_default_scan() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            storage.insert_content(hash.clone(), b"seed-bytes".to_vec());
+            policies.fail_next_list_active(DomainError::Invariant("db timeout".into()));
+
+            let anchor = Utc::now() - chrono::Duration::seconds(90_000); // well past any duration
+            let outcome = uc
+                .register_existing_cas_blob(
+                    RegisterExistingCasBlobRequest {
+                        seed_import_quarantine_anchor: Some(anchor),
+                        ..recb_req(repo_id, hash)
+                    },
+                    &test_handler(),
+                )
+                .await
+                .expect("policy-lookup failure must not abort the seed cutover");
+
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::Quarantined,
+                "the lookup failure must not prevent the quarantine transition"
+            );
+
+            // Two commits — ArtifactIngested, then the quarantine
+            // follow-on (`commit_transition_with_enqueues`).
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 2, "{transitions:?}");
+
+            // Default policy (no operator policy resolved — the lookup
+            // failed) still scans by default.
+            let enqueues = lifecycle.ingest_enqueues();
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert!(
+                enqueues[0].1.iter().any(|e| matches!(
+                    e,
+                    IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "seed-import"
+                )),
+                "policy-lookup failure must still fall back to the scanning DefaultPolicy: {:?}",
+                enqueues[0].1
+            );
         });
     }
 
