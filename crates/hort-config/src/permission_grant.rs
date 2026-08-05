@@ -312,6 +312,7 @@ pub fn validate_permission_grant(env: &Envelope<PermissionGrantSpec>) -> Vec<Val
                 "admin_task_invoke",
                 "curate",
                 "prefetch",
+                "read_metrics",
             ],
         });
     }
@@ -790,13 +791,14 @@ mod tests {
             Permission::AdminTaskInvoke => "admin_task_invoke",
             Permission::Curate => "curate",
             Permission::Prefetch => "prefetch",
+            Permission::ReadMetrics => "read_metrics",
         }
     }
 
     /// Every `Permission` variant, for the diagnostic-list and acceptance
     /// loops. Kept adjacent to [`wire_literal`], whose exhaustive match is
     /// the staleness guard for both.
-    const ALL_PERMISSIONS: [Permission; 7] = [
+    const ALL_PERMISSIONS: [Permission; 8] = [
         Permission::Read,
         Permission::Write,
         Permission::Delete,
@@ -804,6 +806,7 @@ mod tests {
         Permission::AdminTaskInvoke,
         Permission::Curate,
         Permission::Prefetch,
+        Permission::ReadMetrics,
     ];
 
     /// Validation must accept every `Permission` variant that

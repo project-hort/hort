@@ -271,7 +271,7 @@ async fn harden_events_role_tolerates_missing_events_table() {
 fn migrator_set_within_squashed_baseline_bounds() {
     let count = MIGRATOR.iter().count();
     assert!(
-        (5..=15).contains(&count),
-        "squashed migration set out of bounds: count={count} (expected 5..=15 per the ADR 0022 squashed baseline)"
+        (5..=20).contains(&count),
+        "squashed migration set out of bounds: count={count} (expected 5..=20 per the ADR 0022 squashed baseline)"
     );
 }

@@ -1055,6 +1055,7 @@ mod tests {
             Permission::AdminTaskInvoke,
             Permission::Curate,
             Permission::Prefetch,
+            Permission::ReadMetrics,
         ] {
             // Exhaustive, no-wildcard classification. Cross-check against the
             // production `is_admin_class` helper so the two cannot drift.
@@ -1064,6 +1065,10 @@ mod tests {
                 | Permission::Curate
                 | Permission::Prefetch => true,
                 Permission::Read | Permission::Write | Permission::Delete => false,
+                // Read-only, non-admin by design (issue #113): a
+                // Prometheus scraper is deliberately not admin-class, and
+                // `Admin` does not implicitly satisfy it either.
+                Permission::ReadMetrics => false,
             };
             assert_eq!(
                 is_admin_class(p),
