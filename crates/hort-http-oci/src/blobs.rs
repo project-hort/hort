@@ -4108,6 +4108,131 @@ mod tests {
         PrometheusBuilder::new().build_recorder().handle()
     }
 
+    /// A repo-scoped, quarantining, scanning `ScanPolicy` for `repo_id` —
+    /// repo-scoped wins over `build_mock_ctx`'s pre-seeded permissive-
+    /// global default (`resolve_active_policy_for_repo`'s
+    /// `repo_scoped.or(global)`), so seeding one per repo below does not
+    /// interact with the other repo in the same test.
+    fn quarantining_policy(
+        repo_id: Uuid,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        };
+        use hort_domain::events::PolicyScope;
+        let now = Utc::now();
+        ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: format!("item3-follower-regression-{repo_id}"),
+            scope: PolicyScope::Repository(repo_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs: 3600,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::Off,
+            provenance_backends: Vec::new(),
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            stream_version: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Issue #107 Item 3 pin (c) — the OCI cross-repo pull-dedup
+    /// FOLLOWER trigger. Unlike
+    /// `concurrent_blob_callers_coalesce_into_one_leader_started` above
+    /// (same repo for both racers — that test only exercises the
+    /// upstream-FETCH coalescing, not the cross-repo follower
+    /// registration), this races the SAME content hash across TWO
+    /// DIFFERENT target repos: `blob_dedup_key = DedupKey::blob_by_hash`
+    /// is keyed purely by hash, not by repo (ADR 0026), so whichever
+    /// caller loses the coalesce race lands in
+    /// `try_upstream_blob_pull`'s `Ok(None)` post-coalesce arm — the
+    /// cross-repo follower branch that calls
+    /// `register_existing_cas_blob` (this file, ~line 928-957) instead
+    /// of `ingest_verified`.
+    ///
+    /// Before issue #107 Item 1, only the LEADER's row (via
+    /// `ingest_verified`, already correctly gated pre-#107) would
+    /// quarantine; the FOLLOWER's row (via `register_by_hash_inner`)
+    /// minted `None`/immediately-downloadable with no gate at all. This
+    /// test asserts BOTH repos' rows end up `Quarantined` under an
+    /// active policy — a leader/follower-agnostic assertion (true
+    /// regardless of which repo wins the race), which is exactly what
+    /// distinguishes post-#107 (both quarantined) from pre-#107 (only
+    /// one quarantined) behaviour.
+    #[test]
+    fn cross_repo_follower_quarantines_target_row_under_active_policy() {
+        let (r1, r2) = run(async {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo_a = oci_repo("repo-a");
+            let repo_b = oci_repo("repo-b");
+            mocks.repositories.insert(repo_a.clone());
+            mocks.repositories.insert(repo_b.clone());
+            mocks
+                .policy_projections
+                .insert(quarantining_policy(repo_a.id));
+            mocks
+                .policy_projections
+                .insert(quarantining_policy(repo_b.id));
+
+            let content = b"cross-repo follower content for item3 regression".to_vec();
+            let hex = {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(&content))
+            };
+            let hash: ContentHash = hex.parse().unwrap();
+            mocks.upstream_proxy.insert_blob(
+                "dockerhub/",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                content.clone(),
+                Some(format!("sha256:{hex}")),
+            );
+            seed_dockerhub_mapping(&mocks, repo_a.id);
+            seed_dockerhub_mapping(&mocks, repo_b.id);
+
+            let ctx_a = ctx.clone();
+            let repo_a2 = repo_a.clone();
+            let hash_a = hash.clone();
+            let h1 = tokio::spawn(async move {
+                try_upstream_blob_pull(&ctx_a, &repo_a2, "dockerhub/library/nginx", &hash_a).await
+            });
+            let ctx_b = ctx.clone();
+            let repo_b2 = repo_b.clone();
+            let hash_b = hash.clone();
+            let h2 = tokio::spawn(async move {
+                try_upstream_blob_pull(&ctx_b, &repo_b2, "dockerhub/library/nginx", &hash_b).await
+            });
+
+            (h1.await.unwrap(), h2.await.unwrap())
+        });
+
+        for (label, outcome) in [("repo-a", r1), ("repo-b", r2)] {
+            match outcome {
+                UpstreamPullOutcome::Ingested(artifact) => {
+                    assert_eq!(
+                        artifact.quarantine_status,
+                        QuarantineStatus::Quarantined,
+                        "issue #107 Item 1: {label}'s row must be Quarantined under its \
+                         active policy regardless of whether {label} won the coalesce race \
+                         (leader, via ingest_verified) or lost it (follower, via \
+                         register_by_hash_inner) — pre-#107 only the leader's row quarantined"
+                    );
+                }
+                other => panic!(
+                    "{label} must succeed with Ingested; got variant {}",
+                    outcome_variant_name(&other)
+                ),
+            }
+        }
+    }
+
     /// Render `UpstreamPullOutcome`'s variant discriminator without
     /// depending on `Debug` (the variants carry an `Artifact` row that
     /// the production type intentionally does not derive `Debug` on).
