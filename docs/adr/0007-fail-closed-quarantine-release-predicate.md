@@ -24,6 +24,18 @@ The background sweep transitions an artifact to `released` only when `quarantine
 
 `ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` immediately sets `rejected` (time never reverses this). A scan job that exhausts retries fails closed — see the exhaustion split below.
 
+### "A successful `ScanCompleted`" means the latest verdict, not mere presence (issue #108, amended 2026-08-05; human-approved via `workflow::ready`)
+
+Authority 1 above reads "a successful `ScanCompleted` on the artifact stream" — this was under-specified enough to have been misimplemented as *any* `ScanCompleted`, full stop. That is wrong: the **rejecting** scan branch (the `ScanCompleted(findings)` → `rejected` path noted above) itself commits a `ScanCompleted` event — with a nonzero `finding_count` — immediately before the `ArtifactRejected` that makes the verdict terminal. A presence-only reading of authority 1 therefore treated a dirty scan's own rejection record as a release authority for the very artifact it had just condemned, defeating the `rejected` status it landed in the same commit (issue #108 H3 — closed by hardening the two verdict-commit paths that made the resulting timer-release *reachable*, items 1–2 of the same issue; this clarification closes the authority predicate itself as defense-in-depth, so the amplifier cannot resurface even if a future write path reopens the underlying race).
+
+**"Successful" is defined precisely as:** the artifact's **latest** `ScanCompleted` on the stream carries `finding_count == 0`, **AND** no `ArtifactRejected` appears **later** on the stream than that `ScanCompleted`. Both clauses matter and are independent failure modes:
+
+- A stream whose latest `ScanCompleted` is dirty (`finding_count > 0`) never authorizes release, regardless of how many earlier clean scans preceded it — the latest verdict governs, not any-verdict-ever.
+- A stream whose latest `ScanCompleted` is clean but is followed by a later `ArtifactRejected` (an admin/curation rejection landing after the scan, for instance) also never authorizes release — the clean scan is stale with respect to the subsequent rejection.
+- Symmetrically, an earlier dirty scan + rejection followed by a genuinely later clean **rescan**, with no further rejection after it, DOES authorize release — the predicate is about the latest verdict on the stream, not "was there ever a rejection anywhere in this artifact's history".
+
+This reads the SAME artifact stream `resolve_release_authority` already reads to check for presence; no new port, query shape, or release authority is introduced. The other four authorities (`ScanWaived`, `AdminOverride`, `CuratorWaiver`, `PolicyReEvaluation`) are unaffected — this clarification is scoped to authority 1 alone.
+
 ### Scan-execution failure vs ambiguous result on retry-exhaustion (issue #6, amended 2026-07-14)
 
 A `ScanRunOutcome::Failed` that exhausts `HORT_SCANNER_MAX_ATTEMPTS` is a scanner-**execution** failure (every configured backend errored — the scan could not run), which is operationally distinct from a genuinely ambiguous scan **result**. On exhaustion, `ScanOrchestrationUseCase::record_outcome` splits by the artifact's **current** `quarantine_status`:
