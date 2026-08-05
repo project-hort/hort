@@ -121,12 +121,26 @@ pub struct WhoamiResponse {
 #[serde(untagged)]
 pub enum WhoamiEffectiveGrants {
     /// Unrestricted admin (synthetic `admin` claim / `is_admin`) carrying
-    /// no narrowing cap. Renders `{ "global_admin": true }`.
+    /// no narrowing cap. Renders `{ "global_admin": true, "read_metrics":
+    /// bool }`.
     GlobalAdmin {
         /// Always `true` — the field exists so the marker serializes as
-        /// the documented `{ "global_admin": true }` object, distinct
+        /// the documented `{ "global_admin": true, ... }` object, distinct
         /// from the cell-list array variant.
         global_admin: bool,
+        /// **Additive field (#113 / D3, item 2c).** `Permission::ReadMetrics`
+        /// is the ONE permission the admin marker does not imply — see
+        /// `RbacEvaluator::user_grants_authorize`'s carve-out
+        /// (`hort-app/src/rbac.rs`). `true` iff the admin also holds an
+        /// explicit `read_metrics` grant (surfaced as a
+        /// `(repo, ReadMetrics)` cell in
+        /// [`RbacEvaluator::effective_grants`]'s otherwise-empty `cells`
+        /// for a global admin); `false` otherwise. Every other permission
+        /// stays implied by `global_admin: true` as before — this field
+        /// exists so a whoami caller can tell "I hold `read_metrics`"
+        /// from "I don't" without that one exception being silently
+        /// swallowed by the marker.
+        read_metrics: bool,
     },
     /// The exact `(repository, permission)` cells this token can exercise.
     /// Empty = the token holds nothing.
@@ -271,9 +285,24 @@ async fn resolve_effective_grants(
     if grant_set.is_global_admin {
         // Unrestricted admin → the marker. A *narrowing* cap turns the
         // admin's footprint into the cap itself (grants ⊇ cap), enumerated
-        // below.
+        // below — the capped path needs no parallel `read_metrics` field:
+        // it never renders the marker at all, so a held `read_metrics`
+        // grant already surfaces as an ordinary cell in that enumeration
+        // (see `cap_cells` / item 2c's capped-admin audit).
         if caller.token_cap.is_none() {
-            return WhoamiEffectiveGrants::GlobalAdmin { global_admin: true };
+            // `Permission::ReadMetrics` is the one exception the marker
+            // doesn't cover (#113 / D3) — `effective_grants` surfaces it
+            // as an explicit cell in `grant_set.cells` even though
+            // `is_global_admin` is `true`; every other permission never
+            // appears there for a global admin.
+            let read_metrics = grant_set
+                .cells
+                .iter()
+                .any(|&(_, perm)| perm == Permission::ReadMetrics);
+            return WhoamiEffectiveGrants::GlobalAdmin {
+                global_admin: true,
+                read_metrics,
+            };
         }
         let cells = cap_cells(caller.token_cap.as_ref());
         return render_cells(ctx, cells).await;
@@ -805,6 +834,165 @@ mod tests {
             v["effective_grants"].as_array().is_none(),
             "marker must not serialize as a cell array: {v}"
         );
+        // #113 / D3 / item 2c: no explicit read_metrics grant held here.
+        assert_eq!(
+            v["effective_grants"]["read_metrics"], false,
+            "no read_metrics grant held — the additive field must be false: {v}"
+        );
+    }
+
+    // (b2) #113 / D3 / item 2c: an admin who ALSO holds an explicit
+    // `read_metrics` grant sees `read_metrics: true` on the marker,
+    // alongside `global_admin: true` — the one field the marker doesn't
+    // otherwise imply.
+    #[tokio::test]
+    async fn whoami_effective_grants_admin_no_cap_with_read_metrics_grant_sets_flag() {
+        let user_id = Uuid::new_v4();
+        let grants = vec![claims_grant(&["admin"], None, Permission::ReadMetrics)];
+        let (router, _) = build_enabled_router(grants, Vec::new());
+
+        let principal = principal_with_cap(user_id, &["admin"], Some(TokenKind::CliSession), None);
+
+        let v = whoami_json(router, &principal).await;
+        assert_eq!(v["effective_grants"]["global_admin"], true);
+        assert_eq!(
+            v["effective_grants"]["read_metrics"], true,
+            "explicit read_metrics grant held — the additive field must be true: {v}"
+        );
+        assert!(
+            v["effective_grants"].as_array().is_none(),
+            "still the marker object, not a cell array, even with the flag set: {v}"
+        );
+    }
+
+    // (b3) Non-admin whoami is byte-identical to pre-item-2c: the new
+    // `read_metrics` field lives ONLY on the `GlobalAdmin` marker variant,
+    // so a non-admin's `Cells(...)` response must not gain it anywhere.
+    #[tokio::test]
+    async fn whoami_effective_grants_non_admin_path_unaffected_by_read_metrics_field() {
+        let user_id = Uuid::new_v4();
+        let mut repo = sample_repository();
+        repo.key = "npm-proxy".into();
+        let repo_id = repo.id;
+        let grants = vec![
+            claims_grant(&["developer"], Some(repo_id), Permission::Read),
+            // A read_metrics grant on a DIFFERENT claim the caller doesn't
+            // hold — must not leak into a non-admin's cell list or shape.
+            claims_grant(&["scraper"], None, Permission::ReadMetrics),
+        ];
+        let (router, _) = build_enabled_router(grants, vec![repo]);
+
+        let principal =
+            principal_with_cap(user_id, &["developer"], Some(TokenKind::CliSession), None);
+
+        let v = whoami_json(router, &principal).await;
+        let cells = v["effective_grants"].as_array().expect("cell list");
+        assert_eq!(
+            cells.len(),
+            1,
+            "unrelated read_metrics grant must not appear: {v}"
+        );
+        assert_eq!(cells[0]["repository"], "npm-proxy");
+        assert_eq!(cells[0]["permission"], "read");
+        assert!(
+            v["effective_grants"]["read_metrics"].is_null(),
+            "read_metrics is a GlobalAdmin-only field, absent on the Cells shape: {v}"
+        );
+        assert!(
+            v["effective_grants"]["global_admin"].is_null(),
+            "non-admin never renders the marker: {v}"
+        );
+    }
+
+    // (b4) #113 / D3 / item 2c capped-admin audit: a capped admin's cap was
+    // minted via `RbacEvaluator::derive_cli_session_cap` (item 2b), which
+    // only includes `ReadMetrics` in the cap when the admin held the
+    // explicit grant AT MINT TIME. The whoami capped-admin path renders the
+    // cap's cells directly (never the marker), so a held `read_metrics`
+    // grant already surfaces as an ordinary cell with no parallel field
+    // needed — this test proves the mint-time guarantee (item 2b) and the
+    // render-time behavior (item 2c) compose correctly end-to-end.
+    #[tokio::test]
+    async fn whoami_effective_grants_capped_admin_read_metrics_cell_reflects_mint_time_grant() {
+        use hort_app::rbac::RbacEvaluator as Eval;
+
+        let user_id = Uuid::new_v4();
+        let grants = vec![claims_grant(&["admin"], None, Permission::ReadMetrics)];
+        let evaluator = Eval::new(grants.clone());
+
+        // Mint the cap the SAME way the exchange path does: through
+        // `derive_cli_session_cap`, which item 2b taught to drop
+        // ReadMetrics unless the admin holds the explicit grant.
+        let mint_principal =
+            principal_with_cap(user_id, &["admin"], Some(TokenKind::CliSession), None);
+        let cap = evaluator
+            .derive_cli_session_cap(
+                &mint_principal,
+                &[Permission::ReadMetrics, Permission::Write],
+            )
+            .expect("admin with the explicit grant derives a non-empty cap");
+        assert_eq!(
+            cap.permissions,
+            vec![Permission::ReadMetrics, Permission::Write],
+            "sanity: the minted cap actually carries ReadMetrics (mint-time grant held)"
+        );
+
+        let (router, _) = build_enabled_router(grants, Vec::new());
+        let principal = principal_with_cap(user_id, &["admin"], Some(TokenKind::Pat), Some(cap));
+
+        let v = whoami_json(router, &principal).await;
+        let cells = v["effective_grants"]
+            .as_array()
+            .expect("cell list, not the marker");
+        assert!(
+            cells
+                .iter()
+                .any(|c| c["permission"] == "read_metrics" && c["repository"].is_null()),
+            "the mint-time-granted read_metrics cell must render as an ordinary cell: {v}"
+        );
+        assert!(
+            cells.iter().any(|c| c["permission"] == "write"),
+            "the other capped permission still renders too: {v}"
+        );
+    }
+
+    // (b5) Companion negative case: requesting ReadMetrics without holding
+    // the grant at mint time drops it from the cap (item 2b); whoami then
+    // correctly shows no read_metrics cell at all.
+    #[tokio::test]
+    async fn whoami_effective_grants_capped_admin_without_grant_omits_read_metrics_cell() {
+        use hort_app::rbac::RbacEvaluator as Eval;
+
+        let user_id = Uuid::new_v4();
+        // No read_metrics grant anywhere.
+        let evaluator = Eval::new(Vec::new());
+
+        let mint_principal =
+            principal_with_cap(user_id, &["admin"], Some(TokenKind::CliSession), None);
+        let cap = evaluator
+            .derive_cli_session_cap(
+                &mint_principal,
+                &[Permission::ReadMetrics, Permission::Write],
+            )
+            .expect("admin still derives a cap for Write even without the ReadMetrics grant");
+        assert_eq!(
+            cap.permissions,
+            vec![Permission::Write],
+            "sanity: ReadMetrics dropped at mint time, only Write survives"
+        );
+
+        let (router, _) = build_enabled_router(Vec::new(), Vec::new());
+        let principal = principal_with_cap(user_id, &["admin"], Some(TokenKind::Pat), Some(cap));
+
+        let v = whoami_json(router, &principal).await;
+        let cells = v["effective_grants"]
+            .as_array()
+            .expect("cell list, not the marker");
+        assert!(
+            !cells.iter().any(|c| c["permission"] == "read_metrics"),
+            "no read_metrics cell — the grant was never held: {v}"
+        );
+        assert!(cells.iter().any(|c| c["permission"] == "write"));
     }
 
     // (c) THE Finding-1 over-report guard. User holds {Read,Write}×{repoA,
