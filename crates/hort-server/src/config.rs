@@ -77,19 +77,6 @@ pub struct Config {
     /// shape, exactly the reconnaissance signal an attacker uses to
     /// time probes around real traffic.
     pub metrics_bind_addr: Option<SocketAddr>,
-    /// When `true` (the default), the
-    /// `/metrics` route requires admin authentication on both the
-    /// admin listener (`build_admin_router`) and the main listener
-    /// when `HORT_METRICS_BIND` is unset (auth dispatch carve-out in
-    /// `wrap_with_middleware`). Anonymous scrapes return 401.
-    ///
-    /// `HORT_METRICS_REQUIRE_AUTH=false` re-permits anonymous scraping
-    /// for legacy deployments and emits a startup `WARN` so the
-    /// trade-off is visible in logs / log shippers. The endpoint
-    /// reveals repository names, auth-failure rates, and traffic
-    /// shape — opting out re-opens the reconnaissance vector this
-    /// lockdown closes.
-    pub metrics_require_auth: bool,
     /// When `false` (the default), the
     /// metrics listener refuses to bind to the unspecified address
     /// (`0.0.0.0:port` or `[::]:port`). Operators who genuinely want
@@ -906,7 +893,6 @@ impl std::fmt::Debug for Config {
             api_bind_addr,
             require_https,
             metrics_bind_addr,
-            metrics_require_auth,
             metrics_public_bind,
             control_bind_addr,
             control_public_bind,
@@ -984,7 +970,6 @@ impl std::fmt::Debug for Config {
             .field("api_bind_addr", api_bind_addr)
             .field("require_https", require_https)
             .field("metrics_bind_addr", metrics_bind_addr)
-            .field("metrics_require_auth", metrics_require_auth)
             .field("metrics_public_bind", metrics_public_bind)
             .field("control_bind_addr", control_bind_addr)
             .field("control_public_bind", control_public_bind)
@@ -1923,12 +1908,12 @@ impl Config {
                 .expect("hard-coded bind default parses"),
         };
 
-        // Opt-in flags for the
-        // `/metrics` lockdown. Parsed BEFORE `metrics_bind_addr` so
-        // the unspecified-address guard can consult them in the same
-        // pass. `parse_bool` keeps the conventional defaults: auth
-        // required = true, public bind = false.
-        let metrics_require_auth = parse_bool("HORT_METRICS_REQUIRE_AUTH", true)?;
+        // Opt-in flag for the `/metrics` unspecified-address bind guard.
+        // Parsed BEFORE `metrics_bind_addr` so the guard can consult it in
+        // the same pass. `parse_bool` keeps the conventional default:
+        // public bind = false. (`/metrics` auth itself is no longer
+        // optional — #113 item 3 removed `HORT_METRICS_REQUIRE_AUTH`; the
+        // endpoint always requires `Permission::ReadMetrics`.)
         let metrics_public_bind = parse_bool("HORT_METRICS_PUBLIC_BIND", false)?;
 
         let metrics_bind_addr = match std::env::var("HORT_METRICS_BIND") {
@@ -2461,7 +2446,6 @@ impl Config {
             api_bind_addr,
             require_https,
             metrics_bind_addr,
-            metrics_require_auth,
             metrics_public_bind,
             control_bind_addr,
             control_public_bind,
@@ -3918,9 +3902,7 @@ mod tests {
             api_bind_addr: "0.0.0.0:8080".parse().unwrap(),
             require_https: false,
             metrics_bind_addr: None,
-            // Defaults match production
-            // posture (auth required, public-bind opt-out off).
-            metrics_require_auth: true,
+            // Default matches production posture (public-bind opt-out off).
             metrics_public_bind: false,
             control_bind_addr: None,
             control_public_bind: false,
@@ -4045,7 +4027,6 @@ mod tests {
             api_bind_addr: "127.0.0.1:8080".parse().unwrap(),
             require_https: true,
             metrics_bind_addr: Some("127.0.0.1:9090".parse().unwrap()),
-            metrics_require_auth: true,
             metrics_public_bind: false,
             control_bind_addr: None,
             control_public_bind: false,
@@ -4328,8 +4309,8 @@ mod tests {
             "Config Debug dropped require_https field name: {debug_repr}"
         );
         assert!(
-            debug_repr.contains("metrics_require_auth"),
-            "Config Debug dropped metrics_require_auth field name: {debug_repr}"
+            debug_repr.contains("metrics_public_bind"),
+            "Config Debug dropped metrics_public_bind field name: {debug_repr}"
         );
     }
 
@@ -5259,16 +5240,11 @@ mod tests {
         });
     }
 
-    /// Defaults for the new lockdown
-    /// flags. Auth required, public-bind opt-out off.
+    /// Default for the surviving lockdown flag: public-bind opt-out off.
     #[test]
     fn metrics_lockdown_flags_default_to_secure_posture() {
         temp_env::with_vars(fs_env(), || {
             let cfg = Config::from_env().unwrap();
-            assert!(
-                cfg.metrics_require_auth,
-                "HORT_METRICS_REQUIRE_AUTH default must be true"
-            );
             assert!(
                 !cfg.metrics_public_bind,
                 "HORT_METRICS_PUBLIC_BIND default must be false"
@@ -5276,16 +5252,25 @@ mod tests {
         });
     }
 
-    /// `HORT_METRICS_REQUIRE_AUTH=false`
-    /// flips the bypass on and is observable on the parsed config.
+    /// #113 item 3: `HORT_METRICS_REQUIRE_AUTH` is removed end-to-end, not
+    /// renamed or shimmed — `Config::from_env` never calls
+    /// `std::env::var("HORT_METRICS_REQUIRE_AUTH")` anywhere, so setting it
+    /// is silently ignored (no error, no effect on any field) rather than
+    /// rejected. This pins that "silently ignored" is the actual, verified
+    /// behavior for a stale operator-set var, not an assumption — parsing
+    /// still succeeds and every other field still matches the plain
+    /// `fs_env()` baseline.
     #[test]
-    fn metrics_require_auth_false_parsed() {
+    fn removed_metrics_require_auth_var_is_silently_ignored() {
         let mut env = fs_env();
         env.push(("HORT_METRICS_REQUIRE_AUTH", Some("false")));
-        temp_env::with_vars(env, || {
-            let cfg = Config::from_env().unwrap();
-            assert!(!cfg.metrics_require_auth);
-        });
+        let with_stale_var = temp_env::with_vars(env, Config::from_env).unwrap();
+        let baseline = temp_env::with_vars(fs_env(), Config::from_env).unwrap();
+        assert_eq!(
+            format!("{with_stale_var:?}"),
+            format!("{baseline:?}"),
+            "a stale HORT_METRICS_REQUIRE_AUTH must not change the parsed config at all"
+        );
     }
 
     /// `HORT_METRICS_BIND=0.0.0.0:9090` is refused at config-parse

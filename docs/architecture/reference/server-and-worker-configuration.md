@@ -457,8 +457,7 @@ it is referenced, not scheduled here.
 
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
-| `HORT_METRICS_REQUIRE_AUTH` | bool | `true` | No | Require admin auth on `/metrics`; `false` re-permits anonymous scrape (boot WARN). |
-| `HORT_METRICS_BIND` | SocketAddr | _unset → metrics on the main router_ | No | Dedicated metrics listener address. |
+| `HORT_METRICS_BIND` | SocketAddr | _unset → /metrics not exposed on any listener_ | No | Dedicated admin listener address; `/metrics` always requires a bearer carrying `Permission::ReadMetrics` (no opt-out, #113 item 3). |
 | `HORT_METRICS_PUBLIC_BIND` | bool | `false` | No | Allow the metrics listener to bind an unspecified address (`0.0.0.0`/`::`). Parsed before `HORT_METRICS_BIND` so the guard can consult it. |
 
 ### CAS scrubber

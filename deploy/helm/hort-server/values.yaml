@@ -102,9 +102,11 @@ trustedProxyCidrs: []
 rateLimitExemptCidrs: []
 
 # -------------------- Authentication --------------------
-# Note: `auth.provider` gates the main API; `metrics.requireAuth` gates
-# the /metrics endpoint independently. Disabling one does not affect
-# the other — operators set both to align with their threat model.
+# Note: `auth.provider` gates the main API. `/metrics` is gated
+# independently, and unconditionally — a caller must present a bearer
+# carrying the `read_metrics` grant regardless of `auth.provider`; there
+# is no chart-level opt-out (#113 item 3 retired the
+# `HORT_METRICS_REQUIRE_AUTH=false` anonymous escape hatch).
 auth:
   # HORT_AUTH_PROVIDER — `oidc` (default) | `disabled`.
   #
@@ -347,32 +349,29 @@ upstream:
   userAgent: ""
 
 # -------------------- Metrics --------------------
-# /metrics is always served by the binary. The chart controls WHERE:
-# - `bindAddr` non-empty → dedicated listener on that address. The
-#   main 8080 router has no /metrics route. Container + Service ports
-#   for `metricsPort` are exposed.
-# - `bindAddr` empty → /metrics mounted on the main 8080 router under
-#   `requireAuth`. No separate listener; metrics container/Service
-#   ports skipped.
+# /metrics is served EXCLUSIVELY by the dedicated admin listener, gated by
+# the `read_metrics` grant (#113 item 3 — no main-router mount, no
+# operator opt-out of the grant check). The chart controls WHETHER that
+# listener binds at all:
+# - `bindAddr` non-empty (the default) → dedicated listener on that
+#   address. Container + Service ports for `metricsPort` are exposed.
+# - `bindAddr` empty → no admin listener binds; `/metrics` is not
+#   reachable on any listener in the pod.
 metrics:
   # HORT_METRICS_BIND — bind address for the dedicated /metrics listener
   # inside the pod. Examples:
   #   "127.0.0.1:9090" (default) — loopback only; sidecar-scrape pattern
   #   "0.0.0.0:9090"             — all interfaces; needs allowUnspecifiedBind: true
-  #   ""                         — /metrics on main router (dev mode)
+  #   ""                         — /metrics not exposed on any listener
   bindAddr: "127.0.0.1:9090"
   # HORT_METRICS_PUBLIC_BIND — required when `bindAddr` binds to
   # `0.0.0.0` or `::`. The binary refuses to start with an unspecified
   # bind unless this opt-in is true. Operators wiring an explicit pod-
   # level bind ALSO take responsibility for restricting reachability via
-  # NetworkPolicy / ingress rules.
+  # NetworkPolicy / ingress rules — network position is defense-in-depth
+  # ONLY; the `read_metrics` grant is the sole authz gate and is never
+  # optional.
   allowUnspecifiedBind: false
-  # HORT_METRICS_REQUIRE_AUTH — default true.
-  # Setting false emits a prominent NOTES.txt warning post-install.
-  # Note: this is independent of `auth.provider` — that one gates the
-  # main API; this one gates /metrics. Set both to match your threat
-  # model.
-  requireAuth: true
   serviceMonitor:
     # When true, renders `templates/servicemonitor.yaml`. Requires the
     # Prometheus Operator CRDs to be installed in the cluster, AND

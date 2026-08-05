@@ -8,7 +8,10 @@
 # This compose stack is for local development and the E2E smoke harness ONLY.
 # It ships intentionally-weak defaults that MUST NOT be used in production:
 #   - default DB / Keycloak-admin passwords (overridable — see below),
-#   - anonymous /metrics on 0.0.0.0 (HORT_METRICS_REQUIRE_AUTH=false),
+#   - /metrics bound to 0.0.0.0 so the host port-mapping can reach it (still
+#     requires a bearer carrying `read_metrics` — #113 item 3 removed the
+#     anonymous-scrape opt-out entirely, so this is reachability-only, not
+#     an auth downgrade),
 #   - plaintext HTTP, no TLS, ephemeral data.
 # Credentials are overridable via the environment (e.g. a gitignored
 # `.env.local`, see `.env.local.example`): `${POSTGRES_PASSWORD:-registry}` /
@@ -238,9 +241,10 @@ services:
       HORT_STORAGE_FILESYSTEM_PATH: "/var/lib/hort-server/cas"
       HORT_API_BIND: "0.0.0.0:8080"
       HORT_METRICS_BIND: "0.0.0.0:9090"
-      # DANGER (dev/CI only): the next two flags expose /metrics on 0.0.0.0
-      # WITHOUT auth (repo names, error rates, traffic shape). Production MUST
-      # leave both UNSET (secure defaults: bind off / require auth).
+      # DANGER (dev/CI only): the next flag exposes the /metrics LISTENER on
+      # 0.0.0.0 (reachability, not authz — `/metrics` still unconditionally
+      # requires a bearer carrying `read_metrics`, #113 item 3). Production
+      # MUST leave it UNSET (secure default: bind off).
       # Explicit opt-in to bind /metrics on 0.0.0.0; hort-server
       # refuses the unspecified-address bind without this flag. The
       # compose network namespace requires 0.0.0.0 so the host
@@ -250,14 +254,14 @@ services:
       # and bind metrics on a dedicated internal interface or expose
       # the listener only on the proxy network.
       HORT_METRICS_PUBLIC_BIND: "true"
-      # Keep /metrics scrape anonymous in this example/dev compose so
-      # the e2e harness's readiness probe (`curl -sf $METRICS_URL`
-      # before any token is fetched) and any local Prometheus instance
-      # can scrape without bearer config. The startup WARN documents
-      # the deliberate downgrade. Production MUST leave this UNSET
-      # (defaults to true) and configure the scraper with a
-      # Keycloak-issued bearer.
-      HORT_METRICS_REQUIRE_AUTH: "false"
+      # `/metrics` has no anonymous-scrape opt-out — the e2e harness's
+      # metrics-content assertions (`assert_metric_ingest` in
+      # scripts/native-tests/lib/common.sh) probe it without a bearer and
+      # gracefully SKIP (not fail) when that returns non-2xx; readiness
+      # itself polls `/healthz` on the main listener instead (anonymous by
+      # design), not `/metrics`. A local Prometheus instance or a scenario
+      # that wants real scrape content needs a `read_metrics`-granted
+      # bearer — see docs/metrics-catalog.md (ADR 0017).
       METRICS_INCLUDE_REPOSITORY_LABEL: "true"
       HORT_LOG_FORMAT: "json"
       # E2E runs without a TLS-terminating proxy; clients hit hort-server

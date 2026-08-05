@@ -12,16 +12,18 @@ Verify:
   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "hort-server.fullname" . }} 8080:{{ .Values.service.httpPort }}
   curl -fsS http://localhost:8080/healthz
 
-{{- if .Values.metrics.requireAuth }}
+{{- if .Values.metrics.bindAddr }}
 
 Metrics:
-  /metrics is auth-gated (HORT_METRICS_REQUIRE_AUTH=true). Wire a bearer
-  token via `secrets.mounts` and your Prometheus ServiceMonitor's
+  /metrics is served on the dedicated admin listener and always requires
+  a bearer carrying the `read_metrics` grant — there is no opt-out. Wire
+  a bearer token via `secrets.mounts` and your Prometheus ServiceMonitor's
   `bearerTokenSecret` to scrape it.
-{{- if not .Values.metrics.bindAddr }}
-  metrics.bindAddr is empty: /metrics is mounted on the main 8080
-  router (dev mode); no separate metrics listener is bound.
-{{- end }}
+{{- else }}
+
+Metrics:
+  metrics.bindAddr is empty: no admin listener binds, so /metrics is not
+  exposed on any listener.
 {{- end }}
 
 {{- if eq .Values.auth.provider "disabled" }}
@@ -69,24 +71,15 @@ MUST migrate:
   - `HORT_AUTH_LOCKOUT_*` env vars (formerly rendered under
     `auth.lockout.*`) → removed; the PAT-side brute-force lockout
     (`HORT_PAT_LOCKOUT_*`, distinct mechanism) is unchanged.
+  - `metrics.requireAuth` (boolean) → removed; no replacement.
+    `/metrics` now unconditionally requires a bearer carrying the
+    `read_metrics` grant and is served exclusively by the admin listener
+    (#113 item 3) — there is no anonymous-scrape opt-out.
 
-A values file with `auth.provider: basic` will be rejected by chart
-schema validation at `helm install` / `helm upgrade` time.
+A values file with `auth.provider: basic` or `metrics.requireAuth` set
+will be rejected by chart schema validation at `helm install` / `helm
+upgrade` time.
 ==============================================================================
-
-{{- if not .Values.metrics.requireAuth }}
-
-==============================================================================
-WARNING: metrics.requireAuth = false
-==============================================================================
-The /metrics endpoint is unauthenticated. This endpoint is auth-gated
-by default; turning it back off is acceptable only on a private metrics
-network where every scraper is a trusted operator.
-
-Fix:
-  helm upgrade ... --set metrics.requireAuth=true
-==============================================================================
-{{- end }}
 
 {{- if eq .Values.storage.backend "filesystem" }}
 

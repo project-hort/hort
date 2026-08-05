@@ -9,10 +9,14 @@
 //! position is defense-in-depth only, never the sole gate — the handler
 //! itself requires `Permission::ReadMetrics` via
 //! [`MetricsReaderPrincipal`](crate::authz::MetricsReaderPrincipal) (issue
-//! #113). In production the binary should ALSO bind this handler to a
-//! separate admin port via `hort_server::http::build_admin_router` and
-//! restrict access at the network layer (NetworkPolicy, firewall, mTLS on
-//! the proxy). See `docs/metrics-catalog.md` (ADR 0017).
+//! #113). This handler is mounted EXCLUSIVELY by
+//! `hort_server::http::build_admin_router` on its own admin listener
+//! (#113 item 3) — no router assembled by `hort_http_core::router` ever
+//! mounts `/metrics`. Operators are still encouraged to bind that listener
+//! to an internal interface as defense-in-depth (NetworkPolicy, firewall,
+//! mTLS on the proxy) — network position is never a substitute for the
+//! grant gate, only a second layer. See `docs/metrics-catalog.md`
+//! (ADR 0017).
 
 use std::sync::Arc;
 

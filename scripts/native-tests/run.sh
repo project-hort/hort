@@ -106,7 +106,13 @@ COMPOSE_FILE="$REPO_ROOT/deploy/compose/docker-compose.yml"
 COMPOSE_NETWORK="hort_default"
 IMAGE="hort-test-client:dev"
 KC_DISCOVERY="http://localhost:25082/realms/hort/.well-known/openid-configuration"
-HOST_METRICS="http://localhost:25090/metrics"
+# Readiness probe for hort-server itself. NOT `/metrics` — that endpoint
+# unconditionally requires a bearer carrying `read_metrics` (#113 item 3,
+# no anonymous-scrape opt-out), so an anonymous readiness curl against it
+# would 401 forever and never observe "up". `/healthz` on the main
+# listener is anonymous by design (kubelet-probe shape) and proves the
+# same thing: the binary finished booting and is accepting connections.
+HOST_HEALTHZ="http://localhost:25080/healthz"
 
 # Context is the repo root: the Dockerfile's stage 1 builds hort-cli from the
 # workspace (.dockerignore keeps target/.git out, so the context stays small).
@@ -143,7 +149,7 @@ if [ "$HORT_MODE" = "compose" ]; then
   docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" up -d --build
   STARTED=1
   wait_url "$KC_DISCOVERY" 120 || { echo "Keycloak not ready" >&2; exit 1; }
-  wait_url "$HOST_METRICS" 120 || { echo "hort-server not ready" >&2; exit 1; }
+  wait_url "$HOST_HEALTHZ" 120 || { echo "hort-server not ready" >&2; exit 1; }
   [ "$NEED_WORKER" = 1 ] && { wait_running hort-worker 180 || { echo "hort-worker not running" >&2; exit 1; }; }
   IN_HORT="http://hort-server:8080"; IN_KC="http://keycloak:8080/realms/hort"; IN_METRICS="http://hort-server:9090/metrics"
   NET_ARGS=(--network "$COMPOSE_NETWORK")

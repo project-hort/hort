@@ -3,10 +3,17 @@
 //! Per-format crates (`hort-http-cargo`, `hort-http-npm`, `hort-http-pypi`,
 //! `hort-http-oci`) build a per-format route tree and hand it to
 //! [`wrap_with_middleware`] via the composition root (`hort-server`). This
-//! module owns the cross-cutting concerns: optional `/metrics` mount,
-//! the six-layer middleware chain, and the method-based auth dispatch
-//! helper. The top-level assembly (nesting every per-format tree) lives
-//! in `hort-server::http::build_router_with_oci_config`.
+//! module owns the cross-cutting concerns: the six-layer middleware chain
+//! and the method-based auth dispatch helper. The top-level assembly
+//! (nesting every per-format tree) lives in
+//! `hort-server::http::build_router_with_oci_config`.
+//!
+//! `/metrics` is NEVER mounted on a router built here (#113 / design doc
+//! §2 D4, item 3) — it is served exclusively by
+//! `hort_server::http::build_admin_router` on its own listener, gated by
+//! `MetricsReaderPrincipal`. A request for `/metrics` on any router this
+//! module builds falls through to the standard unmatched-route 404, same
+//! as any other unknown path.
 
 use std::sync::Arc;
 
@@ -14,30 +21,15 @@ use axum::extract::{Request, State};
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::routing::get;
 use axum::Router;
 
 use crate::context::AppContext;
-use crate::handlers::metrics;
 use crate::middleware;
 
 /// Wrap a per-format route tree with the full middleware chain.
 ///
 /// `inner` is the format-agnostic nested router (admin + each per-format
-/// crate's routes). `include_metrics` toggles the `/metrics` scrape mount
-/// on the main listener — production deployments usually set this to
-/// `false` and expose `/metrics` on a dedicated admin listener so
-/// network policy can keep scrape traffic off the public surface.
-///
-/// `metrics_require_auth` gates whether
-/// the `/metrics` route mounted on the main listener (when
-/// `include_metrics=true`) is treated as an authenticated path. When
-/// `true` (the production default), the auth dispatch routes
-/// `GET /metrics` through [`require_principal`] rather than
-/// [`extract_optional_principal`] so anonymous scrapes return 401.
-/// When `false` (legacy/operator escape hatch via
-/// `HORT_METRICS_REQUIRE_AUTH=false`), `/metrics` keeps the read-path
-/// optional-principal treatment and accepts anonymous scrapes.
+/// crate's routes).
 ///
 /// The six layers are attached in the exact order that preserves the
 /// pre-split runtime behaviour. Tower wraps outward: the layer attached
@@ -47,17 +39,8 @@ use crate::middleware;
 ///
 /// [`require_principal`]: crate::middleware::auth::require_principal
 /// [`extract_optional_principal`]: crate::middleware::auth::extract_optional_principal
-pub fn wrap_with_middleware(
-    ctx: Arc<AppContext>,
-    inner: Router<Arc<AppContext>>,
-    include_metrics: bool,
-    metrics_require_auth: bool,
-) -> Router {
+pub fn wrap_with_middleware(ctx: Arc<AppContext>, inner: Router<Arc<AppContext>>) -> Router {
     let mut router = inner;
-
-    if include_metrics {
-        router = router.route("/metrics", get(metrics::render_metrics));
-    }
 
     // Write-path / read-path carve-out (ADR 0021).
     //
@@ -87,15 +70,7 @@ pub fn wrap_with_middleware(
     // (no-OIDC + `HORT_NATIVE_TOKENS_ENABLED=true`), the same dispatch
     // attaches so admin routes get an actual auth path.
     if ctx.auth.has_auth() {
-        // Thread the metrics-auth flag
-        // through to the dispatch via a small composite state. The
-        // `/metrics` carve-out reads the flag to decide between
-        // `require_principal` (default) and `extract_optional_principal`
-        // (legacy bypass).
-        let dispatch_state = AuthDispatchState {
-            ctx: ctx.clone(),
-            metrics_require_auth,
-        };
+        let dispatch_state = AuthDispatchState { ctx: ctx.clone() };
         router = router.layer(axum::middleware::from_fn_with_state(
             dispatch_state,
             method_based_auth_dispatch,
@@ -243,15 +218,10 @@ pub fn wrap_with_middleware(
 /// Composite middleware state for [`method_based_auth_dispatch`].
 ///
 /// `Clone` is required by axum's `from_fn_with_state` (the state is
-/// cloned per request); both fields are pointer-cheap (`Arc` clone +
-/// `bool` copy).
+/// cloned per request) — pointer-cheap (`Arc` clone).
 #[derive(Clone)]
 struct AuthDispatchState {
     ctx: Arc<AppContext>,
-    /// When `true` (production default),
-    /// `GET /metrics` on the main listener routes through
-    /// `require_principal` rather than `extract_optional_principal`.
-    metrics_require_auth: bool,
 }
 
 /// Route an incoming request to either `require_principal` (write methods)
@@ -267,12 +237,11 @@ struct AuthDispatchState {
 /// introduces genuine read-only support for `OPTIONS` (CORS preflight), it
 /// already lives in the optional branch.
 ///
-/// `/metrics` is a per-path carve-out:
-/// regardless of method (it is always GET in practice), the request
-/// goes through `require_principal` when
-/// `state.metrics_require_auth == true`. This closes the dev-mode
-/// (single-listener) anonymous-scrape vector without changing the
-/// rest of the GET-read posture.
+/// `/metrics` is never routed here (#113 item 3) — no router built by
+/// [`wrap_with_middleware`] ever has a `/metrics` route registered, so
+/// there is no path-based carve-out to make; a request for that path
+/// falls through to the standard 404 before this dispatch would even see
+/// it as a distinct case.
 async fn method_based_auth_dispatch(
     State(state): State<AuthDispatchState>,
     req: Request,
@@ -298,13 +267,6 @@ async fn method_based_auth_dispatch(
     // above — the handler owns auth.
     if is_anonymous_path(req.uri().path()) {
         return next.run(req).await;
-    }
-    // `/metrics` carve-out. Always
-    // require_principal under the default; falls through to the
-    // method-based branches when `metrics_require_auth=false` so
-    // the legacy anonymous-scrape escape hatch still works.
-    if state.metrics_require_auth && req.uri().path() == "/metrics" {
-        return middleware::auth::require_principal(State(state.ctx), req, next).await;
     }
     match *req.method() {
         Method::GET | Method::HEAD | Method::OPTIONS => {

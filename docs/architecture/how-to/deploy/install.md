@@ -589,9 +589,11 @@ curl -fsS http://<svc-or-ingress>/healthz
 #               least one Deployment pod is Ready.
 curl -fsS http://<svc-or-ingress>/readyz
 
-# 7.5 /metrics — expected: 401 Unauthorized (the metrics-auth
-#                gate). A 200 means
-#                metrics.requireAuth=false — re-check your values.
+# 7.5 /metrics — expected: 401 Unauthorized without a bearer (or 404 if
+#                you're hitting the main-router address — /metrics is
+#                admin-listener-only, see metrics.bindAddr). A 200 means
+#                the request carried a bearer with the read_metrics grant;
+#                there is no anonymous-scrape opt-out to check.
 curl -i http://<svc-or-ingress>/metrics
 
 # 7.6 OIDC-authenticated admin request — expected: 200 with body []

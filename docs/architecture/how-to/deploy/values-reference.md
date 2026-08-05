@@ -59,7 +59,6 @@ for the full rationale behind each control.
 | Request timeout | `HORT_HTTP_REQUEST_TIMEOUT_SECS` | `http.requestTimeoutSeconds` | `300` | `300` |
 | Header-read timeout | `HORT_HTTP_HEADER_READ_TIMEOUT_SECS` | `http.headerReadTimeoutSeconds` | `15` | `15` |
 | OCI upload timeout | `HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS` | `oci.uploadTimeoutSeconds` | `3600` | `3600` |
-| Metrics auth | `HORT_METRICS_REQUIRE_AUTH` | `metrics.requireAuth` | `true` | `true` |
 | Metrics bind | `HORT_METRICS_BIND` | `metrics.bindAddr` | `127.0.0.1:9090` | unset |
 | Metrics unspecified-bind guard | `HORT_METRICS_PUBLIC_BIND` | `metrics.allowUnspecifiedBind` | `false` | `false` |
 | Two-role Postgres | `HORT_DATABASE_URL` (split by role; chart injects this canonical name, binary falls back to bare `DATABASE_URL`) | `postgres.app.existingSecret` + `postgres.admin.existingSecret` | (required) | (no default) |
@@ -412,32 +411,27 @@ Prometheus scrape configuration.
 |---|---|---|---|
 | `metrics.bindAddr` | string (host:port) | `127.0.0.1:9090` | no |
 | `metrics.allowUnspecifiedBind` | boolean | `false` | no |
-| `metrics.requireAuth` | boolean | `true` | no |
 | `metrics.serviceMonitor.enabled` | boolean | `false` | no |
 | `metrics.serviceMonitor.interval` | duration | `30s` | no |
 | `metrics.serviceMonitor.scrapeTimeout` | duration | `10s` | no |
 | `metrics.serviceMonitor.namespace` | string | `""` (release ns) | no |
 
-`/metrics` is always served by the binary. `bindAddr` controls where:
+`/metrics` is served EXCLUSIVELY by the dedicated admin listener and
+always requires a bearer carrying the `read_metrics` grant — there is no
+main-router mount and no operator opt-out of the grant check (#113 item
+3). `bindAddr` controls whether that listener binds at all:
 
 - **`bindAddr: "127.0.0.1:9090"` (default)** — dedicated listener
-  bound to the pod's loopback. The main `8080` router carries no
-  `/metrics` route. Container + Service ports for `metricsPort` are
-  exposed; sidecar-scrape pattern.
+  bound to the pod's loopback. Container + Service ports for
+  `metricsPort` are exposed; sidecar-scrape pattern.
 - **`bindAddr: "0.0.0.0:9090"`** — dedicated listener on all
   interfaces. Requires `allowUnspecifiedBind: true` (the
   unspecified-bind guard); the binary refuses to start without the explicit
   opt-in. Operators take responsibility for restricting reach via
   NetworkPolicy / firewall.
-- **`bindAddr: ""`** — no separate listener. `/metrics` mounts on
-  the main `8080` router under `requireAuth`. Metrics container +
-  Service ports are skipped. Useful for dev / single-port deploys.
-
-`requireAuth: true` (the default) requires admin authentication on
-the `/metrics` endpoint regardless of which listener serves it.
-Setting `false` re-permits anonymous scraping for legacy deployments
-and emits a startup `WARN` plus a prominent NOTES.txt post-install
-warning.
+- **`bindAddr: ""`** — no admin listener binds. `/metrics` is not
+  reachable on any listener in the pod. Metrics container/Service
+  ports are skipped.
 
 `serviceMonitor.enabled: true` requires the Prometheus Operator CRDs
 (`monitoring.coreos.com/v1`) installed in the cluster, AND

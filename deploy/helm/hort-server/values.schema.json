@@ -668,7 +668,6 @@
       "properties": {
         "bindAddr": {"type": "string"},
         "allowUnspecifiedBind": {"type": "boolean"},
-        "requireAuth": {"type": "boolean"},
         "serviceMonitor": {
           "type": "object",
           "additionalProperties": false,

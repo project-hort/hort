@@ -320,11 +320,17 @@ both return `200`.
 `prefetch-*`, `seed-import`, etc. (a couple are skipped on a non-k8s /
 filesystem host: `ServiceAccountRotation`, `EventstoreCheckpoint` — expected).
 
-**Assertion (§4.d):** `curl -s http://localhost:8080/metrics | grep '^hort_'`
+**Assertion (§4.d):** `/metrics` is not on the main `8080` listener at all
+(#113 item 3) — it is served exclusively by a dedicated admin listener,
+which only exists when `HORT_METRICS_BIND` is set, and always requires a
+bearer carrying the `read_metrics` grant (no anonymous-scrape opt-out).
+`alpha.env` does not set `HORT_METRICS_BIND`, so by default the alpha
+tracks expose no `/metrics` endpoint at all — this assertion is skipped
+unless you've set `HORT_METRICS_BIND` and minted a token whose claims
+match a `read_metrics` grant, in which case:
+`curl -s -H "Authorization: Bearer <token>" http://localhost:<metrics-port>/metrics | grep '^hort_'`
 returns a non-empty list (e.g. `hort_http_requests_total`,
-`hort_event_store_*`, `hort_storage_*`). `alpha.env` sets
-`HORT_METRICS_REQUIRE_AUTH=false` so this scrape is anonymous; without it the
-endpoint returns `401` and you must pass `-H "Authorization: Bearer <token>"`.
+`hort_event_store_*`, `hort_storage_*`).
 
 If §4.a–d don't all pass, **stop and triage** — most often a stale schema
 (re-run `hort-server migrate`, see §2) or the worker not started first.
@@ -636,8 +642,11 @@ version hort does not hold.
 
 **Assertions (§9.a):**
 
+`/metrics` is admin-listener-only and grant-gated (see §4.d) — with
+`HORT_METRICS_BIND` set and a `read_metrics`-granted bearer:
+
 ```bash
-curl -s http://localhost:8080/metrics | grep hort_prefetch_enqueued_total
+curl -s -H "Authorization: Bearer <token>" http://localhost:<metrics-port>/metrics | grep hort_prefetch_enqueued_total
 #   hort_prefetch_enqueued_total{trigger="on_dist_tag_move",…} > 0   (tag-move induced)
 #   hort_prefetch_self_service_total{…,result="enqueued"} > 0        (hort-cli prefetch)
 ```
@@ -854,7 +863,7 @@ unset HORT_TOKEN ADMIN_PAT ADMIN_TOKEN DEV_TOKEN READER_TOKEN \
 | `hort-server serve` exits `gitops validation failed: … scanBackends … is not a supported scanner backend (supported: osv, trivy)` | Typo'd / unsupported `scan_backends` entry. Use only `trivy`/`osv`, or remove the entry. (Boot no longer requires a live worker — H20.) |
 | `hort-server serve` exits `… GroupMapping object(s) are declared … HORT_AUTH_PROVIDER=disabled` | Track A is pointed at the full tree. Use `HORT_CONFIG_DIR=…/gitops-config/base` (alpha.env default), or switch to Track B (`alpha.env.oidc`). |
 | `migrate` fails "previously applied but has been modified" | Stale schema — recreate the DB (§2 drift note). |
-| `/metrics` returns `401` | `HORT_METRICS_REQUIRE_AUTH` not false — `source alpha.env`, or pass a bearer. |
+| `/metrics` returns `401`/`403`, or connection refused | `/metrics` always requires a bearer carrying `read_metrics` (no opt-out) and only exists when `HORT_METRICS_BIND` is set — pass a granted bearer, or set `HORT_METRICS_BIND` if unset. |
 | `503` on every artifact download | Quarantine working; release via §8.2 sweep, §11.5.2 waive, or §8.4 admin-release. |
 | `404` on `/api/v1/...` for a repo you created | Restart `hort-server` after editing `$HORT_CONFIG_DIR` (startup-only). |
 | OCI `crane` fails `unauthorized` / `NotOurToken` | OCI needs Track B (`$ADMIN_TOKEN`), not a svc-token PAT (§7.4). |
