@@ -1,0 +1,35 @@
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: oci-provenance-proxy-e2e-required
+spec:
+  # Keyed hold-until-signed (ADR 0039) x proxy pull-through (#115 Item 4). This
+  # is a DEDICATED repo+policy, not a reuse of oci-provenance-e2e-required or
+  # oci-proxy-quarantine-e2e-quarantine — the same "hollowness trap" rationale
+  # as oci-proxy-quarantine-e2e-quarantine.yaml applies in the other direction
+  # here: oci-provenance-e2e is a HOSTED-PUSH-only repo (no upstream mapping),
+  # so it cannot exercise the proxy pull-through content_references edge-write
+  # this scenario needs; oci-proxy-quarantine-e2e's policy is provenanceMode:
+  # off (scan-timer-only) and is load-bearing for the sibling
+  # proxy-multiarch-zero-window.sh scenario, so repointing it would change that
+  # scenario's semantics. ScanPolicy scope is 1:1 per-repository, so a new
+  # policy is the only option once a new repository exists.
+  #
+  # `provenanceIdentities` MUST be empty for a cosign-key-only scope (ADR 0039
+  # §4, the inert-field guard — a non-empty list is apply-rejected).
+  #
+  # `scanBackends: []` keeps the release gate purely provenance + time, same
+  # rationale as oci-provenance-e2e-required.yaml. A 30s window is long enough
+  # that a keyed `cosign sign` against the proxy-pulled subject lands inside
+  # it, short enough that the release/expiry sweep completes within a smoke
+  # run.
+  scope:
+    repository: oci-provenance-proxy-e2e
+  severityThreshold: critical
+  quarantineDuration: 30s
+  requireApproval: false
+  provenanceMode: required
+  provenanceBackends: [cosign-key]
+  provenanceIdentities: []
+  scanBackends: []
+  licensePolicy: {}
