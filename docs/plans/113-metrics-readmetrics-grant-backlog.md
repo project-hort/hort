@@ -79,11 +79,11 @@ metrics_auth tests. Confirm acceptance, refine with the user, then implement. De
 
 ## Item 4 — ADR 0051 + scraper-SA provisioning how-to (D7 distillation)
 
-**Design doc section:** §4
-**Read first:** `docs/adr/0000-historical-decisions-index.md`, `docs/adr/0012-claim-based-rbac.md`, `docs/adr/0038-admin-identity-model.md`, `docs/architecture/how-to/declare-gitops-config.md`
+**Design doc section:** §4, §3.1
+**Read first:** `docs/adr/0000-historical-decisions-index.md`, `docs/adr/0012-claim-based-rbac.md`, `docs/adr/0037-gitops-service-account-grant.md`, `docs/adr/0038-admin-identity-model.md`, `crates/hort-config/src/service_account.rs` (`fallbackRotation`/`federatedIdentities`), `docs/architecture/how-to/declare-gitops-config.md`
 **Acceptance:**
 - `docs/adr/0051-scoped-metrics-read-capability.md`: records D1–D5, the rejection of admin-gating and of pure-ingress-as-sole-control (with the ADR 0012 "network ≠ authz" citation), and the anon-hatch retirement; registered in the ADR index (0000).
-- A how-to (operate) page shows provisioning a non-admin scraper ServiceAccount with an unscoped `read_metrics` `PermissionGrant` via gitops apply, minting its svc-token, and pointing Prometheus at the internal metrics bind.
+- A how-to (operate) page shows provisioning a non-admin scraper ServiceAccount + unscoped `read_metrics` `PermissionGrant` via gitops apply, with **§3.1 Model A** (`fallbackRotation` → `targetSecret`; Hort mints/rotates the PAT into a k8s Secret; Prometheus reads it via `authorization.credentials_file`) as the worked example and **Model B** (`federatedIdentities` workload-identity + exchange sidecar; subject-identifying claim required, never aud-only) as the alternative. **The git repo never contains a token** — only the declaration.
 - Design/backlog `docs/plans/` files deleted in the promotion (D7) — durable record is the ADR + how-to.
 
 ### Starter prompt

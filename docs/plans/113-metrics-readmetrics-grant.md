@@ -135,6 +135,33 @@ the removal in the ADR (reversing a prior escape hatch) and the auth surface.
   `repository=None`) — the service-account pattern (ADR 0037/0038/0044); no new
   grant mechanism, no `api_tokens.claims` (hard-blocked by ADR 0012).
 
+### §3.1 Token delivery to a Flux-controlled Prometheus (no token in git)
+
+The git repo declares the **identity + grant**, never a token; Hort mints/rotates
+and delivers on the Flux apply. Both existing gitops `ServiceAccount` delivery
+modes fit (`crates/hort-config/src/service_account.rs`):
+
+- **Model A — `fallbackRotation` → k8s Secret (recommended default for Prometheus).**
+  The `ServiceAccountSpec.fallbackRotation` block names a `targetSecret`
+  (`{name, namespace, format: opaque}`), `rotationInterval` (min `1h`, default
+  `6h`), and `validity` (≥ 2× interval, default `24h`). On apply, Hort mints a
+  PAT carrying the unscoped `read_metrics` grant and writes it via
+  `KubernetesSecretWriter::upsert_managed` into the target Secret, rotating on
+  schedule (plaintext PAT is `Zeroizing`, lives only in the Secret). Prometheus
+  consumes it natively via `authorization.credentials_file`. Git holds only the
+  `ServiceAccount` + separate `PermissionGrant` (`subject.serviceAccount`,
+  ADR 0037) declarations.
+- **Model B — `federatedIdentities` (workload identity, zero secret at rest).**
+  The SA trusts the cluster K8s/Dex OIDC issuer with claims pinned to
+  Prometheus's own workload identity — **subject-identifying claim required**
+  (`sub: system:serviceaccount:…`), never `aud`-only (that is the escalation in
+  sibling finding #111). Prometheus needs a small sidecar to run the
+  `POST /api/v1/auth/exchange` (RFC 8693) and refresh a `credentials_file`.
+
+Model A is the worked example in Item 4; Model B is documented as the
+pure-workload-identity alternative. (Provisioning-model preference is an open
+refinement question for the human on #113.)
+
 ## §4 Auth-catalog & ADR
 
 - **auth-catalog.md:** no new entry — `ReadMetrics` is an RBAC *permission*
