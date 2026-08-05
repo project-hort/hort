@@ -1065,7 +1065,7 @@ mod tests {
                 | Permission::Curate
                 | Permission::Prefetch => true,
                 Permission::Read | Permission::Write | Permission::Delete => false,
-                // Read-only, non-admin by design (issue #113 / ADR 0051): a
+                // Read-only, non-admin by design (issue #113): a
                 // Prometheus scraper is deliberately not admin-class, and
                 // `Admin` does not implicitly satisfy it either.
                 Permission::ReadMetrics => false,
