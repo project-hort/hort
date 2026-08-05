@@ -3883,6 +3883,46 @@ impl IngestUseCase {
                 .find_by_repo_and_checksum(src, &existing_hash)
                 .await
             {
+                // Refuse a terminally-blocked source (issue #107 Item 2,
+                // design §2 D2): re-minting a known-bad blob into ANOTHER
+                // repo is a laundering vector, even though the target
+                // copy is itself quarantine+scan gated by Item 1 — a
+                // `Rejected`/`ScanIndeterminate` source must not be
+                // mountable AT ALL. Collapses to the SAME `NotFound` the
+                // `Ok(None)` arm below already returns (anti-enumeration:
+                // the caller cannot distinguish "no such blob" from
+                // "terminally blocked blob"), so `handle_cross_mount`'s
+                // existing NotFound -> initiate fall-through handles this
+                // with NO handler change. NOT `Conflict`/`409` — ADR 0025
+                // covers explicit state-precondition endpoints (e.g.
+                // admin release), not this anti-enumeration collapse.
+                //
+                // `Quarantined` stays mountable — the target copy is
+                // itself gated by Item 1, so re-minting a still-under-
+                // observation blob is not a laundering bypass. `Released`
+                // and the (structurally unreachable here) `None` also
+                // proceed unchanged.
+                Ok(Some(a))
+                    if matches!(
+                        a.quarantine_status,
+                        QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate
+                    ) =>
+                {
+                    tracing::info!(
+                        source_repository_id = %src,
+                        hash = %existing_hash,
+                        source_status = %a.quarantine_status,
+                        "register_by_hash: refused mount source (terminally blocked, \
+                         issue #107 Item 2 anti-laundering gate)"
+                    );
+                    return Err(RegisterError::Other {
+                        err: AppError::Domain(DomainError::NotFound {
+                            entity: "Artifact",
+                            id: existing_hash.to_string(),
+                        }),
+                        repo_key: Some(repo_key),
+                    });
+                }
                 Ok(Some(a)) => a.size_bytes,
                 Ok(None) => {
                     return Err(RegisterError::Other {
@@ -7559,7 +7599,27 @@ mod tests {
         hash_hex: &str,
         size_bytes: i64,
     ) -> Artifact {
-        let mut a = sample_artifact(QuarantineStatus::None);
+        seed_source_artifact_with_status(
+            artifacts,
+            src_repo_id,
+            hash_hex,
+            size_bytes,
+            QuarantineStatus::None,
+        )
+    }
+
+    /// [`seed_source_artifact`] variant that lets the caller pin the
+    /// source row's `quarantine_status` — the #107 Item 2 mount-source
+    /// refusal tests need `Rejected`/`ScanIndeterminate`/`Quarantined`/
+    /// `Released` sources, not just the default `None`.
+    fn seed_source_artifact_with_status(
+        artifacts: &MockArtifactRepository,
+        src_repo_id: Uuid,
+        hash_hex: &str,
+        size_bytes: i64,
+        status: QuarantineStatus,
+    ) -> Artifact {
+        let mut a = sample_artifact(status);
         a.repository_id = src_repo_id;
         a.sha256_checksum = hash_hex.parse().unwrap();
         a.size_bytes = size_bytes;
@@ -7705,6 +7765,206 @@ mod tests {
             // No event committed — the rejection happens before any
             // lifecycle port call.
             assert!(lifecycle.committed_transitions().is_empty());
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // #107 Item 2 — refuse a terminally-blocked mount source
+    // (Rejected/ScanIndeterminate), even though the target copy is
+    // itself gated by Item 1. Four-arm matrix: Rejected -> NotFound,
+    // ScanIndeterminate -> NotFound, Quarantined -> allowed, Released ->
+    // allowed. (`None` is covered separately below — no source ROW to
+    // inspect on that branch at all.)
+    // -----------------------------------------------------------------
+
+    /// `Rejected` source -> `NotFound` (anti-enumeration collapse — the
+    /// caller cannot distinguish "no such blob" from "terminally blocked
+    /// blob"). No lifecycle commit; the mount never mints a target row
+    /// from a known-bad source.
+    #[test]
+    fn register_by_hash_some_src_rejected_source_returns_not_found() {
+        let target = pypi_repository();
+        let target_id = target.id;
+        let src_id = Uuid::new_v4();
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, lifecycle, _storage, repos) = make_use_case();
+            repos.insert(target);
+            seed_source_artifact_with_status(
+                &artifacts,
+                src_id,
+                EMPTY_HASH,
+                4242,
+                QuarantineStatus::Rejected,
+            );
+
+            let err = uc
+                .register_by_hash(req_legacy(target_id), hash, Some(src_id), &test_handler())
+                .await
+                .expect_err("a Rejected mount source must be refused");
+
+            assert!(
+                matches!(
+                    err,
+                    AppError::Domain(DomainError::NotFound {
+                        entity: "Artifact",
+                        ..
+                    })
+                ),
+                "expected NotFound(Artifact) — anti-enumeration collapse, not a distinct \
+                 error shape a caller could use to infer the source is blocked: got {err:?}"
+            );
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "a Rejected source must never mint a target row — laundering the blocked \
+                 content into another repo, even quarantined-and-scanned, is exactly what \
+                 this gate prevents"
+            );
+        });
+    }
+
+    /// `ScanIndeterminate` source -> `NotFound`, same as `Rejected` — the
+    /// scanner's inability to decide is fail-closed (ADR 0007), and that
+    /// posture must hold across a cross-repo mount too.
+    #[test]
+    fn register_by_hash_some_src_scan_indeterminate_source_returns_not_found() {
+        let target = pypi_repository();
+        let target_id = target.id;
+        let src_id = Uuid::new_v4();
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, lifecycle, _storage, repos) = make_use_case();
+            repos.insert(target);
+            seed_source_artifact_with_status(
+                &artifacts,
+                src_id,
+                EMPTY_HASH,
+                4242,
+                QuarantineStatus::ScanIndeterminate,
+            );
+
+            let err = uc
+                .register_by_hash(req_legacy(target_id), hash, Some(src_id), &test_handler())
+                .await
+                .expect_err("a ScanIndeterminate mount source must be refused");
+
+            assert!(
+                matches!(
+                    err,
+                    AppError::Domain(DomainError::NotFound {
+                        entity: "Artifact",
+                        ..
+                    })
+                ),
+                "expected NotFound(Artifact), got {err:?}"
+            );
+            assert!(lifecycle.committed_transitions().is_empty());
+        });
+    }
+
+    /// `Quarantined` source stays mountable — the target copy is itself
+    /// quarantine+scan gated by Item 1, so re-minting a still-under-
+    /// observation blob is not a laundering bypass (only a TERMINAL bad
+    /// verdict is refused).
+    #[test]
+    fn register_by_hash_some_src_quarantined_source_is_still_mountable() {
+        let target = pypi_repository();
+        let target_id = target.id;
+        let src_id = Uuid::new_v4();
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, lifecycle, _storage, repos) = make_use_case();
+            repos.insert(target);
+            seed_source_artifact_with_status(
+                &artifacts,
+                src_id,
+                EMPTY_HASH,
+                4242,
+                QuarantineStatus::Quarantined,
+            );
+
+            let outcome = uc
+                .register_by_hash(
+                    req_legacy(target_id),
+                    hash.clone(),
+                    Some(src_id),
+                    &test_handler(),
+                )
+                .await
+                .expect("a Quarantined mount source must remain mountable");
+
+            assert_eq!(outcome.artifact.repository_id, target_id);
+            assert_eq!(outcome.artifact.sha256_checksum, hash);
+            assert!(
+                !lifecycle.committed_transitions().is_empty(),
+                "the mount must proceed and mint a target row"
+            );
+        });
+    }
+
+    /// `Released` source stays mountable — a fully cleared blob is the
+    /// unremarkable common case.
+    #[test]
+    fn register_by_hash_some_src_released_source_is_still_mountable() {
+        let target = pypi_repository();
+        let target_id = target.id;
+        let src_id = Uuid::new_v4();
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, lifecycle, _storage, repos) = make_use_case();
+            repos.insert(target);
+            seed_source_artifact_with_status(
+                &artifacts,
+                src_id,
+                EMPTY_HASH,
+                4242,
+                QuarantineStatus::Released,
+            );
+
+            let outcome = uc
+                .register_by_hash(
+                    req_legacy(target_id),
+                    hash.clone(),
+                    Some(src_id),
+                    &test_handler(),
+                )
+                .await
+                .expect("a Released mount source must remain mountable");
+
+            assert_eq!(outcome.artifact.repository_id, target_id);
+            assert_eq!(outcome.artifact.sha256_checksum, hash);
+            assert!(!lifecycle.committed_transitions().is_empty());
+        });
+    }
+
+    /// `source_repo = None` (e.g. a pull-dedup follower statting CAS
+    /// directly) has no source ROW to inspect at all — Item 2's refusal
+    /// gate does not apply on this branch; Item 1 already gates the
+    /// follower's OWN target-repo row. Regression pin that the new
+    /// `Some(src)`-only match arm did not accidentally widen to affect
+    /// the `None` branch.
+    #[test]
+    fn register_by_hash_none_source_is_unaffected_by_item2_refusal_gate() {
+        let target = pypi_repository();
+        let target_id = target.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(target);
+            storage.insert_content(hash.clone(), b"blob bytes".to_vec());
+
+            let outcome = uc
+                .register_by_hash(req_legacy(target_id), hash.clone(), None, &test_handler())
+                .await
+                .expect("the None-source branch has no status to refuse");
+
+            assert_eq!(outcome.artifact.repository_id, target_id);
+            assert!(!lifecycle.committed_transitions().is_empty());
         });
     }
 

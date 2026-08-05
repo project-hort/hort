@@ -1254,8 +1254,29 @@ mod tests {
         hex: &str,
         content: &[u8],
     ) {
+        seed_blob_with_status(
+            artifacts,
+            storage,
+            repo_id,
+            hex,
+            content,
+            QuarantineStatus::None,
+        );
+    }
+
+    /// [`seed_blob`] variant that lets the caller pin the seeded row's
+    /// `quarantine_status` — the #107 Item 2 mount-source-refusal handler
+    /// test needs a `Rejected` source.
+    fn seed_blob_with_status(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        hex: &str,
+        content: &[u8],
+        status: QuarantineStatus,
+    ) {
         let hash: ContentHash = hex.parse().unwrap();
-        let mut a = sample_artifact(QuarantineStatus::None);
+        let mut a = sample_artifact(status);
         a.repository_id = repo_id;
         a.path = format!("blobs/sha256:{hex}");
         a.sha256_checksum = hash.clone();
@@ -1875,6 +1896,63 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+    }
+
+    /// Mount of a `Rejected` source (issue #107 Item 2, design §2 D2):
+    /// `register_by_hash_inner`'s new source-status refusal collapses to
+    /// the SAME `DomainError::NotFound` the two tests above already
+    /// exercise for "no such blob in source repo" — anti-enumeration
+    /// means the handler CANNOT distinguish "missing" from "terminally
+    /// blocked", so it must (and does, unmodified) map BOTH through the
+    /// same `map_register_error` `NotFound` arm to 404 `BLOB_UNKNOWN`. No
+    /// row is minted in `target-repo` from the rejected source. This is
+    /// distinct from the source-REPO-not-visible fallback
+    /// (`cross_mount_unknown_source_repo_falls_through_to_initiate` /
+    /// `cross_mount_without_source_read_falls_through_to_initiate` below)
+    /// — that 202-initiate path fires at `repository_access_use_case
+    /// .resolve` on the source REPO itself, one step earlier than
+    /// `register_by_hash`'s own per-blob NotFound this test pins.
+    #[test]
+    fn cross_mount_rejected_source_returns_404_blob_unknown_no_row_minted() {
+        let content = b"known-bad bytes".to_vec();
+        let hex = sha256_of(&content);
+        let (status, body, artifact_count_after) = run(async {
+            let h = harness();
+            let src = oci_repo("src-repo");
+            let src_id = src.id;
+            h.repositories.insert(src);
+            h.repositories.insert(oci_repo("target-repo"));
+            seed_blob_with_status(
+                &h.artifacts,
+                &h.storage,
+                src_id,
+                &hex,
+                &content,
+                QuarantineStatus::Rejected,
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            let uri =
+                format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo");
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body, h.artifacts.snapshot_all().len())
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+        // Exactly the ONE pre-seeded Rejected source row — no target-repo
+        // row was minted from it.
+        assert_eq!(
+            artifact_count_after, 1,
+            "a Rejected source must never mint a target-repo row"
+        );
     }
 
     /// Cross-mount privilege-escalation regression guard (ADR 0008).
