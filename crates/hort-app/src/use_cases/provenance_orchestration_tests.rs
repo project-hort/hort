@@ -3952,6 +3952,75 @@ async fn cascade_verified_single_image_manifest_clears_config_and_layers() {
 }
 
 // ---------------------------------------------------------------------------
+// issue #108 H2c — `commit_cascade_event` must not clobber a concurrently-
+// written column on the constituent's stream, the same class of defect
+// Item 1 closed on the two primary verdict paths. The cascade's
+// `ProvenanceVerified` always leaves `quarantine_status` unchanged
+// (`Artifact::cascade_provenance_clearance` takes `&self`), so
+// skip-unchanged means the routed-through `commit_provenance_verdict` call
+// makes NO status-column write at all — proven here by calling
+// `commit_cascade_event` directly (mirrors
+// `provenance_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor`'s
+// stale-vs-concurrent construction) with a STALE constituent snapshot while
+// a "concurrently committed" DIFFERENT snapshot sits in the mock's queryable
+// projection. Pre-#108 (full-row `commit_transition`) the stale snapshot's
+// columns would have overwritten the concurrent write; post-#108 the
+// cascaded event still appends but the concurrent write survives untouched.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cascade_commit_does_not_clobber_concurrently_written_anchor() {
+    let f = build(RepositoryFormat::Oci, None, vec![], vec![]);
+    let subject_hash = f.content_hash.clone();
+    let config = hexhash('a');
+
+    // A STALE constituent snapshot — as if `cascade_one` had loaded it
+    // BEFORE a concurrent transition (e.g. the constituent's own ingest
+    // finishing its quarantine stamp) landed: no anchor yet.
+    let mut stale = sample_artifact(QuarantineStatus::Quarantined);
+    stale.repository_id = f.repository_id;
+    stale.sha256_checksum = config.clone();
+    stale.quarantine_window_start = None;
+    let constituent_id = stale.id;
+
+    // The event `cascade_provenance_clearance` would produce for this
+    // constituent — built from the SAME stale snapshot (its identity/hash
+    // never changes), matching what `cascade_one` passes to
+    // `commit_cascade_event`.
+    let event = stale
+        .cascade_provenance_clearance(subject_hash.clone(), sample_identity(), None, "cosign-key")
+        .expect("Quarantined constituent takes the cascaded clearance");
+
+    // The concurrent transition commits, setting the anchor — AFTER the
+    // stale snapshot above was captured.
+    let anchor = chrono::Utc::now();
+    let mut current = stale.clone();
+    current.quarantine_window_start = Some(anchor);
+    f.artifacts.insert(current);
+
+    f.uc.commit_cascade_event(&stale, event, ExpectedVersion::Any)
+        .await
+        .expect("commit_cascade_event");
+
+    let cascaded = cascaded_events(&f);
+    assert_eq!(
+        cascaded.len(),
+        1,
+        "the cascaded ProvenanceVerified must still append"
+    );
+    assert_eq!(cascaded[0].0, constituent_id);
+
+    let saved = f.artifacts.get(constituent_id).unwrap();
+    assert_eq!(
+        saved.quarantine_window_start,
+        Some(anchor),
+        "issue #108 H2c: the concurrently-committed anchor must survive — commit_cascade_event \
+         must not clobber it with the stale snapshot's None. Routing through the full-row \
+         commit_transition (the pre-fix shape) is exactly the regression this pins."
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Terminal is terminal: an already-rejected constituent is NOT resurrected.
 // ---------------------------------------------------------------------------
 
