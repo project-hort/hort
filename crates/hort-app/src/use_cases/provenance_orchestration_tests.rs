@@ -1169,42 +1169,59 @@ async fn required_young_none_status_forged_signature_still_rejects_immediately()
 }
 
 // ---------------------------------------------------------------------------
-// issue #90 facet 2 — a provenance-verdict commit built from a stale
-// in-memory `Artifact` snapshot (captured before a concurrently-committed
-// quarantine transition landed) must not clobber the anchor that other
-// transition just wrote. `commit_provenance_verdict` is column-scoped
-// (`quarantine_status` only); a full-row write-back (the pre-fix
-// `commit_transition` shape) would zero `quarantine_window_start` back out.
+// issue #90 facet 2, AMENDED BY issue #108 (H2b) — a provenance-verdict
+// commit built from a stale in-memory `Artifact` snapshot must not clobber
+// EITHER the anchor a concurrently-committed transition wrote (#90) NOR the
+// `quarantine_status` that transition wrote (#108).
+//
+// **This test previously asserted the opposite of what it asserts now, and
+// the flip is the point.** As written for #90 it ended with "the verdict's
+// own status change must land" — i.e. it CODIFIED the status clobber as the
+// contract, protecting only `quarantine_window_start`. #90 scoped the write
+// to the status column, which hardened every OTHER column against the stale
+// snapshot but left the security-load-bearing one written unconditionally
+// from it. The scenario is now oriented the way the real defect runs: the
+// CONCURRENT writer commits `Rejected` (a scan verdict), and the stale
+// provenance verdict resolves `Verified` — which leaves the status
+// `Quarantined`, exactly equal to what it loaded. Under the skip-unchanged
+// rule that is no status write at all, so the concurrent `Rejected`
+// survives. Pre-#108 the same commit wrote `Quarantined` back over
+// `Rejected`, resurrecting a rejected artifact into a timer-releasable
+// state. The #90 anchor-survival assertion is kept verbatim alongside it.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn provenance_verdict_commit_does_not_clobber_concurrently_written_anchor() {
+async fn provenance_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor() {
     let f = build(RepositoryFormat::Oci, None, vec![], vec![]);
 
     // A STALE in-memory snapshot — as if `verify_artifact` loaded the
-    // artifact BEFORE the concurrent quarantine transition below landed:
-    // `None` status, no anchor.
+    // artifact BEFORE the concurrent scan verdict below landed:
+    // `Quarantined`, no anchor yet.
     let mut stale = f.artifacts.get(f.artifact_id).unwrap();
-    stale.quarantine_status = QuarantineStatus::None;
+    stale.quarantine_status = QuarantineStatus::Quarantined;
     stale.quarantine_window_start = None;
+    // What the verify path loaded — the guard the conditional write keys on.
+    let prior_status = stale.quarantine_status;
 
-    // The concurrent quarantine transition commits, setting the anchor —
+    // The concurrent scan verdict commits `Rejected` AND sets the anchor —
     // AFTER the stale snapshot above was captured.
     let anchor = chrono::Utc::now();
     let mut current = f.artifacts.get(f.artifact_id).unwrap();
-    current.quarantine_status = QuarantineStatus::Quarantined;
+    current.quarantine_status = QuarantineStatus::Rejected;
     current.quarantine_window_start = Some(anchor);
     f.artifacts.insert(current);
 
-    // The (stale) verdict commit now runs, deciding Rejected from its OWN
-    // stale view — exactly the shape `Artifact::complete_provenance`'s
-    // `Rejected` arm would have produced on `stale`.
-    stale.quarantine_status = QuarantineStatus::Rejected;
-    let event = DomainEvent::ProvenanceRejected(hort_domain::events::ProvenanceRejected {
+    // The (stale) provenance verdict now commits `Verified`. Per
+    // `Artifact::complete_provenance`'s `Verified` arm the status is left
+    // untouched — still `Quarantined` on the stale snapshot, i.e. EQUAL to
+    // `prior_status`.
+    let event = DomainEvent::ProvenanceVerified(hort_domain::events::ProvenanceVerified {
         artifact_id: f.artifact_id,
         content_hash: f.content_hash.clone(),
-        backend: "(policy)".to_string(),
-        reason: ProvenanceRejectReason::Unsigned,
+        backend: "cosign".to_string(),
+        signer: sample_identity(),
+        predicate_type: None,
+        cascaded_from: None,
     });
     f.lifecycle
         .commit_provenance_verdict(
@@ -1217,6 +1234,7 @@ async fn provenance_verdict_commit_does_not_clobber_concurrently_written_anchor(
                 causation_id: None,
                 actor: system_actor(),
             },
+            prior_status,
         )
         .await
         .expect("commit_provenance_verdict");
@@ -1225,13 +1243,74 @@ async fn provenance_verdict_commit_does_not_clobber_concurrently_written_anchor(
     assert_eq!(
         saved.quarantine_status,
         QuarantineStatus::Rejected,
-        "the verdict's own status change must land"
+        "issue #108: the concurrently-committed Rejected must SURVIVE — a Verified verdict \
+         leaves the status unchanged from what it loaded, so it must write no status at all. \
+         Reverting it to Quarantined here is the resurrect-then-timer-release defect."
     );
     assert_eq!(
         saved.quarantine_window_start,
         Some(anchor),
         "the concurrently-committed anchor must survive — a column-scoped verdict commit must \
          not clobber it with the stale snapshot's None"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// issue #108 H2b, the OTHER arm — when the verdict DOES change the status
+// (a genuine `Rejected` decision, not the skip-unchanged `Verified` case)
+// and the persisted row has meanwhile moved off the loaded status, the
+// conditional write must fail `Conflict` rather than overwrite. This is the
+// defense-in-depth backstop behind the event-store OCC: it fires even on a
+// path whose append did not conflict (here, `ExpectedVersion::Any`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn provenance_verdict_commit_conflicts_when_status_moved_under_it() {
+    let f = build(RepositoryFormat::Oci, None, vec![], vec![]);
+
+    let mut stale = f.artifacts.get(f.artifact_id).unwrap();
+    stale.quarantine_status = QuarantineStatus::Quarantined;
+    let prior_status = stale.quarantine_status;
+
+    // Concurrent writer moves the row off `prior_status`.
+    let mut current = f.artifacts.get(f.artifact_id).unwrap();
+    current.quarantine_status = QuarantineStatus::Released;
+    f.artifacts.insert(current);
+
+    // The stale verdict decides `Rejected` — a real status CHANGE, so
+    // skip-unchanged does not apply and the conditional write is reached.
+    stale.quarantine_status = QuarantineStatus::Rejected;
+    let event = DomainEvent::ProvenanceRejected(hort_domain::events::ProvenanceRejected {
+        artifact_id: f.artifact_id,
+        content_hash: f.content_hash.clone(),
+        backend: "(policy)".to_string(),
+        reason: ProvenanceRejectReason::Unsigned,
+    });
+    let err = f
+        .lifecycle
+        .commit_provenance_verdict(
+            &stale,
+            AppendEvents {
+                stream_id: StreamId::artifact(f.artifact_id),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event)],
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+            },
+            prior_status,
+        )
+        .await
+        .expect_err("a status that moved under the verdict must Conflict, not be overwritten");
+    assert!(
+        matches!(err, DomainError::Conflict(_)),
+        "expected Conflict (distinct from NotFound, which stays reserved for an absent id); \
+         got {err:?}"
+    );
+    assert_eq!(
+        f.artifacts.get(f.artifact_id).unwrap().quarantine_status,
+        QuarantineStatus::Released,
+        "the concurrent writer's status must be left exactly as it was"
     );
 }
 

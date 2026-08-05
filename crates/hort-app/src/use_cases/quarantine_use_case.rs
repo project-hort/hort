@@ -385,6 +385,32 @@ impl QuarantineUseCase {
 
         // Step 3 — load artifact + resolve policy + exclusions + coords.
         let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
+
+        // Read the expected stream version HERE — paired with the load
+        // above, BEFORE the policy/exclusion resolution, prior-scan
+        // hydration and findings-blob CAS write below (issue #108 H2a).
+        // It used to be read at step 7, after all of that: a concurrent
+        // verdict committing in that window was already in the version we
+        // then read, so this append did NOT conflict and the paired
+        // projection write happily overwrote the newer status. Anchored
+        // to the load, that append now fails `Conflict` instead.
+        //
+        // Mirrors `policy_use_case.rs`'s early-read shape (warn on read
+        // error), but PROPAGATES rather than skipping: that is a bulk
+        // re-evaluation pass where one artifact is skippable, whereas
+        // this is a single-artifact job — `Err` fails the job so the
+        // dispatcher retries, rather than silently dropping a scan result.
+        let expected_version = read_expected_version(&*self.events, &stream_id, false)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "record_scan_result: expected-version read failed; aborting this artifact \
+                     (job retries)",
+                );
+            })?;
+
         let policy =
             resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
                 .await?;
@@ -422,9 +448,8 @@ impl QuarantineUseCase {
         };
         scan_event.validate()?;
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
-
-        // Step 8 — drive the per-outcome path.
+        // Step 8 — drive the per-outcome path. (`expected_version` was
+        // read up front at step 3 — issue #108 H2a.)
         let scan_id = Uuid::new_v4();
         let scan_findings_rows = build_scan_findings_rows(&findings, artifact_id, scan_id, now);
         // Capture the prior status BEFORE mutation so
@@ -627,6 +652,7 @@ impl QuarantineUseCase {
                         Some((repository_id, score_delta))
                     },
                     sbom_components_owned.as_deref(),
+                    prior_status,
                 )
                 .await?;
 
@@ -771,6 +797,7 @@ impl QuarantineUseCase {
                     now,
                     score_update,
                     sbom_components_owned.as_deref(),
+                    prior_status,
                 )
                 .await?;
 
@@ -1015,6 +1042,15 @@ impl QuarantineUseCase {
     /// default that produced that string is gone, every impl now
     /// implements `commit_scan_result_with_score` directly, and this
     /// dispatch is a single method call.
+    ///
+    /// `prior_status` is the artifact's `quarantine_status` as LOADED at
+    /// the top of [`Self::record_scan_result`], before the domain
+    /// transition mutated it. The lifecycle port uses it to skip the
+    /// status write entirely when the verdict left the status unchanged,
+    /// and to make it conditional otherwise (issue #108 H2b) — see
+    /// `ArtifactLifecyclePort::commit_provenance_verdict`'s doc for the
+    /// shared contract.
+    #[allow(clippy::too_many_arguments)] // trait-defined shape — see the port.
     async fn commit_scan_result_dual_write(
         &self,
         artifact: &Artifact,
@@ -1023,6 +1059,7 @@ impl QuarantineUseCase {
         last_scan_at: DateTime<Utc>,
         score_delta: Option<(Uuid, ScoreDelta)>,
         sbom_components: Option<&[hort_domain::types::sbom::SbomComponent]>,
+        prior_status: QuarantineStatus,
     ) -> AppResult<()> {
         self.lifecycle
             .commit_scan_result_with_score(
@@ -1032,6 +1069,7 @@ impl QuarantineUseCase {
                 last_scan_at,
                 score_delta,
                 sbom_components,
+                prior_status,
             )
             .await
             .map(|_| ())
@@ -2058,47 +2096,60 @@ mod tests {
 
     // -- Tests ----------------------------------------------------------------
 
-    /// issue #90 facet 2 — a scan-verdict commit built from a stale
-    /// in-memory `Artifact` snapshot (captured before a concurrently-
-    /// committed quarantine transition landed) must not clobber the anchor
-    /// that other transition just wrote. `commit_scan_result_with_score`'s
-    /// artifact-state write is column-scoped (`quarantine_status` only);
-    /// a full-row write-back (the pre-fix `save_in_tx` shape) would zero
-    /// `quarantine_window_start` back out. Mirrors
-    /// `provenance_verdict_commit_does_not_clobber_concurrently_written_anchor`
-    /// in `provenance_orchestration_tests.rs` for the scan-verdict path.
+    /// issue #90 facet 2, AMENDED BY issue #108 (H2b) — the scan-path
+    /// mirror of
+    /// `provenance_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor`
+    /// in `provenance_orchestration_tests.rs`.
+    ///
+    /// **This test previously asserted the opposite of what it asserts
+    /// now, and the flip is the point.** As written for #90 it ended with
+    /// "the verdict's own status change must land" — codifying the status
+    /// clobber as the contract, protecting only `quarantine_window_start`.
+    /// #90 scoped the write to the status column, hardening every OTHER
+    /// column against the stale snapshot but leaving the
+    /// security-load-bearing one written unconditionally from it. The
+    /// scenario is now oriented the way the real defect runs: the
+    /// concurrent writer commits `Rejected`, and the stale scan verdict is
+    /// a CLEAN mid-window scan, which leaves the status `Quarantined` —
+    /// exactly equal to what it loaded. Under skip-unchanged that is no
+    /// status write at all, so the concurrent `Rejected` survives. The #90
+    /// anchor-survival assertion is kept verbatim alongside it.
     #[tokio::test]
-    async fn scan_verdict_commit_does_not_clobber_concurrently_written_anchor() {
+    async fn scan_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor() {
         let (_uc, artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
 
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &_repositories, QuarantineStatus::Quarantined);
 
         // A STALE in-memory snapshot — as if `record_scan_result` loaded
-        // the artifact BEFORE the concurrent quarantine transition below
-        // landed: `None` status, no anchor.
+        // the artifact BEFORE the concurrent verdict below landed:
+        // `Quarantined`, no anchor yet.
         let mut stale = artifacts.get(artifact_id).unwrap();
-        stale.quarantine_status = QuarantineStatus::None;
+        stale.quarantine_status = QuarantineStatus::Quarantined;
         stale.quarantine_window_start = None;
+        // What the scan path loaded — the guard the conditional write
+        // keys on (`record_scan_result` captures exactly this, before the
+        // domain transition mutates the artifact).
+        let prior_status = stale.quarantine_status;
 
-        // The concurrent quarantine transition commits, setting the
-        // anchor — AFTER the stale snapshot above was captured.
+        // The concurrent verdict commits `Rejected` AND sets the anchor —
+        // AFTER the stale snapshot above was captured.
         let anchor = Utc::now();
         let mut current = artifacts.get(artifact_id).unwrap();
-        current.quarantine_status = QuarantineStatus::Quarantined;
+        current.quarantine_status = QuarantineStatus::Rejected;
         current.quarantine_window_start = Some(anchor);
         artifacts.insert(current);
 
-        // The (stale) scan-verdict commit now runs, deciding Rejected
-        // from its OWN stale view — exactly the shape
-        // `Artifact::reject_from_scan` would have produced on `stale`.
-        stale.quarantine_status = QuarantineStatus::Rejected;
+        // The (stale) scan-verdict commit now runs with a CLEAN result
+        // mid-window: `ScanCompleted{finding_count: 0}` and the artifact
+        // stays `Quarantined` (the timer, not this scan, releases it), so
+        // the status is unchanged from `prior_status`.
         let event = DomainEvent::ScanCompleted(ScanCompleted {
             artifact_id,
             scanner: "trivy".to_string(),
-            finding_count: 1,
+            finding_count: 0,
             severity_summary: SeveritySummary {
-                critical: 1,
+                critical: 0,
                 high: 0,
                 medium: 0,
                 low: 0,
@@ -2121,6 +2172,7 @@ mod tests {
                 Utc::now(),
                 None,
                 None,
+                prior_status,
             )
             .await
             .expect("commit_scan_result_with_score");
@@ -2129,13 +2181,83 @@ mod tests {
         assert_eq!(
             saved.quarantine_status,
             QuarantineStatus::Rejected,
-            "the verdict's own status change must land"
+            "issue #108: the concurrently-committed Rejected must SURVIVE — a clean mid-window \
+             scan leaves the status unchanged from what it loaded, so it must write no status \
+             at all. Reverting it to Quarantined here is the resurrect-then-timer-release defect."
         );
         assert_eq!(
             saved.quarantine_window_start,
             Some(anchor),
             "the concurrently-committed anchor must survive — a column-scoped verdict commit \
              must not clobber it with the stale snapshot's None"
+        );
+    }
+
+    /// issue #108 H2b, the OTHER arm on the scan path — when the scan
+    /// verdict DOES change the status (a dirty scan rejecting) and the
+    /// persisted row has meanwhile moved off the loaded status, the
+    /// conditional write must fail `Conflict` rather than overwrite.
+    /// Mirrors `provenance_verdict_commit_conflicts_when_status_moved_under_it`.
+    #[tokio::test]
+    async fn scan_verdict_commit_conflicts_when_status_moved_under_it() {
+        let (_uc, artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
+
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &_repositories, QuarantineStatus::Quarantined);
+
+        let mut stale = artifacts.get(artifact_id).unwrap();
+        stale.quarantine_status = QuarantineStatus::Quarantined;
+        let prior_status = stale.quarantine_status;
+
+        // Concurrent writer moves the row off `prior_status`.
+        let mut current = artifacts.get(artifact_id).unwrap();
+        current.quarantine_status = QuarantineStatus::Released;
+        artifacts.insert(current);
+
+        // The stale verdict decides `Rejected` — a real status CHANGE, so
+        // skip-unchanged does not apply and the conditional write fires.
+        stale.quarantine_status = QuarantineStatus::Rejected;
+        let event = DomainEvent::ScanCompleted(ScanCompleted {
+            artifact_id,
+            scanner: "trivy".to_string(),
+            finding_count: 1,
+            severity_summary: SeveritySummary {
+                critical: 1,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: None,
+        });
+        let err = lifecycle
+            .commit_scan_result_with_score(
+                &stale,
+                AppendEvents {
+                    stream_id: StreamId::artifact(artifact_id),
+                    expected_version: ExpectedVersion::Any,
+                    events: vec![EventToAppend::new(event)],
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: system_actor(),
+                },
+                &[],
+                Utc::now(),
+                None,
+                None,
+                prior_status,
+            )
+            .await
+            .expect_err("a status that moved under the verdict must Conflict, not be overwritten");
+        assert!(
+            matches!(err, DomainError::Conflict(_)),
+            "expected Conflict (distinct from NotFound, which stays reserved for an absent id); \
+             got {err:?}"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released,
+            "the concurrent writer's status must be left exactly as it was"
         );
     }
 

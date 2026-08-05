@@ -242,6 +242,43 @@ impl ProvenanceOrchestrationUseCase {
     /// [`Artifact::complete_provenance`], persisting the event (if any).
     pub async fn verify_artifact(&self, artifact_id: Uuid) -> AppResult<ProvenanceRunOutcome> {
         let artifact = self.artifacts.find_by_id(artifact_id).await?;
+
+        // Read the expected stream version HERE — paired with the load
+        // above, BEFORE the bundle-fetch / CAS-preimage / verifier round
+        // trip below (issue #108 H2a). Reading it late (at commit time,
+        // where it used to live) meant a scan verdict that committed
+        // `ArtifactRejected` during that round trip was ALREADY in the
+        // version we then read, so the provenance append did not conflict
+        // — and `complete_provenance(Verified)`, working from the
+        // stale-loaded `Quarantined`, wrote that status back over
+        // `Rejected`, resurrecting a rejected artifact into a
+        // timer-releasable state. Anchored to the load, a concurrent
+        // verdict's append now makes THIS append fail `Conflict` and the
+        // paired projection write never runs.
+        //
+        // Nothing between here and the commit appends to THIS stream:
+        // the referrer-landing path (`commit_referrer_manifest`) mints a
+        // NEW artifact id and appends to its own stream, and the cascade
+        // runs only after this artifact's own verdict has committed.
+        //
+        // Mirrors `policy_use_case.rs`'s early-read shape (warn on read
+        // error), but PROPAGATES instead of skipping: that is a bulk
+        // re-evaluation pass where one artifact is skippable, whereas
+        // this is a single-artifact job — returning `Err` fails the job
+        // so the dispatcher retries it, rather than silently reporting a
+        // verify that never happened.
+        let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
+        let expected_version = read_expected_version(&*self.events, &stream_id, false)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "provenance verify: expected-version read failed; aborting this artifact \
+                     (job retries)",
+                );
+            })?;
+
         let repo = self.repositories.find_by_id(artifact.repository_id).await?;
         let format = repo.format.to_string();
 
@@ -431,6 +468,7 @@ impl ProvenanceOrchestrationUseCase {
                         is_referenced_descendant,
                         "bundle fetch",
                         e,
+                        expected_version,
                     )
                     .await;
             }
@@ -474,6 +512,7 @@ impl ProvenanceOrchestrationUseCase {
                                         is_referenced_descendant,
                                         "post-proxy bundle re-read",
                                         e,
+                                        expected_version,
                                     )
                                     .await;
                             }
@@ -489,6 +528,7 @@ impl ProvenanceOrchestrationUseCase {
                                 is_referenced_descendant,
                                 "upstream referrer fetch",
                                 e,
+                                expected_version,
                             )
                             .await;
                     }
@@ -511,6 +551,7 @@ impl ProvenanceOrchestrationUseCase {
                         is_referenced_descendant,
                         "CAS preimage read",
                         e,
+                        expected_version,
                     )
                     .await;
             }
@@ -576,6 +617,7 @@ impl ProvenanceOrchestrationUseCase {
                 mode,
                 window_open,
                 is_referenced_descendant,
+                expected_version,
             )
             .await?;
 
@@ -1351,6 +1393,12 @@ impl ProvenanceOrchestrationUseCase {
     /// Apply a folded verdict via [`Artifact::complete_provenance`] and
     /// persist the returned event (if any). Mirrors how scan orchestration
     /// persists `ScanCompleted` through the lifecycle port.
+    ///
+    /// `too_many_arguments`: 8 with `&self` — #115 Item 3's
+    /// `is_referenced_descendant` plus #108's `expected_version`, both
+    /// resolved in `verify_artifact` and threaded here. A struct wrapper
+    /// would churn both call paths for no behavioural gain.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_verdict(
         &self,
         mut artifact: Artifact,
@@ -1359,6 +1407,7 @@ impl ProvenanceOrchestrationUseCase {
         mode: ProvenanceMode,
         window_open: bool,
         is_referenced_descendant: bool,
+        expected_version: ExpectedVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
         // Defense-in-depth bounded requeue (issue #90). A `NoAttestation`
         // verdict under `Required` with a `None` `quarantine_window_start`
@@ -1426,6 +1475,12 @@ impl ProvenanceOrchestrationUseCase {
                 verdict.outcome,
                 hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
             );
+        // The status as LOADED, captured before `complete_provenance`
+        // mutates it — the guard the conditional projection write keys on
+        // (issue #108 H2b; see `ArtifactLifecyclePort`'s doc). A
+        // `Verified` verdict leaves the artifact `Quarantined`, i.e.
+        // EQUAL to this, so the adapter skips the status write entirely.
+        let prior_status = artifact.quarantine_status;
         let event = artifact.complete_provenance(
             verdict,
             mode,
@@ -1518,16 +1573,23 @@ impl ProvenanceOrchestrationUseCase {
         };
 
         let stream_id = hort_domain::events::StreamId::artifact(artifact.id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
         let correlation_id = Uuid::new_v4();
 
-        // Column-scoped verdict commit (issue #90): `artifact` was loaded
-        // at the top of `verify_artifact`, before the bundle fetch / CAS
-        // preimage read / verifier dispatch round trip — by now its
-        // snapshot of every column but `quarantine_status` can be stale.
-        // `commit_provenance_verdict` writes only `quarantine_status`, so
-        // a concurrently-committed transition's `quarantine_window_start`
-        // (the quarantine anchor) survives.
+        // Column-scoped, prior-status-guarded verdict commit (issues #90
+        // and #108). `artifact` was loaded at the top of
+        // `verify_artifact`, before the bundle fetch / CAS preimage read /
+        // verifier dispatch round trip — by now its snapshot of every
+        // column can be stale. Three things keep that from clobbering a
+        // concurrent verdict:
+        //
+        // 1. `expected_version` was read at that same load (#108 H2a, see
+        //    `verify_artifact`), so an intervening append fails this one
+        //    `Conflict` before any projection write happens.
+        // 2. `commit_provenance_verdict` writes only `quarantine_status`,
+        //    so a concurrent transition's `quarantine_window_start` (the
+        //    quarantine anchor) survives regardless (#90).
+        // 3. `prior_status` makes even that one column's write
+        //    skip-if-unchanged and conditional-if-changed (#108 H2b).
         self.lifecycle
             .commit_provenance_verdict(
                 &artifact,
@@ -1539,6 +1601,7 @@ impl ProvenanceOrchestrationUseCase {
                     causation_id: None,
                     actor: system_actor(),
                 },
+                prior_status,
             )
             .await?;
 
@@ -1566,12 +1629,12 @@ impl ProvenanceOrchestrationUseCase {
     /// could not be FETCHED is a different failure from one that provably
     /// has none). Threading the values through does not weaken this.
     ///
-    /// `too_many_arguments`: 8 with `&self` (the #115 descendant flag was
-    /// the 8th). Every parameter is already a distinct, unrelated input
-    /// this private helper forwards verbatim to `apply_verdict`; bundling
-    /// the two hold flags into a struct would only move the same values
-    /// behind a name and would widen the diff on a file `#108` is about to
-    /// rebase against. Matches the crate's established use of this allow.
+    /// `too_many_arguments`: 9 with `&self` (#115's descendant flag was the
+    /// 8th; #108's `expected_version` is the 9th). Every parameter is a
+    /// distinct, unrelated input this private helper forwards verbatim to
+    /// `apply_verdict`; bundling them into a struct would only move the
+    /// same values behind a name. Matches the crate's established use of
+    /// this allow.
     #[allow(clippy::too_many_arguments)]
     async fn apply_fetch_failure(
         &self,
@@ -1582,6 +1645,7 @@ impl ProvenanceOrchestrationUseCase {
         is_referenced_descendant: bool,
         stage: &str,
         err: crate::error::AppError,
+        expected_version: ExpectedVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
         match mode {
             ProvenanceMode::Required => {
@@ -1604,6 +1668,7 @@ impl ProvenanceOrchestrationUseCase {
                     mode,
                     window_open,
                     is_referenced_descendant,
+                    expected_version,
                 )
                 .await
             }
@@ -1623,6 +1688,7 @@ impl ProvenanceOrchestrationUseCase {
                     mode,
                     window_open,
                     is_referenced_descendant,
+                    expected_version,
                 )
                 .await
             }

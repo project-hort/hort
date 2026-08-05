@@ -146,6 +146,7 @@ impl ArtifactLifecyclePort for ChainingLifecycle {
         Box::pin(async move { publisher.append(events).await })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_scan_result_with_score<'a>(
         &'a self,
         _artifact: &'a Artifact,
@@ -154,6 +155,7 @@ impl ArtifactLifecyclePort for ChainingLifecycle {
         _last_scan_at: DateTime<Utc>,
         _score_delta: Option<(Uuid, ScoreDelta)>,
         _sbom_components: Option<&'a [SbomComponent]>,
+        _prior_status: QuarantineStatus,
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
         // Not exercised on the curator-block path; forward defensively.
         let publisher = self.publisher.clone();
