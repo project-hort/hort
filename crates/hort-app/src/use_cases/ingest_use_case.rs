@@ -3946,15 +3946,11 @@ impl IngestUseCase {
         // source row.
         let artifact_id = Uuid::new_v4();
         let now = Utc::now();
-        // Bound `mut` because the seed-import path
-        // (`quarantine_anchor_override = Some(backdated_anchor)`)
-        // transitions the artifact to `Quarantined` after the
-        // `ArtifactIngested` commit lands. Every existing non-seed
-        // caller passes `quarantine_anchor_override = None` (see
-        // `register_existing_cas_blob` for the post-coalesce
-        // follower's `None`, and `hort-http-oci/src/uploads.rs` for the
-        // cross-mount path's `None`) — the mut binding is a no-op for
-        // them.
+        // Bound `mut`: every caller (seed-import, OCI cross-repo blob
+        // mount, and the cross-repo pull-dedup followers) may transition
+        // the artifact to `Quarantined` after the `ArtifactIngested`
+        // commit lands, per the generalized gate below (issue #107 Item
+        // 1). Only a `quarantineDuration: 0` policy leaves it `None`.
         let mut artifact = Artifact {
             id: artifact_id,
             repository_id,
@@ -4039,63 +4035,125 @@ impl IngestUseCase {
                 repo_key: Some(repo_key.clone()),
             })?;
 
-        // Seed-import cutover.
+        // Quarantine-by-default, generalized to EVERY
+        // `register_by_hash_inner` caller (issue #107 Item 1).
         //
-        // When `quarantine_anchor_override = Some(anchor)`, the caller
-        // (today exclusively `SeedImportUseCase` via
-        // `RegisterExistingCasBlobRequest.seed_import_quarantine_anchor`)
-        // has backdated the anchor so the *computed* deadline
-        // (`anchor + effective_duration`) is already
-        // at or before `now()`. We:
+        // Originally (#115 Item 1) this gate ran ONLY when
+        // `quarantine_anchor_override = Some(anchor)` — exclusively the
+        // seed-import path (`SeedImportUseCase` via
+        // `RegisterExistingCasBlobRequest.seed_import_quarantine_anchor`).
+        // Every OTHER caller — OCI cross-repo blob mount
+        // (`handle_cross_mount`) and the cross-repo pull-dedup follower
+        // re-registration (five call sites: OCI blobs/manifests +
+        // pypi/npm/cargo/maven `upstream_pull.rs`) — passed `None` and
+        // fell straight through to `RegisterOutcome::Fresh` with the row
+        // still at `QuarantineStatus::None`: no policy resolution, no
+        // scan enqueue, immediately downloadable (issue #107, HIGH). This
+        // hoists the SAME gate out of the anchor-override branch so it
+        // runs unconditionally:
         //
-        // 1. Transition the in-memory artifact to `Quarantined` with
-        //    the backdated anchor (`Artifact::quarantine` sets
-        //    `quarantine_window_start = anchor`).
-        // 2. Resolve the SAME scan/provenance enqueue gate `ingest_inner`
-        //    computes (issue #115 defect (a) — see `commit_transition_with_enqueues`
-        //    below), so this seed-imported artifact is never quarantined
-        //    without ALSO being scanned. Before this fix the follow-on
-        //    commit landed only `ArtifactQuarantined` with no scan
-        //    enqueue — no rescan-sweep candidate list picks up an
-        //    artifact with no job row at all (`select_eligible` requires
-        //    `released`/`NULL`; `select_stranded` requires a *failed*
-        //    job row), so every seed-imported artifact under a scanning
-        //    policy 503'd forever. Widening `select_stranded` to also
-        //    recover pre-existing job-less rows is #115 Item 2 — this is
-        //    the at-source fix so no NEW ones strand.
-        // 3. Append `ArtifactQuarantined` + the gated `ScanRequested` to
-        //    the same stream as ONE follow-on commit, atomic with the
-        //    job-row enqueues (mirrors `ingest_inner`'s strict-mode
-        //    quarantine step at the bottom of step 6 — same
-        //    `commit_transition_with_enqueues` no-strand guarantee,
-        //    ADR 0002/0004).
+        // 1. Resolve the target repo's active policy (identical
+        //    derivation to `ingest_inner`, ~line 2714 — same non-fatal
+        //    fail-open-to-"no policy" handling on a projection-read
+        //    error: aborting registration on a transient policy-read
+        //    failure would make scanning a hard dependency of every
+        //    mount/follower/seed registration, which the design
+        //    explicitly avoids; the artifact still registers and an
+        //    operator can manually rescan once the projection is back).
+        // 2. Derive `scan_will_run` / `provenance_will_run` /
+        //    `effective_duration_secs` — EXACT same derivations as
+        //    `ingest_inner` (~lines 2739, 2787, 2826).
+        // 3. `effective_duration_secs > 0`: transition `None ->
+        //    Quarantined` with anchor = `quarantine_anchor_override
+        //    .unwrap_or(now)` (the seed caller's backdated anchor is
+        //    preserved verbatim; every other caller anchors at `now`).
+        //    Unlike `ingest_inner`, no referenced-tree-descendant
+        //    zero-window carve-out or `trust_upstream_publish_time` clamp
+        //    applies here — `register_by_hash` mints a fresh per-repo row
+        //    over content that already exists elsewhere in CAS, not a
+        //    fresh upstream fetch; that carve-out stays scoped to
+        //    `ingest_inner` (out of scope for this item).
+        //    `effective_duration_secs == 0` (operator permissive
+        //    opt-out): skip the quarantine transition — the artifact
+        //    stays `None`/downloadable — but `ScanRequested` +
+        //    the job-row enqueues below still fire per `scan_will_run` /
+        //    `provenance_will_run`, mirroring `ingest_inner`'s identical
+        //    permissive-mode behaviour (bad findings still reject via
+        //    `Artifact::reject_from_scan`).
+        // 4. Land whatever combination of `ArtifactQuarantined` +
+        //    `ScanRequested` + the `Scan`/`ProvenanceVerify` job-row
+        //    enqueues applies, ATOMICALLY, in ONE follow-on commit
+        //    (`commit_transition_with_enqueues`, ADR 0002/0004 no-strand
+        //    — mirrors `ingest_inner`'s own guarantee that a quarantine
+        //    transition and its scan/provenance enqueue can never land
+        //    separately). `trigger_source` on the enqueued jobs
+        //    distinguishes the caller class: `"seed-import"` when the
+        //    caller supplied a backdated anchor, `"register-by-hash"`
+        //    otherwise (mount + follower callers, which always pass
+        //    `None`). The commit is skipped entirely when there is
+        //    nothing to append or enqueue (a fully waived policy —
+        //    `quarantineDuration: 0` AND `scanBackends: []` AND
+        //    `provenanceMode: off` — under which the artifact stays
+        //    `None` with no gate at all, matching `ingest_inner`'s
+        //    identical case).
         //
-        // **Not** `ScanWaived`, **not** permissive. A dirty scan still
-        // transitions the artifact to `Rejected` via
-        // `Artifact::reject_from_scan`; the release authority gate
-        // is unchanged. This path stamps the *time* anchor AND now
-        // requests the scan/provenance verdicts that authority depends
-        // on.
+        // **Not** `ScanWaived`, **not** permissive (when duration > 0). A
+        // dirty scan still transitions the artifact to `Rejected` via
+        // `Artifact::reject_from_scan`; the release authority gate is
+        // unchanged. This path stamps the *time* anchor AND requests the
+        // scan/provenance verdicts that authority depends on.
         //
         // Consequence (issue #115 design doc §2 D1, intentional and
-        // policy-consistent, not a bug): seeding unsigned content into a
-        // repo with `provenance_mode: Required` and a provenance-capable
-        // format now resolves to an IMMEDIATE terminal
-        // `Rejected{Unsigned}` — the backdated anchor means
-        // `window_open` is already `false` by the time the enqueued
-        // `provenance-verify` job runs, and this artifact is never a
-        // referenced-tree descendant (seed-import has no
-        // `content_references` target from another already-ingested
-        // artifact), so neither hold carve-out applies. `Required` means
-        // unsigned content does not release, seeded or not; operators
-        // seed unsigned content into non-`Required` repos.
-        //
-        // Every existing non-seed caller passes
-        // `quarantine_anchor_override = None`; this whole block —
-        // including the policy resolution and gate derivation below — is
-        // a no-op for them (#107 generalises the `None` callers'
-        // own Gate-2 exposure separately; this item does not touch them).
-        if let Some(anchor) = quarantine_anchor_override {
+        // policy-consistent, not a bug — now applies to every caller, not
+        // just seed-import): registering unsigned content into a repo
+        // with `provenance_mode: Required` and a provenance-capable
+        // format resolves to an IMMEDIATE terminal `Rejected{Unsigned}`
+        // once the window closes, UNLESS this artifact is itself a
+        // referenced-tree descendant of some other already-ingested
+        // artifact (the `content_references` carve-out, #46 Item 2 / #115
+        // Item 3 — orthogonal to this fn, evaluated by the provenance
+        // orchestrator at verdict time, not here).
+        let trigger_source = if quarantine_anchor_override.is_some() {
+            "seed-import"
+        } else {
+            "register-by-hash"
+        };
+
+        let matched_policy: Option<ScanPolicyProjection> =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        artifact_id = %artifact_id,
+                        repository_id = %repository_id,
+                        error = %e,
+                        "register_by_hash: policy_projections.list_active failed; \
+                         skipping scan auto-enqueue (artifact still registers)",
+                    );
+                    None
+                });
+
+        let scan_will_run = match matched_policy.as_ref() {
+            Some(p) => !p.scan_backends.is_empty(),
+            None => !DefaultPolicy::block_on_critical_default_backends().is_empty(),
+        };
+        let provenance_mode = matched_policy
+            .as_ref()
+            .map(|p| p.provenance_mode)
+            .unwrap_or_default();
+        let provenance_will_run = provenance_mode != ProvenanceMode::Off
+            && self
+                .provenance_capable_formats
+                .contains(&scan_enqueue_format);
+        let effective_duration_secs: i64 = matched_policy
+            .as_ref()
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+
+        let quarantined = effective_duration_secs > 0;
+        let mut events: Vec<EventToAppend> = Vec::new();
+        if quarantined {
+            let anchor = quarantine_anchor_override.unwrap_or(now);
             let quarantine_event =
                 artifact
                     .quarantine(anchor)
@@ -4103,79 +4161,39 @@ impl IngestUseCase {
                         err: AppError::Domain(e),
                         repo_key: Some(repo_key.clone()),
                     })?;
-
-            // Resolve the active policy for the target repo — IDENTICAL
-            // derivation to `ingest_inner` (~line 2705), including the
-            // same non-fatal fail-open-to-"no policy" handling on a
-            // projection-read error: aborting the seed-import on a
-            // transient policy-read failure would make scanning a hard
-            // dependency of seed-import, which the design explicitly
-            // avoids (the artifact still quarantines; an operator can
-            // manually rescan once the projection is back).
-            let matched_policy: Option<ScanPolicyProjection> =
-                resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            artifact_id = %artifact_id,
-                            repository_id = %repository_id,
-                            error = %e,
-                            "seed-import: policy_projections.list_active failed; \
-                             skipping scan auto-enqueue (artifact still quarantines)",
-                        );
-                        None
-                    });
-
-            // `scan_will_run` / `provenance_will_run` — EXACT same
-            // derivations as `ingest_inner` (~lines 2732, 2779). A
-            // `scan_backends: []` policy (or no operator policy plus an
-            // empty `DefaultPolicy`, which never happens today but is
-            // handled identically for parity) enqueues nothing; release
-            // then proceeds via the unchanged `ScanWaived` authority.
-            let scan_will_run = match matched_policy.as_ref() {
-                Some(p) => !p.scan_backends.is_empty(),
-                None => !DefaultPolicy::block_on_critical_default_backends().is_empty(),
-            };
-            let provenance_mode = matched_policy
-                .as_ref()
-                .map(|p| p.provenance_mode)
-                .unwrap_or_default();
-            let provenance_will_run = provenance_mode != ProvenanceMode::Off
-                && self
-                    .provenance_capable_formats
-                    .contains(&scan_enqueue_format);
-
-            let mut events = vec![EventToAppend::new(DomainEvent::ArtifactQuarantined(
+            events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
                 quarantine_event,
-            ))];
-            if scan_will_run {
-                events.push(EventToAppend {
-                    event_id: Uuid::new_v4(),
-                    event: DomainEvent::ScanRequested(ScanRequested {
-                        artifact_id,
-                        scanner: matched_policy
-                            .as_ref()
-                            .map(|p| p.name.clone())
-                            .unwrap_or_else(|| "default".to_string()),
-                    }),
-                });
-            }
+            )));
+        }
+        if scan_will_run {
+            events.push(EventToAppend {
+                event_id: Uuid::new_v4(),
+                event: DomainEvent::ScanRequested(ScanRequested {
+                    artifact_id,
+                    scanner: matched_policy
+                        .as_ref()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "default".to_string()),
+                }),
+            });
+        }
 
-            let mut enqueues: Vec<IngestEnqueue> = Vec::new();
-            if scan_will_run {
-                enqueues.push(IngestEnqueue::Scan {
-                    format: scan_enqueue_format.clone(),
-                    priority: 0, // default tier, mirrors ingest_inner's ingest-time enqueue
-                    trigger_source: "seed-import".to_string(),
-                });
-            }
-            if provenance_will_run {
-                enqueues.push(IngestEnqueue::ProvenanceVerify {
-                    priority: 0,
-                    trigger_source: "seed-import".to_string(),
-                });
-            }
+        let mut enqueues: Vec<IngestEnqueue> = Vec::new();
+        if scan_will_run {
+            enqueues.push(IngestEnqueue::Scan {
+                format: scan_enqueue_format.clone(),
+                priority: 0, // default tier, mirrors ingest_inner's ingest-time enqueue
+                trigger_source: trigger_source.to_string(),
+            });
+        }
+        if provenance_will_run {
+            enqueues.push(IngestEnqueue::ProvenanceVerify {
+                priority: 0,
+                trigger_source: trigger_source.to_string(),
+            });
+        }
 
+        if !events.is_empty() || !enqueues.is_empty() {
             let expected_version = read_expected_version(&*self.events, &stream_id, true)
                 .await
                 .map_err(|e| RegisterError::Other {
@@ -4192,10 +4210,10 @@ impl IngestUseCase {
                         events,
                         correlation_id,
                         causation_id: None,
-                        // System actor — the seed-import path is operator-
-                        // initiated but the per-artifact follow-on commit
-                        // is mechanical bookkeeping (mirrors
-                        // `ingest_inner`'s strict-mode quarantine step).
+                        // System actor — this follow-on commit is
+                        // mechanical bookkeeping regardless of caller
+                        // (mirrors `ingest_inner`'s strict-mode
+                        // quarantine step).
                         actor: hort_domain::events::system_actor(),
                     },
                     None, // metadata was persisted on the preceding ingest transition
@@ -4209,10 +4227,11 @@ impl IngestUseCase {
 
             tracing::info!(
                 %artifact_id,
-                %anchor,
+                trigger_source,
+                quarantined,
                 scan_will_run,
                 provenance_will_run,
-                "seed-import quarantine stamped (backdated anchor); scan/provenance gate resolved"
+                "register_by_hash: quarantine/scan/provenance gate resolved"
             );
         }
 
@@ -7587,14 +7606,24 @@ mod tests {
                 assert_eq!(outcome.artifact.sha256_checksum, hash);
                 assert_eq!(outcome.artifact.size_bytes, 4242);
 
-                // Exactly one transition — the ArtifactIngested event.
+                // Two transitions: the `ArtifactIngested` commit, then
+                // the generalized gate's follow-on commit (issue #107
+                // Item 1) — the shared permissive-global test policy has
+                // `quarantine_duration_secs: 0` (no quarantine) but
+                // `scan_backends: ["trivy"]` (non-empty), so
+                // `ScanRequested` + a `Scan` job enqueue land in a second
+                // commit even though nothing quarantines.
                 // `ingested_event_id` equals the id on the event actually
                 // committed (same contract as `ingest`).
                 let transitions = lifecycle.committed_transitions();
-                assert_eq!(transitions.len(), 1);
+                assert_eq!(transitions.len(), 2);
                 let appended = &transitions[0].1.events[0];
                 assert!(matches!(appended.event, DomainEvent::ArtifactIngested(_)));
                 assert_eq!(outcome.ingested_event_id, appended.event_id);
+                assert!(matches!(
+                    transitions[1].1.events[0].event,
+                    DomainEvent::ScanRequested(_)
+                ));
 
                 // Metadata round-trips onto the event (and the 1:1
                 // projection row handed to the lifecycle port).
@@ -7705,11 +7734,19 @@ mod tests {
             assert_eq!(outcome.artifact.sha256_checksum, hash);
             assert_eq!(outcome.artifact.repository_id, target_id);
 
+            // Two transitions — see the identical note in
+            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
+            // gate: the shared permissive-global test policy still scans
+            // even though it does not quarantine).
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions.len(), 2);
             assert!(matches!(
                 transitions[0].1.events[0].event,
                 DomainEvent::ArtifactIngested(_)
+            ));
+            assert!(matches!(
+                transitions[1].1.events[0].event,
+                DomainEvent::ScanRequested(_)
             ));
         });
     }
@@ -7844,18 +7881,28 @@ mod tests {
                 "follower registration must not call storage.put"
             );
 
-            // Exactly one new commit for the follower's repo-B row —
-            // the same ArtifactIngested event the leader's
-            // non-concurrent cross-repo dedup emits.
+            // Two commits per caller: `ArtifactIngested`, then the
+            // generalized gate's follow-on `ScanRequested` commit (issue
+            // #107 Item 1 — the shared permissive-global test policy
+            // still scans even though it does not quarantine). Leader:
+            // transitions[0..2). Follower's own repo-B mint:
+            // transitions[2..4) — the same `ArtifactIngested` event the
+            // leader's non-concurrent cross-repo dedup emits, now
+            // followed by its own scan enqueue too.
             let transitions = lifecycle.committed_transitions();
             assert_eq!(
                 transitions.len(),
-                2,
-                "one commit for the leader's resolve, one for the follower's repo-B mint"
+                4,
+                "two commits (Ingested + scan-gate) for the leader's resolve, \
+                 two for the follower's repo-B mint"
             );
             assert!(matches!(
-                transitions[1].1.events[0].event,
+                transitions[2].1.events[0].event,
                 DomainEvent::ArtifactIngested(_)
+            ));
+            assert!(matches!(
+                transitions[3].1.events[0].event,
+                DomainEvent::ScanRequested(_)
             ));
         });
     }
@@ -7891,9 +7938,13 @@ mod tests {
                 first.artifact.id, second.artifact.id,
                 "idempotent: same repo-B row returned, no second mint"
             );
+            // Two commits for the FIRST call (`ArtifactIngested` + the
+            // gate's follow-on `ScanRequested`, issue #107 Item 1); the
+            // second call short-circuits on the same-path-same-hash
+            // dedup guard before ever reaching the gate, so it adds none.
             assert_eq!(
                 lifecycle.committed_transitions().len(),
-                1,
+                2,
                 "same-path-same-hash dedup must not emit a second commit"
             );
         });
@@ -8077,8 +8128,13 @@ mod tests {
                 .await
                 .expect("metadata round-trip path must succeed");
 
+            // Two transitions — `ArtifactIngested` (asserted below),
+            // then the generalized gate's follow-on `ScanRequested`
+            // commit (issue #107 Item 1; the shared permissive-global
+            // test policy still scans even though it does not
+            // quarantine). Only the FIRST commit is this test's concern.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions.len(), 2);
 
             // Event payload carries the exact JSON the caller supplied.
             match &transitions[0].1.events[0].event {
@@ -8168,8 +8224,11 @@ mod tests {
                 "new artifact is a fresh row"
             );
 
+            // Two transitions — see the identical note in
+            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
+            // gate).
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions.len(), 2);
         });
     }
 
@@ -8521,13 +8580,15 @@ mod tests {
                 // Same artifact row — idempotent on the aggregate id.
                 assert_eq!(first.artifact.id, second.artifact.id);
 
-                // Exactly ONE `ArtifactIngested` committed across both
-                // calls — the dedup path short-circuits before the
-                // lifecycle port.
+                // Two commits total: `ArtifactIngested` + the generalized
+                // gate's follow-on `ScanRequested` (issue #107 Item 1)
+                // for the FIRST call only — the second call's dedup path
+                // short-circuits before the lifecycle port (and before
+                // the gate) entirely.
                 let transitions = lifecycle.committed_transitions();
                 assert_eq!(
                     transitions.len(),
-                    1,
+                    2,
                     "same-path-same-hash dedup must not emit a second commit"
                 );
             });
@@ -8591,9 +8652,11 @@ mod tests {
                 "expected Conflict, got {err:?}"
             );
 
-            // Only the first commit landed — the conflict rejection
-            // did not emit a second event.
-            assert_eq!(lifecycle.committed_transitions().len(), 1);
+            // Two commits from the first (successful) placement only —
+            // `ArtifactIngested` + the generalized gate's follow-on
+            // `ScanRequested` (issue #107 Item 1); the conflict
+            // rejection on the second call did not emit any event.
+            assert_eq!(lifecycle.committed_transitions().len(), 2);
         });
     }
 
@@ -8627,9 +8690,12 @@ mod tests {
                 outcome.artifact.size_bytes, expected_size as i64,
                 "register_by_hash must source size_bytes authoritatively from storage.size_of"
             );
-            // Event payload carries the same authoritative size.
+            // Event payload carries the same authoritative size. Two
+            // transitions total — see the identical note in
+            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
+            // gate); only the FIRST commit is this test's concern.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions.len(), 2);
             match &transitions[0].1.events[0].event {
                 DomainEvent::ArtifactIngested(ev) => {
                     assert_eq!(ev.size_bytes, expected_size as i64);
@@ -8675,8 +8741,11 @@ mod tests {
                 "register_by_hash writes exactly one refcount row (primary_content)"
             );
 
+            // Two transitions — see the identical note in
+            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
+            // gate).
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions.len(), 2);
             let artifact = &transitions[0].0;
 
             let rows = content_refs
@@ -9368,8 +9437,9 @@ mod tests {
 
             assert_eq!(
                 lifecycle.committed_transitions().len(),
-                1,
-                "ArtifactIngested must still commit on register_by_hash when refcount insert fails"
+                2,
+                "ArtifactIngested must still commit on register_by_hash when refcount insert fails \
+                 (plus the generalized gate's follow-on ScanRequested commit, issue #107 Item 1)"
             );
 
             // No refcount row landed — the failed insert was warned
@@ -12476,6 +12546,300 @@ mod tests {
         .with_provenance_capable_formats(capable_formats.iter().map(ToString::to_string));
 
         (uc, repos, policy_projections, jobs, lifecycle)
+    }
+
+    /// [`provenance_make_use_case`] variant that also hands back `storage`
+    /// (for the `register_by_hash` `None`-source branch's
+    /// `storage.exists`/`size_of`) — needed by the #107 Item 1 gate-matrix
+    /// tests that drive `register_by_hash` (rather than `ingest_verified`)
+    /// against a provenance-capable format.
+    #[allow(clippy::type_complexity)]
+    fn provenance_make_use_case_for_register_by_hash(
+        capable_formats: &[&str],
+    ) -> (
+        IngestUseCase,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+        Arc<MockJobsRepository>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockStoragePort>,
+    ) {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let events = Arc::new(MockEventStore::new());
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let groups = Arc::new(MockArtifactGroupRepository::new());
+        let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
+        let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
+        let curation_rules = Arc::new(MockCurationRuleRepository::new());
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+        let jobs = Arc::new(MockJobsRepository::default());
+
+        let uc = IngestUseCase::new(
+            storage.clone(),
+            lifecycle.clone(),
+            artifacts,
+            repos.clone(),
+            crate::event_store_publisher::wrap_for_test(events),
+            curation_rules,
+            group_use_case,
+            true,
+            HashMap::new(),
+            0,
+            content_references,
+            policy_projections.clone(),
+            jobs.clone(),
+        )
+        .with_provenance_capable_formats(capable_formats.iter().map(ToString::to_string));
+
+        (uc, repos, policy_projections, jobs, lifecycle, storage)
+    }
+
+    /// [`IngestRequest`] with OCI-formatted coords + `quarantine_anchor_override:
+    /// None` (non-seed caller shape) — mirrors [`req_legacy`], which is
+    /// pinned to `sample_coords()` (Pypi).
+    fn oci_req_legacy(repo_id: Uuid) -> IngestRequest {
+        IngestRequest {
+            repository_id: repo_id,
+            coords: oci_coords(),
+            content_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            quarantine_anchor_override: None,
+            actor: api_actor(),
+            legacy_sha1: None,
+            legacy_md5: None,
+            declared_sha256: None,
+            payload_metadata: serde_json::Value::Null,
+        }
+    }
+
+    // =====================================================================
+    // #107 Item 1 — the generalized `register_by_hash_inner` gate matrix
+    // for NON-SEED callers (mount + follower). The seed-caller cells
+    // (duration>0/=0 x scan on/off x provenance on/off) were already
+    // covered before this item by the `seed_import_use_case.rs` suite
+    // (unaffected by the hoist — see that module's own tests) plus
+    // `seed_cutover_policy_lookup_failure_falls_back_to_default_scan`
+    // above. These four pin the NON-SEED half of the same matrix, which
+    // had NO coverage before this item because non-seed callers had NO
+    // gate at all (issue #107).
+    // =====================================================================
+
+    /// non-seed x duration>0: a mount/follower registration under a
+    /// quarantining policy now HOLDS instead of minting an immediately-
+    /// downloadable `None`-status row — the core issue #107 fix. Anchor is
+    /// `now` (not backdated — only the seed caller supplies an override).
+    #[test]
+    fn register_by_hash_non_seed_quarantines_under_duration_policy() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            policies.insert(global_scan_policy()); // duration=24h, scan_backends=["osv"]
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            let before = Utc::now();
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("non-seed registration under a quarantining policy must succeed");
+            let after = Utc::now();
+
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::Quarantined,
+                "issue #107: a non-seed register_by_hash caller must now quarantine \
+                 under a duration>0 policy, not mint an immediately-downloadable None row"
+            );
+            let anchor = outcome
+                .artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set");
+            assert!(
+                anchor >= before && anchor <= after,
+                "non-seed anchor must be `now` (no backdated override supplied)"
+            );
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 2, "{transitions:?}");
+            assert!(transitions[1]
+                .1
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_))));
+            assert!(transitions[1]
+                .1
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ScanRequested(_))));
+
+            let enqueues = lifecycle.ingest_enqueues();
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert!(
+                enqueues[0].1.iter().any(|e| matches!(
+                    e,
+                    IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "register-by-hash"
+                )),
+                "non-seed caller's enqueue must carry trigger_source=register-by-hash, \
+                 not seed-import: {:?}",
+                enqueues[0].1
+            );
+        });
+    }
+
+    /// non-seed x scan off: a `scan_backends: []` policy still quarantines
+    /// (duration unchanged) but enqueues NO scan job — the explicit
+    /// operator waiver, distinct from "no policy" (DefaultPolicy).
+    #[test]
+    fn register_by_hash_non_seed_scan_waived_still_quarantines_without_scan_enqueue() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            let mut waived = global_scan_policy();
+            waived.scan_backends = vec![]; // explicit waiver; duration stays 24h
+            policies.insert(waived);
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("registration under a scan-waived quarantining policy must succeed");
+
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::Quarantined,
+                "scan_backends:[] waives SCANNING, not the quarantine timer"
+            );
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 2, "{transitions:?}");
+            let follow_on_kinds: Vec<&str> = transitions[1]
+                .1
+                .events
+                .iter()
+                .map(|e| e.event.event_type())
+                .collect();
+            assert_eq!(
+                follow_on_kinds,
+                vec!["ArtifactQuarantined"],
+                "no ScanRequested under an explicit scan_backends:[] waiver: {follow_on_kinds:?}"
+            );
+            // `commit_transition_with_enqueues` records a `(id, enqueues)`
+            // entry on EVERY call, including ones with an empty `enqueues`
+            // slice (the call happened; nothing was requested) — assert
+            // the SLICE is empty, not that no call was recorded.
+            let enqueues = lifecycle.ingest_enqueues();
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert!(
+                enqueues[0].1.is_empty(),
+                "no Scan job enqueue under an explicit scan_backends:[] waiver: {enqueues:?}"
+            );
+        });
+    }
+
+    /// non-seed x provenance on (OCI, provenance-capable format):
+    /// `ProvenanceVerify` enqueues with `trigger_source=register-by-hash` —
+    /// mirrors `required_oci_enqueues_provenance_verify_job` /
+    /// `verify_if_present_oci_enqueues_provenance_verify_job` (which drive
+    /// `ingest_verified`) but through the mount/follower path instead.
+    #[test]
+    fn register_by_hash_non_seed_provenance_capable_format_enqueues_provenance_verify() {
+        let repo = oci_repo();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, repos, projections, _jobs, lifecycle, storage) =
+                provenance_make_use_case_for_register_by_hash(&["oci"]);
+            repos.insert(repo);
+            projections.insert(provenance_policy(ProvenanceMode::Required));
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"oci manifest bytes".to_vec());
+
+            uc.register_by_hash(oci_req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect(
+                    "non-seed OCI registration under Required must succeed (held, not rejected)",
+                );
+
+            assert_eq!(
+                provenance_verify_enqueues(&lifecycle),
+                1,
+                "Required mode on a provenance-capable format must enqueue ProvenanceVerify \
+                 for a non-seed (mount/follower) register_by_hash caller too"
+            );
+            let enqueues = lifecycle.ingest_enqueues();
+            assert!(
+                enqueues
+                    .iter()
+                    .any(|(_, batch)| batch.iter().any(|e| matches!(
+                        e,
+                        IngestEnqueue::ProvenanceVerify { trigger_source, .. }
+                            if trigger_source == "register-by-hash"
+                    ))),
+                "non-seed caller's provenance enqueue must carry \
+                 trigger_source=register-by-hash: {enqueues:?}"
+            );
+        });
+    }
+
+    /// non-seed x fully-waived policy (duration=0 AND scan_backends=[] AND
+    /// provenance_mode=off): the generalized gate has NOTHING to append or
+    /// enqueue, so it must skip its follow-on commit ENTIRELY — exactly one
+    /// `ArtifactIngested` commit, artifact stays `None`/downloadable.
+    /// Exercises the `!events.is_empty() || !enqueues.is_empty()` guard's
+    /// false arm, which no other test reaches (every other register_by_hash
+    /// test's policy enqueues at least a scan).
+    #[test]
+    fn register_by_hash_non_seed_fully_waived_policy_skips_follow_on_commit_entirely() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            let mut fully_waived = global_scan_policy();
+            fully_waived.quarantine_duration_secs = 0;
+            fully_waived.scan_backends = vec![];
+            fully_waived.provenance_mode = ProvenanceMode::Off;
+            policies.insert(fully_waived);
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("registration under a fully-waived policy must succeed");
+
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::None,
+                "a fully-waived policy (duration=0, scan off, provenance off) leaves the \
+                 artifact None/downloadable, matching ingest_inner's identical case"
+            );
+            assert_eq!(
+                lifecycle.committed_transitions().len(),
+                1,
+                "nothing to append or enqueue -> the follow-on commit must be skipped \
+                 entirely, not sent empty: {:?}",
+                lifecycle.committed_transitions()
+            );
+            assert!(
+                lifecycle.ingest_enqueues().is_empty(),
+                "{:?}",
+                lifecycle.ingest_enqueues()
+            );
+        });
     }
 
     /// A provenance policy projection (global scope) at the requested mode.
