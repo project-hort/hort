@@ -472,16 +472,46 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use chrono::Utc;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use hort_app::use_cases::test_support::{
         sample_artifact, sample_repository, MockUserRepository,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::entities::caller::CallerPrincipal;
 
     use hort_http_core::context::AuthContext;
+    use hort_http_core::middleware::auth::test_support::inject_principal;
     use hort_http_core::test_support::{build_mock_ctx as build_base_ctx, with_auth};
+
+    /// Build a `GET /metrics` request carrying a pre-validated principal
+    /// in the `AuthenticatedPrincipal` extension slot — the shape
+    /// `require_principal` writes in production. Needed because
+    /// `MetricsReaderPrincipal` (#113 item 2) now gates `render_metrics`;
+    /// under the `AuthContext::Disabled` mock context these tests use, no
+    /// auth middleware is attached at all (mirrors production: boot
+    /// refuses `Disabled`), so a bare anonymous request never reaches the
+    /// extension-populated shape any real deployment's dispatch layer
+    /// produces. `Disabled` still grants the RBAC leg unconditionally
+    /// once a principal is present — see `authorize()`'s `Disabled` arm.
+    fn metrics_request_with_principal() -> Request<Body> {
+        let principal = CallerPrincipal {
+            user_id: Uuid::new_v4(),
+            external_id: "test:sub".into(),
+            username: "scraper".into(),
+            email: "scraper@example.com".into(),
+            claims: vec![],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        };
+        let mut req = Request::get("/metrics").body(Body::empty()).unwrap();
+        inject_principal(&mut req, principal);
+        req
+    }
 
     /// Seed a `pypi-test` repository + one downloadable artifact onto the
     /// shared mock context, so PyPI routes have something to serve.
@@ -534,7 +564,7 @@ mod tests {
                     let _ = to_bytes(response.into_body(), 1024).await.unwrap();
 
                     let scrape = router
-                        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+                        .oneshot(metrics_request_with_principal())
                         .await
                         .unwrap();
                     assert_eq!(scrape.status(), StatusCode::OK);
@@ -665,12 +695,17 @@ mod tests {
                     // `require_auth=true` is the production default; the
                     // mock context here is `AuthContext::Disabled`, so
                     // the `require_principal` layer is skipped (mirrors
-                    // the public router's gate). Anonymous still 200s.
+                    // the public router's gate; boot refuses `Disabled`
+                    // in production). `render_metrics` still requires
+                    // `MetricsReaderPrincipal` (#113 item 2) — under
+                    // `Disabled` the RBAC leg grants unconditionally, but
+                    // `extract_principal` still needs a principal in
+                    // extensions, hence the manual injection.
                     let router = build_admin_router(ctx, true);
 
                     let metrics_res = router
                         .clone()
-                        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+                        .oneshot(metrics_request_with_principal())
                         .await
                         .unwrap();
                     let pypi_res = router
@@ -842,8 +877,8 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    let target = uuid::Uuid::new_v4();
-                    let token = uuid::Uuid::new_v4();
+                    let target = Uuid::new_v4();
+                    let token = Uuid::new_v4();
 
                     let control = build_control_router(ctx.clone(), true);
                     // Admin-mint and admin-revoke must be ROUTED here.
@@ -1089,7 +1124,7 @@ mod tests {
                     let html_headers = html_res.headers().clone();
 
                     let plain_res = router
-                        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+                        .oneshot(metrics_request_with_principal())
                         .await
                         .unwrap();
                     assert_eq!(plain_res.status(), StatusCode::OK);
