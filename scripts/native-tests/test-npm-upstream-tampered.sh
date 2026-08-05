@@ -38,6 +38,18 @@ set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-http://hort-server:8080}"
 METRICS_URL="${METRICS_URL:-http://hort-server:9090/metrics}"
+# #113 item 5: /metrics unconditionally requires a read_metrics bearer
+# (no anon-scrape opt-out — item 3). These standalone diagnostic scripts
+# are not part of the run.sh-orchestrated harness (no CI wiring, no DB/
+# compose-exec plumbing here) — Item 5 does not auto-mint a token for
+# them. Set METRICS_TOKEN yourself (e.g. `hort-server admin
+# issue-svc-token --name metrics-scraper --permission read_metrics`
+# via `docker compose exec hort-server`) to run the metric checks
+# authenticated; unset, the curl below now 401s (same empty-metric
+# fallback as before, `|| true`).
+METRICS_TOKEN="${METRICS_TOKEN:-}"
+METRICS_AUTH_HEADER=()
+if [ -n "$METRICS_TOKEN" ]; then METRICS_AUTH_HEADER=(-H "Authorization: Bearer ${METRICS_TOKEN}"); fi
 NPM_REPO_KEY="${NPM_REPO_KEY:-npm-upstream-tampered-e2e}"
 WIREMOCK_TAMPERED_URL="${WIREMOCK_TAMPERED_URL:-http://wiremock-npm-tampered:8080}"
 HORT_CONTAINER="${HORT_CONTAINER:-hort-hort-server-1}"
@@ -134,7 +146,7 @@ rm -f "$LOOKUP_TMP"
 # under set -e when the metric series is missing pre-test.
 # ---------------------------------------------------------------------
 read_mismatch_metric() {
-    curl -sf "$METRICS_URL" 2>/dev/null \
+    curl -sf "${METRICS_AUTH_HEADER[@]}" "$METRICS_URL" 2>/dev/null \
         | awk '/^hort_upstream_checksum_total\{[^}]*format="npm"[^}]*result="mismatch"[^}]*\}/ { s += $NF } END { printf "%d\n", (s+0) }' \
         || true
 }

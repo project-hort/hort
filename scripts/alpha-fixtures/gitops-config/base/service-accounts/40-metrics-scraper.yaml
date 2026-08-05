@@ -1,0 +1,19 @@
+# ServiceAccount: the read_metrics scrape identity for the alpha runbook's
+# §4.d / §9.a metrics assertions (#113 item 5). PAT-only (no
+# federatedIdentities / fallbackRotation) — the alpha tracks are single-host
+# and don't do k8s workload federation or Secret rotation; mirrors
+# deploy/compose/example-config/service-accounts/provenance-ci.yaml.
+#
+# Lives under base/ (not auth/) deliberately: unlike the auth/*-claim-mapping
+# fixtures, this SA + its paired grant
+# (41-metrics-scraper-read-metrics.yaml) do NOT require OIDC — `kind:
+# ServiceAccount` and a `serviceAccount`-subject `PermissionGrant` apply
+# under HORT_AUTH_PROVIDER=disabled just as well as under oidc, so Track A
+# (base/ only) can mint the scrape token via
+# `hort-server admin issue-svc-token --name metrics-scraper --permission
+# read_metrics` without needing Track B's OIDC setup.
+apiVersion: project-hort.de/v1
+kind: ServiceAccount
+metadata:
+  name: metrics-scraper
+spec: {}

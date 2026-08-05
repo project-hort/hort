@@ -1,0 +1,15 @@
+# ServiceAccount (e2e): the read_metrics scrape identity for the native-tests
+# harness (#113 item 5). PAT-only (no federatedIdentities / fallbackRotation) —
+# mirrors provenance-ci.yaml. run.sh admin-mints an hort_svc_* token for this
+# SA once per run (POST /api/v1/admin/users/:id/tokens) and threads it as
+# METRICS_TOKEN into every scenario container that scrapes /metrics.
+#
+# Authority is the sibling serviceAccount-subject PermissionGrant in
+# auth/metrics-scraper-read-metrics.yaml. `read_metrics` is deliberately a
+# GLOBAL permission (see that file) — this SA holds no other grant, exactly
+# the non-admin, single-capability shape ADR 0052 requires for a scraper.
+apiVersion: project-hort.de/v1
+kind: ServiceAccount
+metadata:
+  name: metrics-scraper
+spec: {}

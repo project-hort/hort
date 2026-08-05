@@ -127,7 +127,7 @@ read_success_metric() {
     # `|| true` guards the curl half: a transient /metrics blip
     # shouldn't abort the test run. The empty input flows through
     # awk and prints 0.
-    curl -sf "$METRICS_URL" 2>/dev/null \
+    curl -sf "${METRICS_AUTH_HEADER[@]}" "$METRICS_URL" 2>/dev/null \
         | awk '/^hort_upstream_fetch_total\{[^}]*result="success"[^}]*\}/ { s += $NF } END { printf "%d\n", (s+0) }' \
         || true
 }

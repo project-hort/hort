@@ -63,8 +63,20 @@ command -v curl  >/dev/null 2>&1 || skip "curl not found"
 # ---------------------------------------------------------------------
 log ""
 log "--- Preflight: probing ${METRICS_URL}"
-if ! curl -sf -o /dev/null --max-time 5 "$METRICS_URL"; then
-    skip "metrics endpoint not reachable at ${METRICS_URL} — bring up deploy/compose/docker-compose.yml first"
+if [ -z "${METRICS_URL:-}" ]; then
+    skip "METRICS_URL unset — bring up deploy/compose/docker-compose.yml first"
+fi
+# #113 item 5: /metrics unconditionally requires a read_metrics bearer (no
+# anon-scrape opt-out — item 3). No token is the genuinely-absent case
+# (mirrors the METRICS_URL-unset skip above); WITH a token, a non-2xx here
+# is a real regression (grant/token problem), not "stack not up" — fail,
+# don't skip.
+if [ -z "${METRICS_TOKEN:-}" ]; then
+    skip "no read_metrics bearer available (METRICS_TOKEN unset)"
+fi
+if ! curl -sf "${METRICS_AUTH_HEADER[@]}" -o /dev/null --max-time 5 "$METRICS_URL"; then
+    fail "metrics endpoint reachable" "GET ${METRICS_URL} with a read_metrics bearer returned non-2xx"
+    summary
 fi
 log "  metrics endpoint reachable"
 
@@ -105,7 +117,7 @@ esac
 # Returns the integer sum to stdout.
 read_pull_dedup_metric() {
     local pattern="$1"
-    curl -sf "$METRICS_URL" 2>/dev/null \
+    curl -sf "${METRICS_AUTH_HEADER[@]}" "$METRICS_URL" 2>/dev/null \
         | awk -v pat="$pattern" '
             $0 ~ ("^hort_pull_dedup_total\\{[^}]*" pat "[^}]*\\}") { s += $NF }
             END { printf "%d\n", (s+0) }
@@ -116,7 +128,7 @@ read_pull_dedup_metric() {
 read_upstream_fetch_metric() {
     # hort_upstream_fetch_total{format="npm",upstream="...",result="success"} N
     local pattern="$1"
-    curl -sf "$METRICS_URL" 2>/dev/null \
+    curl -sf "${METRICS_AUTH_HEADER[@]}" "$METRICS_URL" 2>/dev/null \
         | awk -v pat="$pattern" '
             $0 ~ ("^hort_upstream_fetch_total\\{[^}]*" pat "[^}]*\\}") { s += $NF }
             END { printf "%d\n", (s+0) }
@@ -282,7 +294,7 @@ fi
 if [ "$_FAIL" -gt 0 ]; then
     log ""
     log "--- /metrics dump (hort_pull_dedup* and hort_upstream_fetch*) ---"
-    curl -sf "$METRICS_URL" 2>/dev/null \
+    curl -sf "${METRICS_AUTH_HEADER[@]}" "$METRICS_URL" 2>/dev/null \
         | grep -E '^hort_pull_dedup|^hort_upstream_fetch' \
         | sort \
         || log "  (curl failed — metrics endpoint unreachable)"

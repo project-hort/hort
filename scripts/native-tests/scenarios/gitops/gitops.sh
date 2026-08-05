@@ -25,10 +25,10 @@ log "Metrics:  ${METRICS_URL}"
 # ---------------------------------------------------------------------
 log ""
 log "--> hort-server is reachable on the metrics port"
-if curl -sSf -o /dev/null "${METRICS_URL}" 2>/dev/null; then
+if curl -sSf "${METRICS_AUTH_HEADER[@]}" -o /dev/null "${METRICS_URL}" 2>/dev/null; then
     pass "metrics endpoint responds"
 else
-    fail "metrics endpoint responds" "${METRICS_URL} unreachable"
+    fail "metrics endpoint responds" "${METRICS_URL} unreachable (with a read_metrics bearer — #113 item 5)"
 fi
 
 # Abort early — nothing else is testable if metrics is down.
@@ -49,7 +49,7 @@ if [ "${_FAIL}" -gt 0 ]; then summary; fi
 log ""
 log '--> hort_gitops_apply_total{result="ok"} fired during boot'
 if bounded_poll "gitops apply_total(result=ok)" 15 \
-    "curl -sSf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_apply_total\{[^}]*result=\"ok\"[^}]*\} +[1-9]'"; then
+    "curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_apply_total\{[^}]*result=\"ok\"[^}]*\} +[1-9]'"; then
     pass 'hort_gitops_apply_total{result=ok} >= 1'
 else
     fail 'hort_gitops_apply_total{result=ok} >= 1' \
@@ -57,7 +57,7 @@ else
 fi
 
 if bounded_poll "gitops objects_total emitted" 15 \
-    "curl -sSf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_objects_total\{'"; then
+    "curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_objects_total\{'"; then
     pass "hort_gitops_objects_total emitted at least once"
 else
     fail "hort_gitops_objects_total emitted" "metric absent in scrape after 15s poll"

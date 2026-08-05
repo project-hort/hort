@@ -5,7 +5,7 @@
 # the old per-script smokes each re-implemented (and drifted on).
 #
 # Required env (set by run.sh): HORT_URL, KEYCLOAK_URL, METRICS_URL,
-#   KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET, FIXTURES.
+#   METRICS_TOKEN, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET, FIXTURES.
 # Optional: HORT_DB_DSN (when the mode provides `db`).
 set -euo pipefail
 
@@ -14,6 +14,16 @@ set -euo pipefail
 KEYCLOAK_CLIENT_ID="${KEYCLOAK_CLIENT_ID:-hort-server}"
 KEYCLOAK_CLIENT_SECRET="${KEYCLOAK_CLIENT_SECRET:-hort-server-secret-dev-only}"
 METRICS_URL="${METRICS_URL:-}"   # runner sets it; empty in external mode is OK (assert skips)
+# read_metrics-granted bearer for scraping $METRICS_URL (#113 item 5 — the
+# anon-hatch retirement means every /metrics scrape needs one). run.sh
+# admin-mints this once per compose run against the metrics-scraper SA;
+# empty in external mode unless the caller sets it. METRICS_AUTH_HEADER is
+# the curl-args array every scrape call site splices in — empty array when
+# no token, so an unauthenticated curl (and its now-expected 401) is what
+# actually runs rather than the array silently vanishing a flag.
+METRICS_TOKEN="${METRICS_TOKEN:-}"
+METRICS_AUTH_HEADER=()
+if [ -n "$METRICS_TOKEN" ]; then METRICS_AUTH_HEADER=(-H "Authorization: Bearer ${METRICS_TOKEN}"); fi
 FIXTURES="${FIXTURES:-/work/fixtures}"
 
 _PASS=0; _FAIL=0; declare -a _FAILURES=()
@@ -79,18 +89,32 @@ bounded_poll() {
 # same endpoint moments later from an idle probe"). Bounded-poll via the
 # shared `bounded_poll` idiom instead of one scrape: a passing run still hits
 # on the FIRST poll attempt (no slower than before), a slow-to-render run
-# gets up to 60s (2s interval) before this hard-fails. `$METRICS_URL` in the
-# predicate is deliberately deferred (escaped) rather than expanded here, so
-# the curl re-runs fresh on every poll attempt — mirrors maven.sh's own
-# bounded_poll predicate quoting for this exact metric.
+# gets up to 60s (2s interval) before this hard-fails. `$METRICS_URL` and
+# `${METRICS_AUTH_HEADER[@]}` in the predicate are deliberately deferred
+# (escaped) rather than expanded here, so the curl re-runs fresh on every
+# poll attempt — mirrors maven.sh's own bounded_poll predicate quoting.
+#
+# #113 item 5: `/metrics` now always requires a `read_metrics` bearer (no
+# anon-scrape opt-out — item 3), so a scrape needs BOTH `METRICS_URL` and
+# `METRICS_TOKEN`. Only a genuinely-absent input (either env var unset —
+# external-hort mode without a minted/supplied credential) stays a graceful
+# skip; once both are present, a non-2xx or an absent metric is a real FAIL
+# — the anon-hatch retirement is exactly why this assertion needs a token
+# to mean anything again.
 assert_metric_ingest() {
   local fmt="$1"
   if [ -z "${METRICS_URL:-}" ]; then log "  note: METRICS_URL unset — skip ingest-metric assert ($fmt)"; return 0; fi
-  if ! curl -sf -o /dev/null --max-time 5 "$METRICS_URL" 2>/dev/null; then
-    log "  note: METRICS_URL ($METRICS_URL) unreachable — skip ingest-metric assert ($fmt)"; return 0
+  if [ -z "${METRICS_TOKEN:-}" ]; then
+    log "  note: METRICS_TOKEN unset (no read_metrics bearer available) — skip ingest-metric assert ($fmt)"
+    return 0
+  fi
+  if ! curl -sf "${METRICS_AUTH_HEADER[@]}" -o /dev/null --max-time 5 "$METRICS_URL" 2>/dev/null; then
+    fail "ingest metric for $fmt" \
+      "GET $METRICS_URL with a read_metrics bearer returned non-2xx (grant/token regression, or the stack genuinely isn't up)"
+    return
   fi
   if bounded_poll "ingest-metric($fmt)" 60 \
-      "curl -sf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_ingest_total\{[^}]*format=\"${fmt}\"[^}]*result=\"success\"[^}]*\}'"; then
+      "curl -sf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_ingest_total\{[^}]*format=\"${fmt}\"[^}]*result=\"success\"[^}]*\}'"; then
     pass "hort_ingest_total{format=\"$fmt\",result=\"success\"} present"
   else
     fail "ingest metric for $fmt" "no hort_ingest_total{format=\"$fmt\",result=\"success\"} at $METRICS_URL after 60s poll"

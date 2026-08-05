@@ -39,6 +39,8 @@ if any ClaimMapping is declared while `HORT_AUTH_PROVIDER=disabled` (no
 | `base/repositories/06-cargo-hosted.yaml`| ArtifactRepository | Local-publish hosted repo |
 | `base/repositories/07-oci-proxy.yaml`  | ArtifactRepository | Pull-through cache of `index.docker.io` |
 | `base/repositories/08-oci-hosted.yaml` | ArtifactRepository | Local-publish hosted repo |
+| `base/service-accounts/40-metrics-scraper.yaml` | ServiceAccount | PAT-only `read_metrics` scrape identity (#113 item 5) |
+| `base/service-accounts/41-metrics-scraper-read-metrics.yaml` | PermissionGrant | `serviceAccount metrics-scraper` → `read_metrics` (global — `repository:` omitted) |
 | `base/upstreams/11-npm-proxy.yaml`     | UpstreamMapping    | Runtime routing for npm-proxy → registry.npmjs.org |
 | `base/upstreams/12-pypi-proxy.yaml`    | UpstreamMapping    | Runtime routing for pypi-proxy → pypi.org |
 | `base/upstreams/13-cargo-proxy.yaml`   | UpstreamMapping    | Runtime routing for cargo-proxy → crates.io |
