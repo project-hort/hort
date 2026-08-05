@@ -2,8 +2,9 @@
 
 PR-sized items, dependency-ordered. Design doc: `113-metrics-readmetrics-grant.md`.
 All work lands on `agent/113-metrics-readmetrics-grant`. Items 1–2 are the
-domain/schema foundation; 3 is the gate; 4–5 are the structural hardening; 6 is
-the ADR + docs distillation (must land before main merge, per D7).
+domain/schema foundation; 2b closes the evaluator gap found during Item 2
+review; 3 is the gate; 4 is the ADR + docs distillation (must land before main
+merge, per D7).
 
 ## Item 1 — `Permission::ReadMetrics` domain variant + migration 016
 
@@ -53,6 +54,38 @@ authz/mod.rs, handlers/metrics.rs, test_support::build_mock_ctx. Add MetricsRead
 Confirm acceptance, refine with the user, then implement. Depends on Item 1.
 ```
 
+## Item 2b — `RbacEvaluator` `ReadMetrics` admin-claim carve-out (orthogonality enforcement)
+
+**Added during Item 2 review (2026-08-05).** Item 2's extractor has no `Admin`
+fall-through of its own, but `RbacEvaluator::user_grants_authorize`'s
+pre-existing, unconditional `"admin"`-claim short-circuit still grants every
+`Permission` — including `ReadMetrics` — so the DECIDED orthogonality
+(admin-without-grant → 403; human, 2026-08-05) is unenforced until the shared
+evaluator carves `ReadMetrics` out. Pinned by the characterization test
+`metrics_reader_admin_claim_short_circuits_pending_113_evaluator_carveout`.
+
+**Design doc section:** §2 D3 (orthogonality decision)
+**Read first:** `crates/hort-app/src/rbac.rs` (`user_grants_authorize` admin
+short-circuit ~line 249, `effective_grants` marker short-circuit ~line 325, the
+`effective_grants_agrees_with_authorize_per_cell` G3-invariant test),
+`crates/hort-app/src/use_cases/rbac_resolve_use_case.rs` (the
+`effective_grants` consumer)
+**Acceptance:**
+- `user_grants_authorize`: admin-claim short-circuit no longer applies to
+  `Permission::ReadMetrics` — an admin-claim principal needs an explicit
+  `read_metrics` grant. Every other permission keeps the short-circuit
+  unchanged (including the B1 fail-closed cap arm).
+- `effective_grants` stays G3-consistent: under the admin marker it still never
+  enumerates repos, but it must surface a `ReadMetrics` cell if (and only if)
+  an explicit grant exists — an admin's self-view must agree with what
+  `authorize` will actually answer for `/metrics`.
+- `effective_grants_agrees_with_authorize_per_cell` extended with
+  admin-marker × `ReadMetrics` cases (granted and ungranted); the
+  `rbac_resolve_use_case.rs` consumer swept for marker-plus-cells handling.
+- The Item 2 characterization test flips to assert 403 (per its own
+  forward-motion instructions) and becomes the permanent orthogonality guard.
+- 100% `hort-app` coverage on the changed branches.
+
 ## Item 3 — Serve `/metrics` admin-listener-only; drop public-main-listener carve-out; retire the anon hatch
 
 **Design doc section:** §2 D4, D5
@@ -77,12 +110,12 @@ HORT_METRICS_REQUIRE_AUTH anon hatch end-to-end (config+chart+docs). Update the
 metrics_auth tests. Confirm acceptance, refine with the user, then implement. Depends on Item 2.
 ```
 
-## Item 4 — ADR 0051 + scraper-SA provisioning how-to (D7 distillation)
+## Item 4 — capability ADR + scraper-SA provisioning how-to (D7 distillation)
 
 **Design doc section:** §4, §3.1
 **Read first:** `docs/adr/0000-historical-decisions-index.md`, `docs/adr/0012-claim-based-rbac.md`, `docs/adr/0037-gitops-service-account-grant.md`, `docs/adr/0038-admin-identity-model.md`, `crates/hort-config/src/service_account.rs` (`fallbackRotation`/`federatedIdentities`), `docs/architecture/how-to/declare-gitops-config.md`
 **Acceptance:**
-- `docs/adr/0051-scoped-metrics-read-capability.md`: records D1–D5, the rejection of admin-gating and of pure-ingress-as-sole-control (with the ADR 0012 "network ≠ authz" citation), and the anon-hatch retirement; registered in the ADR index (0000).
+- `docs/adr/00XX-scoped-metrics-read-capability.md` — under the **then-next-free ADR number** (0051, reserved by the design doc, has since been claimed by `0051-self-contained-chart-and-hort-base-hosting.md`): records D1–D5, the rejection of admin-gating and of pure-ingress-as-sole-control (with the ADR 0012 "network ≠ authz" citation), and the anon-hatch retirement; registered in the ADR index (0000).
 - A how-to (operate) page shows provisioning a non-admin scraper ServiceAccount + unscoped `read_metrics` `PermissionGrant` via gitops apply. **Featured worked example = §3.1 Model B** (per the human's one-Flux-repo setup): `federatedIdentities` pinned to Prometheus's K8s SA `sub` (subject-identifying, never aud-only — cf #111), building on the existing `docs/architecture/how-to/federate-k8s-workload-identity.md` exchange, with a ~10-line refresh-loop sidecar writing Prometheus's `authorization.credentials_file`. **Model A** (`fallbackRotation` → `targetSecret`; Hort mints/rotates the PAT into a k8s Secret) is documented as the alternative. **The git repo never contains a token** — only the declaration. Verify the exchanged `TokenKind::ServiceAccount` bearer carries the `read_metrics` grant (grant-snapshot behavior).
 - **Read also:** `docs/architecture/how-to/federate-k8s-workload-identity.md`, `docs/architecture/how-to/rotating-service-account-tokens.md`.
 - Design/backlog `docs/plans/` files deleted in the promotion (D7) — durable record is the ADR + how-to.
@@ -92,7 +125,7 @@ metrics_auth tests. Confirm acceptance, refine with the user, then implement. De
 /hort-architect
 
 Implement Item 4 of docs/plans/113-metrics-readmetrics-grant-backlog.md (design §4).
-Write docs/adr/0051-scoped-metrics-read-capability.md (D1–D5, reject admin-gating +
+Write docs/adr/<next-free-number>-scoped-metrics-read-capability.md (D1–D5, reject admin-gating +
 pure-ingress-sole-control, retire anon hatch), register it in docs/adr/0000..index, and add
 an operate how-to for provisioning a non-admin scraper ServiceAccount with an unscoped
 read_metrics grant. Remember docs/plans/ files are deleted before the main promotion (D7).
@@ -101,6 +134,6 @@ but must reflect their final shapes before merge.
 ```
 
 ## Sequencing / notes
-- Merge order: 1 → 2 → 3, with 4 landing before the develop→main promotion (D7 delete of `docs/plans/`).
+- Merge order: 1 → 2 → 2b → 3, with 4 landing before the develop→main promotion (D7 delete of `docs/plans/`).
 - Not architecture-eroding: no new port, no `AppContext` field, no adapter import in a format crate, no release-gate interaction. One additive migration.
 - Pre-push gate per CLAUDE.md (`cargo fmt/clippy/test --workspace`, `cargo audit`, `cargo deny`); migration adds a non-workspace-crate-free change so no attribution regen needed.
