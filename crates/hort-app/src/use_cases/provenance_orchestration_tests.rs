@@ -831,6 +831,160 @@ async fn required_unsigned_window_closed_rejects_unsigned() {
     assert_eq!(ev.reason, ProvenanceRejectReason::Unsigned);
 }
 
+// ===========================================================================
+// Issue #115 defect (b) — referenced-tree descendants HOLD on
+// NoAttestation × Required, even with the window closed.
+//
+// The defect: OCI pull-through writes `oci_config`/`oci_layer` edges before
+// the blobs are pulled, so each layer ingests as a ZERO-WINDOW descendant
+// (#46: anchor = ingested_at − duration ⇒ window_open == false immediately).
+// Under `Required`, the ingest-enqueued verify found no bundle for the layer
+// digest (cosign signs only the top-level digest) and terminally rejected it
+// as `Unsigned` — BEFORE the subject's cascade could clear it. The cascade
+// then refuses the rejected constituent ("terminal is terminal"), so a
+// correctly-signed image became permanently unpullable.
+// ===========================================================================
+
+/// Seed an `oci_layer` content-reference edge making the fixture's subject
+/// artifact a referenced-tree descendant of some other artifact — the exact
+/// shape the OCI pull-through edge writer produces for a manifest's layer
+/// blob before the blob itself is pulled.
+fn seed_descendant_edge(f: &Fixture) {
+    futures::executor::block_on(async {
+        f.content_references
+            .insert(ContentReference {
+                source_artifact_id: Uuid::new_v4(), // the parent manifest
+                target_content_hash: f.content_hash.clone(),
+                kind: "oci_layer".to_string(),
+                metadata: serde_json::Value::Null,
+                repository_id: f.repository_id,
+                recorded_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("seed descendant content-reference edge");
+    });
+}
+
+/// **The regression test for #115 defect (b).** Identical setup to
+/// `required_unsigned_window_closed_rejects_unsigned` above (zero-width
+/// window ⇒ `window_open == false`) except the artifact carries an
+/// `oci_layer` edge making it a referenced-tree descendant. It must HOLD as
+/// `HeldPendingSignature` instead of terminally rejecting, so the parent's
+/// later cascade can still clear it.
+#[tokio::test]
+async fn required_unsigned_window_closed_descendant_holds_instead_of_rejecting() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0); // window CLOSED
+    seed_descendant_edge(&f); // …but it IS a descendant
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+        },
+        "a zero-window referenced-tree descendant must HOLD (issue #115 defect (b)), \
+         not terminally reject as Unsigned — and must report the existing \
+         HeldPendingSignature summary, not the allowed-unsigned NoAttestation no-op",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Quarantined,
+        "held descendant stays Quarantined so the parent's cascade can clear it",
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "the descendant hold appends NO provenance verdict event",
+    );
+}
+
+/// The carve-out is scoped to the unsigned arm: a descendant whose
+/// signature is genuinely BAD still rejects terminally. A blanket
+/// "descendants are never rejected" would let a tampered layer through.
+#[tokio::test]
+async fn required_descendant_with_bad_signature_still_rejects() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::rejected(ProvenanceRejectReason::UntrustedIdentity),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 24 * 3600); // even mid-window
+    seed_descendant_edge(&f);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::UntrustedIdentity),
+        },
+        "a BAD signature on a descendant is position-independent and still terminal",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+}
+
+/// **Error-direction regression (the load-bearing half).** A
+/// `content_references` lookup failure at VERDICT time must PROPAGATE —
+/// the job fails, the dispatcher retries, and the artifact stays
+/// `Quarantined`. Degrading to `false` (the correct default at INGEST,
+/// where it means "keep the full window") would here mean "no descendant
+/// hold" and fall straight into the terminal `Rejected{Unsigned}` arm,
+/// turning a transient read error into an unrecoverable rejection of a
+/// legitimately-signed image's layer.
+#[tokio::test]
+async fn verdict_time_descendant_lookup_failure_propagates_and_applies_no_verdict() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    // Window CLOSED — so a degrade-to-`false` bug would terminally reject.
+    seed_required_policy_with_duration(&f, 0);
+    f.content_references
+        .fail_next_find_by_target(DomainError::Invariant("content_references down".into()));
+
+    let err =
+        f.uc.verify_artifact(f.artifact_id)
+            .await
+            .expect_err("a verdict-time descendant-lookup failure must propagate, not degrade");
+    assert!(
+        format!("{err}").contains("content_references down"),
+        "the underlying lookup error must surface verbatim: {err}"
+    );
+
+    // The load-bearing assertions: NO verdict was applied.
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Quarantined,
+        "a propagated lookup failure must leave the artifact Quarantined — \
+         never terminally rejected on a read error",
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "no provenance verdict event may be appended when the lookup failed",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Required + unsigned + MISSING quarantine_window_start on an ALREADY
 // `Quarantined` artifact → window_open = false (defensive-only branch,

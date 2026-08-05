@@ -67,6 +67,7 @@ use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::read_expected_version;
+use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
 
 /// The `kind` filter used to read cosign attestation bundles off the
 /// content-reference / OCI Referrers surface. A cosign signature manifest
@@ -295,6 +296,37 @@ impl ProvenanceOrchestrationUseCase {
             })
             .unwrap_or(false);
 
+        // Referenced-tree-descendant hold (issue #115 defect (b)). A
+        // descendant — an index's child manifest, a manifest's config/layer
+        // blob, a referrer's subject — has a zero-length window by
+        // construction (#46), so `window_open` above is ALWAYS false for it.
+        // Under `Required` that used to resolve `NoAttestation` straight to
+        // terminal `Rejected{Unsigned}` before the subject's cascade could
+        // clear the constituent, permanently bricking a correctly-signed
+        // image. `complete_provenance` now holds on
+        // `window_open || is_referenced_descendant`; this resolves the flag.
+        //
+        // **ERROR DIRECTION IS LOAD-BEARING — the asymmetry with ingest is
+        // deliberate, not an oversight.** `IngestUseCase::ingest_inner`
+        // resolves this SAME predicate and degrades a lookup failure to
+        // `false`; that is correct THERE because `false` at ingest means
+        // "not a descendant" ⇒ the artifact keeps its normal FULL
+        // observation window — the conservative direction. HERE `false`
+        // means "no descendant hold" ⇒ under `Required` with a closed
+        // window the very next step is a TERMINAL rejection. Degrading to
+        // `false` at verdict time would turn a transient
+        // `content_references` read failure into an unrecoverable
+        // `Rejected{Unsigned}` on a legitimately-signed image's layer. So
+        // this PROPAGATES: the job fails, the dispatcher retries, and the
+        // artifact stays `Quarantined` (held, 503) in the meantime —
+        // fail-closed and recoverable.
+        let is_referenced_descendant = is_referenced_tree_descendant(
+            &self
+                .content_references
+                .find_by_target(artifact.repository_id, &artifact.sha256_checksum, None)
+                .await?,
+        );
+
         // Off — provenance is inert for this scope. The ingest gate should
         // never enqueue here; the orchestrator no-ops defensively.
         if mode == ProvenanceMode::Off {
@@ -391,7 +423,15 @@ impl ProvenanceOrchestrationUseCase {
             Ok(b) => b,
             Err(e) => {
                 return self
-                    .apply_fetch_failure(artifact, &backend, mode, window_open, "bundle fetch", e)
+                    .apply_fetch_failure(
+                        artifact,
+                        &backend,
+                        mode,
+                        window_open,
+                        is_referenced_descendant,
+                        "bundle fetch",
+                        e,
+                    )
                     .await;
             }
         };
@@ -431,6 +471,7 @@ impl ProvenanceOrchestrationUseCase {
                                         &backend,
                                         mode,
                                         window_open,
+                                        is_referenced_descendant,
                                         "post-proxy bundle re-read",
                                         e,
                                     )
@@ -445,6 +486,7 @@ impl ProvenanceOrchestrationUseCase {
                                 &backend,
                                 mode,
                                 window_open,
+                                is_referenced_descendant,
                                 "upstream referrer fetch",
                                 e,
                             )
@@ -466,6 +508,7 @@ impl ProvenanceOrchestrationUseCase {
                         &backend,
                         mode,
                         window_open,
+                        is_referenced_descendant,
                         "CAS preimage read",
                         e,
                     )
@@ -526,7 +569,14 @@ impl ProvenanceOrchestrationUseCase {
         let subject_hash = artifact.sha256_checksum.clone();
 
         let outcome = self
-            .apply_verdict(artifact, &metric_backend, verdict, mode, window_open)
+            .apply_verdict(
+                artifact,
+                &metric_backend,
+                verdict,
+                mode,
+                window_open,
+                is_referenced_descendant,
+            )
             .await?;
 
         // The cascade fires only after the subject's own clearance
@@ -1308,6 +1358,7 @@ impl ProvenanceOrchestrationUseCase {
         verdict: ProvenanceVerdict,
         mode: ProvenanceMode,
         window_open: bool,
+        is_referenced_descendant: bool,
     ) -> AppResult<ProvenanceRunOutcome> {
         // Defense-in-depth bounded requeue (issue #90). A `NoAttestation`
         // verdict under `Required` with a `None` `quarantine_window_start`
@@ -1357,13 +1408,31 @@ impl ProvenanceOrchestrationUseCase {
         // (fail-closed / held), not an allowed-unsigned no-op. Captured
         // before the value is moved into `complete_provenance` so the `None`
         // branch can distinguish the hold from the VerifyIfPresent/Off allow.
+        //
+        // A referenced-tree descendant is held on the same arm regardless of
+        // the window (issue #115 defect (b)) — its window is zero-length by
+        // construction and its provenance authority is its parent's
+        // signature. This condition MUST mirror `complete_provenance`'s
+        // `window_open || is_referenced_descendant` exactly: a held
+        // descendant that fell through to the `else` below would be reported
+        // as the allowed-unsigned `NoAttestation` no-op, mislabelling a
+        // fail-closed hold as a pass in both the summary and the metric.
+        // Held descendants reuse the EXISTING `HeldPendingSignature`
+        // summary + `result` value — no new metric name or label value
+        // (catalog untouched).
         let held_pending_signature = mode == ProvenanceMode::Required
-            && window_open
+            && (window_open || is_referenced_descendant)
             && matches!(
                 verdict.outcome,
                 hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
             );
-        let event = artifact.complete_provenance(verdict, mode, backend, window_open)?;
+        let event = artifact.complete_provenance(
+            verdict,
+            mode,
+            backend,
+            window_open,
+            is_referenced_descendant,
+        )?;
 
         let Some(event) = event else {
             if held_pending_signature {
@@ -1376,7 +1445,10 @@ impl ProvenanceOrchestrationUseCase {
                 tracing::info!(
                     artifact_id = %artifact.id,
                     backend = %backend,
-                    "provenance held pending signature (Required, observation window open)",
+                    window_open,
+                    is_referenced_descendant,
+                    "provenance held pending signature (Required; observation window open \
+                     or referenced-tree descendant awaiting its parent's cascade)",
                 );
                 crate::metrics::emit_provenance_verify(
                     backend,
@@ -1483,19 +1555,31 @@ impl ProvenanceOrchestrationUseCase {
     /// - `VerifyIfPresent` / `Off` → degrade to `NoAttestation` (allow —
     ///   never fail-closed on infra flakiness).
     ///
-    /// `window_open` is threaded to `apply_verdict` for signature parity with
-    /// the verdict path, but is **inert on the `Required` arm**: a fetch
-    /// failure produces a `Rejected{RekorNotFound}` verdict, and
-    /// `complete_provenance`'s `Rejected` arm never consults `window_open` — a
-    /// fetch failure is NOT an unsigned-hold, so it stays fail-closed even
-    /// mid-window (issue #13, design §2 S1). Threading the value through does
-    /// not weaken this.
+    /// `window_open` / `is_referenced_descendant` are threaded to
+    /// `apply_verdict` for signature parity with the verdict path, but are
+    /// **inert on the `Required` arm**: a fetch failure produces a
+    /// `Rejected{RekorNotFound}` verdict, and `complete_provenance`'s
+    /// `Rejected` arm never consults either flag — a fetch failure is NOT an
+    /// unsigned-hold, so it stays fail-closed even mid-window and even on a
+    /// descendant (issue #13, design §2 S1; issue #115 keeps this arm
+    /// deliberately untouched — a descendant whose attestation material
+    /// could not be FETCHED is a different failure from one that provably
+    /// has none). Threading the values through does not weaken this.
+    ///
+    /// `too_many_arguments`: 8 with `&self` (the #115 descendant flag was
+    /// the 8th). Every parameter is already a distinct, unrelated input
+    /// this private helper forwards verbatim to `apply_verdict`; bundling
+    /// the two hold flags into a struct would only move the same values
+    /// behind a name and would widen the diff on a file `#108` is about to
+    /// rebase against. Matches the crate's established use of this allow.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_fetch_failure(
         &self,
         artifact: Artifact,
         backend: &str,
         mode: ProvenanceMode,
         window_open: bool,
+        is_referenced_descendant: bool,
         stage: &str,
         err: crate::error::AppError,
     ) -> AppResult<ProvenanceRunOutcome> {
@@ -1513,8 +1597,15 @@ impl ProvenanceOrchestrationUseCase {
                 // growing the enum — the audit event's `backend` label disambiguates
                 // which backend's fetch failed.
                 let verdict = ProvenanceVerdict::rejected(ProvenanceRejectReason::RekorNotFound);
-                self.apply_verdict(artifact, backend, verdict, mode, window_open)
-                    .await
+                self.apply_verdict(
+                    artifact,
+                    backend,
+                    verdict,
+                    mode,
+                    window_open,
+                    is_referenced_descendant,
+                )
+                .await
             }
             ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => {
                 tracing::warn!(
@@ -1525,8 +1616,15 @@ impl ProvenanceOrchestrationUseCase {
                      degrade to NoAttestation (allow)",
                 );
                 let verdict = ProvenanceVerdict::no_attestation();
-                self.apply_verdict(artifact, backend, verdict, mode, window_open)
-                    .await
+                self.apply_verdict(
+                    artifact,
+                    backend,
+                    verdict,
+                    mode,
+                    window_open,
+                    is_referenced_descendant,
+                )
+                .await
             }
         }
     }
