@@ -580,8 +580,12 @@ pub(crate) async fn try_upstream_tarball_pull(
                         payload_metadata: serde_json::Value::Null,
                         content_hash: content_hash.clone(),
                         // Upstream pull is not a seed-import cutover;
-                        // quarantine is policy-driven through the primary
-                        // `ingest_verified` path.
+                        // this follower's OWN target-repo row resolves
+                        // its OWN quarantine gate inside the shared
+                        // `register_by_hash_inner` tail (issue #107 Item
+                        // 1) — it is NOT inherited from the leader's
+                        // `ingest_verified`, which only ever gated the
+                        // leader's own (possibly different) repo's row.
                         seed_import_quarantine_anchor: None,
                     },
                     &NpmFormatHandler,

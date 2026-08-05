@@ -950,8 +950,16 @@ pub(crate) async fn try_upstream_blob_pull(
                         }),
                         content_hash: content_hash.clone(),
                         // Coalesced-follower path is not a seed-import;
-                        // quarantine is policy-driven through the leader's
-                        // primary `ingest_verified`.
+                        // this follower's OWN target-repo row resolves
+                        // its OWN quarantine gate inside the shared
+                        // `register_by_hash_inner` tail (issue #107 Item
+                        // 1) — it is NOT inherited from the leader's
+                        // `ingest_verified`, which only ever gated the
+                        // leader's own (possibly different) repo's row.
+                        // `quarantine_status` is a per-repo-row column;
+                        // before #107 Item 1 this follower row minted
+                        // `None`/immediately-downloadable with no gate at
+                        // all.
                         seed_import_quarantine_anchor: None,
                     },
                     &OciFormatHandler,
