@@ -5,5 +5,5 @@
 # API (see garage-bootstrap.sh's header comment for why the Admin API rather
 # than the `garage` CLI — the short version: `dxflrs/garage` is a shell-free
 # scratch image).
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache curl jq

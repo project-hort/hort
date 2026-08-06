@@ -17,11 +17,14 @@
 #   Redis:    30379
 #   Keycloak: 25380 (Track B only — compose profile `oidc`)
 #
-# Volumes are named so they persist across `down` (NOT `down -v`).
+# Volumes are named so they persist across `down` (NOT `down -v`). A postgres
+# major-version bump does not upgrade the data directory in place — if
+# `hort_alpha_postgres_data` was initialized under an older postgres major,
+# recreate it (`down -v`) or dump/restore before bringing this stack up.
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: hort-alpha-postgres
     environment:
       POSTGRES_USER: registry
@@ -40,7 +43,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     container_name: hort-alpha-redis
     # PAT cache + PAT-lockout counter + prefetch dedup. hort's
     # ephemeral-keyspace adapter is the consumer — unset

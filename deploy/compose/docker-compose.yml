@@ -24,7 +24,7 @@ name: hort
 
 services:
   postgres:
-    image: postgres:15
+    image: postgres:17
     # Resource cap (B7/INFRA-6): bound postgres memory so the dev/CI host is
     # protected. Smoke data is tens-of-MB; 512m is comfortable.
     mem_limit: 512m
