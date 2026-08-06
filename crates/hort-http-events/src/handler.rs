@@ -78,12 +78,18 @@ pub async fn get_events(
 
     // 2. Per-category authz gate. Admin-only categories require
     //    `Permission::Admin` upfront; per-repo categories defer to the
-    //    per-event filter below. Under `AuthContext::Disabled` every
-    //    extractor in the workspace grants — preserve that contract
-    //    here too (no extra gate when auth is off).
+    //    per-event filter below. `ctx.auth.rbac()` is `Some` under both
+    //    `Enabled` and `BearerOnly` (either carries a live evaluator) and
+    //    `None` only under `Disabled`, where every extractor in the
+    //    workspace grants — preserve that contract here too (no extra
+    //    gate when auth is off). Routed through the accessor rather than
+    //    a raw `if let AuthContext::Enabled` destructure so the
+    //    Disabled-vs-auth-on distinction is structurally unmissable: a
+    //    single-arm destructure previously skipped this gate under
+    //    `BearerOnly` (#109).
     let admin_required = category_requires_admin(category);
     if admin_required {
-        if let AuthContext::Enabled { rbac, .. } = &ctx.auth {
+        if let Some(rbac) = ctx.auth.rbac() {
             let evaluator = rbac.load();
             if !evaluator.authorize(&principal, Permission::Admin, None) {
                 emit_events_pull(
