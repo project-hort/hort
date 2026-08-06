@@ -58,6 +58,26 @@ git push -u origin chore/open-X.Y.Z-dev
 # open an MR into develop (squash); auto-merge on green is fine
 ```
 
+## When a cycle becomes a new minor (dependency waves)
+
+A behavior-relevant dependency wave ships as a new **minor** version, not a
+patch: crate majors, TLS/auth-stack changes, and runtime-baseline moves (e.g.
+a shift of the tested Postgres window) are minor-bump material. Routine
+lockfile-compatible bumps are not — they ride whatever release ships next.
+
+- Open the cycle at the next minor (`X.(Y+1).0-dev`) as soon as the wave's
+  scope is clear. The wave then soaks on staging as a unit, and the previous
+  minor line (`release/X.Y.x`) stays a dep-stable rollback/maintenance
+  boundary — a fix that must ship while the wave soaks is cherry-picked to
+  the maintenance branch and tagged there.
+- **No standing integration branch for dependency work**: each batch reaches
+  `develop` through its own gated feature-branch MR, which already provides
+  the isolation a dedicated trunk would promise — without the recurring
+  `Cargo.lock` merge conflicts, doubled CI, and staging ambiguity a parallel
+  trunk costs. Exception: a coupled multi-batch migration that cannot land
+  green per batch may use a short-lived integration branch, deleted after
+  its merge.
+
 ## Alpha pre-release — `vX.Y.Z-alpha.N` (pushed, throwaway `test/*` branch)
 
 **Internal-only**: staging + the local hort registry, never the public
