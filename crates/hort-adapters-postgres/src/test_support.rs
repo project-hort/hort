@@ -181,3 +181,43 @@ pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
     }
     Some(pool)
 }
+
+/// Connect to the shared `DATABASE_URL` target — not a per-test isolated
+/// database — and ensure it is migrated before handing back the pool.
+///
+/// For tests that deliberately exercise shared-DB behavior under the
+/// `#[serial(hort_pg_db)]` contract (isolation would defeat the point of
+/// the test). Every caller against the shared target must migrate through
+/// here: `#[serial(hort_pg_db)]` name-orders tests within a binary, but
+/// gives no ordering guarantee *across* the several modules that share
+/// this database, so no test may assume an earlier-sorting module already
+/// migrated it.
+///
+/// Returns `None` when `DATABASE_URL` is unset or the target is
+/// unreachable (mirrors [`isolated_db_from`]'s self-skip semantics). A
+/// migration that fails after retries is a real bug, not a skip
+/// condition, and panics rather than handing back an unmigrated pool.
+pub async fn shared_migrated_pool() -> Option<PgPool> {
+    let url = std::env::var("DATABASE_URL").ok()?;
+    let pool = PgPool::connect(&url).await.ok()?;
+
+    // Bounded retry: the shared target is a migration race between every
+    // test binary that reaches this helper concurrently, the same
+    // thundering-herd contention `isolated_db_from` absorbs above.
+    let mut last_err = None;
+    for attempt in 0..4u32 {
+        match sqlx::migrate!("../../migrations").run(&pool).await {
+            Ok(()) => return Some(pool),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        150 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    panic!("migrations failed against the shared DATABASE_URL target after retries: {last_err:?}");
+}

@@ -163,10 +163,11 @@ impl ReplayGuardPort for PgReplayGuardRepository {
 // `DATABASE_URL` is unset (each test does
 // `let Some(pool) = test_pool().await else { return; };`) — a clean,
 // fast no-op under plain `cargo test`, full execution when
-// `DATABASE_URL` is wired. `test_pool()` connects directly to the shared
-// `DATABASE_URL` target (not a per-test isolated database — isolation
-// here is per-test-unique `issuer_name` values plus explicit cleanup
-// DELETEs), so every test carries `#[serial(hort_pg_db)]`.
+// `DATABASE_URL` is wired. `test_pool()` routes through
+// `test_support::shared_migrated_pool()`, which connects to and migrates
+// the shared `DATABASE_URL` target (not a per-test isolated database —
+// isolation here is per-test-unique `issuer_name` values plus explicit
+// cleanup DELETEs), so every test carries `#[serial(hort_pg_db)]`.
 
 #[cfg(test)]
 mod tests {
@@ -191,8 +192,7 @@ mod tests {
     }
 
     async fn test_pool() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        PgPool::connect(&url).await.ok()
+        crate::test_support::shared_migrated_pool().await
     }
 
     /// First presentation of a `jti` ⇒ FirstSeen (row inserted);
