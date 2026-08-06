@@ -1602,6 +1602,59 @@ mod tests {
             );
         }
 
+        /// A malformed upstream sparse-index NDJSON body must not leak
+        /// its content into the client-facing response on the index
+        /// (listing) route: the marker string appears only
+        /// as the `yanked` value, whose type mismatch (a string where a
+        /// bool is expected) drives `serde_json`'s error message to echo
+        /// it verbatim server-side — the reflection vector the typed
+        /// `UpstreamMetadataInvalid` boundary closes. Status/headers
+        /// mirror the established `upstream_pull::map_upstream_pull_error`
+        /// `ParseError` wire shape (same as the download-path test above),
+        /// unifying the previously-inconsistent 400 the index-serve path
+        /// used to return for this failure class.
+        #[tokio::test]
+        async fn sparse_index_proxy_malformed_upstream_body_does_not_leak_cause() {
+            const MARKER: &str = "XSENTINEL_CARGO_UPSTREAM_LEAK_MARKER";
+
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_cargo_repo("crates-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(&mocks, repo.id);
+
+            let body = format!(
+                r#"{{"name":"serde","vers":"1.0.0","cksum":"abc","deps":[],"features":{{}},"yanked":"{MARKER}"}}"#
+            );
+            mocks
+                .upstream_proxy
+                .insert_metadata("", "/se/rd/serde", body.into_bytes());
+
+            let router = router_for(ctx);
+            let res = router
+                .oneshot(
+                    Request::get("/cargo/crates-mirror/se/rd/serde")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                res.headers()
+                    .get("X-Hort-Reason")
+                    .and_then(|v| v.to_str().ok()),
+                Some("upstream-metadata-malformed"),
+            );
+            let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+            let body_str = std::str::from_utf8(&body).unwrap();
+            assert!(
+                !body_str.contains(MARKER),
+                "client response must not contain the upstream-derived marker: {body_str}"
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "upstream metadata invalid");
+        }
+
         /// Hosted (the `sample_repository` default) cache miss MUST NOT
         /// enter the Proxy pull-through branch — pre-Item-5 behaviour
         /// is preserved as a clean 404. Regression test: a routing
