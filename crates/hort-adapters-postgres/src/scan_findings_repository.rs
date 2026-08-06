@@ -105,7 +105,6 @@ mod tests {
     use chrono::Utc;
     use serial_test::serial;
     use sqlx::PgPool;
-    use std::env;
     use uuid::Uuid;
 
     /// Compile-time assertion that the Postgres adapter implements the
@@ -190,10 +189,7 @@ mod tests {
         // We cannot construct a `PgConnection` without a live DB, so
         // we exercise the early-return path through the public trait
         // method which mirrors the same shortcut.
-        let Ok(url) = env::var("DATABASE_URL") else {
-            return;
-        };
-        let Ok(pool) = PgPool::connect(&url).await else {
+        let Some(pool) = crate::test_support::shared_migrated_pool().await else {
             return;
         };
         let repo = PgScanFindingsRepository::new(pool);
@@ -207,16 +203,9 @@ mod tests {
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn insert_one_row_round_trip() {
-        let Ok(url) = env::var("DATABASE_URL") else {
+        let Some(pool) = crate::test_support::shared_migrated_pool().await else {
             return;
         };
-        let Ok(pool) = PgPool::connect(&url).await else {
-            return;
-        };
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run");
 
         // Seed a real repository + artifact so the FK on
         // `scan_findings.artifact_id → artifacts(id)` (migration 009,
@@ -310,16 +299,9 @@ mod tests {
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn duplicate_row_surfaces_conflict() {
-        let Ok(url) = env::var("DATABASE_URL") else {
+        let Some(pool) = crate::test_support::shared_migrated_pool().await else {
             return;
         };
-        let Ok(pool) = PgPool::connect(&url).await else {
-            return;
-        };
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run");
 
         let repo_id = seed_repo(&pool).await;
         let artifact_id = seed_artifact(&pool, repo_id).await;

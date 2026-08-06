@@ -183,7 +183,6 @@ impl RetentionScanReader for PgRetentionScanReader {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::env;
 
     /// Compile-time assertion that the adapter implements the port.
     #[test]
@@ -283,16 +282,9 @@ mod tests {
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn list_findings_round_trip_db() {
-        let Ok(url) = env::var("DATABASE_URL") else {
+        let Some(pool) = crate::test_support::shared_migrated_pool().await else {
             return;
         };
-        let Ok(pool) = PgPool::connect(&url).await else {
-            return;
-        };
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run");
 
         // Seed repo + artifact (FK: scan_findings.artifact_id →
         // artifacts(id); repo_security_scores.repository_id →
