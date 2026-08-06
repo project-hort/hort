@@ -368,6 +368,16 @@ impl IndexSource for ProxyPypiSource {
                     },
                 ));
             }
+            Err(IndexFetchError::InvalidName { cause }) => {
+                // A traversal-shaped / illegal project name fails closed
+                // BEFORE any cache-key / upstream-URL construction.
+                // Surface as `Validation` → 400 (a client fault), mirroring
+                // the `MetadataMalformed` parse-class arm below, NOT the
+                // network / `upstream_unavailable` bucket.
+                return Err(AppError::Domain(
+                    hort_domain::error::DomainError::Validation(cause),
+                ));
+            }
             Err(IndexFetchError::UpstreamUnavailable) => {
                 return Err(AppError::External(
                     "pypi upstream unavailable; no cached fallback".to_string(),
