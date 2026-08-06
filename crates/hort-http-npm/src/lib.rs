@@ -3383,6 +3383,59 @@ mod tests {
             assert_eq!(json["error"], "upstream metadata invalid");
         }
 
+        /// A malformed upstream packument body must not leak its content
+        /// into the client-facing response on the packument (listing)
+        /// route: the marker string appears only as the
+        /// `dist` value, whose type mismatch (a string where an object is
+        /// expected) drives `serde_json`'s error message to echo it
+        /// verbatim server-side — the reflection vector the typed
+        /// `UpstreamMetadataInvalid` boundary closes. Status/headers
+        /// mirror the established `upstream_pull::map_upstream_pull_error`
+        /// `ParseError` wire shape (same as the download-path test above),
+        /// unifying the previously-inconsistent 400 the index-serve path
+        /// used to return for this failure class.
+        #[tokio::test]
+        async fn packument_proxy_malformed_upstream_body_does_not_leak_cause() {
+            const MARKER: &str = "XSENTINEL_NPM_UPSTREAM_LEAK_MARKER";
+
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_npm_repo("npm-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(&mocks, repo.id);
+
+            let json = format!(
+                r#"{{"versions":{{"1.0.0":{{"name":"express","version":"1.0.0","dist":"{MARKER}"}}}}}}"#
+            );
+            mocks
+                .upstream_proxy
+                .insert_metadata("", "/express", json.into_bytes());
+
+            let router = router(ctx);
+            let res = router
+                .oneshot(
+                    Request::get("/npm/npm-mirror/express")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                res.headers()
+                    .get("X-Hort-Reason")
+                    .and_then(|v| v.to_str().ok()),
+                Some("upstream-metadata-malformed"),
+            );
+            let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+            let body_str = std::str::from_utf8(&body).unwrap();
+            assert!(
+                !body_str.contains(MARKER),
+                "client response must not contain the upstream-derived marker: {body_str}"
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "upstream metadata invalid");
+        }
+
         /// Cache miss + Proxy + packument's `dist.tarball` filename
         /// differs from the request → 502 +
         /// `X-Hort-Reason: upstream-filename-mismatch`. The defence-in-depth

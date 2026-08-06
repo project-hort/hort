@@ -4248,6 +4248,95 @@ mod tests {
         );
     }
 
+    /// A malformed upstream simple-index body must not leak its content
+    /// into the client-facing response: the marker string
+    /// appears only inside a `hashes` value whose type mismatch drives
+    /// `serde_json`'s error message to echo it verbatim server-side —
+    /// exactly the reflection vector the typed `UpstreamMetadataInvalid`
+    /// boundary closes. Status/headers mirror the established
+    /// `upstream_pull::map_upstream_pull_error` `ParseError` wire shape.
+    #[tokio::test]
+    async fn simple_project_proxy_malformed_upstream_body_does_not_leak_cause() {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::repository::RepositoryType;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+        use hort_http_core::test_support::build_mock_ctx;
+
+        const MARKER: &str = "XSENTINEL_PYPI_UPSTREAM_LEAK_MARKER";
+
+        let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let (ctx, mocks) = build_mock_ctx(metrics_handle);
+
+        let mut repo = sample_repository();
+        repo.key = "pypi-mirror".into();
+        repo.format = RepositoryFormat::Pypi;
+        repo.repo_type = RepositoryType::Proxy;
+        repo.upstream_url = Some("https://pypi.org".into());
+        mocks.repositories.insert(repo.clone());
+
+        let now = Utc::now();
+        mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            path_prefix: "".into(),
+            upstream_url: "https://pypi.org".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            created_at: now,
+            updated_at: now,
+        });
+
+        // `hashes` is typed as a nested object (`{"sha256": "..."}`) —
+        // supplying a bare string trips a serde type mismatch whose
+        // message echoes the string verbatim, so this fixture proves the
+        // boundary blocks a genuine content-reflection path, not just a
+        // syntax-error message.
+        let body = format!(
+            r#"{{"files":[{{"filename":"flask-3.0.0.whl","url":"u","hashes":"{MARKER}"}}]}}"#
+        );
+        mocks
+            .upstream_proxy
+            .insert_metadata("", "/simple/flask/", body.into_bytes());
+
+        let r = router(ctx);
+        let res = r
+            .oneshot(
+                Request::get("/pypi/pypi-mirror/simple/flask/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            res.headers()
+                .get("X-Hort-Reason")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream-metadata-malformed"),
+        );
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body_str.contains(MARKER),
+            "client response must not contain the upstream-derived marker: {body_str}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "upstream metadata invalid");
+    }
+
     /// A traversal-shaped project name on the simple-index (project
     /// listing) endpoint of a Proxy repo must reject with 400 — this
     /// exercises the SAME `validate_pep_503_name` gate inside
