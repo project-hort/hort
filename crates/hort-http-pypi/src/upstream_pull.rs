@@ -175,7 +175,7 @@ pub(crate) async fn try_upstream_file_pull(
     //    is the second `-`-separated segment for wheels (PEP 491) and
     //    the right side of the last `-` for sdists (PEP 625).
     let (filename_project, version) = parse_pypi_filename(filename).map_err(|e| {
-        tracing::warn!(error = %e, "PyPI filename parse failed");
+        tracing::warn!(error = %e, filename, "PyPI filename parse failed");
         UpstreamPullError::ParseError(e.to_string())
     })?;
 
@@ -574,6 +574,14 @@ pub(crate) async fn try_upstream_file_pull(
 /// segment) and the filename's name segment is performed in the caller
 /// — both feed it the same data in different cases (`Requests` vs
 /// `requests`), so normalising before comparing is essential.
+///
+/// Error messages **never** include the rejected `filename` — it is
+/// attacker-controlled (taken straight from the request URL) and the
+/// codebase's established rule for this exact `DomainError::Validation`
+/// shape is that it must never carry the offending input (mirrors
+/// `hort_formats::pypi::validate_pypi_filename` / `validate_pep_503_name`
+/// / `validate_pypi_version`, which document the same contract). The
+/// caller logs `filename` via `tracing::warn!` for diagnostics.
 //
 // `extract_upstream_publish_time` (the raw-body `serde_json::Value`
 // walk over `urls[i].upload_time_iso_8601`) was retired: the publish
@@ -587,15 +595,15 @@ fn parse_pypi_filename(filename: &str) -> DomainResult<(String, String)> {
         // PEP 491: at least 5 `-`-separated segments.
         let parts: Vec<&str> = stem.split('-').collect();
         if parts.len() < 5 {
-            return Err(DomainError::Validation(format!(
-                "PyPI wheel filename '{filename}' does not have ≥5 '-'-separated segments \
-                 per PEP 491"
-            )));
+            return Err(DomainError::Validation(
+                "PyPI wheel filename does not have ≥5 '-'-separated segments per PEP 491"
+                    .to_string(),
+            ));
         }
         if parts[0].is_empty() || parts[1].is_empty() {
-            return Err(DomainError::Validation(format!(
-                "PyPI wheel filename '{filename}' has empty name or version segment"
-            )));
+            return Err(DomainError::Validation(
+                "PyPI wheel filename has empty name or version segment".to_string(),
+            ));
         }
         return Ok((parts[0].to_string(), parts[1].to_string()));
     }
@@ -605,25 +613,25 @@ fn parse_pypi_filename(filename: &str) -> DomainResult<(String, String)> {
     } else if let Some(s) = filename.strip_suffix(".zip") {
         s
     } else {
-        return Err(DomainError::Validation(format!(
-            "PyPI filename '{filename}' is neither a wheel (.whl) nor a recognised sdist \
-             (.tar.gz / .zip)"
-        )));
+        return Err(DomainError::Validation(
+            "PyPI filename is neither a wheel (.whl) nor a recognised sdist (.tar.gz / .zip)"
+                .to_string(),
+        ));
     };
 
     // PEP 625: `name-version`. Split on the LAST `-` — the name itself
     // may contain `-` in legacy uploads.
     let Some(idx) = stem.rfind('-') else {
-        return Err(DomainError::Validation(format!(
-            "PyPI sdist filename '{filename}' has no '-' separator between name and version"
-        )));
+        return Err(DomainError::Validation(
+            "PyPI sdist filename has no '-' separator between name and version".to_string(),
+        ));
     };
     let name = &stem[..idx];
     let version = &stem[idx + 1..];
     if name.is_empty() || version.is_empty() {
-        return Err(DomainError::Validation(format!(
-            "PyPI sdist filename '{filename}' has empty name or version segment"
-        )));
+        return Err(DomainError::Validation(
+            "PyPI sdist filename has empty name or version segment".to_string(),
+        ));
     }
     Ok((name.to_string(), version.to_string()))
 }
@@ -927,20 +935,32 @@ mod tests {
 
     #[test]
     fn parse_pypi_filename_unknown_extension_rejected() {
-        let err = parse_pypi_filename("this-is-not-a-package.unknown").unwrap_err();
+        let err = parse_pypi_filename("xsentinel-unknown-ext.unknown").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            !err.to_string().contains("xsentinel"),
+            "error message must not echo the rejected filename: {err}"
+        );
     }
 
     #[test]
     fn parse_pypi_filename_too_few_wheel_segments_rejected() {
-        let err = parse_pypi_filename("requests-2.31.0.whl").unwrap_err();
+        let err = parse_pypi_filename("xsentinel-2.31.0.whl").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            !err.to_string().contains("xsentinel"),
+            "error message must not echo the rejected filename: {err}"
+        );
     }
 
     #[test]
     fn parse_pypi_filename_sdist_no_dash_rejected() {
-        let err = parse_pypi_filename("noseparator.tar.gz").unwrap_err();
+        let err = parse_pypi_filename("xsentinelnoseparator.tar.gz").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            !err.to_string().contains("xsentinel"),
+            "error message must not echo the rejected filename: {err}"
+        );
     }
 
     #[test]

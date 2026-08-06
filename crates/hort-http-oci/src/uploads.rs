@@ -49,7 +49,7 @@ use hort_http_core::context::AppContext;
 use hort_http_core::limits::BoundedPath;
 
 use super::coords::oci_blob_coords;
-use super::digest::{parse_digest, DigestParse};
+use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::name::validate_oci_name;
 use super::upload_session::{
@@ -288,9 +288,9 @@ async fn handle_cross_mount(
 ) -> Response {
     let hash = match parse_digest(mount_digest) {
         DigestParse::Ok(h) => h,
-        DigestParse::Unsupported { algorithm } => {
+        DigestParse::Unsupported => {
             return OciError::Unsupported {
-                message: format!("unsupported digest algorithm: {algorithm}"),
+                message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
             }
             .into_response();
         }
@@ -397,9 +397,9 @@ async fn handle_monolithic(
 ) -> Response {
     let hash = match parse_digest(digest_str) {
         DigestParse::Ok(h) => h,
-        DigestParse::Unsupported { algorithm } => {
+        DigestParse::Unsupported => {
             return OciError::Unsupported {
-                message: format!("unsupported digest algorithm: {algorithm}"),
+                message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
             }
             .into_response();
         }
@@ -489,6 +489,11 @@ struct ContentRangeParseError {
 /// is the bare `a-b`; we tolerate the `/…` suffix by discarding it.
 /// No byte-unit other than `bytes` is accepted; the spec makes no
 /// allowance for alternatives.
+///
+/// On rejection the error message is a deterministic, non-echoing
+/// reason — `value` is attacker-controlled and MUST NOT flow into the
+/// response body (log-injection / response-reflection risk); the raw
+/// header stays available server-side via the `tracing::debug!` below.
 fn parse_content_range(value: &str) -> Result<ContentRange, ContentRangeParseError> {
     let trimmed = value.trim();
     // Accept both `bytes <a>-<b>` and the bare `<a>-<b>` form.  Real
@@ -497,19 +502,23 @@ fn parse_content_range(value: &str) -> Result<ContentRange, ContentRangeParseErr
     let range_part = trimmed.strip_prefix("bytes ").unwrap_or(trimmed);
     // Strip `/<total>` suffix if present.
     let core = range_part.split('/').next().unwrap_or(range_part).trim();
-    let (start_s, end_s) = core.split_once('-').ok_or_else(|| ContentRangeParseError {
-        message: format!("Content-Range missing `-`: {value}"),
-    })?;
-    let start: u64 = start_s.trim().parse().map_err(|e| ContentRangeParseError {
-        message: format!("Content-Range start not a u64: {e}"),
-    })?;
-    let end: u64 = end_s.trim().parse().map_err(|e| ContentRangeParseError {
-        message: format!("Content-Range end not a u64: {e}"),
-    })?;
+    let reject = |reason: &'static str| {
+        tracing::debug!(content_range = %value, reason, "OCI Content-Range header rejected");
+        ContentRangeParseError {
+            message: format!("Content-Range invalid: {reason}"),
+        }
+    };
+    let Some((start_s, end_s)) = core.split_once('-') else {
+        return Err(reject("missing `-` separator"));
+    };
+    let Ok(start) = start_s.trim().parse::<u64>() else {
+        return Err(reject("start is not a u64"));
+    };
+    let Ok(end) = end_s.trim().parse::<u64>() else {
+        return Err(reject("end is not a u64"));
+    };
     if end < start {
-        return Err(ContentRangeParseError {
-            message: format!("Content-Range end < start: {start}-{end}"),
-        });
+        return Err(reject("end is less than start"));
     }
     Ok(ContentRange { start, end })
 }
@@ -840,9 +849,9 @@ pub(crate) async fn put_upload_dispatch(
     };
     let hash = match parse_digest(&digest_str) {
         DigestParse::Ok(h) => h,
-        DigestParse::Unsupported { algorithm } => {
+        DigestParse::Unsupported => {
             return OciError::Unsupported {
-                message: format!("unsupported digest algorithm: {algorithm}"),
+                message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
             }
             .into_response();
         }
@@ -2263,6 +2272,37 @@ mod tests {
         assert_eq!(parsed["errors"][0]["code"], "UNSUPPORTED");
     }
 
+    /// The requested (unsupported) digest algorithm is attacker-controlled
+    /// and must never be reflected into the response body — only the
+    /// stable envelope code is client-observable.
+    #[test]
+    fn monolithic_unsupported_digest_algo_does_not_echo_algorithm() {
+        let (status, body) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let router = router().with_state(h.ctx);
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::post("/v2/myrepo/nginx/blobs/uploads/?digest=xsentinelalgo:abc")
+                        .body(Body::from(&b"x"[..]))
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNSUPPORTED");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("xsentinelalgo"),
+            "response body must not echo the rejected digest algorithm: {text}"
+        );
+    }
+
     // -------------------- parse_content_range --------------------
 
     #[test]
@@ -2875,6 +2915,44 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    /// The rejected `Content-Range` header value must never be reflected
+    /// into the response body — only the status + envelope code are
+    /// stable-observable by the client; the raw header stays server-side
+    /// (`tracing::debug!`) per the "never echo rejected input" rule.
+    #[test]
+    fn patch_malformed_content_range_does_not_echo_header_value() {
+        let (status, code, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let router = router().with_state(h.ctx);
+            let marker = "XSENTINEL-a1b2c3-not-a-valid-range";
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::patch(format!("/v2/myrepo/nginx/blobs/uploads/{session_id}"))
+                        .header("Content-Range", marker)
+                        .header(CONTENT_LENGTH, "3")
+                        .body(Body::from(&b"abc"[..]))
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = parsed["errors"][0]["code"].as_str().unwrap().to_string();
+            (status, code, String::from_utf8(body).unwrap())
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "BLOB_UPLOAD_INVALID");
+        assert!(
+            !body.contains("XSENTINEL"),
+            "response body must not echo the rejected Content-Range header: {body}"
+        );
+    }
+
     // -------------------- PUT — router-level (finalize) --------------------
 
     /// Hash `content` as hex — handy wrapper around `sha2::Sha256`
@@ -3302,6 +3380,41 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "DIGEST_INVALID");
+    }
+
+    /// A digest missing the `<algorithm>:` prefix must reject with
+    /// `DIGEST_INVALID` without echoing the malformed value into the
+    /// response body (the pre-fix message embedded `{raw:?}` verbatim).
+    #[test]
+    fn put_malformed_digest_missing_colon_does_not_echo_raw_value() {
+        let (status, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let router = router().with_state(h.ctx);
+            let uri = format!(
+                "/v2/myrepo/nginx/blobs/uploads/{session_id}?digest=xsentinel-not-a-digest-at-all"
+            );
+            let resp = router
+                .oneshot(with_principal(
+                    HttpRequest::put(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DIGEST_INVALID");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("xsentinel"),
+            "response body must not echo the malformed digest value: {text}"
+        );
     }
 
     #[test]

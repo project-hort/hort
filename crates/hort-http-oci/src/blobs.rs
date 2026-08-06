@@ -55,7 +55,7 @@ use hort_domain::types::{ByteRange, ContentHash};
 use hort_formats::oci::OciFormatHandler;
 
 use super::coords::oci_blob_coords;
-use super::digest::{parse_digest, DigestParse};
+use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::quarantine;
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
@@ -345,9 +345,9 @@ pub(super) async fn serve(
     //    length is DIGEST_INVALID.
     let hash: ContentHash = match parse_digest(digest_str) {
         DigestParse::Ok(h) => h,
-        DigestParse::Unsupported { algorithm } => {
+        DigestParse::Unsupported => {
             return OciError::Unsupported {
-                message: format!("unsupported digest algorithm: {algorithm}"),
+                message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
             }
             .into_response();
         }
