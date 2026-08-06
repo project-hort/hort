@@ -183,6 +183,18 @@ pub(crate) enum JwksUriCheckError {
         issuer_host: String,
         jwks_host: String,
     },
+    /// `jwks_uri` scheme does not equal the `issuer_url` scheme. An
+    /// HTTPS issuer whose discovery document points `jwks_uri` at
+    /// plain HTTP on the SAME host is a downgrade: the JWKS fetch (keys
+    /// used to verify every subsequent token) would run unencrypted
+    /// even though the issuer itself is TLS-protected, exposing it to
+    /// on-path tampering the issuer's own transport was meant to rule
+    /// out. Equality, not an HTTPS-only floor — the in-cluster
+    /// http-issuer/http-jwks deployment (Keycloak) must keep working.
+    SchemeMismatch {
+        issuer_scheme: String,
+        jwks_scheme: String,
+    },
 }
 
 /// Bind a discovery-supplied `jwks_uri` to the issuer origin BEFORE the
@@ -246,6 +258,16 @@ pub(crate) fn check_jwks_uri_bound(
         return Err(JwksUriCheckError::OffHost {
             issuer_host: issuer_host.to_string(),
             jwks_host: jwks_host.to_string(),
+        });
+    }
+
+    // ----- Scheme binding (no same-host HTTPS→HTTP downgrade) --------------
+    // Equality, not an HTTPS-only floor: http-issuer/http-jwks must keep
+    // working for the canonical in-cluster Keycloak deployment.
+    if issuer_parsed.scheme() != jwks_parsed.scheme() {
+        return Err(JwksUriCheckError::SchemeMismatch {
+            issuer_scheme: issuer_parsed.scheme().to_string(),
+            jwks_scheme: jwks_parsed.scheme().to_string(),
         });
     }
 
@@ -424,5 +446,63 @@ mod tests {
         let err = check_jwks_uri_bound("https://example.com", "not a url")
             .expect_err("unparsable jwks_uri must be rejected");
         assert!(matches!(err, JwksUriCheckError::Unparsable(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Scheme binding: `jwks_uri` scheme must equal `issuer_url` scheme.
+    // Equality, not an HTTPS-only floor — same-host http/http (in-cluster
+    // Keycloak) must keep working; only a scheme MISMATCH is rejected.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn jwks_uri_bound_accepts_https_issuer_https_jwks() {
+        check_jwks_uri_bound("https://idp.example.com", "https://idp.example.com/jwks")
+            .expect("https issuer + https jwks_uri must be accepted");
+    }
+
+    #[test]
+    fn jwks_uri_bound_accepts_http_issuer_http_jwks() {
+        // In-cluster Keycloak: both issuer and jwks_uri are plain HTTP on
+        // the same host. Equality holds, so this MUST keep working.
+        check_jwks_uri_bound(
+            "http://10.0.0.5:8080/realms/x",
+            "http://10.0.0.5:8080/realms/x/certs",
+        )
+        .expect("http issuer + http jwks_uri (same host) must be accepted");
+    }
+
+    #[test]
+    fn jwks_uri_bound_rejects_https_issuer_http_jwks_downgrade() {
+        let err = check_jwks_uri_bound("https://idp.example.com", "http://idp.example.com/jwks")
+            .expect_err("https issuer with an http jwks_uri must be rejected as a downgrade");
+        match err {
+            JwksUriCheckError::SchemeMismatch {
+                issuer_scheme,
+                jwks_scheme,
+            } => {
+                assert_eq!(issuer_scheme, "https");
+                assert_eq!(jwks_scheme, "http");
+            }
+            other => panic!("expected SchemeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jwks_uri_bound_rejects_http_issuer_https_jwks_mismatch() {
+        // Not an HTTPS-only floor: the OTHER direction (http issuer,
+        // https jwks_uri) is also a mismatch and must be rejected too —
+        // equality is the rule, not "https is always fine".
+        let err = check_jwks_uri_bound("http://idp.example.com", "https://idp.example.com/jwks")
+            .expect_err("http issuer with an https jwks_uri must be rejected as a mismatch");
+        match err {
+            JwksUriCheckError::SchemeMismatch {
+                issuer_scheme,
+                jwks_scheme,
+            } => {
+                assert_eq!(issuer_scheme, "http");
+                assert_eq!(jwks_scheme, "https");
+            }
+            other => panic!("expected SchemeMismatch, got {other:?}"),
+        }
     }
 }

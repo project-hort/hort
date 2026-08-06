@@ -32,10 +32,12 @@ struct RepositoriesList {
 /// prompts; read-only on auth state (token used as-is, no refresh).
 async fn fetch_repo_keys_from(base_url: &str, token: Option<&str>) -> Vec<String> {
     let url = format!("{}/api/v1/repositories", base_url.trim_end_matches('/'));
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(COMPLETION_TIMEOUT)
-        .build()
-    else {
+    let Ok(builder) = crate::client::apply_extra_ca_bundle(
+        reqwest::Client::builder().timeout(COMPLETION_TIMEOUT),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(client) = builder.build() else {
         return Vec::new();
     };
     let mut req = client.get(&url);
