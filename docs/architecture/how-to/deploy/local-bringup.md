@@ -42,9 +42,11 @@ Before you start:
   (`cargo build --release -p hort-server -p hort-worker`) or downloaded
   from the GitHub release artifacts. Place them on `$PATH`
   (`/usr/local/bin/` is conventional).
-- **PostgreSQL 14+.** Reachable from the host. Local Postgres
-  (`postgresql.service` on the same host) is fine; remote Postgres
-  works identically — just point the DSN at it.
+- **PostgreSQL, tested window 16–17.** 16 is the floor tested in
+  automated CI; 17 is the newest version, tested in the locally-invocable
+  compose/E2E tiers. Older versions are untested. Reachable from the
+  host. Local Postgres (`postgresql.service` on the same host) is fine;
+  remote Postgres works identically — just point the DSN at it.
 - **OpenSSL ≥ 3.0** (or any tool that can produce an Ed25519 PEM —
   `ssh-keygen -t ed25519` is also acceptable). Needed for §3.
 - **`curl` and `jq`** for the verification step (§9). Optional but

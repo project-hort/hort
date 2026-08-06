@@ -146,6 +146,10 @@ Track B only).
 > `30432`. Stop the conflicting container (`docker stop hort-alpha-postgres`)
 > or edit `compose-deps.yml` + `alpha.env` to a different port.
 
+> **⚠ Postgres major bump:** a pre-existing `hort_alpha_postgres_data` volume
+> initialized under an older Postgres major is not upgraded in place. Recreate
+> it (`down -v`) or dump/restore before bringing this stack up on a new major.
+
 **Track A — Postgres + Redis:**
 
 ```bash

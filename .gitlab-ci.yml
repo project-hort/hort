@@ -635,7 +635,7 @@ test:integration:
     - job: test:coverage
       artifacts: false
   services:
-    - name: postgres:17-alpine
+    - name: postgres:16-alpine
       alias: postgres
   variables:
     POSTGRES_DB: "artifact_registry"
