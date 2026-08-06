@@ -46,6 +46,15 @@ pub(crate) enum JwksRefreshResult {
     /// window. No network I/O; the cache entry stays as-is. This fires
     /// on the DoS-mitigation path.
     Throttled,
+    /// A fresh-cache kid-miss (the requested `kid` is absent from an
+    /// otherwise-still-fresh cache) arrived within the kid-miss refresh
+    /// cooldown window. No network I/O; distinct from `Throttled`
+    /// (per-kid signature-mismatch eviction backoff) because the two
+    /// suppressions diagnose different attacks — this one covers an
+    /// unauthenticated flood of syntactically-valid JWTs each carrying a
+    /// fresh, never-seen `kid`, which never touches the per-kid eviction
+    /// map at all.
+    KidMissThrottled,
     /// Discovery or JWKS HTTP request failed (timeout, DNS, non-2xx).
     /// The cache stays stale; the triggering request 401s.
     FetchFailed,
@@ -71,6 +80,7 @@ impl JwksRefreshResult {
         match self {
             Self::Success => "success",
             Self::Throttled => "throttled",
+            Self::KidMissThrottled => "kid_miss_throttled",
             Self::FetchFailed => "fetch_failed",
             Self::BodyTooLarge => "body_too_large",
             Self::ParseError => "parse_error",
@@ -165,6 +175,14 @@ mod tests {
     }
 
     #[test]
+    fn jwks_refresh_result_kid_miss_throttled_as_str() {
+        assert_eq!(
+            JwksRefreshResult::KidMissThrottled.as_str(),
+            "kid_miss_throttled"
+        );
+    }
+
+    #[test]
     fn jwks_refresh_result_fetch_failed_as_str() {
         assert_eq!(JwksRefreshResult::FetchFailed.as_str(), "fetch_failed");
     }
@@ -184,6 +202,7 @@ mod tests {
         let variants = [
             JwksRefreshResult::Success,
             JwksRefreshResult::Throttled,
+            JwksRefreshResult::KidMissThrottled,
             JwksRefreshResult::FetchFailed,
             JwksRefreshResult::BodyTooLarge,
             JwksRefreshResult::ParseError,

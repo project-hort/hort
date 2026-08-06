@@ -229,8 +229,8 @@ catalogued here so an audit sweep finds it.
 
 - **Credential form:** IdP JWKS fetched via the shared TLS-hardened client (`internal::build_http_client` in `crates/hort-adapters-oidc/src/internal.rs`).
 - **Purpose / allowed use:** verify OIDC bearer + federation JWT signatures.
-- **Restrictions & caps:** `exp/nbf/iss/alg` validated, 30 s leeway; no `insecure_jwks_url` knob.
-- **Protection:** in transit — TLS verified against system trust + `HORT_EXTRA_CA_BUNDLE`; blast-radius — bounded by Entry 11's trust posture.
+- **Restrictions & caps:** `exp/nbf/iss/alg` validated, 30 s leeway; no `insecure_jwks_url` knob. JWKS refetch is single-flight (single-issuer: one refresh in flight process-wide; federation: one refresh in flight per issuer — a different issuer's refresh proceeds independently) and the cache lock is never held across the network fetch, so cached-kid validation stays uncontended while a refresh (up to ~20 s worst case) is in flight. A fresh-cache unknown-kid refetch is throttled by a cooldown — single-issuer: the `HORT_JWKS_EVICTION_BACKOFF_SECS` window (default 10 s, dual-role with the existing per-kid signature-mismatch eviction backoff); federation: a fixed 10 s constant (no config-surface knob). TTL/interval-stale refreshes are never gated by the cooldown; a genuinely rotated key is accepted within at most one cooldown window.
+- **Protection:** in transit — TLS verified against system trust + `HORT_EXTRA_CA_BUNDLE`; blast-radius — bounded by Entry 11's trust posture; availability — bounded refetch rate closes the unauthenticated forged/random-kid-flood IdP-amplification vector (issue #114).
 - **Allowed call paths / surfaces:** OIDC + federation validation paths.
 - **Enforcement owner:** `Hort-enforced`.
 - **Status:** `Active`.

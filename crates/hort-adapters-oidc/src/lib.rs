@@ -102,18 +102,38 @@ pub struct OidcProvider {
     groups_claim: String,
     http: reqwest::Client,
     jwks: Arc<RwLock<JwksCache>>,
+    /// Single-flight gate for JWKS refresh. Held for the full
+    /// check → fetch → replace critical section by whichever task wins
+    /// the race to refresh; concurrent misses queue behind it and, once
+    /// it releases, re-check the cache and coalesce onto the leader's
+    /// result instead of each firing their own fetch. Never held across
+    /// an `.await` together with `jwks`'s write lock — this mutex alone
+    /// serialises refreshes; the cache lock is only ever taken for brief
+    /// synchronous reads/writes.
+    refresh_mutex: tokio::sync::Mutex<()>,
     /// Leeway (seconds) applied to `exp` / `nbf`.
     leeway_seconds: u64,
     /// Algorithms the adapter will accept. Production callers use
     /// [`OidcProvider::new`] which locks this down to asymmetric algs;
     /// tests can swap in HS256 via [`OidcProvider::with_algorithms`].
     accepted_algorithms: Vec<Algorithm>,
-    /// Per-kid signature-mismatch eviction cooldown. A second
-    /// `SignatureMismatch` eviction for the same kid within this window
-    /// is throttled (no-op, no refetch). First-seen kids
-    /// (`KidNotInCache`) bypass the backoff and always refresh — the
-    /// legitimate-key-rotation invariant must not be blocked by the DoS
-    /// mitigation.
+    /// Dual-role resilience window, shared by two independent
+    /// mechanisms rather than threaded through as two knobs:
+    ///
+    /// 1. Per-kid signature-mismatch eviction cooldown. A second
+    ///    `SignatureMismatch` eviction for the same kid within this
+    ///    window is throttled (no-op, no refetch).
+    /// 2. Kid-miss refresh cooldown (see [`JwksCache::last_refresh_completed`]).
+    ///    A fresh-cache kid-miss (the cache itself is not TTL-stale, but
+    ///    the requested kid is absent) within this window of the last
+    ///    completed refresh is denied outright — zero network I/O.
+    ///
+    /// Both preserve the key-rotation invariant: a genuinely new kid
+    /// still triggers exactly one refresh per window (mechanism 2) and
+    /// first-seen kids (`KidNotInCache`) bypass mechanism 1's backoff
+    /// entirely — the legitimate-key-rotation invariant must not be
+    /// blocked by either DoS mitigation, only delayed by at most one
+    /// window.
     eviction_backoff: Duration,
     /// Upper bound on discovery + JWKS response body size. Responses
     /// larger than this are classified as
@@ -131,8 +151,11 @@ pub struct OidcProvider {
     event_store: Option<Arc<dyn EventStore>>,
 }
 
-/// Default per-kid signature-mismatch eviction cooldown
-/// (`HORT_JWKS_EVICTION_BACKOFF_SECS` default).
+/// Default value for the dual-role resilience window
+/// (`HORT_JWKS_EVICTION_BACKOFF_SECS` default): both the per-kid
+/// signature-mismatch eviction cooldown AND the kid-miss refresh
+/// cooldown (see `OidcProvider`'s `eviction_backoff` field doc for the
+/// two mechanisms' full rationale) reuse this single duration.
 pub const DEFAULT_EVICTION_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Default discovery + JWKS response body cap
@@ -265,10 +288,15 @@ impl OidcProvider {
     /// tests use short intervals + small caps to exercise the DoS and
     /// oversize-body paths.
     ///
-    /// - `eviction_backoff` — per-kid signature-mismatch cooldown. A
-    ///   second same-kid signature-mismatch eviction within this window
-    ///   is a no-op. Does NOT gate `KidNotInCache` evictions (legitimate
-    ///   key-rotation invariant).
+    /// - `eviction_backoff` — dual-role resilience window: (1) per-kid
+    ///   signature-mismatch cooldown — a second same-kid
+    ///   signature-mismatch eviction within this window is a no-op; does
+    ///   NOT gate `KidNotInCache` evictions (legitimate key-rotation
+    ///   invariant); and (2) kid-miss refresh cooldown — a fresh-cache
+    ///   kid-miss within this window of the last completed refresh is
+    ///   denied with zero network I/O. Neither role blocks a genuinely
+    ///   new key from being picked up; both cap the worst-case
+    ///   legitimate-rotation acceptance delay at one window.
     /// - `body_max_bytes` — upper bound on discovery + JWKS response
     ///   body size. Responses exceeding this are rejected with
     ///   [`JwksRefreshResult::BodyTooLarge`] before parsing.
@@ -306,6 +334,7 @@ impl OidcProvider {
             groups_claim,
             http,
             jwks: Arc::new(RwLock::new(JwksCache::new(jwks_cache_ttl))),
+            refresh_mutex: tokio::sync::Mutex::new(()),
             leeway_seconds: DEFAULT_LEEWAY_SECONDS,
             accepted_algorithms: PRODUCTION_ALGORITHMS.to_vec(),
             eviction_backoff,
@@ -432,10 +461,17 @@ impl OidcProvider {
     }
 
     /// Resolve a JWK by `kid`, refreshing the cache if necessary.
+    ///
+    /// The `jwks` `RwLock` is NEVER held across the `.await` of
+    /// [`Self::fetch_jwks`] — a refresh is coordinated instead via
+    /// `refresh_mutex`, so cached-kid validations proceed uncontended
+    /// while a refresh (up to ~20s worst case: two sequential HTTP round
+    /// trips) is in flight.
     async fn resolve_jwk(&self, kid: &str) -> Result<jsonwebtoken::jwk::Jwk, OidcValidationError> {
         let now = Instant::now();
 
-        // Fast path: read lock, look up. Miss? Drop read and refresh.
+        // Fast path: read lock, look up. Miss? Drop read and take the
+        // slow path.
         {
             let guard = self.jwks.read().await;
             if guard.is_fresh(now) {
@@ -449,25 +485,55 @@ impl OidcProvider {
             }
         }
 
-        // Slow path: acquire write, double-check (another task may have
-        // refreshed), then fetch.
-        let mut guard = self.jwks.write().await;
-        if guard.is_fresh(Instant::now()) {
-            if let Some(jwk) = guard.get(kid) {
-                // Someone else refreshed between our read-drop and
-                // write-acquire.
-                return Ok(jwk.clone());
+        // Slow path: single-flight via `refresh_mutex`, held for the
+        // full check → fetch → replace section below. Concurrent misses
+        // queue here; once the leader releases the mutex, each waiter
+        // re-checks the cache (immediately below) and coalesces onto the
+        // leader's result instead of firing its own fetch.
+        let _refresh_permit = self.refresh_mutex.lock().await;
+
+        let (is_fresh, cached, last_refresh_completed) = {
+            let guard = self.jwks.read().await;
+            (
+                guard.is_fresh(Instant::now()),
+                guard.get(kid).cloned(),
+                guard.last_refresh_completed,
+            )
+        };
+        if is_fresh {
+            if let Some(jwk) = cached {
+                // Another task refreshed while we waited for the mutex.
+                return Ok(jwk);
+            }
+        }
+
+        // Kid-miss refresh cooldown: gates ONLY the fresh-cache-miss
+        // trigger (the cache itself is not TTL-stale, but this
+        // particular kid never showed up in it). A random-kid flood
+        // never repeats a kid, so a per-kid negative map would be
+        // useless; a single last-completed-refresh timestamp throttles
+        // the whole class instead. TTL/staleness-driven refreshes are
+        // NOT gated — they are time-driven (at most one per TTL) and
+        // must stay live for legitimate rotation.
+        if is_fresh {
+            if let Some(last) = last_refresh_completed {
+                if now.saturating_duration_since(last) < self.eviction_backoff {
+                    warn!(%kid, "jwks kid-miss refresh denied by cooldown");
+                    emit_jwks_refresh(USER_LOGIN_ISSUER, JwksRefreshResult::KidMissThrottled);
+                    return Err(OidcValidationError::SignatureInvalid);
+                }
             }
         }
 
         // Kid not in cache (or cache stale) — benign first-seen OR
-        // legitimate key rotation. The backoff map MUST NOT be applied
-        // here; it applies only to signature-mismatch evictions. Fetch
-        // the fresh JWKS unconditionally so legitimate key rotation is
-        // never blocked.
+        // legitimate key rotation past the cooldown. Fetch the fresh
+        // JWKS with NO cache lock held so concurrent validations against
+        // already-cached kids proceed while this refresh is in flight.
         let fresh = self.fetch_jwks().await?;
         emit_jwks_refresh(USER_LOGIN_ISSUER, JwksRefreshResult::Success);
         info!(%kid, "jwks refreshed successfully");
+
+        let mut guard = self.jwks.write().await;
         let rotation = guard.replace(fresh);
         let resolved = guard.get(kid).cloned().ok_or_else(|| {
             warn!(%kid, "signing key not found after jwks refresh");
@@ -791,6 +857,15 @@ struct JwksCache {
     /// eviction. Consulted on each `SignatureMismatch` eviction to decide
     /// whether the DoS-mitigation backoff is active. See [`Self::evict`].
     evictions: HashMap<String, Instant>,
+    /// Timestamp of the most recent successful [`Self::replace`] (any
+    /// completed refresh, whether or not it changed the kid set).
+    /// Consulted by [`OidcProvider::resolve_jwk`]'s kid-miss cooldown: a
+    /// fresh-cache miss within `eviction_backoff` of this timestamp is
+    /// denied without a fetch. Distinct from `fetched_at` — that field
+    /// governs whole-cache TTL staleness; this one governs the kid-miss
+    /// cooldown regardless of TTL, and both are updated together on
+    /// every replace.
+    last_refresh_completed: Option<Instant>,
 }
 
 impl JwksCache {
@@ -800,6 +875,7 @@ impl JwksCache {
             fetched_at: None,
             ttl,
             evictions: HashMap::new(),
+            last_refresh_completed: None,
         }
     }
 
@@ -846,7 +922,9 @@ impl JwksCache {
                 debug!("jwks entry lacks kid — skipping (unaddressable in header lookup)");
             }
         }
-        self.fetched_at = Some(Instant::now());
+        let completed_at = Instant::now();
+        self.fetched_at = Some(completed_at);
+        self.last_refresh_completed = Some(completed_at);
 
         // Diff the new kid set against the previous one. Use BTreeSet
         // so "smallest" is well-defined (lexicographic on the kid
@@ -1490,7 +1568,11 @@ FtBmFfStik03XAfEPVCRWBMc
             .await;
 
         let store = CapturingEventStore::new();
-        let provider = OidcProvider::new(
+        // Zero kid-miss cooldown: this test exercises two back-to-back
+        // rotations (empty → [DEFAULT_KID] → [OTHER_KID]) with no
+        // intervening delay; the cooldown's own throttling behaviour is
+        // covered by the dedicated `kid_miss_cooldown_*` tests below.
+        let provider = OidcProvider::with_resilience(
             base.clone(),
             "hort-server".into(),
             "groups".into(),
@@ -1498,9 +1580,11 @@ FtBmFfStik03XAfEPVCRWBMc
             // TTL-driven idle refresh. The latter would not change the
             // kid set and so would not emit.
             Duration::from_secs(600),
+            Duration::ZERO,
+            DEFAULT_BODY_MAX_BYTES,
             None,
         )
-        .expect("OidcProvider::new must succeed with None anchors")
+        .expect("with_resilience must succeed with None anchors")
         .with_event_store(store.clone() as Arc<dyn EventStore>);
 
         // Warm the cache with a token signed by DEFAULT_KID. Initial
@@ -1618,14 +1702,20 @@ FtBmFfStik03XAfEPVCRWBMc
             .mount_as_scoped(&server)
             .await;
 
-        let provider = OidcProvider::new(
+        // Zero kid-miss cooldown: this test exercises the rotation
+        // (kid-miss → refetch) behaviour itself, back-to-back with no
+        // intervening delay; the cooldown's own throttling behaviour is
+        // covered by the dedicated `kid_miss_cooldown_*` tests below.
+        let provider = OidcProvider::with_resilience(
             base.clone(),
             "hort-server".into(),
             "groups".into(),
             Duration::from_secs(600), // long TTL — force a kid-miss refresh, not TTL expiry
+            Duration::ZERO,
+            DEFAULT_BODY_MAX_BYTES,
             None,
         )
-        .expect("OidcProvider::new must succeed with None anchors");
+        .expect("with_resilience must succeed with None anchors");
 
         // Warm the cache with a token that hits DEFAULT_KID.
         let claims = TestClaims::defaults(&base, "hort-server");
@@ -2462,6 +2552,393 @@ FtBmFfStik03XAfEPVCRWBMc
         assert!(
             out.is_ok(),
             "legitimate token after backoff window must still validate: {out:?}"
+        );
+    }
+
+    // -- Refetch-throttle: fetch-outside-lock, single-flight, kid-miss
+    // cooldown ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cached_kid_validation_does_not_wait_for_concurrent_refresh() {
+        // Liveness: the `jwks` lock must never be held across the
+        // `fetch_jwks().await` of a refresh. Prove it by putting a
+        // deliberately slow mock behind the NEXT (kid-miss-triggered)
+        // fetch and asserting a concurrent validation of an
+        // already-cached kid completes promptly instead of queueing
+        // behind the slow fetch.
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+
+        let warm = Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .up_to_n_times(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // Zero cooldown — this test isolates lock liveness, not the
+        // cooldown gate (covered by the dedicated `kid_miss_cooldown_*`
+        // tests below).
+        let provider = Arc::new(
+            OidcProvider::with_resilience(
+                base.clone(),
+                "hort-server".into(),
+                "groups".into(),
+                Duration::from_secs(600),
+                Duration::ZERO,
+                DEFAULT_BODY_MAX_BYTES,
+                None,
+            )
+            .expect("with_resilience must succeed with None anchors"),
+        );
+
+        let claims = TestClaims::defaults(&base, "hort-server");
+        let good_token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+        provider
+            .validate_token_impl(&good_token)
+            .await
+            .expect("warmup should succeed");
+
+        drop(warm);
+        // Every subsequent /jwks hit is slow — this is the refresh the
+        // background unknown-kid validation below will trigger.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(jwks_body_for(OTHER_KID, OTHER_N))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let unknown_token = sign(&claims, Algorithm::RS256, OTHER_KID, OTHER_PRIV_PEM);
+        let provider_bg = provider.clone();
+        let refresh_task =
+            tokio::spawn(async move { provider_bg.validate_token_impl(&unknown_token).await });
+
+        // Let the background task enter the slow fetch (acquire the
+        // refresh mutex, drop the cache lock, start the `.await`).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = Instant::now();
+        let cached_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.validate_token_impl(&good_token),
+        )
+        .await
+        .expect("cached-kid validation must not wait for the concurrent slow refresh");
+        assert!(cached_result.is_ok(), "{cached_result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "cached-kid validation took too long: {:?}",
+            start.elapsed()
+        );
+
+        refresh_task.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_kid_validations_single_flight_one_fetch() {
+        // N concurrent first-ever validations (same never-seen kid) must
+        // produce exactly one discovery+JWKS fetch pair — the rest
+        // coalesce onto the leader's refresh via `refresh_mutex`.
+        let (server, issuer) = start_idp(jwks_body_for(DEFAULT_KID, TEST_N)).await;
+
+        let provider = Arc::new(
+            OidcProvider::with_resilience(
+                issuer.clone(),
+                "hort-server".into(),
+                "groups".into(),
+                Duration::from_secs(600),
+                Duration::ZERO, // isolate single-flight from the cooldown gate
+                DEFAULT_BODY_MAX_BYTES,
+                None,
+            )
+            .expect("with_resilience must succeed with None anchors"),
+        );
+
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let provider = provider.clone();
+                let token = token.clone();
+                tokio::spawn(async move { provider.validate_token_impl(&token).await })
+            })
+            .collect();
+        for task in tasks {
+            let out = task.await.expect("task must not panic");
+            assert!(
+                out.is_ok(),
+                "every concurrent validation should succeed: {out:?}"
+            );
+        }
+
+        let discovery_hits = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/.well-known/openid-configuration")
+            .count();
+        assert_eq!(
+            discovery_hits, 1,
+            "single-flight must produce exactly one discovery fetch"
+        );
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            1,
+            "single-flight must produce exactly one jwks fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn kid_miss_cooldown_allows_refresh_after_window_expires() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+
+        let first = Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .up_to_n_times(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let backoff = Duration::from_millis(50);
+        let provider = OidcProvider::with_resilience(
+            base.clone(),
+            "hort-server".into(),
+            "groups".into(),
+            Duration::from_secs(600), // long TTL — stays "fresh" for the whole test
+            backoff,
+            DEFAULT_BODY_MAX_BYTES,
+            None,
+        )
+        .expect("with_resilience must succeed with None anchors");
+
+        let claims = TestClaims::defaults(&base, "hort-server");
+        let good_token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+        provider
+            .validate_token_impl(&good_token)
+            .await
+            .expect("warmup should succeed");
+        let after_warmup = jwks_hit_count(&server).await;
+        assert_eq!(after_warmup, 1);
+
+        drop(first);
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "keys": [
+                    {
+                        "kty": "RSA",
+                        "use": "sig",
+                        "alg": "RS256",
+                        "kid": OTHER_KID,
+                        "n": OTHER_N,
+                        "e": TEST_E,
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // Within the window: denied, zero additional upstream requests.
+        let unknown_token = sign(&claims, Algorithm::RS256, OTHER_KID, OTHER_PRIV_PEM);
+        let denied = provider.validate_token_impl(&unknown_token).await;
+        assert!(
+            matches!(denied, Err(OidcValidationError::SignatureInvalid)),
+            "kid-miss within the cooldown window must be denied: {denied:?}"
+        );
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup,
+            "cooldown denial must not fire an additional jwks request"
+        );
+
+        // Past the window: exactly one new refresh, and the token
+        // validates.
+        tokio::time::sleep(backoff * 3).await;
+        let out = provider.validate_token_impl(&unknown_token).await;
+        assert!(
+            out.is_ok(),
+            "kid-miss past the cooldown window must refresh: {out:?}"
+        );
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup + 1,
+            "exactly one new jwks fetch after the cooldown window elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn kid_miss_cooldown_does_not_block_ttl_stale_refresh() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .mount(&server)
+            .await;
+
+        // Short TTL, long cooldown — the TTL expires well inside the
+        // cooldown window, isolating "TTL-stale" as the only trigger.
+        let provider = OidcProvider::with_resilience(
+            base.clone(),
+            "hort-server".into(),
+            "groups".into(),
+            Duration::from_millis(30),
+            Duration::from_secs(600),
+            DEFAULT_BODY_MAX_BYTES,
+            None,
+        )
+        .expect("with_resilience must succeed with None anchors");
+
+        let claims = TestClaims::defaults(&base, "hort-server");
+        let good_token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+        provider
+            .validate_token_impl(&good_token)
+            .await
+            .expect("warmup should succeed");
+        let after_warmup = jwks_hit_count(&server).await;
+        assert_eq!(after_warmup, 1);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Same kid, but the cache is now TTL-stale — must refetch even
+        // though we are far inside the (10 min) cooldown window.
+        let out = provider.validate_token_impl(&good_token).await;
+        assert!(
+            out.is_ok(),
+            "TTL-stale refresh must not be blocked by the cooldown: {out:?}"
+        );
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup + 1,
+            "TTL-stale validation must trigger exactly one new jwks fetch"
+        );
+    }
+
+    #[test]
+    fn kid_miss_cooldown_denial_emits_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+        use std::collections::HashMap;
+
+        fn counter_value(
+            snap: &[(
+                CompositeKey,
+                Option<::metrics::Unit>,
+                Option<::metrics::SharedString>,
+                DebugValue,
+            )],
+            metric_name: &str,
+            label_kvs: &[(&str, &str)],
+        ) -> u64 {
+            for (key, _u, _d, value) in snap {
+                if key.kind() != MetricKind::Counter {
+                    continue;
+                }
+                if key.key().name() != metric_name {
+                    continue;
+                }
+                let got: HashMap<String, String> = key
+                    .key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                let labels_match = label_kvs
+                    .iter()
+                    .all(|(k, v)| got.get(*k).is_some_and(|g| g == v))
+                    && got.len() == label_kvs.len();
+                if labels_match {
+                    if let DebugValue::Counter(v) = value {
+                        return *v;
+                    }
+                }
+            }
+            0
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        ::metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (_server, issuer) = start_idp(jwks_body_for(DEFAULT_KID, TEST_N)).await;
+
+                    let provider = OidcProvider::with_resilience(
+                        issuer.clone(),
+                        "hort-server".into(),
+                        "groups".into(),
+                        Duration::from_secs(600),
+                        Duration::from_secs(600), // long cooldown — never expires mid-test
+                        DEFAULT_BODY_MAX_BYTES,
+                        None,
+                    )
+                    .expect("with_resilience must succeed with None anchors");
+
+                    let claims = TestClaims::defaults(&issuer, "hort-server");
+                    let good_token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+                    provider
+                        .validate_token_impl(&good_token)
+                        .await
+                        .expect("warmup should succeed");
+
+                    let unknown_token = sign(&claims, Algorithm::RS256, OTHER_KID, OTHER_PRIV_PEM);
+                    let out = provider.validate_token_impl(&unknown_token).await;
+                    assert!(
+                        matches!(out, Err(OidcValidationError::SignatureInvalid)),
+                        "cooldown-denied kid-miss must surface SignatureInvalid: {out:?}"
+                    );
+                });
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        let denied = counter_value(
+            &snap,
+            "hort_jwks_refresh_total",
+            &[("issuer", "<user-login>"), ("result", "kid_miss_throttled")],
+        );
+        assert_eq!(
+            denied, 1,
+            "cooldown denial must emit kid_miss_throttled exactly once"
         );
     }
 
