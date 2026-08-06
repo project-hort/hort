@@ -55,6 +55,23 @@ concurrently.
 
 ## 2a. The minimum-viable trust boundary (read before you write `claims`)
 
+> **⚠️ `federatedIdentities[].claims` must carry at least one
+> subject-identifying claim — `sub`, `repository`, or
+> `project_path`.** Every other claim (`aud`, `ref`, `environment`,
+> `workflow`, and every GitHub/GitLab-specific claim not in that
+> list) *refines* a subject; none of them *identify* one on their
+> own. GitHub Actions is a shared, multi-tenant issuer —
+> `token.actions.githubusercontent.com` signs for every repository
+> on GitHub — so an `aud`-only (or `ref`-only, `environment`-only,
+> `workflow`-only) claims map is rejected at apply time: `aud` is
+> caller-chosen by whoever requests the token, and on its own it
+> constrains nothing about which repository or workflow may assume
+> the identity. Every example in this guide carries `repository` or
+> `project_path`, which satisfies this rule on its own — the rest of
+> this section is about a SEPARATE, narrower risk: `repository` /
+> `project_path` alone is under-constrained (see below), not
+> rejected.
+
 > **⚠️ Binding a federated `ServiceAccount` on `repository` /
 > `project_path` *alone* is under-constrained — any pipeline or
 > branch in that repo can assume it.**
@@ -106,9 +123,9 @@ concurrently.
 > WARN gitops apply: under-constrained federatedIdentities —
 >   ServiceAccount `<name>` federatedIdentities[<idx>] (issuer
 >   `<issuer>`) constrains only a repository/project claim without a
->   discriminating ref/environment/workflow/aud — any workflow in
->   that repo can assume this identity. Add a discriminating claim
->   (e.g. `ref`, `environment`, `workflow`) or pin `aud`.
+>   discriminating ref/environment/workflow — any workflow in that
+>   repo can assume this identity. Add a discriminating claim (e.g.
+>   `ref`, `environment`, `workflow`).
 > ```
 > (structured fields: `service_account`, `federated_identity_index`,
 > `issuer`).

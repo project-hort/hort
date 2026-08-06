@@ -143,25 +143,25 @@ spec:
 **Pin `sub`, and pin it *as well as* `aud` — not instead of.** An
 `aud`-only trust policy says "any workload in this cluster that can
 mint a token for hort-server may assume this identity", which is a
-privilege-escalation footgun (the class of mistake tracked as issue
-#111). `sub: system:serviceaccount:<namespace>:<name>` is what
-actually names the workload.
+privilege-escalation footgun — apply-time validation rejects such a
+fragment outright. `sub: system:serviceaccount:<namespace>:<name>` is
+what actually names the workload.
 
-Pinning `aud` **in addition** buys two things:
+Pinning `aud` **in addition** closes the confused-deputy /
+token-redirection vector: a JWT minted for a *different* relying
+party cannot satisfy the fragment. The `aud` key is special-cased to
+bind the validator-resolved audience rather than the raw claim, so
+the RFC 7519 §4.1.3 array form (`"aud": ["hort-server"]`, which is
+what k8s emits) matches correctly.
 
-- It closes the confused-deputy / token-redirection vector: a JWT
-  minted for a *different* relying party cannot satisfy the
-  fragment. The `aud` key is special-cased to bind the
-  validator-resolved audience rather than the raw claim, so the
-  RFC 7519 §4.1.3 array form (`"aud": ["hort-server"]`, which is
-  what k8s emits) matches correctly.
-- It silences the apply-time **under-constrained federated
-  identity** warning. A fragment with neither a repo-scope claim
-  nor a discriminating claim (`ref` / `environment` / `workflow` /
-  `aud`) is flagged as having "no scope-narrowing claim" — a
-  `sub`-only fragment hits this. The warning is advisory, not a
-  rejection, but pinning `aud` is the correct fix rather than
-  ignoring it.
+`sub` is a subject-identifying claim — apply requires at least one
+of `sub`, `repository`, or `project_path` on every FI; `aud` and
+other run-context claims refine a subject, they never identify one.
+A `sub`-only fragment is therefore validation-clean and triggers no
+apply-time warning: the apply-time **under-constrained federated
+identity** warning only fires on a `repository`/`project_path` claim
+left without a discriminating `ref`/`environment`/`workflow` claim
+alongside it, a shape this fragment does not have.
 
 An empty `claims:` map is **hard-rejected** at apply and
 fail-closed at runtime — it would mean "any JWT from this issuer
@@ -437,7 +437,7 @@ And confirm Prometheus itself is succeeding:
 | Connection refused from *another pod*, works in-pod | `metrics.bindAddr` is `127.0.0.1:9090` (pod loopback). Bind a routable interface — `0.0.0.0` additionally requires `metrics.allowUnspecifiedBind: true` — and restrict reach with a NetworkPolicy. |
 | `403` with `no_sa_match` on exchange | The FI `claims:` fragment did not exact-match the JWT. Usually a typo in `sub: system:serviceaccount:<ns>:<name>`, or the pod's `serviceAccountName` differs from the pinned one. |
 | `403` with `aud_mismatch` / `AudienceDenied` | The projected token's `audience:` does not match `OidcIssuer.spec.audiences` (or the `aud` you pinned in the FI). |
-| Apply logs an under-constrained-FI `warn` | The FI pins no scope-narrowing claim. Pin `aud` alongside `sub` (§3.2). |
+| Apply logs an under-constrained-FI `warn` | The FI pins a `repository`/`project_path` claim with no discriminating `ref`/`environment`/`workflow` claim alongside it — any workflow in that repo/project could assume the identity. Add a discriminating claim. Not applicable to the `sub` + `aud` shape in §3.2, which never triggers this warning. |
 | Apply rejected with `wildcard-repo-non-admin` | The grant used a `claims` subject with no `repository`. Use the `serviceAccount` subject form (§3.1). |
 | Rotation never happens (Model A) | The Secret's namespace is not in `worker.rotation.targetNamespaces`, or an existing Secret lacks the `project-hort.de/managed-by=hort-worker` label (ownership collision — hand off explicitly). |
 
