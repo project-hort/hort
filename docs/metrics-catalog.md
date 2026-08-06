@@ -430,7 +430,7 @@ in the `AdminStatusChanged` event payload.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_jwks_refresh_total` | counter | `issuer`, `result` | — | `success`, `throttled`, `fetch_failed`, `body_too_large`, `parse_error`, `apply_warmup_failed` |
+| `hort_jwks_refresh_total` | counter | `issuer`, `result` | — | `success`, `throttled`, `kid_miss_throttled`, `fetch_failed`, `body_too_large`, `parse_error`, `apply_warmup_failed` |
 
 Emitted by `hort-adapters-oidc` on every JWKS refresh attempt + every
 signature-mismatch eviction decision. Covers the forged-kid-flood DoS
@@ -471,6 +471,24 @@ under any plausible operator scale.
   implement per-kid eviction backoff (the forged-kid threat model
   does not apply because the federation path mints short-lived bearers,
   not session tokens).
+- `kid_miss_throttled` — a fresh-cache (or fresh-entry, federation path)
+  kid-miss (the requested `kid` is absent from an otherwise-still-fresh
+  cache/entry) arrived within the kid-miss refresh cooldown. No upstream
+  request fires; the request is denied immediately. Distinct from
+  `throttled` — that one gates repeat *signature-mismatch* evictions of
+  a kid already in the cache, while this one gates an *unknown* kid, the
+  shape of an unauthenticated flood of syntactically-valid JWTs each
+  carrying a fresh, never-seen `kid` (reflected IdP-amplification DoS).
+  TTL/interval-staleness-driven refreshes are never gated by this
+  cooldown — a genuinely rotated key is still picked up within one
+  cooldown window. Fires on BOTH paths, with different cooldown
+  durations: single-issuer user-login (`OidcProvider`) reuses
+  `HORT_JWKS_EVICTION_BACKOFF_SECS` (default 10 s, dual-role with the
+  `throttled` backoff above); the multi-issuer federation validator
+  (`MultiIssuerJwksValidator`) uses a fixed 10 s constant, per issuer —
+  no config-surface knob on either the per-issuer refresh serialisation
+  or this cooldown. Log level: `warn!` with `issuer` + `kid` in span
+  attrs.
 - `fetch_failed` — discovery or JWKS HTTP request failed (transport
   error, non-2xx status, stream read error). Cache stays stale; the
   triggering request 401s (user-login path) or denies with `unknown_kid`

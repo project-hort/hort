@@ -2394,6 +2394,7 @@ dependencies = [
  "hort-domain",
  "jsonwebtoken 11.0.0",
  "metrics",
+ "metrics-util",
  "rcgen",
  "reqwest",
  "rustls",
