@@ -98,6 +98,15 @@ pub(crate) enum UpstreamPullError {
     #[error("upstream metadata parse error: {0}")]
     ParseError(String),
 
+    /// The version segment extracted from the filename (PEP 491 / PEP 625
+    /// split) failed the format-crate version validator — reject before the
+    /// per-version JSON metadata path is built. Distinct from `ParseError`:
+    /// the filename's *structural* shape (dash-segment count, extension)
+    /// parsed fine; the extracted *value* is what fails, and that is a
+    /// client fault, not an upstream fault — surfaced as 400, not 502.
+    #[error("invalid version segment: {0}")]
+    InvalidVersion(String),
+
     /// `IngestUseCase::ingest_verified` returned `Conflict` — upstream
     /// bytes hashed differently from the `digests.sha256` advertised in
     /// the JSON body (ADR 0006). The use case already emitted
@@ -168,6 +177,15 @@ pub(crate) async fn try_upstream_file_pull(
     let (filename_project, version) = parse_pypi_filename(filename).map_err(|e| {
         tracing::warn!(error = %e, "PyPI filename parse failed");
         UpstreamPullError::ParseError(e.to_string())
+    })?;
+
+    // Reject a version segment that isn't a valid PyPI version before it
+    // reaches the per-version JSON metadata path built below — the segment
+    // is attacker-controlled (it comes straight out of the request-URL
+    // filename) and otherwise flows unvalidated into the upstream URL.
+    hort_formats::pypi::validate_pypi_version(&version).map_err(|e| {
+        tracing::warn!(error = %e, "PyPI filename version segment failed validation");
+        UpstreamPullError::InvalidVersion(e.to_string())
     })?;
 
     // Cross-check: PEP 503-normalising the filename's project segment
@@ -735,6 +753,15 @@ pub(crate) fn map_upstream_pull_error(e: &UpstreamPullError) -> Response {
                 serde_json::json!({"error": "upstream metadata invalid"}).to_string(),
             ))
             .unwrap(),
+        // A client-request fault (the URL's filename yielded an invalid
+        // version segment), NOT an upstream fault — 400, matching the same
+        // `{"error": message}` envelope shape the format-crate validators'
+        // `Validation` → 400 mapping uses elsewhere on this serve path.
+        UpstreamPullError::InvalidVersion(cause) => Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::json!({"error": cause}).to_string()))
+            .unwrap(),
         UpstreamPullError::MetadataFetchFailed { stage, .. } => {
             let body = match *stage {
                 "json" => serde_json::json!({"error": "upstream metadata fetch failed"}),
@@ -1087,6 +1114,63 @@ mod tests {
         );
     }
 
+    // ---- Branch 2b: version segment fails the format-crate validator --------
+
+    /// The sdist grammar (`{name}-{version}.tar.gz`) has no charset check
+    /// of its own — `parse_pypi_filename` only requires the split to
+    /// yield non-empty name/version segments — so a version segment
+    /// outside `validate_pypi_version`'s allowlist must be caught by the
+    /// explicit gate this fix adds, one-shot proving the upstream JSON
+    /// leg is never reached on reject.
+    #[tokio::test]
+    async fn invalid_version_segment_rejects_before_upstream_leg() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = pypi_repo("pypi-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id, "");
+        mocks
+            .upstream_proxy
+            .fail_next_metadata_with(DomainError::Invariant(
+                "MARKER:fetch_metadata_must_not_be_called".into(),
+            ));
+
+        let err = try_upstream_file_pull(&ctx, &repo, "pkg", "pkg-1@2.tar.gz")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::InvalidVersion(_)),
+            "expected InvalidVersion for a version segment outside the charset allowlist, \
+             got {err:?}"
+        );
+    }
+
+    /// The gate must not regress the happy path: a legitimate PEP 440
+    /// version segment still flows through to a successful pull.
+    #[tokio::test]
+    async fn valid_version_segment_passes_the_validation_gate() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = pypi_repo("pypi-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id, "");
+
+        let body_bytes = b"the actual sdist body".to_vec();
+        let sha = sha256_hex(&body_bytes);
+        let sdist_url = "https://files.pythonhosted.org/packages/abc/requests-2.31.0.tar.gz";
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pypi/requests/2.31.0/json",
+            pypi_json("requests-2.31.0.tar.gz", &sha, sdist_url),
+        );
+        mocks
+            .upstream_proxy
+            .insert_artifact("", sdist_url, body_bytes);
+
+        try_upstream_file_pull(&ctx, &repo, "requests", "requests-2.31.0.tar.gz")
+            .await
+            .expect("a legitimate version segment must pass the validation gate");
+    }
+
     // ---- Branch 3: metadata fetch failure (json leg) ------------------------
 
     #[tokio::test]
@@ -1354,6 +1438,25 @@ mod tests {
         assert_eq!(
             blocked_body, miss_body,
             "curation-blocked body must be byte-identical to a genuine miss"
+        );
+    }
+
+    /// `InvalidVersion` is a client-request fault (the URL's filename
+    /// yielded an invalid version segment) — 400, not the 502/503 the
+    /// upstream-fault variants map to.
+    #[tokio::test]
+    async fn invalid_version_maps_to_bad_request() {
+        use axum::body::to_bytes;
+
+        let resp = map_upstream_pull_error(&UpstreamPullError::InvalidVersion(
+            "pypi.version: contains a byte outside [A-Za-z0-9.+!_-]".into(),
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"],
+            "pypi.version: contains a byte outside [A-Za-z0-9.+!_-]"
         );
     }
 

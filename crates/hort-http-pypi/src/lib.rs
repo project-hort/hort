@@ -253,10 +253,11 @@ async fn upload(
     // Strict publish-side validation of every attacker-controlled multipart
     // field BEFORE any storage path is constructed, any database row is
     // built, or `IngestUseCase::ingest_verified` is awaited. The download
-    // path (`PyPiFormatHandler::parse_download_path`) has called
-    // `validate_pep_503_name` / `validate_pypi_filename` for some time;
-    // this site closes the publish-side asymmetry the 2026-05-03 audit
-    // flagged.
+    // handler runs the same `validate_pep_503_name` / `validate_pypi_filename`
+    // gate directly at its own head (it does not route through
+    // `PyPiFormatHandler::parse_download_path` — that constructor is used by
+    // Maven serve and Cargo's upstream pull, not PyPI serve); this site
+    // closes the equivalent publish-side gap.
     //
     // `validate_pypi_version` — a permissive PEP 440 charset gate (not a
     // full PEP 440 parser; see its doc comment for why the simplification
@@ -518,7 +519,16 @@ async fn download(
     // `BoundedPath` enforces the route-parameter length cap on every
     // captured segment before this handler body runs — a malicious client
     // that passes a 1 MiB `filename` is rejected inside the extractor,
-    // not here.
+    // not here. It enforces length only, not charset — reject a project
+    // segment that isn't a valid PEP-503 name, or a filename segment whose
+    // charset or all-dots shape signals traversal intent, before either
+    // reaches any local lookup key, the `.metadata` PEP 658 dispatch below,
+    // or (via the proxy cache-miss branch further down) an upstream URL.
+    hort_formats::pypi::validate_pep_503_name(&project)
+        .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
+    hort_formats::pypi::validate_pypi_filename(&filename)
+        .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
+
     // PEP 658 `.metadata` endpoint is served from the SAME route slot —
     // axum's path syntax doesn't admit a second route with a literal
     // `.metadata` suffix on the `:filename` segment, so we branch here.
@@ -1258,6 +1268,73 @@ mod tests {
         assert_eq!(&body[..], b"file content");
     }
 
+    /// A `..` / `..%2f`-shaped `project` segment must reject with 400
+    /// BEFORE any repository/artifact lookup — `validate_pep_503_name`
+    /// runs at the head of the handler, ahead of `find_visible_by_path`'s
+    /// `format!("simple/{project}/{filename}")` key.
+    ///
+    /// Calls the handler directly with the route-parameter values
+    /// (`BoundedPath`'s tuple field is `pub`) rather than round-tripping
+    /// through the HTTP router: a raw `../etc` embedded in a URL string
+    /// changes the number of `/`-delimited path segments and gets caught
+    /// by axum's own routing before the handler runs at all, which would
+    /// test the router's behaviour, not the validation gate this test
+    /// pins. Mirrors the cargo/npm sibling tests, which call their
+    /// serve-path functions directly for the same reason.
+    #[tokio::test]
+    async fn download_rejects_traversal_project_name() {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+
+        for bad in ["..", "../etc", "..%2fetc", "..%2f"] {
+            let err = download(
+                State(h.ctx.clone()),
+                BoundedPath((
+                    "pypi-test".to_string(),
+                    bad.to_string(),
+                    "file.tar.gz".to_string(),
+                )),
+                None,
+            )
+            .await
+            .expect_err("traversal project name must be rejected");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "traversal project name {bad:?} must map to 400, got {}",
+                response.status()
+            );
+        }
+    }
+
+    /// A `..` / `..%2f`-shaped `filename` segment must reject with 400 for
+    /// the same reason — `validate_pypi_filename` runs before the same
+    /// key is built. See the project-name test above for why this calls
+    /// the handler directly rather than through the HTTP router.
+    #[tokio::test]
+    async fn download_rejects_traversal_filename() {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+
+        for bad in ["..", "../etc", "..%2fetc", "..%2f"] {
+            let err = download(
+                State(h.ctx.clone()),
+                BoundedPath(("pypi-test".to_string(), "pkg".to_string(), bad.to_string())),
+                None,
+            )
+            .await
+            .expect_err("traversal filename must be rejected");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "traversal filename {bad:?} must map to 400, got {}",
+                response.status()
+            );
+        }
+    }
+
     // -- CAS serve-path integrity: storage io::Error fails the
     //    HTTP transfer ------------------------------------------------------
     //
@@ -1650,6 +1727,57 @@ mod tests {
             let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["error"], "package not found");
+        }
+
+        /// Tripwire: a traversal-shaped `project` or `filename` on a Proxy
+        /// repo's cache-miss path must reject with 400 WITHOUT ever
+        /// reaching the upstream leg. The one-shot `fail_next_metadata_with`
+        /// proves it — if the top-of-handler validation gate regressed, the
+        /// request would fall through to `try_upstream_file_pull` and
+        /// consume this failure, surfacing as a 502/500, not a 400.
+        ///
+        /// Calls the handler directly (not through the HTTP router) — see
+        /// the top-level `download_rejects_traversal_project_name` test for
+        /// why a raw `../etc` embedded in a URL string doesn't exercise
+        /// the intended code path.
+        #[tokio::test]
+        async fn download_rejects_traversal_before_upstream_leg() {
+            for (project, filename) in [
+                ("..", "requests-2.31.0.tar.gz"),
+                ("../etc", "requests-2.31.0.tar.gz"),
+                ("requests", ".."),
+                ("requests", "..%2fetc"),
+            ] {
+                let (ctx, mocks) = build_mock_ctx(handle());
+                let repo = proxy_pypi_repo("pypi-mirror");
+                mocks.repositories.insert(repo.clone());
+                seed_mapping(&mocks, repo.id);
+                mocks.upstream_proxy.fail_next_metadata_with(
+                    hort_domain::error::DomainError::Invariant(
+                        "MARKER:fetch_metadata_must_not_be_called".into(),
+                    ),
+                );
+
+                let err = download(
+                    State(ctx),
+                    BoundedPath((
+                        "pypi-mirror".to_string(),
+                        project.to_string(),
+                        filename.to_string(),
+                    )),
+                    None,
+                )
+                .await
+                .expect_err("traversal must be rejected before the upstream leg");
+                let response = err.into_response();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "traversal (project={project:?}, filename={filename:?}) must reject 400 \
+                     before the upstream leg runs, got {}",
+                    response.status()
+                );
+            }
         }
 
         /// Cache miss on a Hosted (default) repo MUST NOT enter the Proxy
@@ -3834,44 +3962,48 @@ mod tests {
     }
 
     /// Boundary regression: exactly 512 bytes stays under the cap and
-    /// falls through to the regular 404 path (no artifact of that name).
+    /// falls through to the regular 404 path (no repo of that key).
     /// Guards against an off-by-one (e.g. `>=` instead of `>`).
+    ///
+    /// Varies `repo_key`, not `project` — `project` now ALSO runs through
+    /// `validate_pep_503_name`, which has its own (narrower, 256-byte)
+    /// length cap, so a 512-byte `project` value would trip that validator
+    /// first and confound this test's `BoundedPath`-specific boundary
+    /// with an unrelated one. `repo_key` carries no such extra validator,
+    /// so it isolates the `BoundedPath` comparator alone.
     #[tokio::test]
     async fn download_accepts_package_name_at_cap_boundary() {
         let h = harness();
-        insert_repo(&h, "pypi-test");
         let router = router(h.ctx.clone());
 
-        // Exactly 512 bytes — at the cap, not over. Short filename so
-        // the test isolates the `project` segment's boundary behaviour
-        // rather than incidentally tripping the `filename` validator.
+        // Exactly 512 bytes — at the cap, not over.
         let at_cap = "a".repeat(hort_http_core::limits::MAX_ROUTE_PARAM_BYTES);
         let res = router
             .oneshot(
-                Request::get(format!("/pypi/pypi-test/simple/{at_cap}/file.tar.gz"))
+                Request::get(format!("/pypi/{at_cap}/simple/pkg/file.tar.gz"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         // 512 bytes — under the cap. Not 400. The handler then falls
-        // through to its own not-found logic (404).
+        // through to its own not-found logic (404, no such repo).
         assert_ne!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     /// 513 bytes rejects — the first over-cap value. Paired with the
     /// at-boundary test above, this pins the comparator as `>` not
-    /// `>=`.
+    /// `>=`. See the at-boundary test above for why this varies
+    /// `repo_key` rather than `project`.
     #[tokio::test]
     async fn download_rejects_package_name_one_over_cap() {
         let h = harness();
-        insert_repo(&h, "pypi-test");
         let router = router(h.ctx.clone());
 
         let over = "a".repeat(hort_http_core::limits::MAX_ROUTE_PARAM_BYTES + 1);
         let res = router
             .oneshot(
-                Request::get(format!("/pypi/pypi-test/simple/{over}/file.tar.gz"))
+                Request::get(format!("/pypi/{over}/simple/pkg/file.tar.gz"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4114,6 +4246,83 @@ mod tests {
             !html.contains("https://files.pythonhosted.org"),
             "no upstream URLs should remain after rewrite"
         );
+    }
+
+    /// A traversal-shaped project name on the simple-index (project
+    /// listing) endpoint of a Proxy repo must reject with 400 — this
+    /// exercises the SAME `validate_pep_503_name` gate inside
+    /// `simple_index::fetch_raw_with_cache` as the download-path tripwire,
+    /// reached this time through `ProxyPypiSource::fetch` (via
+    /// `serve::serve_simple_index_unified`) rather than the download
+    /// handler, pinning `index_source.rs`'s `IndexFetchError::InvalidName`
+    /// → `DomainError::Validation` mapping.
+    #[tokio::test]
+    async fn simple_project_proxy_repo_rejects_traversal_project_name() {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::repository::RepositoryType;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+        use hort_http_core::test_support::build_mock_ctx;
+
+        let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let (ctx, mocks) = build_mock_ctx(metrics_handle);
+
+        let mut repo = sample_repository();
+        repo.key = "pypi-mirror".into();
+        repo.format = RepositoryFormat::Pypi;
+        repo.repo_type = RepositoryType::Proxy;
+        repo.upstream_url = Some("https://pypi.org".into());
+        mocks.repositories.insert(repo.clone());
+
+        let now = Utc::now();
+        mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            path_prefix: "".into(),
+            upstream_url: "https://pypi.org".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            created_at: now,
+            updated_at: now,
+        });
+        // Tripwire: if validation were bypassed, the fetch would call
+        // upstream and consume this one-shot failure.
+        mocks
+            .upstream_proxy
+            .fail_next_metadata_with(hort_domain::error::DomainError::Invariant(
+                "MARKER:fetch_metadata_must_not_be_called".into(),
+            ));
+
+        for bad in ["..", "..%2fetc", "..%2f"] {
+            let err = serve::serve_simple_index_unified(
+                &ctx,
+                "pypi-mirror",
+                bad,
+                simple_index::SimpleIndexFormat::Html,
+                None,
+            )
+            .await
+            .expect_err("traversal project name must be rejected");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "traversal project name {bad:?} must map to 400, got {}",
+                response.status()
+            );
+        }
     }
 
     /// `data-requires-python` attribute on the simple index anchor
