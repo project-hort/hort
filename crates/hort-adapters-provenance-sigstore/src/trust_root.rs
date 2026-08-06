@@ -175,19 +175,27 @@ impl CachedTrustRoot {
 /// no `Client::new()`, no `*_INSECURE_TLS`) and returns the bytes for
 /// [`CachedTrustRoot::from_trusted_root_json`].
 ///
-/// **Residual (ADR 0010 / TUF) — flagged, not silently claimed:** this
-/// fetches the already-resolved `trusted_root.json` *target* over a
-/// controlled TLS client; it does **not** perform the full TUF
-/// metadata-chain signature verification (root → timestamp → snapshot →
-/// targets) that `sigstore`'s built-in `SigstoreTrustRoot::new` does via
-/// `tough`. That built-in path is deliberately avoided because it builds
-/// its HTTP client with `reqwest::Client::new()` (the exact ADR 0010
-/// anti-pattern) and cannot be handed our `apply_to_reqwest_builder`
-/// client. The trade-off — controlled-TLS fetch of the resolved target vs.
-/// full TUF-chain verification — is the documented residual; closing it
-/// needs either an upstream `sigstore` API to inject the TUF HTTP client
-/// or a `tough`-based fetch wired through `apply_to_reqwest_builder`. The
-/// **verify path is unaffected and stays fully offline** regardless.
+/// **Accepted residual — TUF metadata-chain verification is skipped.**
+/// This fetches the already-resolved `trusted_root.json` *target* and
+/// loads it `_unchecked` ([`parse_trusted_root`]); it does **not** walk the
+/// TUF root → timestamp → snapshot → targets signature chain that
+/// `sigstore`'s built-in `SigstoreTrustRoot::new` performs via `tough`.
+/// Trust-root integrity therefore rests entirely on TLS (system trust
+/// store + `HORT_EXTRA_CA_BUNDLE`) to `trusted_root_url`, not on the TUF
+/// chain.
+///
+/// Why: `SigstoreTrustRoot::new` hardwires its TUF HTTP client with
+/// `reqwest::Client::new()` — the exact client construction ADR 0010
+/// forbids — and offers no way to hand it our `apply_to_reqwest_builder`
+/// client instead. Upholding ADR 0010 here takes priority over the TUF
+/// chain, so this code fetches the resolved target over the compliant
+/// client and skips `SigstoreTrustRoot::new` entirely.
+///
+/// Exit condition: once the `sigstore` crate exposes a way to inject the
+/// TUF HTTP client (or an equivalent builder surface) into
+/// `SigstoreTrustRoot`, switch to it, restore full TUF metadata-chain
+/// verification, and delete this comment. The **verify path is unaffected
+/// and stays fully offline** regardless of this residual.
 ///
 /// # Errors
 /// `DomainError::Invariant` if the client cannot be built, the fetch
