@@ -25,6 +25,12 @@
 //! - `federatedIdentities[].claims` **non-empty** — empty claims means
 //!   "any JWT from this issuer can assume me," which is a
 //!   privilege-escalation footgun. Hard rejection.
+//! - `federatedIdentities[].claims` **contains at least one
+//!   subject-identifying claim** (`sub`, `repository`, `project_path`) —
+//!   audience and run-context claims (`aud`, `ref`, `environment`,
+//!   `workflow`) refine a subject, they never identify one, so a
+//!   fragment built only from those matches every caller a shared
+//!   issuer will sign for. Hard rejection.
 //! - `fallbackRotation.targetSecret.name` / `.namespace` non-blank;
 //!   names must match the k8s DNS label/subdomain regex (≤63 chars).
 //! - `fallbackRotation.format` ∈ `{dockerconfigjson, opaque}`.
@@ -190,6 +196,29 @@ pub fn validate_service_account(env: &Envelope<ServiceAccountSpec>) -> Vec<Valid
                      (privilege-escalation footgun)"
                 ),
             });
+        } else if !fi
+            .claims
+            .keys()
+            .any(|k| SUBJECT_IDENTIFYING_CLAIMS.contains(&k.as_str()))
+        {
+            // Load-bearing: audience and run-context claims (`aud`, `ref`,
+            // `environment`, `workflow`) refine a subject, they never
+            // identify one — a fragment built only from those matches
+            // every caller a shared issuer will sign for. Hard reject,
+            // distinct from (and layered on top of) the empty-claims rule
+            // above.
+            errors.push(ValidationError::Invalid {
+                kind: Kind::ServiceAccount,
+                name: name.clone(),
+                detail: format!(
+                    "spec.federatedIdentities[{idx}] (issuer `{}`) declares no \
+                     subject-identifying claim — at least one of `sub`, `repository`, \
+                     `project_path` is required; audience and run-context claims (`aud`, \
+                     `ref`, `environment`, `workflow`) refine a subject, they never identify \
+                     one",
+                    fi.issuer
+                ),
+            });
         }
         for (k, v) in &fi.claims {
             if k.trim().is_empty() {
@@ -224,6 +253,17 @@ pub fn validate_service_account(env: &Envelope<ServiceAccountSpec>) -> Vec<Valid
 // Under-constrained federated-issuer warning
 // ---------------------------------------------------------------------------
 
+/// Claim keys that genuinely identify a subject/principal — a fragment
+/// containing at least one of these pins WHO the token was minted for.
+/// `repository`/`project_path` double as [`REPO_SCOPE_ONLY_CLAIMS`]
+/// (identifying AND repo-scoping is correct and intentional: naming a
+/// repo does narrow the assuming principal to "something in that repo",
+/// it just doesn't narrow it to one workflow run). `sub` alone also
+/// qualifies — an exact-match `sub` literal pins one principal.
+/// `pub` so the runtime evaluator (`hort-http-core`) shares this exact
+/// set rather than maintaining a second, driftable copy.
+pub const SUBJECT_IDENTIFYING_CLAIMS: &[&str] = &["sub", "repository", "project_path"];
+
 /// Claim keys that, on a GitHub/GitLab-Actions-shaped issuer, identify
 /// only the *repository/project* — necessary but not sufficient to
 /// scope a trust policy. A workflow in the named repo can mint a token
@@ -233,8 +273,8 @@ const REPO_SCOPE_ONLY_CLAIMS: &[&str] = &["repository", "project_path"];
 
 /// Claim keys that discriminate *which* workflow run / branch /
 /// environment / relying party the token was minted for. At least one
-/// (or an explicit `aud`) must accompany a repo-scope claim for the
-/// trust policy to be meaningfully narrow.
+/// must accompany a repo-scope claim for the trust policy to be
+/// meaningfully narrow.
 const DISCRIMINATING_CLAIMS: &[&str] = &["ref", "environment", "workflow", "aud"];
 
 /// One under-constrained `federatedIdentities[]` entry. The boot
@@ -256,19 +296,19 @@ pub struct UnderConstrainedFederatedIdentity {
     pub message: String,
 }
 
-/// Detect under-constrained `federatedIdentities[]` entries.
-/// Two distinct, mutually-exclusive warning classes:
+/// Detect under-constrained `federatedIdentities[]` entries: an FI names
+/// a `repository`/`project_path` (so it already identifies a subject —
+/// "something in that repo") but pins no discriminating
+/// `ref`/`environment`/`workflow`/`aud` on top — any *workflow in that
+/// repo* can assume the identity. The canonical "named the repo, forgot
+/// to pin the branch/env" mistake.
 ///
-/// 1. **Repo-scope without discriminator**: the FI names a
-///    `repository`/`project_path` but pins no discriminating
-///    `ref`/`environment`/`workflow`/`aud` — any *workflow in that
-///    repo* can assume the identity. The canonical "named the repo,
-///    forgot to pin the branch/env" mistake.
-/// 2. **No scope-narrowing claim at all**: the FI's claim set
-///    contains *neither* a repo-scope claim *nor* a discriminator —
-///    e.g. a `sub`-only / issuer-only fragment. This is *more*
-///    under-constrained than (1): any JWT from the issuer matching the
-///    declared `sub` literal can assume the SA.
+/// A fragment with no subject-identifying claim at all (no `sub`, no
+/// `repository`, no `project_path`) is a strictly worse shape than this
+/// — [`validate_service_account`] hard-rejects it at apply time rather
+/// than warning, since it identifies nobody at all. A `sub`-only
+/// fragment DOES identify a subject (an exact-match literal pins one
+/// principal) and is intentionally never flagged here.
 ///
 /// Pure — returns the findings; the caller emits the `warn!`. Does NOT
 /// push `ValidationError`s, so apply still succeeds (an
@@ -291,46 +331,21 @@ pub fn detect_under_constrained_federated_identities(
             .keys()
             .any(|k| DISCRIMINATING_CLAIMS.contains(&k.as_str()));
 
-        if !has_repo_scope {
-            // Class 2: no scope-narrowing claim AT ALL — neither a
-            // repo-scope claim nor a discriminator. A discriminator on
-            // its own (e.g. `ref` without a `repository`) is still
-            // some narrowing, so it is not this class. Only the truly
-            // unscoped shape (`sub`-only / issuer-only) is flagged here.
-            if !has_discriminator {
-                findings.push(UnderConstrainedFederatedIdentity {
-                    service_account: env.metadata.name.clone(),
-                    index: idx,
-                    issuer: fi.issuer.clone(),
-                    message: format!(
-                        "ServiceAccount `{}` federatedIdentities[{idx}] (issuer `{}`) declares \
-                         no scope-narrowing claim (no repo/project + no \
-                         ref/environment/workflow/aud) — any JWT from this issuer matching the \
-                         declared sub can assume this identity. Add a scope-narrowing claim or \
-                         pin `aud`.",
-                        env.metadata.name, fi.issuer
-                    ),
-                });
-            }
-            continue;
+        if has_repo_scope && !has_discriminator {
+            findings.push(UnderConstrainedFederatedIdentity {
+                service_account: env.metadata.name.clone(),
+                index: idx,
+                issuer: fi.issuer.clone(),
+                message: format!(
+                    "ServiceAccount `{}` federatedIdentities[{idx}] (issuer `{}`) constrains \
+                     only a repository/project claim without a discriminating \
+                     ref/environment/workflow — any workflow in that repo can assume this \
+                     identity. Add a discriminating claim (e.g. `ref`, `environment`, \
+                     `workflow`).",
+                    env.metadata.name, fi.issuer
+                ),
+            });
         }
-
-        // Class 1: has a repo-scope claim but no discriminator.
-        if has_discriminator {
-            continue;
-        }
-        findings.push(UnderConstrainedFederatedIdentity {
-            service_account: env.metadata.name.clone(),
-            index: idx,
-            issuer: fi.issuer.clone(),
-            message: format!(
-                "ServiceAccount `{}` federatedIdentities[{idx}] (issuer `{}`) constrains only \
-                 a repository/project claim without a discriminating ref/environment/workflow/aud \
-                 — any workflow in that repo can assume this identity. Add a discriminating \
-                 claim (e.g. `ref`, `environment`, `workflow`) or pin `aud`.",
-                env.metadata.name, fi.issuer
-            ),
-        });
     }
     findings
 }
@@ -667,6 +682,76 @@ spec:
         );
     }
 
+    // -- Subject-identifying-claim hard rule --------------------------------
+
+    /// A non-empty claim fragment with no subject-identifying claim
+    /// (`sub`/`repository`/`project_path`) is a hard reject, distinct from
+    /// (and in addition to) the empty-claims rule above.
+    fn assert_rejects_no_subject_claim(claims_yaml: &str, sa_name: &str) {
+        let body = format!(
+            "
+  federatedIdentities:
+    - issuer: github-actions
+      claims:
+{claims_yaml}"
+        );
+        let env = parse_service_account(&p(), yaml(sa_name, &body).as_bytes()).unwrap();
+        let errs = validate_service_account(&env);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("subject-identifying")),
+            "expected a subject-identifying-claim rejection for {claims_yaml:?}, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_aud_only_claims() {
+        assert_rejects_no_subject_claim("        aud: hort-server\n", "ci-aud-only");
+    }
+
+    #[test]
+    fn validate_rejects_ref_only_claims() {
+        assert_rejects_no_subject_claim("        ref: refs/heads/main\n", "ci-ref-only");
+    }
+
+    #[test]
+    fn validate_rejects_environment_only_claims() {
+        assert_rejects_no_subject_claim("        environment: production\n", "ci-env-only");
+    }
+
+    #[test]
+    fn validate_rejects_workflow_only_claims() {
+        assert_rejects_no_subject_claim("        workflow: deploy.yml\n", "ci-workflow-only");
+    }
+
+    #[test]
+    fn validate_rejects_aud_plus_ref_claims_no_subject() {
+        // Two discriminator-class claims together still identify nobody —
+        // combining discriminators is not a substitute for a subject claim.
+        assert_rejects_no_subject_claim(
+            "        aud: hort-server\n        ref: refs/heads/main\n",
+            "ci-aud-ref-no-subject",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_repository_only_claims() {
+        // `repository` is subject-identifying on its own — must apply
+        // cleanly (the under-constrained WARNING is a separate, non-fatal
+        // concern covered elsewhere).
+        let body = "
+  federatedIdentities:
+    - issuer: github-actions
+      claims:
+        repository: my-org/my-repo
+";
+        let env = parse_service_account(&p(), yaml("ci-repo-only-valid", body).as_bytes()).unwrap();
+        assert!(
+            validate_service_account(&env).is_empty(),
+            "a repository-only FI identifies a subject; it must apply cleanly"
+        );
+    }
+
     // -- Under-constrained-issuer warning --
 
     #[test]
@@ -725,16 +810,14 @@ spec:
         assert!(detect_under_constrained_federated_identities(&env).is_empty());
     }
 
-    // -- sub-only / issuer-only warning (second, distinct warning class) --
+    // -- sub-only fragments genuinely identify a subject: no warning --
 
     #[test]
-    fn under_constrained_warning_fires_on_sub_only_fi() {
-        // (test a) An FI with only a `sub` claim has NO scope-narrowing
-        // claim at all (neither a REPO_SCOPE_ONLY_CLAIMS nor a
-        // DISCRIMINATING_CLAIMS member) — any JWT from this issuer
-        // matching the declared `sub` literal can assume the SA. This
-        // is MORE under-constrained than the repo-with-no-discriminator
-        // case; it must emit the "no scope-narrowing claim" warning class.
+    fn under_constrained_warning_silent_on_sub_only_fi() {
+        // A `sub`-only fragment pins an exact-match subject literal — it
+        // genuinely identifies one principal, so it must NOT be flagged
+        // as under-constrained. It also has no repo-scope claim, so it
+        // must apply cleanly too (a subject-identifying claim is present).
         let body = "
   federatedIdentities:
     - issuer: github-actions
@@ -742,55 +825,20 @@ spec:
         sub: some-stable-subject
 ";
         let env = parse_service_account(&p(), yaml("ci-sub", body).as_bytes()).unwrap();
-        // Still VALIDATES (warning, not error) — warn-not-reject preserved.
         assert!(
             validate_service_account(&env).is_empty(),
-            "a sub-only FI is a footgun, not a schema violation"
-        );
-        let findings = detect_under_constrained_federated_identities(&env);
-        assert_eq!(findings.len(), 1, "expected one under-constrained finding");
-        assert_eq!(findings[0].index, 0);
-        assert_eq!(findings[0].issuer, "github-actions");
-        assert_eq!(findings[0].service_account, "ci-sub");
-        assert!(
-            findings[0].message.contains("no scope-narrowing claim"),
-            "message must describe the sub-only no-scope-narrowing risk, got: {:?}",
-            findings[0].message
-        );
-    }
-
-    #[test]
-    fn under_constrained_repo_only_class_fires_its_original_warning() {
-        // (test b) The EXISTING class — a repo-scope claim with no
-        // discriminator — must STILL fire its original warning (no
-        // regression). The class-1 message is the "constrains only a
-        // repository/project claim" shape, distinct from the sub-only
-        // class-2 "no scope-narrowing claim" message.
-        let body = "
-  federatedIdentities:
-    - issuer: github-actions
-      claims:
-        repository: my-org/my-repo
-";
-        let env = parse_service_account(&p(), yaml("ci-repo-only", body).as_bytes()).unwrap();
-        let findings = detect_under_constrained_federated_identities(&env);
-        assert_eq!(
-            findings.len(),
-            1,
-            "the existing repo-only class must still fire"
+            "a sub-only FI genuinely identifies a subject; it must apply cleanly"
         );
         assert!(
-            findings[0].message.contains("discriminating")
-                && !findings[0].message.contains("no scope-narrowing claim"),
-            "must be the EXISTING repo-only-without-discriminator message, got: {:?}",
-            findings[0].message
+            detect_under_constrained_federated_identities(&env).is_empty(),
+            "a sub-only FI must not be flagged as under-constrained"
         );
     }
 
     #[test]
     fn under_constrained_silent_on_well_formed_repo_plus_discriminator() {
-        // (test c) repository + ref ⇒ a repo-scope claim AND a
-        // discriminating claim ⇒ well-formed ⇒ NO warning of either class.
+        // repository + ref ⇒ a repo-scope claim AND a discriminating
+        // claim ⇒ well-formed ⇒ no warning.
         let body = "
   federatedIdentities:
     - issuer: github-actions
@@ -807,7 +855,7 @@ spec:
 
     #[test]
     fn empty_claims_rejected_upstream_never_reaches_detector() {
-        // (test d) An FI with `claims = {}` is rejected UPSTREAM by the
+        // An FI with `claims = {}` is rejected UPSTREAM by the
         // non-empty-claims rule in `validate_service_account` (the
         // `fi.claims.is_empty()` arm — the rule the domain entity's
         // docstring names `validate_federated_identity_claims_non_empty`).

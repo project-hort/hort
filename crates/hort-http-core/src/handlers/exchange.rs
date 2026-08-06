@@ -101,6 +101,7 @@ use hort_app::use_cases::api_token_use_case::{
     ApiTokenError, FederationSource, IssueCliSessionRequest, IssueTokenRequest,
 };
 use hort_app::use_cases::pat_validation_use_case::parse_pat_token_format;
+use hort_config::SUBJECT_IDENTIFYING_CLAIMS;
 use hort_domain::entities::service_account::ServiceAccount;
 use hort_domain::ports::federated_jwt_validator::{FederationDenyReason, ValidatedClaims};
 use hort_domain::ports::identity_provider::OidcValidationError;
@@ -1546,6 +1547,19 @@ fn evaluate_fi(
     // this is the defense-in-depth layer.
     if fi.claims.is_empty() {
         return FiEval::EmptyClaims;
+    }
+    // Fail-closed runtime skip, same shape as the empty-claims skip above:
+    // audience and run-context claims refine a subject, they never
+    // identify one, so a fragment built only from those would match every
+    // caller a shared issuer will sign for. Apply-time validation already
+    // rejects this shape; this is the defense-in-depth layer for a legacy
+    // row or any path that slipped past apply.
+    if !fi
+        .claims
+        .keys()
+        .any(|k| SUBJECT_IDENTIFYING_CLAIMS.contains(&k.as_str()))
+    {
+        return FiEval::NoMatch;
     }
     let mut non_aud_all_match = true;
     let mut aud_ok = true;
@@ -4090,6 +4104,48 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         let mut claims_map = std::collections::BTreeMap::new();
         claims_map.insert("repository".to_string(), "my-org/my-repo".to_string());
         claims_map.insert("environment".to_string(), "production".to_string());
+        let fi = hort_domain::entities::service_account::FederatedIdentity {
+            issuer_name: "github-actions".into(),
+            claims: claims_map,
+        };
+        assert_eq!(
+            evaluate_fi(&fi, &sample_validated_claims(600)),
+            FiEval::Match
+        );
+    }
+
+    /// A fragment with no subject-identifying claim — here `aud` only,
+    /// the shape a shared multi-tenant issuer's caller could mint for
+    /// themselves — must return `NoMatch`, not `Match`, even though the
+    /// legacy per-claim walk below would otherwise treat it as vacuously
+    /// satisfied. This is the defense-in-depth layer for a stored row
+    /// that slipped past apply-time validation.
+    #[test]
+    fn evaluate_fi_no_subject_identifying_claim_is_no_match() {
+        let mut claims_map = std::collections::BTreeMap::new();
+        claims_map.insert("aud".to_string(), "hort-server".to_string());
+        let fi = hort_domain::entities::service_account::FederatedIdentity {
+            issuer_name: "github-actions".into(),
+            claims: claims_map,
+        };
+        assert_eq!(
+            evaluate_fi(&fi, &sample_validated_claims(600)),
+            FiEval::NoMatch,
+            "an aud-only fragment must not match — it identifies no subject"
+        );
+    }
+
+    /// A `sub`-pinned fragment against a JWT whose `sub` claim matches
+    /// still returns `Match` — the subject-identifying-claim guard does
+    /// not regress the happy path for the ONE claim it was added to
+    /// protect.
+    #[test]
+    fn evaluate_fi_sub_matching_claim_still_matches() {
+        let mut claims_map = std::collections::BTreeMap::new();
+        claims_map.insert(
+            "sub".to_string(),
+            "repo:my-org/my-repo:ref:refs/heads/main".to_string(),
+        );
         let fi = hort_domain::entities::service_account::FederatedIdentity {
             issuer_name: "github-actions".into(),
             claims: claims_map,

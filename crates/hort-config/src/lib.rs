@@ -75,7 +75,7 @@ pub use scope::{RepositoryScope, ScopeSpec};
 pub use service_account::{
     detect_under_constrained_federated_identities, parse_service_account, validate_service_account,
     FallbackRotationSpec, FederatedIdentitySpec, ServiceAccountSpec, TargetSecretSpec,
-    UnderConstrainedFederatedIdentity,
+    UnderConstrainedFederatedIdentity, SUBJECT_IDENTIFYING_CLAIMS,
 };
 pub use upstream_mapping::{
     parse_upstream_mapping, validate_upstream_mapping, UpstreamAuthSpec, UpstreamMappingSpec,
