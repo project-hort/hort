@@ -738,16 +738,6 @@ fn algorithm_allowed(alg: Algorithm, allowed: &[JwtAlg]) -> bool {
 /// `JwtAlg` carries trust semantics (RS*/ES* only — no `HS*`) and lives
 /// in `hort-domain`; `Algorithm` is the wire-form enum from the JWT
 /// library and carries no trust intent.
-///
-/// Note: [`JwtAlg::Es512`] has no counterpart in `jsonwebtoken` 10.x —
-/// the JWT library exposes ES256 and ES384 but not ES512 (jsonwebtoken
-/// 10.3.0 `algorithms.rs`). An operator declaring `ES512` in
-/// `OidcIssuer.allowed_algorithms` cannot have any incoming JWT
-/// match it, because `decode_header` will surface the wire algorithm
-/// as a different `Algorithm` variant. The function returns `false`
-/// for that pair — the JWT is denied at the algorithm gate with
-/// `AlgorithmNotAllowed`. Promoting ES512 support is a follow-on once
-/// jsonwebtoken adds the variant.
 fn jwt_alg_matches_algorithm(domain: JwtAlg, wire: Algorithm) -> bool {
     matches!(
         (domain, wire),
@@ -2083,29 +2073,6 @@ FtBmFfStik03XAfEPVCRWBMc
             (JwtAlg::Es384, Algorithm::ES384),
         ] {
             assert!(algorithm_allowed(wire, &[domain]));
-        }
-    }
-
-    #[test]
-    fn algorithm_allowed_es512_has_no_jsonwebtoken_match() {
-        // `Algorithm::ES512` does not exist in jsonwebtoken 10.x —
-        // operators may declare `JwtAlg::Es512` but no incoming JWT
-        // can match it. Document this gap explicitly so a future
-        // jsonwebtoken upgrade that adds `ES512` produces a test
-        // failure here, forcing the match arm to be added.
-        for wire in [
-            Algorithm::RS256,
-            Algorithm::RS384,
-            Algorithm::RS512,
-            Algorithm::ES256,
-            Algorithm::ES384,
-        ] {
-            assert!(
-                !algorithm_allowed(wire, &[JwtAlg::Es512]),
-                "JwtAlg::Es512 must not match any wire algorithm currently \
-                 exposed by jsonwebtoken — promoting ES512 requires extending \
-                 jwt_alg_matches_algorithm"
-            );
         }
     }
 

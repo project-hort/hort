@@ -68,7 +68,6 @@ pub enum JwtAlg {
     Rs512,
     Es256,
     Es384,
-    Es512,
 }
 
 impl JwtAlg {
@@ -81,7 +80,6 @@ impl JwtAlg {
             Self::Rs512 => "RS512",
             Self::Es256 => "ES256",
             Self::Es384 => "ES384",
-            Self::Es512 => "ES512",
         }
     }
 }
@@ -104,7 +102,6 @@ impl FromStr for JwtAlg {
             "RS512" => Ok(Self::Rs512),
             "ES256" => Ok(Self::Es256),
             "ES384" => Ok(Self::Es384),
-            "ES512" => Ok(Self::Es512),
             other => Err(DomainError::Validation(format!(
                 "unknown JWT algorithm: {other}"
             ))),
@@ -178,7 +175,6 @@ mod tests {
         assert_eq!(JwtAlg::Rs512.as_str(), "RS512");
         assert_eq!(JwtAlg::Es256.as_str(), "ES256");
         assert_eq!(JwtAlg::Es384.as_str(), "ES384");
-        assert_eq!(JwtAlg::Es512.as_str(), "ES512");
     }
 
     #[test]
@@ -200,7 +196,6 @@ mod tests {
             JwtAlg::Rs512,
             JwtAlg::Es256,
             JwtAlg::Es384,
-            JwtAlg::Es512,
         ] {
             assert_eq!(JwtAlg::from_str(variant.as_str()).unwrap(), variant);
         }
@@ -234,6 +229,16 @@ mod tests {
         let err = JwtAlg::from_str("RS999").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
         assert!(err.to_string().contains("RS999"));
+    }
+
+    #[test]
+    fn jwt_alg_from_str_rejects_es512() {
+        // `jsonwebtoken` has no ES512 support — the variant was removed
+        // rather than left inert (accepted at apply, unmatchable at
+        // runtime).
+        let err = JwtAlg::from_str("ES512").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(err.to_string().contains("ES512"));
     }
 
     #[test]

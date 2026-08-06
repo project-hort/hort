@@ -15,7 +15,7 @@
 //!   CAs.
 //! - `audiences` non-empty (each entry must be non-blank).
 //! - `allowedAlgorithms`: every entry must be one of the supported
-//!   asymmetric variants (`RS256/384/512`, `ES256/384/512`).
+//!   asymmetric variants (`RS256/384/512`, `ES256/384`).
 //!   Symmetric (`HS*`) is excluded by the domain enum
 //!   ([`JwtAlg`](hort_domain::entities::oidc_issuer::JwtAlg)).
 //! - `jwksRefreshInterval` between 1 minute and 24 hours. The lower
@@ -196,7 +196,7 @@ pub fn validate_oidc_issuer(env: &Envelope<OidcIssuerSpec>) -> Vec<ValidationErr
             errors.push(ValidationError::UnknownEnumValue {
                 field: "spec.allowedAlgorithms[*]",
                 got: alg.clone(),
-                expected: vec!["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+                expected: vec!["RS256", "RS384", "RS512", "ES256", "ES384"],
             });
         }
     }
@@ -495,7 +495,7 @@ spec:
 
     #[test]
     fn validate_accepts_every_supported_algorithm() {
-        for alg in ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"] {
+        for alg in ["RS256", "RS384", "RS512", "ES256", "ES384"] {
             let body = format!(
                 "
   issuerUrl: https://example.com
@@ -510,6 +510,42 @@ spec:
                 "algorithm `{alg}` must validate cleanly: {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_es512_algorithm_with_intelligible_message() {
+        // ES512 was removed end-to-end (jsonwebtoken has no ES512
+        // support — an issuer configured with it would silently never
+        // validate any token). Apply-time rejection must name the
+        // supported set, not just say "unsupported".
+        let body = "
+  issuerUrl: https://example.com
+  audiences: [a]
+  allowedAlgorithms: [ES512]
+";
+        let env = parse_oidc_issuer(&p(), yaml("x", body).as_bytes()).unwrap();
+        let errs = validate_oidc_issuer(&env);
+        let expected = errs
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::UnknownEnumValue {
+                    field,
+                    got,
+                    expected,
+                } if *field == "spec.allowedAlgorithms[*]" && got == "ES512" => Some(expected),
+                _ => None,
+            })
+            .expect("expected an ES512 UnknownEnumValue error");
+        assert_eq!(expected, &vec!["RS256", "RS384", "RS512", "ES256", "ES384"]);
+        let msg = errs
+            .iter()
+            .find(|e| e.to_string().contains("ES512"))
+            .expect("expected an ES512-naming error")
+            .to_string();
+        assert!(
+            msg.contains("is not in the allowed set: RS256, RS384, RS512, ES256, ES384"),
+            "error must name the supported algorithms without ES512, got: {msg}"
+        );
     }
 
     #[test]
