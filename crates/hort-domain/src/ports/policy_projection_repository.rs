@@ -67,6 +67,12 @@ pub trait PolicyProjectionRepository: Send + Sync {
     /// Every active (non-archived) policy. Used by 14b's diff to
     /// determine which projected policies are absent from the
     /// desired YAML and therefore need a `PolicyArchived` event.
+    ///
+    /// **Ordering contract**: ascending `(created_at, policy_id)` —
+    /// earliest-created first, `policy_id` breaking ties between
+    /// same-instant rows so the order is total and stable across
+    /// calls. Callers that need a different order (e.g. by name) must
+    /// sort locally; do not assume any other ordering is preserved.
     fn list_active(&self) -> BoxFuture<'_, DomainResult<Vec<ScanPolicyProjection>>>;
 
     /// Every exclusion currently attached to the given policy.

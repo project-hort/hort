@@ -79,6 +79,37 @@ async fn seed_policy(pool: &PgPool) -> Uuid {
     policy_id
 }
 
+/// Same shape as [`seed_policy`], but `Repository`-scoped — for tests
+/// that need TWO distinct non-archived policies in one database. Only
+/// one non-archived policy may occupy a given scope, so a second
+/// `Global` row would collide with the first; a repository scope is
+/// unique per fresh `Uuid::new_v4()` and never collides with `Global`.
+async fn seed_repo_scoped_policy(pool: &PgPool) -> Uuid {
+    let policy_id = Uuid::new_v4();
+    let name = format!("it-curation-exclusions-policy-{}", policy_id.simple());
+    let scope = json!({ "Repository": Uuid::new_v4().to_string() });
+    sqlx::query(
+        r#"INSERT INTO public.policy_projections (
+               policy_id, name, scope, severity_threshold,
+               rescan_interval_hours, quarantine_duration_secs,
+               require_approval, archived,
+               stream_version
+           ) VALUES (
+               $1, $2, $3, 'high',
+               24, 86400,
+               false, false,
+               1
+           )"#,
+    )
+    .bind(policy_id)
+    .bind(&name)
+    .bind(&scope)
+    .execute(pool)
+    .await
+    .expect("seed policy_projections row");
+    policy_id
+}
+
 /// Seed an `exclusion_projections` row directly (bypassing the
 /// projector). Lets the adapter tests drive deterministic shapes
 /// without dragging in the use case.
@@ -131,7 +162,7 @@ async fn list_exclusions_filter_by_policy_id() {
         return;
     };
     let policy_a = seed_policy(&pool).await;
-    let policy_b = seed_policy(&pool).await;
+    let policy_b = seed_repo_scoped_policy(&pool).await;
     let actor = Uuid::new_v4();
 
     let in_a_1 = Uuid::new_v4();
@@ -196,7 +227,7 @@ async fn list_exclusions_filter_by_cve_id() {
         return;
     };
     let policy_a = seed_policy(&pool).await;
-    let policy_b = seed_policy(&pool).await;
+    let policy_b = seed_repo_scoped_policy(&pool).await;
     let actor = Uuid::new_v4();
     let target_cve = "CVE-2026-7777";
 

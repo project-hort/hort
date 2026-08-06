@@ -906,7 +906,13 @@ impl PolicyProjectionRepository for MockPolicyProjectionRepository {
         if let Some(e) = self.next_list_active_error.lock().unwrap().take() {
             return Box::pin(async move { Err(e) });
         }
-        let res: Vec<_> = self
+        // Honour the port's ordering contract (ascending `(created_at,
+        // policy_id)`) rather than the backing `HashMap`'s unspecified
+        // iteration order — callers that rely on the contract (e.g. the
+        // defense-in-depth "earliest wins" fallback in
+        // `resolve_active_policy_for_repo`) get the same behaviour
+        // against this mock as against the real adapter.
+        let mut res: Vec<_> = self
             .by_id
             .lock()
             .unwrap()
@@ -914,6 +920,7 @@ impl PolicyProjectionRepository for MockPolicyProjectionRepository {
             .filter(|p| !p.archived)
             .cloned()
             .collect();
+        res.sort_by(|a, b| (a.created_at, a.policy_id).cmp(&(b.created_at, b.policy_id)));
         Box::pin(async move { Ok(res) })
     }
 
