@@ -825,9 +825,12 @@ pub async fn validate_token(server_url: &str, token: &str) -> Result<WhoamiRespo
         .context("invalid token characters in Bearer header")?;
     headers.insert(reqwest::header::AUTHORIZATION, auth_value);
 
-    let client = reqwest::Client::builder()
-        .default_headers(headers)
-        .timeout(std::time::Duration::from_secs(15))
+    let builder = crate::client::apply_extra_ca_bundle(
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(15)),
+    )?;
+    let client = builder
         .build()
         .context("building reqwest client for whoami")?;
 

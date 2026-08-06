@@ -735,6 +735,15 @@ async fn do_publish(
         validation_error(&format!("cannot parse version from filename {filename}"))
     })?;
 
+    // Strict-validate the extracted version BEFORE any storage path is
+    // constructed or any side-effecting action is taken. Mirrors the
+    // cargo publish path's `validate_cargo_version` gate: an
+    // `_attachments`-derived version is attacker-controlled input, and
+    // without this the garbage survives into the coords/path/projection
+    // row unvalidated. Error messages never echo the rejected input.
+    hort_formats::npm::validate_npm_version(&version)
+        .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
+
     // Pull the per-version packument block — `body["versions"][version]` —
     // to hand to ingest as payload metadata. npm publish requests always
     // carry at least one entry in `versions` keyed by the tarball's
@@ -1812,6 +1821,98 @@ mod tests {
             h.storage.put_call_count(),
             0,
             "validator must reject traversal before any storage write"
+        );
+    }
+
+    /// A NUL byte in the `_attachments`-derived version must be rejected
+    /// before any storage write — the version never touches the charset
+    /// allowlist that admits it into a stored path.
+    #[tokio::test]
+    async fn publish_unscoped_rejects_nul_byte_version_before_storage_write() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let version = "1.0.0\u{0}";
+        let body = build_publish_body("express", version, b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.storage.put_call_count(),
+            0,
+            "validator must reject before any storage write"
+        );
+        let body_bytes = to_bytes(res.into_body(), 1024).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            !body_str.contains(version),
+            "rejection response must not echo the rejected version: {body_str}"
+        );
+    }
+
+    /// An empty version segment (`pkg-.tgz`-shaped filename would fail
+    /// `extract_version` first) — this test instead covers a version that
+    /// *parses* out of the filename but fails the semver-ish grammar:
+    /// path-traversal-shaped input.
+    #[tokio::test]
+    async fn publish_unscoped_rejects_path_traversal_shaped_version_before_storage_write() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let version = "../../etc/passwd";
+        let body = build_publish_body("express", version, b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.storage.put_call_count(),
+            0,
+            "validator must reject before any storage write"
+        );
+    }
+
+    /// An oversized version string is rejected before any storage write.
+    #[tokio::test]
+    async fn publish_unscoped_rejects_oversized_version_before_storage_write() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let version = format!("1.0.0-{}", "a".repeat(128));
+        let body = build_publish_body("express", &version, b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.storage.put_call_count(),
+            0,
+            "validator must reject before any storage write"
         );
     }
 
