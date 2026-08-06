@@ -335,8 +335,21 @@ Phase 4 migration tiers:
 
 ### WASM Module Interface (WIT sketch)
 
+Body-bearing calls use a `wasi:io/streams` `input-stream` resource, not
+`list<u8>` — ADR 0026 (streaming metadata projection) froze the native
+`FormatHandler` port's metadata/content parameters as `&mut dyn
+std::io::Read`, never a whole-body byte buffer, specifically so a ~50 MiB
+upstream packument never gets materialized in memory. A future WASM
+`format-core` implementation of the same methods must carry that
+no-buffering guarantee across the host/guest boundary too, or the WASM
+migration would silently reintroduce the exact failure mode ADR 0026 closed.
+`build-index`'s `list<u8>` return is unaffected — it's a host-controlled
+output, not an upstream-body input parameter.
+
 ```wit
 interface format-core {
+    use wasi:io/streams.{input-stream};
+
     record artifact-coords {
         name: string,
         version: string,
@@ -346,7 +359,7 @@ interface format-core {
 
     parse-coords: func(request-path: string) -> result<artifact-coords, string>;
     build-index: func(artifacts: list<artifact-coords>) -> result<list<u8>, string>;
-    verify-upstream-checksum: func(content: list<u8>, upstream-metadata: list<u8>) -> result<bool, string>;
+    verify-upstream-checksum: func(content: input-stream, upstream-metadata: input-stream) -> result<bool, string>;
 }
 ```
 

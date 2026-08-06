@@ -667,6 +667,15 @@ flags, OCI session records, auth-event throttle). Each falls back to
 `*ExistingSecret` indirection are mutually exclusive (schema rules 4b /
 4c).
 
+**TLS posture: in-cluster / trusted-network only.** The `fred` Redis
+client is compiled without a TLS feature, so a `rediss://` URL fails
+closed (cannot connect) rather than falling back to plaintext. Treat
+`ephemeralStore.redis` (all of `url`, `evictableUrl`, `durableUrl`) as
+reachable only over a trusted network path — a ClusterIP Service or
+equivalent private link, never a public endpoint. See the HA example
+(`deploy/helm/hort-server/test-values-ha.yaml`) for a Redis backend
+configured this way.
+
 ### Pull-through deduplication
 
 Two-layer request coalescing covers every upstream

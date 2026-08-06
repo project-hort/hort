@@ -19,20 +19,28 @@
 //!
 //! # Scoping discipline (HARD constraint — do not relax)
 //!
-//! The upstream-http / OIDC / S3 targets are *operator-vetted* (config or
+//! The OIDC / S3 targets are *operator-vetted* (config or
 //! deployment-pinned) and a connect-time guard there only produced a
-//! false-positive class on legitimate internal mirrors. That rationale
-//! does **not** transfer to *user-submitted* webhook URLs — user-submitted
-//! URLs are the SSRF threat surface, not operator-configured upstreams.
+//! false-positive class on legitimate internal targets (in-cluster IdP,
+//! private S3 endpoint). That rationale does **not** transfer to
+//! *user-submitted* webhook URLs — user-submitted URLs are the SSRF
+//! threat surface, not operator-configured deployment config.
+//! (Upstream-http's *artifact/metadata* fetch target is
+//! metadata-supplied rather than operator-vetted, so it later grew its
+//! own equivalently-scoped connect-time guard for the same
+//! attacker-reachable-target reason — see
+//! `hort-adapters-upstream-http::dns_guard`, security audit finding
+//! INJ-1. See `docs/architecture/explanation/security.md`'s "Egress and
+//! SSRF posture" table for the full per-adapter picture.)
 //!
 //! This resolver is therefore scoped **to the webhook `reqwest::Client`
 //! only**. It is constructed in, and bound by,
 //! [`crate::WebhookNotifier::new`] via
 //! `ClientBuilder::dns_resolver(...)` and is reachable from nowhere
 //! else. It is NOT re-exported, NOT placed in `hort-net-egress`, and is
-//! never threaded to the upstream-http / S3 / OIDC client builders —
-//! those stay operator-vetted by deployment configuration. Re-globalizing
-//! this guard to operator-vetted clients is an anti-pattern; do not do it.
+//! never threaded to the S3 / OIDC client builders — those stay
+//! operator-vetted by deployment configuration. Re-globalizing this
+//! guard to operator-vetted clients is an anti-pattern; do not do it.
 //!
 //! # `HORT_WEBHOOK_ALLOWLIST_HOSTS`
 //!
