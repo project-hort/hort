@@ -731,8 +731,18 @@ async fn do_publish(
     // here used the unscoped basename and rejected every scoped publish
     // from a real `npm publish` client with "cannot parse version" —
     // guarded by the scoped-publish tests below.
+    //
+    // `filename` is the client-supplied `_attachments` key — attacker-
+    // controlled. The rejection message must NOT echo it (never-echo-
+    // rejected-input rule); it stays available server-side via
+    // `tracing::debug!`.
     let version = extract_version(filename, pkg_name).ok_or_else(|| {
-        validation_error(&format!("cannot parse version from filename {filename}"))
+        tracing::debug!(
+            filename,
+            pkg_name,
+            "npm publish: cannot parse version from filename"
+        );
+        validation_error("cannot parse version from attachment filename")
     })?;
 
     // Strict-validate the extracted version BEFORE any storage path is
@@ -1468,6 +1478,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The `_attachments` key is the client-supplied tarball filename —
+    /// attacker-controlled. When it doesn't carry a parseable version,
+    /// the 400 body must NOT echo it back (never-echo-rejected-input
+    /// rule); only the stable validation-error shape is observable.
+    #[tokio::test]
+    async fn publish_unparseable_filename_returns_400_without_echoing_filename() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let tarball = b"tarball-bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(tarball);
+        let marker_filename = "xsentinel-not-a-parseable-npm-filename";
+        let body = serde_json::json!({
+            "name": "express",
+            "_attachments": {
+                marker_filename: {
+                    "content_type": "application/octet-stream",
+                    "data": b64,
+                    "length": tarball.len(),
+                }
+            },
+        })
+        .to_string();
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            !body_str.contains("xsentinel"),
+            "response body must not echo the rejected attachment filename: {body_str}"
+        );
     }
 
     #[tokio::test]

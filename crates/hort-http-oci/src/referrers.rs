@@ -59,7 +59,7 @@ use hort_domain::error::DomainError;
 use hort_domain::ports::content_reference_index::ContentReference;
 use hort_domain::types::ContentHash;
 
-use super::digest::{parse_digest, DigestParse};
+use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use hort_http_core::context::AppContext;
 
@@ -153,10 +153,10 @@ pub async fn serve(
     //    different OCI codes.
     let target_hash: ContentHash = match parse_digest(digest_str) {
         DigestParse::Ok(h) => h,
-        DigestParse::Unsupported { algorithm } => {
+        DigestParse::Unsupported => {
             emit_metric(&repo_label(&ctx, Some(&repo.key)), "digest_invalid");
             return OciError::Unsupported {
-                message: format!("unsupported digest algorithm: {algorithm}"),
+                message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
             }
             .into_response();
         }
