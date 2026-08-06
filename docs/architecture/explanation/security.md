@@ -251,6 +251,33 @@ answer when the chain length isn't fixed. CIDR membership uses
 IPv4-mapped IPv6 peer (`::ffff:10.0.0.5`) matches the same
 allowlist entry as the bare IPv4 form.
 
+## Egress and SSRF posture
+
+`hort-net-egress::is_routable` is the single canonical routability
+predicate (rejects loopback/link-local/RFC1918/CGNAT/IPv4-mapped-IPv6
+IMDS addresses); every outbound-URL adapter below builds on it, but
+each applies it at a different point in its request lifecycle
+depending on whether the target is operator-vetted or user-submitted.
+
+| Adapter / surface | Target trust | Checks applied |
+|---|---|---|
+| Upstream artifact/metadata fetch (`hort-adapters-upstream-http`) | Operator-configured upstream (Cargo/npm/PyPI registry mapping) | `check_ssrf_safe` at URL-validation time, a per-hop `is_routable` re-check on every redirect (`build_redirect_policy`), **and** a connect-time `GuardedDnsResolver` (security audit finding INJ-1) that re-runs `is_routable` on every dial-time resolution — closing the TOCTOU window between validation and dial. |
+| Webhook delivery (`hort-notifier-webhook`) | User-submitted (any caller with subscription-create privilege) | `WebhookTargetGuard::check` at subscription create-time (IP literal or single-shot DNS resolution), `Policy::limited(0)` (zero redirects — any 3xx is rejected outright), and a connect-time `GuardedDnsResolver` closing the create→deliver DNS-rebind TOCTOU. Operator opt-outs: `HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS` (blanket, last resort) and `HORT_WEBHOOK_ALLOWLIST_HOSTS` (targeted, per-host/CIDR). |
+| OIDC discovery / JWKS fetch (`hort-adapters-oidc`) | Operator-configured issuer (deployment-pinned) | Same-host binding (the JWKS fetch is pinned to the issuer's own host, so a compromised discovery document cannot redirect it elsewhere) — no `is_routable` leg. Deliberately dropped: it broke the canonical in-cluster-IdP deployment for negligible benefit given same-host binding is already load-bearing. |
+| S3-compatible storage backend (`hort-adapters-storage`) | Operator-configured endpoint (deployment config) | No connect-time guard; the endpoint is deployment config, not attacker-influenced input. Defence in depth is TLS cert validation (`HORT_EXTRA_CA_BUNDLE`) and artifact-layer content-checksum verification. |
+
+**Why upstream-http and webhook diverge from OIDC/S3.** Upstream
+artifact URLs are metadata-supplied (an attacker who influences
+upstream registry metadata influences the fetch target) and webhook
+URLs are literally user-submitted — both are within an attacker's
+reach, so both get the full three-layer treatment including a
+connect-time guard. OIDC issuer and S3 endpoint URLs are
+operator-configured deployment config; a connect-time guard there
+would only produce false positives against legitimate internal
+targets (in-cluster IdP, private S3-compatible endpoint) for a
+threat that requires the operator's own configuration to already be
+compromised.
+
 ## Defence in depth
 
 Additional layers, each small and focused:

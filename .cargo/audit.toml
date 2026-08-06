@@ -86,19 +86,4 @@ ignore = [
     # there too. Re-evaluate if a fixed rsa ships, or if any RSA signing
     # (private-key) path is ever added.
     "RUSTSEC-2023-0071",
-
-    # REGISTRY-EXEMPT: RUSTSEC-2025-0134 — dev-only (test-only
-    # axum-server tls-rustls feature, never a production dependency);
-    # not observed to block a CI prefetch/build. Revisit if that changes.
-    # rustls-pemfile - Unmaintained; thin wrapper around the same code
-    # in rustls-pki-types since 1.9.0. The repo was archived 2025-08;
-    # there is no fix to apply. We migrated our own PEM parsing
-    # to `rustls_pki_types::pem::PemObject` —
-    # the only remaining path is **dev-only** through `axum-server`'s
-    # `tls-rustls` feature, which we use exclusively to stand up
-    # in-process HTTPS test servers for the mTLS / pinning unit tests.
-    # No production binary links rustls-pemfile. Tracks for removal
-    # once axum-server (or hyper-rustls) migrate to the same successor
-    # API.
-    "RUSTSEC-2025-0134",
 ]

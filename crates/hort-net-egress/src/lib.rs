@@ -14,11 +14,17 @@
 //! Earlier revisions of this crate also hosted a `GuardedDnsResolver`
 //! (connect-time DNS guard) and `build_egress_redirect_policy`
 //! (redirect-policy builder). Both were dropped during a release
-//! close-out after re-evaluating the `EGRESS-1` posture: the project's
-//! settled posture is to accept operator-vetted upstream / IdP / S3
-//! target trust without a connect-time guard. See
-//! `docs/architecture/explanation/security.md` for the per-adapter SSRF
-//! posture table.
+//! close-out after re-evaluating the `EGRESS-1` posture: a
+//! shared, crate-hosted connect-time guard produced a false-positive
+//! class against legitimate operator-vetted internal targets (IdP, S3
+//! endpoint), so it does not belong here. Individual adapters have
+//! since grown their **own**, narrowly-scoped connect-time guards where
+//! their target is attacker-reachable (upstream-http's dial guard,
+//! security audit finding INJ-1; webhook's create→deliver TOCTOU guard)
+//! — both still call this crate's bare `is_routable`, they just apply
+//! it at connect time instead of only at validation time. See
+//! `docs/architecture/explanation/security.md`'s "Egress and SSRF
+//! posture" section for the per-adapter table.
 //!
 //! A subsequent review-pass also dropped the `is_routable_with_allowlist`
 //! and `is_ip_routable_with_allowlist` exports — both were
@@ -31,8 +37,8 @@
 //!
 //! What stays: the `is_routable` predicate, used by
 //! `hort-adapters-upstream-http::check_ssrf_safe` for URL-input validation
-//! against operator-supplied or upstream-metadata-derived URLs. That
-//! validation does not depend on connect-time guarding.
+//! against operator-supplied or upstream-metadata-derived URLs, and by
+//! the per-adapter connect-time guards described above.
 //!
 //! # Why a dedicated crate?
 //!

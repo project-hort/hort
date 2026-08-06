@@ -30,6 +30,10 @@ storage:
 
 ephemeralStore:
   backend: redis
+  # In-cluster/trusted-network only: the server's Redis client is built
+  # without a TLS feature, so a rediss:// URL fails closed (cannot
+  # connect) rather than falling back to plaintext. Never point this at
+  # a Redis reachable over an untrusted network.
   redis:
     existingSecret: hort-redis-creds
 

@@ -3,10 +3,15 @@
 Auto-generated from all feature plans. Last updated: 011
 
 ## Active Technologies
-- Rust 1.94+ (backend) + wasmtime 21.0+, wasmtime-wasi, wit-bindgen, git2, axum
-- PostgreSQL (existing), filesystem for WASM binaries
+- Rust 1.94+ (backend) + git2, axum
 - Rust 1.94+ + axum, sqlx, tokio, reqwest
 - Rust 1.94+ + axum, serde, serde_json
+- Planned, post-v1 (not wired into the build today — see
+  `hort-formats/README.md`): wasmtime 21.0+, wasmtime-wasi, wit-bindgen,
+  filesystem for WASM binaries. Format handlers are currently compiled-in
+  Rust structs behind `FormatHandler` (ADR 0005), not `$WASM_PLUGIN_DIR`
+  modules.
+- PostgreSQL (existing)
 
 ## Architectural Direction
 
@@ -305,9 +310,13 @@ advisory against an already-pinned crate flips the blocking CI security gate
 (`cargo audit --deny warnings`) red with **zero code or `Cargo.lock`
 changes**. Inferring the gate's result from "no dependency change" is a known
 blind spot — actually run the command; do not report the gate satisfied without
-its output. The CI security stage is `main`/`release`/`tags`-gated, so a
-feature-branch push will not surface this for you — this local check is the only
-thing that will. On a hit, prefer upgrading the flagged crate (`cargo update -p
+its output. `security:cargo-audit` runs via `.rules-code-changed` — every
+code-changing MR/branch push, not just `main`/release/tags — but its
+`changes:` trigger fires on a *diff*, not on the live advisory DB gaining a
+new entry: a docs-only or otherwise non-code-changed push won't even run the
+job, so a freshly-published advisory against your already-pinned deps stays
+invisible until something next touches a code path. This local check is the
+only thing that catches that window. On a hit, prefer upgrading the flagged crate (`cargo update -p
 <crate> --precise <fixed-version>`, `Cargo.lock`-only) over an ignore; an ignore
 must be added to **both** `.cargo/audit.toml` and `deny.toml` (the
 `security:advisory-sync` job enforces parity) and is a deliberate, justified risk
@@ -318,10 +327,14 @@ audit`.** The two tools walk the dependency graph differently: `cargo audit`
 scans the **full `Cargo.lock`**; `cargo deny` walks the **active build graph**
 (it excludes crates reachable only through unused optional features). They also
 read **separate ignore lists** (`.cargo/audit.toml` vs `deny.toml`). The CI
-`security:cargo-deny` job runs `cargo deny check` and the `security:cargo-deny`
-gate is `main`/`release`/`tags`-gated, so a feature-branch push will not surface a
-cargo-deny-only failure — this local check is the only thing that will. The
-canonical trap (rc.10, RUSTSEC-2023-0071): an advisory ignored AUDIT-ONLY in
+`security:cargo-deny` job runs `cargo deny check`, also via
+`.rules-code-changed` (every code-changing MR/branch push, same trigger as
+`security:cargo-audit` — not `main`/release/tags-only). Same blind spot as
+above applies: the `changes:` trigger needs a diff, so a build-graph shift
+caused purely by a newly-published advisory or a change elsewhere in the
+dependency resolution (not a `Cargo.lock` edit in *this* push) won't
+necessarily re-run the job — this local check is the only thing that will
+catch it. The canonical trap (rc.10, RUSTSEC-2023-0071): an advisory ignored AUDIT-ONLY in
 `.cargo/audit.toml` (deliberately not mirrored to `deny.toml` because the crate
 was reachable only via an inactive feature) **silently became a cargo-deny
 failure** when a new dependency (sigstore → openidconnect → rsa) pulled the crate
