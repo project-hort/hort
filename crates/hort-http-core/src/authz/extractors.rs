@@ -1656,7 +1656,11 @@ mod tests {
     /// `read_metrics` grant — the leak this closes is specifically that
     /// `require_principal` (authN only) does not distinguish `Enabled` from
     /// `BearerOnly`, so an authenticated-but-ungranted BearerOnly caller
-    /// must deny exactly like the `Enabled` case above.
+    /// must deny exactly like the `Enabled` case above. Same leak class,
+    /// different site: `hort_http_events`'s admin-category gate had the
+    /// identical single-arm-`Enabled` omission, closed by #109 item 1 —
+    /// see `get_events_returns_403_for_admin_only_category_under_bearer_only_with_zero_grant`
+    /// in `crates/hort-http-events/tests/handler.rs`.
     #[test]
     fn metrics_reader_extractor_denies_no_grant_under_bearer_only() {
         let status = run_async(async {

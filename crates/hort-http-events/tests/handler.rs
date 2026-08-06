@@ -159,6 +159,25 @@ fn enable_auth_with(
     )
 }
 
+/// Flip a mock context to `AuthContext::BearerOnly`
+/// (`HORT_AUTH_PROVIDER=disabled` and `HORT_NATIVE_TOKENS_ENABLED=true`)
+/// with an empty grant set — the zero-grant-token shape. #109: this arm
+/// carries a fully populated evaluator (`permission_grant_repo.list_all()`
+/// in production) just like `Enabled`; the admin-category gate must run
+/// identically under both.
+fn enable_bearer_only_auth(base: &Arc<AppContext>, mocks: &MockPorts) -> Arc<AppContext> {
+    let idp = Arc::new(MockIdentityProvider::new());
+    let users: Arc<dyn UserRepository> = mocks.users.clone();
+    let authenticate = Arc::new(AuthenticateUseCase::new(
+        idp as Arc<dyn IdentityProvider>,
+        users,
+        Vec::new(),
+    ));
+    let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![])));
+
+    with_auth(base, AuthContext::BearerOnly { authenticate, rbac })
+}
+
 fn artifact_event(repo_id: Uuid, global_pos: u64) -> PersistedEvent {
     let artifact_id = Uuid::new_v4();
     PersistedEvent {
@@ -745,6 +764,64 @@ async fn get_events_under_disabled_auth_admin_only_category_passes() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["events"].as_array().unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 15b — #109 leak pin: BearerOnly, admin-only category, zero-grant caller → 403
+// ---------------------------------------------------------------------------
+
+/// #109 regression pin. Before the fix, the admin-category gate at
+/// `handler.rs:86` was a single-arm `if let AuthContext::Enabled { rbac, .. }`
+/// that silently skipped under `BearerOnly` — a production-supported mode
+/// (`HORT_AUTH_PROVIDER=disabled` + `HORT_NATIVE_TOKENS_ENABLED=true`) whose
+/// composition arm wires a fully populated evaluator. A zero-grant token
+/// then fell through to the per-event filter's `admin_required` else-branch
+/// (`:191-193`), which assumes the upfront gate already ran, and received
+/// full unredacted admin-only pages. This mirrors test 8
+/// (`get_events_returns_403_for_admin_only_category_when_caller_not_admin`)
+/// under `BearerOnly` instead of `Enabled`. Companion prior-art pin for the
+/// same leak class: `hort_http_core::authz::extractors::
+/// metrics_reader_extractor_denies_no_grant_under_bearer_only` (#109/#113).
+#[tokio::test]
+async fn get_events_returns_403_for_admin_only_category_under_bearer_only_with_zero_grant() {
+    let (base, mocks) = new_ctx();
+    let ctx = enable_bearer_only_auth(&base, &mocks);
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=policy", user_principal()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "forbidden");
+}
+
+// ---------------------------------------------------------------------------
+// 15c — BearerOnly, admin-only category, admin-claim caller → 200
+// ---------------------------------------------------------------------------
+
+/// #109 companion to the deny-path pin above: an admin-claim caller under
+/// `BearerOnly` still reaches 200, proving the RBAC leg (not just the deny
+/// leg) is exercised identically to `Enabled` once routed through
+/// `ctx.auth.rbac()`.
+#[tokio::test]
+async fn get_events_returns_200_for_admin_only_category_under_bearer_only_when_admin() {
+    let (base, mocks) = new_ctx();
+    mocks.events.set_category(
+        StreamCategory::Policy,
+        vec![policy_event(1), policy_event(2)],
+    );
+
+    let ctx = enable_bearer_only_auth(&base, &mocks);
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=policy", admin_principal()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
 }
 
 // ---------------------------------------------------------------------------
