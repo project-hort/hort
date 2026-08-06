@@ -419,6 +419,7 @@ impl DesiredState {
         // so there is no system-role protection rule to enforce.
         push_init14_reference_errors(self, &declared_repos, &mut errors);
         push_per_policy_exclusion_duplicates(&self.exclusions, &mut errors);
+        push_scan_policy_scope_duplicates(&self.scan_policies, &mut errors);
         push_upstream_mapping_reference_errors(self, &declared_repos, &mut errors);
         push_upstream_mapping_identity_duplicates(&self.upstream_mappings, &mut errors);
         push_upstream_mapping_format_compatibility_errors(self, &mut errors);
@@ -887,12 +888,13 @@ pub fn validate_trust_upstream_publish_time_against_scan_backends(
     for env in &state.scan_policies {
         match &env.spec.scope {
             crate::scope::ScopeSpec::Repository(r) => {
-                // If two policies declare the same repository scope, the
-                // duplicate-name / duplicate-scope checks elsewhere will
-                // surface that as a separate validation error; here we
-                // keep the first-seen entry (stable iteration order) so
-                // the linter's behaviour is deterministic regardless of
-                // YAML load order.
+                // `DesiredState::validate` rejects more than one active
+                // ScanPolicy per scope before this linter ever runs, so
+                // at most one entry can exist per repository here. The
+                // `or_insert` is defensive, not a tie-break: it keeps
+                // this function total (and its own unit tests, which
+                // build a `DesiredState` directly and skip `validate`,
+                // deterministic) rather than assuming the invariant holds.
                 repo_scoped.entry(r.repository.as_str()).or_insert(env);
             }
             crate::scope::ScopeSpec::Global => {
@@ -1084,6 +1086,62 @@ fn push_upstream_mapping_identity_duplicates(
             });
         } else {
             seen.insert(key, env);
+        }
+    }
+}
+
+/// Scope-uniqueness check for `ScanPolicy`.
+///
+/// A `ScanPolicy`'s scope (`Global` or `Repository(<name>)`) is the key
+/// the runtime resolver looks up by — at most one active policy may
+/// occupy a scope, or resolution has no way to pick between them
+/// deterministically. A second same-scope policy is not merely
+/// confusing: it makes the effective policy depend on load order (or
+/// iteration order over a set, in the general case), which can silently
+/// widen the effective `scanBackends` a mapping resolves against a
+/// stricter operator intended.
+///
+/// Mirrors `push_upstream_mapping_identity_duplicates`: the standard
+/// `metadata.name` duplicate check (above, in `validate`) catches name
+/// collisions; this catches the case where two envelopes have distinct
+/// names but collapse to the same scope. Unlike that helper's pairwise
+/// "also declared by `<prior>`" message, every envelope in an offending
+/// scope gets its own error whose detail lists ALL of that scope's
+/// names — not just one other — so an operator with three colliding
+/// policies sees the full set from any one of the three errors.
+fn push_scan_policy_scope_duplicates(
+    policies: &[Envelope<ScanPolicySpec>],
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut by_scope: HashMap<Option<&str>, Vec<&Envelope<ScanPolicySpec>>> = HashMap::new();
+    for env in policies {
+        by_scope
+            .entry(env.spec.scope.repository_name())
+            .or_default()
+            .push(env);
+    }
+    for (scope, group) in &by_scope {
+        if group.len() <= 1 {
+            continue;
+        }
+        let scope_desc = match scope {
+            None => "Global".to_string(),
+            Some(repository) => format!("Repository(`{repository}`)"),
+        };
+        let mut names: Vec<&str> = group.iter().map(|e| e.metadata.name.as_str()).collect();
+        names.sort_unstable();
+        let names_joined = names.join(", ");
+        for env in group {
+            errors.push(ValidationError::Invalid {
+                kind: Kind::ScanPolicy,
+                name: env.metadata.name.clone(),
+                detail: format!(
+                    "duplicate ScanPolicy scope {scope_desc} — {} active envelopes declare it: \
+                     {names_joined} — at most one ScanPolicy may be active per scope, or \
+                     resolution has no deterministic way to choose between them",
+                    group.len(),
+                ),
+            });
         }
     }
 }
@@ -1644,6 +1702,135 @@ spec:
         )));
     }
 
+    // -- ScanPolicy scope-uniqueness rules ----------------------------------
+
+    #[test]
+    fn validate_catches_two_global_scan_policies() {
+        let files = vec![
+            (
+                p("a.yaml"),
+                sp_yaml_with_scope_and_backends("p-a", "global", &["trivy"]),
+            ),
+            (
+                p("b.yaml"),
+                sp_yaml_with_scope_and_backends("p-b", "global", &["trivy"]),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        let matching: Vec<&ValidationError> = err
+            .0
+            .iter()
+            .filter(|e| e.to_string().contains("duplicate ScanPolicy scope"))
+            .collect();
+        assert!(
+            !matching.is_empty(),
+            "expected a duplicate-scope error, got: {:?}",
+            err.0
+        );
+        for e in &matching {
+            let s = e.to_string();
+            assert!(s.contains("Global"), "must name the scope: {s}");
+            assert!(
+                s.contains("p-a") && s.contains("p-b"),
+                "must list both offending names: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_catches_two_same_repository_scan_policies() {
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (
+                p("a.yaml"),
+                sp_yaml_with_scope_and_backends("p-a", "{ repository: npm-internal }", &["trivy"]),
+            ),
+            (
+                p("b.yaml"),
+                sp_yaml_with_scope_and_backends("p-b", "{ repository: npm-internal }", &["trivy"]),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        assert!(err.0.iter().any(|e| {
+            let s = e.to_string();
+            s.contains("duplicate ScanPolicy scope")
+                && s.contains("npm-internal")
+                && s.contains("p-a")
+                && s.contains("p-b")
+        }));
+    }
+
+    #[test]
+    fn validate_allows_distinct_scan_policy_scopes() {
+        // Two different repository scopes plus one Global — every scope
+        // is occupied by exactly one policy, so this must validate clean.
+        let files = vec![
+            (p("repo-a.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (p("repo-b.yaml"), repo_yaml("pypi-internal", "hosted", None)),
+            (
+                p("a.yaml"),
+                sp_yaml_with_scope_and_backends("p-a", "{ repository: npm-internal }", &["trivy"]),
+            ),
+            (
+                p("b.yaml"),
+                sp_yaml_with_scope_and_backends("p-b", "{ repository: pypi-internal }", &["trivy"]),
+            ),
+            (
+                p("g.yaml"),
+                sp_yaml_with_scope_and_backends("p-global", "global", &["trivy"]),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        assert!(
+            state.validate().is_ok(),
+            "distinct scopes (two repositories + Global) must not collide: {:?}",
+            state.validate().err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_the_gate2_collapse_combination() {
+        // The exact bypass the ADR 0016 linter exists to fail-closed
+        // reject: a strict Global policy (scan_backends: [trivy]) and a
+        // second, permissive Global policy (scan_backends: []) both pass
+        // per-spec validation individually. Without the scope-uniqueness
+        // rule, the runtime resolver's iteration order — not the
+        // operator's intent — decides which one governs a
+        // `trustUpstreamPublishTime: true` mapping, silently collapsing
+        // the quarantine observation window. This must now fail at
+        // apply, before the linter ever runs.
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-public", "proxy", None)),
+            (
+                p("strict.yaml"),
+                sp_yaml_with_scope_and_backends("p-strict", "global", &["trivy"]),
+            ),
+            (
+                p("open.yaml"),
+                sp_yaml_with_scope_and_backends("p-open", "global", &[]),
+            ),
+            (
+                p("um.yaml"),
+                um_yaml_with_trust_pt("npm-up", "npm-public", "https://registry.npmjs.org", true),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        assert!(
+            err.0.iter().any(|e| {
+                let s = e.to_string();
+                s.contains("duplicate ScanPolicy scope")
+                    && s.contains("Global")
+                    && s.contains("p-strict")
+                    && s.contains("p-open")
+            }),
+            "the Gate-2 collapse combination must fail on the duplicate-scope error, got: {:?}",
+            err.0
+        );
+    }
+
     // -- exclusion duplicate identity rules --------------------------------
 
     #[test]
@@ -1669,9 +1856,15 @@ spec:
         // Identity is per-policy: `(p1, CVE-1, x)` and `(p2, CVE-1, x)`
         // are independent exclusions — operators may declare the same
         // CVE-pattern under multiple parent policies without conflict.
+        // `p1`/`p2` need distinct scopes (only one ScanPolicy may be
+        // active per scope) — scope has no bearing on exclusion
+        // identity, which is what this test actually exercises.
         let files = vec![
             (p("p1.yaml"), sp_yaml("p1")),
-            (p("p2.yaml"), sp_yaml("p2")),
+            (
+                p("p2.yaml"),
+                sp_yaml_with_scope_and_backends("p2", "{ repository: other-repo }", &["trivy"]),
+            ),
             (p("a.yaml"), ex_yaml("ex-on-p1", "p1", "CVE-1", Some("xz*"))),
             (p("b.yaml"), ex_yaml("ex-on-p2", "p2", "CVE-1", Some("xz*"))),
         ];

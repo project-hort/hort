@@ -257,7 +257,14 @@ mod tests {
         let h = build_harness();
         let mut desired = DesiredState::default();
         desired.scan_policies.push(scan_policy_env("p1"));
-        desired.scan_policies.push(scan_policy_env("p2"));
+        // Distinct scope from p1 — only one ScanPolicy may be active per
+        // scope; scope has no bearing on what this test exercises
+        // (append-conflict abort), so any distinct scope will do.
+        let mut p2 = scan_policy_env("p2");
+        p2.spec.scope = ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+            repository: "other-repo".into(),
+        });
+        desired.scan_policies.push(p2);
         // Inject a Conflict on the very first append (the create of p1).
         h.events.schedule_conflict_on_next_append();
 
