@@ -687,6 +687,34 @@ mod tests {
         crate::middleware::auth::test_support::inject_principal(req, p.clone());
     }
 
+    /// Seed `GrantSubject::User(target_id)` grants for the given
+    /// permissions onto the router's live RBAC evaluator. The admin-mint
+    /// cap-vs-authority walk authorizes declared permissions against the
+    /// TARGET service account's own grants, not the admin caller's
+    /// — an admin-mint success test needs the target seeded here,
+    /// not the admin.
+    fn grant_target_permissions(ctx: &AppContext, target_id: Uuid, perms: &[Permission]) {
+        use hort_app::rbac::RbacEvaluator;
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::rbac::{GrantSubject, PermissionGrant};
+        let crate::context::AuthContext::Enabled { rbac, .. } = &ctx.auth else {
+            panic!("grant_target_permissions requires AuthContext::Enabled");
+        };
+        let grants: Vec<PermissionGrant> = perms
+            .iter()
+            .map(|perm| PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::User(target_id),
+                repository_id: None,
+                permission: *perm,
+                created_at: Utc::now(),
+                managed_by: ManagedBy::Local,
+                managed_by_digest: None,
+            })
+            .collect();
+        rbac.store(Arc::new(RbacEvaluator::new(grants)));
+    }
+
     fn happy_request_body() -> &'static str {
         r#"{"name":"ci","declared_permissions":["read","write"],"expires_in_days":90}"#
     }
@@ -974,7 +1002,7 @@ mod tests {
         let admin_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
         let principal = principal_with_claims(admin_id, &["admin"]);
-        let (router, mocks, _) = router_with_principal(&principal);
+        let (router, mocks, ctx) = router_with_principal(&principal);
         mocks.users.insert(User {
             id: target_id,
             username: "ci-bot".into(),
@@ -989,6 +1017,10 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        // The admin-mint cap-vs-authority walk authorizes `happy_request_
+        // body()`'s declared [read, write] against the TARGET's own
+        // grants, not the admin caller's — seed them here.
+        grant_target_permissions(&ctx, target_id, &[Permission::Read, Permission::Write]);
         let mut req = Request::post(format!("/admin/users/{target_id}/tokens"))
             .header("content-type", "application/json")
             .body(Body::from(happy_request_body()))
