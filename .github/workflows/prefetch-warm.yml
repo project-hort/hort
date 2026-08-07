@@ -54,7 +54,7 @@ jobs:
       # On `schedule`/`workflow_dispatch` the default ref is the default
       # branch (main); the lock we must warm is develop's — the next
       # release's lock (main's is a historical subset of it at promotion).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: develop
 
