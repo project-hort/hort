@@ -3210,7 +3210,7 @@ deployment the only registered kind is `"scan"`.
 | `hort_admin_tasks_duration_seconds` | histogram | `kind` | seconds | wall-clock time from claim to outcome recording, wrapping `TaskHandler::run` |
 | `hort_admin_tasks_in_flight` | gauge | `kind` | tasks | incremented before `TaskHandler::run`, decremented after; 0 when idle |
 | `hort_admin_tasks_pending_eligible` | gauge | `kind` | jobs | claim-eligible pending rows per kind (`status='pending'` and the lock free/expired), set once per starvation audit (every 60 s). Covers **every** kind present in `jobs`, including kinds this worker does not claim |
-| `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
+| `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed, oldest_row_stalled}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
 | `hort_admin_tasks_claim_unmappable_total` | counter | (none) | — | emitted by the Postgres jobs adapter: one increment per claimed row that failed `JobRow` projection and was resolved terminally instead of being stranded in `running` |
 
 **Starvation semantics** (issue #131). A `provenance-verify` backlog once
@@ -3233,6 +3233,18 @@ closes that hole:
   `priority DESC, created_at ASC` claim race on every poll for the whole
   window (a higher-priority tier, or an older same-priority backlog,
   saturating `batch_size` at every poll instant).
+- `reason="oldest_row_stalled"` — the kind's single oldest eligible row has
+  aged past the threshold, **independent of `last_claimed`**. This axis
+  catches a shape the two above cannot: the kind IS registered and IS being
+  claimed every poll (so `not_claimed`/`unregistered` stay silent), but a
+  sustained higher-priority stream of the SAME kind claims only fresh rows
+  every time, leaving one old low-priority row to rot indefinitely behind
+  them. The claim query's reserved-oldest-slot fairness shape (one claim
+  slot per poll reserved for the single oldest eligible row across kinds,
+  regardless of priority) bounds this in the common case; this metric is
+  the backstop that still fires if a kind is starved by some other means
+  (e.g. it is excluded from `claim_pending_by_kinds`'s `kind = ANY($1)`
+  filter for a different reason than being fully unregistered).
 
 Operators alarm on `increase(hort_admin_tasks_starved_total[15m]) > 0`.
 `hort_admin_tasks_pending_eligible` is the accompanying depth signal.

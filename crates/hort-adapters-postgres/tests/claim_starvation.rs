@@ -436,3 +436,66 @@ async fn eligible_pending_by_kind_mirrors_the_claim_eligibility_predicate() {
         "a pending row whose lock has EXPIRED is claim-eligible"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F2 — reserved-oldest-slot fairness bounds the starvation window
+// ---------------------------------------------------------------------------
+
+/// The exact shape the priority race would otherwise reproduce forever: an
+/// old, low-priority backlog of a kind sitting behind a SUSTAINED stream of
+/// fresh high-priority rows of the SAME kind. Before the reserved-oldest
+/// slot, `ORDER BY priority DESC, created_at ASC LIMIT batch_size` never
+/// reaches the old rows as long as the fresh stream keeps saturating every
+/// slot — an unbounded stall. One claim slot per poll is now reserved for
+/// the single globally oldest eligible row across the claimed kinds,
+/// regardless of priority, so as long as the old rows remain older than
+/// every freshly-inserted row (true here: the fresh stream is inserted with
+/// `age_secs = 0` on every iteration), each poll claims at least one of
+/// them. The bound is exact — one old row per poll — not a generous
+/// estimate, so a regression back to unbounded starvation fails this test
+/// well before any timeout would.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn reserved_oldest_slot_drains_an_old_backlog_under_a_sustained_high_priority_stream() {
+    let Some(pool) = isolated_pool().await else {
+        return;
+    };
+    let repo = PgJobsRepository::new(pool.clone());
+
+    const OLD_ROWS: usize = 12;
+    // Comfortably more than `BATCH_SIZE - 1`, so the priority-ordered
+    // slots are saturated by the fresh stream on every single poll and
+    // never spill over into the old backlog on their own.
+    const FRESH_PER_POLL: usize = 8;
+    const BATCH_SIZE: u16 = REAL_BATCH_SIZE;
+    const MAX_POLLS: usize = OLD_ROWS;
+
+    seed_provenance(&pool, OLD_ROWS, 0, 7200).await;
+
+    let kinds = ["provenance-verify"];
+    const REMAINING_OLD_PREDICATE: &str =
+        "kind = 'provenance-verify' AND priority = 0 AND status = 'pending'";
+
+    let mut polls_used = 0;
+    for poll in 1..=MAX_POLLS {
+        seed_provenance(&pool, FRESH_PER_POLL, 10, 0).await;
+        repo.claim_pending_by_kinds(&kinds, BATCH_SIZE, "w", Duration::from_secs(900))
+            .await
+            .expect("claim");
+        polls_used = poll;
+        if count_where(&pool, REMAINING_OLD_PREDICATE).await == 0 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        count_where(&pool, REMAINING_OLD_PREDICATE).await,
+        0,
+        "the old prio-0 backlog must fully drain within {MAX_POLLS} polls under a sustained \
+         prio-10 stream of the same kind ({polls_used} polls actually used)",
+    );
+    assert!(
+        polls_used <= MAX_POLLS,
+        "drain took {polls_used} polls, exceeding the hard bound of {MAX_POLLS}",
+    );
+}
