@@ -29,6 +29,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }
 # `save_managed` does a global `DELETE FROM permission_grants WHERE
 # managed_by='gitops'` full reconcile, so the `save_managed_*` tests
 # corrupt each other's preconditions when `cargo test --lib` runs them
