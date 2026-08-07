@@ -261,6 +261,13 @@ services:
       # over plain http:// and gets refused without this opt-in. Production
       # MUST leave it UNSET (secure default: PAT-over-HTTP refused).
       HORT_BEARER_ALLOW_OVER_HTTP: "true"
+      # DANGER (dev/CI only, pairs with the transport opt-in above): native
+      # API tokens are validated only when this flag is on — without it the
+      # auth middleware has NO PAT branch, so the harness's admin-minted
+      # `hort_svc_*` scrape token can be ISSUED but never AUTHENTICATED
+      # (401 "invalid or expired token" on /metrics). Production enables
+      # this deliberately per ADR 0012, not as a default.
+      HORT_NATIVE_TOKENS_ENABLED: "true"
       # `/metrics` has no anonymous-scrape opt-out — the e2e harness's
       # metrics-content assertions (`assert_metric_ingest` in
       # scripts/native-tests/lib/common.sh) probe it without a bearer and
