@@ -141,7 +141,7 @@ async fn task_invoke_with_params_file_sends_body() {
 
     let mut server = Server::new_async().await;
     let m = server
-        .mock("POST", "/api/v1/admin/tasks/scan")
+        .mock("POST", "/api/v1/admin/tasks/retention-purge")
         .match_body(mockito::Matcher::JsonString(
             r#"{"repo_id":"abc-123","priority":5}"#.to_string(),
         ))
@@ -153,7 +153,7 @@ async fn task_invoke_with_params_file_sends_body() {
 
     let client = test_client(&server.url());
     let args = TaskInvokeArgs {
-        kind: "scan".to_string(),
+        kind: "retention-purge".to_string(),
         params_file: Some(params_path),
         idempotency_key: None,
         idempotency_key_window: None,

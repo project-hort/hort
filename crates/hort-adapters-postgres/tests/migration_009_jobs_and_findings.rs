@@ -150,6 +150,10 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
     // adapter → DB path). The in-place-edited 009 file IS the source of
     // truth and this fixture follows it.
     let all_kinds = [
+        // Written only by `enqueue_scan` (which supplies the scan-typed
+        // columns), so it is intentionally absent from
+        // `VALID_TASK_KINDS` — a DB-CHECK-only kind on the admin-invoke
+        // axis, same asymmetry as `verify-event-chain` below.
         "scan",
         "cron-rescan-tick",
         "advisory-watch-tick",

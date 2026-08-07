@@ -125,7 +125,8 @@ impl TaskParams for StagingSweepParams {
 ///
 /// `KIND` is deliberately set to `""` — the `invoke` handler reads the
 /// kind from a fixed associated constant on the *concrete* type at each
-/// `Router::route` call site (e.g. `.route(".../scan", post(invoke::<ScanRawParams>))`).
+/// `Router::route` call site (e.g.
+/// `.route(".../retention-purge", post(invoke::<RetentionPurgeRawParams>))`).
 /// `RawTaskParams` itself must never be instantiated directly at a route
 /// that requires a specific kind; each of the six untyped routes uses a
 /// distinct newtype below.
@@ -174,7 +175,6 @@ macro_rules! raw_kind {
     };
 }
 
-raw_kind!(ScanRawParams, "scan");
 raw_kind!(CronRescanTickRawParams, "cron-rescan-tick");
 raw_kind!(AdvisoryWatchTickRawParams, "advisory-watch-tick");
 raw_kind!(RetentionEvaluateRawParams, "retention-evaluate");
@@ -255,7 +255,6 @@ mod tests {
 
     #[test]
     fn raw_kind_constants() {
-        assert_eq!(ScanRawParams::KIND, "scan");
         assert_eq!(CronRescanTickRawParams::KIND, "cron-rescan-tick");
         assert_eq!(AdvisoryWatchTickRawParams::KIND, "advisory-watch-tick");
         assert_eq!(RetentionEvaluateRawParams::KIND, "retention-evaluate");
@@ -271,7 +270,7 @@ mod tests {
 
     #[test]
     fn raw_params_validate_always_ok() {
-        let p = ScanRawParams::default();
+        let p = CronRescanTickRawParams::default();
         assert!(p.validate().is_ok());
     }
 

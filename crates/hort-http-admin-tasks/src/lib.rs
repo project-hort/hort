@@ -8,7 +8,6 @@
 //!
 //! ```text
 //! POST   /                           → invoke::<NoopParams>         (noop)
-//! POST   /scan                       → invoke::<ScanRawParams>
 //! POST   /cron-rescan-tick           → invoke::<CronRescanTickRawParams>
 //! POST   /advisory-watch-tick        → invoke::<AdvisoryWatchTickRawParams>
 //! POST   /retention-evaluate         → invoke::<RetentionEvaluateRawParams>
@@ -48,8 +47,8 @@ use handlers::list::list_tasks;
 use params::{
     AdvisoryWatchTickRawParams, CronRescanTickRawParams, EventstoreArchiveRawParams,
     EventstoreCheckpointRawParams, NoopParams, ReplaySeenPruneRawParams,
-    RetentionEvaluateRawParams, RetentionPurgeRawParams, ScanRawParams,
-    ScannerRegistryPruneRawParams, ServiceAccountRotationRawParams, StagingSweepParams,
+    RetentionEvaluateRawParams, RetentionPurgeRawParams, ScannerRegistryPruneRawParams,
+    ServiceAccountRotationRawParams, StagingSweepParams,
 };
 
 pub mod dto;
@@ -67,7 +66,6 @@ pub fn router() -> Router<Arc<AppContext>> {
     Router::new()
         // --- task-kind invoke endpoints ---
         .route("/noop", post(invoke::<NoopParams>))
-        .route("/scan", post(invoke::<ScanRawParams>))
         .route("/cron-rescan-tick", post(invoke::<CronRescanTickRawParams>))
         .route(
             "/advisory-watch-tick",

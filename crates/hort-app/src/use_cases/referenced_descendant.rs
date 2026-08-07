@@ -27,6 +27,13 @@
 //!   under `Required` with a closed window the artifact is TERMINALLY
 //!   REJECTED — the unsafe direction. A failed lookup must fail the job
 //!   (dispatcher retries), never silently reject.
+//!
+//! A third caller — the release sweep's expiry backstop — reads the same
+//! reference set through the narrower
+//! [`is_parent_gated_blob_constituent`], which decides whether the final
+//! `provenance-verify` enqueue can be SKIPPED as provably state-neutral.
+//! It also propagates a lookup failure: `false` there re-creates the
+//! churn the skip exists to remove, `true` would strand the candidate.
 
 use hort_domain::ports::content_reference_index::ContentReference;
 
@@ -56,6 +63,71 @@ const SELF_REFERENTIAL_KINDS: [&str; 2] = ["primary_content", "metadata_blob"];
 pub(crate) fn is_referenced_tree_descendant(refs: &[ContentReference]) -> bool {
     refs.iter()
         .any(|r| !SELF_REFERENTIAL_KINDS.contains(&r.kind.as_str()))
+}
+
+/// `content_references.kind` values whose TARGET is an OCI **blob** — a
+/// manifest's config blob or one of its layer blobs.
+///
+/// The set is deliberately narrow. It is not "the tree-edge kinds"; it
+/// is "the tree-edge kinds whose target can never be the subject of an
+/// attestation". `oci_index_member` and `oci_subject` both target a
+/// *manifest*, and a manifest CAN acquire its own signature later; a
+/// blob cannot (the OCI referrers `subject` is a manifest descriptor,
+/// and cosign signs manifest digests).
+const PARENT_GATE_BLOB_KINDS: [&str; 2] = ["oci_config", "oci_layer"];
+
+/// Is this artifact a **parent-gated blob constituent** — a config/layer
+/// blob whose only inbound edges are its parent manifest's, so no verify
+/// run can ever reach a verdict other than the parent-gated hold?
+///
+/// `refs` is the result of
+/// `ContentReferenceIndex::find_by_target(repo, hash, None)` (the
+/// unfiltered kind set) for the artifact's own content hash — the SAME
+/// input as [`is_referenced_tree_descendant`], of which this is a strict
+/// subset (true here ⇒ true there).
+///
+/// True iff BOTH hold:
+///
+/// - at least one row carries a kind in [`PARENT_GATE_BLOB_KINDS`] (the
+///   artifact really is a manifest's blob constituent), and
+/// - EVERY row carries a kind in [`SELF_REFERENTIAL_KINDS`] ∪
+///   [`PARENT_GATE_BLOB_KINDS`] — no `oci_subject` (an attestation
+///   points at this artifact), no `oci_index_member` (this artifact is a
+///   child *manifest*, which can be signed in its own right), and no
+///   unknown/future kind.
+///
+/// # Why the "every row" clause, and why the allowlist is closed
+///
+/// The one consumer is the release sweep's expiry backstop, which uses
+/// this to SKIP enqueueing a final `provenance-verify`. Skipping is the
+/// direction that can strand an artifact, so the predicate must be true
+/// only where the skipped job is provably state-neutral:
+///
+/// - a `NoAttestation × Required` verdict on a referenced-tree
+///   descendant is HELD, not terminal
+///   ([`Artifact::complete_provenance`](hort_domain::entities::artifact::Artifact::complete_provenance));
+/// - a `Verified` / `Rejected` verdict requires attestation material,
+///   and no attestation can ever target a blob;
+/// - so the only verdicts left for a blob constituent are the hold —
+///   which changes nothing — and the fail-closed
+///   `Rejected{RekorNotFound}` a *fetch failure* produces, which is
+///   pure harm on a candidate that had nothing to fetch.
+///
+/// The inverse conservatism to [`is_referenced_tree_descendant`] is
+/// deliberate: there, an unknown kind counts AS a descendant (hold-safe);
+/// here, an unknown kind disqualifies the skip (enqueue-safe). Both
+/// directions default to "do not terminally decide this artifact".
+pub(crate) fn is_parent_gated_blob_constituent(refs: &[ContentReference]) -> bool {
+    let mut saw_blob_edge = false;
+    for r in refs {
+        let kind = r.kind.as_str();
+        if PARENT_GATE_BLOB_KINDS.contains(&kind) {
+            saw_blob_edge = true;
+        } else if !SELF_REFERENTIAL_KINDS.contains(&kind) {
+            return false;
+        }
+    }
+    saw_blob_edge
 }
 
 #[cfg(test)]
@@ -144,5 +216,118 @@ mod tests {
     #[test]
     fn unknown_kind_is_treated_as_a_descendant() {
         assert!(is_referenced_tree_descendant(&[reference("future_kind")]));
+    }
+
+    // -- is_parent_gated_blob_constituent -----------------------------
+
+    #[test]
+    fn no_references_at_all_is_not_a_parent_gated_blob() {
+        assert!(!is_parent_gated_blob_constituent(&[]));
+    }
+
+    /// The purged-parent fallback in predicate form: once the parent's
+    /// edges are gone, only the artifact's own refcount rows remain and
+    /// the skip stops applying, so the expiry backstop resumes and the
+    /// artifact settles terminally.
+    #[test]
+    fn own_refcount_rows_alone_are_not_a_parent_gated_blob() {
+        assert!(!is_parent_gated_blob_constituent(&[
+            reference("primary_content"),
+            reference("metadata_blob"),
+        ]));
+    }
+
+    #[test]
+    fn each_blob_edge_kind_is_a_parent_gated_blob() {
+        for kind in PARENT_GATE_BLOB_KINDS {
+            assert!(
+                is_parent_gated_blob_constituent(&[reference("primary_content"), reference(kind)]),
+                "kind {kind} must count as a parent-gated blob constituent"
+            );
+        }
+    }
+
+    /// Mixed tree, shared blob: two parents' layer edges on one blob.
+    /// Still parent-gated — held is correct while ANY live parent is
+    /// unresolved, and the skip does not depend on how many there are.
+    #[test]
+    fn two_parents_layer_edges_on_one_blob_stay_parent_gated() {
+        assert!(is_parent_gated_blob_constituent(&[
+            reference("primary_content"),
+            reference("oci_layer"),
+            reference("oci_layer"),
+        ]));
+    }
+
+    /// A child manifest is NOT a blob: it can be signed in its own
+    /// right, so a verify of it can still reach a real verdict.
+    #[test]
+    fn index_member_is_not_a_parent_gated_blob() {
+        assert!(!is_parent_gated_blob_constituent(&[reference(
+            "oci_index_member"
+        )]));
+    }
+
+    /// The strand case the narrow set exists to prevent: an artifact an
+    /// attestation points at (`oci_subject`) is a verify away from being
+    /// cleared, so it must keep the expiry backstop even though the
+    /// broader descendant predicate also fires for it.
+    #[test]
+    fn an_attestation_subject_is_not_a_parent_gated_blob() {
+        assert!(!is_parent_gated_blob_constituent(&[
+            reference("primary_content"),
+            reference("oci_subject"),
+        ]));
+        // …and the same holds when it is ALSO a blob constituent: one
+        // attestation-bearing edge disqualifies the whole skip.
+        assert!(!is_parent_gated_blob_constituent(&[
+            reference("oci_layer"),
+            reference("oci_subject"),
+        ]));
+    }
+
+    /// Inverse conservatism to [`is_referenced_tree_descendant`]: an
+    /// unknown kind counts as a descendant there (hold-safe) but
+    /// disqualifies the skip here (enqueue-safe).
+    #[test]
+    fn unknown_kind_disqualifies_the_parent_gated_skip() {
+        assert!(!is_parent_gated_blob_constituent(&[
+            reference("oci_layer"),
+            reference("future_kind"),
+        ]));
+    }
+
+    /// Subset invariant: every reference set the skip fires on is also a
+    /// referenced-tree descendant, i.e. the skipped verify would have
+    /// been HELD by `complete_provenance` rather than deciding anything.
+    /// A future edit that widened the skip beyond the hold arm would
+    /// break this.
+    #[test]
+    fn parent_gated_blobs_are_always_referenced_tree_descendants() {
+        let kinds = [
+            "primary_content",
+            "metadata_blob",
+            "oci_config",
+            "oci_layer",
+            "oci_index_member",
+            "oci_subject",
+            "future_kind",
+        ];
+        // Every non-empty subset of the kind space, as reference sets.
+        for mask in 1u32..(1 << kinds.len()) {
+            let refs: Vec<ContentReference> = kinds
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, k)| reference(k))
+                .collect();
+            if is_parent_gated_blob_constituent(&refs) {
+                assert!(
+                    is_referenced_tree_descendant(&refs),
+                    "skip fired on a set the hold arm would not hold: {:?}",
+                    refs.iter().map(|r| &r.kind).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 }

@@ -307,7 +307,19 @@ impl RepositoryUpstreamMappingChanged {
 /// `TaskInvoked::validate` and `TaskFailed::validate` reject any kind not
 /// in this set.
 pub const VALID_TASK_KINDS: &[&str] = &[
-    "scan",
+    // NOTE — `"scan"` is deliberately ABSENT, exactly like
+    // `verify-event-chain`: it is a valid `jobs.kind` (it stays in the
+    // migration's CHECK list) but not an admin-invokable one. A scan row
+    // is only well-formed when it carries the four scan-typed columns
+    // (`artifact_id`, `repository_id`, `content_hash`, `format`), which
+    // ONLY `JobsRepository::enqueue_scan` writes. The generic admin
+    // enqueue path (`TaskUseCase::enqueue` → `enqueue_task`) writes none
+    // of them, so a bare `"scan"` invoke could only ever produce a row
+    // the claim's `decide_kind_fields` must reject — the row should
+    // never exist rather than be terminally resolved after the fact.
+    // Operator-driven rescans go through
+    // `POST /api/v1/artifacts/:id/rescan` (`ManualRescanUseCase`), which
+    // uses `enqueue_scan`.
     "cron-rescan-tick",
     "advisory-watch-tick",
     "retention-evaluate",

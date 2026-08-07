@@ -982,6 +982,31 @@ mod tests {
         );
     }
 
+    /// `"scan"` is rejected at the generic enqueue. The row this would
+    /// have written carries none of the four scan-typed columns the
+    /// claim's `decide_kind_fields` requires, so it could only ever be
+    /// an unclaimable row — the source is closed here rather than
+    /// terminally resolved at claim time. Operator rescans use
+    /// `ManualRescanUseCase` → `JobsRepository::enqueue_scan`.
+    #[tokio::test]
+    async fn enqueue_rejects_bare_scan_kind() {
+        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
+        let events: Arc<EventStorePublisher> =
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
+        let rbac = rbac_with_task_invoke();
+        let use_case = TaskUseCase::new(jobs, events, rbac);
+
+        let actor = caller_with_task_admin_role();
+        let result = use_case
+            .enqueue(&actor, "scan", &serde_json::json!({}), None)
+            .await;
+
+        assert!(
+            matches!(result, Err(AppError::Domain(DomainError::Validation(_)))),
+            "a bare scan enqueue must be refused, not written as a poison row; got {result:?}"
+        );
+    }
+
     /// Test 9 — event-store append failure triggers compensating delete.
     #[tokio::test]
     async fn enqueue_event_store_failure_triggers_compensating_delete() {
@@ -1024,7 +1049,7 @@ mod tests {
         let actor = caller_with_task_admin_role();
         let params = serde_json::json!({"target": "npm-registry", "limit": 42});
         use_case
-            .enqueue(&actor, "scan", &params, None)
+            .enqueue(&actor, "cron-rescan-tick", &params, None)
             .await
             .unwrap();
 

@@ -28,6 +28,7 @@ use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInva
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::ingest_use_case::CLEARANCE_VERIFY_PRIORITY;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
@@ -183,7 +184,9 @@ pub struct QuarantineUseCase {
     /// best-effort, non-gating (warn-and-continue) and idempotent per
     /// tick via [`JobsRepository::find_active_provenance_for_artifact`] —
     /// it never blocks the sweep and never releases a `Pending`
-    /// candidate.
+    /// candidate. Parent-gated blob constituents are skipped entirely
+    /// (see the call site) — for them the enqueued verify is
+    /// state-neutral by construction.
     jobs: Arc<dyn JobsRepository>,
 }
 
@@ -1421,8 +1424,57 @@ impl QuarantineUseCase {
             // already-in-flight `provenance-verify` job for this
             // artifact), so repeated ticks between the enqueue and the
             // worker running it do not pile up duplicate open rows.
+            //
+            // **Parent-gated blob constituents are skipped.** A config /
+            // layer blob bound by a parent manifest can never carry an
+            // attestation of its own (the OCI referrers `subject` is a
+            // manifest descriptor; cosign signs manifest digests), so the
+            // verify this would enqueue has exactly two reachable
+            // outcomes: the referenced-tree-descendant HOLD — which
+            // changes no state at all, and which every subsequent tick
+            // would re-enqueue forever — or, on a proxy scope whose
+            // upstream referrer fetch errors, the fail-closed
+            // `Rejected{RekorNotFound}` that `apply_fetch_failure`
+            // produces regardless of the descendant flag. The first is
+            // waste; the second is a terminal rejection of a held blob
+            // caused by infra flakiness on a fetch that had nothing to
+            // find. Neither is a backstop. The blob's terminal state
+            // comes from its parent instead: the cascade clears it when
+            // the parent verifies (ADR 0039), and if the parent goes away
+            // (purge / manifest DELETE both sweep EVERY kind of the
+            // source's edges) the predicate below stops firing on the very
+            // next tick and the backstop resumes — so a blob whose parent
+            // no longer exists still settles terminally.
+            //
+            // The skip set is deliberately narrower than the hold arm's
+            // `is_referenced_descendant`: an artifact an attestation
+            // points at (`oci_subject`) or a child *manifest*
+            // (`oci_index_member`) can still be cleared by a verify, so
+            // it keeps the backstop.
             if matches!(provenance, ProvenanceClearance::Pending) {
-                self.enqueue_final_provenance_verify(artifact_id).await;
+                // INVARIANT: this lookup PROPAGATES its error, matching
+                // the verdict-side resolve in
+                // `ProvenanceOrchestrationUseCase::verify_artifact`.
+                // Neither degraded default is safe here: `false` (assume
+                // "not a parent-gated blob") re-creates the per-tick
+                // enqueue flood this skip exists to remove, and `true`
+                // (assume "skip") would suppress the backstop for a
+                // candidate that may have no parent at all — the strand
+                // direction. A failed read aborts this sweep tick; the
+                // sweep is re-driven on the next one.
+                let refs = self
+                    .content_references
+                    .find_by_target(repository_id, &artifact.sha256_checksum, None)
+                    .await?;
+                if is_parent_gated_blob_constituent(&refs) {
+                    tracing::debug!(
+                        artifact_id = %artifact_id,
+                        "expiry backstop: parent-gated blob constituent; no verify enqueued \
+                         (its clearance comes from the parent's cascade)"
+                    );
+                } else {
+                    self.enqueue_final_provenance_verify(artifact_id).await;
+                }
             }
 
             // Construct the real release
@@ -1746,6 +1798,7 @@ mod tests {
         system_actor, Actor, DomainEvent, PersistedEvent, PolicyResult, PolicyScope, ReleaseReason,
         SeveritySummary, StreamId,
     };
+    use hort_domain::ports::content_reference_index::ContentReference;
     use hort_domain::ports::event_store::ExpectedVersion;
     use uuid::Uuid;
 
@@ -1915,6 +1968,34 @@ mod tests {
         Arc<MockPolicyProjectionRepository>,
         Arc<MockJobsRepository>,
     ) {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs, _refs) =
+            make_use_case_with_jobs_and_refs();
+        (
+            uc,
+            artifacts,
+            events,
+            lifecycle,
+            repositories,
+            projections,
+            jobs,
+        )
+    }
+
+    /// [`make_use_case_with_jobs`] plus the
+    /// [`MockContentReferenceIndex`] handle, so the expiry-backstop
+    /// skip tests can seed the inbound edge set the S4 site reads (and
+    /// arm a lookup failure on it).
+    #[allow(clippy::type_complexity)]
+    fn make_use_case_with_jobs_and_refs() -> (
+        QuarantineUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockEventStore>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+        Arc<MockJobsRepository>,
+        Arc<MockContentReferenceIndex>,
+    ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let scan_findings = Arc::new(MockScanFindingsRepository::new());
@@ -1946,6 +2027,7 @@ mod tests {
             repositories,
             projections,
             jobs,
+            content_references,
         )
     }
 
@@ -4527,6 +4609,230 @@ mod tests {
             jobs.enqueue_calls().is_empty(),
             "VerifyIfPresent (NotRequired) never triggers the S4 backstop"
         );
+    }
+
+    // =====================================================================
+    // S4 skip — parent-gated blob constituents. The final verify is
+    // enqueued for every Required + Pending candidate EXCEPT a config /
+    // layer blob whose only inbound edges are its parent manifest's:
+    // for those the job is state-neutral by construction (the verdict is
+    // the descendant hold), so re-enqueueing it every tick is pure churn.
+    // The skip is decided per tick against the LIVE edge set, which is
+    // what keeps it from stranding anything.
+    // =====================================================================
+
+    /// Seed one inbound `content_references` edge of `kind` targeting
+    /// `artifact_id`'s content hash — i.e. "some other artifact
+    /// references this one this way".
+    async fn seed_inbound_edge(
+        refs: &Arc<MockContentReferenceIndex>,
+        artifacts: &Arc<MockArtifactRepository>,
+        artifact_id: Uuid,
+        kind: &str,
+    ) {
+        let artifact = artifacts.get(artifact_id).expect("seeded artifact");
+        let reference = ContentReference {
+            source_artifact_id: Uuid::new_v4(),
+            target_content_hash: artifact.sha256_checksum.clone(),
+            kind: kind.to_string(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            repository_id: artifact.repository_id,
+            recorded_at: Utc::now(),
+        };
+        refs.insert(reference).await.expect("seed inbound edge");
+    }
+
+    /// Build the standard `Required` + `Pending` + past-deadline S4
+    /// candidate and return `(fixture handles, artifact_id)`.
+    #[allow(clippy::type_complexity)]
+    fn s4_pending_candidate() -> (
+        QuarantineUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockJobsRepository>,
+        Arc<MockContentReferenceIndex>,
+        Uuid,
+    ) {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, jobs, refs) =
+            make_use_case_with_jobs_and_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        (uc, artifacts, jobs, refs, artifact_id)
+    }
+
+    /// The churn close: a layer blob bound by a parent manifest gets NO
+    /// final verify. The job it would enqueue always completes as the
+    /// referenced-tree-descendant hold, so every tick re-enqueued a
+    /// job that could not change the artifact's state.
+    #[tokio::test]
+    async fn release_expired_skips_the_backstop_for_a_parent_gated_layer_blob() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "primary_content").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(released.is_empty(), "a Pending candidate is never released");
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "a parent-gated layer blob must not re-enqueue a verify that can only hold"
+        );
+    }
+
+    /// Same for a config blob — the other manifest→blob edge kind.
+    #[tokio::test]
+    async fn release_expired_skips_the_backstop_for_a_parent_gated_config_blob() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_config").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(jobs.enqueue_calls().is_empty());
+    }
+
+    /// Mixed tree, shared blob: two parent manifests reference the same
+    /// layer. Held is correct while ANY live parent is unresolved, and
+    /// the skip holds regardless of how many parents there are.
+    #[tokio::test]
+    async fn release_expired_skips_the_backstop_for_a_blob_shared_by_two_parents() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(jobs.enqueue_calls().is_empty());
+    }
+
+    /// The purged-parent fallback, pinned. Purge and manifest DELETE
+    /// both sweep EVERY kind of the source artifact's edges, so once the
+    /// parent is gone the candidate's inbound set is its own refcount
+    /// rows only — the skip stops applying on the very next tick and the
+    /// backstop resumes, which is what lets the orphan settle terminally
+    /// instead of stranding as `Pending` forever.
+    #[tokio::test]
+    async fn release_expired_reenqueues_the_backstop_once_the_parent_edges_are_gone() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        // Only the artifact's own refcount row survives the parent's purge.
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "primary_content").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            jobs.enqueue_calls().len(),
+            1,
+            "with no live parent edge the candidate must get its terminal verify"
+        );
+        assert_eq!(jobs.enqueue_calls()[0].0, "provenance-verify");
+    }
+
+    /// The strand case the narrow skip set exists to prevent: an
+    /// artifact an attestation points at is one verify away from being
+    /// CLEARED, so it keeps the backstop even though the hold arm's
+    /// broader descendant predicate also fires for it. Skipping here
+    /// would brick a signed image whose signature-arrival enqueue was
+    /// lost — exactly the failure S4 exists to backstop.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_an_attestation_subject() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "primary_content").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_subject").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            jobs.enqueue_calls().len(),
+            1,
+            "an artifact with attestation material must still get its final verify"
+        );
+    }
+
+    /// A blob that is ALSO an attestation subject keeps the backstop —
+    /// one attestation-bearing edge disqualifies the whole skip.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_a_blob_that_is_also_a_subject() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_subject").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(jobs.enqueue_calls().len(), 1);
+    }
+
+    /// A child manifest of an index is a manifest: it can be signed in
+    /// its own right, and on a proxy scope its verify is what fetches
+    /// upstream referrers. It keeps the backstop.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_a_child_manifest() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_index_member").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(jobs.enqueue_calls().len(), 1);
+    }
+
+    /// An unknown/future edge kind disqualifies the skip — the inverse
+    /// conservatism to the hold arm, where an unknown kind counts AS a
+    /// descendant. Both directions refuse to terminally decide.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_an_unknown_edge_kind() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "future_kind").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(jobs.enqueue_calls().len(), 1);
+    }
+
+    /// Error direction: the edge lookup PROPAGATES. Degrading to
+    /// "not parent-gated" would re-create the churn; degrading to
+    /// "parent-gated" would suppress the backstop for a candidate that
+    /// may have no parent at all. The tick aborts and is re-driven.
+    #[tokio::test]
+    async fn release_expired_propagates_a_failed_backstop_edge_lookup() {
+        let (uc, _artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        refs.fail_next_find_by_target(DomainError::Invariant("content_references down".into()));
+
+        let result = uc.release_expired(vec![artifact_id]).await;
+
+        assert!(
+            result.is_err(),
+            "a failed edge lookup must fail the sweep tick, not pick a default"
+        );
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "no enqueue decision may be made on an unreadable edge set"
+        );
+    }
+
+    /// The skip is scoped to the S4 arm only: a `Cleared` candidate
+    /// never reaches the edge lookup, so a blob whose parent already
+    /// cascaded still releases normally.
+    #[tokio::test]
+    async fn release_expired_releases_a_cascade_cleared_blob_constituent() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs, refs) =
+            make_use_case_with_jobs_and_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "a cascade-cleared blob constituent releases exactly as before"
+        );
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+        assert!(jobs.enqueue_calls().is_empty());
     }
 
     // =====================================================================
