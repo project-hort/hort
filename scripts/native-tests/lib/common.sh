@@ -73,6 +73,19 @@ bounded_poll() {
   done
 }
 
+# metrics_scrape_diag <url> — one-shot GET of a metrics endpoint, echoes
+# "HTTP <code> (curl exit <n>)" for FAIL-message diagnostics. `-w
+# '%{http_code}'` without `-f` so a non-2xx still yields a real status
+# instead of curl swallowing the body and reporting only exit 22; a
+# transport-level failure (no response at all) surfaces as HTTP <none>
+# with the actual curl exit code. Never itself fails the caller.
+metrics_scrape_diag() {
+  local url="$1" code rc
+  code=$(curl -s "${METRICS_AUTH_HEADER[@]}" -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
+  rc=$?
+  printf 'HTTP %s (curl exit %d)' "${code:-<none>}" "$rc"
+}
+
 # assert_metric_ingest <format> — assert a successful-ingest metric is present.
 # Presence check, sound only on a FRESH stack (compose `down -v` -> `up` zeroes
 # the counter). On a long-lived external hort a stale tick would make it hollow,
@@ -110,13 +123,14 @@ assert_metric_ingest() {
   fi
   if ! curl -sf "${METRICS_AUTH_HEADER[@]}" -o /dev/null --max-time 5 "$METRICS_URL" 2>/dev/null; then
     fail "ingest metric for $fmt" \
-      "GET $METRICS_URL with a read_metrics bearer returned non-2xx (grant/token regression, or the stack genuinely isn't up)"
+      "GET $METRICS_URL with a read_metrics bearer returned non-2xx (grant/token regression, or the stack genuinely isn't up) -- $(metrics_scrape_diag "$METRICS_URL")"
     return
   fi
   if bounded_poll "ingest-metric($fmt)" 60 \
       "curl -sf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_ingest_total\{[^}]*format=\"${fmt}\"[^}]*result=\"success\"[^}]*\}'"; then
     pass "hort_ingest_total{format=\"$fmt\",result=\"success\"} present"
   else
-    fail "ingest metric for $fmt" "no hort_ingest_total{format=\"$fmt\",result=\"success\"} at $METRICS_URL after 60s poll"
+    fail "ingest metric for $fmt" \
+      "no hort_ingest_total{format=\"$fmt\",result=\"success\"} at $METRICS_URL after 60s poll -- last scrape: $(metrics_scrape_diag "$METRICS_URL")"
   fi
 }

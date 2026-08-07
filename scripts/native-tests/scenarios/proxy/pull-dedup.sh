@@ -75,7 +75,8 @@ if [ -z "${METRICS_TOKEN:-}" ]; then
     skip "no read_metrics bearer available (METRICS_TOKEN unset)"
 fi
 if ! curl -sf "${METRICS_AUTH_HEADER[@]}" -o /dev/null --max-time 5 "$METRICS_URL"; then
-    fail "metrics endpoint reachable" "GET ${METRICS_URL} with a read_metrics bearer returned non-2xx"
+    fail "metrics endpoint reachable" \
+        "GET ${METRICS_URL} with a read_metrics bearer returned non-2xx -- $(metrics_scrape_diag "$METRICS_URL")"
     summary
 fi
 log "  metrics endpoint reachable"

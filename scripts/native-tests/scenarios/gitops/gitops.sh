@@ -28,7 +28,8 @@ log "--> hort-server is reachable on the metrics port"
 if curl -sSf "${METRICS_AUTH_HEADER[@]}" -o /dev/null "${METRICS_URL}" 2>/dev/null; then
     pass "metrics endpoint responds"
 else
-    fail "metrics endpoint responds" "${METRICS_URL} unreachable (with a read_metrics bearer — #113 item 5)"
+    fail "metrics endpoint responds" \
+        "${METRICS_URL} unreachable (with a read_metrics bearer — #113 item 5) -- $(metrics_scrape_diag "${METRICS_URL}")"
 fi
 
 # Abort early — nothing else is testable if metrics is down.
@@ -53,14 +54,15 @@ if bounded_poll "gitops apply_total(result=ok)" 15 \
     pass 'hort_gitops_apply_total{result=ok} >= 1'
 else
     fail 'hort_gitops_apply_total{result=ok} >= 1' \
-        "metric absent or zero after 15s poll — gitops boot may have skipped or failed silently"
+        "metric absent or zero after 15s poll — gitops boot may have skipped or failed silently -- last scrape: $(metrics_scrape_diag "${METRICS_URL}")"
 fi
 
 if bounded_poll "gitops objects_total emitted" 15 \
     "curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_objects_total\{'"; then
     pass "hort_gitops_objects_total emitted at least once"
 else
-    fail "hort_gitops_objects_total emitted" "metric absent in scrape after 15s poll"
+    fail "hort_gitops_objects_total emitted" \
+        "metric absent in scrape after 15s poll -- last scrape: $(metrics_scrape_diag "${METRICS_URL}")"
 fi
 
 # ---------------------------------------------------------------------
