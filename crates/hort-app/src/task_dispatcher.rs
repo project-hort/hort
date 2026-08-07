@@ -30,7 +30,12 @@
 //! - `hort_admin_tasks_starved_total{kind, reason}` — counter; one
 //!   increment per audit at which a kind's eligible backlog has gone
 //!   unserved past [`STARVATION_THRESHOLD`]. `reason ∈ {unregistered,
-//!   not_claimed}`.
+//!   not_claimed, oldest_row_stalled}`. `oldest_row_stalled` is independent
+//!   of the other two: it fires whenever the single oldest eligible row of
+//!   a kind has aged past the threshold, even while that kind is being
+//!   claimed constantly (a sustained high-priority stream of the same kind
+//!   can starve one old low-priority row indefinitely while claims of
+//!   fresher rows keep `not_claimed`/`unregistered` silent).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -66,6 +71,7 @@ const RESULT_FAILED_TERMINAL: &str = "failed_terminal";
 // `reason` label values on `hort_admin_tasks_starved_total`.
 const STARVED_UNREGISTERED: &str = "unregistered";
 const STARVED_NOT_CLAIMED: &str = "not_claimed";
+const STARVED_OLDEST_ROW: &str = "oldest_row_stalled";
 
 // Default backoff for a retryable failed task (exponential from this base).
 const DEFAULT_BACKOFF_SECS: u64 = 30;
@@ -374,7 +380,10 @@ impl TaskDispatcher {
                 "TaskDispatcher: kind has claim-eligible pending jobs that are not being \
                  claimed — reason 'unregistered' means no handler is registered for it in this \
                  worker (check the composition root's registration gate); reason 'not_claimed' \
-                 means it loses the priority/created_at claim race on every poll",
+                 means it loses the priority/created_at claim race on every poll; reason \
+                 'oldest_row_stalled' means the single oldest eligible row of this kind has \
+                 aged past the threshold even though the kind IS being claimed — a sustained \
+                 higher-priority stream of the same kind is starving it",
             );
             metrics::counter!(
                 METRIC_STARVED,
@@ -526,6 +535,16 @@ struct StarvationFinding {
 ///
 /// A kind that is being drained at all keeps re-arming its reference
 /// every tick, so a deep-but-draining FIFO queue never trips this.
+///
+/// A second, independent axis runs alongside the one above: regardless of
+/// `last_claimed`/`started_at`, a kind whose single oldest eligible row has
+/// aged past `threshold` is flagged with `reason = "oldest_row_stalled"`.
+/// This catches the case the first axis structurally cannot: a kind
+/// claimed constantly (so `last_claimed` keeps re-arming) while a
+/// sustained high-priority stream of the SAME kind claims only fresh rows
+/// every poll, leaving one old low-priority row to rot behind them forever
+/// — the first axis's `.max(reference, oldest_created_at)` floor means a
+/// recent `last_claimed` always wins there and the finding never fires.
 fn detect_starvation(
     backlogs: &[PendingKindBacklog],
     registered: &HashSet<&str>,
@@ -546,19 +565,28 @@ fn detect_starvation(
             .unwrap_or(started_at)
             .max(b.oldest_created_at);
         let stalled_for = now - reference;
-        if stalled_for <= threshold {
-            continue;
+        if stalled_for > threshold {
+            findings.push(StarvationFinding {
+                kind: b.kind.clone(),
+                count: b.count,
+                reason: if registered.contains(b.kind.as_str()) {
+                    STARVED_NOT_CLAIMED
+                } else {
+                    STARVED_UNREGISTERED
+                },
+                stalled_for_secs: stalled_for.num_seconds(),
+            });
         }
-        findings.push(StarvationFinding {
-            kind: b.kind.clone(),
-            count: b.count,
-            reason: if registered.contains(b.kind.as_str()) {
-                STARVED_NOT_CLAIMED
-            } else {
-                STARVED_UNREGISTERED
-            },
-            stalled_for_secs: stalled_for.num_seconds(),
-        });
+
+        let oldest_age = now - b.oldest_created_at;
+        if oldest_age > threshold {
+            findings.push(StarvationFinding {
+                kind: b.kind.clone(),
+                count: b.count,
+                reason: STARVED_OLDEST_ROW,
+                stalled_for_secs: oldest_age.num_seconds(),
+            });
+        }
     }
     findings
 }
@@ -1690,11 +1718,23 @@ mod tests {
             THRESHOLD,
         );
 
-        assert_eq!(f.len(), 1, "{f:?}");
-        assert_eq!(f[0].kind, "provenance-verify");
-        assert_eq!(f[0].count, 1450);
-        assert_eq!(f[0].reason, STARVED_UNREGISTERED);
-        assert!(f[0].stalled_for_secs >= 7200, "{f:?}");
+        // Two independent findings: the primary axis (`unregistered`, since
+        // the reference/`.max` floor is old too) AND the oldest-row axis
+        // (the row itself is hours old, unconditionally).
+        assert_eq!(f.len(), 2, "{f:?}");
+        let primary = f
+            .iter()
+            .find(|x| x.reason == STARVED_UNREGISTERED)
+            .expect("missing unregistered finding");
+        assert_eq!(primary.kind, "provenance-verify");
+        assert_eq!(primary.count, 1450);
+        assert!(primary.stalled_for_secs >= 7200, "{f:?}");
+        let oldest_row = f
+            .iter()
+            .find(|x| x.reason == STARVED_OLDEST_ROW)
+            .expect("missing oldest_row_stalled finding");
+        assert_eq!(oldest_row.kind, "provenance-verify");
+        assert!(oldest_row.stalled_for_secs >= 7200, "{f:?}");
     }
 
     /// Same backlog, but the kind IS registered and simply loses the
@@ -1719,12 +1759,49 @@ mod tests {
             THRESHOLD,
         );
 
-        assert_eq!(f.len(), 1, "{f:?}");
-        assert_eq!(f[0].reason, STARVED_NOT_CLAIMED);
+        // Same dual-finding shape as above, but the primary axis's reason
+        // is `not_claimed` because the kind IS registered here.
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f.iter().any(|x| x.reason == STARVED_NOT_CLAIMED), "{f:?}");
+        assert!(f.iter().any(|x| x.reason == STARVED_OLDEST_ROW), "{f:?}");
     }
 
-    /// A deep FIFO queue that IS draining re-arms its last-claimed clock
-    /// on every tick. That is the common case and must never alarm.
+    /// Incident replay: a REGISTERED kind is claimed constantly (`last_claimed`
+    /// re-arms every tick, so the primary axis stays silent) while a
+    /// sustained higher-priority stream of the SAME kind claims only fresh
+    /// rows every poll — the single oldest eligible row of the kind never
+    /// advances and rots for hours. Only the independent oldest-row-age
+    /// axis can catch this; it must alarm with `reason =
+    /// "oldest_row_stalled"` regardless of the fresh `last_claimed`.
+    #[test]
+    fn detect_starvation_flags_a_rotting_oldest_row_despite_constant_claims() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(3);
+        let registered: HashSet<&str> = ["scan"].into_iter().collect();
+        let backlogs = vec![backlog("scan", 500, now - chrono::Duration::hours(2))];
+        let mut last_claimed = HashMap::new();
+        last_claimed.insert("scan".to_string(), now - chrono::Duration::seconds(1));
+
+        let f = detect_starvation(
+            &backlogs,
+            &registered,
+            &last_claimed,
+            now,
+            started,
+            THRESHOLD,
+        );
+
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "scan");
+        assert_eq!(f[0].count, 500);
+        assert_eq!(f[0].reason, STARVED_OLDEST_ROW);
+        assert!(f[0].stalled_for_secs >= 7200, "{f:?}");
+    }
+
+    /// A deep FIFO queue that IS genuinely draining re-arms its
+    /// last-claimed clock on every tick AND keeps its oldest row fresh
+    /// (the front of the FIFO order is continuously being claimed). That
+    /// is the common case and must never alarm on either axis.
     #[test]
     fn detect_starvation_ignores_a_deep_but_draining_queue() {
         let now = Utc::now();
@@ -1733,7 +1810,7 @@ mod tests {
         let backlogs = vec![backlog(
             "provenance-verify",
             5000,
-            now - chrono::Duration::hours(2),
+            now - chrono::Duration::seconds(30),
         )];
         let mut last_claimed = HashMap::new();
         last_claimed.insert(
@@ -1800,11 +1877,13 @@ mod tests {
 
     /// A stall exactly at the threshold is not yet starvation (`>`, not
     /// `>=`), and an out-of-range `Duration` saturates rather than panicking.
+    /// The backlog's oldest row sits exactly at the threshold too, so
+    /// neither the primary axis nor the independent oldest-row axis fires.
     #[test]
     fn detect_starvation_threshold_boundary_and_saturating_conversion() {
         let now = Utc::now();
         let started = now - chrono::Duration::seconds(600);
-        let backlogs = vec![backlog("noop", 1, now - chrono::Duration::hours(2))];
+        let backlogs = vec![backlog("noop", 1, now - chrono::Duration::seconds(600))];
 
         let at_threshold = detect_starvation(
             &backlogs,

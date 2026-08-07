@@ -111,14 +111,49 @@ pub(crate) async fn enqueue_provenance_verify_in_tx(
 /// `artifact_id is NULL in claim_pending_by_kinds result`; the
 /// regression is pinned by
 /// [`claim_pending_by_kinds_sql_returning_includes_scan_typed_columns`].
-const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH claimed AS (\n\
+///
+/// Reserved-oldest-slot fairness shape: `oldest` claims exactly one row —
+/// the single globally oldest eligible row across every registered kind,
+/// ordered by `created_at ASC` alone (priority-blind) — while `ranked`
+/// claims the remaining `batch_size - 1` slots by the pre-existing
+/// `priority DESC, created_at ASC` order, explicitly excluding whatever
+/// `oldest` already picked so the same row is never claimed twice. Without
+/// the reserved slot, a sustained high-priority stream of the same kind can
+/// starve an old low-priority row indefinitely; the reserved slot bounds
+/// that wait to roughly one batch-drain cycle regardless of priority.
+/// `oldest` is `MATERIALIZED` deliberately: it is referenced twice (by
+/// `ranked`'s exclusion and by `claimed`'s union), and the default
+/// multiply-referenced-CTE materialization is exactly what is wanted here —
+/// spelling it out guards against a future edit that drops a reference and
+/// silently flips the default to inlining, which would re-run the `FOR
+/// UPDATE SKIP LOCKED` select twice and risk locking two different rows
+/// instead of reusing the one already picked. `LEAST($2, 1)` /
+/// `GREATEST($2 - 1, 0)` degrade to claiming nothing when `batch_size` is
+/// 0, matching the pre-existing `LIMIT $2` behavior instead of always
+/// locking one row regardless of the caller's requested batch size.
+const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
                      SELECT id FROM public.jobs\n\
                      WHERE status = 'pending'\n\
                        AND kind = ANY($1::text[])\n\
                        AND (locked_until IS NULL OR locked_until < now())\n\
+                     ORDER BY created_at ASC, id ASC\n\
+                     FOR UPDATE SKIP LOCKED\n\
+                     LIMIT LEAST($2, 1)\n\
+                 ),\n\
+                 ranked AS (\n\
+                     SELECT id FROM public.jobs\n\
+                     WHERE status = 'pending'\n\
+                       AND kind = ANY($1::text[])\n\
+                       AND (locked_until IS NULL OR locked_until < now())\n\
+                       AND id NOT IN (SELECT id FROM oldest)\n\
                      ORDER BY priority DESC, created_at ASC\n\
                      FOR UPDATE SKIP LOCKED\n\
-                     LIMIT $2\n\
+                     LIMIT GREATEST($2 - 1, 0)\n\
+                 ),\n\
+                 claimed AS (\n\
+                     SELECT id FROM oldest\n\
+                     UNION ALL\n\
+                     SELECT id FROM ranked\n\
                  )\n\
                  UPDATE public.jobs SET\n\
                      status = 'running',\n\
@@ -1279,14 +1314,19 @@ mod tests {
         let sql = CLAIM_PENDING_BY_KINDS_SQL;
 
         // Positive shape: keyword pairs MUST be separated by whitespace.
-        // Each substring below was a token-mashing site in the bug.
+        // Each substring below was (or, for the reserved-oldest-slot CTEs,
+        // would be) a token-mashing site if a `\n` were dropped.
         let must_contain = [
             "FROM public.jobs",
             "public.jobs\n",
             "'pending'\n",
             "ANY($1::text[])\n",
             "now())\n",
-            "LIMIT $2\n",
+            "LIMIT LEAST($2, 1)\n",
+            "LIMIT GREATEST($2 - 1, 0)\n",
+            "FROM oldest\n",
+            "FROM ranked\n",
+            "NOT IN (SELECT id FROM oldest)\n",
             "UPDATE public.jobs SET\n",
             "now()\n",
             "FROM claimed)\n",
@@ -1301,9 +1341,9 @@ mod tests {
         }
 
         // Negative shape: explicit forbidden conjoined pairs that the
-        // bare-`\` bug produced. Listing them as substrings guards
-        // against any future regression that drops a `\n` before a
-        // continuation.
+        // bare-`\` bug produced (or would produce in the new CTEs).
+        // Listing them as substrings guards against any future regression
+        // that drops a `\n` before a continuation.
         let must_not_contain = [
             "jobsWHERE",
             "'pending'AND",
@@ -1311,6 +1351,7 @@ mod tests {
             "now())ORDER",
             "FOR UPDATE SKIP LOCKEDLIMIT",
             "now()WHERE",
+            "oldest)ORDER",
         ];
         for pat in &must_not_contain {
             assert!(
@@ -1320,6 +1361,64 @@ mod tests {
                  continuation. Full SQL:\n{sql}"
             );
         }
+    }
+
+    /// Regression guard for the reserved-oldest-slot fairness shape: one
+    /// slot per poll MUST be reserved for the single oldest eligible row
+    /// across kinds, priority-blind, and it MUST be excluded from the
+    /// priority-ordered slots so the same row is never double-claimed.
+    /// A prior bug class (see the token-mashing guard above) proved that
+    /// this query's shape is easy to silently corrupt during an edit; this
+    /// test pins the fairness-specific invariants the token-mashing guard
+    /// does not cover.
+    #[test]
+    fn claim_pending_by_kinds_sql_reserves_one_priority_blind_oldest_slot() {
+        let sql = CLAIM_PENDING_BY_KINDS_SQL;
+
+        // The reserved slot's ordering must NOT reference priority — it is
+        // the single globally oldest row regardless of priority.
+        let oldest_cte = sql
+            .split_once("ranked AS (")
+            .map(|(before, _)| before)
+            .expect("CLAIM_PENDING_BY_KINDS_SQL must contain a `ranked` CTE");
+        assert!(
+            oldest_cte.contains("ORDER BY created_at ASC, id ASC"),
+            "the `oldest` CTE must order by created_at alone (priority-blind). \
+             Full `oldest` CTE:\n{oldest_cte}"
+        );
+        assert!(
+            !oldest_cte.contains("priority"),
+            "the `oldest` CTE must not reference priority — it reserves a slot \
+             for the oldest row REGARDLESS of priority. Full `oldest` CTE:\n{oldest_cte}"
+        );
+
+        // The ranked (priority-ordered) slots must exclude whatever the
+        // oldest CTE already picked, and must keep the pre-existing
+        // priority-ordered contract for the remaining slots.
+        assert!(
+            sql.contains("ORDER BY priority DESC, created_at ASC"),
+            "the `ranked` CTE must keep the pre-existing priority DESC, \
+             created_at ASC order for the non-reserved slots. Full SQL:\n{sql}"
+        );
+
+        // Both CTEs preserve FOR UPDATE SKIP LOCKED semantics.
+        assert_eq!(
+            sql.matches("FOR UPDATE SKIP LOCKED").count(),
+            2,
+            "both the `oldest` and `ranked` CTEs must claim with FOR UPDATE \
+             SKIP LOCKED. Full SQL:\n{sql}"
+        );
+
+        // `oldest` is referenced twice (by `ranked`'s exclusion and by
+        // `claimed`'s union) — it must be MATERIALIZED so the FOR UPDATE
+        // SKIP LOCKED select runs once, not once per reference.
+        assert!(
+            sql.contains("WITH oldest AS MATERIALIZED ("),
+            "the `oldest` CTE must be explicitly MATERIALIZED — it is \
+             referenced twice, and relying on the default multiply-referenced \
+             materialization is exactly the kind of implicit contract this \
+             file pins explicitly. Full SQL:\n{sql}"
+        );
     }
 
     /// Regression guard for the bug that produced
