@@ -1384,35 +1384,24 @@ impl QuarantineUseCase {
             let prior_status = artifact.quarantine_status;
             let repository_id = artifact.repository_id;
 
-            // Construct the real release
-            // authority, fail-closed (ADR 0007). No authority ⇒ skip; the
-            // artifact stays quarantined. quarantine_until is
-            // candidacy-only and is never consulted here.
-            let Some(authz) = self
-                .resolve_release_authority(artifact_id, repository_id)
-                .await?
-            else {
-                tracing::debug!(
-                    artifact_id = %artifact_id,
-                    status = %artifact.quarantine_status,
-                    "skipping: no release authority (no successful scan, scanning not waived)"
-                );
-                continue;
-            };
-            let authority_kind = release_authority_label(authz);
-
             // Compute the provenance side of
-            // the gate per candidate (ADR 0027).
-            // `NotRequired` for Off/VerifyIfPresent; `Required` →
-            // `Cleared` iff a `ProvenanceVerified` event exists, else
-            // `Pending` (fail-closed — denies the timer arm). The scan gate
-            // (`authz`) is unchanged; provenance is an AND-precondition on
-            // the timer arm only.
+            // the gate per candidate (ADR 0027), BEFORE the release-authority
+            // guard below. `NotRequired` for Off/VerifyIfPresent; `Required`
+            // → `Cleared` iff a `ProvenanceVerified` event exists, else
+            // `Pending` (fail-closed — denies the timer arm). This
+            // computation does not depend on release authority.
             let provenance = self
                 .resolve_provenance_clearance(artifact_id, repository_id)
                 .await?;
 
             // S4 — terminal decision at window expiry (design §2 S4).
+            //
+            // Hoisted ahead of the release-authority guard: a candidate
+            // whose release authority is not constructible must still
+            // receive its terminal provenance decision — the two are
+            // independent gates (ADR 0007 scan authority vs ADR 0027
+            // provenance clearance), and the provenance side cannot be
+            // allowed to depend on scan-authority constructibility.
             //
             // The candidates handed to this sweep are already past their
             // computed deadline (the adapter's candidacy filter). A
@@ -1435,6 +1424,23 @@ impl QuarantineUseCase {
             if matches!(provenance, ProvenanceClearance::Pending) {
                 self.enqueue_final_provenance_verify(artifact_id).await;
             }
+
+            // Construct the real release
+            // authority, fail-closed (ADR 0007). No authority ⇒ skip; the
+            // artifact stays quarantined. quarantine_until is
+            // candidacy-only and is never consulted here.
+            let Some(authz) = self
+                .resolve_release_authority(artifact_id, repository_id)
+                .await?
+            else {
+                tracing::debug!(
+                    artifact_id = %artifact_id,
+                    status = %artifact.quarantine_status,
+                    "skipping: no release authority (no successful scan, scanning not waived)"
+                );
+                continue;
+            };
+            let authority_kind = release_authority_label(authz);
 
             match artifact.release(ReleaseReason::Timer, authz, provenance) {
                 Ok(event_payload) => {
@@ -4520,6 +4526,85 @@ mod tests {
         assert!(
             jobs.enqueue_calls().is_empty(),
             "VerifyIfPresent (NotRequired) never triggers the S4 backstop"
+        );
+    }
+
+    // =====================================================================
+    // S4 hoisted ahead of the release-authority guard: the terminal
+    // provenance decision must not depend on release-authority
+    // constructibility (design §2 S4 + ADR 0007/ADR 0027 independence).
+    // =====================================================================
+
+    /// A `Required` + `Pending` candidate with NO constructible release
+    /// `provenance-verify` enqueued — the S4 arm fires before the
+    /// authority-guard `continue`, not after it. The candidate is (as
+    /// always) not released, for the authority reason this time rather
+    /// than the provenance one.
+    #[tokio::test]
+    async fn release_expired_s4_fires_even_when_release_authority_is_unconstructible() {
+        let (uc, artifacts, _events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // Deliberately NOT seeding ScanCompleted: no release authority is
+        // constructible. Required provenance policy, no ProvenanceVerified
+        // either: provenance clearance is Pending.
+        seed_required_provenance_policy(&projections, repo_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "no release authority ⇒ never released, regardless of provenance"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no release transition committed when authority is unconstructible"
+        );
+        let calls = jobs.enqueue_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "S4 must enqueue the final provenance-verify even though release \
+             authority could not be constructed — the terminal provenance \
+             decision does not depend on scan authority"
+        );
+        let (kind, params, _actor_id) = &calls[0];
+        assert_eq!(kind, "provenance-verify");
+        assert_eq!(
+            params.get("artifact_id").and_then(|v| v.as_str()),
+            Some(artifact_id.to_string().as_str())
+        );
+    }
+
+    /// Unchanged-behavior pin: when release authority IS
+    /// constructible, S4 behavior is exactly as before the hoist — a
+    /// `Required` + `Pending` candidate with a passing scan gate still
+    /// enqueues exactly one final verify and is not released. Guards
+    /// against the hoist accidentally double-firing S4 or changing the
+    /// authority-present path.
+    #[tokio::test]
+    async fn release_expired_s4_unchanged_when_release_authority_is_constructible() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "Pending provenance still denies the timer arm even with authority present"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+        assert_eq!(
+            jobs.enqueue_calls().len(),
+            1,
+            "authority-present path enqueues exactly one final verify, unchanged by the hoist"
         );
     }
 

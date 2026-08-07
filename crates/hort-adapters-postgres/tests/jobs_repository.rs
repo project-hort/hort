@@ -23,11 +23,13 @@
 //! - `find_active_provenance_surfaces_pending_and_ignores_completed`
 //! - `find_active_provenance_isolates_by_artifact_id`
 //! - `find_active_provenance_returns_none_when_only_completed_row_exists`
+//! - `s4_backstop_n_ticks_over_held_artifact_produce_at_most_one_active_verify_row`
+//! - `s4_backstop_guard_suppresses_reenqueue_then_rearms_after_completion`
 
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sqlx::{PgPool, Row};
@@ -785,5 +787,106 @@ async fn find_active_provenance_returns_none_when_only_completed_row_exists() {
     assert_eq!(
         active, None,
         "completed-only history must not surface as in-flight"
+    );
+}
+
+/// One S4 sweep tick's guard-then-enqueue sequence, reproduced exactly as
+/// `QuarantineUseCase::enqueue_final_provenance_verify` drives it: check
+/// [`JobsRepository::find_active_provenance_for_artifact`] first; enqueue via
+/// [`JobsRepository::enqueue_task`] (same kind, same `params` shape, same
+/// priority/trigger-source literals) only when nothing is in-flight.
+async fn s4_guarded_tick(jobs: &Arc<dyn JobsRepository>, artifact_id: Uuid) {
+    let active = jobs
+        .find_active_provenance_for_artifact(artifact_id)
+        .await
+        .expect("find_active_provenance_for_artifact");
+    if active.is_none() {
+        let params = serde_json::json!({ "artifact_id": artifact_id });
+        // 10 == `CLEARANCE_VERIFY_PRIORITY` (`hort_app::use_cases::ingest_use_case`,
+        // `pub(crate)` — not importable across the crate boundary).
+        jobs.enqueue_task("provenance-verify", &params, None, 10, "ingest", None)
+            .await
+            .expect("enqueue_task");
+    }
+}
+
+async fn count_provenance_rows(pool: &PgPool, artifact_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM public.jobs \
+         WHERE kind = 'provenance-verify' AND params->>'artifact_id' = $1",
+    )
+    .bind(artifact_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("count provenance-verify rows")
+}
+
+/// S4 jobs-table-growth invariant: N sweep ticks over a held `Required` +
+/// `Pending` artifact, with the prior verify job never completing, must
+/// never accumulate more than one active row.
+#[tokio::test]
+async fn s4_backstop_n_ticks_over_held_artifact_produce_at_most_one_active_verify_row() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let jobs: Arc<dyn JobsRepository> = Arc::new(PgJobsRepository::new(pool.clone()));
+    let artifact_id = Uuid::new_v4();
+
+    for _tick in 0..5 {
+        s4_guarded_tick(&jobs, artifact_id).await;
+    }
+
+    assert_eq!(
+        count_provenance_rows(&pool, artifact_id).await,
+        1,
+        "5 sweep ticks over an artifact whose verify never completes must \
+         leave exactly one active provenance-verify row, not one per tick"
+    );
+}
+
+/// S4 idempotency + re-arm: a pending verify suppresses re-enqueue across
+/// repeated ticks; once that job reaches a terminal state, the NEXT tick
+/// enqueues exactly one fresh row (re-arm is intentional — a
+/// completed/failed row is no longer "in-flight").
+#[tokio::test]
+async fn s4_backstop_guard_suppresses_reenqueue_then_rearms_after_completion() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let jobs: Arc<dyn JobsRepository> = Arc::new(PgJobsRepository::new(pool.clone()));
+    let artifact_id = Uuid::new_v4();
+
+    // Tick 1: nothing in-flight yet — enqueues the first row.
+    s4_guarded_tick(&jobs, artifact_id).await;
+    assert_eq!(count_provenance_rows(&pool, artifact_id).await, 1);
+
+    // Ticks 2 and 3: the row from tick 1 is still pending — no second row.
+    s4_guarded_tick(&jobs, artifact_id).await;
+    s4_guarded_tick(&jobs, artifact_id).await;
+    assert_eq!(
+        count_provenance_rows(&pool, artifact_id).await,
+        1,
+        "guard must suppress re-enqueue while the prior verify is still pending"
+    );
+
+    // The worker completes the in-flight job (terminal).
+    let existing = jobs
+        .find_active_provenance_for_artifact(artifact_id)
+        .await
+        .expect("find_active_provenance_for_artifact")
+        .expect("the tick-1 row is still in-flight before completion");
+    jobs.mark_completed(existing, serde_json::Value::Null)
+        .await
+        .expect("mark_completed");
+
+    // Next tick: no in-flight row anymore — enqueues exactly one NEW row.
+    s4_guarded_tick(&jobs, artifact_id).await;
+    assert_eq!(
+        count_provenance_rows(&pool, artifact_id).await,
+        2,
+        "once the prior verify is terminal, the next tick must enqueue a \
+         fresh final verify (re-arm), not stay silent forever"
     );
 }

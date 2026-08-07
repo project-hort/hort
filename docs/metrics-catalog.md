@@ -3209,6 +3209,33 @@ deployment the only registered kind is `"scan"`.
 | `hort_admin_tasks_completed_total` | counter | `kind`, `result` | — | `result ∈ {completed, failed_retry, failed_terminal}` |
 | `hort_admin_tasks_duration_seconds` | histogram | `kind` | seconds | wall-clock time from claim to outcome recording, wrapping `TaskHandler::run` |
 | `hort_admin_tasks_in_flight` | gauge | `kind` | tasks | incremented before `TaskHandler::run`, decremented after; 0 when idle |
+| `hort_admin_tasks_pending_eligible` | gauge | `kind` | jobs | claim-eligible pending rows per kind (`status='pending'` and the lock free/expired), set once per starvation audit (every 60 s). Covers **every** kind present in `jobs`, including kinds this worker does not claim |
+| `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
+| `hort_admin_tasks_claim_unmappable_total` | counter | (none) | — | emitted by the Postgres jobs adapter: one increment per claimed row that failed `JobRow` projection and was resolved terminally instead of being stranded in `running` |
+
+**Starvation semantics** (issue #131). A `provenance-verify` backlog once
+grew to ~1450 rows over 33 minutes while the same dispatcher claimed and
+completed `quarantine-release-sweep` rows every tick — with no panic, no
+`ERROR`, and no metric anywhere. The mechanism: the kind was absent from
+the dispatcher's registered-kind array (the composition root's
+provenance-backend gate logs a single `info!` and registers nothing), so
+`claim_pending_by_kinds`'s `kind = ANY($1)` filtered it out and every
+subsequent signal was silent by construction. `hort_admin_tasks_starved_total`
+closes that hole:
+
+- `reason="unregistered"` — the kind has eligible pending rows and **no
+  handler is registered for it in this worker**. Expected transiently in a
+  mixed fleet (a sibling replica registers it); sustained non-zero means
+  the kind is running nowhere. For `provenance-verify` this is
+  security-relevant: `provenance_mode: required` artifacts stay `Pending`
+  (fail-closed) and never release.
+- `reason="not_claimed"` — the kind IS registered but lost the
+  `priority DESC, created_at ASC` claim race on every poll for the whole
+  window (a higher-priority tier, or an older same-priority backlog,
+  saturating `batch_size` at every poll instant).
+
+Operators alarm on `increase(hort_admin_tasks_starved_total[15m]) > 0`.
+`hort_admin_tasks_pending_eligible` is the accompanying depth signal.
 
 **`hort_admin_tasks_enqueued_total` result semantics** (implemented in `hort-http-admin-tasks`):
 

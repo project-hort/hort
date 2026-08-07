@@ -24,17 +24,25 @@
 //!   `record_outcome_for_row`, wrapping `TaskHandler::run`.
 //! - `hort_admin_tasks_in_flight{kind}` — gauge; incremented when a task
 //!   `run` starts, decremented when it finishes.
+//! - `hort_admin_tasks_pending_eligible{kind}` — gauge; claim-eligible
+//!   pending rows per kind, set on every starvation audit. Covers kinds
+//!   this dispatcher does NOT claim.
+//! - `hort_admin_tasks_starved_total{kind, reason}` — counter; one
+//!   increment per audit at which a kind's eligible backlog has gone
+//!   unserved past [`STARVATION_THRESHOLD`]. `reason ∈ {unregistered,
+//!   not_claimed}`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use hort_domain::events::{Actor, InternalActor};
-use hort_domain::ports::jobs_repository::{JobRow, JobsRepository};
+use hort_domain::ports::jobs_repository::{JobRow, JobsRepository, PendingKindBacklog};
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 
 use crate::error::AppResult;
@@ -47,14 +55,35 @@ use crate::event_store_publisher::EventStorePublisher;
 const METRIC_COMPLETED: &str = "hort_admin_tasks_completed_total";
 const METRIC_DURATION: &str = "hort_admin_tasks_duration_seconds";
 const METRIC_IN_FLIGHT: &str = "hort_admin_tasks_in_flight";
+const METRIC_PENDING_ELIGIBLE: &str = "hort_admin_tasks_pending_eligible";
+const METRIC_STARVED: &str = "hort_admin_tasks_starved_total";
 
 // Result label values
 const RESULT_COMPLETED: &str = "completed";
 const RESULT_FAILED_RETRY: &str = "failed_retry";
 const RESULT_FAILED_TERMINAL: &str = "failed_terminal";
 
+// `reason` label values on `hort_admin_tasks_starved_total`.
+const STARVED_UNREGISTERED: &str = "unregistered";
+const STARVED_NOT_CLAIMED: &str = "not_claimed";
+
 // Default backoff for a retryable failed task (exponential from this base).
 const DEFAULT_BACKOFF_SECS: u64 = 30;
+
+/// How long a kind's claim-eligible backlog may sit un-drained before the
+/// dispatcher calls it starvation (ERROR log + metric).
+///
+/// Sized well above any legitimate transient: a deep queue drains FIFO,
+/// so a kind that is being claimed at all keeps re-arming its
+/// last-claimed clock long before this elapses. A silently starved
+/// kind, by contrast, can otherwise run for hours undetected.
+const STARVATION_THRESHOLD: Duration = Duration::from_secs(600);
+
+/// Minimum spacing between starvation audits, independent of
+/// `poll_interval_secs`. The audit is one grouped aggregate over the
+/// eligible-pending rows; at a 5 s poll that would be 12 scans a minute
+/// for no diagnostic gain.
+const STARVATION_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // TaskDispatcher
@@ -152,6 +181,9 @@ impl TaskDispatcher {
     /// 3. Dispatches each row to its handler in a `tokio::spawn` task,
     ///    gated by the kind's semaphore.
     /// 4. Each spawned task records the outcome via `record_outcome_for_row`.
+    /// 5. Every [`STARVATION_AUDIT_INTERVAL`], runs the starvation audit
+    ///    (see [`detect_starvation`]) over the WHOLE eligible-pending
+    ///    backlog — including kinds this dispatcher does not claim.
     ///
     /// Returns `Ok(())` when the cancellation token fires (clean shutdown).
     /// Infrastructure errors on claim or outcome recording are logged and
@@ -159,9 +191,21 @@ impl TaskDispatcher {
     #[tracing::instrument(skip(self))]
     pub async fn run(self, cancel: CancellationToken) -> AppResult<()> {
         let kinds: Vec<&str> = self.handlers.keys().copied().collect();
+        let registered: HashSet<&str> = kinds.iter().copied().collect();
         // Wrap self in Arc so spawned tasks can share ownership without
         // cloning the entire struct.
         let dispatcher = Arc::new(self);
+
+        // Starvation-audit state. Owned by the loop, not by `self`: it is
+        // per-run, and the audit is the only reader.
+        let started_at = Utc::now();
+        let mut last_claimed: HashMap<String, DateTime<Utc>> = HashMap::new();
+        // `None` = audit on the first poll: a worker that boots into an
+        // unclaimable backlog publishes `hort_admin_tasks_pending_eligible`
+        // straight away. The ERROR/counter still needs
+        // `STARVATION_THRESHOLD` to elapse, so the early audit cannot
+        // false-alarm.
+        let mut last_audit: Option<Instant> = None;
 
         loop {
             tokio::select! {
@@ -193,6 +237,22 @@ impl TaskDispatcher {
                 }
             };
 
+            // Re-arm the per-kind starvation clock for every kind that
+            // actually produced a row this tick — before the `is_empty`
+            // short-circuit below, so the audit runs on idle ticks too
+            // (an idle claim is exactly when a starved kind is invisible).
+            let claimed_at = Utc::now();
+            for job in &claimed {
+                last_claimed.insert(job.kind.clone(), claimed_at);
+            }
+
+            if last_audit.is_none_or(|t| t.elapsed() >= STARVATION_AUDIT_INTERVAL) {
+                last_audit = Some(Instant::now());
+                dispatcher
+                    .audit_starvation(&registered, &last_claimed, started_at)
+                    .await;
+            }
+
             if claimed.is_empty() {
                 tracing::debug!("TaskDispatcher: no pending jobs");
                 continue;
@@ -204,18 +264,22 @@ impl TaskDispatcher {
                 let kind_str = job.kind.clone();
                 let Some(handler) = dispatcher.handlers.get(kind_str.as_str()).cloned() else {
                     // Should not happen — claim query filters by registered kinds.
-                    // Defensive: log and skip without updating the row (leave it
-                    // 'running' so the lock expires and another worker claims it).
                     tracing::error!(
                         job_id = %job.id,
                         kind = %kind_str,
-                        "TaskDispatcher: claimed job has unregistered kind; skipping"
+                        "TaskDispatcher: claimed job has unregistered kind; returning it to pending"
                     );
+                    dispatcher
+                        .return_to_pending(&job, "claimed job has unregistered kind")
+                        .await;
                     continue;
                 };
                 let Some(semaphore) = dispatcher.semaphores.get(kind_str.as_str()).cloned() else {
                     // Invariant: semaphore always co-exists with handler.
                     tracing::error!(kind = %kind_str, "TaskDispatcher: no semaphore for kind");
+                    dispatcher
+                        .return_to_pending(&job, "no semaphore registered for kind")
+                        .await;
                     continue;
                 };
                 let dispatcher_clone = dispatcher.clone();
@@ -237,6 +301,89 @@ impl TaskDispatcher {
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
+
+    /// Return a claimed-but-undispatchable row to `pending` so it is not
+    /// permanently lost.
+    ///
+    /// The claim query transitions rows to `running` BEFORE the
+    /// dispatcher decides it can run them. Both callers below are paths
+    /// where the row was claimed and then not dispatched. Leaving such a
+    /// row `running` — which is what this code used to do, on the stated
+    /// assumption that "the lock expires and another worker claims it" —
+    /// loses it permanently: `claim_pending_by_kinds` selects only
+    /// `status = 'pending'` rows, and nothing anywhere resets a stale
+    /// `running` row. Invariant: a claimed-but-not-dispatched row is
+    /// never permanently lost.
+    ///
+    /// `reschedule` is the revert vehicle (it sets `status = 'pending'`,
+    /// clears `locked_by` and records `last_error`); the backoff keeps a
+    /// row this replica structurally cannot run from being re-claimed by
+    /// the same replica on the very next tick, while leaving it visible
+    /// to a sibling replica that does register the kind.
+    async fn return_to_pending(&self, job: &JobRow, reason: &str) {
+        let backoff = compute_backoff(job.attempts);
+        if let Err(e) = self.job_repo.reschedule(job.id, backoff, reason).await {
+            tracing::error!(
+                error = %e,
+                job_id = %job.id,
+                kind = %job.kind,
+                "TaskDispatcher: returning an undispatchable claimed row to pending failed; \
+                 the row stays 'running' and cannot be re-claimed",
+            );
+        }
+    }
+
+    /// Starvation audit — makes a kind that stops being claimed loud
+    /// instead of silent.
+    ///
+    /// Reads the eligible-pending backlog for EVERY kind (not just the
+    /// registered ones), emits the per-kind gauge, and turns each
+    /// [`detect_starvation`] finding into an ERROR log + counter.
+    async fn audit_starvation(
+        &self,
+        registered: &HashSet<&str>,
+        last_claimed: &HashMap<String, DateTime<Utc>>,
+        started_at: DateTime<Utc>,
+    ) {
+        let backlogs = match self.job_repo.eligible_pending_by_kind().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "TaskDispatcher: starvation audit query failed; will retry on a later tick",
+                );
+                return;
+            }
+        };
+        for b in &backlogs {
+            metrics::gauge!(METRIC_PENDING_ELIGIBLE, "kind" => b.kind.clone()).set(b.count as f64);
+        }
+        for finding in detect_starvation(
+            &backlogs,
+            registered,
+            last_claimed,
+            Utc::now(),
+            started_at,
+            STARVATION_THRESHOLD,
+        ) {
+            tracing::error!(
+                kind = %finding.kind,
+                eligible_pending = finding.count,
+                stalled_for_secs = finding.stalled_for_secs,
+                reason = finding.reason,
+                "TaskDispatcher: kind has claim-eligible pending jobs that are not being \
+                 claimed — reason 'unregistered' means no handler is registered for it in this \
+                 worker (check the composition root's registration gate); reason 'not_claimed' \
+                 means it loses the priority/created_at claim race on every poll",
+            );
+            metrics::counter!(
+                METRIC_STARVED,
+                "kind" => finding.kind.clone(),
+                "reason" => finding.reason,
+            )
+            .increment(1);
+        }
+    }
 
     /// Invoke the handler for a single job row and record the outcome.
     async fn dispatch_one(&self, job: JobRow, handler: Arc<dyn TaskHandler>) {
@@ -355,6 +502,67 @@ impl TaskDispatcher {
     }
 }
 
+/// One kind whose claim-eligible backlog is not draining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StarvationFinding {
+    kind: String,
+    count: i64,
+    /// `unregistered` or `not_claimed` — the `reason` metric label.
+    reason: &'static str,
+    /// How long the backlog has gone unserved, in seconds.
+    stalled_for_secs: i64,
+}
+
+/// Decide which kinds are starving. Pure — no clock, no I/O — so every
+/// branch is unit-testable without timing.
+///
+/// For each kind with a non-empty claim-eligible backlog, the reference
+/// instant is the last time THIS dispatcher claimed a row of that kind,
+/// or `started_at` if it never has (a freshly booted worker gets a full
+/// threshold of grace before it accuses anyone). The backlog is only
+/// considered stalled since `max(reference, oldest_created_at)`: rows
+/// that arrived a second ago cannot have been starved for ten minutes,
+/// no matter how long the worker has been up.
+///
+/// A kind that is being drained at all keeps re-arming its reference
+/// every tick, so a deep-but-draining FIFO queue never trips this.
+fn detect_starvation(
+    backlogs: &[PendingKindBacklog],
+    registered: &HashSet<&str>,
+    last_claimed: &HashMap<String, DateTime<Utc>>,
+    now: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+    threshold: Duration,
+) -> Vec<StarvationFinding> {
+    let threshold = chrono::Duration::from_std(threshold).unwrap_or(chrono::Duration::MAX);
+    let mut findings = Vec::new();
+    for b in backlogs {
+        if b.count <= 0 {
+            continue;
+        }
+        let reference = last_claimed
+            .get(&b.kind)
+            .copied()
+            .unwrap_or(started_at)
+            .max(b.oldest_created_at);
+        let stalled_for = now - reference;
+        if stalled_for <= threshold {
+            continue;
+        }
+        findings.push(StarvationFinding {
+            kind: b.kind.clone(),
+            count: b.count,
+            reason: if registered.contains(b.kind.as_str()) {
+                STARVED_NOT_CLAIMED
+            } else {
+                STARVED_UNREGISTERED
+            },
+            stalled_for_secs: stalled_for.num_seconds(),
+        });
+    }
+    findings
+}
+
 /// Compute an exponential backoff for a retryable failure.
 ///
 /// `attempts` is the current `jobs.attempts` value (already incremented by the
@@ -430,6 +638,13 @@ mod tests {
         mark_completed_summaries: Mutex<Vec<serde_json::Value>>,
         reschedule_calls: Mutex<Vec<(Uuid, String)>>,
         mark_failed_calls: Mutex<Vec<(Uuid, String)>>,
+        /// What `eligible_pending_by_kind` reports (starvation audit).
+        backlog: Mutex<Vec<PendingKindBacklog>>,
+        /// When true, `eligible_pending_by_kind` returns `Err`.
+        backlog_fails: Mutex<bool>,
+        /// When true, `reschedule` returns `Err` — exercises the
+        /// "could not return the row to pending" error branch.
+        reschedule_fails: Mutex<bool>,
     }
 
     impl DispatcherMockRepo {
@@ -440,11 +655,26 @@ mod tests {
                 mark_completed_summaries: Mutex::new(Vec::new()),
                 reschedule_calls: Mutex::new(Vec::new()),
                 mark_failed_calls: Mutex::new(Vec::new()),
+                backlog: Mutex::new(Vec::new()),
+                backlog_fails: Mutex::new(false),
+                reschedule_fails: Mutex::new(false),
             }
         }
 
         fn seed_batch(&self, rows: Vec<JobRow>) {
             self.claim_batches.lock().unwrap().push(rows);
+        }
+
+        fn seed_backlog(&self, rows: Vec<PendingKindBacklog>) {
+            *self.backlog.lock().unwrap() = rows;
+        }
+
+        fn fail_backlog(&self) {
+            *self.backlog_fails.lock().unwrap() = true;
+        }
+
+        fn fail_reschedule(&self) {
+            *self.reschedule_fails.lock().unwrap() = true;
         }
 
         fn mark_completed_calls(&self) -> Vec<Uuid> {
@@ -500,7 +730,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((job_id, last_error.to_string()));
-            Box::pin(async { Ok(()) })
+            let fails = *self.reschedule_fails.lock().unwrap();
+            Box::pin(async move {
+                if fails {
+                    Err(hort_domain::error::DomainError::Invariant("boom".into()))
+                } else {
+                    Ok(())
+                }
+            })
         }
 
         fn mark_failed<'a>(
@@ -543,6 +780,20 @@ mod tests {
                 }
             };
             Box::pin(async move { Ok(batch) })
+        }
+
+        fn eligible_pending_by_kind(&self) -> BoxFuture<'_, DomainResult<Vec<PendingKindBacklog>>> {
+            let fails = *self.backlog_fails.lock().unwrap();
+            let rows = self.backlog.lock().unwrap().clone();
+            Box::pin(async move {
+                if fails {
+                    Err(hort_domain::error::DomainError::Invariant(
+                        "backlog boom".into(),
+                    ))
+                } else {
+                    Ok(rows)
+                }
+            })
         }
     }
 
@@ -821,8 +1072,7 @@ mod tests {
             2,
         );
 
-        let kinds: std::collections::HashSet<&str> =
-            dispatcher.registered_kinds().into_iter().collect();
+        let kinds: HashSet<&str> = dispatcher.registered_kinds().into_iter().collect();
         assert_eq!(kinds.len(), 2, "got {kinds:?}");
         assert!(kinds.contains("noop"), "got {kinds:?}");
         assert!(kinds.contains("other-kind"), "got {kinds:?}");
@@ -1108,6 +1358,9 @@ mod tests {
         // The claim mock bypasses the kind filter, so this simulates a race
         // where the kind was deregistered between claim and dispatch.
         // (In practice the claim query's WHERE kind = ANY(...) prevents this.)
+        // The row is now returned to `pending` rather than left `running`
+        // — see `claimed_row_with_unregistered_kind_is_returned_to_pending`;
+        // this test pins the surrounding loop's liveness.
         let row = make_job_row("unknown-kind");
         repo.seed_batch(vec![row]);
 
@@ -1329,5 +1582,397 @@ mod tests {
         // 0 attempts should not produce a shorter-than-base backoff.
         let d = compute_backoff(0);
         assert_eq!(d.as_secs(), DEFAULT_BACKOFF_SECS);
+    }
+
+    // -----------------------------------------------------------------------
+    // Claimed-but-undispatchable rows must not be lost
+    // -----------------------------------------------------------------------
+
+    /// A claimed row whose kind has no registered handler used to be
+    /// skipped with the row left `running`, on the stated assumption that
+    /// "the lock expires and another worker claims it". It does not: the
+    /// claim query selects `status = 'pending'` only, and nothing anywhere
+    /// resets a stale `running` row. The row must be returned to `pending`.
+    #[tokio::test]
+    async fn claimed_row_with_unregistered_kind_is_returned_to_pending() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let orphan = make_job_row("kind-with-no-handler");
+        repo.seed_batch(vec![orphan.clone()]);
+
+        // No handler registered at all → the claimed row is undispatchable.
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.poll_interval_secs = 0;
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        let calls = repo.reschedule_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the orphan row must be returned to pending: {calls:?}"
+        );
+        assert_eq!(calls[0].0, orphan.id);
+        assert!(
+            calls[0].1.contains("unregistered kind"),
+            "last_error must name the cause: {:?}",
+            calls[0].1
+        );
+    }
+
+    /// The revert itself can fail (DB flap). The dispatcher logs and keeps
+    /// polling — it must not panic or abort the loop.
+    #[tokio::test]
+    async fn failed_return_to_pending_does_not_break_the_poll_loop() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.fail_reschedule();
+        repo.seed_batch(vec![make_job_row("kind-with-no-handler")]);
+        repo.seed_batch(vec![make_job_row("kind-with-no-handler")]);
+
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.poll_interval_secs = 0;
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("join timed out")
+            .expect("task did not panic");
+        assert!(result.is_ok(), "run returned Err: {result:?}");
+        assert!(
+            repo.reschedule_calls().len() >= 2,
+            "the loop must keep polling after a failed revert"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Starvation detection
+    // -----------------------------------------------------------------------
+
+    fn backlog(kind: &str, count: i64, oldest: DateTime<Utc>) -> PendingKindBacklog {
+        PendingKindBacklog {
+            kind: kind.to_string(),
+            count,
+            oldest_created_at: oldest,
+        }
+    }
+
+    const THRESHOLD: Duration = Duration::from_secs(600);
+
+    /// The live-incident shape: an unregistered kind has ~1450 eligible pending
+    /// rows, the oldest hours old, and this dispatcher has no handler for
+    /// the kind — so `claim_pending_by_kinds` never selects it and nothing
+    /// ever complains. The audit must call it out as `unregistered`.
+    #[test]
+    fn detect_starvation_flags_an_unregistered_kind_with_an_old_backlog() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(2);
+        let registered: HashSet<&str> = ["quarantine-release-sweep"].into_iter().collect();
+        let backlogs = vec![backlog(
+            "provenance-verify",
+            1450,
+            now - chrono::Duration::hours(2),
+        )];
+
+        let f = detect_starvation(
+            &backlogs,
+            &registered,
+            &HashMap::new(),
+            now,
+            started,
+            THRESHOLD,
+        );
+
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "provenance-verify");
+        assert_eq!(f[0].count, 1450);
+        assert_eq!(f[0].reason, STARVED_UNREGISTERED);
+        assert!(f[0].stalled_for_secs >= 7200, "{f:?}");
+    }
+
+    /// Same backlog, but the kind IS registered and simply loses the
+    /// `priority DESC, created_at ASC` race every poll → `not_claimed`.
+    #[test]
+    fn detect_starvation_flags_a_registered_but_unclaimed_kind() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(2);
+        let registered: HashSet<&str> = ["provenance-verify"].into_iter().collect();
+        let backlogs = vec![backlog(
+            "provenance-verify",
+            40,
+            now - chrono::Duration::hours(1),
+        )];
+
+        let f = detect_starvation(
+            &backlogs,
+            &registered,
+            &HashMap::new(),
+            now,
+            started,
+            THRESHOLD,
+        );
+
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].reason, STARVED_NOT_CLAIMED);
+    }
+
+    /// A deep FIFO queue that IS draining re-arms its last-claimed clock
+    /// on every tick. That is the common case and must never alarm.
+    #[test]
+    fn detect_starvation_ignores_a_deep_but_draining_queue() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(2);
+        let registered: HashSet<&str> = ["provenance-verify"].into_iter().collect();
+        let backlogs = vec![backlog(
+            "provenance-verify",
+            5000,
+            now - chrono::Duration::hours(2),
+        )];
+        let mut last_claimed = HashMap::new();
+        last_claimed.insert(
+            "provenance-verify".to_string(),
+            now - chrono::Duration::seconds(5),
+        );
+
+        let f = detect_starvation(
+            &backlogs,
+            &registered,
+            &last_claimed,
+            now,
+            started,
+            THRESHOLD,
+        );
+
+        assert!(f.is_empty(), "a draining queue must not alarm: {f:?}");
+    }
+
+    /// A long-running worker that has never claimed a kind whose rows only
+    /// just arrived must not alarm — the backlog cannot have starved for
+    /// longer than it has existed.
+    #[test]
+    fn detect_starvation_floors_the_stall_at_the_oldest_row() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(6);
+        let registered: HashSet<&str> = ["provenance-verify"].into_iter().collect();
+        let backlogs = vec![backlog(
+            "provenance-verify",
+            3,
+            now - chrono::Duration::seconds(2),
+        )];
+
+        let f = detect_starvation(
+            &backlogs,
+            &registered,
+            &HashMap::new(),
+            now,
+            started,
+            THRESHOLD,
+        );
+
+        assert!(f.is_empty(), "fresh rows must not read as a stall: {f:?}");
+    }
+
+    /// An empty backlog row (count 0) is not starvation.
+    #[test]
+    fn detect_starvation_ignores_empty_backlogs() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(2);
+        let backlogs = vec![backlog("noop", 0, now - chrono::Duration::hours(2))];
+
+        let f = detect_starvation(
+            &backlogs,
+            &HashSet::new(),
+            &HashMap::new(),
+            now,
+            started,
+            THRESHOLD,
+        );
+
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    /// A stall exactly at the threshold is not yet starvation (`>`, not
+    /// `>=`), and an out-of-range `Duration` saturates rather than panicking.
+    #[test]
+    fn detect_starvation_threshold_boundary_and_saturating_conversion() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::seconds(600);
+        let backlogs = vec![backlog("noop", 1, now - chrono::Duration::hours(2))];
+
+        let at_threshold = detect_starvation(
+            &backlogs,
+            &HashSet::new(),
+            &HashMap::new(),
+            now,
+            started,
+            THRESHOLD,
+        );
+        assert!(
+            at_threshold.is_empty(),
+            "exactly-at-threshold must not fire: {at_threshold:?}"
+        );
+
+        // `chrono::Duration::from_std(Duration::MAX)` fails → saturate to
+        // `chrono::Duration::MAX`, i.e. nothing can ever exceed it.
+        let saturated = detect_starvation(
+            &backlogs,
+            &HashSet::new(),
+            &HashMap::new(),
+            now,
+            started,
+            Duration::MAX,
+        );
+        assert!(saturated.is_empty(), "{saturated:?}");
+    }
+
+    /// End-to-end through the poll loop: a dispatcher with NO
+    /// `provenance-verify` handler and an hours-old eligible backlog for
+    /// that kind emits the depth gauge and the `unregistered` starvation
+    /// counter. This is the diagnostic a silent starvation otherwise lacks.
+    #[tokio::test]
+    async fn poll_loop_audit_emits_gauge_and_unregistered_starvation_counter() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.seed_backlog(vec![backlog(
+            "provenance-verify",
+            1450,
+            Utc::now() - chrono::Duration::hours(2),
+        )]);
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.poll_interval_secs = 0;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        drop(guard);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge = snapshot.iter().find(|(ck, _, _, _)| {
+            ck.kind() == MetricKind::Gauge && ck.key().name() == METRIC_PENDING_ELIGIBLE
+        });
+        let (_, _, _, depth) = gauge.expect("depth gauge missing");
+        assert_eq!(*depth, DebugValue::Gauge(1450.0.into()));
+
+        // A just-booted worker publishes the depth immediately but does NOT
+        // accuse anyone: the ERROR/counter still needs STARVATION_THRESHOLD
+        // to elapse since `started_at`.
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_STARVED,
+                &[
+                    ("kind", "provenance-verify"),
+                    ("reason", STARVED_UNREGISTERED),
+                ],
+            ),
+            0,
+            "a freshly booted worker must not alarm within its grace window"
+        );
+    }
+
+    /// Once the grace window has elapsed, the same backlog produces the
+    /// ERROR-logged `unregistered` starvation counter. `started_at` is the
+    /// only input that has to age, so it is supplied directly rather than
+    /// waiting ten minutes of wall clock.
+    #[tokio::test]
+    async fn audit_starvation_emits_the_unregistered_counter_past_the_grace_window() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.seed_backlog(vec![backlog(
+            "provenance-verify",
+            1450,
+            Utc::now() - chrono::Duration::hours(2),
+        )]);
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        dispatcher
+            .audit_starvation(
+                &HashSet::new(),
+                &HashMap::new(),
+                Utc::now() - chrono::Duration::hours(2),
+            )
+            .await;
+        drop(guard);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_STARVED,
+                &[
+                    ("kind", "provenance-verify"),
+                    ("reason", STARVED_UNREGISTERED),
+                ],
+            ),
+            1,
+            "starvation counter missing: {snapshot:?}"
+        );
+    }
+
+    /// A failing audit query is warn-and-continue, not a loop-killer.
+    #[tokio::test]
+    async fn audit_starvation_swallows_a_query_failure() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.fail_backlog();
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher
+            .audit_starvation(&HashSet::new(), &HashMap::new(), Utc::now())
+            .await;
+    }
+
+    /// Claiming a row of a kind re-arms that kind's starvation clock, so a
+    /// registered-and-draining kind never trips the audit even when its
+    /// backlog is old and deep.
+    #[tokio::test]
+    async fn claiming_a_kind_suppresses_its_starvation_finding() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.seed_batch(vec![make_job_row("noop")]);
+        repo.seed_backlog(vec![backlog(
+            "noop",
+            5000,
+            Utc::now() - chrono::Duration::hours(2),
+        )]);
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.register(Arc::new(NoopHandler::new("noop", run_count.clone())), 4);
+        dispatcher.poll_interval_secs = 0;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        drop(guard);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_STARVED,
+                &[("kind", "noop"), ("reason", STARVED_NOT_CLAIMED)],
+            ),
+            0,
+            "a kind claimed this tick must not be reported starved: {snapshot:?}"
+        );
     }
 }

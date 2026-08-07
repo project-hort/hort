@@ -16,7 +16,7 @@ use uuid::Uuid;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
     EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage,
-    ScanJob, ScanKindFields, TriggerSource,
+    PendingKindBacklog, ScanJob, ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -202,6 +202,11 @@ impl PgJobsRepository {
         Ok(id_opt)
     }
 }
+
+/// Emitted once per claimed row that failed [`row_to_job_row`]
+/// projection and was resolved terminally instead of being stranded in
+/// `running`. See `docs/metrics-catalog.md`.
+const METRIC_CLAIM_UNMAPPABLE: &str = "hort_admin_tasks_claim_unmappable_total";
 
 /// PostgreSQL `unique_violation` SQLSTATE — surfaced when the partial
 /// unique on `(artifact_id) WHERE kind='scan'` rejects a duplicate
@@ -1011,12 +1016,98 @@ impl JobsRepository for PgJobsRepository {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Job", "claim_pending_by_kinds"))?;
-            let mut jobs: Vec<JobRow> = rows
-                .iter()
-                .map(row_to_job_row)
-                .collect::<DomainResult<_>>()?;
+            // Per-row projection, NOT `collect::<DomainResult<_>>()?`.
+            //
+            // The `?` form propagated the FIRST mapping error out of the
+            // function *after* the claiming UPDATE had already committed:
+            // every row in the batch was `running`, none was returned to
+            // the caller, and nothing ever moved them back — the claim
+            // predicate requires `status = 'pending'` and there is no
+            // stale-`running` reaper anywhere in the codebase. One
+            // unmappable row therefore permanently stranded up to
+            // `batch_size` healthy rows (invariant: a claimed-but-not-
+            // dispatched row is never permanently lost). The shape is reachable in production: `"scan"` is in
+            // `VALID_TASK_KINDS`, so the admin task-invoke path's
+            // `enqueue_task` writes a `kind='scan'` row with the
+            // scan-typed columns NULL, which `decide_kind_fields`
+            // rejects.
+            //
+            // Now each row is projected independently: mappable rows are
+            // returned and dispatched; an unmappable row is resolved
+            // TERMINALLY (`mark_failed`, carrying the projection error as
+            // `last_error`) plus an ERROR log and a metric. Terminal
+            // rather than revert-to-`pending` on purpose — an unmappable
+            // row is unmappable on every subsequent claim too, so
+            // re-queueing it would swap silent loss for a hot loop that
+            // burns a batch slot every poll.
+            let mut jobs: Vec<JobRow> = Vec::with_capacity(rows.len());
+            let mut unmappable: Vec<(Uuid, String)> = Vec::new();
+            for row in &rows {
+                match row_to_job_row(row) {
+                    Ok(job) => jobs.push(job),
+                    Err(e) => match row.try_get::<Uuid, _>("id") {
+                        Ok(id) => unmappable.push((id, e.to_string())),
+                        Err(id_err) => {
+                            // The `id` column itself is unreadable, so the
+                            // row cannot even be addressed for a terminal
+                            // transition. Pinned as unreachable by
+                            // `claim_pending_by_kinds_sql_*` (the
+                            // RETURNING clause always projects `id`);
+                            // logged rather than silently dropped.
+                            tracing::error!(
+                                error = %e,
+                                id_error = %id_err,
+                                "claim_pending_by_kinds: claimed row is unmappable AND its id is \
+                                 unreadable; the row stays 'running' and cannot be re-claimed"
+                            );
+                        }
+                    },
+                }
+            }
+            for (id, reason) in unmappable {
+                tracing::error!(
+                    job_id = %id,
+                    reason = %reason,
+                    "claim_pending_by_kinds: claimed row failed projection; marking it failed so \
+                     it is not stranded in 'running' (the rest of the batch is dispatched)"
+                );
+                metrics::counter!(METRIC_CLAIM_UNMAPPABLE).increment(1);
+                if let Err(e) = JobsRepository::mark_failed(self, id, &reason).await {
+                    tracing::error!(
+                        job_id = %id,
+                        error = %e,
+                        "claim_pending_by_kinds: marking the unmappable row failed did not persist",
+                    );
+                }
+            }
             sort_claimed_jobs(&mut jobs);
             Ok(jobs)
+        })
+    }
+
+    fn eligible_pending_by_kind(&self) -> BoxFuture<'_, DomainResult<Vec<PendingKindBacklog>>> {
+        Box::pin(async move {
+            // Mirrors the claim query's eligibility predicates minus the
+            // `kind = ANY(...)` filter — see the port doc.
+            let rows = sqlx::query(
+                "SELECT kind, count(*) AS n, min(created_at) AS oldest \
+                 FROM public.jobs \
+                 WHERE status = 'pending' \
+                   AND (locked_until IS NULL OR locked_until < now()) \
+                 GROUP BY kind",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Job", "eligible_pending_by_kind"))?;
+            rows.iter()
+                .map(|row| {
+                    Ok(PendingKindBacklog {
+                        kind: row.try_get("kind").map_err(|e| invariant(&e))?,
+                        count: row.try_get("n").map_err(|e| invariant(&e))?,
+                        oldest_created_at: row.try_get("oldest").map_err(|e| invariant(&e))?,
+                    })
+                })
+                .collect()
         })
     }
 

@@ -257,6 +257,28 @@ pub struct ScanKindFields {
     pub format: String,
 }
 
+/// One kind's claim-eligible pending backlog, as observed by
+/// [`JobsRepository::eligible_pending_by_kind`].
+///
+/// "Claim-eligible" means the row satisfies every predicate of the
+/// multi-kind claim query EXCEPT the `kind = ANY(<registered kinds>)`
+/// filter: `status = 'pending'` and
+/// `(locked_until IS NULL OR locked_until < now())`. Deliberately
+/// unfiltered by kind — the starvation audit's whole purpose is to see
+/// backlogs the poll loop's own kind array cannot (the blind spot: the
+/// `provenance-verify` handler was not registered, so the claim query
+/// never selected the kind and ~1450 rows accumulated with zero
+/// diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingKindBacklog {
+    /// The `jobs.kind` value.
+    pub kind: String,
+    /// Number of claim-eligible pending rows of this kind.
+    pub count: i64,
+    /// `created_at` of the oldest claim-eligible pending row of this kind.
+    pub oldest_created_at: DateTime<Utc>,
+}
+
 /// Domain projection of a `kind='scan'` row in the `jobs` table.
 ///
 /// Carries the typed scan-specific columns
@@ -637,6 +659,26 @@ pub trait JobsRepository: Send + Sync {
                 "claim_pending_by_kinds not implemented".into(),
             ))
         })
+    }
+
+    /// Group the **claim-eligible pending** rows of the `jobs` table by
+    /// `kind`, returning per-kind count + oldest `created_at`.
+    ///
+    /// Deliberately NOT filtered by the caller's registered kinds: this
+    /// is the input to the dispatcher's starvation audit, whose blind
+    /// spot is precisely a kind the poll loop does not claim. A kind with
+    /// eligible rows that the dispatcher never claims — because no
+    /// handler is registered for it, or because it loses the
+    /// `priority DESC, created_at ASC` race on every poll — is otherwise
+    /// invisible: the claim query filters it out and every log stays
+    /// silent.
+    ///
+    /// **Default implementation:** returns `Ok(Vec::new())` (no backlog
+    /// observed) so existing mock `JobsRepository` impls keep compiling
+    /// and the audit is inert for them. The Postgres adapter overrides it
+    /// with the real grouped aggregate.
+    fn eligible_pending_by_kind(&self) -> BoxFuture<'_, DomainResult<Vec<PendingKindBacklog>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     /// Batch-insert prefetch cascade jobs with
