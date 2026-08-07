@@ -53,7 +53,8 @@ pub enum IdempotencyKeyWindow {
         .args(["idempotency_key", "idempotency_key_window"])
 ))]
 pub struct TaskInvokeArgs {
-    /// Task kind to invoke (e.g. `noop`, `staging-sweep`, `scan`).
+    /// Task kind to invoke (e.g. `noop`, `staging-sweep`,
+    /// `retention-purge`).
     pub kind: String,
 
     /// Read JSON body from this file. Default: empty object `{}`.

@@ -299,10 +299,16 @@ async fn older_same_priority_backlog_out_sorts_a_newer_sweep_row() {
 /// nothing to move them back — the claim predicate selects `pending` only
 /// and there is no stale-`running` reaper anywhere in the codebase.
 ///
-/// The shape is production-reachable: `"scan"` is in `VALID_TASK_KINDS`,
-/// so the admin task-invoke path's `enqueue_task` writes a `kind='scan'`
-/// row with the scan-typed columns NULL, which `decide_kind_fields`
-/// rejects — and the `jobs` table has no CHECK preventing it.
+/// The shape used to be production-reachable: `"scan"` was in
+/// `VALID_TASK_KINDS`, so the admin task-invoke path's `enqueue_task`
+/// wrote a `kind='scan'` row with the scan-typed columns NULL, which
+/// `decide_kind_fields` rejects. That source is now closed at the apply
+/// side (no admin route, and the kind is off the allow-list), but the
+/// `jobs` table still has no CHECK preventing the shape — a row seeded
+/// by direct SQL, left over from an older deployment, or produced by a
+/// future kind whose typed columns go missing must still not take its
+/// whole claimed batch down. This is that defence-in-depth proof, and
+/// the seed below is deliberately raw SQL for exactly that reason.
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn unmappable_row_does_not_strand_the_rest_of_its_claimed_batch() {
