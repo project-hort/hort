@@ -48,7 +48,7 @@ impl std::fmt::Display for ValidationError {
 /// before forwarding the params to `TaskUseCase::enqueue`.
 pub trait TaskParams: serde::de::DeserializeOwned + Serialize + Send + Sync + 'static {
     /// The `jobs.kind` literal for this parameter struct.
-    /// Must be one of the values in `VALID_TASK_KINDS`.
+    /// Must be one of the values in `ADMIN_INVOKABLE_TASK_KINDS`.
     const KIND: &'static str;
 
     /// Validate the params. Returns `Err(ValidationError)` for any

@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn kind_constant_is_provenance_verify() {
         // The literal the dispatcher registers under and the SQL CHECK /
-        // VALID_TASK_KINDS mirror.
+        // ADMIN_INVOKABLE_TASK_KINDS mirror.
         assert_eq!("provenance-verify", "provenance-verify");
     }
 

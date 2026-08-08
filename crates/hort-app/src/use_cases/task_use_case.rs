@@ -55,7 +55,7 @@ use hort_domain::entities::rbac::Permission;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     task_kind_is_destructive, Actor, ApiActor, DomainEvent, StreamId, TaskInvoked,
-    DESTRUCTIVE_TASK_CLAIM, VALID_TASK_KINDS,
+    ADMIN_INVOKABLE_TASK_KINDS, DESTRUCTIVE_TASK_CLAIM,
 };
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
@@ -187,7 +187,7 @@ impl TaskUseCase {
     /// Authorization stream.
     ///
     /// Every other kind (`noop`, `scan`, …) — and, fail-safe, any
-    /// unrecognised string the upstream `VALID_TASK_KINDS` allowlist
+    /// unrecognised string the upstream `ADMIN_INVOKABLE_TASK_KINDS` allowlist
     /// would have rejected — routes to [`StreamId::authorization`],
     /// exactly as before: zero behaviour change for non-destructive
     /// kinds.
@@ -277,9 +277,9 @@ impl TaskUseCase {
         idempotency_key: Option<&IdempotencyKey>,
     ) -> AppResult<EnqueueOutcome> {
         // 1. Validate kind before doing any I/O.
-        if !VALID_TASK_KINDS.contains(&kind) {
+        if !ADMIN_INVOKABLE_TASK_KINDS.contains(&kind) {
             return Err(AppError::Domain(DomainError::Validation(format!(
-                "unknown task kind {kind:?}; expected one of {VALID_TASK_KINDS:?}"
+                "unknown task kind {kind:?}; expected one of {ADMIN_INVOKABLE_TASK_KINDS:?}"
             ))));
         }
 
@@ -476,7 +476,8 @@ mod tests {
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
     use hort_domain::error::{DomainError, DomainResult};
     use hort_domain::events::{
-        DomainEvent, PersistedEvent, StreamCategory, StreamId, TaskInvoked, VALID_TASK_KINDS,
+        DomainEvent, PersistedEvent, StreamCategory, StreamId, TaskInvoked,
+        ADMIN_INVOKABLE_TASK_KINDS,
     };
     use hort_domain::ports::event_store::{
         AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
@@ -1064,10 +1065,10 @@ mod tests {
         assert_eq!(payload.params_digest, expected_digest);
     }
 
-    /// Test — every value in `VALID_TASK_KINDS` is accepted.
+    /// Test — every value in `ADMIN_INVOKABLE_TASK_KINDS` is accepted.
     #[tokio::test]
     async fn enqueue_all_valid_kinds_accepted() {
-        for kind in VALID_TASK_KINDS {
+        for kind in ADMIN_INVOKABLE_TASK_KINDS {
             let job_id = Uuid::new_v4();
             let jobs = Arc::new(RecordingJobsRepository::new(job_id));
             let events = Arc::new(RecordingEventStore::new());

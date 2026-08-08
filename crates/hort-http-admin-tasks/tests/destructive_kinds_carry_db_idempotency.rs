@@ -20,7 +20,7 @@
 //!
 //! Mirrors the closed-set walker shape from
 //! `crates/hort-server/tests/task_use_case_enqueue_real_db.rs:154,165-185`
-//! (the `VALID_TASK_KINDS` walker) but stays at the HTTP layer (mocked
+//! (the `ADMIN_INVOKABLE_TASK_KINDS` walker) but stays at the HTTP layer (mocked
 //! ports — no real DB) because the contract here is between the handler
 //! and the use-case port, not between the use case and Postgres.
 //!
@@ -134,7 +134,7 @@ fn ordinary_principal() -> CallerPrincipal {
 #[tokio::test]
 async fn destructive_kinds_carry_db_idempotency() {
     // The closed set is non-empty — this is the same invariant the
-    // VALID_TASK_KINDS walker pins for its closed-set guarantee.
+    // ADMIN_INVOKABLE_TASK_KINDS walker pins for its closed-set guarantee.
     assert!(
         !DESTRUCTIVE_TASK_KINDS.is_empty(),
         "DESTRUCTIVE_TASK_KINDS must be non-empty — the loop below would silently pass",
