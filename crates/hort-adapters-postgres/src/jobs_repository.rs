@@ -1061,11 +1061,18 @@ impl JobsRepository for PgJobsRepository {
             // stale-`running` reaper anywhere in the codebase. One
             // unmappable row therefore permanently stranded up to
             // `batch_size` healthy rows (invariant: a claimed-but-not-
-            // dispatched row is never permanently lost). The shape is reachable in production: `"scan"` is in
-            // `VALID_TASK_KINDS`, so the admin task-invoke path's
-            // `enqueue_task` writes a `kind='scan'` row with the
-            // scan-typed columns NULL, which `decide_kind_fields`
-            // rejects.
+            // dispatched row is never permanently lost). The shape used to
+            // be production-reachable: `"scan"` was in
+            // `ADMIN_INVOKABLE_TASK_KINDS`, so the admin task-invoke
+            // path's `enqueue_task` wrote a `kind='scan'` row with the
+            // scan-typed columns NULL, which `decide_kind_fields` rejects.
+            // That source is now closed at the apply side (no admin
+            // route, and the kind is off the allow-list) — bare-`scan`
+            // rows lacking the scan-typed columns are legacy/poison only
+            // now, reachable solely via direct SQL, an older deployment's
+            // leftover row, or a future kind whose typed columns go
+            // missing; the `jobs` table still has no CHECK preventing the
+            // shape, so this per-row projection stays defence-in-depth.
             //
             // Now each row is projected independently: mappable rows are
             // returned and dispatched; an unmappable row is resolved

@@ -1,5 +1,5 @@
 //! Integration test — `TaskUseCase::enqueue` for every value in
-//! `VALID_TASK_KINDS` against a real PostgreSQL instance.
+//! `ADMIN_INVOKABLE_TASK_KINDS` against a real PostgreSQL instance.
 //!
 //! # Why this test exists
 //!
@@ -13,14 +13,14 @@
 //! literal mismatch — only a path through the real use case ↔ real
 //! adapter ↔ real DB can.
 //!
-//! This test walks every kind in `VALID_TASK_KINDS` through
+//! This test walks every kind in `ADMIN_INVOKABLE_TASK_KINDS` through
 //! `TaskUseCase::enqueue`, asserts the row lands successfully, and
 //! re-reads it to pin both the persisted `trigger_source` and the
 //! `actor_id` FK satisfaction.
 //!
 //! # Coverage scope
 //!
-//! - Every kind in `VALID_TASK_KINDS` enqueues without error.
+//! - Every kind in `ADMIN_INVOKABLE_TASK_KINDS` enqueues without error.
 //! - The persisted row's `trigger_source` is the literal the use case
 //!   passes (`"manual"`). Changing it back to anything not in the
 //!   CHECK allow-list re-breaks this test.
@@ -54,7 +54,7 @@ use hort_app::use_cases::task_use_case::TaskUseCase;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
-use hort_domain::events::VALID_TASK_KINDS;
+use hort_domain::events::ADMIN_INVOKABLE_TASK_KINDS;
 use hort_domain::ports::event_store::EventStore;
 use hort_domain::ports::jobs_repository::JobsRepository;
 
@@ -108,13 +108,13 @@ fn rbac_with_task_invoke() -> Arc<ArcSwap<RbacEvaluator>> {
     Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![grant])))
 }
 
-/// Walk every value in `VALID_TASK_KINDS` through
+/// Walk every value in `ADMIN_INVOKABLE_TASK_KINDS` through
 /// `TaskUseCase::enqueue` against a real DB and confirm:
 /// 1. each enqueue succeeds (no SQL CHECK / FK violation);
 /// 2. the persisted row carries `trigger_source = 'manual'`;
 /// 3. `actor_id` resolves the FK against the seeded test user.
 ///
-/// If a future change broadens or narrows `VALID_TASK_KINDS`, the loop
+/// If a future change broadens or narrows `ADMIN_INVOKABLE_TASK_KINDS`, the loop
 /// implicitly covers the new set. If a future change re-introduces a
 /// trigger_source literal absent from the SQL CHECK (the historical
 /// "api" regression), every iteration fails with a 23514 violation.
@@ -154,7 +154,7 @@ async fn enqueue_accepts_every_valid_kind() {
         // `task:destructive` is the
         // additional claim the destructive-kind
         // gate (ADR 0028) requires on top of `Permission::AdminTaskInvoke` for the
-        // destructive kinds in `VALID_TASK_KINDS` (`retention-evaluate`,
+        // destructive kinds in `ADMIN_INVOKABLE_TASK_KINDS` (`retention-evaluate`,
         // `retention-purge`, `eventstore-archive`); this test asserts a
         // sufficiently-privileged actor can enqueue *every* valid kind,
         // so it must carry it.
@@ -165,11 +165,11 @@ async fn enqueue_accepts_every_valid_kind() {
     };
 
     assert!(
-        !VALID_TASK_KINDS.is_empty(),
-        "VALID_TASK_KINDS must be non-empty — the loop below would silently pass"
+        !ADMIN_INVOKABLE_TASK_KINDS.is_empty(),
+        "ADMIN_INVOKABLE_TASK_KINDS must be non-empty — the loop below would silently pass"
     );
 
-    for &kind in VALID_TASK_KINDS {
+    for &kind in ADMIN_INVOKABLE_TASK_KINDS {
         let params = serde_json::json!({});
         let outcome = use_case
             .enqueue(&actor, kind, &params, None)

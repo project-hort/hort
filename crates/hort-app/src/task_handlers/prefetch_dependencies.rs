@@ -90,11 +90,11 @@ use hort_domain::types::PageRequest;
 const PREFETCH_TRIGGER_SOURCE: &str = "prefetch";
 
 /// `kind` literal for the ingest-leaf row. Must match
-/// `VALID_TASK_KINDS`.
+/// `ADMIN_INVOKABLE_TASK_KINDS`.
 const KIND_PREFETCH_INGEST: &str = "prefetch";
 
 /// `kind` literal for the cascade-driver row. Must match
-/// `VALID_TASK_KINDS`.
+/// `ADMIN_INVOKABLE_TASK_KINDS`.
 const KIND_PREFETCH_DEPENDENCIES: &str = "prefetch-dependencies";
 
 // ---------------------------------------------------------------------------
