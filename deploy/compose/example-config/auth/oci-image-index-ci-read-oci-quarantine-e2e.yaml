@@ -1,0 +1,23 @@
+# PermissionGrant: serviceAccount oci-image-index-ci -> read
+# oci-quarantine-e2e.
+# Granted alongside write (write does not imply read; permissions are flat).
+# Load-bearing for the Phase B write-authorized HEAD/GET-by-index-digest
+# checks (and the child-manifest/blob resolution they drive): those are
+# pull-scoped `/v2/auth` requests, gated by the credentialed exchange path's
+# grant scan before the quarantine hold-read exemption is even consulted —
+# the exemption overrides only the HOLD's 503, it does not substitute for
+# holding this grant. `isPublic` on this repo does not help here either: that
+# shortcut is legacy Basic-as-JWT-only
+# (crates/hort-app/src/use_cases/repository_access.rs `enforce`); the
+# credentialed `/v2/auth` exchange path never consults it. Mirrors
+# provenance-ci-read.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-image-index-ci-read-oci-quarantine-e2e
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-image-index-ci
+  permission: read
+  repository: oci-quarantine-e2e

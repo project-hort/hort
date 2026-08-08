@@ -1,0 +1,21 @@
+# PermissionGrant: serviceAccount oci-private-e2e-writer -> read
+# oci-private-e2e.
+# Granted alongside write (write does not imply read; permissions are flat).
+# Load-bearing for the writer's OWN seed push under the native-token posture:
+# the blob-existence HEAD skopeo issues before every upload (Distribution-Spec
+# dedup) resolves through the SAME base Read gate as any GET/HEAD
+# (crates/hort-http-oci/src/blobs.rs `serve`), so a write-only SA 403s on its
+# very first push. The repo being private changes nothing here — the
+# credentialed /v2/auth exchange is a pure grant scan either way. Mirrors
+# oci-quarantine-e2e-ci-read.yaml, where the same two-gate reasoning is spelled
+# out in full.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-private-e2e-writer-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-private-e2e-writer
+  permission: read
+  repository: oci-private-e2e

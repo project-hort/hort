@@ -12,7 +12,8 @@ per crate layer live in `CLAUDE.md` → *Test Coverage Tiers*.
 | **1 — lint** | `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings` | nothing |
 | **1 — structural guards** | see below | nothing (source/fixture scans) |
 | **2 — integration (DB)** | `cargo test --workspace` | PostgreSQL (`DATABASE_URL`) |
-| **3 — E2E (native clients)** | `./scripts/native-tests/run.sh --hort=compose` | Docker (brings up `deploy/compose/`) |
+| **3 — E2E (native clients, base lane)** | `./scripts/native-tests/run.sh --hort=compose` | Docker (brings up `deploy/compose/`) |
+| **3 — E2E (native clients, native-tokens lane)** | `./scripts/native-tests/run.sh --hort=compose --compose-overlay=native-tokens` | Docker (brings up `deploy/compose/` + the native-tokens overlay) |
 
 ### Unit + lint (Tier 1)
 
@@ -56,9 +57,16 @@ against a hort stack — either one it brings up from
 `deploy/compose/docker-compose.yml` itself, or an external hort you point it at.
 
 ```bash
-# compose mode: bring up deploy/compose, run every available scenario
-# in-network, tear down. This is the CI gate.
+# compose mode, base lane: bring up deploy/compose, run every available
+# scenario in-network, tear down. This is one of the two required CI gate
+# lanes (legacy posture — metrics-content assertions are unarmed here).
 ./scripts/native-tests/run.sh --hort=compose
+
+# compose mode, native-tokens lane: the other required CI gate lane — the
+# posture registry.hort.rs actually runs (native OCI /v2/auth token dance,
+# metrics-content assertions armed). Both invocations together are the full
+# local/pre-push E2E gate.
+./scripts/native-tests/run.sh --hort=compose --compose-overlay=native-tokens
 
 # A subset (by group or scenario; both `--flag value` and `--flag=value` work):
 ./scripts/native-tests/run.sh --hort=compose --group clients
@@ -106,13 +114,15 @@ with config overlays, or mint server-signed service tokens via
   image builds (hort-server + hort-worker via **buildah**), Helm publish, release
   SBOM. Its runners are buildah/Kubernetes-based (no docker daemon), so the
   compose-based E2E does **not** run here.
-- **GitHub Actions — runs the E2E gate.** `e2e.yml` runs
-  `scripts/native-tests/run.sh --hort=compose` on `ubuntu-latest` (which has
-  docker + compose) for pushes/PRs to `main` and `release/**`, for `v*` tags,
-  and — via `workflow_call` — as `release.yml`'s release gate. `ci.yml`
-  (lint/unit/coverage/integration/audit/deny), `codeql.yml`,
-  `docker-publish.yml` (images on `v*` tags), `release.yml`, and the weekly
-  `scheduled-container-scan.yml` also live here.
+- **GitHub Actions — runs the E2E gate.** `e2e.yml` runs both required
+  lanes — `scripts/native-tests/run.sh --hort=compose` (base) and
+  `scripts/native-tests/run.sh --hort=compose --compose-overlay=native-tokens`
+  (native-tokens) — as separate jobs on `ubuntu-latest` (which has docker +
+  compose) for pushes/PRs to `main` and `release/**`, for `v*` tags, and —
+  via `workflow_call` — as `release.yml`'s release gate (the caller waits on
+  both jobs). `ci.yml` (lint/unit/coverage/integration/audit/deny),
+  `codeql.yml`, `docker-publish.yml` (images on `v*` tags), `release.yml`,
+  and the weekly `scheduled-container-scan.yml` also live here.
 
 ## Coverage targets
 

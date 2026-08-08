@@ -1,0 +1,17 @@
+# PermissionGrant: serviceAccount oci-e2e-ci -> read oci-e2e.
+# Granted alongside write (write does not imply read; permissions are flat):
+# the credentialed `/v2/auth` mint narrows a requested `pull` scope to the
+# held read authority regardless of the repo's `isPublic` visibility (that
+# shortcut only applies to the anonymous mint path and to legacy Basic-as-JWT
+# reads) — without this grant the pull-back leg of oci.sh would get an empty
+# access[] on its pull-scoped request. Mirrors provenance-ci-read.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-e2e-ci-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-e2e-ci
+  permission: read
+  repository: oci-e2e

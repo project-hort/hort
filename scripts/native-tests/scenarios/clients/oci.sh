@@ -33,13 +33,33 @@ command -v skopeo >/dev/null 2>&1 || skip "skopeo not found"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"; rm -f "$PULLED_ARCHIVE"' EXIT
 
-# Fetch token via the shared lib
-DEV_TOKEN="$(fetch_token dev-user dev)"
-[ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
+# -----------------------------------------------------------------------------
+# Credential mode: legacy (Basic / IdP-JWT) vs native tokens.
+# -----------------------------------------------------------------------------
+# Under the `native-tokens` compose overlay every `/v2/*` request runs the real
+# Distribution-Spec token dance, and the /v2/auth mint validates the Basic
+# password strictly as a native PAT (dev-user's Keycloak JWT can never
+# complete it) -- so push and pull-back ride the oci-e2e-ci service account
+# instead (gitops: service-accounts/oci-e2e-ci.yaml +
+# auth/oci-e2e-ci-{read,write}.yaml). Legacy (no overlay): dev-user's Keycloak
+# JWT, unchanged.
+NATIVE_TOKENS=0
+case " ${HORT_COMPOSE_OVERLAYS:-} " in
+    *" native-tokens "*) NATIVE_TOKENS=1 ;;
+esac
 
-log "[auth] fetched DEV_TOKEN from Keycloak"
-
-DEST_CREDS="dev-user:${DEV_TOKEN}"
+if [ "$NATIVE_TOKENS" = "1" ]; then
+    log "[auth] native-token mode: admin-minting an hort_svc_* token for service account oci-e2e-ci"
+    SVC_TOKEN="$(mint_svc_token oci-e2e-ci "$REPO_KEY" read,write)" || {
+        fail "admin-mint oci-e2e-ci svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
+    DEST_CREDS="oci-e2e-ci:${SVC_TOKEN}"
+    log "[auth] svc token minted; push+pull ride the oci-e2e-ci service account"
+else
+    DEV_TOKEN="$(fetch_token dev-user dev)"
+    [ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
+    DEST_CREDS="dev-user:${DEV_TOKEN}"
+    log "[auth] legacy mode: fetched DEV_TOKEN from Keycloak"
+fi
 
 # ---- Test 1: push ----
 log "==> [1/3] Push: ${SOURCE_IMAGE} -> docker://${DEST_IMAGE}"

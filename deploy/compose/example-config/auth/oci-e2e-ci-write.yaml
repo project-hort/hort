@@ -1,0 +1,13 @@
+# PermissionGrant: serviceAccount oci-e2e-ci -> write oci-e2e (native-token-mode
+# skopeo push in scripts/native-tests/scenarios/clients/oci.sh). Resolves at
+# apply to the SA's backing user (GrantSubject::User, ADR 0037).
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-e2e-ci-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-e2e-ci
+  permission: write
+  repository: oci-e2e

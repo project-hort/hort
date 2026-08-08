@@ -135,26 +135,6 @@ www_auth_scheme_head() {
     | awk '{print $1}' || true
 }
 
-# admin_mint_sa_token <sa-name> <declared-permissions-json-array> -> prints
-# the minted hort_svc_* token, or an empty string on any failure (resolving
-# the SA's backing user, or the mint call itself) — never a non-zero exit,
-# matching this suite's established idiom of letting the caller check
-# emptiness (e.g. `psql_one`, provenance-push-then-sign.sh). Requires
-# `ADMIN_TOKEN` to already be set by the caller.
-admin_mint_sa_token() {
-  local sa_name="$1" perms_json="$2" uid
-  uid="$(psql_one "SELECT id FROM users WHERE username='sa:${sa_name}';")"
-  if [ -z "$uid" ]; then
-    printf ''
-    return 0
-  fi
-  curl -sS -X POST \
-      -H "Authorization: Bearer ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
-      -d "{\"name\":\"oci-private-pull-e2e-$(date +%s)-${sa_name}\",\"declared_permissions\":${perms_json},\"expires_in_days\":1}" \
-      "${HORT_URL}/api/v1/admin/users/${uid}/tokens" 2>/dev/null | jq -r '.token // empty'
-  return 0
-}
-
 # =============================================================================
 # Step 0: probe GET /v2/ (anonymous) for the deployed WWW-Authenticate scheme.
 # =============================================================================
@@ -184,14 +164,10 @@ if [ "$MODE" = "bearer" ]; then
   # complete it, so push/pull ride dedicated serviceAccount-subject
   # identities instead (gitops: service-accounts/oci-private-e2e-{writer,
   # reader}.yaml + auth/oci-private-e2e-{writer,reader}-{write,read}.yaml).
-  ADMIN_TOKEN="$(fetch_token admin admin)"
-  [ -n "$ADMIN_TOKEN" ] || { fail "fetch admin token (native-mode credentials)" "empty response from Keycloak"; summary; }
-  WRITER_SVC_TOKEN="$(admin_mint_sa_token oci-private-e2e-writer '["write"]')"
-  [ -n "$WRITER_SVC_TOKEN" ] || { fail "admin-mint oci-private-e2e-writer svc token" \
-      "no users row 'sa:oci-private-e2e-writer' or mint failed -- gitops service-accounts/oci-private-e2e-writer.yaml applied?"; summary; }
-  READER_SVC_TOKEN="$(admin_mint_sa_token oci-private-e2e-reader '["read"]')"
-  [ -n "$READER_SVC_TOKEN" ] || { fail "admin-mint oci-private-e2e-reader svc token" \
-      "no users row 'sa:oci-private-e2e-reader' or mint failed -- gitops service-accounts/oci-private-e2e-reader.yaml applied?"; summary; }
+  WRITER_SVC_TOKEN="$(mint_svc_token oci-private-e2e-writer "$REPO_KEY" write)" || {
+      fail "admin-mint oci-private-e2e-writer svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
+  READER_SVC_TOKEN="$(mint_svc_token oci-private-e2e-reader "$REPO_KEY" read)" || {
+      fail "admin-mint oci-private-e2e-reader svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
   PUSH_CREDS="oci-private-e2e-writer:${WRITER_SVC_TOKEN}"
   PULL_CREDS="oci-private-e2e-reader:${READER_SVC_TOKEN}"
   log "[auth] native-token mode: admin-minted hort_svc_* tokens for oci-private-e2e-writer (push) + oci-private-e2e-reader (pull)"
