@@ -51,25 +51,35 @@
 # failure mode backlog/036 guards against with its >5 MiB blob-size floor.
 #
 # ---------------------------------------------------------------------------
-# WHY "releasable", NOT "released" — the eligibility predicate.
+# WHY "releasable-OR-released" — the eligibility predicate.
 # ---------------------------------------------------------------------------
 # The child's window anchor (created_at - 24h) means its computed deadline
-# (anchor + 24h == created_at) has ALREADY PASSED the instant it is ingested
-# — but nothing in this harness actually FLIPS its status to `released`:
-# that requires the `quarantine-release-sweep` task, which is dispatched
-# through the jobs queue and consumed by hort-worker
-# (crates/hort-worker/src/composition.rs registers
-# `QuarantineReleaseSweepHandler`) — and, per the same no-worker constraint
-# as `ScanSucceeded` above, nothing in the compose stack ever claims that
-# job. So this scenario asserts ELIGIBILITY, not an observed release: the
-# exact predicate `crates/hort-adapters-postgres/src/
-# quarantine_release_candidates.rs`'s `select_expired` query uses —
-# `quarantine_status = 'quarantined' AND quarantine_window_start <= now() -
-# duration` — evaluated directly via `psql_one`. That predicate is pure SQL
-# over already-ingested rows; it needs no sweep task to actually run to be
-# true or false right now, and it is exactly what "becomes releasable at the
-# next sweep" means operationally: the row satisfies the sweep's own
-# selection query, whenever a worker next polls it.
+# (anchor + 24h == created_at) has ALREADY PASSED the instant it is ingested.
+# This scenario's own `requires:` line (egress db) does not need a worker, so
+# in an ISOLATED run (e.g. `--scenario`) nothing ever claims the
+# `quarantine-release-sweep` job and the row just sits ELIGIBLE. But
+# `scripts/native-tests/run.sh` computes `--profile worker` ONCE, over the
+# union of every selected scenario's `requires:` — so in a combined/full run
+# that also selects a worker-requiring scenario (e.g.
+# `proxy-required-multilayer.sh`), the shared compose stack's hort-worker AND
+# `hort-sweep-ticker` (also `profile: worker`) are BOTH live for this
+# scenario's entire run too. The ticker's cadence is `SWEEP_TICK_SECS`
+# (dev/CI default 30s, see deploy/compose/docker-compose.yml) — fast enough
+# that the sweep can legitimately claim and release this already-eligible
+# child mid-scenario. A `released` status is a STRICTLY STRONGER proof that
+# the release-sweep selection predicate held (it only fires post-hoc on rows
+# that satisfied it) than an unconsumed `eligible` reading — so every
+# assertion below that touches the child's `quarantine_status` accepts
+# EITHER outcome. The exact predicate
+# `crates/hort-adapters-postgres/src/quarantine_release_candidates.rs`'s
+# `select_expired` query uses — `quarantine_status = 'quarantined' AND
+# quarantine_window_start <= now() - duration` — is evaluated directly via
+# `psql_one` for the eligible case; it needs no sweep task to actually run to
+# be true or false right now, and it is exactly what "becomes releasable at
+# the next sweep" means operationally: the row satisfies the sweep's own
+# selection query, whenever a worker next polls it. The index's window is a
+# full, fresh 24h — it cannot elapse mid-run — so index assertions stay
+# strict (`quarantined` / not-eligible only).
 #
 # ---------------------------------------------------------------------------
 # WHY alpine:3.19, WHY digests not counts.
@@ -339,10 +349,13 @@ if [ "$index_status" = "quarantined" ]; then
 else
     fail "index quarantine_status = quarantined" "got '${index_status}'"
 fi
-if [ "$child_status" = "quarantined" ]; then
-    pass "child quarantine_status = quarantined"
+# released-OR-quarantined: see "WHY releasable-OR-released" above — a fast
+# sweep tick can legitimately release the zero-window child before this
+# check runs when a worker-requiring scenario shares the stack.
+if [ "$child_status" = "quarantined" ] || [ "$child_status" = "released" ]; then
+    pass "child quarantine_status = quarantined (or already released by a fast sweep tick)"
 else
-    fail "child quarantine_status = quarantined" "got '${child_status}'"
+    fail "child quarantine_status = quarantined (or released)" "got '${child_status}'"
 fi
 
 # ---------------------------------------------------------------------
@@ -376,11 +389,18 @@ fi
 log ""
 log "--- Step 7: release-eligibility predicate (child eligible now, index not)"
 
-child_eligible="$(psql_one "SELECT (quarantine_status = 'quarantined' AND quarantine_window_start <= now() - interval '24 hours') FROM artifacts WHERE id = '${CHILD_ID}';")"
-if [ "$child_eligible" = "t" ]; then
-    pass "child satisfies the release-sweep selection predicate NOW (releasable at the next sweep)"
+child_status_now="$(psql_one "SELECT quarantine_status FROM artifacts WHERE id = '${CHILD_ID}';")"
+child_window_elapsed="$(psql_one "SELECT (quarantine_window_start <= now() - interval '24 hours') FROM artifacts WHERE id = '${CHILD_ID}';")"
+# released-OR-eligible: quarantine_status = 'released' is a strictly
+# stronger proof the sweep's predicate held (see "WHY releasable-OR-released"
+# above) than an unconsumed eligible reading — a fast sweep tick sharing the
+# stack can legitimately claim this row before this line runs.
+if [ "$child_status_now" = "released" ] || \
+   { [ "$child_status_now" = "quarantined" ] && [ "$child_window_elapsed" = "t" ]; }; then
+    pass "child satisfies the release-sweep selection predicate NOW (releasable at the next sweep, or already released by a fast tick)"
 else
-    fail "child satisfies the release-sweep selection predicate" "got '${child_eligible}' (expected t)"
+    fail "child satisfies the release-sweep selection predicate" \
+        "got status='${child_status_now}' window_elapsed='${child_window_elapsed}' (expected quarantined+elapsed or released)"
 fi
 
 index_eligible="$(psql_one "SELECT (quarantine_status = 'quarantined' AND quarantine_window_start <= now() - interval '24 hours') FROM artifacts WHERE id = '${INDEX_ID}';")"

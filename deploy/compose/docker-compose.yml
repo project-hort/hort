@@ -417,15 +417,19 @@ services:
     # CronJob (native deploys: the `hort_timers` systemd timer). Production
     # schedules `hort-server enqueue-quarantine-release-sweep` every 5 minutes
     # (values.yaml `schedule: "*/5 * * * *"`); compose has no cron, so this
-    # sidecar loops the same DB-only enqueue subcommand every 15 seconds —
-    # tight enough that the E2E policies' short quarantine windows (30s)
-    # release/expire within a smoke run. The enqueued row drives BOTH
-    # release-gate decisions: releasing a window-elapsed Cleared artifact AND
-    # the terminal ProvenanceRejected{Unsigned} at expiry (release_expired
-    # enqueues the final window_open=false provenance-verify itself — no
-    # separate expiry tick exists in production either). Lives under the
-    # `worker` profile: only the worker consumes the enqueued rows, so ticking
-    # a workerless stack would just pile up pending jobs.
+    # sidecar loops the same DB-only enqueue subcommand every SWEEP_TICK_SECS
+    # (default 15s — the stack's long-standing cadence). SWEEP_TICK_SECS is a dev/CI cadence knob only —
+    # production deployments schedule their own ticker via the CronJob/timer
+    # above, never this variable. Tight enough that the E2E policies' short
+    # quarantine windows (seconds-to-minutes) release/expire within a smoke run, with
+    # release latency after eligibility bounded by ~SWEEP_TICK_SECS plus
+    # processing. The enqueued row drives BOTH release-gate decisions:
+    # releasing a window-elapsed Cleared artifact AND the terminal
+    # ProvenanceRejected{Unsigned} at expiry (release_expired enqueues the
+    # final window_open=false provenance-verify itself — no separate expiry
+    # tick exists in production either). Lives under the `worker` profile:
+    # only the worker consumes the enqueued rows, so ticking a workerless
+    # stack would just pile up pending jobs.
     profiles:
       - worker
     build:
@@ -451,7 +455,7 @@ services:
         while true; do
           /usr/local/bin/hort-server enqueue-quarantine-release-sweep \
             || echo "[sweep-ticker] enqueue failed; retrying next tick" >&2
-          sleep 15
+          sleep "${SWEEP_TICK_SECS:-15}"
         done
     environment:
       DATABASE_URL: "postgres://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/artifact_registry"
