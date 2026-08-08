@@ -19,14 +19,19 @@ spec:
   # §4, the inert-field guard — a non-empty list is apply-rejected).
   #
   # `scanBackends: []` keeps the release gate purely provenance + time, same
-  # rationale as oci-provenance-e2e-required.yaml. A 30s window is long enough
-  # that a keyed `cosign sign` against the proxy-pulled subject lands inside
-  # it, short enough that the release/expiry sweep completes within a smoke
-  # run.
+  # rationale as oci-provenance-e2e-required.yaml. The window doubles as the
+  # signing deadline AND must cover the client's constituent pulls, which
+  # must complete before the sign so the one-shot verify cascade (it walks
+  # the signed subject's constituents once, at verify time, and clears only
+  # rows that exist at that moment) finds every row — a constituent ingested
+  # after verify never receives clearance and strands until a re-sign. 120s
+  # covers the pulls (~30-60s incl. docker.io) plus the sign with margin,
+  # while staying short enough that the release/expiry sweep completes
+  # within a smoke run.
   scope:
     repository: oci-provenance-proxy-e2e
   severityThreshold: critical
-  quarantineDuration: 30s
+  quarantineDuration: 120s
   requireApproval: false
   provenanceMode: required
   provenanceBackends: [cosign-key]

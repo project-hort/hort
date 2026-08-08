@@ -110,10 +110,13 @@ RESOLVER_REFRESH_GUESS="${RESOLVER_REFRESH_GUESS:-8}"
 # not window-bound: release happens on the first quarantine-release-sweep
 # pass after the observation window closes, and the compose sweep-ticker
 # enqueues that sweep every 300s. From the moment the wait starts (right
-# after ProvenanceVerified), the releasing tick can therefore land up to
-# ~300s + the 30s window offset later, plus job-claim/release/pull seconds
-# on top — so a 300s budget structurally loses in the tail. 420s covers the
-# worst case with margin; a passing run still exits on the first poll hit.
+# after ProvenanceVerified — typically landing around T+70s, once the
+# constituent pulls and the sign have run), the window itself doesn't close
+# until T+120s (the quarantineDuration), so the releasing tick can land up
+# to ~(120-70)=50s later for the window plus a further 300s tick cadence,
+# plus job-claim/release/pull seconds on top: ~350s + ~10-50s processing =~
+# 360-400s worst case. 420s covers that with margin; a passing run still
+# exits on the first poll hit.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-420}"
 
 REGISTRY_HOST="${HORT_URL#http://}"
@@ -310,16 +313,56 @@ log "  child config digest = ${CONFIG_DIGEST}"
 log "  child layer digests = ${LAYER_DIGESTS[*]}"
 
 # ---------------------------------------------------------------------
-# Step 3: SIGN the index (the real subject) — cosign sign --key
+# Step 3: force constituent ingest — explicit GET of the config blob and
+# every layer blob through the proxy, run BEFORE the sign (Step 4), never
+# after it. Two invariants converge on this ordering:
+#   (a) the verify cascade walks the signed subject's constituent digests
+#       ONCE, at verify time, and clears only rows that exist at that
+#       moment (a missing row is a warn-and-skip, best-effort). A
+#       constituent ingested AFTER the subject's verify never receives
+#       clearance — there is no parent-lookup self-clear, and the sweep's
+#       expiry backstop deliberately skips parent-gated constituents — so
+#       it strands Pending+held until a re-sign re-drives the cascade. The
+#       constituents must therefore already exist when the sign's verify
+#       runs: a direct blob GET performs the SAME synchronous cold-pull
+#       ingest as Step 0's index GET regardless of whether the response is
+#       200 or a designed hold-503, so by the time this loop returns every
+#       constituent row exists for the cascade to find;
+#   (b) everything placed between ingest and sign eats into the
+#       observation window, because under a required provenance policy the
+#       window's end IS the signing deadline. The window is sized (120s)
+#       to cover both these constituent pulls (~30-60s incl. docker.io)
+#       and the sign itself, with margin.
+# Statuses are deliberately NOT asserted beyond "curl completed" — this is a
+# forcing step, not an assertion; the 60s polls in Step 6/8 stay as a
+# backstop.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 3: force constituent ingest (config blob + every layer blob)"
+
+curl -sS -o /dev/null \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
+    "${BASE_URL}/blobs/sha256:${CONFIG_HASH}" 2>/dev/null || true
+for h in "${LAYER_HASHES[@]}"; do
+    curl -sS -o /dev/null \
+        -H "Authorization: Bearer ${PUSH_SECRET}" \
+        "${BASE_URL}/blobs/sha256:${h}" 2>/dev/null || true
+done
+log "  forcing GETs issued for config blob + ${#LAYER_HASHES[@]} layer blob(s)"
+
+# ---------------------------------------------------------------------
+# Step 4: SIGN the index (the real subject) — cosign sign --key
 # --registry-referrers-mode=oci-1-1 against the SAME repo namespace the
 # image was proxy-pulled into (confirmed: cosign-key verification resolves
 # referrers repo-scoped-first, landing an upstream-fetched referrer back
 # into the same local index — a directly-pushed referrer is found the same
-# way). Signing early gives the worker's cascade the most wall-clock before
-# this scenario's later assertions poll for it.
+# way). Signing after the constituents are forced in (Step 3) satisfies
+# invariant (a) above — the verify cascade needs every constituent row to
+# already exist — while still giving the worker's cascade wall-clock ahead
+# of this scenario's later assertions.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 3: cosign sign --key ... --registry-referrers-mode=oci-1-1 ${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}"
+log "--- Step 4: cosign sign --key ... --registry-referrers-mode=oci-1-1 ${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}"
 export COSIGN_DOCKER_MEDIA_TYPES=1
 export COSIGN_EXPERIMENTAL=1
 SIGN_OUT=""
@@ -345,41 +388,6 @@ else
     fi
     summary
 fi
-
-# ---------------------------------------------------------------------
-# Step 4: force constituent ingest — explicit GET of the config blob and
-# every layer blob through the proxy, run AFTER the sign (Step 3), never
-# before it. Two invariants converge on this ordering:
-#   (a) it removes the race against best-effort background blob warming
-#       (prefetch.rs, fired off the child-manifest GET, with no retry and no
-#       ordering guarantee against a poll that starts immediately after) — a
-#       direct blob GET performs the SAME synchronous cold-pull ingest as
-#       Step 0's index GET regardless of whether the response is 200 or a
-#       designed hold-503, so by the time this loop returns every
-#       constituent row already exists;
-#   (b) under a required provenance policy, the observation window's end IS
-#       the signing deadline — a subject still unsigned when the window
-#       closes terminally rejects, so anything placed between ingest and
-#       sign eats into that window. This scenario's window is deliberately
-#       short to keep the release-wait cheap, so any step with no
-#       dependency on the sign belongs after it, never between ingest and
-#       sign.
-# Statuses are deliberately NOT asserted beyond "curl completed" — this is a
-# forcing step, not an assertion; the 60s polls in Step 6/8 stay as a
-# backstop.
-# ---------------------------------------------------------------------
-log ""
-log "--- Step 4: force constituent ingest (config blob + every layer blob)"
-
-curl -sS -o /dev/null \
-    -H "Authorization: Bearer ${PUSH_SECRET}" \
-    "${BASE_URL}/blobs/sha256:${CONFIG_HASH}" 2>/dev/null || true
-for h in "${LAYER_HASHES[@]}"; do
-    curl -sS -o /dev/null \
-        -H "Authorization: Bearer ${PUSH_SECRET}" \
-        "${BASE_URL}/blobs/sha256:${h}" 2>/dev/null || true
-done
-log "  forcing GETs issued for config blob + ${#LAYER_HASHES[@]} layer blob(s)"
 
 # ---------------------------------------------------------------------
 # Step 5: resolve repository + artifact ids via psql (defence-in-depth poll,
@@ -470,7 +478,7 @@ else
     fail "index quarantine_window_start == created_at" "got '${index_full_window}' (expected t)"
 fi
 
-# Duration is the literal `quarantineDuration: 30s` in
+# Duration is the literal `quarantineDuration: 120s` in
 # oci-provenance-proxy-e2e-required.yaml — hardcoded here rather than
 # resolved from `policy_projections` (mirrors proxy-multiarch-zero-window.sh,
 # which hardcodes its own policy's 24h for the identical reason: the
@@ -478,7 +486,7 @@ fi
 # foreign key, so a dynamic lookup would need the same scope-resolution
 # logic the application layer already owns — out of scope for a scenario
 # script to reimplement).
-QUARANTINE_DURATION_SQL="interval '30 seconds'"
+QUARANTINE_DURATION_SQL="interval '120 seconds'"
 assert_zero_window() {
     local id="$1" label="$2" got
     got="$(psql_one "SELECT (quarantine_window_start = created_at - ${QUARANTINE_DURATION_SQL}) FROM artifacts WHERE id = '${id}';")"
