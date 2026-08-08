@@ -45,12 +45,36 @@ command -v skopeo >/dev/null 2>&1 || skip "skopeo not found"
 
 trap 'rm -f "$PULLED_ARCHIVE"' EXIT
 
-# dev-user carries [developer, ci-pusher] → write on ${REPO_KEY}
-# (deploy/compose/example-config/auth/dev-write-oci-quarantine-e2e.yaml).
-DEV_TOKEN="$(fetch_token dev-user dev)"
-[ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
-DEST_CREDS="dev-user:${DEV_TOKEN}"
-log "[auth] fetched DEV_TOKEN from Keycloak (dev-user is write-authorized for ${REPO_KEY})"
+# -----------------------------------------------------------------------------
+# Credential mode: legacy (Basic / IdP-JWT) vs native tokens.
+# -----------------------------------------------------------------------------
+# Under the `native-tokens` compose overlay every `/v2/*` request runs the real
+# Distribution-Spec token dance, and the /v2/auth mint validates the Basic
+# password strictly as a native PAT (dev-user's Keycloak JWT can never
+# complete it) -- so the push, the dedup re-push, and the must-fail pull ride
+# the oci-quarantine-e2e-ci service account instead (gitops:
+# service-accounts/oci-quarantine-e2e-ci.yaml +
+# auth/oci-quarantine-e2e-ci-{read,write}.yaml). Legacy (no overlay): dev-user
+# carries [developer, ci-pusher] -> write on ${REPO_KEY}
+# (deploy/compose/example-config/auth/dev-write-oci-quarantine-e2e.yaml),
+# unchanged.
+NATIVE_TOKENS=0
+case " ${HORT_COMPOSE_OVERLAYS:-} " in
+    *" native-tokens "*) NATIVE_TOKENS=1 ;;
+esac
+
+if [ "$NATIVE_TOKENS" = "1" ]; then
+    log "[auth] native-token mode: admin-minting an hort_svc_* token for service account oci-quarantine-e2e-ci"
+    SVC_TOKEN="$(mint_svc_token oci-quarantine-e2e-ci "$REPO_KEY" read,write)" || {
+        fail "admin-mint oci-quarantine-e2e-ci svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
+    DEST_CREDS="oci-quarantine-e2e-ci:${SVC_TOKEN}"
+    log "[auth] svc token minted; push/re-push/pull ride the oci-quarantine-e2e-ci service account"
+else
+    DEV_TOKEN="$(fetch_token dev-user dev)"
+    [ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
+    DEST_CREDS="dev-user:${DEV_TOKEN}"
+    log "[auth] legacy mode: fetched DEV_TOKEN from Keycloak (dev-user is write-authorized for ${REPO_KEY})"
+fi
 
 # ---- [1/3] First push: quarantines the blobs on ingest ----
 log "==> [1/3] Push ${SOURCE_IMAGE} -> docker://${DEST_V0}"

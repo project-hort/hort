@@ -42,9 +42,19 @@
 # subsequent tests start clean. Worker brought up via `--profile
 # worker`.
 #
+# Invariant: this smoke mints an hort_svc_* service-account token and then
+# CONSUMES it (every hort-cli call after minting authenticates with it).
+# Consuming a native token requires the native-token validator
+# (HORT_NATIVE_TOKENS_ENABLED=true) — without it the PAT surface is a
+# no-op (no cache, no validator, no listener) and every call after the
+# mint would 401 against a stack that otherwise looks healthy. The
+# preflight below checks for that posture before minting anything.
+#
 # Skip semantics:
 #   - helm CLI missing → exit 2 (env unmet) for Phase 1.
 #   - Compose stack down → exit 2 for Phase 2 (env unmet, NOT failure).
+#   - Native-token posture absent (HORT_NATIVE_TOKENS_ENABLED != 'true') →
+#     exit 2 for Phase 2 (env unmet, NOT failure).
 #   - Worker container fails to start / register → exit 1.
 #   - hort-cli binary missing under target/{debug,release}/ → exit 2.
 #   - Token bootstrap impossible (HORT_TOKEN_ALLOW_ADMIN unset) → exit 2.
@@ -255,6 +265,25 @@ compose_available() {
     docker compose -f "$COMPOSE_FILE" ps >/dev/null 2>&1
 }
 
+# Refuses loudly (exit 2, env-unmet) if the running hort-server lacks the
+# native-token posture — same exec-and-check idiom as the
+# HORT_TOKEN_ALLOW_ADMIN gate in mint_svc_token() below.
+require_native_token_posture() {
+    local enabled
+    enabled="$(docker compose -f "$COMPOSE_FILE" \
+        exec -T hort-server sh -c 'echo "${HORT_NATIVE_TOKENS_ENABLED:-}"' 2>/dev/null \
+        | tr -d '[:space:]' || echo "")"
+    if [ "$enabled" != "true" ]; then
+        log "SKIP: HORT_NATIVE_TOKENS_ENABLED != 'true' in hort-server container env"
+        log "      this smoke mints an hort_svc_* token and then consumes it; the"
+        log "      PAT validator is a no-op without native tokens enabled, so the"
+        log "      mint would succeed but every hort-cli call after it would 401."
+        log "      bring the stack up with the native-tokens overlay:"
+        log "        docker compose -f $COMPOSE_FILE -f $REPO_ROOT/deploy/compose/docker-compose.native-tokens.yml up -d"
+        exit 2
+    fi
+}
+
 require_stack_up() {
     if ! compose_available; then
         log "SKIP: docker compose stack not running at $COMPOSE_FILE"
@@ -265,6 +294,7 @@ require_stack_up() {
         log "SKIP: hort-server metrics endpoint unreachable at $METRICS_URL"
         exit 2
     fi
+    require_native_token_posture
 }
 
 # Bounded poll. Returns 0 on success, 1 on timeout. No fixed `sleep N`

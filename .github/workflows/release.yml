@@ -25,9 +25,12 @@ jobs:
 
   e2e-gate:
     name: 🚦 E2E Gate
-    # e2e.yml runs the full native-tests compose suite (no input knobs); it is
-    # reusable via its `workflow_call:` trigger. It only checks out the repo and
-    # runs docker compose — no OIDC, no registry writes.
+    # e2e.yml runs the full native-tests compose suite across both posture
+    # lanes (base + native-tokens overlay) as two jobs (no input knobs); it is
+    # reusable via its `workflow_call:` trigger, and a `uses:` caller waits on
+    # every job the callee defines — so this single dependency already covers
+    # both lanes with no extra job listed here. It only checks out the repo
+    # and runs docker compose — no OIDC, no registry writes.
     permissions:
       contents: read
     uses: ./.github/workflows/e2e.yml

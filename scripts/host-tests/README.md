@@ -50,6 +50,12 @@ bash scripts/host-tests/run.sh --list   # list scripts without running
 - `HORT_TOKEN_ALLOW_ADMIN=true` in the `hort-server` container environment for
   scripts that mint service tokens (`test-task-framework.sh`,
   `test-notifications.sh`, `test-rescanning.sh`).
+- The **native-tokens overlay** for `test-rescanning.sh` — it consumes the
+  `hort_svc_*` token it mints, and the PAT validator is a no-op without
+  `HORT_NATIVE_TOKENS_ENABLED=true` (the base stack's legacy posture). Bring
+  the stack up with
+  `docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.native-tokens.yml up -d`;
+  the script's preflight refuses (exit 2) otherwise.
 - `HORT_RUN_INIT35_NOTIFICATIONS_E2E=1` to opt in to `test-notifications.sh`.
 - `HORT_E2E_NOTIFICATIONS=1` to opt in to `test-notifications-rbac.sh`.
 - `HORT_TEST_DEBUG=1` toggles `set -x` in scripts that support it.

@@ -227,17 +227,8 @@ sys.stdout.write(base64.urlsafe_b64decode(seg).decode("utf-8"))
 
 if [ "$NATIVE_TOKENS" = "1" ]; then
     log "[auth] native-token mode: admin-minting an hort_svc_* token for service account provenance-ci"
-    ADMIN_TOKEN="$(fetch_token admin admin)"
-    [ -n "$ADMIN_TOKEN" ] || { fail "fetch admin token" "empty response from Keycloak"; summary; }
-    SA_UID="$(psql_one "SELECT id FROM users WHERE username='sa:provenance-ci';")"
-    [ -n "$SA_UID" ] || { fail "resolve provenance-ci backing user" \
-        "no users row 'sa:provenance-ci' — gitops service-accounts/provenance-ci.yaml not applied?"; summary; }
-    SVC_TOKEN="$(curl -sS -X POST \
-        -H "Authorization: Bearer ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
-        -d "{\"name\":\"provenance-e2e-$(date +%s)\",\"declared_permissions\":[\"read\",\"write\"],\"expires_in_days\":1}" \
-        "${HORT_URL}/api/v1/admin/users/${SA_UID}/tokens" 2>/dev/null | jq -r '.token // empty')"
-    [ -n "$SVC_TOKEN" ] || { fail "admin-mint provenance-ci svc token" \
-        "POST /api/v1/admin/users/${SA_UID}/tokens returned no token"; summary; }
+    SVC_TOKEN="$(mint_svc_token provenance-ci "$REPO_KEY" read,write)" || {
+        fail "admin-mint provenance-ci svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
     PUSH_USER="provenance-ci"; PUSH_SECRET="$SVC_TOKEN"
     # The hold probes ([2/6]) ride a PULL-scoped capability JWT — the
     # issue-#13 shape: read-only cap, write-granted identity.

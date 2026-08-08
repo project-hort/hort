@@ -57,6 +57,75 @@ fetch_token() {
 psql_one() { psql "${HORT_DB_DSN:?scenario used psql without HORT_DB_DSN (needs requires: db)}" -tAX -c "$1" 2>/dev/null | tr -d '[:space:]'; }
 psql_exec() { psql "${HORT_DB_DSN:?scenario used psql without HORT_DB_DSN}" -c "$1" 2>&1; }
 
+# mint_svc_token <sa-username> <repo-key>[,<repo-key>...] <perm>[,<perm>...] ->
+# prints a minted hort_svc_* token on stdout, scoped to the given repos with
+# the given declared permissions. Resolves the SA's backing user
+# (`sa:<sa-username>`) and each repo's uuid via HORT_DB_DSN psql --
+# `repositories.key` holds the scenario-facing repo key, `.name` is only the
+# display name -- then admin-mints with BOTH `declared_permissions` AND
+# `repository_ids` set, so the mint authorizes against the per-repo
+# cap-vs-authority branch (api_token_use_case.rs run_issuance_gates,
+# `Some(ids)` arm) instead of the global branch (`None` arm), which a
+# repo-scoped-only SA can never satisfy ("a per-repo-only grantee CANNOT
+# mint a global token, only a per-repo one").
+#
+# On ANY failed stage -- admin-token fetch, SA-uid resolution, repo-uuid
+# resolution, or the mint POST itself (non-201, or 201 with no `.token`) --
+# prints the failing stage, HTTP status where applicable, and a body excerpt
+# to stderr, then returns non-zero. Never a silent empty-token success: this
+# replaces three bespoke mint blocks whose `| jq -r '.token // empty'`
+# swallowed the failure reason.
+mint_svc_token() {
+  local sa_user="$1" repo_keys_csv="$2" perms_csv="$3"
+  local admin_token uid key rid resp http_code body token
+  local -a repo_ids=()
+
+  admin_token="$(fetch_token admin admin)"
+  if [ -z "$admin_token" ]; then
+    echo "mint_svc_token(${sa_user}): [fetch admin token] empty response from Keycloak" >&2
+    return 1
+  fi
+
+  uid="$(psql_one "SELECT id FROM users WHERE username='sa:${sa_user}';")"
+  if [ -z "$uid" ]; then
+    echo "mint_svc_token(${sa_user}): [resolve backing user] no users row 'sa:${sa_user}' -- gitops service-accounts/${sa_user}.yaml not applied?" >&2
+    return 1
+  fi
+
+  IFS=',' read -ra _mint_svc_token_repo_keys <<< "$repo_keys_csv"
+  for key in "${_mint_svc_token_repo_keys[@]}"; do
+    rid="$(psql_one "SELECT id FROM repositories WHERE key='${key}';")"
+    if [ -z "$rid" ]; then
+      echo "mint_svc_token(${sa_user}): [resolve repository id] no repositories row with key='${key}'" >&2
+      return 1
+    fi
+    repo_ids+=("$rid")
+  done
+
+  resp="$(curl -sS -w '\n%{http_code}' -X POST \
+    -H "Authorization: Bearer ${admin_token}" -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg name "${sa_user}-e2e-$(date +%s)" \
+              --arg perms "$perms_csv" \
+              --argjson repo_ids "$(printf '%s\n' "${repo_ids[@]}" | jq -R . | jq -s .)" \
+              '{name: $name, declared_permissions: ($perms | split(",")), repository_ids: $repo_ids, expires_in_days: 1}')" \
+    "${HORT_URL}/api/v1/admin/users/${uid}/tokens" 2>/dev/null)"
+  http_code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  if [ "$http_code" != "201" ]; then
+    echo "mint_svc_token(${sa_user}): [admin-mint POST /api/v1/admin/users/${uid}/tokens] HTTP ${http_code} -- $(printf '%s' "$body" | head -c 300)" >&2
+    return 1
+  fi
+
+  token="$(printf '%s' "$body" | jq -r '.token // empty')"
+  if [ -z "$token" ]; then
+    echo "mint_svc_token(${sa_user}): [admin-mint POST] HTTP 201 with no .token field -- $(printf '%s' "$body" | head -c 300)" >&2
+    return 1
+  fi
+
+  printf '%s' "$token"
+}
+
 # bounded_poll <label> <timeout_secs> <predicate> [interval_secs] — eval the
 # predicate string every interval until it succeeds (exit 0) or the timeout
 # elapses (returns 1, logs a timeout line). `eval` runs in THIS shell, so the

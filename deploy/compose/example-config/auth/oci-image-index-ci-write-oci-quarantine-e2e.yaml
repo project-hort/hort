@@ -1,0 +1,16 @@
+# PermissionGrant: serviceAccount oci-image-index-ci -> write
+# oci-quarantine-e2e (native-token-mode Phase B held image-index push in
+# scripts/native-tests/scenarios/quarantine/oci-image-index.sh). Also what the
+# quarantine hold-read exemption's granted-authority predicate (ADR 0039 §10)
+# evaluates for the Phase B write-authorized HEAD/GET checks. Resolves at
+# apply to the SA's backing user (GrantSubject::User, ADR 0037).
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-image-index-ci-write-oci-quarantine-e2e
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-image-index-ci
+  permission: write
+  repository: oci-quarantine-e2e

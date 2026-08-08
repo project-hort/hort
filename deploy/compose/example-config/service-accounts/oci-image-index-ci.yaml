@@ -1,0 +1,19 @@
+# ServiceAccount (e2e): the native-token-mode pusher/reader for
+# scripts/native-tests/scenarios/quarantine/oci-image-index.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation): under the
+# native-tokens compose overlay the scenario admin-mints a SINGLE hort_svc_*
+# token for this SA spanning BOTH oci-e2e and oci-quarantine-e2e in one
+# `repository_ids` mint — the scenario drives both repos in one run and needs
+# one credential valid for both, so a single two-repo SA is the expected
+# shape here (rather than the oci-e2e-ci / oci-quarantine-e2e-ci split used by
+# the other two client scenarios, which each touch only one repo). Authority
+# is the sibling serviceAccount-subject PermissionGrants in
+# auth/oci-image-index-ci-{read,write}-oci-{e2e,quarantine-e2e}.yaml. Inert in
+# legacy (no-overlay) runs: the SA row exists, nothing mints for it — the
+# scenario's legacy-mode branch keeps using dev-user's OIDC token instead.
+apiVersion: project-hort.de/v1
+kind: ServiceAccount
+metadata:
+  name: oci-image-index-ci
+spec: {}

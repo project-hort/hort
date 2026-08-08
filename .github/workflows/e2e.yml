@@ -22,8 +22,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Two lanes, two jobs — not two steps in one job and not a matrix leg —
+  # so a failure names its posture directly in the checks list rather than
+  # requiring a log dive. Both run on the same triggers (the `on:` block
+  # above is workflow-scoped) and both are plain required jobs (no
+  # `continue-on-error`): this workflow's `workflow_call` caller waits on
+  # every job in the callee, so the release gate already covers both lanes
+  # with no change on the caller side. Each job cycles the compose stack
+  # exactly once, so the existing 20-minute timeout is per-cycle and does
+  # not need doubling for running two lanes — that would only apply if a
+  # single job cycled both stacks sequentially.
   run-e2e:
-    name: native-tests E2E (compose)
+    name: native-tests E2E (compose, base lane)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -40,6 +50,32 @@ jobs:
 
       # Builds the client image (incl. hort-cli), brings up deploy/compose,
       # runs every available scenario in-network, tears down. Per-scenario
-      # PASS/FAIL/SKIP/QUARANTINED is in this step's log.
-      - name: Run native-tests E2E (compose)
+      # PASS/FAIL/SKIP/QUARANTINED is in this step's log. Legacy posture:
+      # metrics-content assertions are unarmed here (no native-token
+      # validator to consume a minted scraper bearer against) — the
+      # native-tokens lane below covers that surface.
+      - name: Run native-tests E2E (compose, base lane)
         run: ./scripts/native-tests/run.sh --hort=compose
+
+  # Native-token posture: the shape registry.hort.rs actually runs in
+  # production — `/v2/auth` mints real capability JWTs, OCI clients run the
+  # full Distribution-Spec token dance, and metrics-content assertions arm
+  # (the runner admin-mints a `read_metrics` bearer once per run under this
+  # overlay). Marking this job required in branch protection is this
+  # workflow's design intent — it is gated on the human's overlay-lane
+  # acceptance run proving it green-capable before that branch-protection
+  # change lands, not on any uncertainty about the lane itself.
+  run-e2e-native-tokens:
+    name: native-tests E2E (compose, native-tokens lane)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check docker
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run native-tests E2E (compose, native-tokens lane)
+        run: ./scripts/native-tests/run.sh --hort=compose --compose-overlay=native-tokens

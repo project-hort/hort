@@ -179,19 +179,42 @@ esac
 
 if [ "$NATIVE_TOKENS" = "1" ]; then
     log "[auth] native-token mode: admin-minting an hort_svc_* token for service account provenance-proxy-ci"
-    ADMIN_TOKEN="$(fetch_token admin admin)"
-    [ -n "$ADMIN_TOKEN" ] || { fail "fetch admin token" "empty response from Keycloak"; summary; }
-    SA_UID="$(psql_one "SELECT id FROM users WHERE username='sa:provenance-proxy-ci';")"
-    [ -n "$SA_UID" ] || { fail "resolve provenance-proxy-ci backing user" \
-        "no users row 'sa:provenance-proxy-ci' — gitops service-accounts/provenance-proxy-ci.yaml not applied?"; summary; }
-    SVC_TOKEN="$(curl -sS -X POST \
-        -H "Authorization: Bearer ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
-        -d "{\"name\":\"provenance-proxy-e2e-$(date +%s)\",\"declared_permissions\":[\"read\",\"write\"],\"expires_in_days\":1}" \
-        "${HORT_URL}/api/v1/admin/users/${SA_UID}/tokens" 2>/dev/null | jq -r '.token // empty')"
-    [ -n "$SVC_TOKEN" ] || { fail "admin-mint provenance-proxy-ci svc token" \
-        "POST /api/v1/admin/users/${SA_UID}/tokens returned no token"; summary; }
+    SVC_TOKEN="$(mint_svc_token provenance-proxy-ci "$REPO_KEY" read,write)" || {
+        fail "admin-mint provenance-proxy-ci svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
     PUSH_USER="provenance-proxy-ci"; PUSH_SECRET="$SVC_TOKEN"
     log "[auth] svc token minted for the sign step"
+
+    # --- Negative regression pin (native mode only) -------------------------
+    # A deliberate GLOBAL mint (no repository_ids) for the same repo-scoped
+    # SA must be denied: `run_issuance_gates`'s `None` branch
+    # (crates/hort-app/src/use_cases/api_token_use_case.rs:2212-2223)
+    # requires each declared permission to be held GLOBALLY, and
+    # provenance-proxy-ci only ever holds a per-repo grant on REPO_KEY --
+    # "a per-repo-only grantee CANNOT mint a global token, only a per-repo
+    # one." This pins that invariant at the E2E tier: the admin-mint-without-
+    # scope path this scenario used to take (and which silently swallowed
+    # its own failure) is now the deliberately-tested negative case, not the
+    # happy path.
+    NEG_ADMIN_TOKEN="$(fetch_token admin admin)"
+    [ -n "$NEG_ADMIN_TOKEN" ] || fail "fetch admin token (negative-mint pin)" "empty response from Keycloak"
+    NEG_SA_UID="$(psql_one "SELECT id FROM users WHERE username='sa:provenance-proxy-ci';")"
+    [ -n "$NEG_SA_UID" ] || fail "resolve provenance-proxy-ci backing user (negative-mint pin)" \
+        "no users row 'sa:provenance-proxy-ci'"
+    if [ -n "$NEG_ADMIN_TOKEN" ] && [ -n "$NEG_SA_UID" ]; then
+        NEG_RESP="$(curl -sS -w '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer ${NEG_ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+            -d "{\"name\":\"provenance-proxy-e2e-negative-$(date +%s)\",\"declared_permissions\":[\"read\",\"write\"],\"expires_in_days\":1}" \
+            "${HORT_URL}/api/v1/admin/users/${NEG_SA_UID}/tokens" 2>/dev/null)"
+        NEG_HTTP_CODE="${NEG_RESP##*$'\n'}"
+        NEG_BODY="${NEG_RESP%$'\n'*}"
+        NEG_ERROR="$(printf '%s' "$NEG_BODY" | jq -r '.error // empty' 2>/dev/null || true)"
+        if [ "$NEG_HTTP_CODE" = "403" ] && [ "$NEG_ERROR" = "cap_exceeds_authority" ]; then
+            pass "deliberate global mint for repo-scoped SA provenance-proxy-ci -> 403 cap_exceeds_authority (issuance invariant pinned)"
+        else
+            fail "negative global-mint pin for provenance-proxy-ci" \
+                "want HTTP 403 {\"error\":\"cap_exceeds_authority\",...}, got HTTP ${NEG_HTTP_CODE}: $(printf '%s' "$NEG_BODY" | head -c 300)"
+        fi
+    fi
 else
     DEV_TOKEN="$(fetch_token dev-user dev)"
     [ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
