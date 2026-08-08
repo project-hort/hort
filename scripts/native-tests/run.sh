@@ -194,14 +194,29 @@ if [ "$HORT_MODE" = "compose" ]; then
   IN_HORT="http://hort-server:8080"; IN_KC="http://keycloak:8080/realms/hort"; IN_METRICS="http://hort-server:9090/metrics"
   NET_ARGS=(--network "$COMPOSE_NETWORK")
   DB_DSN="postgres://registry:registry@postgres:5432/artifact_registry"
-  # Harness setup (#113 item 5): mint the read_metrics bearer ONCE for the
-  # whole run — compose mode always has the gitops-applied metrics-scraper
-  # SA (deploy/compose/example-config) and DB/Keycloak access to mint it.
-  # A failure here is an infra problem, not a per-scenario skip condition —
-  # every scenario in the METRICS_URL call-site inventory now needs this
-  # token to scrape anything, so fail the whole run loudly rather than let
-  # ~10 scenarios silently degrade to "unauthenticated / always-skip".
-  IN_METRICS_TOKEN="$(mint_metrics_token)" || { echo "could not mint the read_metrics scrape token" >&2; exit 1; }
+  # Harness setup: mint the read_metrics bearer ONCE for the whole run, but
+  # ONLY when the native-tokens overlay is active. PAT/token-exchange consume
+  # requires the native-token validator (HORT_NATIVE_TOKENS_ENABLED), which
+  # the legacy-posture base stack deliberately does not enable. Minting there
+  # would either boot-fail (no signing key) or produce a token the base
+  # stack can't validate, so the base lane instead leaves the token unset:
+  # every assert_metric_ingest call site takes its existing "METRICS_TOKEN
+  # unset" note-and-skip path rather than failing.
+  # Under the overlay, a mint failure is an infra problem, not a
+  # per-scenario skip condition — every scenario in the METRICS_URL
+  # call-site inventory needs this token to scrape anything, so fail the
+  # whole run loudly rather than let those scenarios silently degrade to
+  # "unauthenticated / always-skip".
+  NATIVE_TOKENS_OVERLAY=0
+  for o in "${OVERLAYS[@]:-}"; do [ "$o" = "native-tokens" ] && NATIVE_TOKENS_OVERLAY=1; done
+  if [ "$NATIVE_TOKENS_OVERLAY" = 1 ]; then
+    IN_METRICS_TOKEN="$(mint_metrics_token)" || { echo "could not mint the read_metrics scrape token" >&2; exit 1; }
+  else
+    IN_METRICS_TOKEN=""
+    echo "metrics-content assertions skip on the legacy-posture base stack" \
+         "(no native-token validator) — run with --compose-overlay=native-tokens" \
+         "to assert them" >&2
+  fi
 else
   : "${HORT_URL:?external mode needs HORT_URL}"; : "${KEYCLOAK_URL:?external mode needs KEYCLOAK_URL}"
   build_image
