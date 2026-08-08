@@ -121,22 +121,71 @@ log "--- Preflight: waiting up to ${RESOLVER_REFRESH_GUESS}s for the resolver ca
 sleep "${RESOLVER_REFRESH_GUESS}"
 
 # ---------------------------------------------------------------------
-# Step 1: cold-pull the INDEX by tag.
+# Step 0: ANONYMOUS cold-pull of the INDEX by tag. This is the triggering
+# fetch — it performs the cold ingest — and the designed proxy read path
+# never hands an unprivileged caller the freshly-ingested, still-quarantined
+# manifest: the response is 503 with a Retry-After header and an
+# UNAVAILABLE error body, not the manifest itself. This is the regression
+# pin for that hold.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 1: GET the index by tag (cold pull-through)"
+log "--- Step 0: ANONYMOUS GET the index by tag (cold ingest; must hold, not serve)"
+
+ANON_HEADERS="$(mktemp)"
+ANON_BODY="$(mktemp)"
+trap 'rm -f "$ANON_HEADERS" "$ANON_BODY" "${INDEX_HEADERS:-}" "${INDEX_BODY:-}" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
+
+ANON_CODE="$(curl -sS -o "$ANON_BODY" -D "$ANON_HEADERS" -w '%{http_code}' \
+    -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
+    "${BASE_URL}/manifests/${IMAGE_TAG}" 2>/dev/null || echo 000)"
+if [ "$ANON_CODE" = "503" ]; then
+    pass "ANONYMOUS GET index by tag -> 503 (quarantined; cold ingest performed)"
+else
+    fail "ANONYMOUS GET index by tag -> 503" "got HTTP ${ANON_CODE} (egress? upstream reachable? gitops applied?)"
+    summary
+fi
+
+if grep -qi '^retry-after:' "$ANON_HEADERS"; then
+    pass "ANONYMOUS 503 carries a Retry-After header"
+else
+    fail "ANONYMOUS 503 carries a Retry-After header" "no Retry-After header in response"
+fi
+
+ANON_ERROR_CODE="$(jq -r '.errors[0].code // empty' "$ANON_BODY" 2>/dev/null)"
+if [ "$ANON_ERROR_CODE" = "UNAVAILABLE" ]; then
+    pass "ANONYMOUS 503 body errors[0].code == UNAVAILABLE"
+else
+    fail "ANONYMOUS 503 body errors[0].code == UNAVAILABLE" "got '${ANON_ERROR_CODE:-<empty>}'"
+fi
+
+# ---------------------------------------------------------------------
+# Auth: the write-authorized hold-read exemption (ADR 0039 §10) keys on
+# GRANTED write authority, so steps 1/2 authenticate as dev-user
+# (write-granted on this repo — see deploy/compose/example-config/auth/
+# dev-write-oci-proxy-quarantine-e2e.yaml) to read the still-held manifests.
+# ---------------------------------------------------------------------
+DEV_TOKEN="$(fetch_token dev-user dev)"
+[ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
+[ -n "$DEV_TOKEN" ] || summary
+
+# ---------------------------------------------------------------------
+# Step 1: AUTHENTICATED re-GET of the INDEX by tag — the write-authorized
+# hold-read exemption serves the already-quarantined manifest.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 1: AUTHENTICATED GET the index by tag (write-authorized hold-read)"
 
 INDEX_HEADERS="$(mktemp)"
 INDEX_BODY="$(mktemp)"
-trap 'rm -f "$INDEX_HEADERS" "$INDEX_BODY" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
 
 INDEX_CODE="$(curl -sS -o "$INDEX_BODY" -D "$INDEX_HEADERS" -w '%{http_code}' \
+    -H "Authorization: Bearer ${DEV_TOKEN}" \
     -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
     "${BASE_URL}/manifests/${IMAGE_TAG}" 2>/dev/null || echo 000)"
 if [ "$INDEX_CODE" = "200" ]; then
-    pass "GET index by tag -> 200"
+    pass "AUTHENTICATED GET index by tag -> 200 (write-authorized hold-read exemption)"
 else
-    fail "GET index by tag -> 200" "got HTTP ${INDEX_CODE} (egress? upstream reachable? gitops applied?)"
+    fail "AUTHENTICATED GET index by tag -> 200" "got HTTP ${INDEX_CODE}"
     summary
 fi
 
@@ -163,23 +212,25 @@ fi
 CHILD_HASH="${CHILD_DIGEST#sha256:}"
 
 # ---------------------------------------------------------------------
-# Step 2: pull the platform-specific child manifest BY DIGEST — what a
-# real client does next, and the leg that spawns #51's background blob
+# Step 2: AUTHENTICATED pull of the platform-specific child manifest BY
+# DIGEST — the write-authorized hold-read exemption again (the child is
+# also still quarantined), and the leg that spawns #51's background blob
 # warming.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 2: GET the child manifest by digest"
+log "--- Step 2: AUTHENTICATED GET the child manifest by digest"
 
 CHILD_HEADERS="$(mktemp)"
 CHILD_BODY="$(mktemp)"
 
 CHILD_CODE="$(curl -sS -o "$CHILD_BODY" -D "$CHILD_HEADERS" -w '%{http_code}' \
+    -H "Authorization: Bearer ${DEV_TOKEN}" \
     -H "Accept: ${OCI_MANIFEST_MEDIA}, ${DOCKER_MANIFEST_MEDIA}" \
     "${BASE_URL}/manifests/${CHILD_DIGEST}" 2>/dev/null || echo 000)"
 if [ "$CHILD_CODE" = "200" ]; then
-    pass "GET child manifest by digest -> 200"
+    pass "AUTHENTICATED GET child manifest by digest -> 200 (write-authorized hold-read exemption)"
 else
-    fail "GET child manifest by digest -> 200" "got HTTP ${CHILD_CODE}"
+    fail "AUTHENTICATED GET child manifest by digest -> 200" "got HTTP ${CHILD_CODE}"
     summary
 fi
 
