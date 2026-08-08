@@ -109,15 +109,19 @@ RESOLVER_REFRESH_GUESS="${RESOLVER_REFRESH_GUESS:-8}"
 # Sized against the release path's real worst case, which is CADENCE-bound,
 # not window-bound: release happens on the first quarantine-release-sweep
 # pass after the observation window closes, and the compose sweep-ticker
-# enqueues that sweep every 300s. From the moment the wait starts (right
-# after ProvenanceVerified — typically landing around T+70s, once the
-# constituent pulls and the sign have run), the window itself doesn't close
-# until T+120s (the quarantineDuration), so the releasing tick can land up
-# to ~(120-70)=50s later for the window plus a further 300s tick cadence,
-# plus job-claim/release/pull seconds on top: ~350s + ~10-50s processing =~
-# 360-400s worst case. 420s covers that with margin; a passing run still
-# exits on the first poll hit.
-WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-420}"
+# enqueues that sweep every SWEEP_TICK_SECS (dev/CI default 15s — see
+# deploy/compose/docker-compose.yml; now parameterized, previously a
+# hardcoded 15s, NOT the 300s this budget used to assume — the old 420s
+# default over-provisioned against a cadence the ticker never actually ran
+# at). From the moment the wait starts (right after
+# ProvenanceVerified — typically landing around T+70s, once the constituent
+# pulls and the sign have run), the window itself doesn't close until T+120s
+# (the quarantineDuration), so the releasing tick can land up to
+# ~(120-70)=50s later for the window, plus one full SWEEP_TICK_SECS tick (15s
+# interval, plus job-claim/release/pull processing (~10-40s) on top:
+# default) — ~75-105s worst case. The 240s default keeps >2x margin; a
+# passing run still exits on the first poll hit.
+WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-240}"
 
 REGISTRY_HOST="${HORT_URL#http://}"
 REGISTRY_HOST="${REGISTRY_HOST#https://}"
@@ -521,21 +525,34 @@ fi
 
 # ---------------------------------------------------------------------
 # Step 9 [Acceptance (a)]: the pull EVENTUALLY SUCCEEDS — anonymous, proving
-# the whole tree (index + child + config + every layer) is genuinely
-# consumable once cleared + released, not merely "not rejected in the DB".
+# the verified subtree (index + the ingested platform child + its config +
+# every layer) is genuinely consumable once cleared + released, not merely
+# "not rejected in the DB".
+#
+# Deliberately NOT `--all`: the verify cascade clears only the constituent
+# rows that exist at verify time, and this scenario ingests exactly one
+# platform subtree before the sign. `--all` would force every OTHER
+# platform child of the multi-arch index through cold pull-through DURING
+# this poll — each one a late-joiner constituent with no clearance path
+# (held until a re-sign), so the full-index pull can never complete. A
+# single-platform copy resolves the index (released), selects the runner's
+# platform child (released), and pulls its blobs (released) — asserting
+# precisely the tree this scenario verified. The `--all` variant is the
+# acceptance criterion of the late-joiner clearance work, not of this
+# regression pin.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 9: await release + anonymous pull of the full multi-layer image"
+log "--- Step 9: await release + anonymous pull of the verified platform subtree"
 rm -f "$PULLED_ARCHIVE"
 if bounded_poll \
         "signed image pullable (anonymous)" \
         "$WINDOW_WAIT_SECS" \
-        "skopeo copy --all --insecure-policy --src-tls-verify=false 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${PULLED_ARCHIVE}'" \
+        "skopeo copy --insecure-policy --src-tls-verify=false 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${PULLED_ARCHIVE}'" \
         5; then
-    pass "the signed+cleared multi-layer image released and pulled anonymously after the quarantine window (Cleared + timer gate satisfied)"
+    pass "the signed+cleared platform subtree released and pulled anonymously after the quarantine window (Cleared + timer gate satisfied)"
 else
-    fail "signed image releases + pulls anonymously" \
-         "the signed+cleared image never became anonymously pullable within ${WINDOW_WAIT_SECS}s (window, cascade, or release-sweep gate not satisfied)"
+    fail "signed subtree releases + pulls anonymously" \
+         "the signed+cleared subtree never became anonymously pullable within ${WINDOW_WAIT_SECS}s (window, cascade, or release-sweep gate not satisfied)"
 fi
 
 # ---------------------------------------------------------------------
