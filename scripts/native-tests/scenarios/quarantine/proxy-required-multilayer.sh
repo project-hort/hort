@@ -302,6 +302,31 @@ log "  child config digest = ${CONFIG_DIGEST}"
 log "  child layer digests = ${LAYER_DIGESTS[*]}"
 
 # ---------------------------------------------------------------------
+# Step 2b: force constituent ingest — explicit GET of the config blob and
+# every layer blob through the proxy, right after the child-manifest GET
+# that would otherwise leave this to best-effort background blob warming
+# (prefetch.rs, fired off that same GET, with no retry and no ordering
+# guarantee against a poll that starts immediately after). A direct blob GET
+# performs the SAME synchronous cold-pull ingest as Step 0's index GET
+# regardless of whether the response is 200 or a designed hold-503, so by
+# the time this loop returns every constituent row already exists. Statuses
+# are deliberately NOT asserted beyond "curl completed" — this is a forcing
+# step, not an assertion; the 60s polls in Step 4/6 stay as a backstop.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 2b: force constituent ingest (config blob + every layer blob)"
+
+curl -sS -o /dev/null \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
+    "${BASE_URL}/blobs/sha256:${CONFIG_HASH}" 2>/dev/null || true
+for h in "${LAYER_HASHES[@]}"; do
+    curl -sS -o /dev/null \
+        -H "Authorization: Bearer ${PUSH_SECRET}" \
+        "${BASE_URL}/blobs/sha256:${h}" 2>/dev/null || true
+done
+log "  forcing GETs issued for config blob + ${#LAYER_HASHES[@]} layer blob(s)"
+
+# ---------------------------------------------------------------------
 # Step 3: SIGN the index (the real subject) — cosign sign --key
 # --registry-referrers-mode=oci-1-1 against the SAME repo namespace the
 # image was proxy-pulled into (confirmed: cosign-key verification resolves
@@ -359,6 +384,12 @@ find_artifact_id() {
         "[ -n \"\$(psql_one \"SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND checksum_sha256 = '${hash}';\")\" ]" \
         2 || true
     id="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND checksum_sha256 = '${hash}';")"
+    # defense in depth: a captured id must be UUID-shaped or downstream
+    # `[ -n ]`/WHERE-clause guards could be satisfied by garbage — never
+    # return anything else, even with the poll's own output routed away.
+    if [[ ! "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        id=""
+    fi
     printf '%s' "$id"
 }
 

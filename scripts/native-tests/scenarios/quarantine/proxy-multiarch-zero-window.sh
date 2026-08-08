@@ -269,6 +269,12 @@ find_artifact_id() {
         "[ -n \"\$(psql_one \"SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND checksum_sha256 = '${hash}';\")\" ]" \
         1 || true
     id="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND checksum_sha256 = '${hash}';")"
+    # defense in depth: a captured id must be UUID-shaped or downstream
+    # `[ -n ]`/WHERE-clause guards could be satisfied by garbage — never
+    # return anything else, even with the poll's own output routed away.
+    if [[ ! "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        id=""
+    fi
     printf '%s' "$id"
 }
 
