@@ -68,7 +68,10 @@ bounded_poll() {
   deadline=$(( $(date +%s) + timeout ))
   while :; do
     if eval "$predicate" >/dev/null 2>&1; then return 0; fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then log "  bounded_poll($label) timed out after ${timeout}s"; return 1; fi
+    # stderr, not log() (stdout): callers that resolve an id via
+    # `x="$(some_fn_calling_bounded_poll ...)"` would otherwise capture this
+    # line as part of the id.
+    if [ "$(date +%s)" -ge "$deadline" ]; then printf '  bounded_poll(%s) timed out after %ss\n' "$label" "$timeout" >&2; return 1; fi
     sleep "$interval"
   done
 }
