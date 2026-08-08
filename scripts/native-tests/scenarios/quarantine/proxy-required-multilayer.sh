@@ -302,31 +302,6 @@ log "  child config digest = ${CONFIG_DIGEST}"
 log "  child layer digests = ${LAYER_DIGESTS[*]}"
 
 # ---------------------------------------------------------------------
-# Step 2b: force constituent ingest — explicit GET of the config blob and
-# every layer blob through the proxy, right after the child-manifest GET
-# that would otherwise leave this to best-effort background blob warming
-# (prefetch.rs, fired off that same GET, with no retry and no ordering
-# guarantee against a poll that starts immediately after). A direct blob GET
-# performs the SAME synchronous cold-pull ingest as Step 0's index GET
-# regardless of whether the response is 200 or a designed hold-503, so by
-# the time this loop returns every constituent row already exists. Statuses
-# are deliberately NOT asserted beyond "curl completed" — this is a forcing
-# step, not an assertion; the 60s polls in Step 4/6 stay as a backstop.
-# ---------------------------------------------------------------------
-log ""
-log "--- Step 2b: force constituent ingest (config blob + every layer blob)"
-
-curl -sS -o /dev/null \
-    -H "Authorization: Bearer ${PUSH_SECRET}" \
-    "${BASE_URL}/blobs/sha256:${CONFIG_HASH}" 2>/dev/null || true
-for h in "${LAYER_HASHES[@]}"; do
-    curl -sS -o /dev/null \
-        -H "Authorization: Bearer ${PUSH_SECRET}" \
-        "${BASE_URL}/blobs/sha256:${h}" 2>/dev/null || true
-done
-log "  forcing GETs issued for config blob + ${#LAYER_HASHES[@]} layer blob(s)"
-
-# ---------------------------------------------------------------------
 # Step 3: SIGN the index (the real subject) — cosign sign --key
 # --registry-referrers-mode=oci-1-1 against the SAME repo namespace the
 # image was proxy-pulled into (confirmed: cosign-key verification resolves
@@ -364,11 +339,46 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Step 4: resolve repository + artifact ids via psql (defence-in-depth poll,
+# Step 4: force constituent ingest — explicit GET of the config blob and
+# every layer blob through the proxy, run AFTER the sign (Step 3), never
+# before it. Two invariants converge on this ordering:
+#   (a) it removes the race against best-effort background blob warming
+#       (prefetch.rs, fired off the child-manifest GET, with no retry and no
+#       ordering guarantee against a poll that starts immediately after) — a
+#       direct blob GET performs the SAME synchronous cold-pull ingest as
+#       Step 0's index GET regardless of whether the response is 200 or a
+#       designed hold-503, so by the time this loop returns every
+#       constituent row already exists;
+#   (b) under a required provenance policy, the observation window's end IS
+#       the signing deadline — a subject still unsigned when the window
+#       closes terminally rejects, so anything placed between ingest and
+#       sign eats into that window. This scenario's window is deliberately
+#       short to keep the release-wait cheap, so any step with no
+#       dependency on the sign belongs after it, never between ingest and
+#       sign.
+# Statuses are deliberately NOT asserted beyond "curl completed" — this is a
+# forcing step, not an assertion; the 60s polls in Step 6/8 stay as a
+# backstop.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 4: force constituent ingest (config blob + every layer blob)"
+
+curl -sS -o /dev/null \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
+    "${BASE_URL}/blobs/sha256:${CONFIG_HASH}" 2>/dev/null || true
+for h in "${LAYER_HASHES[@]}"; do
+    curl -sS -o /dev/null \
+        -H "Authorization: Bearer ${PUSH_SECRET}" \
+        "${BASE_URL}/blobs/sha256:${h}" 2>/dev/null || true
+done
+log "  forcing GETs issued for config blob + ${#LAYER_HASHES[@]} layer blob(s)"
+
+# ---------------------------------------------------------------------
+# Step 5: resolve repository + artifact ids via psql (defence-in-depth poll,
 # mirrors proxy-multiarch-zero-window.sh's find_artifact_id).
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 4: resolve repository + artifact ids via psql"
+log "--- Step 5: resolve repository + artifact ids via psql"
 
 REPO_ID="$(psql_one "SELECT id FROM repositories WHERE key = '${REPO_KEY}';")"
 if [ -z "$REPO_ID" ]; then
@@ -410,12 +420,12 @@ done
 pass "all ${#LAYER_IDS[@]} layer artifact rows resolved"
 
 # ---------------------------------------------------------------------
-# Step 5: content_references edges — the pull-through edge-write half of the
+# Step 6: content_references edges — the pull-through edge-write half of the
 # composition this scenario exercises (targets specific digests, never a
 # count — #51 background warming means unrelated rows can appear).
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 5: content_references edges"
+log "--- Step 6: content_references edges"
 
 assert_edge() {
     local source_id="$1" target_hash="$2" kind="$3" label="$4" row
@@ -437,13 +447,13 @@ for i in "${!LAYER_HASHES[@]}"; do
 done
 
 # ---------------------------------------------------------------------
-# Step 6: sanity — index (NOT a descendant) got the full window; every
+# Step 7: sanity — index (NOT a descendant) got the full window; every
 # constituent (a referenced-tree descendant) got the #46 Item 2 zero window
 # — the same mechanism that makes Item 3's hold observable without waiting
 # out a full-length window.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 6: quarantine_window_start — index full window, constituents zero window"
+log "--- Step 7: quarantine_window_start — index full window, constituents zero window"
 
 index_full_window="$(psql_one "SELECT (quarantine_window_start = created_at) FROM artifacts WHERE id = '${INDEX_ID}';")"
 if [ "$index_full_window" = "t" ]; then
@@ -477,11 +487,11 @@ for i in "${!LAYER_IDS[@]}"; do
 done
 
 # ---------------------------------------------------------------------
-# Step 7: await ProvenanceVerified on the SIGNED SUBJECT (the index) — the
+# Step 8: await ProvenanceVerified on the SIGNED SUBJECT (the index) — the
 # real-verifier clearance the whole chain hangs off.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 7: await ProvenanceVerified on the signed index"
+log "--- Step 8: await ProvenanceVerified on the signed index"
 if bounded_poll \
         "ProvenanceVerified for index sha256:${INDEX_HASH}" \
         "$WINDOW_WAIT_SECS" \
@@ -494,12 +504,12 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Step 8 [Acceptance (a)]: the pull EVENTUALLY SUCCEEDS — anonymous, proving
+# Step 9 [Acceptance (a)]: the pull EVENTUALLY SUCCEEDS — anonymous, proving
 # the whole tree (index + child + config + every layer) is genuinely
 # consumable once cleared + released, not merely "not rejected in the DB".
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 8: await release + anonymous pull of the full multi-layer image"
+log "--- Step 9: await release + anonymous pull of the full multi-layer image"
 rm -f "$PULLED_ARCHIVE"
 if bounded_poll \
         "signed image pullable (anonymous)" \
@@ -513,7 +523,7 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Step 9 [Acceptance (b), THE regression pin]: no constituent — child
+# Step 10 [Acceptance (b), THE regression pin]: no constituent — child
 # manifest, config blob, any layer blob — EVER emitted ProvenanceRejected.
 # By this point the full lifecycle (sign -> verify -> cascade -> release ->
 # pull) has completed or timed out, so if the pre-Item-3 defect were present
@@ -521,7 +531,7 @@ fi
 # fired within moments of ingest, well before this poll).
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 9: THE #115 Item 3 regression pin — no constituent ever rejected"
+log "--- Step 10: THE #115 Item 3 regression pin — no constituent ever rejected"
 
 # Queried by artifact id (stream_id = 'artifact-<id>'), not checksum —
 # checksum alone is not repository-scoped, and an unrelated fixture
