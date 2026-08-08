@@ -106,7 +106,15 @@ COSIGN_KEY="${COSIGN_KEY:-${FIXTURES:-}/cosign/cosign.key}"
 export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
 IMAGE="${IMAGE:-redis:7-alpine}"
 RESOLVER_REFRESH_GUESS="${RESOLVER_REFRESH_GUESS:-8}"
-WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-300}"
+# Sized against the release path's real worst case, which is CADENCE-bound,
+# not window-bound: release happens on the first quarantine-release-sweep
+# pass after the observation window closes, and the compose sweep-ticker
+# enqueues that sweep every 300s. From the moment the wait starts (right
+# after ProvenanceVerified), the releasing tick can therefore land up to
+# ~300s + the 30s window offset later, plus job-claim/release/pull seconds
+# on top — so a 300s budget structurally loses in the tail. 420s covers the
+# worst case with margin; a passing run still exits on the first poll hit.
+WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-420}"
 
 REGISTRY_HOST="${HORT_URL#http://}"
 REGISTRY_HOST="${REGISTRY_HOST#https://}"
