@@ -1,0 +1,43 @@
+// AUTO-GENERATED — do not hand-edit.
+//
+// Rendered by `hort_domain::entities::quarantine_transitions::render_lifecycle_dot`
+// from the declared `QUARANTINE_TRANSITIONS` table (backlog 090, #135 item 2).
+// Regenerate after any table change; the drift guard
+// `crates/hort-domain/tests/lifecycle_dot_artifact.rs` fails CI if this file
+// and the table disagree. Self-loop-only transitions (a guard method that
+// accepts a state but leaves it unchanged) are omitted — see the render
+// function's doc comment.
+digraph ArtifactQuarantineLifecycle {
+    rankdir=LR;
+    node [shape=box];
+    "none";
+    "quarantined";
+    "released";
+    "rejected";
+    "scan_indeterminate";
+    "none" -> "quarantined" [label="quarantine"];
+    "none" -> "rejected" [label="reject_from_scan"];
+    "quarantined" -> "rejected" [label="reject_from_scan"];
+    "quarantined" -> "rejected" [label="reject_from_retroactive_curation"];
+    "released" -> "rejected" [label="reject_from_retroactive_curation"];
+    "quarantined" -> "rejected" [label="reject_from_scan_policy_retroactive"];
+    "released" -> "rejected" [label="reject_from_scan_policy_retroactive"];
+    "none" -> "rejected" [label="block_by_curator"];
+    "quarantined" -> "rejected" [label="block_by_curator"];
+    "released" -> "rejected" [label="block_by_curator"];
+    "none" -> "rejected" [label="tombstone_from_corruption"];
+    "quarantined" -> "rejected" [label="tombstone_from_corruption"];
+    "released" -> "rejected" [label="tombstone_from_corruption"];
+    "scan_indeterminate" -> "rejected" [label="tombstone_from_corruption"];
+    "quarantined" -> "released" [label="release (curator waiver)"];
+    "quarantined" -> "released" [label="release (general)"];
+    "scan_indeterminate" -> "released" [label="release (general)"];
+    "none" -> "scan_indeterminate" [label="fail_scan_indeterminate"];
+    "quarantined" -> "scan_indeterminate" [label="fail_scan_indeterminate"];
+    "rejected" -> "quarantined" [label="re_evaluate"];
+    "rejected" -> "released" [label="re_evaluate"];
+    "none" -> "rejected" [label="complete_provenance"];
+    "quarantined" -> "rejected" [label="complete_provenance"];
+    "released" -> "rejected" [label="complete_provenance"];
+    "scan_indeterminate" -> "rejected" [label="complete_provenance"];
+}

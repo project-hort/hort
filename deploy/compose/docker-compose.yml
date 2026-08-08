@@ -327,6 +327,13 @@ services:
     # Image is built locally from docker/Dockerfile.worker
     # (multi-stage Rust build + pinned trivy / osv-scanner binaries).
     # CI may override `image:` with a registry-published tag.
+    #
+    # Scan concurrency is 1 per replica BY DESIGN (composition.rs pins
+    # ScanTaskHandler to max_concurrency = 1 — Trivy is CPU/IO-heavy, so
+    # intra-process parallelism is deliberately not the axis); parallelism
+    # comes from running more replicas. The E2E runner scales this service
+    # (`--scale hort-worker=N`) so serial trivy runtime stays off the
+    # release critical path.
     profiles:
       - worker
     # Resource caps + least-capability hardening (B7/INFRA-6/11). The
@@ -342,7 +349,6 @@ services:
       context: ../..
       dockerfile: docker/Dockerfile.worker
     image: hort-worker:dev
-    container_name: hort-worker
     depends_on:
       postgres:
         condition: service_healthy

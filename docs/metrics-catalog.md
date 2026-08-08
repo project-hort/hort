@@ -3074,16 +3074,33 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 |--------|------|--------|------|--------------|
 | `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `requeued_no_anchor` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
+| `hort_provenance_late_joiner_cleared_total` | counter | `backend` | — | one increment per constituent that self-cleared against an already-verified subject at its own quarantine commit |
 
-Both counters are emitted at exactly **one layer** — the orchestration
-use case
+The first two counters are emitted at exactly **one layer** — the
+orchestration use case
 [`ProvenanceOrchestrationUseCase::verify_artifact`](../crates/hort-app/src/use_cases/provenance_orchestration.rs)
 (the domain stays metrics-free; the verdict + resolved mode are surfaced
 to this layer at the emission site). One increment per **applied
 provenance verdict**. Standing decisions: ADR 0027
 (`docs/adr/0027-artifact-provenance-verification.md`).
 
-**Scrape target — the worker `/metrics` listener.** These
+**`hort_provenance_late_joiner_cleared_total`** (ADR 0039 §11,
+late-joiner end). Emitted at exactly one layer —
+[`ProvenanceCascade::resolve_late_joiner_clearance`](../crates/hort-app/src/use_cases/provenance_cascade.rs)
+— one increment per constituent that arrived AFTER its subject was
+verified and self-cleared against that subject's signed bytes at its own
+quarantine commit. Unlike the two counters above, this one runs on the
+**ingest path**, so it is served by the **`hort-server`** `/metrics`
+endpoint, not the worker listener. A steady non-zero rate is the normal
+signature of pulling further platforms of an already-verified multi-arch
+image; a rate of zero on a scope where such pulls happen means the
+constituents are stranding instead (check for `Pending` clearances on
+`Required`-mode repos). `backend` is the verifier recorded on the
+subject's clearance — same bounded value space as everywhere else. No
+per-artifact labels (same forbidden-label rule below); `artifact_id`,
+`subject`, and `constituent` ride the accompanying `info!` line.
+
+**Scrape target — the worker `/metrics` listener.** The two verdict
 counters run in **`hort-worker`** (the `provenance-verify` job), which
 serves an opt-in `GET /metrics` listener — bound via `HORT_WORKER_METRICS_BIND`
 (disabled by default; set a pod-reachable address to enable) — making
@@ -3193,8 +3210,9 @@ accompanying `info!` audit line on the `ProvenanceVerified` /
 not `err`).
 
 Cardinality: `hort_provenance_verify_total` ≤ `backend` (~few) × `mode`
-(3) × `result` (4); `hort_provenance_reject_total` ≤ `backend` × `reason`
-(5). Both are tiny in Tier 1 (one backend).
+(3) × `result` (5); `hort_provenance_reject_total` ≤ `backend` × `reason`
+(5); `hort_provenance_late_joiner_cleared_total` ≤ `backend`. All three
+are tiny in Tier 1 (one backend).
 
 ### Admin task dispatcher
 

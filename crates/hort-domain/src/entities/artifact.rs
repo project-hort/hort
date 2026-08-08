@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::entities::quarantine_transitions::{self, QuarantineEvent};
 use crate::entities::repository::RepositoryFormat;
 use crate::entities::scan_policy::ProvenanceMode;
 use crate::error::{DomainError, DomainResult};
@@ -330,7 +331,12 @@ impl Artifact {
     /// resolved policy duration via
     /// [`crate::policy::effective_quarantine_deadline`].
     pub fn quarantine(&mut self, window_start: DateTime<Utc>) -> DomainResult<ArtifactQuarantined> {
-        if self.quarantine_status != QuarantineStatus::None {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::Quarantine,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot quarantine artifact in state {}",
                 self.quarantine_status
@@ -360,11 +366,17 @@ impl Artifact {
     /// rejection. (This is the `quarantineDuration: 0` permissive-mode
     /// contract — see `docs/architecture/explanation/scanning-pipeline.md`.)
     pub fn record_clean_scan(&self) -> DomainResult<()> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::None => Ok(()),
-            other => Err(DomainError::Invariant(format!(
-                "cannot record clean scan for artifact in state {other}"
-            ))),
+        match quarantine_transitions::allowed_targets(
+            QuarantineEvent::RecordCleanScan,
+            self.quarantine_status,
+        ) {
+            Some(_) => Ok(()),
+            None => {
+                let other = self.quarantine_status;
+                Err(DomainError::Invariant(format!(
+                    "cannot record clean scan for artifact in state {other}"
+                )))
+            }
         }
     }
 
@@ -382,13 +394,16 @@ impl Artifact {
     /// permissive-mode contract — see
     /// `docs/architecture/explanation/scanning-pipeline.md`.)
     pub fn reject_from_scan(&mut self, reason: String) -> DomainResult<ArtifactRejected> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::None => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot reject artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::RejectFromScan,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot reject artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::Rejected;
         self.rejection_reason = Some(RejectionReason::Scanner);
@@ -411,13 +426,16 @@ impl Artifact {
         rule_id: Uuid,
         reason: String,
     ) -> DomainResult<ArtifactRejected> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::Released => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot retroactively-reject artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::RejectFromRetroactiveCuration,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot retroactively-reject artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::Rejected;
         self.rejection_reason = Some(RejectionReason::CurationRetroactive { rule_id });
@@ -481,13 +499,16 @@ impl Artifact {
         outcome: &ScanOutcome,
         reason: String,
     ) -> DomainResult<Option<ArtifactRejected>> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::Released => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot retroactively scan-re-hold artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::RejectFromScanPolicyRetroactive,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot retroactively scan-re-hold artifact in state {other}"
+            )));
         }
         match outcome {
             // Still-passing under the new policy — unchanged verdict, no-op
@@ -550,14 +571,16 @@ impl Artifact {
         curator_id: Uuid,
         reason: String,
     ) -> DomainResult<ArtifactRejected> {
-        match self.quarantine_status {
-            QuarantineStatus::None | QuarantineStatus::Quarantined | QuarantineStatus::Released => {
-            }
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot curator-block artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::BlockByCurator,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot curator-block artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::Rejected;
         self.rejection_reason = Some(RejectionReason::Curator { curator_id });
@@ -598,7 +621,12 @@ impl Artifact {
         computed_hash: ContentHash,
         now: DateTime<Utc>,
     ) -> DomainResult<ArtifactCorrupted> {
-        if self.quarantine_status == QuarantineStatus::Rejected {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::TombstoneFromCorruption,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot tombstone artifact in state {} (already rejected)",
                 self.quarantine_status
@@ -660,15 +688,15 @@ impl Artifact {
         // release accepts `Quarantined` ONLY. `ScanIndeterminate`
         // stays admin-only — clearing a stuck scanner requires the
         // broader admin authority.
-        let source_state_ok = match (&reason, authz) {
+        let release_event = match (&reason, authz) {
             (ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver) => {
-                matches!(self.quarantine_status, QuarantineStatus::Quarantined)
+                QuarantineEvent::ReleaseCuratorWaiver
             }
-            _ => matches!(
-                self.quarantine_status,
-                QuarantineStatus::Quarantined | QuarantineStatus::ScanIndeterminate
-            ),
+            _ => QuarantineEvent::ReleaseGeneral,
         };
+        let source_state_ok =
+            quarantine_transitions::allowed_targets(release_event, self.quarantine_status)
+                .is_some();
         if !source_state_ok {
             // Caller-reachable state precondition (an operator can POST
             // release/waive against an artifact in any state) → InvalidState
@@ -736,6 +764,15 @@ impl Artifact {
     /// Apply a provenance verdict to artifact state (ADR 0027).
     /// Returns the domain event to append (if any) or
     /// `Ok(None)` for the no-op case.
+    ///
+    /// **Not source-state-gated** — unlike every other method in this
+    /// state machine, there is no `match self.quarantine_status` guard
+    /// here; the caller (the provenance orchestrator) only ever invokes
+    /// this against a held artifact, but the method itself is total over
+    /// every [`QuarantineStatus`]. [`crate::entities::quarantine_transitions`]
+    /// represents it as `QuarantineEvent::CompleteProvenance`, unrestricted
+    /// (`Allowed` from every state) — there is no guard here for the table
+    /// to replace.
     ///
     /// - [`ProvenanceOutcome::Verified`] → emit [`ProvenanceVerified`];
     ///   **status unchanged** (like `ScanCompleted(clean)`, a verified
@@ -925,7 +962,12 @@ impl Artifact {
         predicate_type: Option<String>,
         backend: &str,
     ) -> DomainResult<ProvenanceVerified> {
-        if self.quarantine_status != QuarantineStatus::Quarantined {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::CascadeProvenanceClearance,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot cascade provenance clearance to artifact in state {}",
                 self.quarantine_status
@@ -962,13 +1004,16 @@ impl Artifact {
         reason: String,
         attempts: u32,
     ) -> DomainResult<ScanIndeterminate> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::None => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot mark scan-indeterminate for artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::FailScanIndeterminate,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot mark scan-indeterminate for artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::ScanIndeterminate;
         Ok(ScanIndeterminate {
@@ -1037,7 +1082,12 @@ impl Artifact {
         provenance: ProvenanceClearance,
         curation: CurationClearance,
     ) -> DomainResult<DomainEvent> {
-        if self.quarantine_status != QuarantineStatus::Rejected {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::ReEvaluate,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot re-evaluate artifact in state {}",
                 self.quarantine_status

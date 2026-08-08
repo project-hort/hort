@@ -1139,6 +1139,34 @@ impl QuarantineUseCase {
         Ok(deadline <= Utc::now())
     }
 
+    /// `true` iff the effective policy for `artifact`'s repository gates
+    /// release on provenance (`Required`) AND the artifact's provenance
+    /// clearance is still `Pending` — i.e. a release-authority-satisfied
+    /// `Quarantined` artifact would STILL be denied release purely on the
+    /// provenance leg. Delegates to [`Self::resolve_provenance_clearance`],
+    /// the SAME resolution the inline fast-path release suppression in
+    /// `record_scan_result` (the `"fast-path release suppressed:
+    /// provenance gate not cleared"` arm) and the `release_expired` sweep
+    /// both call, so this answer and theirs can never drift — `Pending`
+    /// can only ever be produced by `Required` mode (see
+    /// [`crate::use_cases::release_clearance::resolve_provenance_clearance`]),
+    /// so checking the clearance alone is equivalent to the mode+clearance
+    /// conjunction.
+    ///
+    /// Read-only candidacy check — consults no release authority and
+    /// mutates nothing; never itself an authorization to release (ADR
+    /// 0007), mirroring [`Self::is_window_elapsed`]'s posture. Intended
+    /// caller: the `hort-http-oci` bounded-await guard (backlog 094) — a
+    /// candidate that fails this check would burn the full await bound
+    /// and 503 anyway, since sign + verify + cascade cannot land inside
+    /// it.
+    pub async fn release_blocked_on_provenance(&self, artifact: &Artifact) -> AppResult<bool> {
+        let clearance = self
+            .resolve_provenance_clearance(artifact.id, artifact.repository_id)
+            .await?;
+        Ok(matches!(clearance, ProvenanceClearance::Pending))
+    }
+
     /// Timer-release authority resolution (ADR 0007).
     ///
     /// Construct the timer-release authority for a candidate, **fail
@@ -4354,6 +4382,18 @@ mod tests {
         events: &Arc<MockEventStore>,
         artifact_id: Uuid,
     ) {
+        seed_stream_scanned_and_cleared(events, artifact_id, None);
+    }
+
+    /// [`seed_stream_scanned_and_provenance_verified`] with the clearance's
+    /// attribution parameterized: `Some(subject)` models a CASCADED
+    /// clearance — the shape a late-joining constituent carries after it
+    /// self-clears against an already-verified subject at ingest.
+    fn seed_stream_scanned_and_cleared(
+        events: &Arc<MockEventStore>,
+        artifact_id: Uuid,
+        cascaded_from: Option<ContentHash>,
+    ) {
         let stream_id = StreamId::artifact(artifact_id);
         let quarantined = dummy_persisted_event(&stream_id, artifact_id, 0);
         let scan_completed = PersistedEvent {
@@ -4398,7 +4438,7 @@ mod tests {
                             .into(),
                 },
                 predicate_type: None,
-                cascaded_from: None,
+                cascaded_from,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -4467,6 +4507,118 @@ mod tests {
             panic!("ArtifactReleased expected");
         };
         assert_eq!(ev.released_by, ReleaseReason::Timer);
+    }
+
+    // =====================================================================
+    // `release_blocked_on_provenance` (backlog 094) — the bounded-await
+    // guard's predicate. Reuses `resolve_provenance_clearance`, so these
+    // tests pin the same arms the `release_expired` Required-mode tests
+    // above already cover, but through the new public entry point.
+    // =====================================================================
+
+    /// `Required` + no `ProvenanceVerified` on the stream ⇒ `Pending` ⇒
+    /// blocked. This is the exact case the bounded-await guard exists to
+    /// short-circuit: the fast-path release is suppressed for it, so
+    /// awaiting the bound would only ever end in a 503.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_required_pending_returns_true() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        seed_required_provenance_policy(&projections, artifact.repository_id);
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(
+            blocked,
+            "Required + no ProvenanceVerified ⇒ Pending ⇒ blocked"
+        );
+    }
+
+    /// `Required` + a `ProvenanceVerified` event on the stream ⇒ `Cleared`
+    /// ⇒ NOT blocked — the provenance leg is satisfied, so a bounded await
+    /// is worth attempting (subject to the scan leg, which this predicate
+    /// does not evaluate).
+    #[tokio::test]
+    async fn release_blocked_on_provenance_required_cleared_returns_false() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        seed_required_provenance_policy(&projections, artifact.repository_id);
+        seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(
+            !blocked,
+            "Required + ProvenanceVerified ⇒ Cleared ⇒ not blocked"
+        );
+    }
+
+    /// `provenance_mode == VerifyIfPresent` (the default) never gates
+    /// release ⇒ `NotRequired` ⇒ NOT blocked, regardless of stream
+    /// contents.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_verify_if_present_returns_false() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        let repo_id = artifact.repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(
+            !blocked,
+            "VerifyIfPresent never gates release ⇒ not blocked"
+        );
+    }
+
+    /// `provenance_mode == Off` ⇒ `NotRequired` ⇒ NOT blocked.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_off_returns_false() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        let repo_id = artifact.repository_id;
+        let mut p = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        p.provenance_mode = ProvenanceMode::Off;
+        projections.insert(p);
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(!blocked, "Off never gates release ⇒ not blocked");
+    }
+
+    /// A policy-resolution failure (the same failure mode
+    /// `is_window_elapsed` and `resolve_release_authority` can hit)
+    /// propagates as `Err` rather than being swallowed into `false`. The
+    /// caller (`maybe_bounded_await_release`) owns the fail-safe
+    /// (`unwrap_or(false)`), not this predicate.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_propagates_resolution_error() {
+        let (uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        projections.fail_next_list_active(DomainError::Invariant("policy read failed".into()));
+
+        let result = uc.release_blocked_on_provenance(&artifact).await;
+
+        assert!(result.is_err(), "policy resolution failure must propagate");
     }
 
     // =====================================================================
@@ -4773,6 +4925,55 @@ mod tests {
         uc.release_expired(vec![artifact_id]).await.unwrap();
 
         assert_eq!(jobs.enqueue_calls().len(), 1);
+    }
+
+    /// **Churn quiescing (ADR 0039 §11, late-joiner end).** A child
+    /// manifest that self-cleared at ingest — a CASCADED
+    /// `ProvenanceVerified` on its stream — resolves `Cleared`, so the
+    /// expiry backstop stops enqueueing a verify for it on every tick.
+    ///
+    /// This is the shape the backstop churned on before the late-joiner
+    /// end existed: `release_expired_keeps_the_backstop_for_a_child_manifest`
+    /// pins the identical edge set STILL enqueueing while the constituent
+    /// is `Pending` — the only difference here is the clearance, so this
+    /// pair isolates exactly what quiesced the churn.
+    #[tokio::test]
+    async fn release_expired_stops_re_enqueueing_a_late_joiner_cleared_manifest() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, jobs, refs) =
+            make_use_case_with_jobs_and_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_required_provenance_policy(&projections, repo_id);
+        // The late-joiner clearance: cascaded, attributed to the signed
+        // index. A child manifest is NOT a parent-gated blob, so the
+        // backstop's own skip does not apply — only the clearance can
+        // quiesce it.
+        seed_stream_scanned_and_cleared(
+            &events,
+            artifact_id,
+            Some(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .parse()
+                    .unwrap(),
+            ),
+        );
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_index_member").await;
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        // A second tick: the backstop is driven per tick, so quiescing
+        // must hold across ticks, not just on the first one.
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "Cleared + scan authority ⇒ the constituent releases instead of stranding"
+        );
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "a late-joiner-cleared manifest must not be re-enqueued by the expiry backstop"
+        );
     }
 
     /// An unknown/future edge kind disqualifies the skip — the inverse

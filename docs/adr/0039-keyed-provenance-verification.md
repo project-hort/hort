@@ -424,6 +424,108 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
     The **root itself** is unchanged — it is not a descendant, so it still
     rejects `Unsigned` at expiry.
 
+    **The late-joiner (constituent-end) trigger (amended 2026-08-08,
+    issue #135; direction and this amendment approved on-issue).** The
+    cascade above fires at the SUBJECT's verify, over the constituents
+    that exist *at that moment*. The inverse arrival order had no
+    trigger at all: a constituent ingested AFTER its subject was
+    verified never gets one. Its own verify finds no bundle (cosign
+    signs only the top-level digest); the `NoAttestation × Required`
+    arm HOLDS it (the amendment above); and the S4 expiry backstop skips
+    parent-gated blob constituents — so it stays `Pending` forever, and
+    the non-skipped shapes (a child *manifest*) churn the backstop every
+    tick. Consumer-visible on any multi-arch proxy repo under `Required`:
+    a `skopeo copy --all` after the release pulls the foreign-platform
+    subtrees through cold pull-through, and every one of them strands.
+
+    Closed by the **symmetric second trigger**: at its own
+    quarantine-commit time, a `Required`-mode constituent looks *up* for
+    an already-verified subject and clears itself. Mechanism, in the same
+    fail-closed shape as the subject end:
+
+    - **Inbound edges only NOMINATE.** The constituent reads
+      `content_references.find_by_target(repo, hash)` (unfiltered — kind
+      is not authority) and treats each distinct source artifact as a
+      *candidate* subject. Its own `primary_content`/`metadata_blob`
+      refcount rows are excluded (self-clearing would be circular).
+    - **Membership is decided by the signed CAS bytes**, via the SAME
+      `constituent_digests` walk the subject end uses — index →
+      `manifests[]` children → each child's `config`/`layers`, one level,
+      same caps. A digest not inside those bytes does not clear, no
+      matter what the edge says. This is the load-bearing half: DB edges
+      are mutable projections and must never become clearance authority.
+    - **Authority is a DIRECTLY-verified subject.** A candidate holding
+      `cascaded_from: None` is its own authority. A candidate that was
+      itself cascade-cleared is NOT: its bytes are covered by someone
+      else's signature, and re-walking them is exactly how an
+      index-of-indexes would leak clearance to grandchildren. The walk
+      instead continues **one hop** to the root its `cascaded_from`
+      names, requires THAT root's clearance to be direct, and checks
+      membership in the root's bytes. So the covered set is byte-for-byte
+      the set the verify-time cascade derives from the same root — never
+      wider. (This hop is what lets a late-joining `config`/`layer` blob
+      clear: its only inbound edge is its parent child-manifest, which
+      under a signed multi-arch index is itself only cascade-cleared,
+      while the blob's digest IS inside the index's one-level walk.)
+    - **Everything else is inherited unchanged** from the subject end:
+      same-repository only, `Quarantined`-only (the domain guard),
+      idempotent, one version-conflict retry, and the identical
+      `cascaded_from: <root digest>` attribution — a late-joiner
+      clearance is indistinguishable from a verify-time one in the audit
+      trail, because it *is* the same clearance.
+    - **Best-effort, post-commit, never gating.** The quarantine
+      transition is already durable when the hook runs. Every failure
+      arm — edge-read error, unresolvable candidate, missing/indirect
+      clearance, unreadable or unparseable subject bytes, membership
+      miss, append failure — is `warn!` + continue and leaves EXACTLY
+      the hold the artifact already had. Nothing here can fail, delay,
+      or roll back an ingest.
+
+    Observability: `hort_provenance_late_joiner_cleared_total{backend}`
+    (one increment per self-clear) plus an `info!` naming subject +
+    constituent. Emitted on the ingest path, so it is a `hort-server`
+    series — see `docs/metrics-catalog.md`.
+
+12. **Both-ends-trigger principle.** A standing cross-artifact lifecycle
+    dependency — "artifact A's state change decides artifact B's state" —
+    MUST name a trigger at **both** ends: one fired by A's change, one
+    fired by B's arrival/change. A single-ended trigger is correct only
+    for the arrival order its author had in mind, and silently strands
+    the other order; §11's late-joiner gap is the worked example (the
+    subject-end cascade shipped alone, and every constituent that
+    happened to arrive later stranded until this amendment). Both ends
+    must resolve the decision from the SAME authority — here, the signed
+    bytes — so the two can never disagree about what is covered; sharing
+    one implementation (`ProvenanceCascade`) is how that is enforced
+    structurally rather than by convention. This generalises beyond
+    provenance: apply it to any future subject⇄constituent, parent⇄child,
+    or policy⇄artifact dependency.
+
+    **Cross-opt-in interaction matrix (ADR 0016 discipline).** The
+    late-joiner end adds a clearance **producer**, not a new
+    release-authority kind — `ProvenanceClearance` still resolves
+    `Cleared` iff a `ProvenanceVerified` exists, the release predicate is
+    untouched, and the scan gate is still ANDed. Its interaction with
+    every existing operator opt-in that can influence the release-gate
+    computation:
+
+    | Opt-in | Interaction | Why it cannot collapse a gate |
+    |---|---|---|
+    | `trust_upstream_publish_time` | **Orthogonal.** | The late-joiner walk reads no timestamps at all — not the subject's, not the constituent's. It changes *which* artifacts hold a provenance clearance, never *when* an observation window opens or closes. A publish-time-anchored constituent gets its clearance on exactly the same terms as an ingest-anchored one, and still waits out whatever window its anchor produced. |
+    | `scan_backends: []` | **Unchanged, still ANDed.** | The clearance is the provenance leg only. A constituent that self-clears still needs its own scan authority (`ScanSucceeded`/`ScanWaived`) to release; with no scan backends the existing waiver semantics apply verbatim, exactly as they do for a verify-time cascaded clearance. No new path reaches release without the scan leg. |
+    | `requireApproval` | **Unchanged.** | Approval is a separate release-authority leg evaluated after clearance; producing a clearance earlier does not satisfy it. |
+
+    No combination of the three shortens an observation window, removes
+    a leg from the release conjunction, or lets untrusted input into the
+    clearance decision: the only new input the late-joiner end reads that
+    the subject end does not is the `content_references` edge set, and
+    that input is *non-authoritative by construction* — it can only
+    propose a candidate subject whose signed bytes must then bind the
+    digest. A hostile or corrupted edge set can therefore cause a missed
+    clearance (a hold — fail-closed) but never an unearned one. Because
+    it adds no operator surface, there is nothing here for the
+    apply-time linter to reject; the fail-closed close is structural.
+
 ## Consequences
 
 - A sovereign keyed-cosign operator gets `provenance_mode: Required`
@@ -527,6 +629,12 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
 - `crates/hort-app/src/use_cases/apply_config_use_case.rs` — the backend→format
   capability map (Tier-1 `{"oci"}` for cosign) and the fail-closed config lints
   to make backend-aware.
+- `crates/hort-app/src/use_cases/provenance_cascade.rs` — the shared
+  clearance-cascade machinery both trigger ends of §11 use
+  (`cascade_clearance` / `constituent_digests` / `cascade_one` for the
+  subject end, `resolve_late_joiner_clearance` / `clearance_root` for the
+  constituent end). One implementation so the two ends can never drift on
+  what a signature covers (§12).
 - `crates/hort-app/src/use_cases/provenance_orchestration.rs` — the
   single-verifier `applicable[0]` selection, the `backend` metric label, and the
   verdict fold this ADR makes the first multi-verifier user of.
