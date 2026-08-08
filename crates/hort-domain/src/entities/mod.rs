@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod managed_by;
 pub mod mutable_ref;
 pub mod oidc_issuer;
+pub mod quarantine_transitions;
 pub mod rbac;
 pub mod repository;
 pub mod scan_policy;

@@ -122,6 +122,14 @@ RESOLVER_REFRESH_GUESS="${RESOLVER_REFRESH_GUESS:-8}"
 # default) — ~75-105s worst case. The 240s default keeps >2x margin; a
 # passing run still exits on the first poll hit.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-240}"
+# Step 9b budget: after 9a has driven every foreign platform through cold
+# pull-through and each has self-cleared at its own quarantine commit, the
+# anonymous poll is waiting only on clearance + the release sweep tick — not
+# on any pull-through round-trip. ~2 sweep ticks (default SWEEP_TICK_SECS
+# 15s) plus job-claim/release/pull processing is the expected worst case; 90s
+# keeps a comfortable margin without reintroducing the unbounded serial-pull
+# wait 9a now absorbs.
+ANON_PULL_WAIT_SECS="${ANON_PULL_WAIT_SECS:-90}"
 
 REGISTRY_HOST="${HORT_URL#http://}"
 REGISTRY_HOST="${REGISTRY_HOST#https://}"
@@ -149,7 +157,8 @@ case "$IMAGE_REPO" in
 esac
 BASE_URL="${HORT_URL}/v2/${REPO_KEY}/dockerhub/${IMAGE_PATH}"
 PULLED_ARCHIVE="/tmp/prov-proxy-pulled-$$.tar"
-trap 'rm -f "$PULLED_ARCHIVE" "${ANON_HEADERS:-}" "${ANON_BODY:-}" "${INDEX_HEADERS:-}" "${INDEX_BODY:-}" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
+WARM_ARCHIVE="/tmp/prov-proxy-warm-$$.tar"
+trap 'rm -f "$PULLED_ARCHIVE" "$WARM_ARCHIVE" "${ANON_HEADERS:-}" "${ANON_BODY:-}" "${INDEX_HEADERS:-}" "${INDEX_BODY:-}" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
 
 log "==> Proxy pull-through x provenance_mode:Required, multi-layer image (issue #115 Item 4)"
 log "Registry : ${HORT_URL}"
@@ -524,35 +533,57 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Step 9 [Acceptance (a)]: the pull EVENTUALLY SUCCEEDS — anonymous, proving
-# the verified subtree (index + the ingested platform child + its config +
-# every layer) is genuinely consumable once cleared + released, not merely
-# "not rejected in the DB".
+# Step 9 — two-phase contract, split per backlog 093.
 #
-# Deliberately NOT `--all`: the verify cascade clears only the constituent
-# rows that exist at verify time, and this scenario ingests exactly one
-# platform subtree before the sign. `--all` would force every OTHER
-# platform child of the multi-arch index through cold pull-through DURING
-# this poll — each one a late-joiner constituent with no clearance path
-# (held until a re-sign), so the full-index pull can never complete. A
-# single-platform copy resolves the index (released), selects the runner's
-# platform child (released), and pulls its blobs (released) — asserting
-# precisely the tree this scenario verified. The `--all` variant is the
-# acceptance criterion of the late-joiner clearance work, not of this
-# regression pin.
+# `--all` forces every platform child of the index through pull-through.
+# This scenario ingests exactly one platform subtree before the sign, so
+# the verify-time cascade clears only that subtree; every OTHER platform
+# child is a LATE JOINER — it arrives after the subject was already
+# verified, and self-clears at its own quarantine commit against the
+# signed index's bytes (child manifests directly; their config/layer
+# blobs via the root behind their cascade-cleared parent).
+#
+# 9a is the ingest vehicle: an AUTHENTICATED `--all` warm pass. Write
+# authorization gives the hold-read exemption, so this pull can read
+# every held constituent as it lands and drives the full foreign-platform
+# tree through cold pull-through in one client-side pass.
+#
+# 9b proves the actual acceptance criterion: an ANONYMOUS `--all` pull
+# succeeds end-to-end once every constituent has cleared and released.
+# The anonymous poll cannot be the thing that DRIVES those cold pulls:
+# skopeo aborts the whole copy at the FIRST held (503) artifact, so an
+# anonymous-only poll advances the ingest frontier by ~one artifact per
+# retry — a serial crawl that is unbounded against any fixed budget, not
+# a slow-but-finite wait. 9a removes that dependency; 9b then only waits
+# on clearance + the release sweep tick.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 9: await release + anonymous pull of the verified platform subtree"
+log "--- Step 9a: authenticated warm pass (late-joiner ingest vehicle)"
+rm -f "$WARM_ARCHIVE"
+if bounded_poll \
+        "signed image pullable (authenticated warm pass)" \
+        120 \
+        "skopeo copy --all --insecure-policy --src-tls-verify=false --src-creds '${PUSH_USER}:${PUSH_SECRET}' 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${WARM_ARCHIVE}'" \
+        5; then
+    pass "authenticated --all warm pass ingested every foreign platform (hold-read exemption honored; each late joiner self-cleared at its own quarantine commit)"
+else
+    fail "authenticated warm pass ingests every foreign platform" \
+         "the signed index never became fully (--all) authenticated-pullable within 120s (hold-read exemption not honored, or a foreign platform failed to ingest/self-clear)"
+fi
+rm -f "$WARM_ARCHIVE"
+
+log ""
+log "--- Step 9b: await release + anonymous FULL-index pull (release acceptance after warm pass)"
 rm -f "$PULLED_ARCHIVE"
 if bounded_poll \
         "signed image pullable (anonymous)" \
-        "$WINDOW_WAIT_SECS" \
-        "skopeo copy --insecure-policy --src-tls-verify=false 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${PULLED_ARCHIVE}'" \
+        "$ANON_PULL_WAIT_SECS" \
+        "skopeo copy --all --insecure-policy --src-tls-verify=false 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${PULLED_ARCHIVE}'" \
         5; then
-    pass "the signed+cleared platform subtree released and pulled anonymously after the quarantine window (Cleared + timer gate satisfied)"
+    pass "release acceptance after warm pass: the signed+cleared multi-arch index pulled anonymously in full (Cleared + timer gate satisfied for every platform, late joiners included)"
 else
-    fail "signed subtree releases + pulls anonymously" \
-         "the signed+cleared subtree never became anonymously pullable within ${WINDOW_WAIT_SECS}s (window, cascade, or release-sweep gate not satisfied)"
+    fail "release acceptance after warm pass: signed index pulls anonymously with --all" \
+         "the signed index never became fully (--all) anonymously pullable within ${ANON_PULL_WAIT_SECS}s (window, cascade, LATE-JOINER clearance, or release-sweep gate not satisfied)"
 fi
 
 # ---------------------------------------------------------------------

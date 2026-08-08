@@ -75,6 +75,10 @@ pub mod project;
 // capable-format set (single source for every wiring site) + the
 // ScanPolicy wire->domain mappers.
 pub mod provenance;
+// Dependency-edge registry (backlog 090, #135 item 2, ADR 0039 §12):
+// every standing cross-artifact lifecycle dependency, both trigger ends
+// named. Pure data + the structural guard's cross-check helper; no I/O.
+pub mod lifecycle_dependency_registry;
 pub mod rbac;
 // The vulnerability-scanner backends compiled into this build — the single
 // source of truth the apply-time `scanBackends` validator checks against

@@ -4,6 +4,10 @@
 #   ./run.sh [--hort=compose|external] [--group G]... [--scenario N]...
 #            [--compose-overlay O]... [--list] [--keep]
 # Env (external mode): HORT_URL, KEYCLOAK_URL[, METRICS_URL, HORT_DB_DSN].
+# Env (compose mode, worker-requiring scenarios only): HORT_E2E_WORKER_REPLICAS
+#   (default 4) — hort-worker replica count. Scan concurrency is 1 per replica
+#   by design; replicas are the scaling axis so serial trivy runtime stays off
+#   the release critical path.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -173,6 +177,10 @@ while IFS=$'\t' read -r _g _n _p reqs; do
   for t in $reqs; do case "$t" in worker|scanner) NEED_WORKER=1;; esac; done
 done < <(selected)
 PROFILE_ARGS=(); [ "$NEED_WORKER" = 1 ] && PROFILE_ARGS=(--profile worker)
+# Scale hort-worker replicas so serial trivy scan throughput isn't the E2E
+# release-cadence floor (backlog 095). Only when the worker profile is on —
+# compose errors scaling a profile-inactive service.
+SCALE_ARGS=(); [ "$NEED_WORKER" = 1 ] && SCALE_ARGS=(--scale "hort-worker=${HORT_E2E_WORKER_REPLICAS:-4}")
 
 # The worker has no HTTP health/port, so readiness = compose reports it running.
 wait_running() { local svc="$1" t="${2:-180}"; local d=$(( $(now)+t )); until docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" ps --status running --services 2>/dev/null | grep -qx "$svc"; do [ "$(now)" -ge "$d" ] && return 1; sleep 2; done; }
@@ -185,8 +193,15 @@ trap cleanup EXIT
 
 if [ "$HORT_MODE" = "compose" ]; then
   build_image
+  # E2E sweep cadence: for scan-less policies (scanBackends: []) the release
+  # sweep is the ONLY release engine, and the OCI cold-blob bounded await
+  # (default 10s) only catches a release when the tick fits inside its bound —
+  # tick <= await turns a cold `--all` tree pull into a single client pass
+  # instead of a 503-abort frontier crawl. Compose interpolates the ticker's
+  # ${SWEEP_TICK_SECS:-15} from THIS process env at `up` time.
+  export SWEEP_TICK_SECS="${SWEEP_TICK_SECS:-5}"
   docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" up -d --build
+  docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" up -d --build "${SCALE_ARGS[@]}"
   STARTED=1
   wait_url "$KC_DISCOVERY" 120 || { echo "Keycloak not ready" >&2; exit 1; }
   wait_url "$HOST_HEALTHZ" 120 || { echo "hort-server not ready" >&2; exit 1; }

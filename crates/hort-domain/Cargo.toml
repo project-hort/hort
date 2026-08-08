@@ -70,3 +70,10 @@ hex = { workspace = true }
 # (the previous test was a no-op placeholder). Test-only — does not
 # affect the production dep graph.
 static_assertions = "1"
+
+# Stateful property-based testing for the quarantine lifecycle convergence
+# suite (backlog 091, #135 item 3) — random interleavings of ingest /
+# verify / sweep-tick actions checked against the declared
+# `QUARANTINE_TRANSITIONS` table plus the liveness/authority/idempotency
+# invariants. Test-only — does not affect the production dep graph.
+proptest = "1"

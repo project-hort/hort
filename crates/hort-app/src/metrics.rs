@@ -2157,6 +2157,24 @@ pub fn emit_provenance_reject(
     .increment(1);
 }
 
+/// Emit `hort_provenance_late_joiner_cleared_total{backend}` once per
+/// constituent that self-cleared against an already-verified subject at
+/// its own quarantine-commit time (ADR 0039 §11, late-joiner end). Single
+/// emission site: `ProvenanceCascade::resolve_late_joiner_clearance`.
+///
+/// Unlike the two counters above — which run in `hort-worker`'s
+/// `provenance-verify` job — this one is emitted on the **ingest path**,
+/// so it appears on the `hort-server` registry. `backend` is the verifier
+/// recorded on the subject's clearance, carrying the same bounded value
+/// space as the `backend` label everywhere else.
+pub fn emit_provenance_late_joiner_cleared(backend: &str) {
+    metrics::counter!(
+        "hort_provenance_late_joiner_cleared_total",
+        labels::BACKEND => backend.to_string(),
+    )
+    .increment(1);
+}
+
 // ---------------------------------------------------------------------------
 // Test helper: capture emitted metrics into a snapshot.
 // ---------------------------------------------------------------------------

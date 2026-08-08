@@ -4313,7 +4313,8 @@ async fn cascade_commit_does_not_clobber_concurrently_written_anchor() {
     current.quarantine_window_start = Some(anchor);
     f.artifacts.insert(current);
 
-    f.uc.commit_cascade_event(&stale, event, ExpectedVersion::Any)
+    f.uc.cascade
+        .commit_cascade_event(&stale, event, ExpectedVersion::Any)
         .await
         .expect("commit_cascade_event");
 
@@ -4669,15 +4670,16 @@ async fn cascade_commit_failure_warns_and_continues_with_remaining() {
     f.lifecycle
         .fail_next_commit(DomainError::Invariant("injected commit failure".into()));
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     let cascaded = cascaded_events(&f);
     assert_eq!(
@@ -4721,15 +4723,16 @@ async fn cascade_version_conflict_retries_once_and_lands() {
     f.lifecycle
         .fail_next_commit(DomainError::Conflict("stream moved".into()));
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     let cascaded = cascaded_events(&f);
     assert_eq!(
@@ -4762,15 +4765,16 @@ async fn cascade_version_conflict_twice_warns_and_skips_remaining_still_cascade(
     f.lifecycle
         .fail_next_commit(DomainError::Conflict("stream moved again".into()));
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     let cascaded = cascaded_events(&f);
     assert_eq!(
@@ -4804,15 +4808,16 @@ async fn cascade_version_conflict_retry_observes_clearance_appeared_and_skips() 
         vec![persisted_verified(config_id, Some(hexhash('8')))],
     );
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     assert!(
         f.lifecycle.committed_transitions().is_empty(),
@@ -4968,15 +4973,16 @@ async fn cascade_skips_a_self_referencing_digest() {
     );
     seed_held_artifact(&f, f.repository_id, &selfhash);
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &selfhash, // subject == the referenced digest
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &selfhash, // subject == the referenced digest
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign",
+        )
+        .await;
 
     assert!(
         f.lifecycle.committed_transitions().is_empty(),

@@ -45,13 +45,11 @@ use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
-use hort_domain::ports::event_store::{
-    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
-};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::provenance::{
     AttestationBundle, ProvenancePort, ProvenanceRejectReason, ProvenanceRequirements,
-    ProvenanceSubject, ProvenanceVerdict, SignerIdentity,
+    ProvenanceSubject, ProvenanceVerdict,
 };
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
@@ -60,12 +58,12 @@ use hort_domain::ports::upstream_proxy::{IdentityProjector, UpstreamProxy};
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::types::ContentHash;
 
-use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 
 use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::read_expected_version;
 use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
 
@@ -75,26 +73,12 @@ use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
 /// content hash (the OCI Referrers projection).
 const OCI_SUBJECT_KIND: &str = "oci_subject";
 
-/// Upper bound on bytes read from CAS for the artifact preimage / a single
-/// attestation bundle. For OCI cosign the subject is the manifest (small);
-/// the bundle is a Sigstore JSON blob. A generous backstop that keeps a
-/// pathological CAS object from buffering unbounded into memory on the
-/// verify path. 16 MiB.
-const MAX_PROVENANCE_READ_BYTES: u64 = 16 * 1024 * 1024;
-
 /// Number of attempts (1 initial + N-1 retries) the orchestrator makes to
 /// fetch the bundle set / read the CAS preimage before giving up. On
 /// exhaustion the mode decides: `Required` → fail-closed
 /// `Rejected{RekorNotFound}`; `VerifyIfPresent` → degrade to
 /// `NoAttestation` (allow).
 const FETCH_ATTEMPTS: u32 = 3;
-
-/// Cap on the number of events read when scanning an artifact stream for an
-/// existing `ProvenanceVerified` (the already-cleared no-op skip and the
-/// cascade's idempotency check). Mirrors `STREAM_READ_LIMIT` in
-/// `release_clearance` (the release gate's own clearance read); every
-/// artifact stream begins well within this bound.
-const STREAM_READ_LIMIT: u64 = 200;
 
 /// Bounded grace window (issue #90 defense-in-depth) — see `apply_verdict`.
 /// A `NoAttestation`×`Required` verdict on a `None`-status, anchor-less
@@ -205,6 +189,12 @@ pub struct ProvenanceOrchestrationUseCase {
     /// is `Some` iff the repo is a proxy/pull-through scope — the trigger
     /// for the upstream referrer-fetch arm.
     upstream_resolver: Arc<dyn UpstreamResolver>,
+    /// Shared clearance-cascade machinery (ADR 0039 §11), built from the
+    /// same port handles this use case already holds. The verify-time
+    /// cascade is one of its two trigger ends; the ingest-time
+    /// late-joiner self-clear is the other. One implementation so the
+    /// two ends can never drift on what a signature covers.
+    cascade: ProvenanceCascade,
 }
 
 impl ProvenanceOrchestrationUseCase {
@@ -221,6 +211,13 @@ impl ProvenanceOrchestrationUseCase {
         upstream_proxy: Arc<dyn UpstreamProxy>,
         upstream_resolver: Arc<dyn UpstreamResolver>,
     ) -> Self {
+        let cascade = ProvenanceCascade::new(
+            Arc::clone(&artifacts),
+            Arc::clone(&storage),
+            Arc::clone(&lifecycle),
+            Arc::clone(&events),
+            Arc::clone(&content_references),
+        );
         Self {
             artifacts,
             repositories,
@@ -232,6 +229,7 @@ impl ProvenanceOrchestrationUseCase {
             provenance_ports,
             upstream_proxy,
             upstream_resolver,
+            cascade,
         }
     }
 
@@ -396,7 +394,7 @@ impl ProvenanceOrchestrationUseCase {
         // `VerifyIfPresent`/`Off` never consult the clearance, so their
         // re-verify behaviour is unchanged.
         if mode == ProvenanceMode::Required {
-            let (cleared, _) = self.read_clearance_state(artifact.id).await?;
+            let (cleared, _) = self.cascade.read_clearance_state(artifact.id).await?;
             if let Some(existing) = cleared {
                 tracing::debug!(
                     artifact_id = %artifact.id,
@@ -416,17 +414,18 @@ impl ProvenanceOrchestrationUseCase {
                 // bytes here. Best-effort: no failure in the re-drive
                 // changes the skip outcome (the subject's clearance stands).
                 if existing.cascaded_from.is_none() {
-                    match self.read_bounded(&artifact.sha256_checksum).await {
+                    match self.cascade.read_bounded(&artifact.sha256_checksum).await {
                         Ok(payload) => {
-                            self.cascade_clearance(
-                                artifact.repository_id,
-                                &artifact.sha256_checksum,
-                                &payload,
-                                &existing.signer,
-                                existing.predicate_type.as_deref(),
-                                &existing.backend,
-                            )
-                            .await;
+                            self.cascade
+                                .cascade_clearance(
+                                    artifact.repository_id,
+                                    &artifact.sha256_checksum,
+                                    &payload,
+                                    &existing.signer,
+                                    existing.predicate_type.as_deref(),
+                                    &existing.backend,
+                                )
+                                .await;
                         }
                         Err(e) => tracing::warn!(
                             artifact_id = %artifact.id,
@@ -628,15 +627,16 @@ impl ProvenanceOrchestrationUseCase {
         // in the cascade can retract or block the already-committed
         // subject clearance.
         if let Some((signer, predicate_type)) = cascade_seed {
-            self.cascade_clearance(
-                repository_id,
-                &subject_hash,
-                &payload,
-                &signer,
-                predicate_type.as_deref(),
-                &metric_backend,
-            )
-            .await;
+            self.cascade
+                .cascade_clearance(
+                    repository_id,
+                    &subject_hash,
+                    &payload,
+                    &signer,
+                    predicate_type.as_deref(),
+                    &metric_backend,
+                )
+                .await;
         }
         Ok(outcome)
     }
@@ -692,7 +692,7 @@ impl ProvenanceOrchestrationUseCase {
                 .artifacts
                 .find_by_id(reference.source_artifact_id)
                 .await?;
-            let manifest_bytes = self.read_bounded(&source.sha256_checksum).await?;
+            let manifest_bytes = self.cascade.read_bounded(&source.sha256_checksum).await?;
 
             // Parse the referrer manifest and keep only the Sigstore-bundle
             // layer blobs (the pure `sigstore_bundle_layers` helper). A referrer that
@@ -705,7 +705,7 @@ impl ProvenanceOrchestrationUseCase {
                 // referenced by the manifest but absent from CAS surfaces as
                 // a `read_bounded` error → the existing fetch-failure path
                 // (mode-dependent), never a panic.
-                let bundle_bytes = self.read_bounded(&blob_hash).await?;
+                let bundle_bytes = self.cascade.read_bounded(&blob_hash).await?;
                 bundles.push(build_bundle(bundle_bytes));
             }
 
@@ -717,7 +717,7 @@ impl ProvenanceOrchestrationUseCase {
             // (under `Required`, no valid bundle folds to `Rejected{Unsigned}`).
             let sig_layers = hort_domain::oci::simplesigning_signature_layers(&manifest_bytes)?;
             for sig in sig_layers {
-                let payload_bytes = self.read_bounded(&sig.payload_layer).await?;
+                let payload_bytes = self.cascade.read_bounded(&sig.payload_layer).await?;
                 let Some(sig_bytes) = decode_simplesigning_signature(&sig.signature) else {
                     continue;
                 };
@@ -1016,321 +1016,12 @@ impl ProvenanceOrchestrationUseCase {
     async fn read_preimage(&self, content_hash: &ContentHash) -> AppResult<Vec<u8>> {
         let mut last_err = None;
         for _ in 0..FETCH_ATTEMPTS {
-            match self.read_bounded(content_hash).await {
+            match self.cascade.read_bounded(content_hash).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.expect("FETCH_ATTEMPTS >= 1 so at least one error was recorded"))
-    }
-
-    /// Read up to [`MAX_PROVENANCE_READ_BYTES`] from the CAS object at
-    /// `hash`. A read error surfaces as `Err`. Over-cap content is
-    /// truncated at the cap (the verify path does not need the full blob
-    /// for the manifest-shaped subjects Tier-1 covers; a larger artifact
-    /// simply hashes wrong and is rejected by the verifier, never a panic).
-    async fn read_bounded(&self, hash: &ContentHash) -> AppResult<Vec<u8>> {
-        let reader = self.storage.get(hash).await?;
-        let mut limited = reader.take(MAX_PROVENANCE_READ_BYTES);
-        let mut buf = Vec::new();
-        limited.read_to_end(&mut buf).await.map_err(|e| {
-            hort_domain::error::DomainError::Invariant(format!(
-                "provenance: CAS read failed for {hash}: {e}"
-            ))
-        })?;
-        Ok(buf)
-    }
-
-    // -----------------------------------------------------------------
-    // Provenance-clearance cascade (ADR 0039)
-    // -----------------------------------------------------------------
-
-    /// Cascade the verified subject's provenance clearance to the
-    /// constituents its signed bytes bind (ADR 0039 cascade).
-    ///
-    /// The constituent set derives from the subject's **verified CAS
-    /// bytes** — never from DB edges (`content_references` /
-    /// `oci_index_member` rows are mutable projections; the signed bytes
-    /// are the cryptographic authority). An image index yields its
-    /// `manifests[]` children plus, per child manifest read back from CAS,
-    /// that manifest's `config`/`layers` digests; a single-image manifest
-    /// yields its own `config`/`layers`. Each digest sits inside its signed
-    /// parent's bytes (a Merkle-like chain), so the signature over the
-    /// subject digest covers exactly these constituents — and nothing else.
-    ///
-    /// Best-effort end to end: the subject's own clearance is already
-    /// committed when this runs, and no failure here may retract or block
-    /// it — every error is `warn!` + continue. Only the provenance
-    /// authority cascades; the scan gate and observation window stay
-    /// per-artifact (ADR 0007 / ADR 0043).
-    async fn cascade_clearance(
-        &self,
-        repository_id: Uuid,
-        subject_hash: &ContentHash,
-        subject_bytes: &[u8],
-        signer: &SignerIdentity,
-        predicate_type: Option<&str>,
-        backend: &str,
-    ) {
-        let digests = match self.constituent_digests(subject_bytes).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    subject = %subject_hash,
-                    error = %e,
-                    "provenance cascade: subject bytes did not parse as an OCI \
-                     index/manifest — cascading to nothing",
-                );
-                return;
-            }
-        };
-
-        let mut cascaded = 0usize;
-        for digest in &digests {
-            // Defensive self-reference guard: a subject cannot reference its
-            // own hash in real content (self-referential digest), but the
-            // cascade must never re-append to the subject's stream.
-            if digest == subject_hash {
-                continue;
-            }
-            match self
-                .cascade_one(
-                    repository_id,
-                    subject_hash,
-                    digest,
-                    signer,
-                    predicate_type,
-                    backend,
-                )
-                .await
-            {
-                Ok(true) => cascaded += 1,
-                Ok(false) => {}
-                Err(e) => tracing::warn!(
-                    subject = %subject_hash,
-                    constituent = %digest,
-                    error = %e,
-                    "provenance cascade: constituent clearance failed — skipped",
-                ),
-            }
-        }
-        if cascaded > 0 {
-            tracing::info!(
-                subject = %subject_hash,
-                constituents = cascaded,
-                backend = %backend,
-                "provenance: cascaded clearance to signed constituents",
-            );
-        }
-    }
-
-    /// Derive the constituent digest set from the verified subject bytes.
-    ///
-    /// Index → `manifests[]` children (capped by the domain's
-    /// `MAX_INDEX_CHILDREN`) plus each child manifest's `config`/`layers`
-    /// digests read back from the child's own CAS bytes (capped per
-    /// manifest by `MAX_MANIFEST_BLOBS`); single-image manifest → its own
-    /// `config`/`layers`. A child whose CAS bytes cannot be read or parsed
-    /// contributes the child digest itself (it is bound into the signed
-    /// index bytes regardless) but no blobs — `warn!` + continue.
-    /// Deduplicated (a blob shared across children appears once),
-    /// order-preserving.
-    async fn constituent_digests(&self, subject_bytes: &[u8]) -> AppResult<Vec<ContentHash>> {
-        let mut out: Vec<ContentHash> = Vec::new();
-        if hort_domain::oci::is_image_index(subject_bytes) {
-            for child in hort_domain::oci::index_child_digests(subject_bytes)? {
-                out.push(child.clone());
-                let child_bytes = match self.read_bounded(&child).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            child = %child,
-                            error = %e,
-                            "provenance cascade: child manifest CAS read failed — \
-                             its config/layer blobs are not cascaded",
-                        );
-                        continue;
-                    }
-                };
-                match hort_domain::oci::manifest_blob_digests(&child_bytes) {
-                    Ok(blobs) => out.extend(blobs),
-                    Err(e) => tracing::warn!(
-                        child = %child,
-                        error = %e,
-                        "provenance cascade: child manifest did not parse — \
-                         its config/layer blobs are not cascaded",
-                    ),
-                }
-            }
-        } else {
-            out.extend(hort_domain::oci::manifest_blob_digests(subject_bytes)?);
-        }
-        let mut seen = std::collections::HashSet::new();
-        out.retain(|h| seen.insert(h.clone()));
-        Ok(out)
-    }
-
-    /// Cascade the clearance to ONE constituent digest. Returns `Ok(true)`
-    /// when a cascaded `ProvenanceVerified` was committed, `Ok(false)` on
-    /// the deliberate skips:
-    ///
-    /// - no artifact row for the digest **in the subject's repository**
-    ///   (the lookup is repo-scoped — a same-digest artifact in another
-    ///   repo is never touched);
-    /// - a constituent that is not currently held (the domain guard in
-    ///   [`Artifact::cascade_provenance_clearance`] refuses every
-    ///   non-`Quarantined` state — terminally rejected stays rejected,
-    ///   `Released`/status-`None` need no clearance);
-    /// - a constituent already carrying a `ProvenanceVerified` (its own
-    ///   verification or an earlier cascade) — idempotent re-runs append
-    ///   no duplicate.
-    async fn cascade_one(
-        &self,
-        repository_id: Uuid,
-        subject_hash: &ContentHash,
-        digest: &ContentHash,
-        signer: &SignerIdentity,
-        predicate_type: Option<&str>,
-        backend: &str,
-    ) -> AppResult<bool> {
-        let Some(constituent) = self
-            .artifacts
-            .find_by_repo_and_checksum(repository_id, digest)
-            .await?
-        else {
-            return Ok(false);
-        };
-
-        // The domain guard: only a held (`Quarantined`) constituent takes
-        // a cascaded clearance. The `Err` is the guard refusing a
-        // non-held state — a deliberate skip, not an infra failure.
-        let Ok(event) = constituent.cascade_provenance_clearance(
-            subject_hash.clone(),
-            signer.clone(),
-            predicate_type.map(str::to_string),
-            backend,
-        ) else {
-            tracing::debug!(
-                artifact_id = %constituent.id,
-                status = %constituent.quarantine_status,
-                "provenance cascade: constituent not held — skipped",
-            );
-            return Ok(false);
-        };
-
-        let (cleared, expected_version) = self.read_clearance_state(constituent.id).await?;
-        if cleared.is_some() {
-            return Ok(false);
-        }
-
-        // Append at the just-read version. A version conflict means a
-        // concurrent append bumped the stream between the read and this
-        // append (the constituent's own `ScanCompleted` is the realistic
-        // race — scan and sign both land seconds after push): re-read
-        // once, re-check idempotency (the concurrent event may itself
-        // have been a `ProvenanceVerified`), and re-append at the fresh
-        // version. ONE retry only — a second conflict, or any
-        // non-conflict error, propagates to the caller's warn+skip.
-        if let Err(err) = self
-            .commit_cascade_event(&constituent, event.clone(), expected_version)
-            .await
-        {
-            if !matches!(err, hort_domain::error::DomainError::Conflict(_)) {
-                return Err(err.into());
-            }
-            tracing::debug!(
-                artifact_id = %constituent.id,
-                "provenance cascade: version conflict — retrying once with a fresh read",
-            );
-            let (cleared, fresh_version) = self.read_clearance_state(constituent.id).await?;
-            if cleared.is_some() {
-                return Ok(false);
-            }
-            self.commit_cascade_event(&constituent, event, fresh_version)
-                .await?;
-        }
-
-        tracing::info!(
-            artifact_id = %constituent.id,
-            constituent = %digest,
-            subject = %subject_hash,
-            backend = %backend,
-            "provenance: clearance cascaded from verified subject",
-        );
-        Ok(true)
-    }
-
-    /// Append one cascaded `ProvenanceVerified` to `constituent`'s stream
-    /// at `expected_version`. Split out of [`Self::cascade_one`] so the
-    /// version-conflict retry re-appends through the identical path;
-    /// returns the raw [`DomainResult`] so the caller can match the
-    /// event store's `Conflict` shape before converting to `AppError`.
-    ///
-    /// Routed through Item 1's verdict-scoped conditional write
-    /// (`commit_provenance_verdict`), NOT `commit_transition` (issue #108
-    /// H2c): the previous full-row `save_in_tx` write-back could clobber
-    /// any column a concurrent writer changed on `constituent`'s stale
-    /// in-memory snapshot — the exact hazard #90 already removed from the
-    /// two primary verdict paths, left here on the cascade. `prior_status`
-    /// is `constituent.quarantine_status` as loaded by `cascade_one` — the
-    /// SAME status the artifact is still in here, since
-    /// `Artifact::cascade_provenance_clearance` takes `&self` and never
-    /// mutates it (only the domain GUARD reads it, requiring
-    /// `Quarantined`). So `artifact.quarantine_status == prior_status`
-    /// always on this path, and Item 1's skip-unchanged rule always fires:
-    /// the cascade's `ProvenanceVerified` event still appends, but NO
-    /// status-column write happens at all — the full-row clobber vector
-    /// is gone.
-    async fn commit_cascade_event(
-        &self,
-        constituent: &Artifact,
-        event: hort_domain::events::ProvenanceVerified,
-        expected_version: ExpectedVersion,
-    ) -> hort_domain::error::DomainResult<()> {
-        self.lifecycle
-            .commit_provenance_verdict(
-                constituent,
-                AppendEvents {
-                    stream_id: hort_domain::events::StreamId::artifact(constituent.id),
-                    expected_version,
-                    events: vec![EventToAppend::new(DomainEvent::ProvenanceVerified(event))],
-                    correlation_id: Uuid::new_v4(),
-                    causation_id: None,
-                    actor: system_actor(),
-                },
-                constituent.quarantine_status,
-            )
-            .await
-            .map(|_| ())
-    }
-
-    /// Read the artifact's event stream once, reporting the existing
-    /// `ProvenanceVerified` (if any) plus the expected version for a
-    /// subsequent append — a single read serving the already-cleared
-    /// verify skip (which inspects the event's `cascaded_from` / signer
-    /// for the cascade re-drive) and the cascade's idempotency check +
-    /// append.
-    async fn read_clearance_state(
-        &self,
-        artifact_id: Uuid,
-    ) -> AppResult<(
-        Option<hort_domain::events::ProvenanceVerified>,
-        ExpectedVersion,
-    )> {
-        let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let persisted = self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await?;
-        let cleared = persisted.iter().find_map(|e| match &e.event {
-            DomainEvent::ProvenanceVerified(ev) => Some(ev.clone()),
-            _ => None,
-        });
-        let expected = match persisted.last() {
-            Some(last) => ExpectedVersion::Exact(last.stream_position),
-            None => ExpectedVersion::NoStream,
-        };
-        Ok((cleared, expected))
     }
 
     // -----------------------------------------------------------------

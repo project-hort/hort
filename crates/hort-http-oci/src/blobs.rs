@@ -178,8 +178,17 @@ pub(super) fn parse_range_header(value: &str, size: u64) -> Result<ByteRange, Ra
 /// `check_quarantine` 503 decision runs. Returns the artifact unchanged
 /// (no I/O beyond the caller's own resolve) in every other case: not
 /// `Quarantined`, the window has NOT elapsed (a genuine time-based hold —
-/// e.g. a non-released-parent manifest's full window), or the wait is
-/// disabled (`oci_pullthrough_release_wait_secs == 0`).
+/// e.g. a non-released-parent manifest's full window), the wait is
+/// disabled (`oci_pullthrough_release_wait_secs == 0`), or (backlog 094)
+/// release is provenance-blocked
+/// (`QuarantineUseCase::release_blocked_on_provenance`) — under
+/// `provenance_mode: Required` with the gate still `Pending`, the await's
+/// premise ("nothing left to wait on except the artifact's own scan
+/// result") is false: release additionally needs sign + verify + cascade,
+/// which cannot land inside the bound, and the inline fast-path release
+/// is suppressed for exactly this case. The scan-pending (provenance
+/// already cleared, or provenance not gating) case is unaffected and
+/// still awaits exactly as before.
 ///
 /// # Why this is safe under ADR 0007 (fail-closed release predicate)
 ///
@@ -263,6 +272,29 @@ async fn maybe_bounded_await_release(ctx: &Arc<AppContext>, artifact: Artifact) 
         .await
         .unwrap_or(false);
     if !window_elapsed {
+        return artifact;
+    }
+
+    // backlog 094: the await's premise is "nothing left to wait on except
+    // the artifact's own scan result" — false under `provenance_mode:
+    // Required` while the provenance gate is still `Pending`, since
+    // release additionally needs sign + verify + cascade, which cannot
+    // land inside the bound (the inline fast-path release is suppressed
+    // for exactly this case). Skip the wait and let the caller's existing
+    // quarantine check 503 immediately instead of burning the full bound
+    // first. Fail-safe on `Err` (e.g. a transient policy-projection read
+    // failure): treat as NOT blocked, i.e. keep today's await — this
+    // guard is an optimization and must never introduce a new hold.
+    if ctx
+        .quarantine_use_case
+        .release_blocked_on_provenance(&artifact)
+        .await
+        .unwrap_or(false)
+    {
+        tracing::debug!(
+            artifact_id = %artifact.id,
+            "pull-through release bounded-await skipped; release is provenance-blocked"
+        );
         return artifact;
     }
 
@@ -492,23 +524,15 @@ pub(super) async fn serve(
     // where the upstream-pull branch isn't taken.
     let _ = &repo;
 
-    // 4a. #65 bounded-await: a cold pull-through blob is ingested
-    // `Quarantined` and its own async scan flips it to `Released` a
-    // few seconds later — after this handler would already have
-    // 503'd. Only waits when the artifact is `Quarantined` AND its
-    // computed window has already elapsed (release-pending on its own
-    // scan, e.g. the referenced-tree-descendant zero-window case);
-    // never awaits a genuine, not-yet-elapsed time-quarantine. See
-    // `maybe_bounded_await_release`'s doc comment for the full
-    // ADR-0007-safety argument.
-    let artifact = maybe_bounded_await_release(&ctx, artifact).await;
-
-    // 5. Quarantine / rejected check. See module docs for why this is
-    //    done in the handler rather than deferred to
-    //    ArtifactUseCase::download: transparent-proxy compatibility +
-    //    avoiding the CAS round-trip for a blob that won't be served.
-    //    Rejected stays inline because the hidden-404 envelope is
-    //    format-specific (`BLOB_UNKNOWN`).
+    // 4a-pre. ADR 0039 §10 write-authorized existence-probe exemption —
+    // evaluated BEFORE the #65 bounded-await below (backlog 094) so a
+    // HEAD that will be served via the exemption regardless does not pay
+    // the await first. Keyed on the artifact's PRE-await quarantine
+    // status: `maybe_bounded_await_release` only ever loops when that
+    // status is `Quarantined` to begin with (every other case is its own
+    // immediate-return), so the pre-await read is exactly the condition
+    // the await would otherwise have started from, and the flag stays
+    // correct whether or not the await below actually runs.
     //
     //    Push-dedup exception (ADR 0039 §10): a write-granted caller's
     //    blob-EXISTENCE check (`HEAD`) must report 200 (exists) so an OCI
@@ -543,6 +567,33 @@ pub(super) async fn serve(
             .resolve_granted_write(repo_key, actor)
             .await
             .is_ok();
+
+    // 4a. #65 bounded-await: a cold pull-through blob is ingested
+    // `Quarantined` and its own async scan flips it to `Released` a
+    // few seconds later — after this handler would already have
+    // 503'd. Only waits when the artifact is `Quarantined` AND its
+    // computed window has already elapsed (release-pending on its own
+    // scan, e.g. the referenced-tree-descendant zero-window case);
+    // never awaits a genuine, not-yet-elapsed time-quarantine. See
+    // `maybe_bounded_await_release`'s doc comment for the full
+    // ADR-0007-safety argument.
+    //
+    // Skipped entirely when the write-authorized existence-probe
+    // exemption above already applies (backlog 094): a HEAD that the
+    // quarantine check below is about to wave through regardless must
+    // not pay the await's latency first.
+    let artifact = if write_authorized_existence_probe {
+        artifact
+    } else {
+        maybe_bounded_await_release(&ctx, artifact).await
+    };
+
+    // 5. Quarantine / rejected check. See module docs for why this is
+    //    done in the handler rather than deferred to
+    //    ArtifactUseCase::download: transparent-proxy compatibility +
+    //    avoiding the CAS round-trip for a blob that won't be served.
+    //    Rejected stays inline because the hidden-404 envelope is
+    //    format-specific (`BLOB_UNKNOWN`).
     // Exhaustive match (issue #92) — no wildcard arm, so a future
     // `QuarantineStatus` variant is a compile error here, not a
     // fall-through 500/200. `None` / `Released` continue to the happy
@@ -4515,5 +4566,268 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // -- backlog 094: bounded-await provenance guard ------------------------
+
+    /// A repo-scoped `Required`-provenance policy with a zero quarantine
+    /// duration, so a `quarantine_window_start` in the past reads as
+    /// elapsed via [`QuarantineUseCase::is_window_elapsed`] regardless of
+    /// the exact anchor value — mirrors [`quarantining_policy`] but with
+    /// `provenance_mode: Required`, the variable under test here.
+    fn required_provenance_policy(
+        repo_id: Uuid,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        };
+        use hort_domain::events::PolicyScope;
+        let now = Utc::now();
+        ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: format!("backlog094-required-provenance-{repo_id}"),
+            scope: PolicyScope::Repository(repo_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs: 0,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::Required,
+            provenance_backends: vec!["cosign".to_string()],
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            stream_version: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Seed a single `ProvenanceVerified` event on `artifact_id`'s stream
+    /// — the shape [`QuarantineUseCase::release_blocked_on_provenance`]'s
+    /// underlying resolution (`resolve_provenance_clearance`) reads to
+    /// compute `Cleared` under `Required` mode. Mirrors the `hort-app`
+    /// suite's `seed_stream_scanned_and_provenance_verified` fixture; only
+    /// the provenance leg matters to the guard, so no `ScanCompleted` is
+    /// needed here.
+    fn seed_provenance_verified(
+        events: &Arc<hort_app::use_cases::test_support::MockEventStore>,
+        artifact_id: Uuid,
+    ) {
+        use hort_domain::events::{DomainEvent, PersistedEvent, ProvenanceVerified, StreamId};
+        use hort_domain::ports::provenance::SignerIdentity;
+
+        let stream_id = StreamId::artifact(artifact_id);
+        let verified = PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: stream_id.clone(),
+            stream_position: 0,
+            global_position: 1,
+            event: DomainEvent::ProvenanceVerified(ProvenanceVerified {
+                artifact_id,
+                content_hash: valid_hex().parse().unwrap(),
+                backend: "cosign".into(),
+                signer: SignerIdentity {
+                    issuer: "https://token.actions.githubusercontent.com".into(),
+                    san:
+                        "https://github.com/acme/repo/.github/workflows/release.yml@refs/heads/main"
+                            .into(),
+                },
+                predicate_type: None,
+                cascaded_from: None,
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: hort_domain::events::system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        };
+        events.set_stream(&stream_id, vec![verified]);
+    }
+
+    /// (a) `Required` + `Pending` (no `ProvenanceVerified` on the stream),
+    /// `Quarantined`, window already elapsed: the bounded-await guard must
+    /// skip the wait entirely and 503 immediately — burning the bound
+    /// would only ever end in the same 503, since the fast-path release is
+    /// suppressed for exactly this case. Asserted by wall-clock against a
+    /// deliberately large bound: a wrongly-awaited request would take
+    /// clearly longer than the assertion threshold.
+    #[test]
+    fn get_blob_required_pending_elapsed_window_returns_503_without_consuming_bound() {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, elapsed) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (base_ctx, mocks) = build_mock_ctx(handle);
+            let ctx = with_oci_pullthrough_release_wait_secs(&base_ctx, 30);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            mocks
+                .policy_projections
+                .insert(required_provenance_policy(repo_id));
+            // No `ProvenanceVerified` event seeded — the artifact stream
+            // reads empty, so `resolve_provenance_clearance` computes
+            // `Pending` under `Required` mode.
+            seed_blob_with_deadline(
+                &mocks.artifacts,
+                &mocks.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+                Utc::now() - chrono::Duration::seconds(1),
+            );
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+            let started = std::time::Instant::now();
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, started.elapsed())
+        });
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "request took {elapsed:?} against a 30s bound; the provenance guard \
+             must skip the await entirely, not burn (any part of) the bound"
+        );
+    }
+
+    /// (b) `Required` + `Cleared` (a `ProvenanceVerified` event already on
+    /// the stream) but the artifact's own scan is still pending: the
+    /// provenance guard must NOT block this case — it still awaits and
+    /// serves 200 once the mock's async scan flips the row to `Released`.
+    /// This is the pre-existing #65 late-joiner case (issue #135) and must
+    /// keep working: the guard only ever short-circuits the
+    /// provenance-blocked case, never the ordinary scan-pending one.
+    #[test]
+    fn get_blob_required_cleared_scan_pending_still_awaits_and_serves_on_release() {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, body) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (base_ctx, mocks) = build_mock_ctx(handle);
+            let ctx = with_oci_pullthrough_release_wait_secs(&base_ctx, 5);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            mocks
+                .policy_projections
+                .insert(required_provenance_policy(repo_id));
+            let artifact_id = seed_blob_with_deadline(
+                &mocks.artifacts,
+                &mocks.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+                Utc::now() - chrono::Duration::seconds(1),
+            );
+            seed_provenance_verified(&mocks.events, artifact_id);
+
+            // Simulate the artifact's own async scan pipeline completing a
+            // few hundred ms after the GET arrives — same shape as the
+            // #65 suite's release-race fixture.
+            let artifacts = mocks.artifacts.clone();
+            let spawn_hex = hex.clone();
+            let spawn_size = content.len() as i64;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let mut released = sample_artifact(QuarantineStatus::Released);
+                released.id = artifact_id;
+                released.repository_id = repo_id;
+                released.path = format!("blobs/sha256:{spawn_hex}");
+                released.sha256_checksum = spawn_hex.parse().unwrap();
+                released.size_bytes = spawn_size;
+                artifacts.insert(released);
+            });
+
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, content);
+    }
+
+    /// (c) A write-authorized caller's existence-probe HEAD on a
+    /// `Required`+`Pending`, `Quarantined`, window-elapsed blob is served
+    /// (200) without awaiting — the ADR 0039 §10 exemption is now
+    /// evaluated BEFORE the bounded-await, so a HEAD the quarantine check
+    /// is about to wave through regardless never pays the wait first.
+    /// Asserted by wall-clock against a deliberately large bound.
+    #[test]
+    fn head_blob_write_authorized_required_pending_elapsed_window_returns_200_without_awaiting() {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+
+        let (status, elapsed) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (base_ctx, mocks) = build_mock_ctx(handle);
+            let ctx = with_oci_pullthrough_release_wait_secs(&base_ctx, 30);
+            let ctx = write_grant_ctx(&ctx, mocks.repositories.clone(), "ci-pusher");
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            mocks
+                .policy_projections
+                .insert(required_provenance_policy(repo_id));
+            seed_blob_with_deadline(
+                &mocks.artifacts,
+                &mocks.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+                Utc::now() - chrono::Duration::seconds(1),
+            );
+            let principal = principal_with_claim("ci-pusher");
+            let started = std::time::Instant::now();
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ true,
+                Some(&principal),
+            )
+            .await;
+            (resp.status(), started.elapsed())
+        });
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a write-authorized existence-probe HEAD must be served regardless of \
+             the provenance-blocked quarantine hold"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "request took {elapsed:?} against a 30s bound; the write-authorized \
+             existence-probe exemption must be evaluated BEFORE the bounded-await, \
+             never after"
+        );
     }
 }

@@ -141,6 +141,10 @@ pub mod retention_use_case;
 // content-reference surface) + the CAS preimage, dispatch each applicable
 // `ProvenancePort`, fold to one verdict, apply `complete_provenance`.
 // See ADR 0027.
+// Shared provenance-clearance cascade machinery (ADR 0039 §11): the
+// verify-time subject cascade and the ingest-time late-joiner self-clear
+// are two trigger ends of one dependency, so they share one walk.
+pub(crate) mod provenance_cascade;
 pub mod provenance_orchestration;
 pub(crate) mod release_clearance;
 pub(crate) mod scan_history;

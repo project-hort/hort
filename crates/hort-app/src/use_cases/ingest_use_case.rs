@@ -41,6 +41,7 @@ use crate::use_cases::multi_hash::{
     Sha1DigestHandle, Sha1HashingRead, Sha512DigestHandle, Sha512HashingRead,
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_expected_version,
@@ -566,6 +567,16 @@ pub struct IngestUseCase {
     /// mis-registration leaves the artifact `Pending` → never timer-releases
     /// (fail-closed at the release gate).
     provenance_capable_formats: Arc<HashSet<String>>,
+    /// Shared provenance-clearance cascade machinery (ADR 0039 §11),
+    /// built from the port handles above. Drives the **late-joiner**
+    /// trigger end: a constituent that lands after its subject was
+    /// already verified clears itself against that subject's signed
+    /// bytes at its own quarantine-commit time. Constructed here rather
+    /// than injected because every port it needs (`storage`,
+    /// `lifecycle`, `artifacts`, `events`, `content_references`) is
+    /// already a field — it adds no dependency to the composition root
+    /// and no new decision surface, only a shared walk.
+    provenance_cascade: ProvenanceCascade,
 }
 
 impl IngestUseCase {
@@ -595,6 +606,13 @@ impl IngestUseCase {
         policy_projections: Arc<dyn PolicyProjectionRepository>,
         jobs: Arc<dyn JobsRepository>,
     ) -> Self {
+        let provenance_cascade = ProvenanceCascade::new(
+            Arc::clone(&artifacts),
+            Arc::clone(&storage),
+            Arc::clone(&lifecycle),
+            Arc::clone(&events),
+            Arc::clone(&content_references),
+        );
         Self {
             storage,
             lifecycle,
@@ -613,6 +631,7 @@ impl IngestUseCase {
             // `with_provenance_capable_formats`. Empty = no
             // `provenance-verify` ever enqueued (fail-safe).
             provenance_capable_formats: Arc::new(HashSet::new()),
+            provenance_cascade,
         }
     }
 
@@ -644,6 +663,53 @@ impl IngestUseCase {
             values::REPOSITORY_ALL.to_string()
         } else {
             repo_key.unwrap_or(values::REPOSITORY_UNKNOWN).to_string()
+        }
+    }
+
+    /// Late-joiner provenance self-clear (ADR 0039 §11, constituent
+    /// end) — the post-commit hook of every quarantine-committing ingest
+    /// path.
+    ///
+    /// The verify-time cascade clears the constituents a signed subject
+    /// binds *that already exist when the subject verifies*. A
+    /// constituent that lands afterwards — a foreign-platform child
+    /// manifest or one of its blobs pulled through on a later
+    /// `skopeo copy --all` — has no clearance path of its own under
+    /// `Required`: cosign signs only the top-level digest, so its own
+    /// verify finds no bundle, and the referenced-tree-descendant hold
+    /// keeps it `Pending` indefinitely. This is the symmetric second
+    /// trigger end; a standing cross-artifact lifecycle dependency needs
+    /// a trigger at BOTH ends or one arrival order strands.
+    ///
+    /// **Best-effort, post-commit, never gating.** The quarantine
+    /// transition is already durable when this runs; nothing here can
+    /// fail or delay the ingest, and no failure inside it changes the
+    /// outcome — the artifact simply stays held exactly as it would have
+    /// without the attempt (fail-closed in every direction).
+    ///
+    /// Gated on `Required` AND a provenance-capable format: under
+    /// `Off`/`VerifyIfPresent` no constituent carries a pending
+    /// provenance gate at all, and a format no verifier acts on can
+    /// never have a signed subject to clear against.
+    async fn resolve_late_joiner_clearance(
+        &self,
+        artifact: &Artifact,
+        provenance_mode: ProvenanceMode,
+        quarantined: bool,
+        format: &str,
+    ) {
+        if !quarantined
+            || provenance_mode != ProvenanceMode::Required
+            || !self.provenance_capable_formats.contains(format)
+        {
+            return;
+        }
+        if let Some(cleared) = self
+            .provenance_cascade
+            .resolve_late_joiner_clearance(artifact)
+            .await
+        {
+            crate::metrics::emit_provenance_late_joiner_cleared(&cleared.backend);
         }
     }
 
@@ -3010,6 +3076,18 @@ impl IngestUseCase {
                 )
             })?;
 
+        // Late-joiner provenance self-clear. Runs AFTER the quarantine
+        // transition is durable, so a constituent that arrives once its
+        // subject is already verified clears itself instead of stranding
+        // `Pending` (see the helper for the full contract).
+        self.resolve_late_joiner_clearance(
+            &artifact,
+            provenance_mode,
+            quarantine_fired.is_some(),
+            &scan_enqueue_format,
+        )
+        .await;
+
         // Refcount projection writes. Run AFTER
         // `commit_transition` succeeds (the artifact is persisted-and-
         // valid by this point). Insert failure is recoverable: the
@@ -4274,6 +4352,18 @@ impl IngestUseCase {
                 "register_by_hash: quarantine/scan/provenance gate resolved"
             );
         }
+
+        // Late-joiner provenance self-clear — the same post-commit hook
+        // `ingest_inner` runs, on this path's own quarantine commit. The
+        // OCI cross-repo blob mount lands a fresh per-repo row over
+        // content whose subject may already be verified in this repo.
+        self.resolve_late_joiner_clearance(
+            &artifact,
+            provenance_mode,
+            quarantined,
+            &scan_enqueue_format,
+        )
+        .await;
 
         // Refcount projection write. The OCI cross-repo
         // blob mount path takes this branch; the new repository's
@@ -13326,6 +13416,397 @@ mod tests {
                 0,
                 "an empty capability set must enqueue NO provenance-verify job (fail-safe default)"
             );
+        });
+    }
+
+    // =====================================================================
+    // Late-joiner provenance self-clear (ADR 0039 §11, constituent end).
+    //
+    // The gate is `Required` x provenance-capable format x this ingest
+    // actually quarantined. Inside it, an already-verified subject that
+    // binds the arriving digest clears it on the spot; every miss leaves
+    // exactly the hold the artifact already had.
+    // =====================================================================
+
+    /// [`provenance_make_use_case`] with the port handles the late-joiner
+    /// hook reads: the artifact repo + CAS (to seed a verified subject),
+    /// the event store (to seed its clearance), and the reference index
+    /// (to seed the inbound edge that nominates it).
+    #[allow(clippy::type_complexity)]
+    fn late_joiner_make_use_case(
+        capable_formats: &[&str],
+    ) -> (
+        IngestUseCase,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockArtifactRepository>,
+        Arc<MockStoragePort>,
+        Arc<MockEventStore>,
+        Arc<MockContentReferenceIndex>,
+    ) {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let events = Arc::new(MockEventStore::new());
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let groups = Arc::new(MockArtifactGroupRepository::new());
+        let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
+        let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
+        let curation_rules = Arc::new(MockCurationRuleRepository::new());
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+        let jobs = Arc::new(MockJobsRepository::default());
+
+        let uc = IngestUseCase::new(
+            storage.clone(),
+            lifecycle.clone(),
+            artifacts.clone(),
+            repos.clone(),
+            crate::event_store_publisher::wrap_for_test(events.clone()),
+            curation_rules,
+            group_use_case,
+            true,
+            HashMap::new(),
+            0,
+            content_references.clone(),
+            policy_projections.clone(),
+            jobs,
+        )
+        .with_provenance_capable_formats(capable_formats.iter().map(ToString::to_string));
+
+        (
+            uc,
+            repos,
+            policy_projections,
+            lifecycle,
+            artifacts,
+            storage,
+            events,
+            content_references,
+        )
+    }
+
+    /// [`provenance_policy`] with a real observation window, so the ingest
+    /// actually quarantines (the hook's third gate).
+    fn late_joiner_policy(mode: ProvenanceMode) -> ScanPolicyProjection {
+        let mut p = provenance_policy(mode);
+        p.quarantine_duration_secs = 3600;
+        p
+    }
+
+    /// Seed a signed, directly-verified image index that binds
+    /// `sha256(child_content)`, plus the `oci_index_member` edge that
+    /// nominates it. Returns the index's content hash.
+    async fn seed_verified_index_binding(
+        artifacts: &Arc<MockArtifactRepository>,
+        storage: &Arc<MockStoragePort>,
+        events: &Arc<MockEventStore>,
+        refs: &Arc<MockContentReferenceIndex>,
+        repository_id: Uuid,
+        child_content: &[u8],
+    ) -> ContentHash {
+        use hort_domain::events::PersistedEvent;
+        use hort_domain::ports::content_reference_index::{
+            ContentReference, ContentReferenceIndex,
+        };
+
+        let child_hash: ContentHash = sha256_of(child_content).parse().unwrap();
+        let index_hash: ContentHash = std::iter::repeat_n('1', 64)
+            .collect::<String>()
+            .parse()
+            .unwrap();
+        let index_body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:{child_hash}"),
+                "size": 528,
+                "platform": { "architecture": "arm64", "os": "linux" },
+            }],
+        }))
+        .unwrap();
+
+        let mut index: Artifact = sample_artifact(QuarantineStatus::Released);
+        index.repository_id = repository_id;
+        index.sha256_checksum = index_hash.clone();
+        let index_id = index.id;
+        artifacts.insert(index);
+        storage.insert_content(index_hash.clone(), index_body);
+
+        events.set_stream(
+            &StreamId::artifact(index_id),
+            vec![PersistedEvent {
+                event_id: Uuid::new_v4(),
+                stream_id: StreamId::artifact(index_id),
+                stream_position: 0,
+                global_position: 0,
+                event: DomainEvent::ProvenanceVerified(hort_domain::events::ProvenanceVerified {
+                    artifact_id: index_id,
+                    content_hash: index_hash.clone(),
+                    backend: "cosign".into(),
+                    signer: hort_domain::ports::provenance::SignerIdentity {
+                        issuer: "https://token.actions.githubusercontent.com".into(),
+                        san: "https://github.com/acme/repo/.github/workflows/release.yml\
+                                  @refs/heads/main"
+                            .into(),
+                    },
+                    predicate_type: None,
+                    cascaded_from: None,
+                }),
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: hort_domain::events::system_actor(),
+                event_version: 1,
+                stored_at: Utc::now(),
+            }],
+        );
+
+        refs.insert(ContentReference {
+            source_artifact_id: index_id,
+            target_content_hash: child_hash,
+            kind: "oci_index_member".to_string(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            repository_id,
+            recorded_at: Utc::now(),
+        })
+        .await
+        .expect("seed inbound edge");
+
+        index_hash
+    }
+
+    /// Every cascaded `ProvenanceVerified` the lifecycle committed.
+    fn cascaded_clearances(
+        lifecycle: &Arc<MockArtifactLifecycle>,
+    ) -> Vec<hort_domain::events::ProvenanceVerified> {
+        lifecycle
+            .committed_transitions()
+            .iter()
+            .flat_map(|(_, batch, _)| batch.events.iter())
+            .filter_map(|e| match &e.event {
+                DomainEvent::ProvenanceVerified(v) => Some(v.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The acceptance: a foreign-platform child manifest arriving after
+    /// its index was verified self-clears at its own quarantine commit,
+    /// attributed to the index, and ticks the metric.
+    #[test]
+    fn required_late_joiner_self_clears_against_its_verified_index() {
+        let content: &[u8] = b"foreign-platform child manifest bytes";
+        let snap = capture_metrics(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
+                    late_joiner_make_use_case(&["oci"]);
+                let repo = oci_repo();
+                let repo_id = repo.id;
+                repos.insert(repo);
+                projections.insert(late_joiner_policy(ProvenanceMode::Required));
+                let index_hash = seed_verified_index_binding(
+                    &artifacts, &storage, &events, &refs, repo_id, content,
+                )
+                .await;
+
+                let outcome = uc
+                    .ingest_verified(
+                        oci_verified_req(repo_id, content),
+                        content_stream(content),
+                        &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
+                    )
+                    .await
+                    .expect("ingest must succeed");
+
+                let cascaded = cascaded_clearances(&lifecycle);
+                assert_eq!(
+                    cascaded.len(),
+                    1,
+                    "the late joiner must self-clear at its quarantine commit"
+                );
+                assert_eq!(cascaded[0].artifact_id, outcome.artifact.id);
+                assert_eq!(
+                    cascaded[0].cascaded_from.as_ref(),
+                    Some(&index_hash),
+                    "attribution names the signed index"
+                );
+            });
+        });
+
+        let ticked = snap.into_vec().iter().any(|(ck, _, _, value)| {
+            ck.key().name() == "hort_provenance_late_joiner_cleared_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "backend" && l.value() == "cosign")
+                && matches!(value, DebugValue::Counter(1))
+        });
+        assert!(
+            ticked,
+            "a late-joiner clearance must tick \
+             hort_provenance_late_joiner_cleared_total{{backend=\"cosign\"}}"
+        );
+    }
+
+    /// Gate: `VerifyIfPresent` never runs the hook — no constituent
+    /// carries a pending provenance gate outside `Required`.
+    #[test]
+    fn verify_if_present_runs_no_late_joiner_clearance() {
+        let content: &[u8] = b"foreign-platform child manifest bytes";
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
+                late_joiner_make_use_case(&["oci"]);
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+            projections.insert(late_joiner_policy(ProvenanceMode::VerifyIfPresent));
+            seed_verified_index_binding(&artifacts, &storage, &events, &refs, repo_id, content)
+                .await;
+
+            uc.ingest_verified(
+                oci_verified_req(repo_id, content),
+                content_stream(content),
+                &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
+            )
+            .await
+            .expect("ingest must succeed");
+
+            assert!(
+                cascaded_clearances(&lifecycle).is_empty(),
+                "the late-joiner hook is Required-only"
+            );
+        });
+    }
+
+    /// Gate: a format no verifier acts on can never have a signed subject
+    /// to clear against, so the hook does not run even under `Required`.
+    #[test]
+    fn a_non_capable_format_runs_no_late_joiner_clearance() {
+        let content: &[u8] = b"foreign-platform child manifest bytes";
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // Capable set is EMPTY — the un-wired composition default.
+            let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
+                late_joiner_make_use_case(&[]);
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+            projections.insert(late_joiner_policy(ProvenanceMode::Required));
+            seed_verified_index_binding(&artifacts, &storage, &events, &refs, repo_id, content)
+                .await;
+
+            uc.ingest_verified(
+                oci_verified_req(repo_id, content),
+                content_stream(content),
+                &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
+            )
+            .await
+            .expect("ingest must succeed");
+
+            assert!(
+                cascaded_clearances(&lifecycle).is_empty(),
+                "no registered verifier for the format ⇒ no late-joiner clearance"
+            );
+        });
+    }
+
+    /// Gate: a permissive policy (`quarantineDuration: 0`) never
+    /// quarantines, so there is no hold to clear.
+    #[test]
+    fn a_permissive_policy_runs_no_late_joiner_clearance() {
+        let content: &[u8] = b"foreign-platform child manifest bytes";
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
+                late_joiner_make_use_case(&["oci"]);
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+            // `provenance_policy` carries quarantine_duration_secs == 0.
+            projections.insert(provenance_policy(ProvenanceMode::Required));
+            seed_verified_index_binding(&artifacts, &storage, &events, &refs, repo_id, content)
+                .await;
+
+            uc.ingest_verified(
+                oci_verified_req(repo_id, content),
+                content_stream(content),
+                &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
+            )
+            .await
+            .expect("ingest must succeed");
+
+            assert!(
+                cascaded_clearances(&lifecycle).is_empty(),
+                "a permissive ingest has no quarantine hold to clear"
+            );
+        });
+    }
+
+    /// The hook is best-effort: a total failure inside it (no CAS bytes
+    /// for the subject ⇒ no membership proof) must leave the ingest
+    /// successful and the artifact simply held.
+    #[test]
+    fn a_failing_late_joiner_clearance_never_fails_the_ingest() {
+        let content: &[u8] = b"foreign-platform child manifest bytes";
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
+                late_joiner_make_use_case(&["oci"]);
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+            projections.insert(late_joiner_policy(ProvenanceMode::Required));
+            let index_hash =
+                seed_verified_index_binding(&artifacts, &storage, &events, &refs, repo_id, content)
+                    .await;
+            storage.fail_get_persistent(index_hash);
+
+            let outcome = uc
+                .ingest_verified(
+                    oci_verified_req(repo_id, content),
+                    content_stream(content),
+                    &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
+                )
+                .await
+                .expect("ingest must succeed even when the clearance attempt fails");
+
+            assert_ne!(outcome.artifact.id, Uuid::nil());
+            assert!(
+                cascaded_clearances(&lifecycle).is_empty(),
+                "no membership proof ⇒ no clearance (the artifact stays held)"
+            );
+        });
+    }
+
+    /// The same hook on the `register_by_hash` quarantine commit (the OCI
+    /// cross-repo blob mount / follower path).
+    #[test]
+    fn register_by_hash_late_joiner_self_clears_against_its_verified_index() {
+        let content: &[u8] = b"mounted child manifest bytes";
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
+                late_joiner_make_use_case(&["oci"]);
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+            projections.insert(late_joiner_policy(ProvenanceMode::Required));
+            let index_hash =
+                seed_verified_index_binding(&artifacts, &storage, &events, &refs, repo_id, content)
+                    .await;
+            let child_hash: ContentHash = sha256_of(content).parse().unwrap();
+            storage.insert_content(child_hash.clone(), content.to_vec());
+
+            uc.register_by_hash(
+                oci_req_legacy(repo_id),
+                child_hash,
+                None,
+                &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
+            )
+            .await
+            .expect("register_by_hash must succeed");
+
+            let cascaded = cascaded_clearances(&lifecycle);
+            assert_eq!(cascaded.len(), 1);
+            assert_eq!(cascaded[0].cascaded_from.as_ref(), Some(&index_hash));
         });
     }
 
