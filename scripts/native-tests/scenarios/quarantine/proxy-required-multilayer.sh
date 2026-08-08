@@ -47,15 +47,17 @@
 # Unlike that script, this repo is PUBLIC (isPublic:true, like
 # oci-proxy-quarantine-e2e) — the private-repo visibility x hold interaction
 # (ADR 0045) is already covered there; this scenario stays focused on the
-# proxy x Required x descendant-hold composition, so all manifest READS below
-# are anonymous. The ONE identity-bearing call is the cosign sign itself
-# (write path), because the subject's SECOND read (cosign's own
-# subject-resolution GET, ADR 0039 §10) hits an already-HELD, already-cached
-# manifest and needs the write-authorized hold-read exemption — unlike this
-# scenario's OWN first-touch pull-through GETs, which are the very fetch that
-# INGESTS the content and so are never hold-gated (mirrors
-# provenance-push-then-sign.sh's [1/6]: the write/populate transaction that
-# CREATES an artifact is accepted-then-held, never blocked on creation).
+# proxy x Required x descendant-hold composition. The FIRST-touch cold index
+# GET (Step 0) is the fetch that performs the ingest, and — mirroring
+# proxy-multiarch-zero-window.sh's own Step 0 — the designed proxy read path
+# never hands that fetch's caller the freshly-ingested, still-quarantined
+# manifest even though it is the one that populated it: an anonymous caller
+# gets 503 + Retry-After + an UNAVAILABLE body, not the manifest. Every
+# subsequent manifest READ (index re-GET, child GET) authenticates with the
+# credential already fetched below (PUSH_USER/PUSH_SECRET) and relies on the
+# write-authorized hold-read exemption (ADR 0039 §10) to see the held
+# content — the same exemption the cosign sign step's own subject-resolution
+# GET needs, so signing needs no separate credential dance.
 #
 # ---------------------------------------------------------------------------
 # WHY A NEW REPO+POLICY+SA, NOT A REUSE.
@@ -132,7 +134,7 @@ case "$IMAGE_REPO" in
 esac
 BASE_URL="${HORT_URL}/v2/${REPO_KEY}/dockerhub/${IMAGE_PATH}"
 PULLED_ARCHIVE="/tmp/prov-proxy-pulled-$$.tar"
-trap 'rm -f "$PULLED_ARCHIVE" "${INDEX_HEADERS:-}" "${INDEX_BODY:-}" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
+trap 'rm -f "$PULLED_ARCHIVE" "${ANON_HEADERS:-}" "${ANON_BODY:-}" "${INDEX_HEADERS:-}" "${INDEX_BODY:-}" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
 
 log "==> Proxy pull-through x provenance_mode:Required, multi-layer image (issue #115 Item 4)"
 log "Registry : ${HORT_URL}"
@@ -140,8 +142,11 @@ log "Repo key : ${REPO_KEY} (expected: provenanceMode=required, provenanceBacken
 log "Image    : ${IMAGE} (${IMAGE_PATH})"
 
 # -----------------------------------------------------------------------------
-# Credential mode for the SIGN step only (mirrors provenance-push-then-sign.sh;
-# all manifest READS in this scenario are anonymous — the repo is public).
+# Credential mode for the authenticated manifest reads (Steps 1-2) and the
+# SIGN step (mirrors provenance-push-then-sign.sh's dual native-token/legacy
+# auth) — the repo is public, so only the write-authorized hold-read
+# exemption needs a credential at all; the cold-ingest GET (Step 0) stays
+# anonymous.
 # -----------------------------------------------------------------------------
 NATIVE_TOKENS=0
 case " ${HORT_COMPOSE_OVERLAYS:-} " in
@@ -180,22 +185,61 @@ log "--- Preflight: waiting up to ${RESOLVER_REFRESH_GUESS}s for the resolver ca
 sleep "${RESOLVER_REFRESH_GUESS}"
 
 # ---------------------------------------------------------------------
-# Step 1: cold-pull the INDEX by tag (anonymous — the fetch that ingests it
-# is never hold-gated; see header).
+# Step 0: ANONYMOUS cold-pull of the INDEX by tag. This is the triggering
+# fetch — it performs the cold ingest — and the designed proxy read path
+# never hands an unprivileged caller the freshly-ingested, still-quarantined
+# manifest: the response is 503 with a Retry-After header and an
+# UNAVAILABLE error body, not the manifest itself (mirrors
+# proxy-multiarch-zero-window.sh's Step 0 — the regression pin for the hold).
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 1: GET the index by tag (cold pull-through)"
+log "--- Step 0: ANONYMOUS GET the index by tag (cold ingest; must hold, not serve)"
+
+ANON_HEADERS="$(mktemp)"
+ANON_BODY="$(mktemp)"
+
+ANON_CODE="$(curl -sS -o "$ANON_BODY" -D "$ANON_HEADERS" -w '%{http_code}' \
+    -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
+    "${BASE_URL}/manifests/${IMAGE_TAG}" 2>/dev/null || echo 000)"
+if [ "$ANON_CODE" = "503" ]; then
+    pass "ANONYMOUS GET index by tag -> 503 (quarantined; cold ingest performed)"
+else
+    fail "ANONYMOUS GET index by tag -> 503" "got HTTP ${ANON_CODE} (egress? upstream reachable? gitops applied?)"
+    summary
+fi
+
+if grep -qi '^retry-after:' "$ANON_HEADERS"; then
+    pass "ANONYMOUS 503 carries a Retry-After header"
+else
+    fail "ANONYMOUS 503 carries a Retry-After header" "no Retry-After header in response"
+fi
+
+ANON_ERROR_CODE="$(jq -r '.errors[0].code // empty' "$ANON_BODY" 2>/dev/null)"
+if [ "$ANON_ERROR_CODE" = "UNAVAILABLE" ]; then
+    pass "ANONYMOUS 503 body errors[0].code == UNAVAILABLE"
+else
+    fail "ANONYMOUS 503 body errors[0].code == UNAVAILABLE" "got '${ANON_ERROR_CODE:-<empty>}'"
+fi
+
+# ---------------------------------------------------------------------
+# Step 1: AUTHENTICATED re-GET of the INDEX by tag — the write-authorized
+# hold-read exemption (ADR 0039 §10) serves the already-quarantined index to
+# the credential fetched above (PUSH_USER/PUSH_SECRET).
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 1: AUTHENTICATED GET the index by tag (write-authorized hold-read)"
 
 INDEX_HEADERS="$(mktemp)"
 INDEX_BODY="$(mktemp)"
 
 INDEX_CODE="$(curl -sS -o "$INDEX_BODY" -D "$INDEX_HEADERS" -w '%{http_code}' \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
     -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
     "${BASE_URL}/manifests/${IMAGE_TAG}" 2>/dev/null || echo 000)"
 if [ "$INDEX_CODE" = "200" ]; then
-    pass "GET index by tag -> 200 (ingest-populating fetch, never hold-gated)"
+    pass "AUTHENTICATED GET index by tag -> 200 (write-authorized hold-read exemption)"
 else
-    fail "GET index by tag -> 200" "got HTTP ${INDEX_CODE} (egress? upstream reachable? gitops applied?)"
+    fail "AUTHENTICATED GET index by tag -> 200" "got HTTP ${INDEX_CODE}"
     summary
 fi
 
@@ -219,22 +263,25 @@ fi
 CHILD_HASH="${CHILD_DIGEST#sha256:}"
 
 # ---------------------------------------------------------------------
-# Step 2: pull the child manifest BY DIGEST (anonymous, first touch —
-# ingests the child and spawns #51's background config/layer blob warming).
+# Step 2: AUTHENTICATED pull of the child manifest BY DIGEST — the
+# write-authorized hold-read exemption again (the child is also still
+# quarantined), and the leg that spawns #51's background config/layer blob
+# warming.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 2: GET the child manifest by digest"
+log "--- Step 2: AUTHENTICATED GET the child manifest by digest"
 
 CHILD_HEADERS="$(mktemp)"
 CHILD_BODY="$(mktemp)"
 
 CHILD_CODE="$(curl -sS -o "$CHILD_BODY" -D "$CHILD_HEADERS" -w '%{http_code}' \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
     -H "Accept: ${OCI_MANIFEST_MEDIA}, ${DOCKER_MANIFEST_MEDIA}" \
     "${BASE_URL}/manifests/${CHILD_DIGEST}" 2>/dev/null || echo 000)"
 if [ "$CHILD_CODE" = "200" ]; then
-    pass "GET child manifest by digest -> 200"
+    pass "AUTHENTICATED GET child manifest by digest -> 200 (write-authorized hold-read exemption)"
 else
-    fail "GET child manifest by digest -> 200" "got HTTP ${CHILD_CODE}"
+    fail "AUTHENTICATED GET child manifest by digest -> 200" "got HTTP ${CHILD_CODE}"
     summary
 fi
 

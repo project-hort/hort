@@ -86,6 +86,41 @@ metrics_scrape_diag() {
   printf 'HTTP %s (curl exit %d)' "${code:-<none>}" "$rc"
 }
 
+# metrics_scrape_preflight <label> — posture-aware gate for scenarios that
+# read metric VALUES directly (before/after deltas, sums) rather than via
+# assert_metric_ingest's single presence poll, where a masked-as-zero scrape
+# would misread as "the metric is legitimately absent" instead of "the scrape
+# itself failed". Returns 0 when a real scrape is safe to rely on (both
+# METRICS_URL and METRICS_TOKEN set, and one reachability probe already
+# succeeded); returns 1 otherwise, having already done the right thing for
+# each disposition:
+#   - METRICS_URL or METRICS_TOKEN unset: a genuinely-absent input (external
+#     mode without a minted/supplied credential) — logs a note and returns 1;
+#     the caller must skip its metric assertion(s) without touching _FAIL.
+#   - both set but the endpoint answers non-2xx: a real regression (grant/
+#     token problem, or the stack genuinely isn't up) — calls `fail` with the
+#     HTTP status via metrics_scrape_diag and returns 1.
+# Mirrors assert_metric_ingest's own unset-branch wording and
+# scenarios/proxy/pull-dedup.sh's preflight, generalised for callers that
+# need more than a single presence poll.
+metrics_scrape_preflight() {
+  local label="$1"
+  if [ -z "${METRICS_URL:-}" ]; then
+    log "  note: METRICS_URL unset — skip ${label}"
+    return 1
+  fi
+  if [ -z "${METRICS_TOKEN:-}" ]; then
+    log "  note: METRICS_TOKEN unset (no read_metrics bearer available) — skip ${label}"
+    return 1
+  fi
+  if ! curl -sf "${METRICS_AUTH_HEADER[@]}" -o /dev/null --max-time 5 "$METRICS_URL" 2>/dev/null; then
+    fail "${label}" \
+      "GET $METRICS_URL with a read_metrics bearer returned non-2xx (grant/token regression, or the stack genuinely isn't up) -- $(metrics_scrape_diag "$METRICS_URL")"
+    return 1
+  fi
+  return 0
+}
+
 # assert_metric_ingest <format> — assert a successful-ingest metric is present.
 # Presence check, sound only on a FRESH stack (compose `down -v` -> `up` zeroes
 # the counter). On a long-lived external hort a stale tick would make it hollow,
