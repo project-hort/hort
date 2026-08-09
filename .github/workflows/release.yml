@@ -309,7 +309,9 @@ jobs:
           proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
           audience: hort-server-release
 
-      # ── vetted-index preflight (issue #137 / backlog 096) ──────────────────
+      # ── vetted-index preflight (issue #137 / backlog 096; scripts extracted
+      # to scripts/ci/ for #138 / backlog 097 — the same implementation is
+      # now also called from .gitlab-ci.yml's prefetch:warm / prefetch:verify)
       #
       # cargo-virtual is released_only (NonServableStatusFilter +
       # IndexModeFilter, hort-http-cargo/src/serve.rs): a locked dep hort has
@@ -320,13 +322,13 @@ jobs:
       # full quarantine window. This step enumerates every cold dep up front
       # so a single warm + wait covers the whole set instead of one-at-a-time.
       #
-      # `cargo metadata` is deliberately NOT used to enumerate the locked
-      # graph: source replacement is already active in this job (hort-auth
-      # just wrote .cargo/config.toml), so `cargo metadata` would resolve
-      # through the very index this preflight exists to check, hitting the
-      # same serial one-miss failure it's meant to replace. Parse Cargo.lock
-      # directly instead. (prefetch-warm.yml runs without replacement, so it
-      # can keep using `cargo metadata`.)
+      # locked-registry-deps.sh deliberately does not use `cargo metadata` to
+      # enumerate the locked graph: source replacement is already active in
+      # this job (hort-auth just wrote .cargo/config.toml), so `cargo
+      # metadata` would resolve through the very index this preflight exists
+      # to check, hitting the same serial one-miss failure it's meant to
+      # replace. It parses Cargo.lock directly instead. (prefetch-warm.yml
+      # runs without replacement, so it can keep using `cargo metadata`.)
       - name: Vetted-index preflight (released_only cold-dep check)
         env:
           HORT_URL: https://registry.hort.rs
@@ -337,90 +339,13 @@ jobs:
 
           tmpdir="$(mktemp -d)"
           trap 'rm -rf "${tmpdir}"' EXIT
-          export tmpdir
 
-          # Locked set: one "name version" pair per [[package]] block whose
-          # source is a registry (path-dep workspace members have no
-          # `source` line at all and are correctly skipped). Cargo.lock has
-          # no trailing blank line after the LAST [[package]] block, so the
-          # per-block flush on the next `[[package]]` marker never fires for
-          # it — the END block flushes that final pending record.
-          awk '
-            /^\[\[package\]\]$/ {
-              if (name != "" && source ~ /^registry\+/) print name, version
-              name = ""; version = ""; source = ""
-              next
-            }
-            /^name = / { name = $0; sub(/^name = "/, "", name); sub(/"$/, "", name); next }
-            /^version = / { version = $0; sub(/^version = "/, "", version); sub(/"$/, "", version); next }
-            /^source = / { source = $0; sub(/^source = "/, "", source); sub(/"$/, "", source); next }
-            END {
-              if (name != "" && source ~ /^registry\+/) print name, version
-            }
-          ' Cargo.lock > "${tmpdir}/locked.txt"
-
+          scripts/ci/locked-registry-deps.sh Cargo.lock > "${tmpdir}/locked.txt"
           locked_count=$(wc -l < "${tmpdir}/locked.txt")
-          cut -d' ' -f1 "${tmpdir}/locked.txt" | sort -u > "${tmpdir}/names.txt"
-          name_count=$(wc -l < "${tmpdir}/names.txt")
-          echo "Locked registry deps: ${locked_count} (${name_count} distinct names)"
 
-          # Cargo sparse-index prefix rule (lowercased name):
-          #   1 char  -> 1/{n}
-          #   2 chars -> 2/{n}
-          #   3 chars -> 3/{n[0]}/{n}
-          #   else    -> {n[0:2]}/{n[2:4]}/{n}
-          prefix_path() {
-            local n len
-            n=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-            len=${#n}
-            if [ "${len}" -eq 1 ]; then
-              printf '1/%s' "${n}"
-            elif [ "${len}" -eq 2 ]; then
-              printf '2/%s' "${n}"
-            elif [ "${len}" -eq 3 ]; then
-              printf '3/%s/%s' "${n:0:1}" "${n}"
-            else
-              printf '%s/%s/%s' "${n:0:2}" "${n:2:2}" "${n}"
-            fi
-          }
-          export -f prefix_path
-
-          # One GET per distinct name, bounded parallelism. A non-200 (or a
-          # curl failure) is recorded as an empty served-set — fail closed,
-          # since an index we could not reach must be treated as not having
-          # the version yet, not as silently passing the check.
-          fetch_one() {
-            local name path outfile status
-            name="$1"
-            path="$(prefix_path "${name}")"
-            outfile="${tmpdir}/served/${name}"
-            status=$(curl -sS -o "${outfile}" -w '%{http_code}' \
-              -H "Authorization: Bearer ${HORT_TOKEN}" \
-              "${HORT_URL}/cargo/${CARGO_SOURCE_REPO}/${path}") || status=000
-            if [ "${status}" != "200" ]; then
-              : > "${outfile}"
-            fi
-          }
-          export -f fetch_one
-
-          mkdir -p "${tmpdir}/served"
-          xargs -P8 -I{} bash -c 'fetch_one "$@"' _ {} < "${tmpdir}/names.txt"
-
-          # A locked (name, version) is COLD if its name's served set is
-          # empty (non-200 above) or the exact version string is absent from
-          # the served `.vers` entries.
-          cold_file="${tmpdir}/cold.txt"
-          : > "${cold_file}"
-          while read -r name version; do
-            served="${tmpdir}/served/${name}"
-            if [ ! -s "${served}" ] || \
-               ! jq -e --arg v "${version}" 'select(.vers == $v)' "${served}" >/dev/null 2>&1; then
-              echo "${name} ${version}" >> "${cold_file}"
-            fi
-          done < "${tmpdir}/locked.txt"
-
-          if [ -s "${cold_file}" ]; then
-            cold_count=$(wc -l < "${cold_file}")
+          if ! scripts/ci/vetted-index-preflight.sh "${HORT_URL}" "${CARGO_SOURCE_REPO}" \
+              < "${tmpdir}/locked.txt" > "${tmpdir}/cold.txt"; then
+            cold_count=$(wc -l < "${tmpdir}/cold.txt")
 
             # Same request shape as prefetch-warm.yml: batch-POST the FULL
             # locked set (idempotent — already-present entries are a no-op),
@@ -431,21 +356,26 @@ jobs:
             ' "${tmpdir}/locked.txt")
 
             echo "Cold deps found — starting a prefetch warm for the full locked set (${locked_count} deps)…"
-            curl -sS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
+            # -f: a non-2xx (most likely 403 — the gha-release-prefetch-
+            # cargo-virtual grant not applied yet, issue #138) must be loud,
+            # not rendered as a misleading `queued: ?  already_present: ?`
+            # line (the #137 review finding).
+            if ! curl -fsS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
               -H "Authorization: Bearer ${HORT_TOKEN}" \
               -H "Content-Type: application/json" \
               -d "{\"items\": ${items}}" \
-              | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"' \
-              || echo "::warning::prefetch POST failed — cold deps below still block this publish"
+              | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"'; then
+              echo "::warning::prefetch POST failed — likely cause: the gha-release-prefetch-cargo-virtual grant is not applied yet (issue #138). Cold deps below still block this publish."
+            fi
 
             echo "::error::hort-publish preflight: ${cold_count} locked dependency version(s) are not yet served by the vetted index (cargo-virtual, released_only) — publish would otherwise fail one miss at a time. A prefetch warm was just started for the full locked set; re-run this release after the crates-proxy quarantine window (24h, or 3d once #126's playbook run is applied) so every cold dep above has cleared quarantine. Cold set:"
             while read -r name version; do
               echo "::error::  ${name} ${version}"
-            done < "${cold_file}"
+            done < "${tmpdir}/cold.txt"
             exit 1
           fi
 
-          echo "Vetted-index preflight OK — ${locked_count} locked deps (${name_count} distinct names) all served by cargo-virtual."
+          echo "Vetted-index preflight OK — ${locked_count} locked deps all served by ${CARGO_SOURCE_REPO}."
 
       # Publish in dependency order. hort-domain has no intra-workspace deps so
       # it goes first; each subsequent crate may depend on earlier entries.

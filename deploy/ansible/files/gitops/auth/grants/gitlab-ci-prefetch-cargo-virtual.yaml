@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: gitlab-ci-prefetch-cargo-virtual
+spec:
+  # Per-repo serviceAccount-subject grant: gitlab-ci (GitLab CI pull
+  # identity) may prefetch cargo-virtual — the single cargo source CI/dev
+  # builds resolve against (see repositories/cargo-virtual.yaml). Permissions
+  # are flat (read does not imply prefetch — see gitlab-ci-read-cargo-virtual.yaml
+  # for the sibling read grant); both are required by
+  # SelfServicePrefetchUseCase's Read ∧ Prefetch RBAC gate
+  # (crates/hort-app/src/use_cases/self_service_prefetch_use_case.rs).
+  #
+  # Backs the `prefetch:warm` / `prefetch:verify` GitLab pipeline jobs
+  # (.gitlab-ci.yml, issue #138 / backlog 097) — develop lives on GitLab, so
+  # a GitLab-side warm reacts to a Cargo.lock change immediately instead of
+  # waiting for the GitHub release-time sync. Mirrors gha-ci-prefetch-cargo-virtual.yaml.
+  subject:
+    kind: serviceAccount
+    name: gitlab-ci
+  permission: prefetch
+  repository: cargo-virtual
