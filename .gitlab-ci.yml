@@ -259,20 +259,35 @@ variables:
   #                      the VAULT_* CI vars (no portable defaults).
   #   none:              skip signing entirely.
   SIGNING_MODE: "keyless"
+  # Internal registry host for the CI tool images below (ci/rust-ci,
+  # ci/buildah-cosign). Its own variable so the same pipeline works against
+  # another instance, or a stock upstream image, by overriding this plus the
+  # image variables that reference it — no hardcoded host anywhere else.
+  CI_TOOLS_REGISTRY: "hort.kdp.kloni.cloud"
+  # Tag of ci/rust-ci to build/test with, kept separate from the host so a
+  # tool-image bump is a one-line change. See RUST_IMAGE below for what the
+  # image ships.
+  CI_RUST_IMAGE_TAG: "2026.8.115"
   # Project MSRV is 1.94.0 (see .clippy.toml); kept in lockstep with
   # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` by
-  # `scripts/check-rust-version.sh`. GitLab pins the image explicitly so a
-  # silent toolchain bump can't break the gate.
-  RUST_IMAGE: "rust:1.94.1-slim"
-  # FAST path (deliberate dev-cycle speedup): pre-baked rust:1.94-slim + sccache
-  # on PATH, used by the test jobs that extend .sccache. FALLBACK: the
+  # `scripts/check-rust-version.sh`. ci/rust-ci ships Rust 1.94.1,
+  # cargo-llvm-cov, cargo-audit, cargo-deny, cargo-about, cargo-cyclonedx and
+  # sccache — a superset of stock `rust:1.94.1-slim` — so it supersedes the
+  # old ci/rust-sccache image and RUST_IMAGE and RUST_SCCACHE_IMAGE now both
+  # point at it: lint/coverage/security (RUST_IMAGE) and the .sccache-extending
+  # test:unit / test:integration (RUST_SCCACHE_IMAGE) share one image.
+  RUST_IMAGE: "${CI_TOOLS_REGISTRY}/ci/rust-ci:${CI_RUST_IMAGE_TAG}"
+  # FAST path (deliberate dev-cycle speedup): pre-baked image with sccache on
+  # PATH, used by the test jobs that extend .sccache. FALLBACK: the
   # .sccache-install anchor (below) is a NO-OP when this image already ships
   # sccache, but installs it on a stock image — so hort is never HARD-dependent
   # on the custom image. To build without it (custom image unavailable, or off
-  # our internal registry entirely), override RUST_SCCACHE_IMAGE=${RUST_IMAGE}
-  # and sccache is installed inline. (The canonical GitHub Actions build already
-  # runs stock — it cannot reach hort.kdp.kloni.cloud.)
-  RUST_SCCACHE_IMAGE: "hort.kdp.kloni.cloud/ci/rust-sccache:latest"
+  # our internal registry entirely), override BOTH RUST_IMAGE and
+  # RUST_SCCACHE_IMAGE to a stock `rust:1.94.1-slim` (or newer) reference and
+  # sccache plus every tool are installed inline instead. (The canonical
+  # GitHub Actions build already runs stock — it cannot reach
+  # ${CI_TOOLS_REGISTRY}.)
+  RUST_SCCACHE_IMAGE: "${CI_TOOLS_REGISTRY}/ci/rust-ci:${CI_RUST_IMAGE_TAG}"
   SCCACHE_VERSION: "0.16.0"
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
   CARGO_INCREMENTAL: "0"
@@ -1535,7 +1550,7 @@ helm:sign-chart:
   # buildah-cosign tools image: Fedora + cosign v3 + curl + jq (the same image
   # the platform first-party oci component signs with). No helm needed — cosign
   # resolves the chart tag to its digest itself.
-  image: hort.kdp.kloni.cloud/ci/buildah-cosign:latest
+  image: ${CI_TOOLS_REGISTRY}/ci/buildah-cosign:latest
   needs:
     - job: helm:lint-and-publish
   rules:
