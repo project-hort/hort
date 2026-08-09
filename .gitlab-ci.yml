@@ -931,6 +931,13 @@ prefetch:warm:
 prefetch:warm:internal:
   stage: test
   image: alpine:3.24
+  # The internal instance presents an internal-PKI certificate, so this job
+  # needs the platform CA — which only the `platform` runner mounts (at the
+  # path PLATFORM_CA_PATH names). Untagged jobs are dispatched to whichever
+  # runner is free, and on one of them that mount does not exist, so the TLS
+  # handshake fails before any request leaves the container.
+  tags:
+    - platform
   needs: []
   allow_failure: true
   rules:
@@ -940,7 +947,10 @@ prefetch:warm:internal:
     HORT_OIDC_TOKEN:
       aud: hort-server
   before_script:
-    - apk add --no-cache bash curl jq
+    # ca-certificates provides update-ca-certificates, which the platform-CA
+    # anchor calls; without it an internal-PKI endpoint cannot be trusted and
+    # the TLS handshake fails before any request is sent.
+    - apk add --no-cache bash curl jq ca-certificates
     - *platform-ca-deb
     - |
       _hort_internal_url="${HORT_INTERNAL_URL:-https://hort.kdp.kloni.cloud}"
@@ -949,12 +959,26 @@ prefetch:warm:internal:
       _hort_stt="urn:ietf:params:oauth:token-type:jwt"
 
       echo "[hort-auth] exchanging OIDC token for hort bearer token (internal instance)"
+      # Keep curl's own diagnosis: a TLS-trust failure, a DNS failure and a
+      # rejected token are three different problems, and only curl can tell
+      # them apart. Guessing at causes after the fact sent an operator
+      # looking for a misconfiguration that did not exist.
       _hort_resp=$(curl -sSf \
         -X POST "${_hort_internal_url}/api/v1/auth/exchange" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         --data-urlencode "grant_type=${_hort_gt}" \
         --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
-        --data-urlencode "subject_token_type=${_hort_stt}")
+        --data-urlencode "subject_token_type=${_hort_stt}" \
+        2>/tmp/hort-exchange-curl.err) || _hort_curl_rc=$?
+      if [ -n "${_hort_curl_rc:-}" ]; then
+        echo "[hort-auth] curl exited ${_hort_curl_rc}; its diagnosis:"
+        sed 's/^/[hort-auth]   /' /tmp/hort-exchange-curl.err >&2 || true
+        case "${_hort_curl_rc}" in
+          60|77|35) echo "[hort-auth] TLS trust: this endpoint's certificate chain is not trusted in this job. An internal-PKI endpoint needs PLATFORM_CA_PATH set to its CA bundle; the request never reached the server." >&2 ;;
+          6)        echo "[hort-auth] DNS: the endpoint's name did not resolve from this job." >&2 ;;
+          7|28)     echo "[hort-auth] Network: no route or timeout from this job to the endpoint." >&2 ;;
+        esac
+      fi
       HORT_INTERNAL_TOKEN=$(echo "${_hort_resp}" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
       if [ -z "${HORT_INTERNAL_TOKEN}" ]; then
         echo "[hort-auth] ERROR: no access_token in response (omitted)"
@@ -997,7 +1021,7 @@ prefetch:warm:internal:
   after_script:
     - |
       if [ "${CI_JOB_STATUS:-}" = "failed" ]; then
-        echo "::warning::hort OIDC token exchange against the internal instance failed — not authorised yet. Candidate causes: (1) the internal instance's federation gitops is not applied yet, (2) an audience or jti claim mismatch, (3) the instance is unreachable from this runner."
+        echo "::warning::hort OIDC token exchange against the internal instance failed — see the [hort-auth] lines above for curl's own diagnosis. Most common cause is TLS trust (an internal-PKI endpoint needs PLATFORM_CA_PATH), in which case the request never reached the server; otherwise the federation gitops is not applied there, or the audience does not match."
       fi
 
 # Read-only readiness probe: reports the complete cold set ahead of a
