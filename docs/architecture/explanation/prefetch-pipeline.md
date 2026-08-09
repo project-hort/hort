@@ -189,6 +189,13 @@ the upstream version set, and resolves each range to a **concrete**
 version. A range upstream cannot satisfy is logged and skipped — the
 cascade never fabricates versions.
 
+> **Why ranges are resolved here at all:** a range has no hash, so it can be
+> neither quarantined nor scanned nor attested. Resolving it to a concrete
+> version is what lets the artifact enter the normal lifecycle — see
+> [ADR 0053](../../adr/0053-dependency-ranges-resolve-and-pin.md) for the
+> reasoning and for why the cascade deliberately does not serve
+> lockfile-pinned consumption.
+
 Each resolved cold dependency produces a *pair* of rows: a `prefetch`
 leaf (the warming) and — while `current_depth + 1` is within
 `transitive_depth` — a child `prefetch-dependencies` driver. The depth
