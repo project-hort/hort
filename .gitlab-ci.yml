@@ -231,6 +231,42 @@ variables:
   # — the prefetch warm/verify jobs and nothing else. Safe to leave on
   # permanently: warming is what eventually makes HORT_PROXY_ENABLED viable.
   HORT_PREFETCH_ENABLED: ""
+  # Instance whose cargo/npm/OCI configuration the auth anchor writes — the
+  # build source a job's dependency resolution points at. HORT_URL, if set,
+  # is a fallback for this (see .hort-auth below) but is superseded by this
+  # variable and HORT_WARM_URL. Defaults to the public instance so existing
+  # pipelines keep resolving from the same place.
+  HORT_BUILD_URL: "https://registry.hort.rs"
+  # Instance the prefetch:warm / prefetch:verify jobs POST to — the release
+  # target kept warm ahead of a promotion. Independent of HORT_BUILD_URL: a
+  # pipeline can build against one instance while warming another. Same
+  # default and HORT_URL fallback as HORT_BUILD_URL.
+  HORT_WARM_URL: "https://registry.hort.rs"
+  # API endpoint of the internal hort instance — a candidate future build
+  # source (see HORT_BUILD_SOURCE / HORT_RELEASE_BUILD_SOURCE below), never
+  # read as a fallback the way HORT_URL is. Its hostname matches
+  # CI_TOOLS_REGISTRY today only because both happen to be deployed on the
+  # same platform host; CI_TOOLS_REGISTRY names an image-registry host for CI
+  # tool images (ci/rust-ci, ci/buildah-cosign) while this names a hort API
+  # endpoint — two different roles that must stay independently overridable,
+  # so this is its own variable rather than derived from CI_TOOLS_REGISTRY.
+  # Precondition for ever selecting it: point HORT_WARM_URL here and confirm
+  # prefetch:verify reports the whole locked set served (release-ready) —
+  # prefetch:warm:internal (below) is what makes that eventually true.
+  HORT_INTERNAL_URL: "https://hort.kdp.kloni.cloud"
+  # Build-source switch for feature/MR and develop pipelines: "public"
+  # (default — resolves to HORT_BUILD_URL, today's behaviour) or "internal"
+  # (resolves to HORT_INTERNAL_URL). See .hort-auth below for the resolution
+  # logic. Precondition for setting "internal": a green prefetch:verify
+  # against HORT_INTERNAL_URL (see that variable's comment) — an unwarmed or
+  # still-quarantined dependency fails resolution exactly as it would on a
+  # release publish.
+  HORT_BUILD_SOURCE: "public"
+  # Same switch, scoped to release-type pipelines (main / release/* / tags)
+  # instead of feature/develop — kept independent so a release can stay on
+  # the public instance even after feature/develop have switched, or vice
+  # versa. Same values, same default, same precondition as HORT_BUILD_SOURCE.
+  HORT_RELEASE_BUILD_SOURCE: "public"
   # OCI registry host for images AND Helm charts. REQUIRED for the
   # build-images / helm-publish / sign jobs — no default (the former
   # internal-mirror value only resolved on the original runner). Set as
@@ -455,6 +491,27 @@ variables:
 #   • The buildah jobs (.docker) have their own id_tokens block;
 #     HORT_OIDC_TOKEN is added there alongside VAULT/SIGSTORE tokens.
 #
+# Two instance roles, independently addressable:
+#   • HORT_BUILD_URL — the build source; keys the exchange + tool config below.
+#   • HORT_WARM_URL  — the warm target; used only by prefetch:warm/prefetch:verify.
+#   Same URL (the default) ⇒ one exchange, reused for both roles. Different
+#   URLs ⇒ a second exchange against the warm target, because a token minted
+#   at one instance is not valid at another (different service accounts and
+#   audiences). HORT_URL, if set, is a deprecated fallback for both roles.
+#
+# The build source itself is selectable: HORT_BUILD_SOURCE (feature/MR and
+# develop pipelines) and HORT_RELEASE_BUILD_SOURCE (main / release/* / tags)
+# each choose between HORT_BUILD_URL ("public", the default) and
+# HORT_INTERNAL_URL ("internal"). Pipeline-type detection is a shell
+# case/glob on CI_COMMIT_BRANCH/CI_COMMIT_TAG right below, deliberately not
+# workflow:rules:variables or per-job rules:variables — those would either
+# compute the pipeline type disconnected from where it's consumed, or
+# require repeating the mapping in every job that extends .hort-auth
+# (test:lint, test:unit, test:coverage, test:integration, prefetch:warm,
+# prefetch:verify), multiplying the diff and the chance of drift. Both
+# switches default to "public", so the resolved build source is unchanged
+# from today until an operator flips one.
+#
 # Exchange endpoint (RFC 8693 token exchange, confirmed from exchange.rs):
 #   POST https://registry.hort.rs/api/v1/auth/exchange
 #   form-encoded: grant_type=urn:ietf:params:oauth:grant-type:token-exchange
@@ -482,23 +539,71 @@ variables:
       #     serve the whole lock; a version it does not serve yet fails the
       #     job the same way it fails a release publish.
       if [ "${HORT_PROXY_ENABLED:-}" = "true" ] || [ "${HORT_PREFETCH_ENABLED:-}" = "true" ]; then
-        echo "[hort-auth] exchanging OIDC token for hort bearer token"
-        _hort_url="${HORT_URL:-https://registry.hort.rs}"
+        # Build-source selection: release-type pipelines (main, release/*,
+        # any tag) read HORT_RELEASE_BUILD_SOURCE; every other pipeline type
+        # (feature/MR — CI_COMMIT_BRANCH is unset there — and develop) reads
+        # HORT_BUILD_SOURCE. "internal" resolves to HORT_INTERNAL_URL;
+        # anything else (including the "public" default) falls through to
+        # the existing HORT_BUILD_URL/HORT_URL resolution below, so an unset
+        # switch changes nothing.
+        _hort_is_release_pipeline=false
+        case "${CI_COMMIT_BRANCH:-}" in
+          main|release/*) _hort_is_release_pipeline=true ;;
+        esac
+        [ -n "${CI_COMMIT_TAG:-}" ] && _hort_is_release_pipeline=true
+        if [ "${_hort_is_release_pipeline}" = "true" ]; then
+          _hort_build_source="${HORT_RELEASE_BUILD_SOURCE:-public}"
+        else
+          _hort_build_source="${HORT_BUILD_SOURCE:-public}"
+        fi
+
+        # HORT_URL, deprecated, is a fallback for both roles — an operator
+        # who set it before HORT_BUILD_URL/HORT_WARM_URL existed is not
+        # silently ignored.
+        case "${_hort_build_source}" in
+          internal)
+            _hort_url="${HORT_INTERNAL_URL:-https://hort.kdp.kloni.cloud}"
+            ;;
+          *)
+            _hort_url="${HORT_BUILD_URL:-${HORT_URL:-https://registry.hort.rs}}"
+            ;;
+        esac
+        _hort_warm_url="${HORT_WARM_URL:-${HORT_URL:-https://registry.hort.rs}}"
         _hort_cargo_repo="${HORT_CARGO_SOURCE_REPO:-cargo-virtual}"
         _hort_gt="urn:ietf:params:oauth:grant-type:token-exchange"
         _hort_stt="urn:ietf:params:oauth:token-type:jwt"
-        _hort_response=$(curl -sSf \
-          -X POST "${_hort_url}/api/v1/auth/exchange" \
-          -H "Content-Type: application/x-www-form-urlencoded" \
-          --data-urlencode "grant_type=${_hort_gt}" \
-          --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
-          --data-urlencode "subject_token_type=${_hort_stt}")
-        HORT_TOKEN=$(echo "${_hort_response}" \
-          | grep -o '"access_token":"[^"]*"' \
-          | cut -d'"' -f4)
+
+        _hort_exchange() {
+          _hort_resp=$(curl -sSf \
+            -X POST "$1/api/v1/auth/exchange" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=${_hort_gt}" \
+            --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
+            --data-urlencode "subject_token_type=${_hort_stt}")
+          echo "${_hort_resp}" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4
+        }
+
+        echo "[hort-auth] exchanging OIDC token for hort bearer token (build source)"
+        HORT_TOKEN=$(_hort_exchange "${_hort_url}")
         if [ -z "${HORT_TOKEN}" ]; then
           echo "[hort-auth] ERROR: no access_token in response (omitted)"
           exit 1
+        fi
+
+        if [ "${_hort_warm_url}" = "${_hort_url}" ]; then
+          # Same instance for both roles: a token minted for the build
+          # source is valid at the warm target too — reuse it rather than
+          # pay for a second exchange.
+          HORT_WARM_TOKEN="${HORT_TOKEN}"
+        else
+          # Different instances mean different service accounts and
+          # audiences: a token minted at one is not valid at the other.
+          echo "[hort-auth] exchanging OIDC token for hort bearer token (warm target)"
+          HORT_WARM_TOKEN=$(_hort_exchange "${_hort_warm_url}")
+          if [ -z "${HORT_WARM_TOKEN}" ]; then
+            echo "[hort-auth] ERROR: no access_token in response (omitted)"
+            exit 1
+          fi
         fi
         echo "[hort-auth] token exchange succeeded"
       fi
@@ -757,9 +862,9 @@ prefetch:warm:
   # registry.hort.rs is unverified, so this job's own output must distinguish
   # the three possible outcomes without any log spelunking.
   #
-  #   1. exchange failed (no HORT_TOKEN) — *hort-auth-steps above already
-  #      exits 1 in that case (before this `script:` even starts), so that
-  #      outcome is reported from `after_script:` below instead, via
+  #   1. exchange failed (no HORT_WARM_TOKEN) — *hort-auth-steps above
+  #      already exits 1 in that case (before this `script:` even starts), so
+  #      that outcome is reported from `after_script:` below instead, via
   #      CI_JOB_STATUS (the only signal available once before_script has
   #      already terminated the job).
   #   2. exchange OK, prefetch 403 — federation works, the
@@ -775,14 +880,14 @@ prefetch:warm:
         split("\n") | map(select(length > 0) | split(" ") | {package: .[0], version: .[1]})
       ' /tmp/locked.txt)
 
-      echo "Warming ${_hort_cargo_repo} with ${locked_count} locked deps…"
+      echo "Warming ${_hort_cargo_repo} at ${_hort_warm_url} with ${locked_count} locked deps…"
       # Body to a file, status via -w: the runner may execute this under
       # busybox sh (the image ships no bash until before_script installs it,
       # and shell selection happens before that), where bash's $'\n'
       # ANSI-C quoting is not portable.
       status=$(curl -sS -o /tmp/prefetch-response.json -w '%{http_code}' -X POST \
-        "${_hort_url}/api/v1/repositories/${_hort_cargo_repo}/prefetch" \
-        -H "Authorization: Bearer ${HORT_TOKEN}" \
+        "${_hort_warm_url}/api/v1/repositories/${_hort_cargo_repo}/prefetch" \
+        -H "Authorization: Bearer ${HORT_WARM_TOKEN}" \
         -H "Content-Type: application/json" \
         -d "{\"items\": ${items}}")
       body=$(cat /tmp/prefetch-response.json)
@@ -792,7 +897,7 @@ prefetch:warm:
           echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'
           ;;
         403)
-          # Federation worked (we got here — HORT_TOKEN was minted), but the
+          # Federation worked (we got here — HORT_WARM_TOKEN was minted), but the
           # prefetch permission itself is missing: name the grant so the
           # operator knows exactly what Ansible apply to run.
           echo "::warning::prefetch POST rejected with 403 — the gitlab-ci-prefetch-cargo-virtual.yaml grant is not applied yet (federation itself is fine)"
@@ -805,6 +910,94 @@ prefetch:warm:
     - |
       if [ "${CI_JOB_STATUS:-}" = "failed" ]; then
         echo "::warning::hort OIDC token exchange failed — the GitLab<->hort federation is not usable yet. Candidate causes: (1) the federation gitops is not applied yet, (2) an audience or jti claim mismatch between the GitLab id_token and hort's issuer envelope, (3) HORT_PROXY_ENABLED is not actually 'true' in this pipeline context."
+      fi
+
+# Same shape as prefetch:warm above, but always targets HORT_INTERNAL_URL
+# rather than the warm target HORT_WARM_URL currently resolves to (the two
+# are independent roles — see HORT_INTERNAL_URL's comment). A build source
+# can only ever serve what it has already been warmed with, so keeping the
+# internal instance warm is the precondition for ever flipping
+# HORT_BUILD_SOURCE / HORT_RELEASE_BUILD_SOURCE to "internal", not a later
+# addition — without this job the internal instance could never serve a
+# build no matter how the switches are set. Self-contained: it mints its own
+# token against HORT_INTERNAL_URL rather than going through .hort-auth,
+# because that anchor's two-role exchange is keyed to the build/warm roles
+# this job doesn't use. Gated exactly like prefetch:warm and, like it,
+# allow_failure: true — inert today: the internal instance's federation
+# grant is not applied yet, so this reports "not authorised yet" (or
+# "unreachable") every run without ever failing the pipeline, the same
+# three-outcome diagnostic (exchange failed / 403 / success) as
+# prefetch:warm.
+prefetch:warm:internal:
+  stage: test
+  image: alpine:3.24
+  needs: []
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PREFETCH_ENABLED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
+  id_tokens:
+    HORT_OIDC_TOKEN:
+      aud: hort-server
+  before_script:
+    - apk add --no-cache bash curl jq
+    - *platform-ca-deb
+    - |
+      _hort_internal_url="${HORT_INTERNAL_URL:-https://hort.kdp.kloni.cloud}"
+      _hort_cargo_repo="${HORT_CARGO_SOURCE_REPO:-cargo-virtual}"
+      _hort_gt="urn:ietf:params:oauth:grant-type:token-exchange"
+      _hort_stt="urn:ietf:params:oauth:token-type:jwt"
+
+      echo "[hort-auth] exchanging OIDC token for hort bearer token (internal instance)"
+      _hort_resp=$(curl -sSf \
+        -X POST "${_hort_internal_url}/api/v1/auth/exchange" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "grant_type=${_hort_gt}" \
+        --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
+        --data-urlencode "subject_token_type=${_hort_stt}")
+      HORT_INTERNAL_TOKEN=$(echo "${_hort_resp}" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+      if [ -z "${HORT_INTERNAL_TOKEN}" ]; then
+        echo "[hort-auth] ERROR: no access_token in response (omitted)"
+        exit 1
+      fi
+      echo "[hort-auth] token exchange succeeded (internal instance)"
+  script:
+    - |
+      set -uo pipefail
+
+      bash scripts/ci/locked-registry-deps.sh Cargo.lock > /tmp/locked.txt
+      locked_count=$(wc -l < /tmp/locked.txt)
+      items=$(jq -R -s -c '
+        split("\n") | map(select(length > 0) | split(" ") | {package: .[0], version: .[1]})
+      ' /tmp/locked.txt)
+
+      echo "Warming ${_hort_cargo_repo} at ${_hort_internal_url} with ${locked_count} locked deps…"
+      status=$(curl -sS -o /tmp/prefetch-response.json -w '%{http_code}' -X POST \
+        "${_hort_internal_url}/api/v1/repositories/${_hort_cargo_repo}/prefetch" \
+        -H "Authorization: Bearer ${HORT_INTERNAL_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"items\": ${items}}")
+      body=$(cat /tmp/prefetch-response.json)
+
+      case "${status}" in
+        200)
+          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'
+          ;;
+        403)
+          # Federation may work but the prefetch grant on the internal
+          # instance isn't applied yet — the expected state until an
+          # operator runs the internal-instance equivalent of
+          # gitlab-ci-prefetch-cargo-virtual.yaml.
+          echo "::warning::internal-instance prefetch POST rejected with 403 — not authorised yet (the internal instance's prefetch grant is not applied)"
+          ;;
+        *)
+          echo "::warning::internal-instance prefetch POST failed with HTTP ${status}: ${body}"
+          ;;
+      esac
+  after_script:
+    - |
+      if [ "${CI_JOB_STATUS:-}" = "failed" ]; then
+        echo "::warning::hort OIDC token exchange against the internal instance failed — not authorised yet. Candidate causes: (1) the internal instance's federation gitops is not applied yet, (2) an audience or jti claim mismatch, (3) the instance is unreachable from this runner."
       fi
 
 # Read-only readiness probe: reports the complete cold set ahead of a
@@ -828,8 +1021,8 @@ prefetch:verify:
       set -uo pipefail
 
       if bash scripts/ci/locked-registry-deps.sh Cargo.lock \
-          | HORT_TOKEN="${HORT_TOKEN}" bash scripts/ci/vetted-index-preflight.sh \
-              "${_hort_url}" "${_hort_cargo_repo}"; then
+          | HORT_TOKEN="${HORT_WARM_TOKEN}" bash scripts/ci/vetted-index-preflight.sh \
+              "${_hort_warm_url}" "${_hort_cargo_repo}"; then
         echo "prefetch:verify — every locked dep is served by ${_hort_cargo_repo} (release-ready)."
       else
         echo "::warning::prefetch:verify — cold deps listed above are not yet served by ${_hort_cargo_repo}; not release-ready. Re-run prefetch:warm (or wait for the next develop push) and let the quarantine window clear."
@@ -1214,7 +1407,7 @@ quality:site-build:
 # wipes /tmp/cosign.key even if the build failed mid-step.
 
 .docker:
-  # build-images push to the mirror registry (hort.kdp.kloni.cloud) with
+  # build-images push to the mirror registry configured via ${REGISTRY} with
   # credentials mounted only on the in-cluster Platform Runner at /secrets/zot;
   # off-cluster runners fall back to CI_REGISTRY_* (GitLab's own registry) and
   # fail `buildah login` with "invalid username/password". The `platform` tag

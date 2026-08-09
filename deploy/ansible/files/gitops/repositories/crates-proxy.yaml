@@ -29,7 +29,14 @@ spec:
   # lookup time instead of at the build's first fetch. depth 3 = newest 3
   # versions per package. maxAgeDays is omitted: the apply-time linter rejects
   # any value until the planner grows a per-version published-at surface (ADR 0015).
+  # transitive_deps fires on ingest of a crate: it opens the .crate tarball,
+  # reads [dependencies] from the contained Cargo.toml, resolves each range to
+  # a concrete version, and prefetches the unseen subtree. transitiveDepth
+  # bounds how many levels a single walk descends (left at its default of 5);
+  # maxDescendants bounds the cumulative fan-out across the whole cascade, set
+  # explicitly here so the breadth cap is visible rather than implicit.
   prefetchPolicy:
     enabled: true
-    triggers: [on_dist_tag_move]
+    triggers: [on_dist_tag_move, transitive_deps]
     depth: 3
+    maxDescendants: 200
