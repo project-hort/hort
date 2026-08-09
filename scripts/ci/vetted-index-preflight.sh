@@ -26,10 +26,8 @@
 #   The caller decides whether, and how, to warm the cold set and whether a
 #   non-empty cold set is fatal.
 #
-# Extracted verbatim-in-behavior from the inline preflight block #137 landed
-# in .github/workflows/release.yml (issue #138 / backlog 097) — this is the
-# single implementation now shared by that workflow's preflight step and the
-# GitLab `prefetch:warm` / `prefetch:verify` jobs.
+# Single implementation, shared by .github/workflows/release.yml's preflight
+# step and the GitLab `prefetch:warm` / `prefetch:verify` jobs.
 
 set -euo pipefail
 

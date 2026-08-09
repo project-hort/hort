@@ -663,13 +663,13 @@ test:integration:
   script:
     - cargo test --workspace --tests --verbose
 
-# GitLab-side cargo-proxy warm + a scheduled readiness probe (issue #138 /
-# backlog 097). develop lives on GitLab, so a GitLab-side warm reacts to a
-# Cargo.lock change immediately instead of waiting for the GitHub twin
-# (prefetch-warm.yml), which only fires on a develop push mirror / nightly
-# schedule. Both jobs call scripts/ci/locked-registry-deps.sh and/or
-# scripts/ci/vetted-index-preflight.sh (extracted from release.yml's
-# preflight step, #137/#138) — one implementation, three call sites.
+# GitLab-side cargo-proxy warm + a scheduled readiness probe. develop lives
+# on GitLab, so a GitLab-side warm reacts to a Cargo.lock change immediately
+# instead of waiting for the GitHub twin (prefetch-warm.yml), which only
+# fires on a develop push mirror / nightly schedule. Both jobs call
+# scripts/ci/locked-registry-deps.sh and/or scripts/ci/vetted-index-
+# preflight.sh — the same implementation release.yml's preflight uses, so
+# the three call sites cannot drift.
 #
 # Invariant both jobs exist to work around: cargo-virtual is released_only
 # (NonServableStatusFilter + IndexModeFilter, hort-http-cargo/src/serve.rs),
