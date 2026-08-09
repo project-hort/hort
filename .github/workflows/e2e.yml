@@ -29,13 +29,20 @@ jobs:
   # `continue-on-error`): this workflow's `workflow_call` caller waits on
   # every job in the callee, so the release gate already covers both lanes
   # with no change on the caller side. Each job cycles the compose stack
-  # exactly once, so the existing 20-minute timeout is per-cycle and does
-  # not need doubling for running two lanes — that would only apply if a
-  # single job cycled both stacks sequentially.
+  # exactly once, so the timeout is per-cycle and does not need doubling for
+  # running two lanes — that would only apply if a single job cycled both
+  # stacks sequentially.
+  #
+  # 40 minutes, not 20: a lane spends most of its wall-clock on two full Rust
+  # release builds (the client image builds hort-cli, `compose up --build`
+  # builds server + worker), which left a single lane at ~17.5 min and both
+  # lanes hitting the cap. A cancelled run yields no diagnostic at all, which
+  # is strictly worse than a slow one — so the cap is set above the honest
+  # cost until the images are built once and shared.
   run-e2e:
     name: native-tests E2E (compose, base lane)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -68,7 +75,7 @@ jobs:
   run-e2e-native-tokens:
     name: native-tests E2E (compose, native-tokens lane)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
