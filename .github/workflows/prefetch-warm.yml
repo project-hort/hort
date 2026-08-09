@@ -102,5 +102,5 @@ jobs:
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/json" \
             -d "{\"items\": ${items}}" \
-            | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"' \
+            | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")' \
             || echo "::warning::prefetch POST failed — proxy not warmed this run (non-fatal)"

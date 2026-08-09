@@ -730,7 +730,7 @@ prefetch:warm:
 
       case "${status}" in
         200)
-          echo "${body}" | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"'
+          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'
           ;;
         403)
           # Federation worked (we got here — HORT_TOKEN was minted), but the
