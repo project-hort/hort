@@ -179,6 +179,14 @@ services:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+    # Named so a pre-built image (docker load) can satisfy this service without
+    # a rebuild — a `build:` block with no `image:` has no stable local tag to
+    # check for, so `up` (even without `--build`) always builds. Shared with
+    # hort-server and hort-sweep-ticker below: all three build the identical
+    # image from this same Dockerfile/context, so one tag covers all three.
+    # Default reproduces today's behaviour (an implicit compose-generated tag);
+    # override only alongside a matching pre-loaded image.
+    image: ${HORT_SERVER_IMAGE:-hort-server:dev}
     container_name: hort-migrate
     mem_limit: 512m
     cpus: "1.0"
@@ -226,6 +234,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+    # Same image as hort-server-migrate (see that service's comment) — built
+    # from the identical Dockerfile/context, so it shares the one tag.
+    image: ${HORT_SERVER_IMAGE:-hort-server:dev}
     depends_on:
       postgres:
         condition: service_healthy
@@ -348,7 +359,10 @@ services:
     build:
       context: ../..
       dockerfile: docker/Dockerfile.worker
-    image: hort-worker:dev
+    # Env-overridable so a pre-built image (docker load) can satisfy this
+    # service without a rebuild — mirrors HORT_SERVER_IMAGE above. Default
+    # reproduces today's hardcoded tag.
+    image: ${HORT_WORKER_IMAGE:-hort-worker:dev}
     depends_on:
       postgres:
         condition: service_healthy
@@ -441,6 +455,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+    # Same image as hort-server-migrate (see that service's comment) — built
+    # from the identical Dockerfile/context, so it shares the one tag.
+    image: ${HORT_SERVER_IMAGE:-hort-server:dev}
     container_name: hort-sweep-ticker
     mem_limit: 256m
     cpus: "0.5"

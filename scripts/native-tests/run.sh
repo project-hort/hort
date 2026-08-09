@@ -8,6 +8,13 @@
 #   (default 4) — hort-worker replica count. Scan concurrency is 1 per replica
 #   by design; replicas are the scaling axis so serial trivy runtime stays off
 #   the release critical path.
+# Env (opt-out, default unset = build as today): HORT_E2E_SKIP_BUILD=1 skips
+#   building the test-client image and drops `--build` from `compose up`,
+#   for the case where HORT_SERVER_IMAGE / HORT_WORKER_IMAGE / the test-client
+#   tag were loaded beforehand (e.g. `docker load`). With the opt-out active,
+#   a required image that isn't already loaded is a hard failure naming that
+#   image — never a silent rebuild, which would restore the cost this exists
+#   to remove while looking like a cache hit.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -108,7 +115,14 @@ fi
 
 COMPOSE_FILE="$REPO_ROOT/deploy/compose/docker-compose.yml"
 COMPOSE_NETWORK="hort_default"
-IMAGE="hort-test-client:dev"
+IMAGE="${HORT_TEST_CLIENT_IMAGE:-hort-test-client:dev}"
+# Same variables docker-compose.yml interpolates for the server/worker
+# services — exporting them here (even at their defaults) means run.sh and
+# compose agree on exactly which tag a `docker load` needs to satisfy.
+HORT_SERVER_IMAGE="${HORT_SERVER_IMAGE:-hort-server:dev}"
+HORT_WORKER_IMAGE="${HORT_WORKER_IMAGE:-hort-worker:dev}"
+export HORT_SERVER_IMAGE HORT_WORKER_IMAGE
+SKIP_BUILD="${HORT_E2E_SKIP_BUILD:-0}"
 KC_DISCOVERY="http://localhost:25082/realms/hort/.well-known/openid-configuration"
 # Host-mapped Keycloak token endpoint + hort-server base — same realm/client
 # `lib/common.sh`'s `fetch_token` uses from inside a scenario container, just
@@ -127,6 +141,29 @@ HOST_HEALTHZ="${HOST_HORT}/healthz"
 # Context is the repo root: the Dockerfile's stage 1 builds hort-cli from the
 # workspace (.dockerignore keeps target/.git out, so the context stays small).
 build_image() { docker build -q -f "$SCRIPT_DIR/Dockerfile.client" -t "$IMAGE" "$REPO_ROOT" >/dev/null; }
+
+# require_image -> fail loudly (naming the tag) if $1 is not already loaded.
+# Only called under the build opt-out, where a miss must never fall through to
+# a silent rebuild.
+require_image() {
+  docker image inspect "$1" >/dev/null 2>&1 || {
+    echo "HORT_E2E_SKIP_BUILD=1 but image '$1' is not loaded locally — load it" \
+         "(e.g. docker load) before running, or unset HORT_E2E_SKIP_BUILD to build from source." >&2
+    exit 1
+  }
+}
+
+# maybe_build_client_image -> build the test-client image, unless the opt-out
+# is active, in which case the pre-loaded image must already be present.
+maybe_build_client_image() {
+  if [ "$SKIP_BUILD" = "1" ]; then
+    require_image "$IMAGE"
+    echo "images: test-client prebuilt ($IMAGE)"
+  else
+    build_image
+    echo "images: test-client built from source ($IMAGE)"
+  fi
+}
 now() { date +%s; }
 
 # mint_metrics_token -> prints a read_metrics-granted bearer for the
@@ -192,7 +229,26 @@ cleanup() { [ "$STARTED" = 1 ] && [ "$KEEP" = 0 ] && docker compose "${CA[@]}" "
 trap cleanup EXIT
 
 if [ "$HORT_MODE" = "compose" ]; then
-  build_image
+  maybe_build_client_image
+  # UP_BUILD_ARGS: `--build` by default (today's behaviour — compose always
+  # rebuilds server/worker regardless of any cached image). Under the opt-out
+  # it's dropped so `up` uses the already-loaded HORT_SERVER_IMAGE /
+  # HORT_WORKER_IMAGE tags instead — but only once we've confirmed those tags
+  # actually exist locally; otherwise compose would build them anyway (silent
+  # rebuild) simply because the requested tag is missing.
+  UP_BUILD_ARGS=(--build)
+  if [ "$SKIP_BUILD" = "1" ]; then
+    UP_BUILD_ARGS=()
+    require_image "$HORT_SERVER_IMAGE"
+    if [ "$NEED_WORKER" = 1 ]; then
+      require_image "$HORT_WORKER_IMAGE"
+      echo "images: server/worker prebuilt (server=$HORT_SERVER_IMAGE worker=$HORT_WORKER_IMAGE)"
+    else
+      echo "images: server prebuilt (server=$HORT_SERVER_IMAGE); worker profile inactive"
+    fi
+  else
+    echo "images: server/worker building from source (server=$HORT_SERVER_IMAGE worker=$HORT_WORKER_IMAGE)"
+  fi
   # E2E sweep cadence: for scan-less policies (scanBackends: []) the release
   # sweep is the ONLY release engine, and the OCI cold-blob bounded await
   # (default 10s) only catches a release when the tick fits inside its bound —
@@ -201,7 +257,7 @@ if [ "$HORT_MODE" = "compose" ]; then
   # ${SWEEP_TICK_SECS:-15} from THIS process env at `up` time.
   export SWEEP_TICK_SECS="${SWEEP_TICK_SECS:-5}"
   docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" up -d --build "${SCALE_ARGS[@]}"
+  docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" up -d "${UP_BUILD_ARGS[@]}" "${SCALE_ARGS[@]}"
   STARTED=1
   wait_url "$KC_DISCOVERY" 120 || { echo "Keycloak not ready" >&2; exit 1; }
   wait_url "$HOST_HEALTHZ" 120 || { echo "hort-server not ready" >&2; exit 1; }
@@ -234,7 +290,7 @@ if [ "$HORT_MODE" = "compose" ]; then
   fi
 else
   : "${HORT_URL:?external mode needs HORT_URL}"; : "${KEYCLOAK_URL:?external mode needs KEYCLOAK_URL}"
-  build_image
+  maybe_build_client_image
   # External /metrics is usually an internal control-plane port, not on HORT_URL;
   # leave IN_METRICS empty unless the caller set METRICS_URL → assert_metric_ingest
   # then skips rather than failing on a 404 (S2). METRICS_TOKEN mirrors it:
