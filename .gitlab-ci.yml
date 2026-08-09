@@ -614,8 +614,18 @@ test:coverage:
     - *hort-auth-steps
     - rustup component add llvm-tools-preview
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-llvm-cov
-      || cargo install --locked cargo-llvm-cov || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo llvm-cov --version >/dev/null 2>&1; then
+        cargo binstall --no-confirm --locked cargo-llvm-cov \
+          || cargo install --locked cargo-llvm-cov
+      fi
+      cargo llvm-cov --version >/dev/null 2>&1 || {
+        echo "cargo llvm-cov unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     - cargo llvm-cov --workspace --lib
         --lcov --output-path lcov.info
@@ -820,8 +830,18 @@ security:cargo-audit:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-audit
-      || cargo install --locked cargo-audit || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo audit --version >/dev/null 2>&1; then
+        cargo binstall --no-confirm --locked cargo-audit \
+          || cargo install --locked cargo-audit
+      fi
+      cargo audit --version >/dev/null 2>&1 || {
+        echo "cargo audit unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     # Diagnostic JSON artefact captured first; failure-tolerant (||
     # true) so a non-zero exit still produces the upload below.
@@ -886,8 +906,18 @@ security:attribution-sync:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl python3
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-about
-      || cargo install --locked cargo-about --features cli || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo about --version >/dev/null 2>&1; then
+        cargo binstall --no-confirm --locked cargo-about \
+          || cargo install --locked cargo-about --features cli
+      fi
+      cargo about --version >/dev/null 2>&1 || {
+        echo "cargo about unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     - bash scripts/check-attribution.sh
 
@@ -947,8 +977,18 @@ security:cargo-deny:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-deny
-      || cargo install --locked cargo-deny || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo deny --version >/dev/null 2>&1; then
+        cargo binstall --no-confirm --locked cargo-deny \
+          || cargo install --locked cargo-deny
+      fi
+      cargo deny --version >/dev/null 2>&1 || {
+        echo "cargo deny unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     - cargo deny --workspace check
 
@@ -1615,8 +1655,18 @@ release:sbom:
     # Vault-token + key fetch in cosign-setup.sh succeeds.
     - apt-get install -y -qq --no-install-recommends jq
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-cyclonedx
-      || cargo install --locked cargo-cyclonedx || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo cyclonedx --version >/dev/null 2>&1; then
+        cargo binstall --no-confirm --locked cargo-cyclonedx \
+          || cargo install --locked cargo-cyclonedx
+      fi
+      cargo cyclonedx --version >/dev/null 2>&1 || {
+        echo "cargo cyclonedx unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
     # Trust the platform CA (internal PKI) BEFORE cosign-setup.sh runs: in
     # vault-key mode its HTTPS call to ${VAULT_ADDR} (OpenBao) must verify
     # against an internal CA not in the public bundle. No-op when
