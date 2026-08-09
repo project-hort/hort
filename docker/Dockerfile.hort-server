@@ -35,7 +35,7 @@
 # pass the subcommand explicitly (`serve`, `migrate`, `scrub`,
 # `admin`, `reconcile-groups`).
 
-ARG RUST_VERSION=1.94
+ARG RUST_VERSION=1.94.1
 
 # ---------- Stage 1: builder ----------
 # Digest-pinned (B10/INFRA-7); Dependabot (docker ecosystem) bumps tag+digest
