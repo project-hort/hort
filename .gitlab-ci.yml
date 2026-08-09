@@ -663,6 +663,119 @@ test:integration:
   script:
     - cargo test --workspace --tests --verbose
 
+# GitLab-side cargo-proxy warm + a scheduled readiness probe (issue #138 /
+# backlog 097). develop lives on GitLab, so a GitLab-side warm reacts to a
+# Cargo.lock change immediately instead of waiting for the GitHub twin
+# (prefetch-warm.yml), which only fires on a develop push mirror / nightly
+# schedule. Both jobs call scripts/ci/locked-registry-deps.sh and/or
+# scripts/ci/vetted-index-preflight.sh (extracted from release.yml's
+# preflight step, #137/#138) — one implementation, three call sites.
+#
+# Invariant both jobs exist to work around: cargo-virtual is released_only
+# (NonServableStatusFilter + IndexModeFilter, hort-http-cargo/src/serve.rs),
+# so a build resolving THROUGH the vetted index cannot warm a cold dep
+# itself — released_only hides the cold entry, so resolution fails before
+# any fetch is even attempted. The prefetch POST is the only thing that
+# warms; `cargo resolve`/`cargo build` only ever checks.
+#
+# Both grants below take effect only on the operator's Ansible apply, so
+# both jobs treat a permission failure as a loud warning, never a pipeline
+# failure — hence allow_failure: true on both, unconditionally.
+prefetch:warm:
+  stage: test
+  image: alpine:3.24
+  needs: []
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PROXY_ENABLED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PROXY_ENABLED == "true"'
+  id_tokens: !reference [.hort-auth, id_tokens]
+  before_script:
+    - apk add --no-cache bash curl jq
+    - *hort-auth-steps
+  # This job also doubles as the GitLab<->hort OIDC federation probe (backlog
+  # 097 §4): the federation is declared in gitops but its applied state on
+  # registry.hort.rs is unverified, so this job's own output must distinguish
+  # the three possible outcomes without any log spelunking.
+  #
+  #   1. exchange failed (no HORT_TOKEN) — *hort-auth-steps above already
+  #      exits 1 in that case (before this `script:` even starts), so that
+  #      outcome is reported from `after_script:` below instead, via
+  #      CI_JOB_STATUS (the only signal available once before_script has
+  #      already terminated the job).
+  #   2. exchange OK, prefetch 403 — federation works, the
+  #      gitlab-ci-prefetch-cargo-virtual.yaml grant just isn't applied yet.
+  #   3. success — print queued / already_present / rejected.
+  script:
+    - |
+      set -uo pipefail
+
+      bash scripts/ci/locked-registry-deps.sh Cargo.lock > /tmp/locked.txt
+      locked_count=$(wc -l < /tmp/locked.txt)
+      items=$(jq -R -s -c '
+        split("\n") | map(select(length > 0) | split(" ") | {package: .[0], version: .[1]})
+      ' /tmp/locked.txt)
+
+      echo "Warming ${_hort_cargo_repo} with ${locked_count} locked deps…"
+      # Body to a file, status via -w: the runner may execute this under
+      # busybox sh (the image ships no bash until before_script installs it,
+      # and shell selection happens before that), where bash's $'\n'
+      # ANSI-C quoting is not portable.
+      status=$(curl -sS -o /tmp/prefetch-response.json -w '%{http_code}' -X POST \
+        "${_hort_url}/api/v1/repositories/${_hort_cargo_repo}/prefetch" \
+        -H "Authorization: Bearer ${HORT_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"items\": ${items}}")
+      body=$(cat /tmp/prefetch-response.json)
+
+      case "${status}" in
+        200)
+          echo "${body}" | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"'
+          ;;
+        403)
+          # Federation worked (we got here — HORT_TOKEN was minted), but the
+          # prefetch permission itself is missing: name the grant so the
+          # operator knows exactly what Ansible apply to run.
+          echo "::warning::prefetch POST rejected with 403 — the gitlab-ci-prefetch-cargo-virtual.yaml grant is not applied yet (federation itself is fine)"
+          ;;
+        *)
+          echo "::warning::prefetch POST failed with HTTP ${status}: ${body}"
+          ;;
+      esac
+  after_script:
+    - |
+      if [ "${CI_JOB_STATUS:-}" = "failed" ]; then
+        echo "::warning::hort OIDC token exchange failed — the GitLab<->hort federation is not usable yet. Candidate causes: (1) the federation gitops is not applied yet, (2) an audience or jti claim mismatch between the GitLab id_token and hort's issuer envelope, (3) HORT_PROXY_ENABLED is not actually 'true' in this pipeline context."
+      fi
+
+# Read-only readiness probe: reports the complete cold set ahead of a
+# release, without side effects (no prefetch POST — see
+# scripts/ci/vetted-index-preflight.sh). Scheduled only — this is a
+# pre-release signal an operator checks before cutting a release, not
+# something every develop push needs to re-run.
+prefetch:verify:
+  stage: test
+  image: alpine:3.24
+  needs: []
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PROXY_ENABLED == "true"'
+  id_tokens: !reference [.hort-auth, id_tokens]
+  before_script:
+    - apk add --no-cache bash curl jq findutils
+    - *hort-auth-steps
+  script:
+    - |
+      set -uo pipefail
+
+      if bash scripts/ci/locked-registry-deps.sh Cargo.lock \
+          | HORT_TOKEN="${HORT_TOKEN}" bash scripts/ci/vetted-index-preflight.sh \
+              "${_hort_url}" "${_hort_cargo_repo}"; then
+        echo "prefetch:verify — every locked dep is served by ${_hort_cargo_repo} (release-ready)."
+      else
+        echo "::warning::prefetch:verify — cold deps listed above are not yet served by ${_hort_cargo_repo}; not release-ready. Re-run prefetch:warm (or wait for the next develop push) and let the quarantine window clear."
+      fi
+
 # ===========================================================================
 # Stage 2: security — cargo audit (parity with GitHub security-audit)
 # ===========================================================================
