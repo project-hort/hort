@@ -141,6 +141,35 @@ Coverage requirements vary by crate layer. Core crates contain the security-crit
 
 **DB-backed test isolation (parallel-safety contract).** The `hort-adapters-postgres` and `hort-adapters-storage` test suites — inline `#[cfg(test)]` `--lib` tests *and* `crates/*/tests/` integration tests — run **in parallel against one shared database/backend with no per-test isolation** (no transaction rollback, no schema-per-test, no truncation). The `cargo test --tests` CI job (`test:integration`) builds the lib as a unittest target, so inline tests run there too. Several adapters do global-scope work (e.g. the `save_managed` gitops-partition full-reconcile, `pg_stat_activity` probes, unfiltered `COUNT`/`list_*` reads). Coverage % is necessary but **not sufficient**: a DB-backed test that is correct serially but interferes with a concurrently-running sibling is a defect, not passing. Production tolerates this because the only writer of these partitions is single-flight by design (gitops apply is single-process per boot lock); tests must honour that same contract. **Therefore: every new `hort-adapters-postgres` test that acquires a real connection (calls `maybe_pool()` / touches the shared DB) MUST carry the crate-wide `#[serial(hort_pg_db)]` key** (or an equivalent per-test isolation mechanism); a DB-gated test without it is a **blocking review finding** — it silently reintroduces the identity-shifting flake fixed in `ed79360a`. There is no compile-time or lint enforcement of this yet, so it is a mandatory review check (see the architect Implementation Review Checklist).
 
+### Code comments: state the invariant, never the provenance
+
+**No references to issues, merge requests, or backlog items in code comments** —
+no `#137`, no `backlog 097`, no `item 089`, no "found during the #137 review".
+Code is the persistent artifact; issues and backlog items are ephemeral
+coordination records that outlive their usefulness and rot in place. A reader
+five years from now can read the code, not a closed tracker.
+
+Write what a future reader needs in order not to break the thing:
+
+- **Instead of** `# Skip the enqueue here (issue #131).`
+  **write** `# Skip the enqueue: a parent-gated blob can never carry its own
+  attestation, so the verify it would enqueue has no reachable outcome.`
+- Name durable anchors freely: ADRs (`ADR 0007`), file paths, type and function
+  names, env vars, and commit SHAs when a specific change is the evidence.
+- Git history keeps the provenance. Put the issue/MR/backlog reference in the
+  **commit message** and the **MR description**, where it belongs.
+
+This applies to every commentable artifact in the repository — Rust, shell,
+YAML (CI, compose, Helm, gitops envelopes), SQL migrations, Dockerfiles. It
+does **not** apply to `CHANGELOG.md` (issue references are the changelog's
+own convention) or to ADRs and other `docs/` prose, which are themselves the
+durable decision record.
+
+Enforcement is a review check: grep the diff's added comment lines before
+pushing. Legacy references predating this rule are not swept opportunistically
+— removing one is fine when you are already editing that comment for another
+reason.
+
 ### Anti-Patterns Checklist
 
 The architect skill (`/.claude/commands/hort-architect.md`) maintains the canonical anti-patterns checklist used during review. The bullets below are mirrored here for the rules whose enforcement is structural (compile errors / dep-graph) rather than convention; the architect doc has the full list.

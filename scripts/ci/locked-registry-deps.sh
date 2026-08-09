@@ -16,10 +16,8 @@
 # failure the preflight replaces. Parsing Cargo.lock directly sidesteps
 # that entirely; no cargo invocation, no index.
 #
-# Extracted verbatim-in-behavior from the inline preflight block #137 landed
-# in .github/workflows/release.yml (issue #138 / backlog 097) — this is the
-# single implementation now shared by that workflow's preflight step and the
-# GitLab `prefetch:warm` / `prefetch:verify` jobs.
+# Single implementation, shared by .github/workflows/release.yml's preflight
+# step and the GitLab `prefetch:warm` / `prefetch:verify` jobs.
 
 set -euo pipefail
 

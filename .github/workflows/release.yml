@@ -309,9 +309,9 @@ jobs:
           proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
           audience: hort-server-release
 
-      # ── vetted-index preflight (issue #137 / backlog 096; scripts extracted
-      # to scripts/ci/ for #138 / backlog 097 — the same implementation is
-      # now also called from .gitlab-ci.yml's prefetch:warm / prefetch:verify)
+      # ── vetted-index preflight. The check itself lives in scripts/ci/ so
+      # this job, .gitlab-ci.yml's prefetch:warm and prefetch:verify all run
+      # one implementation and cannot drift.
       #
       # cargo-virtual is released_only (NonServableStatusFilter +
       # IndexModeFilter, hort-http-cargo/src/serve.rs): a locked dep hort has
@@ -356,10 +356,9 @@ jobs:
             ' "${tmpdir}/locked.txt")
 
             echo "Cold deps found — starting a prefetch warm for the full locked set (${locked_count} deps)…"
-            # -f: a non-2xx (most likely 403 — the gha-release-prefetch-
-            # cargo-virtual grant not applied yet, issue #138) must be loud,
-            # not rendered as a misleading `queued: ?  already_present: ?`
-            # line (the #137 review finding).
+            # -f: a non-2xx (most likely 403 — this identity's prefetch
+            # grant on cargo-virtual is not applied) must be loud, not
+            # rendered as a misleading `queued: ?  already_present: ?` line.
             if ! curl -fsS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
               -H "Authorization: Bearer ${HORT_TOKEN}" \
               -H "Content-Type: application/json" \

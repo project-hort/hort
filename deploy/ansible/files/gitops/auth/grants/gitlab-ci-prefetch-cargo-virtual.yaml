@@ -12,9 +12,9 @@ spec:
   # (crates/hort-app/src/use_cases/self_service_prefetch_use_case.rs).
   #
   # Backs the `prefetch:warm` / `prefetch:verify` GitLab pipeline jobs
-  # (.gitlab-ci.yml, issue #138 / backlog 097) — develop lives on GitLab, so
-  # a GitLab-side warm reacts to a Cargo.lock change immediately instead of
-  # waiting for the GitHub release-time sync. Mirrors gha-ci-prefetch-cargo-virtual.yaml.
+  # (.gitlab-ci.yml) — develop lives on GitLab, so a GitLab-side warm reacts
+  # to a Cargo.lock change immediately instead of waiting for the GitHub
+  # release-time sync. Mirrors gha-ci-prefetch-cargo-virtual.yaml.
   subject:
     kind: serviceAccount
     name: gitlab-ci
