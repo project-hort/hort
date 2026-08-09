@@ -263,7 +263,7 @@ variables:
   # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` by
   # `scripts/check-rust-version.sh`. GitLab pins the image explicitly so a
   # silent toolchain bump can't break the gate.
-  RUST_IMAGE: "rust:1.94-slim"
+  RUST_IMAGE: "rust:1.94.1-slim"
   # FAST path (deliberate dev-cycle speedup): pre-baked rust:1.94-slim + sccache
   # on PATH, used by the test jobs that extend .sccache. FALLBACK: the
   # .sccache-install anchor (below) is a NO-OP when this image already ships
