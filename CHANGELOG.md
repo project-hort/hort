@@ -9,12 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Release-gate bypasses closed (audit package).** Three high-severity paths
+  could serve or release content that had not passed the gate:
+  `register_by_hash` (cross-repo blob mount and pull-dedup followers) skipped
+  the scan gate entirely; a release-gate verdict commit could resurrect and
+  release an already-rejected artifact from a stale snapshot; and the Events
+  API skipped its admin-category check under bearer-only auth, exposing audit
+  streams to any token. (#107, #108, #109)
+- **Federated-identity and policy-resolution hardening.** A `ServiceAccount`
+  whose `federatedIdentities` claims carried only a discriminator could be
+  assumed by any subject from a shared issuer; duplicate-scope `ScanPolicy`
+  envelopes resolved nondeterministically and could bypass the ADR 0016
+  cross-opt-in linter. Both are now rejected at apply time. (#111, #112)
+- **PyPI proxy input validation.** Serve paths no longer forward unvalidated
+  request paths upstream, closing a path-traversal request-forgery against a
+  credentialed upstream and an index-amplification vector. (#110)
+- **Unknown-`kid` JWTs no longer force an unthrottled JWKS refetch**, which
+  a caller could use to amplify load against the IdP and hold the refresh
+  lock. (#114)
 - **`/metrics` is now admin-listener-only and gated by a dedicated
   `read_metrics` grant, with no anonymous-scrape opt-out.** The main
   public listener no longer serves `/metrics` under any configuration
   (previously reachable there when `HORT_METRICS_BIND` was unset); the
   admin listener's `/metrics` route now requires
   `Permission::ReadMetrics` rather than bare authentication. (#113)
+- **Rejected input is no longer echoed back** in OCI, npm and PyPI error
+  messages. (#123)
+- **Low-severity audit cleanup bundle** across TLS, secret handling,
+  injection surfaces, OIDC and supply-chain documentation. (#117)
+
+### Changed
+
+- **Dependencies moved forward in one coordinated wave**, including
+  `axum` 0.8, `sqlx` 0.9, `reqwest` 0.13, `jsonwebtoken` 11, `kube` 4 with
+  `k8s-openapi` 0.28, the RustCrypto new generation (`rand` 0.10,
+  `ed25519-dalek` 3) and a broad lockfile refresh. Auth- and adapter-facing
+  majors were gated on validation- and error-classification parity before
+  landing. (#95–#104, #128)
+- **Dependency waves now ship as a minor release.** The policy and its
+  rationale are recorded in `RELEASING.md`. (#121)
+- **Pull-through proxy quarantine windows raised to three days** on the
+  reference deployment, widening the supply-chain observation window.
+  (#126)
+
+### Fixed
+
+- **Quarantine no longer strands or wrongly rejects artifacts under
+  `provenance_mode: Required`.** Seed-imported artifacts stayed unscanned
+  forever; zero-window OCI descendants were terminally rejected; a
+  never-signed artifact could escape terminal rejection because its verify
+  job starved; and a constituent ingested *after* its subject was verified
+  (a later platform of a multi-arch image, for example) received no
+  clearance at all and held indefinitely — it now clears itself against the
+  signed subject at ingest. (#115, #131, #132, #135)
+- **Upstream-registry parse failures are no longer reflected verbatim** to
+  PyPI simple-index clients. (#124)
 
 ### Removed
 
@@ -24,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `read_metrics` grant. Setting the removed env var is silently
   ignored; a values file setting `metrics.requireAuth` is rejected by
   chart schema validation. (#113)
+- **Inert `JwtAlg::Es512`.** The variant was accepted at apply time but
+  could never match at runtime; it is gone rather than silently
+  misleading. (#122)
 
 ## [0.9.15] - 2026-08-01
 
