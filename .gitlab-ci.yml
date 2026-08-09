@@ -216,11 +216,21 @@ docs-only:ok:
 # ---------------------------------------------------------------------------
 
 variables:
-  # Route CI deps through registry.hort.rs.
-  # Set to exactly "true" to enable; any other value (absent, empty, "false")
-  # is treated as disabled so merging before the live instance exists does not
-  # break CI. Mirrors the gate in .github/actions/hort-auth/action.yml.
+  # Route CI deps through registry.hort.rs — cargo, npm and the OCI client all
+  # resolve from hort instead of their public upstreams. Set to exactly "true"
+  # to enable; any other value (absent, empty, "false") is treated as disabled
+  # so merging before the live instance exists does not break CI. Mirrors the
+  # gate in .github/actions/hort-auth/action.yml.
+  #
+  # Enabling this is only safe once the vetted index serves the ENTIRE
+  # Cargo.lock: the index hides versions hort has not ingested-and-released,
+  # so a cold or still-quarantined dependency fails every cargo job with
+  # "failed to select a version". `prefetch:verify` reports that readiness.
   HORT_PROXY_ENABLED: ""
+  # Allow jobs to mint a hort bearer WITHOUT repointing any dependency source
+  # — the prefetch warm/verify jobs and nothing else. Safe to leave on
+  # permanently: warming is what eventually makes HORT_PROXY_ENABLED viable.
+  HORT_PREFETCH_ENABLED: ""
   # OCI registry host for images AND Helm charts. REQUIRED for the
   # build-images / helm-publish / sign jobs — no default (the former
   # internal-mirror value only resolved on the original runner). Set as
@@ -435,7 +445,16 @@ variables:
       aud: hort-server
   before_script: &hort-auth-steps
     - |
-      if [ "${HORT_PROXY_ENABLED:-}" = "true" ]; then
+      # Two independent switches, deliberately separate:
+      #   HORT_PREFETCH_ENABLED — mint a bearer so a job can call hort's API
+      #     (the prefetch warm/verify jobs). Harmless: changes no toolchain
+      #     configuration, so a job that resolves dependencies is unaffected.
+      #   HORT_PROXY_ENABLED — additionally repoint cargo, npm and the OCI
+      #     client at hort. This one changes where EVERY dependency in the
+      #     job resolves from, so it is only safe once the vetted index can
+      #     serve the whole lock; a version it does not serve yet fails the
+      #     job the same way it fails a release publish.
+      if [ "${HORT_PROXY_ENABLED:-}" = "true" ] || [ "${HORT_PREFETCH_ENABLED:-}" = "true" ]; then
         echo "[hort-auth] exchanging OIDC token for hort bearer token"
         _hort_url="${HORT_URL:-https://registry.hort.rs}"
         _hort_cargo_repo="${HORT_CARGO_SOURCE_REPO:-cargo-virtual}"
@@ -455,7 +474,9 @@ variables:
           exit 1
         fi
         echo "[hort-auth] token exchange succeeded"
+      fi
 
+      if [ "${HORT_PROXY_ENABLED:-}" = "true" ]; then
         # Cargo: sparse index via cargo-virtual (or crates-proxy fallback)
         mkdir -p .cargo
         # cargo >=1.74 requires a credential provider for auth-required
@@ -490,7 +511,7 @@ variables:
             --password-stdin
         fi
       else
-        echo "[hort-auth] HORT_PROXY_ENABLED != 'true' — proxy disabled"
+        echo "[hort-auth] HORT_PROXY_ENABLED != 'true' — dependency sources unchanged"
       fi
 
 # ===========================================================================
@@ -687,8 +708,8 @@ prefetch:warm:
   needs: []
   allow_failure: true
   rules:
-    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PROXY_ENABLED == "true"'
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PROXY_ENABLED == "true"'
+    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PREFETCH_ENABLED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
     - apk add --no-cache bash curl jq
@@ -759,7 +780,7 @@ prefetch:verify:
   needs: []
   allow_failure: true
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PROXY_ENABLED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
     - apk add --no-cache bash curl jq findutils
