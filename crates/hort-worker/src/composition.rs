@@ -137,6 +137,7 @@ use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_formats::cargo::CargoFormatHandler;
+use hort_formats::maven::MavenFormatHandler;
 use hort_formats::npm::NpmFormatHandler;
 use hort_formats::oci::OciFormatHandler;
 use hort_formats::pypi::PyPiFormatHandler;
@@ -449,12 +450,25 @@ pub async fn build_app_context(
     //    `Arc<dyn FormatHandler>`s are cheap to clone; the `.clone()` at
     //    the orchestration call site preserves single-instance semantics
     //    for the scan path while handing a second handle to seed-import.
+    //
+    //    `maven` participates here too: it has no `VersionDiscovery`
+    //    (no ordering, no upstream-metadata fan-out), so the auto-trigger
+    //    tick and the transitive-dependency cascade both fall through
+    //    their `handler.version_discovery()` guard and no-op for Maven
+    //    repos exactly as they already do for a registered handler with
+    //    no `VersionDiscovery` impl — a case both handlers have dedicated
+    //    coverage for. The leaf-ingest `PrefetchIngestHandler` below is
+    //    the consumer that actually needs the registration: without it,
+    //    the self-service prefetch endpoint's `prefetch` leaf-ingest rows
+    //    for a Maven repo short-circuit as "no FormatHandler registered"
+    //    before ever reaching the Maven pull-through arm.
     // -----------------------------------------------------------------
     let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
     handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));
     handlers.insert("cargo".into(), Arc::new(CargoFormatHandler));
     handlers.insert("npm".into(), Arc::new(NpmFormatHandler));
     handlers.insert("oci".into(), Arc::new(OciFormatHandler));
+    handlers.insert("maven".into(), Arc::new(MavenFormatHandler));
 
     // -----------------------------------------------------------------
     // 8. QuarantineUseCase — the consumer of the orchestrator's

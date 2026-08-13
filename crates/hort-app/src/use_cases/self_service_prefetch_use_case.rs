@@ -896,6 +896,13 @@ mod tests {
         r
     }
 
+    fn maven_repo() -> Repository {
+        let mut r = sample_repository();
+        r.format = RepositoryFormat::Maven;
+        r.is_public = false;
+        r
+    }
+
     fn pypi_repo() -> Repository {
         let mut r = sample_repository();
         r.format = RepositoryFormat::Pypi;
@@ -1662,6 +1669,43 @@ mod tests {
         });
         // Skipped is not a `result` label — verify no per-item
         // success tick.
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
+    }
+
+    /// The truthful-envelope property, pinned for Maven specifically
+    /// (backlog 106): a re-POST of an already-warmed GAV — pinned version,
+    /// colon-joined `groupId:artifactId` package — must classify as
+    /// `skipped_already_held`, not re-enqueue a `prefetch` leaf-ingest row.
+    /// This is the SAME generic pre-flight (`package_version_status`) every
+    /// other format already exercises above; the point of this pin is that
+    /// it works unchanged for Maven's `groupId:artifactId` package shape
+    /// once the Maven leaf-ingest dispatch arm exists.
+    #[test]
+    fn maven_gav_already_held_released_skips_on_repost() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = maven_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                h.artifacts.seed_package_version_status(
+                    repo_id,
+                    "com.example:foo",
+                    vec![("1.0".into(), QuarantineStatus::Released)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome = h
+                    .uc
+                    .enqueue_self_service(&key, vec![item("com.example:foo", Some("1.0"))], &actor)
+                    .await
+                    .expect("ok");
+                assert!(outcome.enqueued_job_ids.is_empty());
+                assert_eq!(outcome.skipped_already_held.len(), 1);
+                assert_eq!(outcome.skipped_already_held[0].package, "com.example:foo");
+                assert!(h.jobs.enqueue_calls().is_empty());
+            })
+        });
         assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
     }
 

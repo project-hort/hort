@@ -92,6 +92,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstre
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::ArtifactCoords;
 
 use crate::use_cases::ingest_use_case::{IngestUseCase, VerifiedIngestRequest};
@@ -319,6 +320,25 @@ impl TaskHandler for PrefetchIngestHandler {
                     };
                     npm_resolve_and_pull(&ctx, &mut summary).await;
                 }
+                RepositoryFormat::Maven => {
+                    let ctx = LeafCtx {
+                        handler_self: self,
+                        repo: &repo,
+                        handler: &handler,
+                        mapping: &mapping,
+                        parsed: &parsed,
+                        cascade_internal,
+                    };
+                    // A rejected GAV coordinate (path traversal, absolute,
+                    // empty segment) short-circuits `run()` with a non-retry
+                    // `Failed` outcome — distinct from the `Completed` +
+                    // `short_circuited` shape every other guard in this
+                    // handler uses, because a malformed GAV is a per-item
+                    // input-validation rejection, not an upstream condition.
+                    if let Some(rejected) = maven_resolve_and_pull(&ctx, &mut summary).await {
+                        return Ok(rejected);
+                    }
+                }
                 other => {
                     tracing::debug!(
                         repository = %repo.key,
@@ -488,7 +508,7 @@ async fn fetch_and_ingest_one(
     ctx: &LeafCtx<'_>,
     coords: ArtifactCoords,
     url: String,
-    upstream_checksum: hort_domain::types::checksum::UpstreamPublishedChecksum,
+    upstream_checksum: UpstreamPublishedChecksum,
     summary: &mut LeafSummary,
 ) {
     let LeafCtx {
@@ -793,6 +813,309 @@ async fn npm_resolve_and_pull(ctx: &LeafCtx<'_>, summary: &mut LeafSummary) {
     };
 
     fetch_and_ingest_one(ctx, coords, tarball_url, upstream_checksum, summary).await;
+}
+
+/// The Maven checksum-sidecar algorithms tried in strength-preferring
+/// order (ADR 0033): `.sha512` (strongest) → `.sha256` → `.sha1` (the
+/// universal floor). Mirrors `hort-http-maven/src/upstream_pull.rs`'s
+/// `SIDECAR_PREFERENCE` constant — kept in sync by hand because `hort-app`
+/// must not depend on `hort-http-maven` (the dependency direction runs the
+/// other way: `hort-http-maven → hort-app`).
+const MAVEN_SIDECAR_PREFERENCE: [(HashAlgorithm, &str); 3] = [
+    (HashAlgorithm::Sha512, "sha512"),
+    (HashAlgorithm::Sha256, "sha256"),
+    (HashAlgorithm::Sha1, "sha1"),
+];
+
+/// Maven leaf pull-through: POM always, jar when present, via the
+/// verified two-leg pull (checksum sidecar preference `sha512` → `sha256`
+/// → `sha1`, fall-through on 404 / transport / malformed body, then
+/// `ingest_verified` with the winning algorithm) — mirroring the documented
+/// contract in `hort-http-maven/src/upstream_pull.rs`. Re-implemented here
+/// rather than reused: `hort-app` must not gain a dependency on
+/// `hort-http-maven`.
+///
+/// `package` is the colon-joined `groupId:artifactId` GAV form. A malformed
+/// shape, or a coordinate that composes into path traversal / an absolute
+/// path / an empty segment (caught by
+/// [`FormatHandler::build_artifact_logical_path`]'s validation), is a
+/// structural per-item REJECTION: `Some(TaskOutcome::Failed{retry: false})`
+/// is returned before any upstream call is made — distinct from the
+/// `Completed` + `short_circuited` shape the rest of this handler uses for
+/// upstream/runtime conditions. `None` means the caller should fall through
+/// to the normal `Completed` summary.
+async fn maven_resolve_and_pull(
+    ctx: &LeafCtx<'_>,
+    summary: &mut LeafSummary,
+) -> Option<TaskOutcome> {
+    let LeafCtx {
+        repo,
+        handler,
+        parsed,
+        ..
+    } = ctx;
+
+    let Some(artifact_id) = maven_artifact_id(&parsed.package) else {
+        tracing::warn!(
+            repository = %repo.key,
+            "prefetch (maven): package is not the colon-joined \"groupId:artifactId\" \
+             form — rejected",
+        );
+        return Some(TaskOutcome::fail(
+            "prefetch (maven): package must be the colon-joined \"groupId:artifactId\" form"
+                .to_string(),
+            false,
+        ));
+    };
+
+    // ----- POM: always fetched. Coordinate validation (traversal, an
+    // absolute path, an empty segment) happens inside
+    // `build_artifact_logical_path` — an `Err` here is a structural
+    // rejection; no upstream call has been made yet.
+    let pom_filename = format!("{artifact_id}-{}.pom", parsed.version);
+    let pom_path = match handler.build_artifact_logical_path(
+        &parsed.package,
+        &parsed.version,
+        Some(&pom_filename),
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                repository = %repo.key,
+                "prefetch (maven): GAV coordinate rejected by the path-composition guard",
+            );
+            return Some(TaskOutcome::fail(
+                format!("prefetch (maven): invalid GAV coordinate: {err}"),
+                false,
+            ));
+        }
+    };
+    let pom_coords = ArtifactCoords {
+        name: parsed.package.clone(),
+        name_as_published: parsed.package.clone(),
+        version: Some(parsed.version.clone()),
+        path: pom_path.clone(),
+        format: repo.format.clone(),
+        metadata: serde_json::Value::Null,
+    };
+    let pom_ingested = maven_pull_one(ctx, pom_coords, &pom_path, summary).await;
+
+    // ----- jar: fetched only when the POM leg succeeded. A jar that
+    // upstream does not publish (BOM / parent packagings) is recorded as a
+    // non-fatal per-URL failure via `maven_pull_one`, exactly like every
+    // other format's per-URL failure in this handler — the leaf still
+    // completes.
+    if pom_ingested {
+        let jar_filename = format!("{artifact_id}-{}.jar", parsed.version);
+        match handler.build_artifact_logical_path(
+            &parsed.package,
+            &parsed.version,
+            Some(&jar_filename),
+        ) {
+            Ok(jar_path) => {
+                let jar_coords = ArtifactCoords {
+                    name: parsed.package.clone(),
+                    name_as_published: parsed.package.clone(),
+                    version: Some(parsed.version.clone()),
+                    path: jar_path.clone(),
+                    format: repo.format.clone(),
+                    metadata: serde_json::Value::Null,
+                };
+                maven_pull_one(ctx, jar_coords, &jar_path, summary).await;
+            }
+            Err(err) => {
+                // Structurally unreachable in practice: the POM leg above
+                // already validated the same (group, artifact, version)
+                // triple via the same builder. A defensive short-circuit
+                // rather than a silent skip if that ever changes.
+                tracing::warn!(
+                    error = %err,
+                    repository = %repo.key,
+                    "prefetch (maven): jar path build failed after a validated POM path",
+                );
+                summary.short_circuited = true;
+            }
+        }
+    }
+
+    None
+}
+
+/// Split `package` (expected `groupId:artifactId`) into its artifactId, for
+/// composing the POM/jar filename. `None` when the shape is wrong (no
+/// colon, or either half empty) — the caller rejects the item rather than
+/// composing a filename from a malformed name. The full coordinate
+/// (including the groupId half) is re-validated by
+/// `FormatHandler::build_artifact_logical_path` regardless.
+fn maven_artifact_id(package: &str) -> Option<&str> {
+    let (group, artifact) = package.split_once(':')?;
+    if group.is_empty() || artifact.is_empty() {
+        return None;
+    }
+    Some(artifact)
+}
+
+/// Fetch the strongest available checksum sidecar for `artifact_path`,
+/// trying `.sha512` → `.sha256` → `.sha1` in order. The first sidecar that
+/// fetches AND parses to a valid digest of the matching shape wins; a fetch
+/// failure OR a malformed body on a stronger digest falls through to the
+/// next (weaker) digest — mirroring
+/// `hort-http-maven/src/upstream_pull.rs::fetch_strongest_sidecar`'s
+/// documented contract. `None` when all three are absent, unfetchable, or
+/// unparseable.
+async fn maven_strongest_sidecar(
+    ctx: &LeafCtx<'_>,
+    artifact_path: &str,
+) -> Option<(HashAlgorithm, UpstreamPublishedChecksum)> {
+    for (algorithm, ext) in MAVEN_SIDECAR_PREFERENCE {
+        let sidecar_path = format!("{artifact_path}.{ext}");
+        let fetch = ctx
+            .handler_self
+            .upstream_proxy
+            .fetch_metadata(ctx.mapping.clone(), sidecar_path, Vec::new())
+            .await;
+        let Ok(outcome) = fetch else {
+            continue;
+        };
+        let Some(handle) = outcome.cache_handle.as_ref() else {
+            continue;
+        };
+        let body_result = crate::project::run_handler_body(handle, |reader| {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(reader, &mut buf).map_err(|e| {
+                DomainError::Validation(format!(
+                    "prefetch (maven): read checksum sidecar body: {e}"
+                ))
+            })?;
+            Ok(buf)
+        })
+        .await;
+        crate::project::remove_cached_body(handle).await;
+        let Ok(body) = body_result else {
+            continue;
+        };
+        if let Some(checksum) = maven_parse_sidecar(algorithm, &body) {
+            return Some((algorithm, checksum));
+        }
+    }
+    None
+}
+
+/// Parse a fetched Maven sidecar body into a shape-validated
+/// [`UpstreamPublishedChecksum`] for `algorithm`, tolerating a trailing
+/// ` filename` suffix (GNU coreutils shape) by taking the first
+/// whitespace-delimited token. `None` on an empty body or a digest that
+/// fails the algorithm's shape check — the caller falls through to the
+/// next (weaker) digest.
+fn maven_parse_sidecar(algorithm: HashAlgorithm, body: &str) -> Option<UpstreamPublishedChecksum> {
+    let token = body.split_whitespace().next()?;
+    UpstreamPublishedChecksum::new(algorithm, token.to_ascii_lowercase()).ok()
+}
+
+/// Resolve the strongest checksum sidecar for `artifact_path`, fetch the
+/// artifact body, and `ingest_verified` it. Non-fatal on any failure
+/// (`warn!`, `urls_failed += 1`) — mirrors `fetch_and_ingest_one`'s
+/// per-URL contract; the leaf still completes. Returns `true` iff the
+/// ingest succeeded.
+async fn maven_pull_one(
+    ctx: &LeafCtx<'_>,
+    coords: ArtifactCoords,
+    artifact_path: &str,
+    summary: &mut LeafSummary,
+) -> bool {
+    let LeafCtx {
+        handler_self,
+        repo,
+        handler,
+        mapping,
+        parsed,
+        cascade_internal,
+    } = ctx;
+
+    let Some((_algorithm, upstream_checksum)) = maven_strongest_sidecar(ctx, artifact_path).await
+    else {
+        summary.urls_attempted += 1;
+        summary.urls_failed += 1;
+        tracing::warn!(
+            repository = %repo.key,
+            package = %parsed.package,
+            version = %parsed.version,
+            path = %artifact_path,
+            "prefetch (maven): no usable upstream checksum sidecar \
+             (sha512/sha256/sha1 all absent or malformed); continuing",
+        );
+        return false;
+    };
+
+    summary.urls_attempted += 1;
+    let fetch = match handler_self
+        .upstream_proxy
+        .fetch_artifact((*mapping).clone(), artifact_path.to_string())
+        .await
+    {
+        Ok(f) => f,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                repository = %repo.key,
+                package = %parsed.package,
+                version = %parsed.version,
+                path = %artifact_path,
+                "prefetch (maven): fetch_artifact failed; continuing",
+            );
+            summary.urls_failed += 1;
+            return false;
+        }
+    };
+    let upstream_published_at = fetch.last_modified;
+    let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
+        Box::new(StreamReader::new(fetch.stream));
+    let request = VerifiedIngestRequest::UpstreamPublished {
+        repository_id: repo.id,
+        coords,
+        content_type: content_type_for(&repo.format),
+        actor: ApiActor {
+            user_id: Uuid::nil(),
+        },
+        payload_metadata: serde_json::json!({
+            "source": "prefetch_leaf_pull_maven",
+            "upstream_path": artifact_path,
+            "cascade_internal": cascade_internal,
+        }),
+        upstream_checksum,
+        upstream_published_at,
+        trust_upstream_publish_time: mapping.trust_upstream_publish_time,
+    };
+    match handler_self
+        .ingest
+        .ingest_verified(request, reader, handler.as_ref())
+        .await
+    {
+        Ok(_outcome) => {
+            summary.urls_succeeded += 1;
+            tracing::info!(
+                repository = %repo.key,
+                package = %parsed.package,
+                version = %parsed.version,
+                path = %artifact_path,
+                "prefetch (maven): leaf pull-through succeeded",
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                repository = %repo.key,
+                package = %parsed.package,
+                version = %parsed.version,
+                path = %artifact_path,
+                "prefetch (maven): ingest_verified failed; continuing",
+            );
+            summary.urls_failed += 1;
+            false
+        }
+    }
 }
 
 /// PyPI per-distribution fan-out.
@@ -1389,6 +1712,16 @@ mod tests {
         format!("{:x}", Sha256::digest(content))
     }
 
+    fn sha1_hex(content: &[u8]) -> String {
+        use sha1::{Digest, Sha1};
+        format!("{:x}", Sha1::digest(content))
+    }
+
+    fn sha512_hex(content: &[u8]) -> String {
+        use sha2::{Digest, Sha512};
+        format!("{:x}", Sha512::digest(content))
+    }
+
     /// Cargo dispatch stub. Sparse-index NDJSON at `/se/rd/serde`; recovers a
     /// Sha256 cksum (sha256 of the seeded body); composes the download URL
     /// from a crates.io-shaped `config.json` `dl` field (placeholder-free →
@@ -1601,6 +1934,85 @@ mod tests {
             }
             Ok(self.tarball.clone())
         }
+    }
+
+    /// Maven dispatch stub. `hort-app` cannot dev-depend on `hort-formats`
+    /// (cycle — see the leaf-path guard tests above), so
+    /// `build_artifact_logical_path` here reproduces JUST the validation
+    /// shape the `maven_resolve_and_pull` dispatch arm relies on: reject an
+    /// unparseable `groupId:artifactId`, an empty component, or a
+    /// path-traversal / path-separator segment. The exact canonical string
+    /// output and every edge case of the real `MavenFormatHandler`
+    /// validator are pinned in `hort-formats`'s own tests
+    /// (`crates/hort-formats/src/maven/mod.rs`).
+    struct MavenDispatchStub;
+    impl FormatHandler for MavenDispatchStub {
+        fn format_key(&self) -> &str {
+            "maven"
+        }
+        fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+            unreachable!("not exercised by the dispatch test")
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn build_artifact_logical_path(
+            &self,
+            name: &str,
+            version: &str,
+            filename: Option<&str>,
+        ) -> DomainResult<String> {
+            let filename = filename.ok_or_else(|| {
+                DomainError::Validation("maven.coordinate: filename is required".into())
+            })?;
+            let (group, artifact) = name.split_once(':').ok_or_else(|| {
+                DomainError::Validation(
+                    "maven.coordinate: name must be the colon-joined groupId:artifactId form"
+                        .into(),
+                )
+            })?;
+            maven_stub_validate_component("groupId", group, true)?;
+            maven_stub_validate_component("artifactId", artifact, false)?;
+            maven_stub_validate_component("version", version, false)?;
+            maven_stub_validate_component("filename", filename, false)?;
+            let group_path = group.replace('.', "/");
+            Ok(format!("{group_path}/{artifact}/{version}/{filename}"))
+        }
+    }
+
+    /// Mirrors the shape (not the exact wording) of
+    /// `hort_formats::maven::coords::validate_component`: reject an empty
+    /// value, a path separator, and a `..`/`.` segment (dot-splitting only
+    /// the groupId, matching the real validator's `dotted` distinction).
+    fn maven_stub_validate_component(label: &str, value: &str, dotted: bool) -> DomainResult<()> {
+        if value.is_empty() {
+            return Err(DomainError::Validation(format!(
+                "maven.coordinate: {label} is empty"
+            )));
+        }
+        if value.contains('/') || value.contains('\\') {
+            return Err(DomainError::Validation(format!(
+                "maven.coordinate: {label} contains a path separator"
+            )));
+        }
+        let segments: Vec<&str> = if dotted {
+            value.split('.').collect()
+        } else {
+            vec![value]
+        };
+        for seg in segments {
+            if seg.is_empty() {
+                return Err(DomainError::Validation(format!(
+                    "maven.coordinate: {label} has an empty segment"
+                )));
+            }
+            if seg == ".." || seg == "." {
+                return Err(DomainError::Validation(format!(
+                    "maven.coordinate: {label} contains a path-traversal segment"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn dispatch_repo(format: RepositoryFormat) -> Repository {
@@ -2056,9 +2468,11 @@ mod tests {
     #[tokio::test]
     async fn unsupported_format_short_circuits_without_pull() {
         // A format with no prefetch-URL concept (e.g. OCI) short-circuits
-        // — it never reaches the per-URL fetch. Maven/generic/oci inherit
-        // the trait defaults (no resolution methods); the `_` dispatch arm
-        // catches them.
+        // — it never reaches the per-URL fetch. OCI and any other
+        // genuinely non-composable format inherit the trait defaults (no
+        // resolution methods); the `_` dispatch arm catches them. Maven
+        // has its own arm (see the `maven_arm_*` tests below) — it is no
+        // longer part of this catch-all.
         let repos = Arc::new(MockRepositoryRepository::new());
         let proxy = Arc::new(MockUpstreamProxy::new());
         let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
@@ -2090,5 +2504,275 @@ mod tests {
         };
         assert_eq!(summary["short_circuited"], true, "{summary}");
         assert_eq!(summary["urls_attempted"], 0, "{summary}");
+    }
+
+    // -- Maven arm (backlog 106) ----------------------------------------
+
+    /// Seed a Maven POM + jar checksum sidecar (default: `.sha256`) and the
+    /// artifact bodies at the layout paths the dispatch arm composes, for a
+    /// GAV that has both a jar and a POM (the common case).
+    fn seed_maven_pom_and_jar(proxy: &MockUpstreamProxy, pom: &[u8], jar: &[u8]) {
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha256",
+            sha256_hex(pom).into_bytes(),
+        );
+        proxy.insert_artifact("", "com/example/foo/1.0/foo-1.0.pom", pom.to_vec());
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.jar.sha256",
+            sha256_hex(jar).into_bytes(),
+        );
+        proxy.insert_artifact("", "com/example/foo/1.0/foo-1.0.jar", jar.to_vec());
+    }
+
+    #[tokio::test]
+    async fn maven_arm_pom_and_jar_ingest_both_verified_quarantined() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Maven);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let pom = b"<project>pom body</project>".to_vec();
+        let jar = b"jar-bytes".to_vec();
+        seed_maven_pom_and_jar(&proxy, &pom, &jar);
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "maven", Arc::new(MavenDispatchStub));
+
+        let outcome = handler
+            .run(
+                &leaf_params(repo.id, "com.example:foo", "1.0"),
+                make_context(),
+            )
+            .await
+            .expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(summary["urls_attempted"], 2, "{summary}");
+        assert_eq!(
+            summary["urls_succeeded"], 2,
+            "POM and jar must both ingest: {summary}"
+        );
+        assert_eq!(summary["urls_failed"], 0, "{summary}");
+        assert_eq!(summary["short_circuited"], false, "{summary}");
+    }
+
+    /// BOM/parent-POM packagings publish a POM but no jar (and therefore no
+    /// jar checksum sidecar). The leaf must still complete, with the POM
+    /// counted as succeeded — a missing jar is never a job-level failure.
+    #[tokio::test]
+    async fn maven_arm_bom_style_gav_completes_with_pom_only() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Maven);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let pom = b"<project>bom pom</project>".to_vec();
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha256",
+            sha256_hex(&pom).into_bytes(),
+        );
+        proxy.insert_artifact("", "com/example/foo/1.0/foo-1.0.pom", pom);
+        // No jar sidecar / jar body seeded at all.
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "maven", Arc::new(MavenDispatchStub));
+
+        let outcome = handler
+            .run(
+                &leaf_params(repo.id, "com.example:foo", "1.0"),
+                make_context(),
+            )
+            .await
+            .expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(
+            summary["urls_succeeded"], 1,
+            "only the POM leg ingests for a jar-less GAV: {summary}"
+        );
+        assert_eq!(summary["short_circuited"], false, "{summary}");
+    }
+
+    /// Mirrors `hort-http-maven`'s `sha512_preferred_over_weaker_digests`:
+    /// all three sidecars present, but only `.sha512` carries the correct
+    /// digest — a successful ingest proves `.sha512` was the one chosen
+    /// (the lying weaker digests would have produced a checksum mismatch).
+    #[tokio::test]
+    async fn maven_arm_prefers_strongest_valid_sidecar() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Maven);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let pom = b"<project>pom body</project>".to_vec();
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha512",
+            sha512_hex(&pom).into_bytes(),
+        );
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha256",
+            sha256_hex(b"a totally different payload").into_bytes(),
+        );
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha1",
+            sha1_hex(b"yet another payload").into_bytes(),
+        );
+        proxy.insert_artifact("", "com/example/foo/1.0/foo-1.0.pom", pom);
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "maven", Arc::new(MavenDispatchStub));
+
+        let outcome = handler
+            .run(
+                &leaf_params(repo.id, "com.example:foo", "1.0"),
+                make_context(),
+            )
+            .await
+            .expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(
+            summary["urls_succeeded"], 1,
+            "the POM must verify via the sha512 sidecar (weaker digests lie): {summary}"
+        );
+    }
+
+    /// Mirrors `hort-http-maven`'s
+    /// `malformed_sha512_falls_through_to_valid_sha1_floor`: a corrupt
+    /// `.sha512` and a non-hex `.sha256` must not block a valid `.sha1`
+    /// floor.
+    #[tokio::test]
+    async fn maven_arm_malformed_stronger_sidecars_fall_through_to_sha1_floor() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Maven);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let pom = b"<project>pom body</project>".to_vec();
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha512",
+            b"   \n".to_vec(),
+        );
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha256",
+            b"not-a-valid-digest".to_vec(),
+        );
+        proxy.insert_metadata(
+            "",
+            "com/example/foo/1.0/foo-1.0.pom.sha1",
+            sha1_hex(&pom).into_bytes(),
+        );
+        proxy.insert_artifact("", "com/example/foo/1.0/foo-1.0.pom", pom);
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "maven", Arc::new(MavenDispatchStub));
+
+        let outcome = handler
+            .run(
+                &leaf_params(repo.id, "com.example:foo", "1.0"),
+                make_context(),
+            )
+            .await
+            .expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(
+            summary["urls_succeeded"], 1,
+            "malformed stronger sidecars must fall through to the valid sha1 floor: {summary}"
+        );
+    }
+
+    /// A GAV whose groupId composes into path traversal is rejected as a
+    /// non-retry `Failed` outcome BEFORE any upstream call — never
+    /// `Completed`+`short_circuited`, which is reserved for upstream/
+    /// runtime conditions. No proxy fixtures are seeded, so the only way
+    /// this test can observe `Failed` is if the rejection happens ahead of
+    /// any sidecar/artifact fetch attempt.
+    #[tokio::test]
+    async fn maven_arm_rejects_traversal_coordinate_before_any_upstream_call() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Maven);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "maven", Arc::new(MavenDispatchStub));
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "..:foo", "1.0"), make_context())
+            .await
+            .expect("Ok");
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(!retry, "a malformed GAV must not be retried: {reason}");
+                assert!(
+                    reason.contains("GAV coordinate"),
+                    "reason should name the constraint: {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A `package` that is not the colon-joined `groupId:artifactId` form
+    /// is rejected the same way — non-retry `Failed`, no upstream call.
+    #[tokio::test]
+    async fn maven_arm_rejects_package_without_colon() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Maven);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "maven", Arc::new(MavenDispatchStub));
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "not-a-gav", "1.0"), make_context())
+            .await
+            .expect("Ok");
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(!retry, "{reason}");
+                assert!(
+                    reason.contains("groupId:artifactId"),
+                    "reason should name the constraint: {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }
