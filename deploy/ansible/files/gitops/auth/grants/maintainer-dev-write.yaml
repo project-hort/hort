@@ -1,0 +1,26 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: maintainer-dev-write
+spec:
+  # Standalone serviceAccount-subject grant, third sibling of
+  # maintainer-dev-{read,prefetch}. Gives the PAT-only operator SA global
+  # WRITE so `issue-svc-token --permission=write` can be minted for
+  # operator actions gated on Permission::Write — concretely the manual
+  # per-artifact rescan (`POST /api/v1/artifacts/:id/rescan`,
+  # ManualRescanUseCase), which is the only rescan path for terminal
+  # artifacts (the cron rescan sweep deliberately covers only
+  # released/NULL).
+  #
+  # Global on purpose, with eyes open: the mint check backs declared
+  # permissions against GLOBAL grants only, so a repo-scoped write grant
+  # cannot back a write-capable token. Blast radius: a leaked
+  # maintainer-dev token with this cap can push to hosted repos. Bounded
+  # by token expiry; mint write-capable tokens only for the action at
+  # hand and prefer read+prefetch-only mints day to day. Revocable by
+  # deleting this file + apply if the trade-off stops being acceptable.
+  subject:
+    kind: serviceAccount
+    name: maintainer-dev
+  permission: write
+  # No `repository:` -> global (see above for why).
