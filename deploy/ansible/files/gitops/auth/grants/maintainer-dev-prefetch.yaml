@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: maintainer-dev-prefetch
+spec:
+  # Standalone serviceAccount-subject grant, sibling of
+  # maintainer-dev-read.yaml. Gives the PAT-only maintainer-dev SA global
+  # PREFETCH so the operator can mint a host-side token
+  # (`issue-svc-token --name maintainer-dev --permission read
+  # --permission prefetch`) and drive the self-service prefetch endpoint
+  # directly — the endpoint accepts CliSession or ServiceAccount tokens
+  # only, and until a human IdP is wired a CliSession is unobtainable, so
+  # this SA is the operator's only session-free path. Non-admin by
+  # construction (issue-svc-token rejects admin; the mint verifies each
+  # declared permission against a live GLOBAL grant like this one).
+  subject:
+    kind: serviceAccount
+    name: maintainer-dev
+  permission: prefetch
+  # No `repository:` -> global prefetch. Deliberate: the operator warms
+  # whichever proxy needs it; the endpoint's Read AND Prefetch RBAC gate
+  # still applies per resolved repository.
