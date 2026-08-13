@@ -21,6 +21,27 @@
       "description": "Resolve crate versions through hort's crates-proxy sparse index instead of crates.io: the pull-through proxy that fires the on_dist_tag_move prefetch on each index read, warming the newest versions off the build's critical path. (cargo-virtual is the CI build source but aggregates crates-proxy, and its serve-path is still in progress, so crates-proxy is the reliable trigger point; warmed content lives here regardless.) Auth (hostRules matchHost hort.kdp.kloni.cloud, hostType crate, plus a hort read token) comes from the renovate-runner; this repo config carries only the routing. Note: crates-proxy uses indexMode include_pending, so not-yet-warmed upstream versions are visible — the read starts the quarantine clock early but does not guarantee a proposed version is released by the first build's fetch. Renovate's supplementary /api/v1/crates/ metadata probe 404s on hort (non-fatal noise, thinner changelog).",
       "matchDatasources": ["crate"],
       "registryUrls": ["sparse+https://hort.kdp.kloni.cloud/cargo/crates-proxy/"]
+    },
+    {
+      "description": "The tested Postgres version window is a deliberate policy decision, not an automatic bump: the floor is tested in the every-push CI tier, the newest supported version runs in the locally-invocable tiers. The window moves only when that decision is revisited.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["postgres"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "The tested Redis version is a deliberate policy decision, not an automatic bump.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["redis"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "The helm tooling image is updated only when needed, not automatically on every major.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["alpine/helm"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ]
 }

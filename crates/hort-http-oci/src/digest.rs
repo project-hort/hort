@@ -14,31 +14,48 @@ pub(super) enum DigestParse {
     /// Valid `sha256:<64-hex>`, wrapped in `ContentHash`.
     Ok(ContentHash),
     /// Well-formed algorithm prefix but not SHA-256 (e.g.
-    /// `sha512:<hex>`). Spec: `UNSUPPORTED`.
-    Unsupported { algorithm: String },
+    /// `sha512:<hex>`). Spec: `UNSUPPORTED`. Carries no data — the
+    /// requested algorithm is attacker-controlled and must not flow
+    /// into a response body; `parse_digest` logs it server-side.
+    Unsupported,
     /// Anything else: missing `:`, wrong length, non-hex. Spec:
     /// `DIGEST_INVALID`.
     Invalid { message: String },
 }
 
+/// Message shared by every call site that maps [`DigestParse::Unsupported`]
+/// onto the wire — deliberately constant (never carries the requested
+/// `algorithm`, which is attacker-controlled and unbounded up to the first
+/// `:`) so a future call site can't accidentally reintroduce the echo.
+pub(super) const UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE: &str = "unsupported digest algorithm";
+
 /// Parse a client-supplied digest string into a [`ContentHash`] or a
 /// classified failure.
+///
+/// Neither failure variant echoes the raw `raw` / `algo` text into its
+/// message — both are attacker-controlled (query param / manifest JSON
+/// field / mount source) and reflecting them in a response body is a
+/// log-injection / response-reflection vector. The offending value stays
+/// available server-side via `tracing::debug!`.
 pub(super) fn parse_digest(raw: &str) -> DigestParse {
     let Some((algo, hex)) = raw.split_once(':') else {
+        tracing::debug!(digest = %raw, "OCI digest missing `<algorithm>:` prefix");
         return DigestParse::Invalid {
-            message: format!("digest must be of the form <algorithm>:<hex>, got {raw:?}"),
+            message: "digest must be of the form <algorithm>:<hex>".to_string(),
         };
     };
     if algo != "sha256" {
-        return DigestParse::Unsupported {
-            algorithm: algo.to_string(),
-        };
+        tracing::debug!(algorithm = %algo, "OCI digest algorithm unsupported");
+        return DigestParse::Unsupported;
     }
     match hex.parse::<ContentHash>() {
         Ok(h) => DigestParse::Ok(h),
-        Err(_) => DigestParse::Invalid {
-            message: "sha256 digest must be exactly 64 lowercase hex characters".to_string(),
-        },
+        Err(_) => {
+            tracing::debug!(digest = %raw, "OCI sha256 digest malformed");
+            DigestParse::Invalid {
+                message: "sha256 digest must be exactly 64 lowercase hex characters".to_string(),
+            }
+        }
     }
 }
 
@@ -58,10 +75,10 @@ mod tests {
 
     #[test]
     fn rejects_sha512_as_unsupported() {
-        match parse_digest(&format!("sha512:{SAMPLE_HEX}")) {
-            DigestParse::Unsupported { algorithm } => assert_eq!(algorithm, "sha512"),
-            _ => panic!("expected Unsupported"),
-        }
+        assert!(matches!(
+            parse_digest(&format!("sha512:{SAMPLE_HEX}")),
+            DigestParse::Unsupported
+        ));
     }
 
     #[test]

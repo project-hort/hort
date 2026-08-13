@@ -1,0 +1,25 @@
+# PermissionGrant: serviceAccount oci-quarantine-e2e-ci -> read
+# oci-quarantine-e2e.
+# Granted alongside write (write does not imply read; permissions are flat).
+# Load-bearing for TWO legs, not just the obvious pull one: the blob-existence
+# HEAD skopeo issues before every upload (the dedup re-push leg) resolves
+# through the SAME base Read gate as any GET/HEAD (crates/hort-http-oci/src/
+# blobs.rs `serve`) before the quarantine hold-read exemption is even
+# consulted — the exemption only overrides the HOLD's 503, it does not
+# substitute for holding this grant. Without it the re-push leg 403s on its
+# first dedup HEAD, and the still-held-content pull would fail on a missing
+# grant instead of on the quarantine hold it is meant to prove. `isPublic` on
+# this repo does not help here either: that shortcut is legacy Basic-as-JWT-
+# only (crates/hort-app/src/use_cases/repository_access.rs `enforce`); the
+# credentialed `/v2/auth` exchange path never consults it. Mirrors
+# provenance-ci-read.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-quarantine-e2e-ci-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-quarantine-e2e-ci
+  permission: read
+  repository: oci-quarantine-e2e

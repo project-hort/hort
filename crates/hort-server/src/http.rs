@@ -34,37 +34,15 @@ use hort_http_oci::OciHttpConfig;
 /// [`build_router_with_oci_config`] so they can thread the
 /// `HORT_OCI_LEGACY_CATALOG_ENABLED` operator flag in.
 ///
-/// When `include_metrics` is true, `GET /metrics` is mounted on the main
-/// router — appropriate for developer/single-listener deployments. In
-/// production, callers set this to `false` and expose `/metrics` on a
-/// dedicated admin listener via [`build_admin_router`] so ingress rules can
-/// keep scrape traffic off the public network. See
-/// `docs/metrics-catalog.md` and ADR 0017.
-///
-/// `metrics_require_auth` gates whether the
-/// `/metrics` route mounted here requires admin authentication. The
-/// production default is `true`; operators with a legacy Prometheus
-/// scrape config that cannot supply a bearer token may opt out via
-/// `HORT_METRICS_REQUIRE_AUTH=false` (the binary emits a startup `WARN`
-/// in that case). Test callers that don't care about the flag should
-/// pass `true` to mirror production posture.
+/// `/metrics` is NEVER mounted on this router (#113 item 3) — it is served
+/// exclusively by [`build_admin_router`] on its own listener, gated by
+/// `MetricsReaderPrincipal`. See `docs/metrics-catalog.md` and ADR 0017.
 ///
 /// Default: token exchange (`POST /api/v1/auth/exchange`, ADR 0013) is
 /// **OFF**. Tests that need the route mount go through
 /// [`build_router_with_oci_config`] with `enable_token_exchange = true`.
-pub fn build_router(
-    ctx: Arc<AppContext>,
-    include_metrics: bool,
-    metrics_require_auth: bool,
-) -> Router {
-    build_router_with_oci_config(
-        ctx,
-        include_metrics,
-        &OciHttpConfig::default(),
-        metrics_require_auth,
-        false,
-        false,
-    )
+pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    build_router_with_oci_config(ctx, &OciHttpConfig::default(), false, false)
 }
 
 /// The internal-only control-plane route subtree.
@@ -160,9 +138,7 @@ fn control_plane_routes() -> Router<Arc<AppContext>> {
 /// management surface.
 pub fn build_router_with_oci_config(
     ctx: Arc<AppContext>,
-    include_metrics: bool,
     oci_http_config: &OciHttpConfig,
-    metrics_require_auth: bool,
     enable_token_exchange: bool,
     control_split: bool,
 ) -> Router {
@@ -316,7 +292,7 @@ pub fn build_router_with_oci_config(
             ctx.clone(),
         ));
 
-    let wrapped = wrap_with_middleware(ctx.clone(), inner, include_metrics, metrics_require_auth);
+    let wrapped = wrap_with_middleware(ctx.clone(), inner);
 
     // `/healthz` + `/readyz` kubelet probes.
     //
@@ -358,8 +334,15 @@ pub fn build_router_with_oci_config(
 /// them time probes around real traffic. The router therefore applies,
 /// in builder-chain order (LIFO at runtime, OUTER wraps INNER):
 ///
-/// 1. `require_principal` (innermost) — when `require_auth=true` AND
-///    `AuthContext::Enabled`. Anonymous scrapes return 401.
+/// 1. `require_principal` (innermost) — unconditional whenever
+///    `AuthContext::Enabled` (see below for the `Disabled` exception).
+///    Anonymous scrapes return 401. `GET /metrics` then goes through
+///    `render_metrics`'s own `MetricsReaderPrincipal` extractor, which
+///    requires `Permission::ReadMetrics` — an authenticated caller without
+///    the grant gets 403 (#113 item 3: no more `HORT_METRICS_REQUIRE_AUTH`
+///    opt-out; the grant is the only gate, `require_principal` here just
+///    turns "no token at all" into a clean 401 instead of the extractor's
+///    router-wiring-bug 500).
 /// 2. Write-rate-limit (skips on GET — `/metrics` is unaffected at
 ///    runtime but the layer is attached to mirror the public stack).
 /// 3. `http_metrics` — counts the scrape requests themselves so
@@ -368,22 +351,17 @@ pub fn build_router_with_oci_config(
 ///    `Referrer-Policy` injected on the scrape response.
 /// 5. `request_trust` (outermost) — populates `RequestTrust` so the
 ///    auth layer's audit-log line carries `client_ip`.
-///
-/// `require_auth=false` is the legacy escape hatch
-/// (`HORT_METRICS_REQUIRE_AUTH=false`); operators get the four other
-/// hardening layers but anonymous scrape returns 200.
-pub fn build_admin_router(ctx: Arc<AppContext>, require_auth: bool) -> Router {
+pub fn build_admin_router(ctx: Arc<AppContext>) -> Router {
     let mut router: Router<Arc<AppContext>> = Router::new().route("/metrics", get(render_metrics));
 
-    // `require_principal` carve-out.
-    //
-    // Only attached when both `require_auth=true` AND auth is wired
-    // (`AuthContext::Enabled`). The runtime-startup guard
-    // (`ensure_auth_enabled`) refuses to boot under
-    // `AUTH=disabled`, so the `Disabled` branch only fires from
-    // mock-context tests; we mirror the public router's gate to keep
-    // those tests' anonymous-pass-through behaviour intact.
-    if require_auth && ctx.auth.has_auth() {
+    // Only skipped when auth isn't wired at all (`AuthContext::Disabled`).
+    // The runtime-startup guard (`ensure_auth_enabled`) refuses to boot
+    // under `AUTH=disabled`, so that branch only fires from mock-context
+    // tests; we mirror the public router's gate to keep those tests'
+    // anonymous-pass-through behaviour intact (under `Disabled`, every
+    // extractor — including `MetricsReaderPrincipal` — grants
+    // unconditionally once a principal is present in extensions).
+    if ctx.auth.has_auth() {
         router = router.layer(axum::middleware::from_fn_with_state(
             ctx.clone(),
             middleware::auth::require_principal,
@@ -446,24 +424,14 @@ pub fn build_admin_router(ctx: Arc<AppContext>, require_auth: bool) -> Router {
 /// The control routes get the **same** cross-cutting stack the main
 /// router applies to them — `request_timeout` (mirroring the non-OCI
 /// subtree) then [`wrap_with_middleware`] (auth dispatch, rate limits,
-/// load shed, metrics-meta, security headers, request trust). Passing
-/// `include_metrics = false` keeps `/metrics` off this listener (it is
-/// the metrics/admin listener's job — `build_admin_router`).
-/// `metrics_require_auth` is irrelevant here (no `/metrics` route) but
-/// threaded through `wrap_with_middleware` as `true` to mirror the
-/// production posture, exactly as `build_router`'s callers do.
-pub fn build_control_router(ctx: Arc<AppContext>, require_auth: bool) -> Router {
+/// load shed, metrics-meta, security headers, request trust).
+/// `wrap_with_middleware` never mounts `/metrics` on any router (#113 item
+/// 3) — that stays exclusively `build_admin_router`'s job.
+pub fn build_control_router(ctx: Arc<AppContext>) -> Router {
     let control = control_plane_routes().layer(middleware::request_timeout::request_timeout_layer(
         ctx.http_timeout_config.request_timeout,
     ));
-
-    // `require_auth` is consumed as the `metrics_require_auth` slot of
-    // `wrap_with_middleware`: there is no `/metrics` route on the
-    // control listener, so the value only affects a non-existent
-    // carve-out. We forward it (rather than hard-coding `true`) so a
-    // deployment running `HORT_METRICS_REQUIRE_AUTH=false` keeps a single
-    // consistent auth posture across every listener.
-    wrap_with_middleware(ctx, control, false, require_auth)
+    wrap_with_middleware(ctx, control)
 }
 
 #[cfg(test)]
@@ -472,16 +440,46 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use chrono::Utc;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use hort_app::use_cases::test_support::{
         sample_artifact, sample_repository, MockUserRepository,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::entities::caller::CallerPrincipal;
 
     use hort_http_core::context::AuthContext;
+    use hort_http_core::middleware::auth::test_support::inject_principal;
     use hort_http_core::test_support::{build_mock_ctx as build_base_ctx, with_auth};
+
+    /// Build a `GET /metrics` request carrying a pre-validated principal
+    /// in the `AuthenticatedPrincipal` extension slot — the shape
+    /// `require_principal` writes in production. Needed because
+    /// `MetricsReaderPrincipal` (#113 item 2) now gates `render_metrics`;
+    /// under the `AuthContext::Disabled` mock context these tests use, no
+    /// auth middleware is attached at all (mirrors production: boot
+    /// refuses `Disabled`), so a bare anonymous request never reaches the
+    /// extension-populated shape any real deployment's dispatch layer
+    /// produces. `Disabled` still grants the RBAC leg unconditionally
+    /// once a principal is present — see `authorize()`'s `Disabled` arm.
+    fn metrics_request_with_principal() -> Request<Body> {
+        let principal = CallerPrincipal {
+            user_id: Uuid::new_v4(),
+            external_id: "test:sub".into(),
+            username: "scraper".into(),
+            email: "scraper@example.com".into(),
+            claims: vec![],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        };
+        let mut req = Request::get("/metrics").body(Body::empty()).unwrap();
+        inject_principal(&mut req, principal);
+        req
+    }
 
     /// Seed a `pypi-test` repository + one downloadable artifact onto the
     /// shared mock context, so PyPI routes have something to serve.
@@ -504,11 +502,15 @@ mod tests {
         ctx
     }
 
-    /// End-to-end wiring check: drive a PyPI request through the real
-    /// router, then scrape `/metrics` and assert the HTTP counters are
-    /// present with the **matched route template** as the path label.
+    /// End-to-end wiring check: drive a PyPI request through the real main
+    /// router, then scrape `/metrics` on the admin router built from the
+    /// SAME `ctx` (shared `metrics_handle` — #113 item 3 moved `/metrics`
+    /// off the main router entirely, see
+    /// `build_router_without_metrics_returns_404_for_scrape`) and assert
+    /// the HTTP counters are present with the **matched route template**
+    /// as the path label.
     #[test]
-    fn build_router_mounts_metrics_and_middleware() {
+    fn build_router_mounts_middleware_and_drops_metrics_to_admin_router() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
 
@@ -519,7 +521,7 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    let router = build_router(ctx, true, true);
+                    let router = build_router(ctx.clone());
 
                     let response = router
                         .clone()
@@ -533,8 +535,11 @@ mod tests {
                     assert_eq!(response.status(), StatusCode::OK);
                     let _ = to_bytes(response.into_body(), 1024).await.unwrap();
 
-                    let scrape = router
-                        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+                    // `/metrics` gone from the main listener is covered by
+                    // `build_router_without_metrics_returns_404_for_scrape`.
+                    let admin_router = build_admin_router(ctx);
+                    let scrape = admin_router
+                        .oneshot(metrics_request_with_principal())
                         .await
                         .unwrap();
                     assert_eq!(scrape.status(), StatusCode::OK);
@@ -559,7 +564,7 @@ mod tests {
             "hort_http_responses_total not present in scrape output:\n{body_text}"
         );
         assert!(
-            body_text.contains("path=\"/pypi/:repo_key/simple/:project/:filename\""),
+            body_text.contains("path=\"/pypi/{repo_key}/simple/{project}/{filename}\""),
             "matched route template missing in scrape output:\n{body_text}"
         );
         assert!(
@@ -592,7 +597,7 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    let router = build_router(ctx, false, true);
+                    let router = build_router(ctx);
 
                     let response = router
                         .oneshot(Request::get("/v2/").body(Body::empty()).unwrap())
@@ -627,7 +632,7 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    let router = build_router(ctx, false, true);
+                    let router = build_router(ctx);
 
                     let response = router
                         .oneshot(Request::get("/v2/").body(Body::empty()).unwrap())
@@ -662,15 +667,19 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    // `require_auth=true` is the production default; the
-                    // mock context here is `AuthContext::Disabled`, so
+                    // The mock context here is `AuthContext::Disabled`, so
                     // the `require_principal` layer is skipped (mirrors
-                    // the public router's gate). Anonymous still 200s.
-                    let router = build_admin_router(ctx, true);
+                    // the public router's gate; boot refuses `Disabled`
+                    // in production). `render_metrics` still requires
+                    // `MetricsReaderPrincipal` (#113 item 2) — under
+                    // `Disabled` the RBAC leg grants unconditionally, but
+                    // `extract_principal` still needs a principal in
+                    // extensions, hence the manual injection.
+                    let router = build_admin_router(ctx);
 
                     let metrics_res = router
                         .clone()
-                        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+                        .oneshot(metrics_request_with_principal())
                         .await
                         .unwrap();
                     let pypi_res = router
@@ -712,11 +721,10 @@ mod tests {
                     .block_on(async {
                         let ctx = build_mock_ctx(handle.clone());
 
-                        // Control router: `require_auth=true` is the
-                        // production default; mock ctx is
+                        // Control router: mock ctx is
                         // `AuthContext::Disabled`, so `require_principal`
                         // is skipped (mirrors the admin-router gate).
-                        let control = build_control_router(ctx.clone(), true);
+                        let control = build_control_router(ctx.clone());
                         // `/admin/repositories/:key` — the seeded
                         // `pypi-test` repo resolves under
                         // `AuthContext::Disabled` (AdminPrincipal grants
@@ -744,9 +752,7 @@ mod tests {
                         // plane still serves.
                         let main = build_router_with_oci_config(
                             ctx,
-                            false,
                             &OciHttpConfig::default(),
-                            true,
                             false,
                             true,
                         );
@@ -842,10 +848,10 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    let target = uuid::Uuid::new_v4();
-                    let token = uuid::Uuid::new_v4();
+                    let target = Uuid::new_v4();
+                    let token = Uuid::new_v4();
 
-                    let control = build_control_router(ctx.clone(), true);
+                    let control = build_control_router(ctx.clone());
                     // Admin-mint and admin-revoke must be ROUTED here.
                     let control_admin_mint_res = control
                         .clone()
@@ -882,14 +888,8 @@ mod tests {
                         .unwrap();
 
                     // Main router with the control split ON.
-                    let main = build_router_with_oci_config(
-                        ctx,
-                        false,
-                        &OciHttpConfig::default(),
-                        true,
-                        false,
-                        true,
-                    );
+                    let main =
+                        build_router_with_oci_config(ctx, &OciHttpConfig::default(), false, true);
                     // Both admin token routes must be GONE here.
                     let main_admin_mint_res = main
                         .clone()
@@ -940,12 +940,12 @@ mod tests {
         assert_ne!(
             control_admin_mint,
             StatusCode::NOT_FOUND,
-            "POST /api/v1/admin/users/:id/tokens must be routed on the control listener"
+            "POST /api/v1/admin/users/{{id}}/tokens must be routed on the control listener"
         );
         assert_ne!(
             control_admin_revoke,
             StatusCode::NOT_FOUND,
-            "DELETE /api/v1/admin/tokens/:id must be routed on the control listener"
+            "DELETE /api/v1/admin/tokens/{{id}} must be routed on the control listener"
         );
         assert_eq!(
             control_self_mint,
@@ -956,13 +956,13 @@ mod tests {
         assert_eq!(
             main_admin_mint,
             StatusCode::NOT_FOUND,
-            "POST /api/v1/admin/users/:id/tokens must be removed from the public listener \
+            "POST /api/v1/admin/users/{{id}}/tokens must be removed from the public listener \
              when the control split is ON"
         );
         assert_eq!(
             main_admin_revoke,
             StatusCode::NOT_FOUND,
-            "DELETE /api/v1/admin/tokens/:id must be removed from the public listener \
+            "DELETE /api/v1/admin/tokens/{{id}} must be removed from the public listener \
              when the control split is ON"
         );
         assert_ne!(
@@ -990,14 +990,8 @@ mod tests {
                     let ctx = build_mock_ctx(handle.clone());
                     // `control_split=false` — the production/dev default
                     // when `HORT_CONTROL_BIND` is unset.
-                    let router = build_router_with_oci_config(
-                        ctx,
-                        false,
-                        &OciHttpConfig::default(),
-                        true,
-                        false,
-                        false,
-                    );
+                    let router =
+                        build_router_with_oci_config(ctx, &OciHttpConfig::default(), false, false);
                     let res = router
                         .oneshot(
                             Request::get("/api/v1/admin/repositories/pypi-test")
@@ -1034,7 +1028,7 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    let router = build_router(ctx, false, true);
+                    let router = build_router(ctx);
 
                     let res = router
                         .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
@@ -1048,9 +1042,13 @@ mod tests {
     }
 
     /// Security-response-headers middleware is
-    /// attached globally. Drive one HTML response (PyPI simple index) and
-    /// one plain-text response (`/metrics`) through the real router and
-    /// assert the presence / absence of each hardening header.
+    /// attached globally. Drive one HTML response (PyPI simple index)
+    /// through the main router and one plain-text response (`/metrics`,
+    /// gone from the main router since #113 item 3) through the admin
+    /// router built from the SAME `ctx` — both go through
+    /// `wrap_with_middleware`, so this still proves the security-header
+    /// layer applies uniformly regardless of content type or which
+    /// listener served the response.
     #[test]
     fn build_router_attaches_security_headers_globally() {
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -1063,10 +1061,9 @@ mod tests {
                 .unwrap()
                 .block_on(async {
                     let ctx = build_mock_ctx(handle.clone());
-                    let router = build_router(ctx, true, true);
+                    let router = build_router(ctx.clone());
 
                     let html_res = router
-                        .clone()
                         .oneshot(
                             Request::get("/pypi/pypi-test/simple/pkg/")
                                 .body(Body::empty())
@@ -1088,8 +1085,9 @@ mod tests {
                     );
                     let html_headers = html_res.headers().clone();
 
-                    let plain_res = router
-                        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+                    let admin_router = build_admin_router(ctx);
+                    let plain_res = admin_router
+                        .oneshot(metrics_request_with_principal())
                         .await
                         .unwrap();
                     assert_eq!(plain_res.status(), StatusCode::OK);
@@ -1238,7 +1236,7 @@ mod tests {
                         },
                     );
 
-                    let router = build_router(ctx, false, true);
+                    let router = build_router(ctx);
 
                     let get_res = router
                         .clone()
@@ -1335,7 +1333,7 @@ mod tests {
                         },
                     );
 
-                    let router = build_router(ctx, false, true);
+                    let router = build_router(ctx);
 
                     let healthz_res = router
                         .clone()

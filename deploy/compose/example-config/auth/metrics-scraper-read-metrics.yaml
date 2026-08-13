@@ -1,0 +1,18 @@
+# PermissionGrant: serviceAccount metrics-scraper -> read_metrics (global).
+#
+# `read_metrics` is always checked with repository=None (the /metrics
+# exposition is process-wide, never per-repository — ADR 0052), so
+# `repository:` is deliberately OMITTED here. An unscoped grant with a
+# `claims` subject would be REJECTED at apply by the wildcard-repo-non-admin
+# linter rule; the `serviceAccount` subject resolves to an SA-owned User
+# grant and takes the linter's provenance exemption instead. See
+# docs/architecture/how-to/operate/metrics-scraper-service-account.md §3.1.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: metrics-scraper-read-metrics
+spec:
+  subject:
+    kind: serviceAccount
+    name: metrics-scraper
+  permission: read_metrics

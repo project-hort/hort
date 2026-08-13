@@ -5,7 +5,7 @@
 //! `jobs.kind` SQL CHECK when enqueued through the **real adapter path**
 //! (`JobsRepository::enqueue_task`), complementing the raw-SQL coverage in
 //! `migration_009_jobs_and_findings.rs`. This is the "easy miss" surface:
-//! a kind added to `VALID_TASK_KINDS` and the worker dispatch but NOT to
+//! a kind added to `ADMIN_INVOKABLE_TASK_KINDS` and the worker dispatch but NOT to
 //! the `jobs.kind` CHECK (defined inline in `009_scan_jobs_and_findings.sql`)
 //! enqueues fine in every mock-based unit test and fails only here —
 //! against a real Postgres.

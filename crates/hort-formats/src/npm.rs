@@ -67,6 +67,12 @@ const NPM_TARBALL_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// `parse_download_path` boundary.
 const NPM_NAME_MAX: usize = 214;
 
+/// Maximum byte length of an npm version string. Mirrors
+/// `CARGO_VERSION_MAX` — real semver versions are well under this; the
+/// cap exists to bound pathological input, not to accommodate any known
+/// legitimate shape.
+const NPM_VERSION_MAX: usize = 64;
+
 /// Parse the *declared runtime* dependency specs from an npm
 /// `package.json` manifest body.
 ///
@@ -204,6 +210,83 @@ fn validate_npm_name_component(component: &str, label: &str) -> DomainResult<()>
             )));
         }
     }
+    Ok(())
+}
+
+/// Validate that `version` matches a semver-ish allowlist:
+/// `[0-9]+(\.[0-9]+){0,2}(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?`.
+///
+/// Mirrors `hort_formats::cargo::validate_cargo_version` — same shape,
+/// same rejection tags, same charset — so a garbage `_attachments`-derived
+/// version (empty, a NUL byte, a path-traversal-shaped string, or an
+/// oversized blob) is rejected before any storage write rather than
+/// surviving as a corrupt projection row. Returns
+/// [`DomainError::Validation`] tagged with `npm.version`. Error messages
+/// **never** include the rejected input.
+pub fn validate_npm_version(version: &str) -> DomainResult<()> {
+    if version.is_empty() {
+        return Err(DomainError::Validation(
+            "npm.version: empty version is not permitted".to_string(),
+        ));
+    }
+    if version.len() > NPM_VERSION_MAX {
+        return Err(DomainError::Validation(format!(
+            "npm.version: exceeds {NPM_VERSION_MAX}-byte cap"
+        )));
+    }
+
+    // Split on optional `+<build>` suffix first.
+    let (core_and_pre, build) = match version.split_once('+') {
+        Some((lhs, rhs)) => (lhs, Some(rhs)),
+        None => (version, None),
+    };
+    // Split the remainder on optional `-<prerelease>` suffix.
+    let (core, prerelease) = match core_and_pre.split_once('-') {
+        Some((lhs, rhs)) => (lhs, Some(rhs)),
+        None => (core_and_pre, None),
+    };
+
+    // Core must be 1..=3 dot-separated numeric components, each
+    // non-empty and digit-only.
+    if core.is_empty() {
+        return Err(DomainError::Validation(
+            "npm.version: core component is empty".to_string(),
+        ));
+    }
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(DomainError::Validation(
+            "npm.version: core must be MAJOR[.MINOR[.PATCH]]".to_string(),
+        ));
+    }
+    for p in &parts {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(DomainError::Validation(
+                "npm.version: core components must be numeric".to_string(),
+            ));
+        }
+    }
+
+    // Prerelease and build, when present, are non-empty and limited to
+    // the SemVer §9/§10 identifier charset [a-zA-Z0-9.-].
+    for (label, suffix) in [("prerelease", prerelease), ("build", build)] {
+        if let Some(s) = suffix {
+            if s.is_empty() {
+                return Err(DomainError::Validation(format!(
+                    "npm.version: {label} segment is empty"
+                )));
+            }
+            if !s
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            {
+                return Err(DomainError::Validation(format!(
+                    "npm.version: {label} segment contains a byte outside [a-zA-Z0-9.-]"
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1844,6 +1927,74 @@ mod tests {
         let err = validate_npm_name("@").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
         assert!(err.to_string().contains("npm.name"));
+    }
+
+    // -- version validation ---------------------------------------------
+    //
+    // `validate_npm_version` mirrors `cargo::validate_cargo_version`: the
+    // publish-time `_attachments`-derived version must pass this gate
+    // BEFORE any storage write. Every rejection carries the structured
+    // `npm.version` field tag and never echoes the rejected input.
+
+    #[test]
+    fn validate_npm_version_accepts_release() {
+        validate_npm_version("1.2.3").expect("plain semver triple must pass");
+    }
+
+    #[test]
+    fn validate_npm_version_accepts_prerelease() {
+        validate_npm_version("1.2.3-beta.1").expect("prerelease must pass");
+    }
+
+    #[test]
+    fn validate_npm_version_accepts_build_metadata() {
+        validate_npm_version("1.2.3+build.5").expect("build metadata must pass");
+    }
+
+    #[test]
+    fn validate_npm_version_rejects_empty() {
+        let err = validate_npm_version("").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(err.to_string().contains("npm.version"));
+    }
+
+    #[test]
+    fn validate_npm_version_rejects_nul_byte() {
+        let err = validate_npm_version("1.0.0\x00").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(err.to_string().contains("npm.version"));
+        assert!(
+            !err.to_string().contains('\u{0}'),
+            "rejection must not echo the rejected input: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_npm_version_rejects_oversized() {
+        let s = format!("1.0.0-{}", "a".repeat(NPM_VERSION_MAX));
+        let err = validate_npm_version(&s).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(err.to_string().contains("npm.version"));
+        assert!(
+            !err.to_string().contains(&s),
+            "rejection must not echo the rejected input: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_npm_version_rejects_path_traversal_shaped() {
+        let err = validate_npm_version("../../etc/passwd").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(err.to_string().contains("npm.version"));
+        assert!(
+            !err.to_string().contains("etc/passwd"),
+            "rejection must not echo the rejected input: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_npm_version_rejects_wildcard() {
+        assert!(validate_npm_version("1.0.0-*").is_err());
     }
 
     #[test]

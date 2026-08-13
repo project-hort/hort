@@ -80,7 +80,7 @@ use hort_domain::types::ContentHash;
 use hort_formats::oci::OciFormatHandler;
 
 use super::coords::oci_manifest_coords;
-use super::digest::{parse_digest, DigestParse};
+use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::quarantine;
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
@@ -394,9 +394,9 @@ pub(super) async fn serve(
 fn resolve_digest_reference(reference: &str) -> Result<ContentHash, Box<Response>> {
     match parse_digest(reference) {
         DigestParse::Ok(h) => Ok(h),
-        DigestParse::Unsupported { algorithm } => Err(Box::new(
+        DigestParse::Unsupported => Err(Box::new(
             OciError::Unsupported {
-                message: format!("unsupported digest algorithm: {algorithm}"),
+                message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
             }
             .into_response(),
         )),
@@ -1514,8 +1514,16 @@ async fn finalise_manifest_pull(
                         }),
                         content_hash: content_hash.clone(),
                         // Coalesced-follower path is not a seed-import;
-                        // quarantine is policy-driven through the leader's
-                        // primary `ingest_verified`.
+                        // this follower's OWN target-repo row resolves
+                        // its OWN quarantine gate inside the shared
+                        // `register_by_hash_inner` tail (issue #107 Item
+                        // 1) — it is NOT inherited from the leader's
+                        // `ingest_verified`, which only ever gated the
+                        // leader's own (possibly different) repo's row.
+                        // `quarantine_status` is a per-repo-row column;
+                        // before #107 Item 1 this follower row minted
+                        // `None`/immediately-downloadable with no gate at
+                        // all.
                         seed_import_quarantine_anchor: None,
                     },
                     &OciFormatHandler,
@@ -1690,7 +1698,7 @@ mod tests {
     fn manifest_router(ctx: Arc<AppContext>) -> Router {
         Router::new()
             .route(
-                "/v2/:repo_key/*tail",
+                "/v2/{repo_key}/{*tail}",
                 axum::routing::get(super::super::get_pull).head(super::super::head_pull),
             )
             .with_state(ctx)

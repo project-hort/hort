@@ -25,16 +25,19 @@
 //! - `select_eligible_returns_null_quarantine_no_policy_artifact`
 //!
 //! `select_stranded` coverage matrix (issue #6 — stranded-scan recovery;
-//! mirrors the different predicate: `quarantine_status='quarantined'` +
-//! most-recent `kind='scan'` job `status='failed'`, no interval/`now`
-//! gating):
+//! widened by issue #115 defect (a) cure — mirrors the predicate:
+//! `quarantine_status='quarantined'` + (most-recent `kind='scan'` job
+//! `status='failed'` OR no `kind='scan'` job at all) + resolved policy
+//! actually scans, no interval/`now` gating):
 //!
 //! - `select_stranded_returns_quarantined_artifact_with_failed_last_scan`
-//! - `select_stranded_skips_quarantined_artifact_with_no_scan_job`
+//! - `select_stranded_returns_quarantined_artifact_with_no_scan_job_under_scanning_policy` (#115)
+//! - `select_stranded_skips_quarantined_artifact_with_no_scan_job_under_scan_waived_policy` (#115)
 //! - `select_stranded_skips_quarantined_artifact_with_pending_last_scan`
 //! - `select_stranded_skips_released_artifact_even_with_failed_scan`
 //! - `select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan`
 //! - `select_stranded_skips_rejected_artifact_even_with_failed_scan`
+//! - `select_stranded_skips_is_deleted_artifact_even_with_failed_scan` (#115)
 //! - `select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job`
 //!
 //! New tests carry `#[serial(hort_pg_db)]` per the crate-wide DB-test
@@ -176,6 +179,38 @@ async fn seed_repo_scoped_policy(pool: &PgPool, repo_id: Uuid, rescan_interval_h
     .execute(pool)
     .await
     .expect("seed repo-scoped policy_projections row");
+    policy_id
+}
+
+/// Seed a non-archived repository-scoped policy with `scan_backends: []`
+/// — the operator's explicit ScanWaived opt-out. Used by the #115 item2
+/// `select_stranded` scan-policy-aware guard tests: a job-less (or
+/// failed-job) quarantined artifact under this policy must NOT be
+/// treated as stranded — see `crates/hort-adapters-postgres/src/rescan_candidates.rs`'s
+/// `select_stranded` doc comment.
+async fn seed_repo_scoped_scan_waived_policy(pool: &PgPool, repo_id: Uuid) -> Uuid {
+    let policy_id = Uuid::new_v4();
+    let name = format!("it-rescan-waived-policy-{}", policy_id.simple());
+    let scope = json!({ "Repository": repo_id });
+    sqlx::query(
+        r#"INSERT INTO public.policy_projections (
+               policy_id, name, scope, severity_threshold,
+               rescan_interval_hours, quarantine_duration_secs,
+               require_approval, archived, scan_backends,
+               stream_version
+           ) VALUES (
+               $1, $2, $3, 'high',
+               24, 86400,
+               false, false, ARRAY[]::text[],
+               1
+           )"#,
+    )
+    .bind(policy_id)
+    .bind(&name)
+    .bind(&scope)
+    .execute(pool)
+    .await
+    .expect("seed scan-waived repo-scoped policy_projections row");
     policy_id
 }
 
@@ -638,17 +673,72 @@ async fn select_eligible_errs_on_malformed_checksum() {
 }
 
 // ---------------------------------------------------------------------
-// (b) Quarantined artifact, never scanned (no jobs row) → NOT returned
+// (b) Quarantined artifact, never scanned (no jobs row), under a
+//     SCANNING policy → returned. #115 defect (a) cure: pre-widening,
+//     a job-less quarantined artifact was invisible to both
+//     `select_eligible` (requires `released`/`NULL`) and the OLD
+//     `select_stranded` (required a *failed* job row, and a job-less
+//     artifact has no job row at all) — permanently stranded with no
+//     manual rescan surface to recover it. This is the exact seed-import
+//     stranding scenario item1 stops at the source; this sweep recovers
+//     rows already stranded that way before that fix.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn select_stranded_skips_quarantined_artifact_with_no_scan_job() {
+async fn select_stranded_returns_quarantined_artifact_with_no_scan_job_under_scanning_policy() {
     let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
     let repo = seed_repo(&pool).await;
+    // Explicit repo-scoped policy — default `scan_backends = ['trivy']`
+    // (the column DEFAULT; `seed_repo_scoped_policy` does not override
+    // it), i.e. scanning is active. Deterministic: unlike relying on the
+    // DefaultPolicy no-policy fallback, this cannot be shadowed by a
+    // sibling test binary's stray Global policy.
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    // No scan job seeded at all.
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    let matched = filter_to(&rows, &[artifact]);
+    assert_eq!(
+        matched.len(),
+        1,
+        "a quarantined artifact with no scan job history at all, under a \
+         scanning policy, IS stranded and must be recovered (issue #115 \
+         defect (a) cure — the widened LEFT JOIN LATERAL admits \
+         last_job.status IS NULL)"
+    );
+    assert_eq!(matched[0].repository_id, repo);
+    assert_eq!(matched[0].format, "pypi");
+}
+
+// ---------------------------------------------------------------------
+// (b2) Quarantined artifact, never scanned (no jobs row), under a
+//      SCAN-WAIVED (`scan_backends: []`) policy → NOT returned. The
+//      operator explicitly opted out of scanning for this repo; the
+//      artifact is not "stranded" — it releases via the existing
+//      ScanWaived release authority (ADR 0007) — and enqueueing a scan
+//      job for it would contradict that policy. This is the
+//      resolved-policy-scans guard #115 item2 adds.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_quarantined_artifact_with_no_scan_job_under_scan_waived_policy() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_scan_waived_policy(&pool, repo).await;
     let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
     // No scan job seeded at all.
 
@@ -660,8 +750,45 @@ async fn select_stranded_skips_quarantined_artifact_with_no_scan_job() {
 
     assert!(
         filter_to(&rows, &[artifact]).is_empty(),
-        "a quarantined artifact with no scan job history at all is not \
-         stranded — it is awaiting its first scan (LATERAL JOIN excludes it)"
+        "a job-less quarantined artifact under a scan_backends:[] policy \
+         is NOT stranded — it releases via the ScanWaived authority, and \
+         must not receive an operator-contradicting scan enqueue"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (b3) is_deleted artifact with a failed scan job → NOT returned.
+//      Mirrors the released/rejected/scan_indeterminate terminal-state
+//      exclusions — a soft-deleted artifact must never be re-picked for
+//      scanning regardless of its quarantine/job history.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_is_deleted_artifact_even_with_failed_scan() {
+    let _serial = lock_serial().await;
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+    sqlx::query("UPDATE public.artifacts SET is_deleted = true WHERE id = $1")
+        .bind(artifact)
+        .execute(&pool)
+        .await
+        .expect("mark artifact is_deleted for the exclusion test");
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "a soft-deleted artifact must NEVER be re-picked for scanning, \
+         regardless of quarantine_status or scan-job history"
     );
 }
 

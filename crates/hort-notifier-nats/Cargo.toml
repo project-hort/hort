@@ -75,4 +75,4 @@ testcontainers = { workspace = true }
 # `RootCertStore::add`). Same generator + version as
 # `hort-notifier-webhook` / `hort-adapters-upstream-http` test suites.
 # rcgen is test-only; production paths never construct certificates.
-rcgen = "0.13"
+rcgen = "0.14"

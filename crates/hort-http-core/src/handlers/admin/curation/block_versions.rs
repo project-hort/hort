@@ -142,6 +142,17 @@ impl FailedBlockEntryDto {
             AppError::Domain(DomainError::UpstreamBodyTooLarge { .. }) => {
                 ("upstream_body_too_large", err.to_string())
             }
+            // Upstream index/metadata parse failure. The
+            // variant carries no upstream-derived text (`err.to_string()`
+            // is the fixed `#[error(...)]` constant), so surfacing it
+            // unmodified here doesn't reopen the reflection the typed
+            // boundary closes — same reasoning as `UpstreamBodyTooLarge`
+            // above. Rare on this code path (curation-block operates on
+            // already-ingested artifacts, not the upstream proxy path);
+            // the arm exists for exhaustive matching.
+            AppError::Domain(DomainError::UpstreamMetadataInvalid) => {
+                ("upstream_metadata_invalid", err.to_string())
+            }
             AppError::Repository(_) => ("repository", "internal error".into()),
             AppError::Storage(_) => ("storage", "internal error".into()),
             AppError::EventStore(_) => ("event_store", "internal error".into()),

@@ -302,7 +302,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE archived = false
-                   ORDER BY name"#,
+                   ORDER BY created_at, policy_id"#,
             )
             .fetch_all(&self.pool)
             .await
@@ -715,6 +715,51 @@ mod tests {
         assert!(!listed.iter().any(|p| p.policy_id == archived_id));
     }
 
+    /// `list_active`'s ordering contract is `(created_at, policy_id)`
+    /// ascending, not alphabetical by name. `zzz` sorts last
+    /// alphabetically but is created first; `aaa` sorts first
+    /// alphabetically but is created second — if the query still
+    /// ordered by name this test would see `aaa` before `zzz`. Distinct
+    /// scopes (`Global` / `Repository`) so this doesn't trip the
+    /// active-scope-uniqueness index.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn list_active_orders_by_creation_not_name() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+        let base = Utc::now();
+
+        let zzz_id = Uuid::new_v4();
+        let mut zzz = sample_projection(zzz_id, &format!("zzz-{}", zzz_id.simple()), 1);
+        zzz.scope = PolicyScope::Global;
+        zzz.created_at = base;
+        repo.upsert(&zzz).await.expect("zzz upsert");
+
+        let aaa_id = Uuid::new_v4();
+        let mut aaa = sample_projection(aaa_id, &format!("aaa-{}", aaa_id.simple()), 1);
+        aaa.scope = PolicyScope::Repository(Uuid::new_v4());
+        aaa.created_at = base + chrono::Duration::seconds(1);
+        repo.upsert(&aaa).await.expect("aaa upsert");
+
+        let listed = repo.list_active().await.expect("list_active");
+        let ids: Vec<Uuid> = listed.iter().map(|p| p.policy_id).collect();
+        let zzz_pos = ids
+            .iter()
+            .position(|&id| id == zzz_id)
+            .expect("zzz present");
+        let aaa_pos = ids
+            .iter()
+            .position(|&id| id == aaa_id)
+            .expect("aaa present");
+        assert!(
+            zzz_pos < aaa_pos,
+            "zzz was created first and must sort first despite sorting last \
+             alphabetically: {ids:?}"
+        );
+    }
+
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn upsert_and_list_exclusions_round_trip() {
@@ -937,5 +982,105 @@ mod tests {
             .await
             .expect("find_by_name");
         assert!(result.is_none());
+    }
+
+    // ---- scope-uniqueness partial index (idx_policy_projections_active_scope)
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn upsert_second_active_global_policy_violates_scope_uniqueness() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+
+        let id1 = Uuid::new_v4();
+        let p1 = sample_projection(id1, &format!("scope-a-{}", id1.simple()), 1);
+        repo.upsert(&p1).await.expect("first Global upsert");
+
+        let id2 = Uuid::new_v4();
+        let p2 = sample_projection(id2, &format!("scope-b-{}", id2.simple()), 1);
+        let err = repo
+            .upsert(&p2)
+            .await
+            .expect_err("a second active Global policy must violate the scope index");
+        assert!(
+            err.to_string()
+                .contains("idx_policy_projections_active_scope"),
+            "expected the scope-uniqueness index in the error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn upsert_second_active_same_repository_policy_violates_scope_uniqueness() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+        let repo_id = Uuid::new_v4();
+
+        let id1 = Uuid::new_v4();
+        let mut p1 = sample_projection(id1, &format!("repo-a-{}", id1.simple()), 1);
+        p1.scope = PolicyScope::Repository(repo_id);
+        repo.upsert(&p1).await.expect("first Repository upsert");
+
+        let id2 = Uuid::new_v4();
+        let mut p2 = sample_projection(id2, &format!("repo-b-{}", id2.simple()), 1);
+        p2.scope = PolicyScope::Repository(repo_id);
+        let err = repo
+            .upsert(&p2)
+            .await
+            .expect_err("a second active same-Repository policy must violate the scope index");
+        assert!(
+            err.to_string()
+                .contains("idx_policy_projections_active_scope"),
+            "expected the scope-uniqueness index in the error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn upsert_active_policies_in_distinct_repository_scopes_both_succeed() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+
+        let id1 = Uuid::new_v4();
+        let mut p1 = sample_projection(id1, &format!("distinct-a-{}", id1.simple()), 1);
+        p1.scope = PolicyScope::Repository(Uuid::new_v4());
+        repo.upsert(&p1).await.expect("first distinct-repo upsert");
+
+        let id2 = Uuid::new_v4();
+        let mut p2 = sample_projection(id2, &format!("distinct-b-{}", id2.simple()), 1);
+        p2.scope = PolicyScope::Repository(Uuid::new_v4());
+        repo.upsert(&p2)
+            .await
+            .expect("a second policy in a DIFFERENT repository scope must not collide");
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn archiving_prior_active_policy_allows_new_active_same_scope_insert() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+
+        let id1 = Uuid::new_v4();
+        let mut p1 = sample_projection(id1, &format!("arch-a-{}", id1.simple()), 1);
+        repo.upsert(&p1).await.expect("first Global upsert");
+
+        // Archive the first row — it must free up the Global scope.
+        p1.archived = true;
+        p1.stream_version = 2;
+        repo.upsert(&p1).await.expect("archive first row");
+
+        let id2 = Uuid::new_v4();
+        let p2 = sample_projection(id2, &format!("arch-b-{}", id2.simple()), 1);
+        repo.upsert(&p2)
+            .await
+            .expect("a new active Global policy must succeed once the prior one is archived");
     }
 }

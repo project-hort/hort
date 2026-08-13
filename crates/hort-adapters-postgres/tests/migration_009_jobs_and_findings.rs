@@ -144,12 +144,19 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
     // `status='pending'`. Hyphen-separated literals are the spec. The full
     // allow-list is defined inline in 009's `jobs.kind` CHECK; pre-1.0 a
     // new kind is added to that IN-list in place (ADR 0022). This test is
-    // the SQL-CHECK side of the `VALID_TASK_KINDS` lock-step; the use-case
-    // side is `crates/hort-server/tests/task_use_case_enqueue_real_db.rs`
-    // (which walks `VALID_TASK_KINDS` directly through the real use case →
-    // adapter → DB path). The in-place-edited 009 file IS the source of
-    // truth and this fixture follows it.
+    // the SQL-CHECK side of the `EVENT_TASK_KINDS` lock-step (the full
+    // CHECK mirror); the DB-free structural guard pinning the two in
+    // lock-step is `task_kind_check_lockstep_guard.rs`. The narrower
+    // admin-invoke side is `crates/hort-server/tests/task_use_case_enqueue_real_db.rs`
+    // (which walks `ADMIN_INVOKABLE_TASK_KINDS` directly through the real
+    // use case → adapter → DB path — a strict subset of the kinds below).
+    // The in-place-edited 009 file IS the source of truth and this
+    // fixture follows it.
     let all_kinds = [
+        // Written only by `enqueue_scan` (which supplies the scan-typed
+        // columns), so it is intentionally absent from
+        // `ADMIN_INVOKABLE_TASK_KINDS` — a DB-CHECK-only kind on the
+        // admin-invoke axis, same asymmetry as `verify-event-chain` below.
         "scan",
         "cron-rescan-tick",
         "advisory-watch-tick",
@@ -178,9 +185,9 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
         "provenance-verify",
         // `verify-event-chain` run liveness breadcrumb written by the
         // verify CLI's `record_run_completion`. NOT a worker-dispatched
-        // task kind, so it is intentionally absent from `VALID_TASK_KINDS`
-        // (this is a DB-CHECK-only kind, not part of the admin-task-invoke
-        // lock-step).
+        // task kind, so it is intentionally absent from
+        // `ADMIN_INVOKABLE_TASK_KINDS` (this is a DB-CHECK-only kind, not
+        // part of the admin-task-invoke lock-step).
         "verify-event-chain",
         // Async scan-policy re-evaluation pass (ADR 0041 Item 3); part of
         // the jobs.kind CHECK in 009. The dedicated real-adapter-path

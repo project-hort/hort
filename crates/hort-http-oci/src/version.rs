@@ -257,7 +257,9 @@ mod tests {
     async fn enabled_auth_anonymous_with_signing_key_challenges_bearer_v2_auth() {
         use hort_http_core::test_support::{with_oci_public_base_url, with_oci_signing_key};
 
-        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+            rand::rngs::SysRng,
+        ));
         let key = hort_app::oci_token_signing::OciTokenSigningKey::new(sk, None);
         let ctx = with_oci_signing_key(&enabled_ctx(), Some(Arc::new(key)));
         let ctx = with_oci_public_base_url(&ctx, Some("https://registry.example.com".into()));

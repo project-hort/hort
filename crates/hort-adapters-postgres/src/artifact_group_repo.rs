@@ -199,7 +199,7 @@ async fn fetch_members_for_group(
          WHERE group_id = $1 \
          ORDER BY added_at, artifact_id"
     );
-    let rows: Vec<ArtifactGroupMemberRow> = sqlx::query_as(&sql)
+    let rows: Vec<ArtifactGroupMemberRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(group_id)
         .fetch_all(pool)
         .await
@@ -227,7 +227,7 @@ impl ArtifactGroupRepository for PgArtifactGroupRepository {
                 "SELECT {SELECT_GROUP_COLS} FROM artifact_groups \
                  WHERE repository_id = $1 AND coords_json = $2"
             );
-            let row: Option<ArtifactGroupRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactGroupRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(repo)
                 .bind(&canonical)
                 .fetch_optional(&self.pool)
@@ -262,7 +262,7 @@ impl ArtifactGroupRepository for PgArtifactGroupRepository {
             };
             let group_sql =
                 format!("SELECT {SELECT_GROUP_COLS} FROM artifact_groups WHERE id = $1");
-            let row: Option<ArtifactGroupRow> = sqlx::query_as(&group_sql)
+            let row: Option<ArtifactGroupRow> = sqlx::query_as(sqlx::AssertSqlSafe(group_sql))
                 .bind(group_id)
                 .fetch_optional(&self.pool)
                 .await

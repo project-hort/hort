@@ -88,11 +88,56 @@ log "Multi-arch  : ${MULTI_SRC}"
 
 command -v skopeo >/dev/null 2>&1 || skip "skopeo not found in client image"
 
-# dev-user is the write-authorized pusher (mirrors the other OCI scenarios).
-DEV_TOKEN="$(fetch_token dev-user dev)"
-[ -n "$DEV_TOKEN" ] || { fail "fetch dev-user token" "empty response from Keycloak"; summary; }
-DEST_CREDS="dev-user:${DEV_TOKEN}"
-log "[auth] fetched DEV_TOKEN from Keycloak (dev-user write-authorized for ${REPO_OPEN} + ${REPO_HOLD})"
+# -----------------------------------------------------------------------------
+# Credential mode: legacy (Basic / IdP-JWT) vs native tokens.
+# -----------------------------------------------------------------------------
+# Under the `native-tokens` compose overlay every `/v2/*` request runs the real
+# Distribution-Spec token dance, and the /v2/auth mint validates the Basic
+# password strictly as a native PAT (dev-user's Keycloak JWT can never
+# complete it) -- so the skopeo pushes ride the oci-image-index-ci service
+# account instead (gitops: service-accounts/oci-image-index-ci.yaml +
+# auth/oci-image-index-ci-{read,write}-oci-{e2e,quarantine-e2e}.yaml), minted
+# with ONE token spanning both repos since this scenario drives both in a
+# single run. The write-authorized HEAD/GET curl checks below are raw curl,
+# not skopeo's auto-negotiated transport, so they need an already-minted
+# PULL-scoped capability JWT per repo rather than the PAT itself (mirrors
+# quarantine/provenance-push-then-sign.sh's mint_cap_jwt). Legacy (no
+# overlay): dev-user's Keycloak JWT used directly everywhere, unchanged.
+NATIVE_TOKENS=0
+case " ${HORT_COMPOSE_OVERLAYS:-} " in
+    *" native-tokens "*) NATIVE_TOKENS=1 ;;
+esac
+
+# mint_cap_jwt <repo-key> <image-name> <actions> — mint a capability JWT
+# scoped to <actions> on one image via the real /v2/auth exchange (Basic
+# <svc-token>). Prints the JWT. Mirrors
+# quarantine/provenance-push-then-sign.sh's mint_cap_jwt.
+mint_cap_jwt() {
+    curl -sS -u "oci-image-index-ci:${SVC_TOKEN}" \
+        "${HORT_URL}/v2/auth?service=${REGISTRY_HOST}&scope=repository:$1/$2:$3" \
+        2>/dev/null | jq -r '.token // empty'
+}
+
+if [ "$NATIVE_TOKENS" = "1" ]; then
+    log "[auth] native-token mode: admin-minting an hort_svc_* token for service account oci-image-index-ci"
+    SVC_TOKEN="$(mint_svc_token oci-image-index-ci "${REPO_OPEN},${REPO_HOLD}" read,write)" || {
+        fail "admin-mint oci-image-index-ci svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
+    DEST_CREDS="oci-image-index-ci:${SVC_TOKEN}"
+    OPEN_BEARER="$(mint_cap_jwt "$REPO_OPEN" "$IMG" pull)"
+    [ -n "$OPEN_BEARER" ] || { fail "mint pull-scoped capability JWT (${REPO_OPEN})" \
+        "GET /v2/auth (Basic <svc-token>, scope …:pull) returned no token"; summary; }
+    HOLD_BEARER="$(mint_cap_jwt "$REPO_HOLD" "$IMG" pull)"
+    [ -n "$HOLD_BEARER" ] || { fail "mint pull-scoped capability JWT (${REPO_HOLD})" \
+        "GET /v2/auth (Basic <svc-token>, scope …:pull) returned no token"; summary; }
+    log "[auth] svc token minted; pushes ride oci-image-index-ci, write-authorized reads ride per-repo pull-scoped capability JWTs"
+else
+    DEV_TOKEN="$(fetch_token dev-user dev)"
+    [ -n "$DEV_TOKEN" ] || { fail "fetch dev-user token" "empty response from Keycloak"; summary; }
+    DEST_CREDS="dev-user:${DEV_TOKEN}"
+    OPEN_BEARER="$DEV_TOKEN"
+    HOLD_BEARER="$DEV_TOKEN"
+    log "[auth] legacy mode: fetched DEV_TOKEN from Keycloak (dev-user write-authorized for ${REPO_OPEN} + ${REPO_HOLD})"
+fi
 
 # code_of <method> <bearer|""> <url> — HTTP status of a HEAD (-I) or GET.
 # `--head` on a HEAD so curl doesn't wait for a body; an empty bearer means an
@@ -146,14 +191,14 @@ fi
 # index digest (skopeo pushed `--all`, so the tag points at the index, not a
 # platform child). This is the same header trick the #14 push-then-sign
 # scenario uses, and it works under a hold too (used again in [B2]).
-OPEN_DIGEST="$(head_digest "$DEV_TOKEN" \
+OPEN_DIGEST="$(head_digest "$OPEN_BEARER" \
     "${HORT_URL}/v2/${REPO_OPEN}/${IMG}/manifests/v0")"
 [ -n "$OPEN_DIGEST" ] || { fail "resolve index digest (${REPO_OPEN})" \
     "the write-authorized HEAD-by-tag returned no Docker-Content-Digest for the pushed index"; summary; }
 log "[A2] index digest on ${REPO_OPEN} = ${OPEN_DIGEST}"
 
 # ---- [A3] write-authorized HEAD-by-index-digest -> 200 ----
-A3_CODE="$(code_of HEAD "$DEV_TOKEN" \
+A3_CODE="$(code_of HEAD "$OPEN_BEARER" \
     "${HORT_URL}/v2/${REPO_OPEN}/${IMG}/manifests/${OPEN_DIGEST}")"
 if [ "$A3_CODE" = "200" ]; then
     pass "write-authorized HEAD /manifests/<index-digest> -> 200 (index exists + resolvable by digest)"
@@ -164,7 +209,7 @@ fi
 
 # ---- [A4] GET-by-index-digest -> 200 with an index Content-Type ----
 log "==> [A4] GET /manifests/<index-digest> -> served with an index Content-Type"
-HDRS="$(curl -sSI -H "Authorization: Bearer ${DEV_TOKEN}" \
+HDRS="$(curl -sSI -H "Authorization: Bearer ${OPEN_BEARER}" \
     -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
     "${HORT_URL}/v2/${REPO_OPEN}/${IMG}/manifests/${OPEN_DIGEST}" 2>/dev/null | tr -d '\r')"
 A4_CODE="$(printf '%s\n' "$HDRS" | awk 'NR==1{print $2}')"
@@ -211,14 +256,14 @@ fi
 # Use the Docker-Content-Digest of the write-authorized HEAD-by-tag (the
 # hold-read exemption serves it). An anonymous GET/inspect is still 503 under
 # the hold; the HEAD-by-tag avoids depending on the write-auth GET here.
-HOLD_DIGEST="$(head_digest "$DEV_TOKEN" \
+HOLD_DIGEST="$(head_digest "$HOLD_BEARER" \
     "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/v0")"
 [ -n "$HOLD_DIGEST" ] || { fail "resolve index digest (${REPO_HOLD})" \
     "write-authorized HEAD-by-tag returned no Docker-Content-Digest for the held index"; summary; }
 log "[B2] held index digest on ${REPO_HOLD} = ${HOLD_DIGEST}"
 
 # ---- [B3] write-authorized HEAD-by-index-digest -> 200 (exemption) ----
-B3_CODE="$(code_of HEAD "$DEV_TOKEN" \
+B3_CODE="$(code_of HEAD "$HOLD_BEARER" \
     "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${HOLD_DIGEST}")"
 if [ "$B3_CODE" = "200" ]; then
     pass "write-authorized HEAD /manifests/<index-digest> on HELD index -> 200 (existence-probe exemption; signer can attach)"
@@ -233,7 +278,7 @@ fi
 # manifest/index now SERVES — the index is metadata (child digests), not
 # runnable content. The real content gate is the child LAYER BLOBS (checked
 # next), which stay HEAD-only.
-B4_HDRS="$(curl -sSI -H "Authorization: Bearer ${DEV_TOKEN}" \
+B4_HDRS="$(curl -sSI -H "Authorization: Bearer ${HOLD_BEARER}" \
     -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
     "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${HOLD_DIGEST}" 2>/dev/null | tr -d '\r')"
 B4_CODE="$(printf '%s\n' "$B4_HDRS" | awk 'NR==1{print $2}')"
@@ -258,7 +303,7 @@ esac
 # the served index, then a layer-blob digest from that child manifest (both are
 # served to the write-authorized GET under the exemption), then GET the blob —
 # which must stay 503 (blobs keep their HEAD-only probe, ADR 0039 §10).
-INDEX_JSON="$(curl -sS -H "Authorization: Bearer ${DEV_TOKEN}" \
+INDEX_JSON="$(curl -sS -H "Authorization: Bearer ${HOLD_BEARER}" \
     -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
     "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${HOLD_DIGEST}" 2>/dev/null || true)"
 CHILD_DIGEST="$(printf '%s' "$INDEX_JSON" | jq -r '.manifests[0].digest // empty' 2>/dev/null || true)"
@@ -271,7 +316,7 @@ log "[B4b] child manifest digest = ${CHILD_DIGEST}"
 
 CHILD_MANIFEST_MEDIA="application/vnd.oci.image.manifest.v1+json"
 DOCKER_MANIFEST_MEDIA="application/vnd.docker.distribution.manifest.v2+json"
-CHILD_JSON="$(curl -sS -H "Authorization: Bearer ${DEV_TOKEN}" \
+CHILD_JSON="$(curl -sS -H "Authorization: Bearer ${HOLD_BEARER}" \
     -H "Accept: ${CHILD_MANIFEST_MEDIA}, ${DOCKER_MANIFEST_MEDIA}" \
     "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/manifests/${CHILD_DIGEST}" 2>/dev/null || true)"
 # Prefer a layer blob; fall back to the config blob (both are held CAS bytes).
@@ -283,7 +328,7 @@ if [ -z "$BLOB_DIGEST" ]; then
 fi
 log "[B4b] child layer/config blob digest = ${BLOB_DIGEST}"
 
-B4B_CODE="$(code_of GET "$DEV_TOKEN" \
+B4B_CODE="$(code_of GET "$HOLD_BEARER" \
     "${HORT_URL}/v2/${REPO_HOLD}/${IMG}/blobs/${BLOB_DIGEST}")"
 if [ "$B4B_CODE" = "503" ]; then
     pass "write-authorized GET /blobs/<child-layer-digest> on HELD image -> 503 (the layer-blob content gate holds; no runnable bytes leave quarantine)"

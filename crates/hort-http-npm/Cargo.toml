@@ -34,7 +34,7 @@ thiserror    = { workspace = true }
 async-trait  = { workspace = true }
 # npm packument tarballs carry `dist.integrity` as base64-encoded SRI
 # (Subresource Integrity) digests — see NpmFormatHandler's wire shape.
-base64       = "0.22"
+base64       = "0.23"
 # sha1 is required to compute the `dist.shasum` field of a tarball
 # entry at packument-render time.
 sha1         = { workspace = true }

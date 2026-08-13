@@ -1,0 +1,29 @@
+# Single-node Garage for the native-tests `s3` compose overlay. Ephemeral (no
+# named volume) — data lives in the container and is discarded on `down -v`,
+# matching every other one-shot service in this stack (postgres's tmpfs, the
+# base file's DANGER banner).
+#
+# Values below are fixed, checked-in, dev/CI-only fixtures (sha256-derived so
+# they are trivially reproducible and obviously not real secrets — see
+# docker-compose.s3.yml's header comment for the derivation). Garage v2.x
+# validates format strictly at import time: rpc_secret must be exactly 32
+# hex-encoded bytes (64 hex chars); the admin token has no format constraint
+# but is kept hex for consistency.
+metadata_dir = "/tmp/garage/meta"
+data_dir = "/tmp/garage/data"
+db_engine = "sqlite"
+
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "garage:3901"
+rpc_secret = "c2dde5affde243e3a2ff44ff735f14b19bd950de87811f8573ba41bf4292131f"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "7f3bedb74c41b903c2fd5cbf83344325"

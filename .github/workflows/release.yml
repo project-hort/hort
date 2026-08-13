@@ -25,9 +25,12 @@ jobs:
 
   e2e-gate:
     name: 🚦 E2E Gate
-    # e2e.yml runs the full native-tests compose suite (no input knobs); it is
-    # reusable via its `workflow_call:` trigger. It only checks out the repo and
-    # runs docker compose — no OIDC, no registry writes.
+    # e2e.yml runs the full native-tests compose suite across both posture
+    # lanes (base + native-tokens overlay) as two jobs (no input knobs); it is
+    # reusable via its `workflow_call:` trigger, and a `uses:` caller waits on
+    # every job the callee defines — so this single dependency already covers
+    # both lanes with no extra job listed here. It only checks out the repo
+    # and runs docker compose — no OIDC, no registry writes.
     permissions:
       contents: read
     uses: ./.github/workflows/e2e.yml
@@ -181,7 +184,7 @@ jobs:
     if: always() && needs.e2e-gate.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -288,7 +291,7 @@ jobs:
       vars.HORT_PROXY_ENABLED == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -299,10 +302,79 @@ jobs:
       # audience: hort-server-release — issue #82 — both must match one of
       # gha-release's federatedIdentities). Writes
       # CARGO_REGISTRIES_HORT_CRATES_TOKEN into the environment.
-      - uses: ./.github/actions/hort-auth
+      - name: Hort registry auth
+        id: hortauth
+        uses: ./.github/actions/hort-auth
         with:
           proxy_enabled: ${{ vars.HORT_PROXY_ENABLED }}
           audience: hort-server-release
+
+      # ── vetted-index preflight. The check itself lives in scripts/ci/ so
+      # this job, .gitlab-ci.yml's prefetch:warm and prefetch:verify all run
+      # one implementation and cannot drift.
+      #
+      # cargo-virtual is released_only (NonServableStatusFilter +
+      # IndexModeFilter, hort-http-cargo/src/serve.rs): a locked dep hort has
+      # never ingested, or is still inside its quarantine window, is simply
+      # absent from the served index. Discovery via `cargo publish` itself is
+      # SERIAL — cargo fails at the first missing version, so a naive release
+      # attempt surfaces exactly one cold dep per try and each retry costs a
+      # full quarantine window. This step enumerates every cold dep up front
+      # so a single warm + wait covers the whole set instead of one-at-a-time.
+      #
+      # locked-registry-deps.sh deliberately does not use `cargo metadata` to
+      # enumerate the locked graph: source replacement is already active in
+      # this job (hort-auth just wrote .cargo/config.toml), so `cargo
+      # metadata` would resolve through the very index this preflight exists
+      # to check, hitting the same serial one-miss failure it's meant to
+      # replace. It parses Cargo.lock directly instead. (prefetch-warm.yml
+      # runs without replacement, so it can keep using `cargo metadata`.)
+      - name: Vetted-index preflight (released_only cold-dep check)
+        env:
+          HORT_URL: https://registry.hort.rs
+          CARGO_SOURCE_REPO: cargo-virtual
+          HORT_TOKEN: ${{ steps.hortauth.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "${tmpdir}"' EXIT
+
+          scripts/ci/locked-registry-deps.sh Cargo.lock > "${tmpdir}/locked.txt"
+          locked_count=$(wc -l < "${tmpdir}/locked.txt")
+
+          if ! scripts/ci/vetted-index-preflight.sh "${HORT_URL}" "${CARGO_SOURCE_REPO}" \
+              < "${tmpdir}/locked.txt" > "${tmpdir}/cold.txt"; then
+            cold_count=$(wc -l < "${tmpdir}/cold.txt")
+
+            # Same request shape as prefetch-warm.yml: batch-POST the FULL
+            # locked set (idempotent — already-present entries are a no-op),
+            # starting every missing dep's quarantine window in parallel
+            # instead of one at a time.
+            items=$(jq -R -s -c '
+              split("\n") | map(select(length > 0) | split(" ") | {package: .[0], version: .[1]})
+            ' "${tmpdir}/locked.txt")
+
+            echo "Cold deps found — starting a prefetch warm for the full locked set (${locked_count} deps)…"
+            # -f: a non-2xx (most likely 403 — this identity's prefetch
+            # grant on cargo-virtual is not applied) must be loud, not
+            # rendered as a misleading `queued: ?  already_present: ?` line.
+            if ! curl -fsS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
+              -H "Authorization: Bearer ${HORT_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"items\": ${items}}" \
+              | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'; then
+              echo "::warning::prefetch POST failed — likely cause: the gha-release-prefetch-cargo-virtual grant is not applied yet (issue #138). Cold deps below still block this publish."
+            fi
+
+            echo "::error::hort-publish preflight: ${cold_count} locked dependency version(s) are not yet served by the vetted index (cargo-virtual, released_only) — publish would otherwise fail one miss at a time. A prefetch warm was just started for the full locked set; re-run this release after the crates-proxy quarantine window (24h, or 3d once #126's playbook run is applied) so every cold dep above has cleared quarantine. Cold set:"
+            while read -r name version; do
+              echo "::error::  ${name} ${version}"
+            done < "${tmpdir}/cold.txt"
+            exit 1
+          fi
+
+          echo "Vetted-index preflight OK — ${locked_count} locked deps all served by ${CARGO_SOURCE_REPO}."
 
       # Publish in dependency order. hort-domain has no intra-workspace deps so
       # it goes first; each subsequent crate may depend on earlier entries.
@@ -358,7 +430,7 @@ jobs:
     if: always() && needs.build-binaries.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -426,7 +498,7 @@ jobs:
       # below then publishes it — but only when all gates passed, so a gate
       # failure still leaves an unpublished draft (same outcome as before).
       - name: Create draft Release (assets upload while mutable)
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Hort ${{ steps.version.outputs.version }}

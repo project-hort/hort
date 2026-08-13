@@ -1,0 +1,14 @@
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: oci-provenance-proxy-e2e
+spec:
+  name: "OCI Provenance Proxy E2E"
+  description: "Hosted PUBLIC OCI repo with a Docker Hub upstream mapping (pull-through, exactly as oci-proxy-quarantine-e2e) under a provenanceMode=required + provenanceBackends=[cosign-key] ScanPolicy; used by scripts/native-tests/scenarios/quarantine/proxy-required-multilayer.sh to drive the #115 Item 3 regression pin — a proxy-pulled multi-layer image's referenced-tree-descendant constituents (child manifest, config, layer blobs) must HOLD, never terminally reject, while the signed subject clears for real. Public (unlike oci-provenance-e2e's private+visibility scenario, already covered by provenance-push-then-sign.sh) to keep this scenario's read path simple; the cosign sign leg still needs a write grant regardless of visibility."
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/oci-provenance-proxy-e2e
+  isPublic: true
+  replicationPriority: local_only

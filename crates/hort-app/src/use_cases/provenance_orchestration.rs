@@ -45,13 +45,11 @@ use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
-use hort_domain::ports::event_store::{
-    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
-};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::provenance::{
     AttestationBundle, ProvenancePort, ProvenanceRejectReason, ProvenanceRequirements,
-    ProvenanceSubject, ProvenanceVerdict, SignerIdentity,
+    ProvenanceSubject, ProvenanceVerdict,
 };
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
@@ -60,13 +58,14 @@ use hort_domain::ports::upstream_proxy::{IdentityProjector, UpstreamProxy};
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::types::ContentHash;
 
-use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 
 use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::read_expected_version;
+use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
 
 /// The `kind` filter used to read cosign attestation bundles off the
 /// content-reference / OCI Referrers surface. A cosign signature manifest
@@ -74,26 +73,12 @@ use crate::use_cases::read_expected_version;
 /// content hash (the OCI Referrers projection).
 const OCI_SUBJECT_KIND: &str = "oci_subject";
 
-/// Upper bound on bytes read from CAS for the artifact preimage / a single
-/// attestation bundle. For OCI cosign the subject is the manifest (small);
-/// the bundle is a Sigstore JSON blob. A generous backstop that keeps a
-/// pathological CAS object from buffering unbounded into memory on the
-/// verify path. 16 MiB.
-const MAX_PROVENANCE_READ_BYTES: u64 = 16 * 1024 * 1024;
-
 /// Number of attempts (1 initial + N-1 retries) the orchestrator makes to
 /// fetch the bundle set / read the CAS preimage before giving up. On
 /// exhaustion the mode decides: `Required` → fail-closed
 /// `Rejected{RekorNotFound}`; `VerifyIfPresent` → degrade to
 /// `NoAttestation` (allow).
 const FETCH_ATTEMPTS: u32 = 3;
-
-/// Cap on the number of events read when scanning an artifact stream for an
-/// existing `ProvenanceVerified` (the already-cleared no-op skip and the
-/// cascade's idempotency check). Mirrors `STREAM_READ_LIMIT` in
-/// `release_clearance` (the release gate's own clearance read); every
-/// artifact stream begins well within this bound.
-const STREAM_READ_LIMIT: u64 = 200;
 
 /// Bounded grace window (issue #90 defense-in-depth) — see `apply_verdict`.
 /// A `NoAttestation`×`Required` verdict on a `None`-status, anchor-less
@@ -204,6 +189,12 @@ pub struct ProvenanceOrchestrationUseCase {
     /// is `Some` iff the repo is a proxy/pull-through scope — the trigger
     /// for the upstream referrer-fetch arm.
     upstream_resolver: Arc<dyn UpstreamResolver>,
+    /// Shared clearance-cascade machinery (ADR 0039 §11), built from the
+    /// same port handles this use case already holds. The verify-time
+    /// cascade is one of its two trigger ends; the ingest-time
+    /// late-joiner self-clear is the other. One implementation so the
+    /// two ends can never drift on what a signature covers.
+    cascade: ProvenanceCascade,
 }
 
 impl ProvenanceOrchestrationUseCase {
@@ -220,6 +211,13 @@ impl ProvenanceOrchestrationUseCase {
         upstream_proxy: Arc<dyn UpstreamProxy>,
         upstream_resolver: Arc<dyn UpstreamResolver>,
     ) -> Self {
+        let cascade = ProvenanceCascade::new(
+            Arc::clone(&artifacts),
+            Arc::clone(&storage),
+            Arc::clone(&lifecycle),
+            Arc::clone(&events),
+            Arc::clone(&content_references),
+        );
         Self {
             artifacts,
             repositories,
@@ -231,6 +229,7 @@ impl ProvenanceOrchestrationUseCase {
             provenance_ports,
             upstream_proxy,
             upstream_resolver,
+            cascade,
         }
     }
 
@@ -241,6 +240,43 @@ impl ProvenanceOrchestrationUseCase {
     /// [`Artifact::complete_provenance`], persisting the event (if any).
     pub async fn verify_artifact(&self, artifact_id: Uuid) -> AppResult<ProvenanceRunOutcome> {
         let artifact = self.artifacts.find_by_id(artifact_id).await?;
+
+        // Read the expected stream version HERE — paired with the load
+        // above, BEFORE the bundle-fetch / CAS-preimage / verifier round
+        // trip below (issue #108 H2a). Reading it late (at commit time,
+        // where it used to live) meant a scan verdict that committed
+        // `ArtifactRejected` during that round trip was ALREADY in the
+        // version we then read, so the provenance append did not conflict
+        // — and `complete_provenance(Verified)`, working from the
+        // stale-loaded `Quarantined`, wrote that status back over
+        // `Rejected`, resurrecting a rejected artifact into a
+        // timer-releasable state. Anchored to the load, a concurrent
+        // verdict's append now makes THIS append fail `Conflict` and the
+        // paired projection write never runs.
+        //
+        // Nothing between here and the commit appends to THIS stream:
+        // the referrer-landing path (`commit_referrer_manifest`) mints a
+        // NEW artifact id and appends to its own stream, and the cascade
+        // runs only after this artifact's own verdict has committed.
+        //
+        // Mirrors `policy_use_case.rs`'s early-read shape (warn on read
+        // error), but PROPAGATES instead of skipping: that is a bulk
+        // re-evaluation pass where one artifact is skippable, whereas
+        // this is a single-artifact job — returning `Err` fails the job
+        // so the dispatcher retries it, rather than silently reporting a
+        // verify that never happened.
+        let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
+        let expected_version = read_expected_version(&*self.events, &stream_id, false)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "provenance verify: expected-version read failed; aborting this artifact \
+                     (job retries)",
+                );
+            })?;
+
         let repo = self.repositories.find_by_id(artifact.repository_id).await?;
         let format = repo.format.to_string();
 
@@ -295,6 +331,37 @@ impl ProvenanceOrchestrationUseCase {
             })
             .unwrap_or(false);
 
+        // Referenced-tree-descendant hold (issue #115 defect (b)). A
+        // descendant — an index's child manifest, a manifest's config/layer
+        // blob, a referrer's subject — has a zero-length window by
+        // construction (#46), so `window_open` above is ALWAYS false for it.
+        // Under `Required` that used to resolve `NoAttestation` straight to
+        // terminal `Rejected{Unsigned}` before the subject's cascade could
+        // clear the constituent, permanently bricking a correctly-signed
+        // image. `complete_provenance` now holds on
+        // `window_open || is_referenced_descendant`; this resolves the flag.
+        //
+        // **ERROR DIRECTION IS LOAD-BEARING — the asymmetry with ingest is
+        // deliberate, not an oversight.** `IngestUseCase::ingest_inner`
+        // resolves this SAME predicate and degrades a lookup failure to
+        // `false`; that is correct THERE because `false` at ingest means
+        // "not a descendant" ⇒ the artifact keeps its normal FULL
+        // observation window — the conservative direction. HERE `false`
+        // means "no descendant hold" ⇒ under `Required` with a closed
+        // window the very next step is a TERMINAL rejection. Degrading to
+        // `false` at verdict time would turn a transient
+        // `content_references` read failure into an unrecoverable
+        // `Rejected{Unsigned}` on a legitimately-signed image's layer. So
+        // this PROPAGATES: the job fails, the dispatcher retries, and the
+        // artifact stays `Quarantined` (held, 503) in the meantime —
+        // fail-closed and recoverable.
+        let is_referenced_descendant = is_referenced_tree_descendant(
+            &self
+                .content_references
+                .find_by_target(artifact.repository_id, &artifact.sha256_checksum, None)
+                .await?,
+        );
+
         // Off — provenance is inert for this scope. The ingest gate should
         // never enqueue here; the orchestrator no-ops defensively.
         if mode == ProvenanceMode::Off {
@@ -327,7 +394,7 @@ impl ProvenanceOrchestrationUseCase {
         // `VerifyIfPresent`/`Off` never consult the clearance, so their
         // re-verify behaviour is unchanged.
         if mode == ProvenanceMode::Required {
-            let (cleared, _) = self.read_clearance_state(artifact.id).await?;
+            let (cleared, _) = self.cascade.read_clearance_state(artifact.id).await?;
             if let Some(existing) = cleared {
                 tracing::debug!(
                     artifact_id = %artifact.id,
@@ -347,17 +414,18 @@ impl ProvenanceOrchestrationUseCase {
                 // bytes here. Best-effort: no failure in the re-drive
                 // changes the skip outcome (the subject's clearance stands).
                 if existing.cascaded_from.is_none() {
-                    match self.read_bounded(&artifact.sha256_checksum).await {
+                    match self.cascade.read_bounded(&artifact.sha256_checksum).await {
                         Ok(payload) => {
-                            self.cascade_clearance(
-                                artifact.repository_id,
-                                &artifact.sha256_checksum,
-                                &payload,
-                                &existing.signer,
-                                existing.predicate_type.as_deref(),
-                                &existing.backend,
-                            )
-                            .await;
+                            self.cascade
+                                .cascade_clearance(
+                                    artifact.repository_id,
+                                    &artifact.sha256_checksum,
+                                    &payload,
+                                    &existing.signer,
+                                    existing.predicate_type.as_deref(),
+                                    &existing.backend,
+                                )
+                                .await;
                         }
                         Err(e) => tracing::warn!(
                             artifact_id = %artifact.id,
@@ -391,7 +459,16 @@ impl ProvenanceOrchestrationUseCase {
             Ok(b) => b,
             Err(e) => {
                 return self
-                    .apply_fetch_failure(artifact, &backend, mode, window_open, "bundle fetch", e)
+                    .apply_fetch_failure(
+                        artifact,
+                        &backend,
+                        mode,
+                        window_open,
+                        is_referenced_descendant,
+                        "bundle fetch",
+                        e,
+                        expected_version,
+                    )
                     .await;
             }
         };
@@ -431,8 +508,10 @@ impl ProvenanceOrchestrationUseCase {
                                         &backend,
                                         mode,
                                         window_open,
+                                        is_referenced_descendant,
                                         "post-proxy bundle re-read",
                                         e,
+                                        expected_version,
                                     )
                                     .await;
                             }
@@ -445,8 +524,10 @@ impl ProvenanceOrchestrationUseCase {
                                 &backend,
                                 mode,
                                 window_open,
+                                is_referenced_descendant,
                                 "upstream referrer fetch",
                                 e,
+                                expected_version,
                             )
                             .await;
                     }
@@ -466,8 +547,10 @@ impl ProvenanceOrchestrationUseCase {
                         &backend,
                         mode,
                         window_open,
+                        is_referenced_descendant,
                         "CAS preimage read",
                         e,
+                        expected_version,
                     )
                     .await;
             }
@@ -526,7 +609,15 @@ impl ProvenanceOrchestrationUseCase {
         let subject_hash = artifact.sha256_checksum.clone();
 
         let outcome = self
-            .apply_verdict(artifact, &metric_backend, verdict, mode, window_open)
+            .apply_verdict(
+                artifact,
+                &metric_backend,
+                verdict,
+                mode,
+                window_open,
+                is_referenced_descendant,
+                expected_version,
+            )
             .await?;
 
         // The cascade fires only after the subject's own clearance
@@ -536,15 +627,16 @@ impl ProvenanceOrchestrationUseCase {
         // in the cascade can retract or block the already-committed
         // subject clearance.
         if let Some((signer, predicate_type)) = cascade_seed {
-            self.cascade_clearance(
-                repository_id,
-                &subject_hash,
-                &payload,
-                &signer,
-                predicate_type.as_deref(),
-                &metric_backend,
-            )
-            .await;
+            self.cascade
+                .cascade_clearance(
+                    repository_id,
+                    &subject_hash,
+                    &payload,
+                    &signer,
+                    predicate_type.as_deref(),
+                    &metric_backend,
+                )
+                .await;
         }
         Ok(outcome)
     }
@@ -600,7 +692,7 @@ impl ProvenanceOrchestrationUseCase {
                 .artifacts
                 .find_by_id(reference.source_artifact_id)
                 .await?;
-            let manifest_bytes = self.read_bounded(&source.sha256_checksum).await?;
+            let manifest_bytes = self.cascade.read_bounded(&source.sha256_checksum).await?;
 
             // Parse the referrer manifest and keep only the Sigstore-bundle
             // layer blobs (the pure `sigstore_bundle_layers` helper). A referrer that
@@ -613,7 +705,7 @@ impl ProvenanceOrchestrationUseCase {
                 // referenced by the manifest but absent from CAS surfaces as
                 // a `read_bounded` error → the existing fetch-failure path
                 // (mode-dependent), never a panic.
-                let bundle_bytes = self.read_bounded(&blob_hash).await?;
+                let bundle_bytes = self.cascade.read_bounded(&blob_hash).await?;
                 bundles.push(build_bundle(bundle_bytes));
             }
 
@@ -625,7 +717,7 @@ impl ProvenanceOrchestrationUseCase {
             // (under `Required`, no valid bundle folds to `Rejected{Unsigned}`).
             let sig_layers = hort_domain::oci::simplesigning_signature_layers(&manifest_bytes)?;
             for sig in sig_layers {
-                let payload_bytes = self.read_bounded(&sig.payload_layer).await?;
+                let payload_bytes = self.cascade.read_bounded(&sig.payload_layer).await?;
                 let Some(sig_bytes) = decode_simplesigning_signature(&sig.signature) else {
                     continue;
                 };
@@ -924,305 +1016,12 @@ impl ProvenanceOrchestrationUseCase {
     async fn read_preimage(&self, content_hash: &ContentHash) -> AppResult<Vec<u8>> {
         let mut last_err = None;
         for _ in 0..FETCH_ATTEMPTS {
-            match self.read_bounded(content_hash).await {
+            match self.cascade.read_bounded(content_hash).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.expect("FETCH_ATTEMPTS >= 1 so at least one error was recorded"))
-    }
-
-    /// Read up to [`MAX_PROVENANCE_READ_BYTES`] from the CAS object at
-    /// `hash`. A read error surfaces as `Err`. Over-cap content is
-    /// truncated at the cap (the verify path does not need the full blob
-    /// for the manifest-shaped subjects Tier-1 covers; a larger artifact
-    /// simply hashes wrong and is rejected by the verifier, never a panic).
-    async fn read_bounded(&self, hash: &ContentHash) -> AppResult<Vec<u8>> {
-        let reader = self.storage.get(hash).await?;
-        let mut limited = reader.take(MAX_PROVENANCE_READ_BYTES);
-        let mut buf = Vec::new();
-        limited.read_to_end(&mut buf).await.map_err(|e| {
-            hort_domain::error::DomainError::Invariant(format!(
-                "provenance: CAS read failed for {hash}: {e}"
-            ))
-        })?;
-        Ok(buf)
-    }
-
-    // -----------------------------------------------------------------
-    // Provenance-clearance cascade (ADR 0039)
-    // -----------------------------------------------------------------
-
-    /// Cascade the verified subject's provenance clearance to the
-    /// constituents its signed bytes bind (ADR 0039 cascade).
-    ///
-    /// The constituent set derives from the subject's **verified CAS
-    /// bytes** — never from DB edges (`content_references` /
-    /// `oci_index_member` rows are mutable projections; the signed bytes
-    /// are the cryptographic authority). An image index yields its
-    /// `manifests[]` children plus, per child manifest read back from CAS,
-    /// that manifest's `config`/`layers` digests; a single-image manifest
-    /// yields its own `config`/`layers`. Each digest sits inside its signed
-    /// parent's bytes (a Merkle-like chain), so the signature over the
-    /// subject digest covers exactly these constituents — and nothing else.
-    ///
-    /// Best-effort end to end: the subject's own clearance is already
-    /// committed when this runs, and no failure here may retract or block
-    /// it — every error is `warn!` + continue. Only the provenance
-    /// authority cascades; the scan gate and observation window stay
-    /// per-artifact (ADR 0007 / ADR 0043).
-    async fn cascade_clearance(
-        &self,
-        repository_id: Uuid,
-        subject_hash: &ContentHash,
-        subject_bytes: &[u8],
-        signer: &SignerIdentity,
-        predicate_type: Option<&str>,
-        backend: &str,
-    ) {
-        let digests = match self.constituent_digests(subject_bytes).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    subject = %subject_hash,
-                    error = %e,
-                    "provenance cascade: subject bytes did not parse as an OCI \
-                     index/manifest — cascading to nothing",
-                );
-                return;
-            }
-        };
-
-        let mut cascaded = 0usize;
-        for digest in &digests {
-            // Defensive self-reference guard: a subject cannot reference its
-            // own hash in real content (self-referential digest), but the
-            // cascade must never re-append to the subject's stream.
-            if digest == subject_hash {
-                continue;
-            }
-            match self
-                .cascade_one(
-                    repository_id,
-                    subject_hash,
-                    digest,
-                    signer,
-                    predicate_type,
-                    backend,
-                )
-                .await
-            {
-                Ok(true) => cascaded += 1,
-                Ok(false) => {}
-                Err(e) => tracing::warn!(
-                    subject = %subject_hash,
-                    constituent = %digest,
-                    error = %e,
-                    "provenance cascade: constituent clearance failed — skipped",
-                ),
-            }
-        }
-        if cascaded > 0 {
-            tracing::info!(
-                subject = %subject_hash,
-                constituents = cascaded,
-                backend = %backend,
-                "provenance: cascaded clearance to signed constituents",
-            );
-        }
-    }
-
-    /// Derive the constituent digest set from the verified subject bytes.
-    ///
-    /// Index → `manifests[]` children (capped by the domain's
-    /// `MAX_INDEX_CHILDREN`) plus each child manifest's `config`/`layers`
-    /// digests read back from the child's own CAS bytes (capped per
-    /// manifest by `MAX_MANIFEST_BLOBS`); single-image manifest → its own
-    /// `config`/`layers`. A child whose CAS bytes cannot be read or parsed
-    /// contributes the child digest itself (it is bound into the signed
-    /// index bytes regardless) but no blobs — `warn!` + continue.
-    /// Deduplicated (a blob shared across children appears once),
-    /// order-preserving.
-    async fn constituent_digests(&self, subject_bytes: &[u8]) -> AppResult<Vec<ContentHash>> {
-        let mut out: Vec<ContentHash> = Vec::new();
-        if hort_domain::oci::is_image_index(subject_bytes) {
-            for child in hort_domain::oci::index_child_digests(subject_bytes)? {
-                out.push(child.clone());
-                let child_bytes = match self.read_bounded(&child).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            child = %child,
-                            error = %e,
-                            "provenance cascade: child manifest CAS read failed — \
-                             its config/layer blobs are not cascaded",
-                        );
-                        continue;
-                    }
-                };
-                match hort_domain::oci::manifest_blob_digests(&child_bytes) {
-                    Ok(blobs) => out.extend(blobs),
-                    Err(e) => tracing::warn!(
-                        child = %child,
-                        error = %e,
-                        "provenance cascade: child manifest did not parse — \
-                         its config/layer blobs are not cascaded",
-                    ),
-                }
-            }
-        } else {
-            out.extend(hort_domain::oci::manifest_blob_digests(subject_bytes)?);
-        }
-        let mut seen = std::collections::HashSet::new();
-        out.retain(|h| seen.insert(h.clone()));
-        Ok(out)
-    }
-
-    /// Cascade the clearance to ONE constituent digest. Returns `Ok(true)`
-    /// when a cascaded `ProvenanceVerified` was committed, `Ok(false)` on
-    /// the deliberate skips:
-    ///
-    /// - no artifact row for the digest **in the subject's repository**
-    ///   (the lookup is repo-scoped — a same-digest artifact in another
-    ///   repo is never touched);
-    /// - a constituent that is not currently held (the domain guard in
-    ///   [`Artifact::cascade_provenance_clearance`] refuses every
-    ///   non-`Quarantined` state — terminally rejected stays rejected,
-    ///   `Released`/status-`None` need no clearance);
-    /// - a constituent already carrying a `ProvenanceVerified` (its own
-    ///   verification or an earlier cascade) — idempotent re-runs append
-    ///   no duplicate.
-    async fn cascade_one(
-        &self,
-        repository_id: Uuid,
-        subject_hash: &ContentHash,
-        digest: &ContentHash,
-        signer: &SignerIdentity,
-        predicate_type: Option<&str>,
-        backend: &str,
-    ) -> AppResult<bool> {
-        let Some(constituent) = self
-            .artifacts
-            .find_by_repo_and_checksum(repository_id, digest)
-            .await?
-        else {
-            return Ok(false);
-        };
-
-        // The domain guard: only a held (`Quarantined`) constituent takes
-        // a cascaded clearance. The `Err` is the guard refusing a
-        // non-held state — a deliberate skip, not an infra failure.
-        let Ok(event) = constituent.cascade_provenance_clearance(
-            subject_hash.clone(),
-            signer.clone(),
-            predicate_type.map(str::to_string),
-            backend,
-        ) else {
-            tracing::debug!(
-                artifact_id = %constituent.id,
-                status = %constituent.quarantine_status,
-                "provenance cascade: constituent not held — skipped",
-            );
-            return Ok(false);
-        };
-
-        let (cleared, expected_version) = self.read_clearance_state(constituent.id).await?;
-        if cleared.is_some() {
-            return Ok(false);
-        }
-
-        // Append at the just-read version. A version conflict means a
-        // concurrent append bumped the stream between the read and this
-        // append (the constituent's own `ScanCompleted` is the realistic
-        // race — scan and sign both land seconds after push): re-read
-        // once, re-check idempotency (the concurrent event may itself
-        // have been a `ProvenanceVerified`), and re-append at the fresh
-        // version. ONE retry only — a second conflict, or any
-        // non-conflict error, propagates to the caller's warn+skip.
-        if let Err(err) = self
-            .commit_cascade_event(&constituent, event.clone(), expected_version)
-            .await
-        {
-            if !matches!(err, hort_domain::error::DomainError::Conflict(_)) {
-                return Err(err.into());
-            }
-            tracing::debug!(
-                artifact_id = %constituent.id,
-                "provenance cascade: version conflict — retrying once with a fresh read",
-            );
-            let (cleared, fresh_version) = self.read_clearance_state(constituent.id).await?;
-            if cleared.is_some() {
-                return Ok(false);
-            }
-            self.commit_cascade_event(&constituent, event, fresh_version)
-                .await?;
-        }
-
-        tracing::info!(
-            artifact_id = %constituent.id,
-            constituent = %digest,
-            subject = %subject_hash,
-            backend = %backend,
-            "provenance: clearance cascaded from verified subject",
-        );
-        Ok(true)
-    }
-
-    /// Append one cascaded `ProvenanceVerified` to `constituent`'s stream
-    /// at `expected_version`. Split out of [`Self::cascade_one`] so the
-    /// version-conflict retry re-appends through the identical path;
-    /// returns the raw [`DomainResult`] so the caller can match the
-    /// event store's `Conflict` shape before converting to `AppError`.
-    async fn commit_cascade_event(
-        &self,
-        constituent: &Artifact,
-        event: hort_domain::events::ProvenanceVerified,
-        expected_version: ExpectedVersion,
-    ) -> hort_domain::error::DomainResult<()> {
-        self.lifecycle
-            .commit_transition(
-                constituent,
-                AppendEvents {
-                    stream_id: hort_domain::events::StreamId::artifact(constituent.id),
-                    expected_version,
-                    events: vec![EventToAppend::new(DomainEvent::ProvenanceVerified(event))],
-                    correlation_id: Uuid::new_v4(),
-                    causation_id: None,
-                    actor: system_actor(),
-                },
-                None,
-            )
-            .await
-            .map(|_| ())
-    }
-
-    /// Read the artifact's event stream once, reporting the existing
-    /// `ProvenanceVerified` (if any) plus the expected version for a
-    /// subsequent append — a single read serving the already-cleared
-    /// verify skip (which inspects the event's `cascaded_from` / signer
-    /// for the cascade re-drive) and the cascade's idempotency check +
-    /// append.
-    async fn read_clearance_state(
-        &self,
-        artifact_id: Uuid,
-    ) -> AppResult<(
-        Option<hort_domain::events::ProvenanceVerified>,
-        ExpectedVersion,
-    )> {
-        let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let persisted = self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await?;
-        let cleared = persisted.iter().find_map(|e| match &e.event {
-            DomainEvent::ProvenanceVerified(ev) => Some(ev.clone()),
-            _ => None,
-        });
-        let expected = match persisted.last() {
-            Some(last) => ExpectedVersion::Exact(last.stream_position),
-            None => ExpectedVersion::NoStream,
-        };
-        Ok((cleared, expected))
     }
 
     // -----------------------------------------------------------------
@@ -1301,6 +1100,12 @@ impl ProvenanceOrchestrationUseCase {
     /// Apply a folded verdict via [`Artifact::complete_provenance`] and
     /// persist the returned event (if any). Mirrors how scan orchestration
     /// persists `ScanCompleted` through the lifecycle port.
+    ///
+    /// `too_many_arguments`: 8 with `&self` — #115 Item 3's
+    /// `is_referenced_descendant` plus #108's `expected_version`, both
+    /// resolved in `verify_artifact` and threaded here. A struct wrapper
+    /// would churn both call paths for no behavioural gain.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_verdict(
         &self,
         mut artifact: Artifact,
@@ -1308,6 +1113,8 @@ impl ProvenanceOrchestrationUseCase {
         verdict: ProvenanceVerdict,
         mode: ProvenanceMode,
         window_open: bool,
+        is_referenced_descendant: bool,
+        expected_version: ExpectedVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
         // Defense-in-depth bounded requeue (issue #90). A `NoAttestation`
         // verdict under `Required` with a `None` `quarantine_window_start`
@@ -1357,13 +1164,37 @@ impl ProvenanceOrchestrationUseCase {
         // (fail-closed / held), not an allowed-unsigned no-op. Captured
         // before the value is moved into `complete_provenance` so the `None`
         // branch can distinguish the hold from the VerifyIfPresent/Off allow.
+        //
+        // A referenced-tree descendant is held on the same arm regardless of
+        // the window (issue #115 defect (b)) — its window is zero-length by
+        // construction and its provenance authority is its parent's
+        // signature. This condition MUST mirror `complete_provenance`'s
+        // `window_open || is_referenced_descendant` exactly: a held
+        // descendant that fell through to the `else` below would be reported
+        // as the allowed-unsigned `NoAttestation` no-op, mislabelling a
+        // fail-closed hold as a pass in both the summary and the metric.
+        // Held descendants reuse the EXISTING `HeldPendingSignature`
+        // summary + `result` value — no new metric name or label value
+        // (catalog untouched).
         let held_pending_signature = mode == ProvenanceMode::Required
-            && window_open
+            && (window_open || is_referenced_descendant)
             && matches!(
                 verdict.outcome,
                 hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
             );
-        let event = artifact.complete_provenance(verdict, mode, backend, window_open)?;
+        // The status as LOADED, captured before `complete_provenance`
+        // mutates it — the guard the conditional projection write keys on
+        // (issue #108 H2b; see `ArtifactLifecyclePort`'s doc). A
+        // `Verified` verdict leaves the artifact `Quarantined`, i.e.
+        // EQUAL to this, so the adapter skips the status write entirely.
+        let prior_status = artifact.quarantine_status;
+        let event = artifact.complete_provenance(
+            verdict,
+            mode,
+            backend,
+            window_open,
+            is_referenced_descendant,
+        )?;
 
         let Some(event) = event else {
             if held_pending_signature {
@@ -1376,7 +1207,10 @@ impl ProvenanceOrchestrationUseCase {
                 tracing::info!(
                     artifact_id = %artifact.id,
                     backend = %backend,
-                    "provenance held pending signature (Required, observation window open)",
+                    window_open,
+                    is_referenced_descendant,
+                    "provenance held pending signature (Required; observation window open \
+                     or referenced-tree descendant awaiting its parent's cascade)",
                 );
                 crate::metrics::emit_provenance_verify(
                     backend,
@@ -1446,16 +1280,23 @@ impl ProvenanceOrchestrationUseCase {
         };
 
         let stream_id = hort_domain::events::StreamId::artifact(artifact.id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
         let correlation_id = Uuid::new_v4();
 
-        // Column-scoped verdict commit (issue #90): `artifact` was loaded
-        // at the top of `verify_artifact`, before the bundle fetch / CAS
-        // preimage read / verifier dispatch round trip — by now its
-        // snapshot of every column but `quarantine_status` can be stale.
-        // `commit_provenance_verdict` writes only `quarantine_status`, so
-        // a concurrently-committed transition's `quarantine_window_start`
-        // (the quarantine anchor) survives.
+        // Column-scoped, prior-status-guarded verdict commit (issues #90
+        // and #108). `artifact` was loaded at the top of
+        // `verify_artifact`, before the bundle fetch / CAS preimage read /
+        // verifier dispatch round trip — by now its snapshot of every
+        // column can be stale. Three things keep that from clobbering a
+        // concurrent verdict:
+        //
+        // 1. `expected_version` was read at that same load (#108 H2a, see
+        //    `verify_artifact`), so an intervening append fails this one
+        //    `Conflict` before any projection write happens.
+        // 2. `commit_provenance_verdict` writes only `quarantine_status`,
+        //    so a concurrent transition's `quarantine_window_start` (the
+        //    quarantine anchor) survives regardless (#90).
+        // 3. `prior_status` makes even that one column's write
+        //    skip-if-unchanged and conditional-if-changed (#108 H2b).
         self.lifecycle
             .commit_provenance_verdict(
                 &artifact,
@@ -1467,6 +1308,7 @@ impl ProvenanceOrchestrationUseCase {
                     causation_id: None,
                     actor: system_actor(),
                 },
+                prior_status,
             )
             .await?;
 
@@ -1483,21 +1325,34 @@ impl ProvenanceOrchestrationUseCase {
     /// - `VerifyIfPresent` / `Off` → degrade to `NoAttestation` (allow —
     ///   never fail-closed on infra flakiness).
     ///
-    /// `window_open` is threaded to `apply_verdict` for signature parity with
-    /// the verdict path, but is **inert on the `Required` arm**: a fetch
-    /// failure produces a `Rejected{RekorNotFound}` verdict, and
-    /// `complete_provenance`'s `Rejected` arm never consults `window_open` — a
-    /// fetch failure is NOT an unsigned-hold, so it stays fail-closed even
-    /// mid-window (issue #13, design §2 S1). Threading the value through does
-    /// not weaken this.
+    /// `window_open` / `is_referenced_descendant` are threaded to
+    /// `apply_verdict` for signature parity with the verdict path, but are
+    /// **inert on the `Required` arm**: a fetch failure produces a
+    /// `Rejected{RekorNotFound}` verdict, and `complete_provenance`'s
+    /// `Rejected` arm never consults either flag — a fetch failure is NOT an
+    /// unsigned-hold, so it stays fail-closed even mid-window and even on a
+    /// descendant (issue #13, design §2 S1; issue #115 keeps this arm
+    /// deliberately untouched — a descendant whose attestation material
+    /// could not be FETCHED is a different failure from one that provably
+    /// has none). Threading the values through does not weaken this.
+    ///
+    /// `too_many_arguments`: 9 with `&self` (#115's descendant flag was the
+    /// 8th; #108's `expected_version` is the 9th). Every parameter is a
+    /// distinct, unrelated input this private helper forwards verbatim to
+    /// `apply_verdict`; bundling them into a struct would only move the
+    /// same values behind a name. Matches the crate's established use of
+    /// this allow.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_fetch_failure(
         &self,
         artifact: Artifact,
         backend: &str,
         mode: ProvenanceMode,
         window_open: bool,
+        is_referenced_descendant: bool,
         stage: &str,
         err: crate::error::AppError,
+        expected_version: ExpectedVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
         match mode {
             ProvenanceMode::Required => {
@@ -1513,8 +1368,16 @@ impl ProvenanceOrchestrationUseCase {
                 // growing the enum — the audit event's `backend` label disambiguates
                 // which backend's fetch failed.
                 let verdict = ProvenanceVerdict::rejected(ProvenanceRejectReason::RekorNotFound);
-                self.apply_verdict(artifact, backend, verdict, mode, window_open)
-                    .await
+                self.apply_verdict(
+                    artifact,
+                    backend,
+                    verdict,
+                    mode,
+                    window_open,
+                    is_referenced_descendant,
+                    expected_version,
+                )
+                .await
             }
             ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => {
                 tracing::warn!(
@@ -1525,8 +1388,16 @@ impl ProvenanceOrchestrationUseCase {
                      degrade to NoAttestation (allow)",
                 );
                 let verdict = ProvenanceVerdict::no_attestation();
-                self.apply_verdict(artifact, backend, verdict, mode, window_open)
-                    .await
+                self.apply_verdict(
+                    artifact,
+                    backend,
+                    verdict,
+                    mode,
+                    window_open,
+                    is_referenced_descendant,
+                    expected_version,
+                )
+                .await
             }
         }
     }

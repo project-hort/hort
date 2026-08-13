@@ -298,7 +298,7 @@ fn build_harness() -> Harness {
 
     // -- 6. Build the OCI token exchange use case. -------------------
     let signing_key = Arc::new(OciTokenSigningKey::new(
-        SigningKey::generate(&mut rand::rngs::OsRng),
+        SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
         None,
     ));
     let public_base = "https://hort.example.com";

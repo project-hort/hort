@@ -104,14 +104,17 @@ pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
     // disambiguates by segment count, but ordering first preserves intent
     // and guards against a future matcher rule change.
     Router::new()
-        .route("/:repo_key/:scope/:name/-/:filename", get(download_scoped))
         .route(
-            "/:repo_key/:scope/:name",
+            "/{repo_key}/{scope}/{name}/-/{filename}",
+            get(download_scoped),
+        )
+        .route(
+            "/{repo_key}/{scope}/{name}",
             get(packument_scoped).put(publish_scoped),
         )
-        .route("/:repo_key/:name/-/:filename", get(download_unscoped))
+        .route("/{repo_key}/{name}/-/{filename}", get(download_unscoped))
         .route(
-            "/:repo_key/:name",
+            "/{repo_key}/{name}",
             get(packument_unscoped).put(publish_unscoped),
         )
         // Body limit applies to every route; GET requests carry no body, so
@@ -728,9 +731,28 @@ async fn do_publish(
     // here used the unscoped basename and rejected every scoped publish
     // from a real `npm publish` client with "cannot parse version" —
     // guarded by the scoped-publish tests below.
+    //
+    // `filename` is the client-supplied `_attachments` key — attacker-
+    // controlled. The rejection message must NOT echo it (never-echo-
+    // rejected-input rule); it stays available server-side via
+    // `tracing::debug!`.
     let version = extract_version(filename, pkg_name).ok_or_else(|| {
-        validation_error(&format!("cannot parse version from filename {filename}"))
+        tracing::debug!(
+            filename,
+            pkg_name,
+            "npm publish: cannot parse version from filename"
+        );
+        validation_error("cannot parse version from attachment filename")
     })?;
+
+    // Strict-validate the extracted version BEFORE any storage path is
+    // constructed or any side-effecting action is taken. Mirrors the
+    // cargo publish path's `validate_cargo_version` gate: an
+    // `_attachments`-derived version is attacker-controlled input, and
+    // without this the garbage survives into the coords/path/projection
+    // row unvalidated. Error messages never echo the rejected input.
+    hort_formats::npm::validate_npm_version(&version)
+        .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
 
     // Pull the per-version packument block — `body["versions"][version]` —
     // to hand to ingest as payload metadata. npm publish requests always
@@ -1458,6 +1480,48 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// The `_attachments` key is the client-supplied tarball filename —
+    /// attacker-controlled. When it doesn't carry a parseable version,
+    /// the 400 body must NOT echo it back (never-echo-rejected-input
+    /// rule); only the stable validation-error shape is observable.
+    #[tokio::test]
+    async fn publish_unparseable_filename_returns_400_without_echoing_filename() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let tarball = b"tarball-bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(tarball);
+        let marker_filename = "xsentinel-not-a-parseable-npm-filename";
+        let body = serde_json::json!({
+            "name": "express",
+            "_attachments": {
+                marker_filename: {
+                    "content_type": "application/octet-stream",
+                    "data": b64,
+                    "length": tarball.len(),
+                }
+            },
+        })
+        .to_string();
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            !body_str.contains("xsentinel"),
+            "response body must not echo the rejected attachment filename: {body_str}"
+        );
+    }
+
     #[tokio::test]
     async fn publish_bad_base64_returns_400() {
         let h = harness();
@@ -1809,6 +1873,98 @@ mod tests {
             h.storage.put_call_count(),
             0,
             "validator must reject traversal before any storage write"
+        );
+    }
+
+    /// A NUL byte in the `_attachments`-derived version must be rejected
+    /// before any storage write — the version never touches the charset
+    /// allowlist that admits it into a stored path.
+    #[tokio::test]
+    async fn publish_unscoped_rejects_nul_byte_version_before_storage_write() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let version = "1.0.0\u{0}";
+        let body = build_publish_body("express", version, b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.storage.put_call_count(),
+            0,
+            "validator must reject before any storage write"
+        );
+        let body_bytes = to_bytes(res.into_body(), 1024).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            !body_str.contains(version),
+            "rejection response must not echo the rejected version: {body_str}"
+        );
+    }
+
+    /// An empty version segment (`pkg-.tgz`-shaped filename would fail
+    /// `extract_version` first) — this test instead covers a version that
+    /// *parses* out of the filename but fails the semver-ish grammar:
+    /// path-traversal-shaped input.
+    #[tokio::test]
+    async fn publish_unscoped_rejects_path_traversal_shaped_version_before_storage_write() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let version = "../../etc/passwd";
+        let body = build_publish_body("express", version, b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.storage.put_call_count(),
+            0,
+            "validator must reject before any storage write"
+        );
+    }
+
+    /// An oversized version string is rejected before any storage write.
+    #[tokio::test]
+    async fn publish_unscoped_rejects_oversized_version_before_storage_write() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let version = format!("1.0.0-{}", "a".repeat(128));
+        let body = build_publish_body("express", &version, b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.storage.put_call_count(),
+            0,
+            "validator must reject before any storage write"
         );
     }
 
@@ -3223,6 +3379,59 @@ mod tests {
                 Some("upstream-metadata-malformed"),
             );
             let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "upstream metadata invalid");
+        }
+
+        /// A malformed upstream packument body must not leak its content
+        /// into the client-facing response on the packument (listing)
+        /// route: the marker string appears only as the
+        /// `dist` value, whose type mismatch (a string where an object is
+        /// expected) drives `serde_json`'s error message to echo it
+        /// verbatim server-side — the reflection vector the typed
+        /// `UpstreamMetadataInvalid` boundary closes. Status/headers
+        /// mirror the established `upstream_pull::map_upstream_pull_error`
+        /// `ParseError` wire shape (same as the download-path test above),
+        /// unifying the previously-inconsistent 400 the index-serve path
+        /// used to return for this failure class.
+        #[tokio::test]
+        async fn packument_proxy_malformed_upstream_body_does_not_leak_cause() {
+            const MARKER: &str = "XSENTINEL_NPM_UPSTREAM_LEAK_MARKER";
+
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_npm_repo("npm-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(&mocks, repo.id);
+
+            let json = format!(
+                r#"{{"versions":{{"1.0.0":{{"name":"express","version":"1.0.0","dist":"{MARKER}"}}}}}}"#
+            );
+            mocks
+                .upstream_proxy
+                .insert_metadata("", "/express", json.into_bytes());
+
+            let router = router(ctx);
+            let res = router
+                .oneshot(
+                    Request::get("/npm/npm-mirror/express")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                res.headers()
+                    .get("X-Hort-Reason")
+                    .and_then(|v| v.to_str().ok()),
+                Some("upstream-metadata-malformed"),
+            );
+            let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+            let body_str = std::str::from_utf8(&body).unwrap();
+            assert!(
+                !body_str.contains(MARKER),
+                "client response must not contain the upstream-derived marker: {body_str}"
+            );
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["error"], "upstream metadata invalid");
         }

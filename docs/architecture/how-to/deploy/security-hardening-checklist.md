@@ -88,53 +88,54 @@ public hostname of the operator's edge.
 
 ### `/metrics` requires authentication
 
-- **Control:** `/metrics` is bound on a separate listener by default
-  (chart binds it to loopback inside the pod) and requires admin
-  authentication regardless of which listener serves it. Anonymous
-  scraping is refused. The dedicated listener also refuses to bind to
-  unspecified addresses (`0.0.0.0` / `::`) without an explicit
-  operator opt-in (`metrics.allowUnspecifiedBind: true`).
+- **Control:** `/metrics` is served exclusively by a dedicated admin
+  listener (chart binds it to loopback inside the pod by default) and
+  unconditionally requires a bearer carrying the `read_metrics` grant
+  regardless of which listener serves it — there is no anonymous-scrape
+  opt-out and no chart/env knob that re-permits it (#113 item 3 retired
+  `HORT_METRICS_REQUIRE_AUTH` / `metrics.requireAuth` end-to-end). The
+  dedicated listener also refuses to bind to unspecified addresses
+  (`0.0.0.0` / `::`) without an explicit operator opt-in
+  (`metrics.allowUnspecifiedBind: true`).
 - **Chart default:** `metrics.bindAddr: "127.0.0.1:9090"`,
-  `metrics.allowUnspecifiedBind: false`, `metrics.requireAuth: true`.
-  The chart renders the dedicated listener on port 9090, scoped to
-  in-pod / sidecar-scrape access.
-- **Operator action required:** no for default config; conditional
-  yes if scraping from outside the pod (configure a `ServiceMonitor`
-  with bearer-token auth, see `install.md` Appendix).
+  `metrics.allowUnspecifiedBind: false`. The chart renders the
+  dedicated listener on port 9090, scoped to in-pod / sidecar-scrape
+  access. Setting `metrics.bindAddr: ""` unbinds the admin listener
+  entirely — `/metrics` becomes unreachable on any listener, not a
+  fallback to the main router.
+- **Operator action required:** provision a dedicated **non-admin**
+  scraper `ServiceAccount` plus an **unscoped** `read_metrics`
+  `PermissionGrant`, and wire the credential into your scraper.
+  Step-by-step (both delivery models, plus the Prometheus-Operator
+  caveat):
+  [`../operate/metrics-scraper-service-account.md`](../operate/metrics-scraper-service-account.md).
+  Two shapes to get right: the grant's `subject` must be
+  `kind: serviceAccount` (an unscoped **claim**-subject grant is
+  rejected at apply by the `wildcard-repo-non-admin` linter rule), and
+  `repository:` must be omitted (`read_metrics` is global). Note
+  `Permission::Admin` does **not** imply `read_metrics` — an admin
+  credential is not a scrape credential
+  ([ADR 0052](../../../adr/0052-scoped-metrics-read-capability.md)).
 - **Verify post-install:**
   ```bash
   curl -i http://<svc-or-ingress>/metrics
-  # Expect: HTTP/1.1 401 Unauthorized on the main listener (or 404
-  #         when metrics.bindAddr is non-empty — /metrics is only on
-  #         the dedicated listener in that mode).
-  # A 200 means metrics.requireAuth=false — re-check values.
+  # Expect: HTTP/1.1 401 Unauthorized without a bearer, 403 with a
+  #         bearer that lacks read_metrics, or 404 if you're hitting
+  #         the main-router address (/metrics is admin-listener-only).
+  # A 200 requires a bearer carrying the read_metrics grant.
+  curl -i -H "Authorization: Bearer <granted-token>" http://<svc-or-ingress>/metrics
   ```
-- **Relaxation:** `metrics.requireAuth: false` re-enables anonymous
-  scraping; the chart emits a `NOTES.txt` warning. Keep
-  `metrics.bindAddr` non-empty (default `127.0.0.1:9090`, or set to a
-  pod-internal interface) so the surface stays inside the pod even
-  when unauthenticated. Setting `metrics.bindAddr: ""` mounts
-  `/metrics` on the main 8080 router (dev mode); production
-  deployments leave the dedicated listener in place.
-- **Single-tenant pattern (explicitly supported relaxation):** in a
-  single-tenant cluster where access to the metrics port is gated by
-  a `NetworkPolicy` that the operator ships alongside the
-  `ServiceMonitor`, `metrics.requireAuth: false` is an acceptable
-  trade. What `/metrics` reveals if reached (repository names from
-  the `repository` label, auth-failure rates, request-rate shape) is
-  reconnaissance value, not a direct compromise — no secrets, no
-  artifact bytes, no tokens. The trade is defence-in-depth: with auth
-  on, a misconfigured / removed NP shows up as 401 errors in
-  Prometheus (a visible near-miss); with auth off, the same operator
-  error means the endpoint becomes reachable from anywhere on the
-  pod network. Two operational disciplines make the relaxation safe:
-  (1) the NP and the `ServiceMonitor` live in the same
-  operator-owned overlay so they cannot drift apart across changes,
-  and (2) Prometheus alerts on `up{job="hort-server"} == 0` so a
-  scrape-broken-by-NP-change is detected within minutes, not weeks.
-  Do **not** apply this relaxation in multi-tenant clusters or
-  clusters where NP is not part of the versioned deployment
-  artefact.
+- **No relaxation available.** Prior chart series exposed
+  `metrics.requireAuth: false` as a supported single-tenant relaxation
+  (network-policy-gated anonymous scrape). #113 item 3 removed that
+  knob: the `read_metrics` grant is now the sole authz gate for
+  `/metrics`, with no operator opt-out — a `NetworkPolicy`-restricted
+  metrics port is defense-in-depth only, never a substitute for the
+  grant. Deployments that relied on the old anonymous-scrape relaxation
+  must instead issue a `read_metrics`-granted bearer to the scraper and
+  wire it via `ServiceMonitor.bearerTokenSecret` — see
+  [`../operate/metrics-scraper-service-account.md`](../operate/metrics-scraper-service-account.md)
+  for the migration path.
 
 ### SSRF redirect-hop revalidation
 

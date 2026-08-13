@@ -536,7 +536,7 @@ pub fn req_principal(req: &Request) -> Result<&CallerPrincipal, ApiError> {
 // password-only contract. Production callers now use
 // `extract_basic_credentials` via `resolve_token`.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum BasicAuthResult {
     /// Header parsed cleanly; inner string is the password field (treated
     /// as an opaque bearer token — the username half is ignored, per the
@@ -552,6 +552,23 @@ pub(crate) enum BasicAuthResult {
     /// No `Authorization: Basic` header present — the common, legitimate
     /// case. Callers treat this silently (no log).
     Absent,
+}
+
+/// Manual `Debug` impl: the `Ok` variant's inner string is the bearer
+/// token half of a Basic-auth header (see the `Ok` doc comment above) —
+/// a derived `Debug` would print it verbatim if a `{:?}` consumer ever
+/// appears (log line, panic message, `assert_eq!` failure). Mirrors the
+/// `S3StorageOpts` precedent (`crates/hort-adapters-storage/src/builders.rs`):
+/// variant name stays visible, secret payload becomes `<redacted>`.
+impl std::fmt::Debug for BasicAuthResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok(_) => f.debug_tuple("Ok").field(&"<redacted>").finish(),
+            Self::MalformedBase64 => write!(f, "MalformedBase64"),
+            Self::MissingColon => write!(f, "MissingColon"),
+            Self::Absent => write!(f, "Absent"),
+        }
+    }
 }
 
 /// Which transport carried the token we're about to validate.
@@ -635,12 +652,35 @@ fn basic_reason(result: &BasicAuthResult) -> &'static str {
 /// [`extract_basic_password_as_token`] is preserved for tests that pin
 /// the password-only contract; production callers use this richer
 /// variant via [`resolve_token`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum BasicCredentialsResult {
     Ok { username: String, password: String },
     MalformedBase64,
     MissingColon,
     Absent,
+}
+
+/// Manual `Debug` impl: `password` is the bearer-token-carrying secret
+/// half of a Basic-auth header — a derived `Debug` would print it
+/// verbatim if a `{:?}` consumer ever appears. `username` is not a
+/// secret (see the type's doc comment: it is only ever read for a
+/// shape-classification log line), so it stays visible. Mirrors the
+/// `S3StorageOpts` precedent (`crates/hort-adapters-storage/src/builders.rs`):
+/// variant name and non-secret fields stay visible, the secret payload
+/// becomes `<redacted>`.
+impl std::fmt::Debug for BasicCredentialsResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok { username, .. } => f
+                .debug_struct("Ok")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::MalformedBase64 => write!(f, "MalformedBase64"),
+            Self::MissingColon => write!(f, "MissingColon"),
+            Self::Absent => write!(f, "Absent"),
+        }
+    }
 }
 
 fn basic_creds_reason(result: &BasicCredentialsResult) -> &'static str {
@@ -2543,6 +2583,50 @@ mod tests {
         // Absent / Ok don't log — the reason is an empty string.
         assert_eq!(basic_reason(&BasicAuthResult::Absent), "");
         assert_eq!(basic_reason(&BasicAuthResult::Ok("x".into())), "");
+    }
+
+    #[test]
+    fn basic_auth_result_debug_redacts_token() {
+        let secret = "super-secret-jwt-do-not-log";
+        let rendered = format!("{:?}", BasicAuthResult::Ok(secret.to_string()));
+        assert!(
+            !rendered.contains(secret),
+            "Debug output must not contain the token: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must mark the token as redacted: {rendered}"
+        );
+        assert!(
+            rendered.contains("Ok"),
+            "Debug output must keep the variant name visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn basic_credentials_result_debug_redacts_password() {
+        let secret = "super-secret-jwt-do-not-log";
+        let rendered = format!(
+            "{:?}",
+            BasicCredentialsResult::Ok {
+                username: "__token__".to_string(),
+                password: secret.to_string(),
+            }
+        );
+        assert!(
+            !rendered.contains(secret),
+            "Debug output must not contain the password: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug output must mark the password as redacted: {rendered}"
+        );
+        // Username is not a secret (see the type's doc comment) — it
+        // stays visible for debuggability.
+        assert!(
+            rendered.contains("__token__"),
+            "Debug output must keep the non-secret username visible: {rendered}"
+        );
     }
 
     #[test]

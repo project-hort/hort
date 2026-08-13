@@ -517,17 +517,19 @@ fi
 # same endpoint moments later from an idle probe), so a hard assertion turns a
 # proven-correct emission into an intermittently-red gate. Poll briefly and
 # record the outcome as a PASS-or-note; the round-trips already proved ingest.
-if [ -n "${METRICS_URL:-}" ] && curl -sf -o /dev/null --max-time 5 "$METRICS_URL" 2>/dev/null; then
-  # Predicate is eval'd by bounded_poll in THIS shell, so $METRICS_URL must
-  # stay deferred — escape it (and the regex) rather than expand at definition
-  # time. Mirrors patch-candidate.sh's bounded_poll predicate quoting.
+if [ -n "${METRICS_URL:-}" ] && [ -n "${METRICS_TOKEN:-}" ] \
+    && curl -sf "${METRICS_AUTH_HEADER[@]}" -o /dev/null --max-time 5 "$METRICS_URL" 2>/dev/null; then
+  # Predicate is eval'd by bounded_poll in THIS shell, so $METRICS_URL and
+  # ${METRICS_AUTH_HEADER[@]} must stay deferred — escape them (and the
+  # regex) rather than expand at definition time. Mirrors
+  # patch-candidate.sh's bounded_poll predicate quoting.
   if bounded_poll "maven ingest metric" 20 \
-      "curl -sf \"\$METRICS_URL\" | grep -Eq '^hort_ingest_total\{[^}]*format=\"maven\"[^}]*result=\"success\"[^}]*\}'"; then
+      "curl -sf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" | grep -Eq '^hort_ingest_total\{[^}]*format=\"maven\"[^}]*result=\"success\"[^}]*\}'"; then
     pass "hort_ingest_total{format=\"maven\",result=\"success\"} present"
   else
     log "  note: hort_ingest_total{format=\"maven\"} not visible to the in-run scrape (soft) — the publish->resolve round-trips above are the authoritative ingest gate"
   fi
 else
-  log "  note: METRICS_URL unset/unreachable — skip ingest-metric check (round-trips are the gate)"
+  log "  note: METRICS_URL/METRICS_TOKEN unset or endpoint unreachable — skip ingest-metric check (round-trips are the gate)"
 fi
 summary

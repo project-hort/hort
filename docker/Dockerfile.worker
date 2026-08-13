@@ -44,7 +44,7 @@
 # operator who has already understood that Dockerfile sees the same
 # shape here.
 
-ARG RUST_VERSION=1.94
+ARG RUST_VERSION=1.94.1
 ARG TRIVY_VERSION=0.70.0
 ARG OSV_SCANNER_VERSION=2.3.8
 

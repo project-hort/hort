@@ -301,6 +301,16 @@ per-IP / per-token-prefix brute-force protection inside
 | `HORT_REDIS_URL_EVICTABLE` | string | _unset → falls back to `HORT_REDIS_URL`_ | No | Per-class evictable Redis override (per-class keyspace routing). |
 | `HORT_REDIS_URL_DURABLE` | string | _unset → falls back to `HORT_REDIS_URL`_ | No | Per-class durable Redis override. |
 
+**TLS posture: in-cluster / trusted-network only.** The `fred` client is
+built with `default-features = false` and no TLS feature (see the
+workspace `Cargo.toml`), so it cannot negotiate TLS at all — a
+`rediss://` URL fails closed at connect time rather than silently
+falling back to plaintext. Point `HORT_REDIS_URL` (and the
+per-class overrides) at a Redis reachable only over a trusted
+network path (in-cluster ClusterIP, private VPC peering, etc.);
+there is no supported way to run the EphemeralStore Redis backend
+over a public or untrusted link.
+
 ### Pull-through deduplication
 
 | Variable | Type | Default | Required? | Semantics |
@@ -457,8 +467,7 @@ it is referenced, not scheduled here.
 
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
-| `HORT_METRICS_REQUIRE_AUTH` | bool | `true` | No | Require admin auth on `/metrics`; `false` re-permits anonymous scrape (boot WARN). |
-| `HORT_METRICS_BIND` | SocketAddr | _unset → metrics on the main router_ | No | Dedicated metrics listener address. |
+| `HORT_METRICS_BIND` | SocketAddr | _unset → /metrics not exposed on any listener_ | No | Dedicated admin listener address; `/metrics` always requires a bearer carrying `Permission::ReadMetrics` (no opt-out, #113 item 3). |
 | `HORT_METRICS_PUBLIC_BIND` | bool | `false` | No | Allow the metrics listener to bind an unspecified address (`0.0.0.0`/`::`). Parsed before `HORT_METRICS_BIND` so the guard can consult it. |
 
 ### CAS scrubber

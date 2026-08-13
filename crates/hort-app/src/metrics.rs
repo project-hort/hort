@@ -903,6 +903,30 @@ pub fn emit_upstream_version_object_too_large(format: &str, repository: &str) {
     .increment(1);
 }
 
+/// Emit `hort_upstream_fetch_total{result="parse_error"}` when an
+/// upstream index/metadata body fails projection (malformed JSON/HTML,
+/// missing required fields) after a successful HTTP fetch.
+///
+/// **Emission-stage note**, same rationale as
+/// [`emit_upstream_version_object_too_large`]: the adapter's own
+/// `fetch_metadata` already recorded `success` for the transport leg —
+/// the parse happens downstream, in the per-format inbound source
+/// (`ProxyNpmSource` / `ProxyPypiSource` / `ProxyCargoSource`) — so
+/// without this call the trip would go unobserved on
+/// `hort_upstream_fetch_total`. `format` is the format key
+/// (`"npm"` / `"pypi"` / `"cargo"`); `repository` is the repo key or the
+/// [`values::REPOSITORY_ALL`] sentinel when
+/// `METRICS_INCLUDE_REPOSITORY_LABEL=false`.
+pub fn emit_upstream_parse_error(format: &str, repository: &str) {
+    metrics::counter!(
+        "hort_upstream_fetch_total",
+        labels::FORMAT => format.to_string(),
+        labels::REPOSITORY => repository.to_string(),
+        labels::RESULT => UpstreamErrorKind::ParseError.as_str(),
+    )
+    .increment(1);
+}
+
 /// Typed error returned by
 /// [`crate::ports::upstream_metadata::UpstreamMetadataPort::list_versions`].
 ///
@@ -2129,6 +2153,24 @@ pub fn emit_provenance_reject(
         "hort_provenance_reject_total",
         labels::BACKEND => backend.to_string(),
         labels::REASON => provenance_reject_reason_label(reason),
+    )
+    .increment(1);
+}
+
+/// Emit `hort_provenance_late_joiner_cleared_total{backend}` once per
+/// constituent that self-cleared against an already-verified subject at
+/// its own quarantine-commit time (ADR 0039 §11, late-joiner end). Single
+/// emission site: `ProvenanceCascade::resolve_late_joiner_clearance`.
+///
+/// Unlike the two counters above — which run in `hort-worker`'s
+/// `provenance-verify` job — this one is emitted on the **ingest path**,
+/// so it appears on the `hort-server` registry. `backend` is the verifier
+/// recorded on the subject's clearance, carrying the same bounded value
+/// space as the `backend` label everywhere else.
+pub fn emit_provenance_late_joiner_cleared(backend: &str) {
+    metrics::counter!(
+        "hort_provenance_late_joiner_cleared_total",
+        labels::BACKEND => backend.to_string(),
     )
     .increment(1);
 }
@@ -4466,6 +4508,43 @@ mod tests {
         assert!(
             found,
             "version_object_too_large must fire on hort_upstream_fetch_total with format+repository"
+        );
+    }
+
+    // -- parse_error emission --
+
+    #[test]
+    fn emit_upstream_parse_error_fires_with_format_repo_result() {
+        use super::emit_upstream_parse_error;
+        let snap = capture_metrics(|| {
+            emit_upstream_parse_error("cargo", "my-repo");
+        });
+        let mut found = false;
+        for (key, _, _, _) in snap.into_vec() {
+            let inner = key.key();
+            if inner.name() != "hort_upstream_fetch_total" {
+                continue;
+            }
+            let mut format = None;
+            let mut repository = None;
+            let mut result = None;
+            for label in inner.labels() {
+                match label.key() {
+                    "format" => format = Some(label.value().to_string()),
+                    "repository" => repository = Some(label.value().to_string()),
+                    "result" => result = Some(label.value().to_string()),
+                    _ => {}
+                }
+            }
+            if result.as_deref() == Some("parse_error") {
+                assert_eq!(format.as_deref(), Some("cargo"));
+                assert_eq!(repository.as_deref(), Some("my-repo"));
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "parse_error must fire on hort_upstream_fetch_total with format+repository"
         );
     }
 

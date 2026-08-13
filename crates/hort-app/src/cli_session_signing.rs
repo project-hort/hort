@@ -261,10 +261,11 @@ mod tests {
 
     use crate::oci_token_signing::{AccessEntry, OciAccessClaims, OciTokenSigningKey};
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
 
     fn fresh_signer() -> CliSessionTokenSigner {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let key = Arc::new(OciTokenSigningKey::new(sk, None));
         CliSessionTokenSigner::new(key, "https://hort.example.com".into())
     }
@@ -359,7 +360,7 @@ mod tests {
         // (the caller falls through to OIDC, which 401s), so it can
         // never replay against the CliSession-gated prefetch/discovery
         // surfaces.
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let key = Arc::new(OciTokenSigningKey::new(sk, None));
         let signer = CliSessionTokenSigner::new(key.clone(), "https://hort.example.com".into());
 
@@ -388,7 +389,7 @@ mod tests {
         // a non-`cli_session` `token_kind` is Rejected, not Verified.
         // (Constructed via the raw signer to bypass the `mint` helper
         // which always sets the correct token_kind.)
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let key = Arc::new(OciTokenSigningKey::new(sk, None));
         let signer = CliSessionTokenSigner::new(key.clone(), "https://hort.example.com".into());
         let bad = CliSessionClaims {

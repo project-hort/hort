@@ -1,0 +1,21 @@
+# ServiceAccount (e2e): the native-token-mode pusher/puller for
+# scripts/native-tests/scenarios/clients/oci.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation): under the
+# native-tokens compose overlay the scenario admin-mints an hort_svc_* token
+# for this SA (`POST /api/v1/admin/users/:id/tokens`) and uses it as the
+# skopeo `--dest-creds`/`--src-creds` for both the push and the pull-back
+# round-trip. A native credential is required because the `/v2/auth` mint
+# validates the Basic password strictly as a PAT: dev-user's claims-based
+# Keycloak JWT can never complete it (mirrors the provenance-ci SA's
+# rationale). Authority is the sibling serviceAccount-subject PermissionGrants
+# in auth/oci-e2e-ci-{read,write}.yaml — the credentialed `/v2/auth` exchange
+# resolves grants only (no repo-visibility shortcut, unlike legacy Basic-as-JWT
+# auth), so both legs are granted explicitly even though oci-e2e is public.
+# Inert in legacy (no-overlay) runs: the SA row exists, nothing mints for it —
+# the scenario's legacy-mode branch keeps using dev-user's OIDC token instead.
+apiVersion: project-hort.de/v1
+kind: ServiceAccount
+metadata:
+  name: oci-e2e-ci
+spec: {}

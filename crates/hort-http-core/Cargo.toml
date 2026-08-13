@@ -36,7 +36,7 @@ hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory", o
 axum                        = { workspace = true }
 tower                       = { workspace = true }
 tower-http                  = { workspace = true }
-governor                    = "0.8"
+governor                    = "0.10"
 tokio                       = { workspace = true }
 tokio-util                  = { workspace = true }
 # Per-IP semaphore map for the
@@ -60,12 +60,7 @@ chrono                      = { workspace = true }
 # fixed-shape payload; `serde` drives the codec.
 postcard                    = { workspace = true }
 # Basic-auth header decoding in `middleware::auth::extract_basic_credentials`.
-base64                      = "0.22"
-# `#[async_trait]` impls on `FromRequestParts` extractors in
-# `limits::BoundedPath` and `authz::extractors::{AdminPrincipal, WriteRepoAccess, ReadRepoAccess}`.
-# axum 0.7's `FromRequestParts` still requires the macro — a future axum
-# bump would let us drop it.
-async-trait                 = "0.1"
+base64                      = "0.23"
 
 [dev-dependencies]
 tokio                        = { workspace = true, features = ["test-util"] }

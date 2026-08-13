@@ -98,6 +98,15 @@ pub(crate) enum UpstreamPullError {
     #[error("upstream metadata parse error: {0}")]
     ParseError(String),
 
+    /// The version segment extracted from the filename (PEP 491 / PEP 625
+    /// split) failed the format-crate version validator — reject before the
+    /// per-version JSON metadata path is built. Distinct from `ParseError`:
+    /// the filename's *structural* shape (dash-segment count, extension)
+    /// parsed fine; the extracted *value* is what fails, and that is a
+    /// client fault, not an upstream fault — surfaced as 400, not 502.
+    #[error("invalid version segment: {0}")]
+    InvalidVersion(String),
+
     /// `IngestUseCase::ingest_verified` returned `Conflict` — upstream
     /// bytes hashed differently from the `digests.sha256` advertised in
     /// the JSON body (ADR 0006). The use case already emitted
@@ -166,8 +175,17 @@ pub(crate) async fn try_upstream_file_pull(
     //    is the second `-`-separated segment for wheels (PEP 491) and
     //    the right side of the last `-` for sdists (PEP 625).
     let (filename_project, version) = parse_pypi_filename(filename).map_err(|e| {
-        tracing::warn!(error = %e, "PyPI filename parse failed");
+        tracing::warn!(error = %e, filename, "PyPI filename parse failed");
         UpstreamPullError::ParseError(e.to_string())
+    })?;
+
+    // Reject a version segment that isn't a valid PyPI version before it
+    // reaches the per-version JSON metadata path built below — the segment
+    // is attacker-controlled (it comes straight out of the request-URL
+    // filename) and otherwise flows unvalidated into the upstream URL.
+    hort_formats::pypi::validate_pypi_version(&version).map_err(|e| {
+        tracing::warn!(error = %e, "PyPI filename version segment failed validation");
+        UpstreamPullError::InvalidVersion(e.to_string())
     })?;
 
     // Cross-check: PEP 503-normalising the filename's project segment
@@ -517,9 +535,12 @@ pub(crate) async fn try_upstream_file_pull(
                         }),
                         content_hash: content_hash.clone(),
                         // Upstream pull is not a seed-import cutover;
-                        // quarantine is policy-driven through the primary
-                        // `ingest_verified` path, not via the follower
-                        // register-by-hash shim.
+                        // this follower's OWN target-repo row resolves
+                        // its OWN quarantine gate inside the shared
+                        // `register_by_hash_inner` tail (issue #107 Item
+                        // 1) — it is NOT inherited from the leader's
+                        // `ingest_verified`, which only ever gated the
+                        // leader's own (possibly different) repo's row.
                         seed_import_quarantine_anchor: None,
                     },
                     &PyPiFormatHandler,
@@ -553,6 +574,14 @@ pub(crate) async fn try_upstream_file_pull(
 /// segment) and the filename's name segment is performed in the caller
 /// — both feed it the same data in different cases (`Requests` vs
 /// `requests`), so normalising before comparing is essential.
+///
+/// Error messages **never** include the rejected `filename` — it is
+/// attacker-controlled (taken straight from the request URL) and the
+/// codebase's established rule for this exact `DomainError::Validation`
+/// shape is that it must never carry the offending input (mirrors
+/// `hort_formats::pypi::validate_pypi_filename` / `validate_pep_503_name`
+/// / `validate_pypi_version`, which document the same contract). The
+/// caller logs `filename` via `tracing::warn!` for diagnostics.
 //
 // `extract_upstream_publish_time` (the raw-body `serde_json::Value`
 // walk over `urls[i].upload_time_iso_8601`) was retired: the publish
@@ -566,15 +595,15 @@ fn parse_pypi_filename(filename: &str) -> DomainResult<(String, String)> {
         // PEP 491: at least 5 `-`-separated segments.
         let parts: Vec<&str> = stem.split('-').collect();
         if parts.len() < 5 {
-            return Err(DomainError::Validation(format!(
-                "PyPI wheel filename '{filename}' does not have ≥5 '-'-separated segments \
-                 per PEP 491"
-            )));
+            return Err(DomainError::Validation(
+                "PyPI wheel filename does not have ≥5 '-'-separated segments per PEP 491"
+                    .to_string(),
+            ));
         }
         if parts[0].is_empty() || parts[1].is_empty() {
-            return Err(DomainError::Validation(format!(
-                "PyPI wheel filename '{filename}' has empty name or version segment"
-            )));
+            return Err(DomainError::Validation(
+                "PyPI wheel filename has empty name or version segment".to_string(),
+            ));
         }
         return Ok((parts[0].to_string(), parts[1].to_string()));
     }
@@ -584,25 +613,25 @@ fn parse_pypi_filename(filename: &str) -> DomainResult<(String, String)> {
     } else if let Some(s) = filename.strip_suffix(".zip") {
         s
     } else {
-        return Err(DomainError::Validation(format!(
-            "PyPI filename '{filename}' is neither a wheel (.whl) nor a recognised sdist \
-             (.tar.gz / .zip)"
-        )));
+        return Err(DomainError::Validation(
+            "PyPI filename is neither a wheel (.whl) nor a recognised sdist (.tar.gz / .zip)"
+                .to_string(),
+        ));
     };
 
     // PEP 625: `name-version`. Split on the LAST `-` — the name itself
     // may contain `-` in legacy uploads.
     let Some(idx) = stem.rfind('-') else {
-        return Err(DomainError::Validation(format!(
-            "PyPI sdist filename '{filename}' has no '-' separator between name and version"
-        )));
+        return Err(DomainError::Validation(
+            "PyPI sdist filename has no '-' separator between name and version".to_string(),
+        ));
     };
     let name = &stem[..idx];
     let version = &stem[idx + 1..];
     if name.is_empty() || version.is_empty() {
-        return Err(DomainError::Validation(format!(
-            "PyPI sdist filename '{filename}' has empty name or version segment"
-        )));
+        return Err(DomainError::Validation(
+            "PyPI sdist filename has empty name or version segment".to_string(),
+        ));
     }
     Ok((name.to_string(), version.to_string()))
 }
@@ -732,6 +761,15 @@ pub(crate) fn map_upstream_pull_error(e: &UpstreamPullError) -> Response {
                 serde_json::json!({"error": "upstream metadata invalid"}).to_string(),
             ))
             .unwrap(),
+        // A client-request fault (the URL's filename yielded an invalid
+        // version segment), NOT an upstream fault — 400, matching the same
+        // `{"error": message}` envelope shape the format-crate validators'
+        // `Validation` → 400 mapping uses elsewhere on this serve path.
+        UpstreamPullError::InvalidVersion(cause) => Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::json!({"error": cause}).to_string()))
+            .unwrap(),
         UpstreamPullError::MetadataFetchFailed { stage, .. } => {
             let body = match *stage {
                 "json" => serde_json::json!({"error": "upstream metadata fetch failed"}),
@@ -776,6 +814,7 @@ mod tests {
     use uuid::Uuid;
 
     use hort_app::use_cases::test_support::sample_repository;
+    use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
     use hort_domain::error::DomainError;
@@ -896,20 +935,32 @@ mod tests {
 
     #[test]
     fn parse_pypi_filename_unknown_extension_rejected() {
-        let err = parse_pypi_filename("this-is-not-a-package.unknown").unwrap_err();
+        let err = parse_pypi_filename("xsentinel-unknown-ext.unknown").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            !err.to_string().contains("xsentinel"),
+            "error message must not echo the rejected filename: {err}"
+        );
     }
 
     #[test]
     fn parse_pypi_filename_too_few_wheel_segments_rejected() {
-        let err = parse_pypi_filename("requests-2.31.0.whl").unwrap_err();
+        let err = parse_pypi_filename("xsentinel-2.31.0.whl").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            !err.to_string().contains("xsentinel"),
+            "error message must not echo the rejected filename: {err}"
+        );
     }
 
     #[test]
     fn parse_pypi_filename_sdist_no_dash_rejected() {
-        let err = parse_pypi_filename("noseparator.tar.gz").unwrap_err();
+        let err = parse_pypi_filename("xsentinelnoseparator.tar.gz").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            !err.to_string().contains("xsentinel"),
+            "error message must not echo the rejected filename: {err}"
+        );
     }
 
     #[test]
@@ -1081,6 +1132,63 @@ mod tests {
             matches!(err, UpstreamPullError::ParseError(_)),
             "expected ParseError for project mismatch, got {err:?}"
         );
+    }
+
+    // ---- Branch 2b: version segment fails the format-crate validator --------
+
+    /// The sdist grammar (`{name}-{version}.tar.gz`) has no charset check
+    /// of its own — `parse_pypi_filename` only requires the split to
+    /// yield non-empty name/version segments — so a version segment
+    /// outside `validate_pypi_version`'s allowlist must be caught by the
+    /// explicit gate this fix adds, one-shot proving the upstream JSON
+    /// leg is never reached on reject.
+    #[tokio::test]
+    async fn invalid_version_segment_rejects_before_upstream_leg() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = pypi_repo("pypi-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id, "");
+        mocks
+            .upstream_proxy
+            .fail_next_metadata_with(DomainError::Invariant(
+                "MARKER:fetch_metadata_must_not_be_called".into(),
+            ));
+
+        let err = try_upstream_file_pull(&ctx, &repo, "pkg", "pkg-1@2.tar.gz")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::InvalidVersion(_)),
+            "expected InvalidVersion for a version segment outside the charset allowlist, \
+             got {err:?}"
+        );
+    }
+
+    /// The gate must not regress the happy path: a legitimate PEP 440
+    /// version segment still flows through to a successful pull.
+    #[tokio::test]
+    async fn valid_version_segment_passes_the_validation_gate() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = pypi_repo("pypi-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id, "");
+
+        let body_bytes = b"the actual sdist body".to_vec();
+        let sha = sha256_hex(&body_bytes);
+        let sdist_url = "https://files.pythonhosted.org/packages/abc/requests-2.31.0.tar.gz";
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pypi/requests/2.31.0/json",
+            pypi_json("requests-2.31.0.tar.gz", &sha, sdist_url),
+        );
+        mocks
+            .upstream_proxy
+            .insert_artifact("", sdist_url, body_bytes);
+
+        try_upstream_file_pull(&ctx, &repo, "requests", "requests-2.31.0.tar.gz")
+            .await
+            .expect("a legitimate version segment must pass the validation gate");
     }
 
     // ---- Branch 3: metadata fetch failure (json leg) ------------------------
@@ -1350,6 +1458,25 @@ mod tests {
         assert_eq!(
             blocked_body, miss_body,
             "curation-blocked body must be byte-identical to a genuine miss"
+        );
+    }
+
+    /// `InvalidVersion` is a client-request fault (the URL's filename
+    /// yielded an invalid version segment) — 400, not the 502/503 the
+    /// upstream-fault variants map to.
+    #[tokio::test]
+    async fn invalid_version_maps_to_bad_request() {
+        use axum::body::to_bytes;
+
+        let resp = map_upstream_pull_error(&UpstreamPullError::InvalidVersion(
+            "pypi.version: contains a byte outside [A-Za-z0-9.+!_-]".into(),
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"],
+            "pypi.version: contains a byte outside [A-Za-z0-9.+!_-]"
         );
     }
 
@@ -1893,6 +2020,134 @@ mod tests {
             "expected ≥1 follower_waited_hit (concurrent coalesce); \
              got {follower_waited_hit}, snap: {snap:?}"
         );
+    }
+
+    /// A repo-scoped, quarantining, scanning `ScanPolicy` for `repo_id`
+    /// — repo-scoped wins over `build_mock_ctx`'s pre-seeded permissive-
+    /// global default, so seeding one per repo does not interact with
+    /// the other repo in the same test.
+    fn quarantining_policy(
+        repo_id: Uuid,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        };
+        use hort_domain::events::PolicyScope;
+        let now = Utc::now();
+        ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: format!("item3-follower-regression-{repo_id}"),
+            scope: PolicyScope::Repository(repo_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs: 3600,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::Off,
+            provenance_backends: Vec::new(),
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            stream_version: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Issue #107 Item 3 pin (d) — pins that the shared-inner-fn fix
+    /// (`register_by_hash_inner`, `hort-app`) reaches a NON-OCI format
+    /// crate too. Same shape as `blobs.rs`'s
+    /// `cross_repo_follower_quarantines_target_row_under_active_policy`:
+    /// races the SAME wheel content hash across TWO DIFFERENT target
+    /// repos (PyPI's `blob_dedup_key = DedupKey::blob_by_hash` is ALSO
+    /// keyed purely by hash, not by repo), so whichever caller loses the
+    /// coalesce race lands in `try_upstream_file_pull`'s `Ok(None)`
+    /// post-coalesce arm — the cross-repo follower branch that calls
+    /// `register_existing_cas_blob` instead of `ingest_verified`.
+    ///
+    /// The harness reaches the SAME `register_by_hash_inner` gate the
+    /// OCI pin exercises (no PyPI-specific harness limitation
+    /// encountered — `try_upstream_file_pull`'s follower arm calls the
+    /// identical `IngestUseCase::register_existing_cas_blob` OCI's
+    /// follower arm does, and `build_mock_ctx`'s `MockPorts` exposes
+    /// `policy_projections` uniformly across every format crate's test
+    /// module).
+    #[test]
+    fn cross_repo_follower_quarantines_target_row_under_active_policy() {
+        let (r1, r2) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (ctx, mocks) = build_mock_ctx(handle());
+                let repo_a = pypi_repo("repo-a");
+                let repo_b = pypi_repo("repo-b");
+                mocks.repositories.insert(repo_a.clone());
+                mocks.repositories.insert(repo_b.clone());
+                mocks
+                    .policy_projections
+                    .insert(quarantining_policy(repo_a.id));
+                mocks
+                    .policy_projections
+                    .insert(quarantining_policy(repo_b.id));
+                seed_mapping(&mocks, repo_a.id, "");
+                seed_mapping(&mocks, repo_b.id, "");
+
+                let body_bytes = b"the actual wheel body for item3 pin (d)".to_vec();
+                let sha = sha256_hex(&body_bytes);
+                let wheel_url =
+                    "https://files.pythonhosted.org/packages/abc/requests-2.31.0-py3-none-any.whl";
+                let json = pypi_json("requests-2.31.0-py3-none-any.whl", &sha, wheel_url);
+                mocks
+                    .upstream_proxy
+                    .insert_metadata("", "/pypi/requests/2.31.0/json", json);
+                mocks
+                    .upstream_proxy
+                    .insert_artifact("", wheel_url, body_bytes.clone());
+
+                let ctx_a = ctx.clone();
+                let repo_a2 = repo_a.clone();
+                let h1 = tokio::spawn(async move {
+                    try_upstream_file_pull(
+                        &ctx_a,
+                        &repo_a2,
+                        "requests",
+                        "requests-2.31.0-py3-none-any.whl",
+                    )
+                    .await
+                });
+                let ctx_b = ctx.clone();
+                let repo_b2 = repo_b.clone();
+                let h2 = tokio::spawn(async move {
+                    try_upstream_file_pull(
+                        &ctx_b,
+                        &repo_b2,
+                        "requests",
+                        "requests-2.31.0-py3-none-any.whl",
+                    )
+                    .await
+                });
+
+                (h1.await.unwrap(), h2.await.unwrap())
+            });
+
+        for (label, outcome) in [("repo-a", r1), ("repo-b", r2)] {
+            match outcome {
+                Ok(artifact) => {
+                    assert_eq!(
+                        artifact.quarantine_status,
+                        QuarantineStatus::Quarantined,
+                        "issue #107 Item 1: {label}'s row must be Quarantined under its \
+                         active policy regardless of whether {label} won the coalesce race \
+                         (leader, via ingest_verified) or lost it (follower, via \
+                         register_by_hash_inner) — pre-#107 only the leader's row quarantined"
+                    );
+                }
+                Err(e) => panic!("{label} must succeed; got {e:?}"),
+            }
+        }
     }
 
     /// Negative-cache test: the wrapped JSON metadata fetch fails

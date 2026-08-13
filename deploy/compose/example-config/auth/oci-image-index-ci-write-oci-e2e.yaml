@@ -1,0 +1,14 @@
+# PermissionGrant: serviceAccount oci-image-index-ci -> write oci-e2e
+# (native-token-mode Phase A image-index push in
+# scripts/native-tests/scenarios/quarantine/oci-image-index.sh). Resolves at
+# apply to the SA's backing user (GrantSubject::User, ADR 0037).
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-image-index-ci-write-oci-e2e
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-image-index-ci
+  permission: write
+  repository: oci-e2e

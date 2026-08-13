@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgArguments;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
@@ -102,7 +102,7 @@ impl ArtifactRepository for PgArtifactRepository {
         Box::pin(async move {
             tracing::debug!(entity = "Artifact", %id, "find_by_id");
             let sql = format!("SELECT {SELECT_COLS} FROM artifacts WHERE id = $1");
-            let row: ArtifactRow = sqlx::query_as(&sql)
+            let row: ArtifactRow = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(id)
                 .fetch_one(&self.pool)
                 .await
@@ -120,7 +120,7 @@ impl ArtifactRepository for PgArtifactRepository {
             tracing::debug!(entity = "Artifact", sha256 = %sha256, "find_by_checksum");
             let sql =
                 format!("SELECT {SELECT_COLS} FROM artifacts WHERE checksum_sha256 = $1 LIMIT 1");
-            let row: Option<ArtifactRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(&sha256)
                 .fetch_optional(&self.pool)
                 .await
@@ -146,7 +146,7 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE repository_id = $1 AND checksum_sha256 = $2 LIMIT 1"
             );
-            let row: Option<ArtifactRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&sha256)
                 .fetch_optional(&self.pool)
@@ -172,7 +172,7 @@ impl ArtifactRepository for PgArtifactRepository {
                    ORDER BY name, version
                    OFFSET $2 LIMIT $3"#
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(offset)
                 .bind(limit)
@@ -229,7 +229,7 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts WHERE repository_id = $1 AND path = $2"
             );
-            let row: Option<ArtifactRow> = sqlx::query_as(&sql)
+            let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&path)
                 .fetch_optional(&self.pool)
@@ -303,7 +303,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY version \
                  OFFSET $3 LIMIT $4"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&name)
                 .bind(offset)
@@ -357,7 +357,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY version \
                  OFFSET $3 LIMIT $4"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(&raw)
                 .bind(offset)
@@ -458,7 +458,7 @@ impl ArtifactRepository for PgArtifactRepository {
                    AND is_deleted = false \
                  LIMIT $2"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
                 .bind(cap + 1)
                 .fetch_all(&self.pool)
@@ -625,7 +625,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY id \
                  LIMIT $2"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(&kind)
                 .bind(limit)
                 .fetch_all(&self.pool)
@@ -708,7 +708,7 @@ impl ArtifactRepository for PgArtifactRepository {
                      )
                    LIMIT $2"#
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(policy_id)
                 .bind(cap + 1)
                 .fetch_all(&self.pool)
@@ -784,7 +784,7 @@ impl ArtifactRepository for PgArtifactRepository {
                  ORDER BY a.id \
                  OFFSET $2 LIMIT $3"
             );
-            let rows: Vec<ArtifactRow> = sqlx::query_as(&sql)
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(policy_id)
                 .bind(offset)
                 .bind(limit)
@@ -793,7 +793,7 @@ impl ArtifactRepository for PgArtifactRepository {
                 .map_err(|e| map_sqlx_error(&e, "Artifact", "list_active_for_policy"))?;
 
             let count_sql = format!("SELECT COUNT(*) FROM artifacts a WHERE {SCOPE_PREDICATE}");
-            let total: Option<i64> = sqlx::query_scalar(&count_sql)
+            let total: Option<i64> = sqlx::query_scalar(AssertSqlSafe(count_sql))
                 .bind(policy_id)
                 .fetch_one(&self.pool)
                 .await
@@ -838,59 +838,116 @@ impl PgArtifactRepository {
         Ok(())
     }
 
-    /// Column-scoped UPDATE for a verdict transition (scan / provenance —
-    /// issue #90). Writes ONLY `quarantine_status` + `updated_at`, never
-    /// the full row: verdict application follows a slow scan-execution /
+    /// Column-scoped, **prior-status-conditional** UPDATE for a verdict
+    /// transition (scan / provenance — issues #90 and #108).
+    ///
+    /// Writes ONLY `quarantine_status` + `updated_at`, never the full row
+    /// (#90): verdict application follows a slow scan-execution /
     /// bundle-fetch round trip after the artifact was loaded, so the
     /// caller's in-memory snapshot of every OTHER column (most critically
     /// `quarantine_window_start`, the quarantine anchor) can be stale by
     /// commit time. A full-row `save_in_tx` write-back would clobber
     /// whatever a concurrently-committed transition wrote to those columns
-    /// in the meantime. Errors `NotFound` if the artifact row does not
-    /// exist — a verdict can only ever apply to an already-ingested
-    /// artifact.
+    /// in the meantime.
+    ///
+    /// #90 left `quarantine_status` ITSELF — the security-load-bearing
+    /// column — written unconditionally from that same stale snapshot, so
+    /// a signed image that also tripped a scan policy could resurrect
+    /// `Rejected → Quarantined` and then timer-release (#108 H2b). The
+    /// UPDATE is therefore predicated on the row still holding the status
+    /// the caller LOADED (`prior_status`), via `IS NOT DISTINCT FROM` —
+    /// NOT `=` — because `QuarantineStatus::None` is stored as SQL `NULL`
+    /// and `NULL = NULL` is `NULL`, never true.
+    ///
+    /// ## The zero-rows split
+    ///
+    /// Zero affected rows is ambiguous — the id may be absent, or present
+    /// with a changed status — and the two must NOT collapse: a
+    /// genuinely-absent id is [`DomainError::NotFound`] (a verdict can
+    /// only apply to an already-ingested artifact), while a present row
+    /// whose status moved under us is [`DomainError::Conflict`] (the
+    /// losing verdict is re-derivable; the caller retries or re-runs).
+    /// A single statement disambiguates race-free: the `existing` CTE
+    /// reads the pre-UPDATE row under the SAME statement snapshot as the
+    /// `updated` CTE's write, so no other transaction can commit between
+    /// the two reads (a follow-up `SELECT` after the UPDATE could, and
+    /// would misreport a concurrently-deleted row as `NotFound` when it
+    /// was really a `Conflict`).
     pub(crate) async fn save_verdict_status_in_tx(
         &self,
         tx: &mut PgUnitOfWork,
         artifact_id: Uuid,
         quarantine_status: QuarantineStatus,
         updated_at: DateTime<Utc>,
+        prior_status: QuarantineStatus,
     ) -> DomainResult<()> {
         tracing::debug!(
             entity = "Artifact",
             id = %artifact_id,
             "save_verdict_status_in_tx"
         );
-        let quarantine_str = match quarantine_status {
+        let to_sql = |s: QuarantineStatus| match s {
             QuarantineStatus::None => None,
             other => Some(other.to_string()),
         };
+        let quarantine_str = to_sql(quarantine_status);
+        let prior_str = to_sql(prior_status);
 
-        let result = sqlx::query(
-            "UPDATE artifacts SET quarantine_status = $1, updated_at = $2 WHERE id = $3",
+        let (existed, updated): (bool, bool) = sqlx::query_as(
+            "WITH existing AS (
+                 SELECT 1 FROM artifacts WHERE id = $3
+             ),
+             updated AS (
+                 UPDATE artifacts SET quarantine_status = $1, updated_at = $2
+                 WHERE id = $3 AND quarantine_status IS NOT DISTINCT FROM $4
+                 RETURNING 1
+             )
+             SELECT EXISTS (SELECT 1 FROM existing), EXISTS (SELECT 1 FROM updated)",
         )
         .bind(quarantine_str)
         .bind(updated_at)
         .bind(artifact_id)
-        .execute(tx.conn())
+        .bind(prior_str)
+        .fetch_one(tx.conn())
         .await
         .map_err(|e| map_sqlx_error(&e, "Artifact", &artifact_id.to_string()))?;
 
-        if result.rows_affected() == 0 {
+        if updated {
+            return Ok(());
+        }
+        if !existed {
             return Err(DomainError::NotFound {
                 entity: "Artifact",
                 id: artifact_id.to_string(),
             });
         }
-        Ok(())
+        // Present, but its status is no longer `prior_status` — a
+        // concurrent verdict/transition won. Fail closed: the stale
+        // verdict must not overwrite the newer status. `warn!` (not
+        // `error!`) — recoverable and expected under contention, matching
+        // the `commit_transition` conflict convention.
+        tracing::warn!(
+            entity = "Artifact",
+            id = %artifact_id,
+            ?prior_status,
+            attempted = ?quarantine_status,
+            "verdict status write conflicted: quarantine_status changed since load"
+        );
+        Err(DomainError::Conflict(format!(
+            "artifact {artifact_id} quarantine_status changed concurrently \
+             (expected {prior_status}); verdict not applied"
+        )))
     }
 }
 
 // ---------------------------------------------------------------------------
 // Tests — DB-backed integration tests covering pagination + LIMIT bounds.
-// Marked `#[ignore]` so they run only via `cargo test -- --ignored` when
-// `DATABASE_URL` is wired; running them without the env var panics rather
-// than silently passing.
+// Runtime self-skip (issue #94): `maybe_pool()` returns `None` when
+// `DATABASE_URL` is unset, and each test does
+// `let Some(pool) = maybe_pool().await else { return; };` — a clean,
+// fast no-op under plain `cargo test`, full execution when
+// `DATABASE_URL` is wired (e.g. `test:integration` CI). Every DB-touching
+// test carries `#[serial(hort_pg_db)]`.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1039,11 +1096,10 @@ mod tests {
     /// `items.len() == limit` AND the total reflects the full row set.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_by_name_in_repo_caps_at_default_page_size() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         // Seed 50 versions, request the first 20 (PageRequest::default).
         seed_artifacts_with_name(&pool, repo_id, "many", 50).await;
@@ -1068,11 +1124,10 @@ mod tests {
     ///     zero-padded so lexicographic == numeric).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_by_name_in_repo_paginates_through_all_results() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         seed_artifacts_with_name(&pool, repo_id, "walk", 75).await;
 
@@ -1109,11 +1164,10 @@ mod tests {
     /// boundary by binding `page.limit` directly.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_by_name_in_repo_max_page_size_capped() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         // Seed enough to hit the cap; 1500 > 1000 = MAX_LIMIT.
         seed_artifacts_with_name(&pool, repo_id, "cap", 1_500).await;
@@ -1137,11 +1191,10 @@ mod tests {
     /// exactly the cap and flips `truncated`.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_repo_truncates_at_limit_list_max_items() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         // Seed cap + 1 active artifacts.
         seed_active_artifacts(&pool, repo_id, LIMIT_LIST_MAX_ITEMS as usize + 1).await;
@@ -1162,11 +1215,10 @@ mod tests {
     /// false-positive truncation signal.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_repo_does_not_truncate_below_cap() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         seed_active_artifacts(&pool, repo_id, 2_000).await;
 
@@ -1249,11 +1301,10 @@ mod tests {
     /// contract.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn package_version_status_returns_repo_scoped_pairs_excluding_deleted_and_null_version() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_a = seed_repo(&pool).await;
         let repo_b = seed_repo(&pool).await;
 
@@ -1371,11 +1422,10 @@ mod tests {
     /// "lookup failure".
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn package_version_status_unknown_package_returns_empty_vec() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let r = PgArtifactRepository::new(pool.clone());
         let triples = r
@@ -1400,14 +1450,13 @@ mod tests {
     /// untrusted value verbatim for audit.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn artifact_upstream_published_at_round_trips() {
         use crate::event_store::PgEventStore;
         use hort_domain::entities::artifact::Artifact;
 
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
 
         // Construct an event store so we can mint a unit-of-work for
@@ -1517,14 +1566,13 @@ mod tests {
     /// other artifact column, not just the anchor.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn save_verdict_status_in_tx_does_not_clobber_other_columns() {
         use crate::event_store::PgEventStore;
         use hort_domain::entities::artifact::Artifact;
 
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
 
         let event_store = PgEventStore::new(pool.clone())
@@ -1581,6 +1629,9 @@ mod tests {
             id,
             QuarantineStatus::Rejected,
             verdict_updated_at,
+            // Prior status == what the seed row holds, so the #108
+            // conditional predicate matches and the write proceeds.
+            QuarantineStatus::Quarantined,
         )
         .await
         .expect("save_verdict_status_in_tx");
@@ -1622,13 +1673,12 @@ mod tests {
     /// missing row is an invariant violation, not a benign skip).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn save_verdict_status_in_tx_errors_not_found_on_missing_row() {
         use crate::event_store::PgEventStore;
 
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
@@ -1641,10 +1691,157 @@ mod tests {
                 Uuid::new_v4(),
                 QuarantineStatus::Rejected,
                 Utc::now(),
+                QuarantineStatus::Quarantined,
             )
             .await
             .expect_err("missing row must error, not silently no-op");
-        assert!(matches!(err, DomainError::NotFound { .. }));
+        assert!(
+            matches!(err, DomainError::NotFound { .. }),
+            "an ABSENT id must stay NotFound — issue #108 added a Conflict arm for a \
+             PRESENT row whose status moved, and the two must not collapse; got {err:?}"
+        );
+    }
+
+    /// Seed one artifact row at `status` and return its id. Shared by the
+    /// #108 conditional-UPDATE tests below.
+    #[cfg(test)]
+    async fn seed_artifact_at_status(
+        pool: &PgPool,
+        repo_id: Uuid,
+        seed: usize,
+        status: QuarantineStatus,
+    ) -> (Uuid, DateTime<Utc>) {
+        use crate::event_store::PgEventStore;
+        use hort_domain::entities::artifact::Artifact;
+
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+        let id = Uuid::new_v4();
+        let anchor: DateTime<Utc> = "2025-06-01T00:00:00Z".parse().unwrap();
+        let artifact = Artifact {
+            id,
+            repository_id: repo_id,
+            name: "cond-pkg".into(),
+            name_as_published: "cond-pkg".into(),
+            version: Some("1.0.0".into()),
+            path: format!("cond-pkg/1.0.0/{id}.tar.gz"),
+            size_bytes: 42,
+            sha256_checksum: deterministic_hex64(seed).parse().unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: status,
+            rejection_reason: None,
+            quarantine_window_start: Some(anchor),
+            quarantine_deadline: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            is_deleted: false,
+            created_at: anchor,
+            updated_at: anchor,
+        };
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        repo.save_in_tx(&mut uow, &artifact)
+            .await
+            .expect("save_in_tx (seed)");
+        uow.commit().await.expect("commit (seed)");
+        (id, anchor)
+    }
+
+    /// issue #108 H2b — the conditional UPDATE must REFUSE a write whose
+    /// `prior_status` no longer matches the persisted row, and must
+    /// report that as `Conflict`, NOT `NotFound` (the row is present) and
+    /// certainly not by overwriting. This is the projection-layer backstop
+    /// behind the event-store OCC: it fires even when the append itself
+    /// did not conflict.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_verdict_status_in_tx_conflicts_when_prior_status_changed() {
+        use crate::event_store::PgEventStore;
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        // Persisted row is `Rejected` (as if a scan verdict just landed).
+        let (id, _anchor) =
+            seed_artifact_at_status(&pool, repo_id, 0xFEED_0108, QuarantineStatus::Rejected).await;
+
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+
+        // A stale verdict that LOADED `Quarantined` tries to write.
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        let err = repo
+            .save_verdict_status_in_tx(
+                &mut uow,
+                id,
+                QuarantineStatus::Released,
+                Utc::now(),
+                QuarantineStatus::Quarantined,
+            )
+            .await
+            .expect_err("a changed prior status must refuse the write");
+        drop(uow);
+
+        assert!(
+            matches!(err, DomainError::Conflict(_)),
+            "a PRESENT row whose status moved must be Conflict, not NotFound — the split is \
+             the whole point of the CTE; got {err:?}"
+        );
+        let saved = repo.find_by_id(id).await.expect("find_by_id");
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Rejected,
+            "the persisted status must be left exactly as the concurrent writer left it"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// issue #108 H2b — `QuarantineStatus::None` is stored as SQL `NULL`,
+    /// and `NULL = NULL` is `NULL` (never true), so the predicate MUST use
+    /// `IS NOT DISTINCT FROM`. A plain `=` would make every
+    /// `None`-prior-status verdict spuriously `Conflict`. Pins that the
+    /// NULL-prior case MATCHES and the write lands.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_verdict_status_in_tx_matches_null_prior_status() {
+        use crate::event_store::PgEventStore;
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        // Persisted row is `None` → the column is SQL NULL.
+        let (id, _anchor) =
+            seed_artifact_at_status(&pool, repo_id, 0xFEED_0109, QuarantineStatus::None).await;
+
+        let event_store = PgEventStore::new(pool.clone())
+            .await
+            .expect("PgEventStore::new");
+        let repo = PgArtifactRepository::new(pool.clone());
+
+        let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
+        repo.save_verdict_status_in_tx(
+            &mut uow,
+            id,
+            QuarantineStatus::Rejected,
+            Utc::now(),
+            QuarantineStatus::None,
+        )
+        .await
+        .expect("a NULL prior status must MATCH via IS NOT DISTINCT FROM, not spuriously conflict");
+        uow.commit().await.expect("commit");
+
+        let saved = repo.find_by_id(id).await.expect("find_by_id");
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+
+        cleanup_repo(&pool, repo_id).await;
     }
 
     // ---------------------------------------------------------------------
@@ -1715,11 +1912,10 @@ mod tests {
     /// candidate set yields summary all-zero).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_returns_empty_when_no_wheels_exist() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let r = PgArtifactRepository::new(pool.clone());
         let got = r
@@ -1736,11 +1932,10 @@ mod tests {
     /// The query MUST return exactly the two un-backfilled wheels.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_excludes_wheels_with_ref_and_sdists() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
 
         // Two wheels with no wheel_metadata row — candidates.
@@ -1781,11 +1976,10 @@ mod tests {
     /// batch on the next invocation).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_honours_limit() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         for seed in 200..205 {
             let _ =
@@ -1809,11 +2003,10 @@ mod tests {
     /// rest of the read path.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_pypi_wheels_without_kind_excludes_soft_deleted_wheels() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
 
         let live = seed_artifact_at_path(&pool, repo, "files/live.whl", 300).await;
@@ -1850,11 +2043,10 @@ mod tests {
     /// reserve a name.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn find_canonical_name_by_collision_key_folds_both_separators() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let r = PgArtifactRepository::new(pool.clone());
 
         // Stored HYPHEN form is found by the folded key.
@@ -1981,11 +2173,10 @@ mod tests {
     /// via `PageRequest`, and reports the full in-scope `total`.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_policy_filters_status_and_paginates() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo_id = seed_repo(&pool).await;
         let policy_id = seed_global_policy(&pool).await;
 
@@ -2061,11 +2252,10 @@ mod tests {
     /// `list_rejected_for_policy`'s precedence rule).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn list_active_for_policy_global_excludes_repo_shadowed_by_scoped_policy() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let global_policy = seed_global_policy(&pool).await;
         let shadowed_repo = seed_repo(&pool).await;
         let plain_repo = seed_repo(&pool).await;

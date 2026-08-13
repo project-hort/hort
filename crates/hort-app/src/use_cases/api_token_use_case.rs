@@ -42,7 +42,7 @@ use std::time::Duration as StdDuration;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
-use rand::RngCore;
+use rand::Rng;
 use uuid::Uuid;
 
 use hort_domain::entities::api_token::{ApiToken, TokenKind};
@@ -63,7 +63,7 @@ use hort_domain::types::{Page, PageRequest};
 use crate::argon2_hash::hash_token;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::labels;
-use crate::rbac::RbacEvaluator;
+use crate::rbac::{add_admin_claim_if_admin, RbacEvaluator};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -772,6 +772,7 @@ impl ApiTokenUseCase {
                 user_id: principal.user_id,
             },
             principal,
+            principal,
             target,
             TokenKind::Pat,
             request,
@@ -814,6 +815,15 @@ impl ApiTokenUseCase {
             );
             return Err(ApiTokenError::NotAuthorized);
         }
+        // Admin cap is forbidden on the admin-SA-mint path, unconditionally
+        // — mirrors `issue_for_service_account_system`'s check. SAs cannot
+        // hold admin (ADR 0018); explicit now that the cap-vs-authority walk
+        // below authorizes against the target SA's own grants rather than
+        // the admin caller's, so the caller-authority walk no longer
+        // implies this rejection.
+        if request.declared_permissions.contains(&Permission::Admin) {
+            return Err(ApiTokenError::AdminAuthorityRequired);
+        }
         let target = self.users.find_by_id(target_user_id).await?;
         if !target.is_service_account {
             self.emit_denial(
@@ -832,11 +842,38 @@ impl ApiTokenUseCase {
             );
             return Err(ApiTokenError::NotServiceAccount);
         }
+        // The authz subject for the cap-vs-authority walk (`issue_inner`
+        // step 5) is the TARGET SA's own principal, not the admin's — the
+        // same invariant `issue_for_service_account_system` documents: a
+        // token's effective authority is bounded by the backing user's
+        // live grants at request time, so gating issuance against anything
+        // else (the admin's authority) is both wrong and pointless. Built
+        // from the target's own user row: its own resolved claims (empty
+        // unless `is_admin`, which is impossible for a service account —
+        // ADR 0018), never a synthetic admin claim, and `token_cap: None`
+        // so the cap leg of `RbacEvaluator::authorize` disappears from the
+        // AND and only the target's live grants are consulted.
+        let mut authz_claims = Vec::new();
+        add_admin_claim_if_admin(&mut authz_claims, target.is_admin);
+        let authz_subject = CallerPrincipal {
+            user_id: target.id,
+            external_id: target
+                .external_id
+                .clone()
+                .unwrap_or_else(|| target.id.to_string()),
+            username: target.username.clone(),
+            email: target.email.clone(),
+            claims: authz_claims,
+            token_kind: Some(TokenKind::ServiceAccount),
+            issued_at: Utc::now(),
+            token_cap: None,
+        };
         self.issue_inner(
             ApiActor {
                 user_id: admin.user_id,
             },
             admin,
+            &authz_subject,
             target,
             TokenKind::ServiceAccount,
             request,
@@ -1610,6 +1647,7 @@ impl ApiTokenUseCase {
             .run_issuance_gates(
                 &actor,
                 principal,
+                principal,
                 &target,
                 TokenKind::CliSession,
                 &inner_request,
@@ -1769,11 +1807,15 @@ impl ApiTokenUseCase {
     }
 
     /// Shared issuance pipeline for both self-mint and admin-mint.
-    /// `caller` is the authority used for the cap-vs-grants check.
-    /// For self-mint that is the user themselves; for
-    /// admin-mint that is the admin (the service account's grants
-    /// don't gate this — runtime intersection bounds the eventual
-    /// authority down to the SA's actual grants).
+    /// `caller` drives the admin-token-flag / audit-attribution gates;
+    /// `authz_subject` is the authority the cap-vs-grants check (step 5 of
+    /// [`Self::run_issuance_gates`]) authorizes declared permissions
+    /// against — a separate parameter from the audit actor. Self-mint:
+    /// `authz_subject` is the caller — behavior byte-identical to before
+    /// this split. Admin-mint: `authz_subject` is a principal built from
+    /// the target SA's own user row (its own grants gate the mint, never
+    /// the admin's) — the same invariant `issue_for_service_account_system`
+    /// documents for the system-mint path.
     ///
     /// This is the OPAQUE-token path (PAT / ServiceAccount). The
     /// CliSession path (`issue_cli_session`) shares the
@@ -1785,6 +1827,7 @@ impl ApiTokenUseCase {
         &self,
         actor: ApiActor,
         caller: &CallerPrincipal,
+        authz_subject: &CallerPrincipal,
         target: User,
         kind: TokenKind,
         request: IssueTokenRequest,
@@ -1793,7 +1836,7 @@ impl ApiTokenUseCase {
         // expiry resolution, cap-vs-authority. Shared with the
         // CliSession JWT path.
         let expires_at = self
-            .run_issuance_gates(&actor, caller, &target, kind, &request)
+            .run_issuance_gates(&actor, caller, authz_subject, &target, kind, &request)
             .await?;
 
         // 6. Generate the token plaintext + hash + prefix.
@@ -1903,6 +1946,12 @@ impl ApiTokenUseCase {
     /// expiry resolution, and the cap-vs-authority check against the
     /// live [`RbacEvaluator`]. Returns the resolved `expires_at`.
     ///
+    /// `caller` drives steps 1-4 (validation, the admin-token flag +
+    /// `principal_is_admin` gate, expiry resolution/audit). `authz_subject`
+    /// is consulted ONLY by step 5, the cap-vs-authority walk — see
+    /// [`Self::issue_inner`]'s doc comment for why the two are distinct
+    /// parameters instead of one.
+    ///
     /// Extracted from `issue_inner` so the
     /// opaque-token path (`issue_inner`) and the CliSession JWT path
     /// (`issue_cli_session`) share ONE copy of these gates — the gates
@@ -1912,6 +1961,7 @@ impl ApiTokenUseCase {
         &self,
         actor: &ApiActor,
         caller: &CallerPrincipal,
+        authz_subject: &CallerPrincipal,
         target: &User,
         kind: TokenKind,
         request: &IssueTokenRequest,
@@ -2138,10 +2188,16 @@ impl ApiTokenUseCase {
         //    `IssuanceCaller.grants` projection would
         //    silently drop per-repo grants.
         //
-        //    For self-mint: caller IS target; for admin-mint: caller is
-        //    the admin and we gate against admin's grants (admin-mint
-        //    permission-cap rule). Runtime intersection
-        //    bounds the eventual authority for both cases.
+        //    Authorized against `authz_subject`, NOT `caller`. For
+        //    self-mint: `authz_subject` IS `caller` IS target — unchanged
+        //    from before the subject/caller split. For admin-mint:
+        //    `authz_subject` is the TARGET SA's own principal — the same
+        //    invariant `issue_for_service_account_system` documents: a
+        //    token's effective authority is bounded by the backing user's
+        //    live grants at request time, so the admin's own authority is
+        //    not what gates this. Runtime intersection (this walk, re-run
+        //    on every request against the SA's live grants) bounds the
+        //    eventual authority.
         // Take ONE evaluator snapshot for the whole cap loop. Calling
         // `.load()` per (perm, repo) is cheap (lock-free + uncontended on
         // the read path per `arc_swap` docs), but a swap landing mid-loop
@@ -2154,13 +2210,13 @@ impl ApiTokenUseCase {
         let mut failed: Vec<(Option<Uuid>, Permission)> = Vec::new();
         match &request.repository_ids {
             None => {
-                // Global token (inherit user grants). The caller must
+                // Global token (inherit user grants). The subject must
                 // have each declared permission globally — `repository_id
                 // = None` requires a grant whose `repository_id == None`
                 // (or admin short-circuit). A per-repo-only grantee
                 // CANNOT mint a global token, only a per-repo one.
                 for perm in &request.declared_permissions {
-                    if !rbac.authorize(caller, *perm, None) {
+                    if !rbac.authorize(authz_subject, *perm, None) {
                         failed.push((None, *perm));
                     }
                 }
@@ -2171,7 +2227,7 @@ impl ApiTokenUseCase {
                 // per-repo grants uniformly.
                 for repo in ids {
                     for perm in &request.declared_permissions {
-                        if !rbac.authorize(caller, *perm, Some(*repo)) {
+                        if !rbac.authorize(authz_subject, *perm, Some(*repo)) {
                             failed.push((Some(*repo), *perm));
                         }
                     }
@@ -2570,7 +2626,7 @@ fn emit_session_admin_issuance_metric(result_label: &'static str) {
 /// reach for it via the `pub(crate)` boundary.
 pub(crate) fn generate_token_plaintext(kind: TokenKind) -> (String, String) {
     let mut bytes = [0u8; TOKEN_BODY_RAW_BYTES];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let body = encode_base32_lowercase(&bytes);
     debug_assert_eq!(body.len(), TOKEN_BODY_LEN);
     let kind_prefix = match kind {
@@ -2846,6 +2902,48 @@ mod tests {
     fn admin_principal() -> (CallerPrincipal, Arc<ArcSwap<RbacEvaluator>>) {
         let p = principal_with_id(Uuid::from_u128(0xAD), vec!["admin"]);
         (p, empty_evaluator())
+    }
+
+    /// Build an evaluator granting the supplied `(permission,
+    /// optional_repo)` tuples to `user_id` via `GrantSubject::User` — the
+    /// identity-subject grant shape a service account's authority is
+    /// expressed through (it has no IdP `groups` claim to route through
+    /// `GrantSubject::Claims`). This is the fixture for the admin-SA-mint
+    /// cap-vs-authority walk, which authorizes against the TARGET SA's own
+    /// grants, not the admin caller's — an admin-mint happy-path test needs
+    /// the target user seeded with these grants, not the admin.
+    fn evaluator_with_user_grants(
+        user_id: Uuid,
+        grants: Vec<(Permission, Option<Uuid>)>,
+    ) -> RbacEvaluator {
+        let rows: Vec<PermissionGrant> = grants
+            .into_iter()
+            .map(|(perm, repo)| PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::User(user_id),
+                repository_id: repo,
+                permission: perm,
+                created_at: Utc::now(),
+                managed_by: ManagedBy::Local,
+                managed_by_digest: None,
+            })
+            .collect();
+        RbacEvaluator::new(rows)
+    }
+
+    /// Admin principal (`0xAD`) paired with an evaluator that grants the
+    /// supplied `(permission, optional_repo)` tuples to `target_id` —
+    /// the SA-mint counterpart to [`principal_with_grants`]/
+    /// [`admin_principal`]: the admin's own authority is irrelevant to the
+    /// cap-vs-authority walk on this path, only the target SA's grants
+    /// matter.
+    fn admin_principal_with_sa_grants(
+        target_id: Uuid,
+        grants: Vec<(Permission, Option<Uuid>)>,
+    ) -> (CallerPrincipal, Arc<ArcSwap<RbacEvaluator>>) {
+        let p = principal_with_id(Uuid::from_u128(0xAD), vec!["admin"]);
+        let eval = evaluator_with_user_grants(target_id, grants);
+        (p, Arc::new(ArcSwap::from_pointee(eval)))
     }
 
     /// Non-admin principal + evaluator with global Read/Write/Delete.
@@ -3535,7 +3633,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_for_service_account_unbounded_expiry_allowed_with_flag() {
-        let (admin, rbac) = admin_principal();
+        let (admin, rbac) = admin_principal_with_sa_grants(
+            Uuid::from_u128(0xACE),
+            vec![(Permission::Read, None), (Permission::Write, None)],
+        );
         let (uc, tokens, users, events) = make_use_case_with_rbac(
             ApiTokenIssuanceConfig {
                 allow_admin_tokens: false,
@@ -3561,6 +3662,168 @@ mod tests {
         assert_eq!(inserts[0].created_by_user_id, Uuid::from_u128(0xAD));
         let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
         assert_eq!(event.minted_by_admin_id, Some(Uuid::from_u128(0xAD)));
+    }
+
+    // ---------- issue_for_service_account: cap authorized against TARGET, not admin ----------
+
+    #[tokio::test]
+    async fn issue_for_service_account_denies_when_target_lacks_grant_despite_admin_caller() {
+        // The admin caller carries the "admin" claim (required to pass the
+        // admin gate above) and the target SA holds NO grants at all.
+        // Under the pre-fix subject-is-caller semantics this would have
+        // short-circuited to success on the caller's admin claim; the
+        // cap-vs-authority walk must authorize against the TARGET's own
+        // grants instead, so it correctly denies. This is the release-
+        // blocker regression shape.
+        let (admin, rbac) = admin_principal();
+        let (uc, tokens, users, events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(true));
+        let request = IssueTokenRequest {
+            declared_permissions: vec![Permission::ReadMetrics],
+            ..make_request_pat()
+        };
+        let err = uc
+            .issue_for_service_account(&admin, Uuid::from_u128(0xACE), request)
+            .await
+            .unwrap_err();
+        match err {
+            ApiTokenError::CapExceedsAuthority { failed } => {
+                assert_eq!(failed, vec![(None, Permission::ReadMetrics)]);
+            }
+            other => panic!("expected CapExceedsAuthority, got {other:?}"),
+        }
+        assert!(tokens.inserts().is_empty());
+        let denial = assert_denial_event(&events);
+        assert!(matches!(
+            denial.denial_reason,
+            DenialReason::CapExceedsAuthority
+        ));
+    }
+
+    #[tokio::test]
+    async fn issue_for_service_account_read_metrics_authorized_when_target_holds_grant() {
+        // ADR 0052: `ReadMetrics` is carved out of the admin short-circuit,
+        // so only an explicit grant on the target SA authorizes it here —
+        // this is the exact acceptance shape of `mint_metrics_token` in
+        // the native-tests E2E harness (scripts/native-tests/run.sh).
+        let (admin, rbac) = admin_principal_with_sa_grants(
+            Uuid::from_u128(0xACE),
+            vec![(Permission::ReadMetrics, None)],
+        );
+        let (uc, tokens, users, _events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(true));
+        let request = IssueTokenRequest {
+            declared_permissions: vec![Permission::ReadMetrics],
+            ..make_request_pat()
+        };
+        let issued = uc
+            .issue_for_service_account(&admin, Uuid::from_u128(0xACE), request)
+            .await
+            .unwrap();
+        assert!(issued.plaintext.starts_with("hort_svc_"));
+        let inserts = tokens.inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(
+            inserts[0].declared_permissions,
+            vec![Permission::ReadMetrics]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_for_service_account_per_repo_cap_authorized_against_target_grant() {
+        let repo_granted = Uuid::from_u128(0xB0);
+        let (admin, rbac) = admin_principal_with_sa_grants(
+            Uuid::from_u128(0xACE),
+            vec![(Permission::Write, Some(repo_granted))],
+        );
+        let (uc, tokens, users, _events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(true));
+        let request = IssueTokenRequest {
+            declared_permissions: vec![Permission::Write],
+            repository_ids: Some(vec![repo_granted]),
+            ..make_request_pat()
+        };
+        let issued = uc
+            .issue_for_service_account(&admin, Uuid::from_u128(0xACE), request)
+            .await
+            .unwrap();
+        assert!(issued.plaintext.starts_with("hort_svc_"));
+        let inserts = tokens.inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].repository_ids, Some(vec![repo_granted]));
+    }
+
+    #[tokio::test]
+    async fn issue_for_service_account_per_repo_cap_denied_for_other_repo() {
+        // The admin caller holds the "admin" claim, but the target SA's
+        // per-repo grant is on a DIFFERENT repo than the one declared —
+        // proving the walk is scoped to the target's specific grant, not
+        // the caller's blanket admin authority.
+        let repo_granted = Uuid::from_u128(0xB0);
+        let repo_requested = Uuid::from_u128(0xB1);
+        let (admin, rbac) = admin_principal_with_sa_grants(
+            Uuid::from_u128(0xACE),
+            vec![(Permission::Write, Some(repo_granted))],
+        );
+        let (uc, tokens, users, events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(true));
+        let request = IssueTokenRequest {
+            declared_permissions: vec![Permission::Write],
+            repository_ids: Some(vec![repo_requested]),
+            ..make_request_pat()
+        };
+        let err = uc
+            .issue_for_service_account(&admin, Uuid::from_u128(0xACE), request)
+            .await
+            .unwrap_err();
+        match err {
+            ApiTokenError::CapExceedsAuthority { failed } => {
+                assert_eq!(failed, vec![(Some(repo_requested), Permission::Write)]);
+            }
+            other => panic!("expected CapExceedsAuthority, got {other:?}"),
+        }
+        assert!(tokens.inserts().is_empty());
+        let denial = assert_denial_event(&events);
+        assert!(matches!(
+            denial.denial_reason,
+            DenialReason::CapExceedsAuthority
+        ));
+    }
+
+    #[tokio::test]
+    async fn issue_for_service_account_admin_cap_rejected_unconditionally() {
+        // Declaring `Permission::Admin` on the admin-SA-mint path is
+        // rejected unconditionally — mirrors
+        // `issue_for_service_account_system`'s check. Regardless of the
+        // `allow_admin_tokens` flag (on here) and regardless of the
+        // target's own grants (the fixture even seeds an Admin grant,
+        // which should never happen per ADR 0018 but must not matter
+        // either way — the rejection is unconditional, not cap-gated).
+        let (admin, rbac) =
+            admin_principal_with_sa_grants(Uuid::from_u128(0xACE), vec![(Permission::Admin, None)]);
+        let (uc, tokens, users, _events) = make_use_case_with_rbac(
+            ApiTokenIssuanceConfig {
+                allow_admin_tokens: true,
+                allow_unbounded_svc_tokens: false,
+            },
+            rbac,
+        );
+        users.insert(user(true));
+        let request = IssueTokenRequest {
+            declared_permissions: vec![Permission::Admin],
+            expires_in_days: Some(30),
+            ..make_request_pat()
+        };
+        let err = uc
+            .issue_for_service_account(&admin, Uuid::from_u128(0xACE), request)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiTokenError::AdminAuthorityRequired));
+        assert!(tokens.inserts().is_empty());
     }
 
     // ---------- issue_for_service_account_system ----------
@@ -5134,7 +5397,11 @@ mod tests {
 
     #[tokio::test]
     async fn issued_event_lands_on_token_owner_stream() {
-        let (admin, rbac) = admin_principal(); // user_id = 0xAD
+        let (admin, rbac) = admin_principal_with_sa_grants(
+            // user_id = 0xAD
+            Uuid::from_u128(0xCAFE),
+            vec![(Permission::Read, None), (Permission::Write, None)],
+        );
         let (uc, _, users, events) = make_use_case_with_rbac(
             ApiTokenIssuanceConfig {
                 allow_unbounded_svc_tokens: false,
@@ -5295,7 +5562,10 @@ mod tests {
     #[test]
     fn issued_metric_emits_kind_svc_result_success_on_admin_mint() {
         let snap = b9_capture_async(|| async move {
-            let (admin, rbac) = admin_principal();
+            let (admin, rbac) = admin_principal_with_sa_grants(
+                Uuid::from_u128(0xCAFE),
+                vec![(Permission::Read, None), (Permission::Write, None)],
+            );
             let (uc, _, users, _) =
                 make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
             users.insert(User {
@@ -5775,8 +6045,7 @@ mod tests {
     /// keypair, plus the denylist store, both shareable.
     fn cli_session_rig() -> (Arc<CliSessionTokenSigner>, Arc<DenylistMockStore>) {
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut rand::rng());
         let key = Arc::new(OciTokenSigningKey::new(sk, None));
         let signer = Arc::new(CliSessionTokenSigner::new(
             key,

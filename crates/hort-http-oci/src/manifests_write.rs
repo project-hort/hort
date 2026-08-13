@@ -91,7 +91,7 @@ use hort_http_core::context::AppContext;
 use hort_http_core::limits::BoundedPath;
 
 use super::coords::{oci_group_coords, oci_manifest_coords};
-use super::digest::{parse_digest, DigestParse};
+use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::name::validate_oci_name;
 
@@ -169,7 +169,7 @@ pub(crate) const MAX_BLOB_REFERENCES: usize = 1024;
 #[cfg(test)]
 fn router() -> Router<Arc<AppContext>> {
     Router::new().route(
-        "/v2/:repo_key/*tail",
+        "/v2/{repo_key}/{*tail}",
         axum::routing::put(put_manifest_dispatch).delete(delete_manifest_dispatch),
     )
 }
@@ -355,21 +355,23 @@ pub(crate) async fn put_manifest_dispatch(
         None => None,
         Some(raw) => match parse_digest(raw) {
             DigestParse::Ok(h) => Some(h),
-            DigestParse::Unsupported { algorithm } => {
+            DigestParse::Unsupported => {
+                // Neither `algorithm` nor `message` is included in the
+                // detail — both are attacker-controlled manifest-JSON
+                // content (mirrors `parse_blob_digest`'s contract); the
+                // raw value is already logged inside `parse_digest`.
                 return OciError::ManifestInvalid {
                     detail: Some(serde_json::json!({
                         "reason": "subject digest uses unsupported algorithm",
-                        "algorithm": algorithm,
                         "field": "subject.digest",
                     })),
                 }
                 .into_response();
             }
-            DigestParse::Invalid { message } => {
+            DigestParse::Invalid { .. } => {
                 return OciError::ManifestInvalid {
                     detail: Some(serde_json::json!({
                         "reason": "subject digest malformed",
-                        "message": message,
                         "field": "subject.digest",
                     })),
                 }
@@ -412,14 +414,14 @@ pub(crate) async fn put_manifest_dispatch(
                 }
                 Some(h)
             }
-            DigestParse::Unsupported { algorithm } => {
+            DigestParse::Unsupported => {
                 // Well-formed but non-sha256 algorithm. The OCI
                 // The spec pins `UNSUPPORTED` for a digest whose
                 // algorithm is recognised but can't be processed.
                 // This is the ONE path where UNSUPPORTED is correct
                 // (vs DIGEST_INVALID).
                 return OciError::Unsupported {
-                    message: format!("unsupported digest algorithm: {algorithm}"),
+                    message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
                 }
                 .into_response();
             }
@@ -1060,9 +1062,9 @@ async fn delete_by_digest(
 ) -> Response {
     let hash = match parse_digest(digest_str) {
         DigestParse::Ok(h) => h,
-        DigestParse::Unsupported { algorithm } => {
+        DigestParse::Unsupported => {
             return OciError::Unsupported {
-                message: format!("unsupported digest algorithm: {algorithm}"),
+                message: UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE.to_string(),
             }
             .into_response();
         }
@@ -1297,17 +1299,29 @@ pub(crate) fn parse_index_children(body: &[u8]) -> Result<Vec<ReferencedBlob>, s
 /// [`parse_digest`] because this one produces the manifest-invalid
 /// envelope shape rather than the blob-pull one — the handler-level
 /// error codes differ.
+///
+/// Neither error arm echoes `raw` (the client-supplied manifest
+/// `config.digest` / `layers[*].digest` field) or the inner
+/// `message`/`algorithm` text into the `detail` payload — both are
+/// attacker-controlled manifest-JSON content and reflecting them is a
+/// response-reflection vector (mirrors [`parse_digest`]'s own
+/// never-echo contract). The raw value stays available server-side via
+/// `tracing::debug!`.
 fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
     match parse_digest(raw) {
         DigestParse::Ok(h) => Ok(h),
-        DigestParse::Unsupported { algorithm } => Err(serde_json::json!({
-            "reason": format!("unsupported digest algorithm in manifest: {algorithm}"),
-            "digest": raw,
-        })),
-        DigestParse::Invalid { message } => Err(serde_json::json!({
-            "reason": format!("malformed digest in manifest: {message}"),
-            "digest": raw,
-        })),
+        DigestParse::Unsupported => {
+            tracing::debug!(digest = %raw, "OCI manifest referenced an unsupported digest algorithm");
+            Err(serde_json::json!({
+                "reason": "unsupported digest algorithm in manifest",
+            }))
+        }
+        DigestParse::Invalid { .. } => {
+            tracing::debug!(digest = %raw, "OCI manifest referenced a malformed digest");
+            Err(serde_json::json!({
+                "reason": "malformed digest in manifest",
+            }))
+        }
     }
 }
 
@@ -2847,7 +2861,9 @@ mod tests {
     fn put_with_unsupported_subject_digest_algo_returns_400_manifest_invalid() {
         // sha512 (or any non-sha256) on subject.digest is treated the
         // same as a malformed digest at this layer — rejected pre-
-        // ingest with MANIFEST_INVALID + algorithm in the detail.
+        // ingest with MANIFEST_INVALID. The detail must NOT echo the
+        // requested algorithm string — it's attacker-controlled
+        // manifest-JSON content (never-echo-rejected-input rule).
         let (status, body) = run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
@@ -2888,7 +2904,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "MANIFEST_INVALID");
         assert_eq!(parsed["errors"][0]["detail"]["field"], "subject.digest");
-        assert_eq!(parsed["errors"][0]["detail"]["algorithm"], "sha512");
+        assert!(parsed["errors"][0]["detail"]["algorithm"].is_null());
+        assert!(
+            !String::from_utf8_lossy(&body).contains("sha512"),
+            "response body must not echo the rejected subject.digest algorithm"
+        );
     }
 
     // -------------------- PUT — missing blob --------------------
@@ -4306,6 +4326,50 @@ mod tests {
         let blobs =
             parse_manifest_blobs(&manifest).expect("a single-layer manifest must parse cleanly");
         assert_eq!(blobs.len(), 2, "config + 1 layer = 2 referenced blobs");
+    }
+
+    /// `config.digest` is fully attacker-controlled manifest-JSON
+    /// content. A malformed value must reject without the raw digest
+    /// (or the inner parse-failure text) reaching the `detail` payload.
+    #[test]
+    fn parse_manifest_blobs_malformed_config_digest_does_not_echo_raw_value() {
+        let manifest = serde_json::json!({
+            "config": {"digest": "xsentinel-not-a-digest-at-all"},
+            "layers": [],
+        });
+        let detail = parse_manifest_blobs(&manifest).unwrap_err();
+        assert_eq!(detail["reason"], "malformed digest in manifest");
+        assert!(
+            detail.get("digest").is_none(),
+            "detail must not carry a `digest` field echoing the raw value: {detail:?}"
+        );
+        let serialized = detail.to_string();
+        assert!(
+            !serialized.contains("xsentinel"),
+            "detail must not echo the rejected digest: {serialized}"
+        );
+    }
+
+    /// A well-formed-but-unsupported `config.digest` algorithm (e.g.
+    /// `sha512:`) must reject without the requested algorithm reaching
+    /// the `detail` payload.
+    #[test]
+    fn parse_manifest_blobs_unsupported_config_digest_algo_does_not_echo_algorithm() {
+        let manifest = serde_json::json!({
+            "config": {"digest": format!("xsentinelalgo:{}", "a".repeat(64))},
+            "layers": [],
+        });
+        let detail = parse_manifest_blobs(&manifest).unwrap_err();
+        assert_eq!(detail["reason"], "unsupported digest algorithm in manifest");
+        assert!(
+            detail.get("digest").is_none(),
+            "detail must not carry a `digest` field echoing the raw value: {detail:?}"
+        );
+        let serialized = detail.to_string();
+        assert!(
+            !serialized.contains("xsentinelalgo"),
+            "detail must not echo the rejected algorithm: {serialized}"
+        );
     }
 
     // -------------------------------------------------------------

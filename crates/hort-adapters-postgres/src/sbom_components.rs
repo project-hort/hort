@@ -157,7 +157,8 @@ impl SbomComponentRepository for PgSbomComponentRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
+
+    use serial_test::serial;
 
     /// Compile-time assertion that the adapter implements the port.
     #[test]
@@ -195,17 +196,19 @@ mod tests {
     /// Pin: the `list_artifacts_by_match` empty-versions shortcut
     /// returns an empty Vec without issuing SQL — exercised through
     /// the public trait surface (no DB round-trip required).
+    ///
+    /// `#[serial(hort_pg_db)]` (issue #94): the method itself issues no
+    /// SQL, but the fixture still opens a real connection against the
+    /// shared `DATABASE_URL` target — every test that acquires a real
+    /// connection carries the crate-wide serial key, no exceptions,
+    /// regardless of whether it queries.
     #[tokio::test]
+    #[serial(hort_pg_db)]
     async fn list_artifacts_by_match_empty_versions_short_circuits() {
-        // No connection — but `list_artifacts_by_match` short-circuits
-        // before touching the pool when `versions.is_empty()`. We
-        // still need a constructed adapter to call the method;
-        // PgPool requires a URL, so gate on DATABASE_URL like the
-        // rest of the suite.
-        let Ok(url) = env::var("DATABASE_URL") else {
-            return;
-        };
-        let Ok(pool) = PgPool::connect(&url).await else {
+        // No query issued — but `list_artifacts_by_match` short-circuits
+        // before touching the pool when `versions.is_empty()`. We still
+        // need a constructed adapter to call the method, hence the pool.
+        let Some(pool) = crate::test_support::shared_migrated_pool().await else {
             return;
         };
         let repo = PgSbomComponentRepository::new(pool);

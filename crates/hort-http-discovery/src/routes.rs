@@ -53,8 +53,8 @@ pub fn routes() -> Router<Arc<AppContext>> {
     Router::new()
         .route("/repositories", get(list_repositories))
         .route(
-            "/repositories/:repo_key/discovery/versions/:package_name",
+            "/repositories/{repo_key}/discovery/versions/{package_name}",
             get(list_versions),
         )
-        .route("/repositories/:repo_key/prefetch", post(prefetch))
+        .route("/repositories/{repo_key}/prefetch", post(prefetch))
 }

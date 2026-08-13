@@ -1,0 +1,21 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: gha-release-prefetch-cargo-virtual
+spec:
+  # Per-repo serviceAccount-subject grant: gha-release (GitHub Actions
+  # release-publish identity) may prefetch cargo-virtual. Permissions are
+  # flat (read does not imply prefetch — see gha-release-read-cargo-virtual.yaml
+  # for the sibling read grant); both are required by
+  # SelfServicePrefetchUseCase's Read ∧ Prefetch RBAC gate
+  # (crates/hort-app/src/use_cases/self_service_prefetch_use_case.rs).
+  #
+  # Without this grant the release.yml preflight's auto-warm POST 403s and
+  # the release-time warm silently does nothing: gha-release's other grants
+  # on cargo-virtual are read/write, and permissions are flat.
+  # Mirrors gha-ci-prefetch-cargo-virtual.yaml.
+  subject:
+    kind: serviceAccount
+    name: gha-release
+  permission: prefetch
+  repository: cargo-virtual

@@ -216,11 +216,57 @@ docs-only:ok:
 # ---------------------------------------------------------------------------
 
 variables:
-  # Route CI deps through registry.hort.rs.
-  # Set to exactly "true" to enable; any other value (absent, empty, "false")
-  # is treated as disabled so merging before the live instance exists does not
-  # break CI. Mirrors the gate in .github/actions/hort-auth/action.yml.
+  # Route CI deps through registry.hort.rs — cargo, npm and the OCI client all
+  # resolve from hort instead of their public upstreams. Set to exactly "true"
+  # to enable; any other value (absent, empty, "false") is treated as disabled
+  # so merging before the live instance exists does not break CI. Mirrors the
+  # gate in .github/actions/hort-auth/action.yml.
+  #
+  # Enabling this is only safe once the vetted index serves the ENTIRE
+  # Cargo.lock: the index hides versions hort has not ingested-and-released,
+  # so a cold or still-quarantined dependency fails every cargo job with
+  # "failed to select a version". `prefetch:verify` reports that readiness.
   HORT_PROXY_ENABLED: ""
+  # Allow jobs to mint a hort bearer WITHOUT repointing any dependency source
+  # — the prefetch warm/verify jobs and nothing else. Safe to leave on
+  # permanently: warming is what eventually makes HORT_PROXY_ENABLED viable.
+  HORT_PREFETCH_ENABLED: ""
+  # Instance whose cargo/npm/OCI configuration the auth anchor writes — the
+  # build source a job's dependency resolution points at. HORT_URL, if set,
+  # is a fallback for this (see .hort-auth below) but is superseded by this
+  # variable and HORT_WARM_URL. Defaults to the public instance so existing
+  # pipelines keep resolving from the same place.
+  HORT_BUILD_URL: "https://registry.hort.rs"
+  # Instance the prefetch:warm / prefetch:verify jobs POST to — the release
+  # target kept warm ahead of a promotion. Independent of HORT_BUILD_URL: a
+  # pipeline can build against one instance while warming another. Same
+  # default and HORT_URL fallback as HORT_BUILD_URL.
+  HORT_WARM_URL: "https://registry.hort.rs"
+  # API endpoint of the internal hort instance — a candidate future build
+  # source (see HORT_BUILD_SOURCE / HORT_RELEASE_BUILD_SOURCE below), never
+  # read as a fallback the way HORT_URL is. Its hostname matches
+  # CI_TOOLS_REGISTRY today only because both happen to be deployed on the
+  # same platform host; CI_TOOLS_REGISTRY names an image-registry host for CI
+  # tool images (ci/rust-ci, ci/buildah-cosign) while this names a hort API
+  # endpoint — two different roles that must stay independently overridable,
+  # so this is its own variable rather than derived from CI_TOOLS_REGISTRY.
+  # Precondition for ever selecting it: point HORT_WARM_URL here and confirm
+  # prefetch:verify reports the whole locked set served (release-ready) —
+  # prefetch:warm:internal (below) is what makes that eventually true.
+  HORT_INTERNAL_URL: "https://hort.kdp.kloni.cloud"
+  # Build-source switch for feature/MR and develop pipelines: "public"
+  # (default — resolves to HORT_BUILD_URL, today's behaviour) or "internal"
+  # (resolves to HORT_INTERNAL_URL). See .hort-auth below for the resolution
+  # logic. Precondition for setting "internal": a green prefetch:verify
+  # against HORT_INTERNAL_URL (see that variable's comment) — an unwarmed or
+  # still-quarantined dependency fails resolution exactly as it would on a
+  # release publish.
+  HORT_BUILD_SOURCE: "public"
+  # Same switch, scoped to release-type pipelines (main / release/* / tags)
+  # instead of feature/develop — kept independent so a release can stay on
+  # the public instance even after feature/develop have switched, or vice
+  # versa. Same values, same default, same precondition as HORT_BUILD_SOURCE.
+  HORT_RELEASE_BUILD_SOURCE: "public"
   # OCI registry host for images AND Helm charts. REQUIRED for the
   # build-images / helm-publish / sign jobs — no default (the former
   # internal-mirror value only resolved on the original runner). Set as
@@ -249,20 +295,35 @@ variables:
   #                      the VAULT_* CI vars (no portable defaults).
   #   none:              skip signing entirely.
   SIGNING_MODE: "keyless"
+  # Internal registry host for the CI tool images below (ci/rust-ci,
+  # ci/buildah-cosign). Its own variable so the same pipeline works against
+  # another instance, or a stock upstream image, by overriding this plus the
+  # image variables that reference it — no hardcoded host anywhere else.
+  CI_TOOLS_REGISTRY: "hort.kdp.kloni.cloud"
+  # Tag of ci/rust-ci to build/test with, kept separate from the host so a
+  # tool-image bump is a one-line change. See RUST_IMAGE below for what the
+  # image ships.
+  CI_RUST_IMAGE_TAG: "2026.8.115"
   # Project MSRV is 1.94.0 (see .clippy.toml); kept in lockstep with
   # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` by
-  # `scripts/check-rust-version.sh`. GitLab pins the image explicitly so a
-  # silent toolchain bump can't break the gate.
-  RUST_IMAGE: "rust:1.94-slim"
-  # FAST path (deliberate dev-cycle speedup): pre-baked rust:1.94-slim + sccache
-  # on PATH, used by the test jobs that extend .sccache. FALLBACK: the
+  # `scripts/check-rust-version.sh`. ci/rust-ci ships Rust 1.94.1,
+  # cargo-llvm-cov, cargo-audit, cargo-deny, cargo-about, cargo-cyclonedx and
+  # sccache — a superset of stock `rust:1.94.1-slim` — so it supersedes the
+  # old ci/rust-sccache image and RUST_IMAGE and RUST_SCCACHE_IMAGE now both
+  # point at it: lint/coverage/security (RUST_IMAGE) and the .sccache-extending
+  # test:unit / test:integration (RUST_SCCACHE_IMAGE) share one image.
+  RUST_IMAGE: "${CI_TOOLS_REGISTRY}/ci/rust-ci:${CI_RUST_IMAGE_TAG}"
+  # FAST path (deliberate dev-cycle speedup): pre-baked image with sccache on
+  # PATH, used by the test jobs that extend .sccache. FALLBACK: the
   # .sccache-install anchor (below) is a NO-OP when this image already ships
   # sccache, but installs it on a stock image — so hort is never HARD-dependent
   # on the custom image. To build without it (custom image unavailable, or off
-  # our internal registry entirely), override RUST_SCCACHE_IMAGE=${RUST_IMAGE}
-  # and sccache is installed inline. (The canonical GitHub Actions build already
-  # runs stock — it cannot reach hort.kdp.kloni.cloud.)
-  RUST_SCCACHE_IMAGE: "hort.kdp.kloni.cloud/ci/rust-sccache:latest"
+  # our internal registry entirely), override BOTH RUST_IMAGE and
+  # RUST_SCCACHE_IMAGE to a stock `rust:1.94.1-slim` (or newer) reference and
+  # sccache plus every tool are installed inline instead. (The canonical
+  # GitHub Actions build already runs stock — it cannot reach
+  # ${CI_TOOLS_REGISTRY}.)
+  RUST_SCCACHE_IMAGE: "${CI_TOOLS_REGISTRY}/ci/rust-ci:${CI_RUST_IMAGE_TAG}"
   SCCACHE_VERSION: "0.16.0"
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
   CARGO_INCREMENTAL: "0"
@@ -340,16 +401,28 @@ variables:
       || echo "sccache install failed — building uncached (fail-safe)"
     fi
 
-# Fetch the PREBUILT cargo-binstall (a single static binary) into
-# $CARGO_HOME/bin, so tool installs (`cargo binstall <tool>`) download a
-# prebuilt release instead of compiling the tool from source every pipeline.
-# Best-effort (`|| true`): if the fetch is unreachable, the per-tool install
-# lines fall back to `cargo install` (source), so binstall is a pure
-# accelerator and never a hard dependency of a gate. Requires curl on PATH.
+# Define (do not run) the cargo-binstall bootstrap. Tool installs use
+# `cargo binstall <tool>` to download a prebuilt release instead of compiling
+# from source; binstall itself is a single static binary fetched from GitHub.
+#
+# DEFERRED ON PURPOSE: an image that already ships the tool must never make
+# this call. Fetching it eagerly spends a GitHub request — and GitHub's rate
+# limit — on every tool job even when nothing will be installed, which is
+# exactly the dependency that turned a rate-limited runner into a failed
+# release job. The tool guards below call `ensure_binstall` only after they
+# have established the tool is missing.
+#
+# Best-effort (`|| true`): if the fetch is unreachable the caller falls back
+# to `cargo install` from source, so binstall is a pure accelerator and never
+# a hard dependency of a gate. Requires curl on PATH.
 .install-binstall: &install-binstall
-  - curl -L --proto '=https' --tlsv1.2 -sSf
-      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh
-      | bash || true
+  - |
+    ensure_binstall() {
+      command -v cargo-binstall >/dev/null 2>&1 && return 0
+      curl -L --proto '=https' --tlsv1.2 -sSf \
+        https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+        | bash || true
+    }
 
 # Conditional internal-PKI CA trust. Two trust-store flavours: RHEL-family
 # (the buildah image) and Debian/Alpine (rust:slim, alpine/helm). Both are
@@ -418,6 +491,27 @@ variables:
 #   • The buildah jobs (.docker) have their own id_tokens block;
 #     HORT_OIDC_TOKEN is added there alongside VAULT/SIGSTORE tokens.
 #
+# Two instance roles, independently addressable:
+#   • HORT_BUILD_URL — the build source; keys the exchange + tool config below.
+#   • HORT_WARM_URL  — the warm target; used only by prefetch:warm/prefetch:verify.
+#   Same URL (the default) ⇒ one exchange, reused for both roles. Different
+#   URLs ⇒ a second exchange against the warm target, because a token minted
+#   at one instance is not valid at another (different service accounts and
+#   audiences). HORT_URL, if set, is a deprecated fallback for both roles.
+#
+# The build source itself is selectable: HORT_BUILD_SOURCE (feature/MR and
+# develop pipelines) and HORT_RELEASE_BUILD_SOURCE (main / release/* / tags)
+# each choose between HORT_BUILD_URL ("public", the default) and
+# HORT_INTERNAL_URL ("internal"). Pipeline-type detection is a shell
+# case/glob on CI_COMMIT_BRANCH/CI_COMMIT_TAG right below, deliberately not
+# workflow:rules:variables or per-job rules:variables — those would either
+# compute the pipeline type disconnected from where it's consumed, or
+# require repeating the mapping in every job that extends .hort-auth
+# (test:lint, test:unit, test:coverage, test:integration, prefetch:warm,
+# prefetch:verify), multiplying the diff and the chance of drift. Both
+# switches default to "public", so the resolved build source is unchanged
+# from today until an operator flips one.
+#
 # Exchange endpoint (RFC 8693 token exchange, confirmed from exchange.rs):
 #   POST https://registry.hort.rs/api/v1/auth/exchange
 #   form-encoded: grant_type=urn:ietf:params:oauth:grant-type:token-exchange
@@ -435,27 +529,86 @@ variables:
       aud: hort-server
   before_script: &hort-auth-steps
     - |
-      if [ "${HORT_PROXY_ENABLED:-}" = "true" ]; then
-        echo "[hort-auth] exchanging OIDC token for hort bearer token"
-        _hort_url="${HORT_URL:-https://registry.hort.rs}"
+      # Two independent switches, deliberately separate:
+      #   HORT_PREFETCH_ENABLED — mint a bearer so a job can call hort's API
+      #     (the prefetch warm/verify jobs). Harmless: changes no toolchain
+      #     configuration, so a job that resolves dependencies is unaffected.
+      #   HORT_PROXY_ENABLED — additionally repoint cargo, npm and the OCI
+      #     client at hort. This one changes where EVERY dependency in the
+      #     job resolves from, so it is only safe once the vetted index can
+      #     serve the whole lock; a version it does not serve yet fails the
+      #     job the same way it fails a release publish.
+      if [ "${HORT_PROXY_ENABLED:-}" = "true" ] || [ "${HORT_PREFETCH_ENABLED:-}" = "true" ]; then
+        # Build-source selection: release-type pipelines (main, release/*,
+        # any tag) read HORT_RELEASE_BUILD_SOURCE; every other pipeline type
+        # (feature/MR — CI_COMMIT_BRANCH is unset there — and develop) reads
+        # HORT_BUILD_SOURCE. "internal" resolves to HORT_INTERNAL_URL;
+        # anything else (including the "public" default) falls through to
+        # the existing HORT_BUILD_URL/HORT_URL resolution below, so an unset
+        # switch changes nothing.
+        _hort_is_release_pipeline=false
+        case "${CI_COMMIT_BRANCH:-}" in
+          main|release/*) _hort_is_release_pipeline=true ;;
+        esac
+        [ -n "${CI_COMMIT_TAG:-}" ] && _hort_is_release_pipeline=true
+        if [ "${_hort_is_release_pipeline}" = "true" ]; then
+          _hort_build_source="${HORT_RELEASE_BUILD_SOURCE:-public}"
+        else
+          _hort_build_source="${HORT_BUILD_SOURCE:-public}"
+        fi
+
+        # HORT_URL, deprecated, is a fallback for both roles — an operator
+        # who set it before HORT_BUILD_URL/HORT_WARM_URL existed is not
+        # silently ignored.
+        case "${_hort_build_source}" in
+          internal)
+            _hort_url="${HORT_INTERNAL_URL:-https://hort.kdp.kloni.cloud}"
+            ;;
+          *)
+            _hort_url="${HORT_BUILD_URL:-${HORT_URL:-https://registry.hort.rs}}"
+            ;;
+        esac
+        _hort_warm_url="${HORT_WARM_URL:-${HORT_URL:-https://registry.hort.rs}}"
         _hort_cargo_repo="${HORT_CARGO_SOURCE_REPO:-cargo-virtual}"
         _hort_gt="urn:ietf:params:oauth:grant-type:token-exchange"
         _hort_stt="urn:ietf:params:oauth:token-type:jwt"
-        _hort_response=$(curl -sSf \
-          -X POST "${_hort_url}/api/v1/auth/exchange" \
-          -H "Content-Type: application/x-www-form-urlencoded" \
-          --data-urlencode "grant_type=${_hort_gt}" \
-          --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
-          --data-urlencode "subject_token_type=${_hort_stt}")
-        HORT_TOKEN=$(echo "${_hort_response}" \
-          | grep -o '"access_token":"[^"]*"' \
-          | cut -d'"' -f4)
+
+        _hort_exchange() {
+          _hort_resp=$(curl -sSf \
+            -X POST "$1/api/v1/auth/exchange" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=${_hort_gt}" \
+            --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
+            --data-urlencode "subject_token_type=${_hort_stt}")
+          echo "${_hort_resp}" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4
+        }
+
+        echo "[hort-auth] exchanging OIDC token for hort bearer token (build source)"
+        HORT_TOKEN=$(_hort_exchange "${_hort_url}")
         if [ -z "${HORT_TOKEN}" ]; then
           echo "[hort-auth] ERROR: no access_token in response (omitted)"
           exit 1
         fi
-        echo "[hort-auth] token exchange succeeded"
 
+        if [ "${_hort_warm_url}" = "${_hort_url}" ]; then
+          # Same instance for both roles: a token minted for the build
+          # source is valid at the warm target too — reuse it rather than
+          # pay for a second exchange.
+          HORT_WARM_TOKEN="${HORT_TOKEN}"
+        else
+          # Different instances mean different service accounts and
+          # audiences: a token minted at one is not valid at the other.
+          echo "[hort-auth] exchanging OIDC token for hort bearer token (warm target)"
+          HORT_WARM_TOKEN=$(_hort_exchange "${_hort_warm_url}")
+          if [ -z "${HORT_WARM_TOKEN}" ]; then
+            echo "[hort-auth] ERROR: no access_token in response (omitted)"
+            exit 1
+          fi
+        fi
+        echo "[hort-auth] token exchange succeeded"
+      fi
+
+      if [ "${HORT_PROXY_ENABLED:-}" = "true" ]; then
         # Cargo: sparse index via cargo-virtual (or crates-proxy fallback)
         mkdir -p .cargo
         # cargo >=1.74 requires a credential provider for auth-required
@@ -490,7 +643,7 @@ variables:
             --password-stdin
         fi
       else
-        echo "[hort-auth] HORT_PROXY_ENABLED != 'true' — proxy disabled"
+        echo "[hort-auth] HORT_PROXY_ENABLED != 'true' — dependency sources unchanged"
       fi
 
 # ===========================================================================
@@ -593,8 +746,19 @@ test:coverage:
     - *hort-auth-steps
     - rustup component add llvm-tools-preview
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-llvm-cov
-      || cargo install --locked cargo-llvm-cov || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo llvm-cov --version >/dev/null 2>&1; then
+        ensure_binstall
+        cargo binstall --no-confirm --locked cargo-llvm-cov \
+          || cargo install --locked cargo-llvm-cov
+      fi
+      cargo llvm-cov --version >/dev/null 2>&1 || {
+        echo "cargo llvm-cov unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     - cargo llvm-cov --workspace --lib
         --lcov --output-path lcov.info
@@ -635,7 +799,7 @@ test:integration:
     - job: test:coverage
       artifacts: false
   services:
-    - name: postgres:17-alpine
+    - name: postgres:16-alpine
       alias: postgres
   variables:
     POSTGRES_DB: "artifact_registry"
@@ -663,6 +827,231 @@ test:integration:
   script:
     - cargo test --workspace --tests --verbose
 
+# GitLab-side cargo-proxy warm + a scheduled readiness probe. develop lives
+# on GitLab, so a GitLab-side warm reacts to a Cargo.lock change immediately
+# instead of waiting for the GitHub twin (prefetch-warm.yml), which only
+# fires on a develop push mirror / nightly schedule. Both jobs call
+# scripts/ci/locked-registry-deps.sh and/or scripts/ci/vetted-index-
+# preflight.sh — the same implementation release.yml's preflight uses, so
+# the three call sites cannot drift.
+#
+# Invariant both jobs exist to work around: cargo-virtual is released_only
+# (NonServableStatusFilter + IndexModeFilter, hort-http-cargo/src/serve.rs),
+# so a build resolving THROUGH the vetted index cannot warm a cold dep
+# itself — released_only hides the cold entry, so resolution fails before
+# any fetch is even attempted. The prefetch POST is the only thing that
+# warms; `cargo resolve`/`cargo build` only ever checks.
+#
+# Both grants below take effect only on the operator's Ansible apply, so
+# both jobs treat a permission failure as a loud warning, never a pipeline
+# failure — hence allow_failure: true on both, unconditionally.
+prefetch:warm:
+  stage: test
+  image: alpine:3.24
+  needs: []
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PREFETCH_ENABLED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
+  id_tokens: !reference [.hort-auth, id_tokens]
+  before_script:
+    - apk add --no-cache bash curl jq
+    - *hort-auth-steps
+  # This job also doubles as the GitLab<->hort OIDC federation probe (backlog
+  # 097 §4): the federation is declared in gitops but its applied state on
+  # registry.hort.rs is unverified, so this job's own output must distinguish
+  # the three possible outcomes without any log spelunking.
+  #
+  #   1. exchange failed (no HORT_WARM_TOKEN) — *hort-auth-steps above
+  #      already exits 1 in that case (before this `script:` even starts), so
+  #      that outcome is reported from `after_script:` below instead, via
+  #      CI_JOB_STATUS (the only signal available once before_script has
+  #      already terminated the job).
+  #   2. exchange OK, prefetch 403 — federation works, the
+  #      gitlab-ci-prefetch-cargo-virtual.yaml grant just isn't applied yet.
+  #   3. success — print queued / already_present / rejected.
+  script:
+    - |
+      set -uo pipefail
+
+      bash scripts/ci/locked-registry-deps.sh Cargo.lock > /tmp/locked.txt
+      locked_count=$(wc -l < /tmp/locked.txt)
+      items=$(jq -R -s -c '
+        split("\n") | map(select(length > 0) | split(" ") | {package: .[0], version: .[1]})
+      ' /tmp/locked.txt)
+
+      echo "Warming ${_hort_cargo_repo} at ${_hort_warm_url} with ${locked_count} locked deps…"
+      # Body to a file, status via -w: the runner may execute this under
+      # busybox sh (the image ships no bash until before_script installs it,
+      # and shell selection happens before that), where bash's $'\n'
+      # ANSI-C quoting is not portable.
+      status=$(curl -sS -o /tmp/prefetch-response.json -w '%{http_code}' -X POST \
+        "${_hort_warm_url}/api/v1/repositories/${_hort_cargo_repo}/prefetch" \
+        -H "Authorization: Bearer ${HORT_WARM_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"items\": ${items}}")
+      body=$(cat /tmp/prefetch-response.json)
+
+      case "${status}" in
+        200)
+          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'
+          ;;
+        403)
+          # Federation worked (we got here — HORT_WARM_TOKEN was minted), but the
+          # prefetch permission itself is missing: name the grant so the
+          # operator knows exactly what Ansible apply to run.
+          echo "::warning::prefetch POST rejected with 403 — the gitlab-ci-prefetch-cargo-virtual.yaml grant is not applied yet (federation itself is fine)"
+          ;;
+        *)
+          echo "::warning::prefetch POST failed with HTTP ${status}: ${body}"
+          ;;
+      esac
+  after_script:
+    - |
+      if [ "${CI_JOB_STATUS:-}" = "failed" ]; then
+        echo "::warning::hort OIDC token exchange failed — the GitLab<->hort federation is not usable yet. Candidate causes: (1) the federation gitops is not applied yet, (2) an audience or jti claim mismatch between the GitLab id_token and hort's issuer envelope, (3) HORT_PROXY_ENABLED is not actually 'true' in this pipeline context."
+      fi
+
+# Same shape as prefetch:warm above, but always targets HORT_INTERNAL_URL
+# rather than the warm target HORT_WARM_URL currently resolves to (the two
+# are independent roles — see HORT_INTERNAL_URL's comment). A build source
+# can only ever serve what it has already been warmed with, so keeping the
+# internal instance warm is the precondition for ever flipping
+# HORT_BUILD_SOURCE / HORT_RELEASE_BUILD_SOURCE to "internal", not a later
+# addition — without this job the internal instance could never serve a
+# build no matter how the switches are set. Self-contained: it mints its own
+# token against HORT_INTERNAL_URL rather than going through .hort-auth,
+# because that anchor's two-role exchange is keyed to the build/warm roles
+# this job doesn't use. Gated exactly like prefetch:warm and, like it,
+# allow_failure: true — inert today: the internal instance's federation
+# grant is not applied yet, so this reports "not authorised yet" (or
+# "unreachable") every run without ever failing the pipeline, the same
+# three-outcome diagnostic (exchange failed / 403 / success) as
+# prefetch:warm.
+prefetch:warm:internal:
+  stage: test
+  image: alpine:3.24
+  # The internal instance presents an internal-PKI certificate, so this job
+  # needs the platform CA — which only the `platform` runner mounts (at the
+  # path PLATFORM_CA_PATH names). Untagged jobs are dispatched to whichever
+  # runner is free, and on one of them that mount does not exist, so the TLS
+  # handshake fails before any request leaves the container.
+  tags:
+    - platform
+  needs: []
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PREFETCH_ENABLED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
+  id_tokens:
+    HORT_OIDC_TOKEN:
+      aud: hort-server
+  before_script:
+    # ca-certificates provides update-ca-certificates, which the platform-CA
+    # anchor calls; without it an internal-PKI endpoint cannot be trusted and
+    # the TLS handshake fails before any request is sent.
+    - apk add --no-cache bash curl jq ca-certificates
+    - *platform-ca-deb
+    - |
+      _hort_internal_url="${HORT_INTERNAL_URL:-https://hort.kdp.kloni.cloud}"
+      _hort_cargo_repo="${HORT_CARGO_SOURCE_REPO:-cargo-virtual}"
+      _hort_gt="urn:ietf:params:oauth:grant-type:token-exchange"
+      _hort_stt="urn:ietf:params:oauth:token-type:jwt"
+
+      echo "[hort-auth] exchanging OIDC token for hort bearer token (internal instance)"
+      # Keep curl's own diagnosis: a TLS-trust failure, a DNS failure and a
+      # rejected token are three different problems, and only curl can tell
+      # them apart. Guessing at causes after the fact sent an operator
+      # looking for a misconfiguration that did not exist.
+      _hort_resp=$(curl -sSf \
+        -X POST "${_hort_internal_url}/api/v1/auth/exchange" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "grant_type=${_hort_gt}" \
+        --data-urlencode "subject_token=${HORT_OIDC_TOKEN}" \
+        --data-urlencode "subject_token_type=${_hort_stt}" \
+        2>/tmp/hort-exchange-curl.err) || _hort_curl_rc=$?
+      if [ -n "${_hort_curl_rc:-}" ]; then
+        echo "[hort-auth] curl exited ${_hort_curl_rc}; its diagnosis:"
+        sed 's/^/[hort-auth]   /' /tmp/hort-exchange-curl.err >&2 || true
+        case "${_hort_curl_rc}" in
+          60|77|35) echo "[hort-auth] TLS trust: this endpoint's certificate chain is not trusted in this job. An internal-PKI endpoint needs PLATFORM_CA_PATH set to its CA bundle; the request never reached the server." >&2 ;;
+          6)        echo "[hort-auth] DNS: the endpoint's name did not resolve from this job." >&2 ;;
+          7|28)     echo "[hort-auth] Network: no route or timeout from this job to the endpoint." >&2 ;;
+        esac
+      fi
+      HORT_INTERNAL_TOKEN=$(echo "${_hort_resp}" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+      if [ -z "${HORT_INTERNAL_TOKEN}" ]; then
+        echo "[hort-auth] ERROR: no access_token in response (omitted)"
+        exit 1
+      fi
+      echo "[hort-auth] token exchange succeeded (internal instance)"
+  script:
+    - |
+      set -uo pipefail
+
+      bash scripts/ci/locked-registry-deps.sh Cargo.lock > /tmp/locked.txt
+      locked_count=$(wc -l < /tmp/locked.txt)
+      items=$(jq -R -s -c '
+        split("\n") | map(select(length > 0) | split(" ") | {package: .[0], version: .[1]})
+      ' /tmp/locked.txt)
+
+      echo "Warming ${_hort_cargo_repo} at ${_hort_internal_url} with ${locked_count} locked deps…"
+      status=$(curl -sS -o /tmp/prefetch-response.json -w '%{http_code}' -X POST \
+        "${_hort_internal_url}/api/v1/repositories/${_hort_cargo_repo}/prefetch" \
+        -H "Authorization: Bearer ${HORT_INTERNAL_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"items\": ${items}}")
+      body=$(cat /tmp/prefetch-response.json)
+
+      case "${status}" in
+        200)
+          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'
+          ;;
+        403)
+          # Federation may work but the prefetch grant on the internal
+          # instance isn't applied yet — the expected state until an
+          # operator runs the internal-instance equivalent of
+          # gitlab-ci-prefetch-cargo-virtual.yaml.
+          echo "::warning::internal-instance prefetch POST rejected with 403 — not authorised yet (the internal instance's prefetch grant is not applied)"
+          ;;
+        *)
+          echo "::warning::internal-instance prefetch POST failed with HTTP ${status}: ${body}"
+          ;;
+      esac
+  after_script:
+    - |
+      if [ "${CI_JOB_STATUS:-}" = "failed" ]; then
+        echo "::warning::hort OIDC token exchange against the internal instance failed — see the [hort-auth] lines above for curl's own diagnosis. Most common cause is TLS trust (an internal-PKI endpoint needs PLATFORM_CA_PATH), in which case the request never reached the server; otherwise the federation gitops is not applied there, or the audience does not match."
+      fi
+
+# Read-only readiness probe: reports the complete cold set ahead of a
+# release, without side effects (no prefetch POST — see
+# scripts/ci/vetted-index-preflight.sh). Scheduled only — this is a
+# pre-release signal an operator checks before cutting a release, not
+# something every develop push needs to re-run.
+prefetch:verify:
+  stage: test
+  image: alpine:3.24
+  needs: []
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
+  id_tokens: !reference [.hort-auth, id_tokens]
+  before_script:
+    - apk add --no-cache bash curl jq findutils
+    - *hort-auth-steps
+  script:
+    - |
+      set -uo pipefail
+
+      if bash scripts/ci/locked-registry-deps.sh Cargo.lock \
+          | HORT_TOKEN="${HORT_WARM_TOKEN}" bash scripts/ci/vetted-index-preflight.sh \
+              "${_hort_warm_url}" "${_hort_cargo_repo}"; then
+        echo "prefetch:verify — every locked dep is served by ${_hort_cargo_repo} (release-ready)."
+      else
+        echo "::warning::prefetch:verify — cold deps listed above are not yet served by ${_hort_cargo_repo}; not release-ready. Re-run prefetch:warm (or wait for the next develop push) and let the quarantine window clear."
+      fi
+
 # ===========================================================================
 # Stage 2: security — cargo audit (parity with GitHub security-audit)
 # ===========================================================================
@@ -686,8 +1075,19 @@ security:cargo-audit:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-audit
-      || cargo install --locked cargo-audit || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo audit --version >/dev/null 2>&1; then
+        ensure_binstall
+        cargo binstall --no-confirm --locked cargo-audit \
+          || cargo install --locked cargo-audit
+      fi
+      cargo audit --version >/dev/null 2>&1 || {
+        echo "cargo audit unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     # Diagnostic JSON artefact captured first; failure-tolerant (||
     # true) so a non-zero exit still produces the upload below.
@@ -752,8 +1152,19 @@ security:attribution-sync:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl python3
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-about
-      || cargo install --locked cargo-about --features cli || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo about --version >/dev/null 2>&1; then
+        ensure_binstall
+        cargo binstall --no-confirm --locked cargo-about \
+          || cargo install --locked cargo-about --features cli
+      fi
+      cargo about --version >/dev/null 2>&1 || {
+        echo "cargo about unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     - bash scripts/check-attribution.sh
 
@@ -813,8 +1224,19 @@ security:cargo-deny:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends ca-certificates git pkg-config libssl-dev curl
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-deny
-      || cargo install --locked cargo-deny || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo deny --version >/dev/null 2>&1; then
+        ensure_binstall
+        cargo binstall --no-confirm --locked cargo-deny \
+          || cargo install --locked cargo-deny
+      fi
+      cargo deny --version >/dev/null 2>&1 || {
+        echo "cargo deny unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
   script:
     - cargo deny --workspace check
 
@@ -1009,7 +1431,7 @@ quality:site-build:
 # wipes /tmp/cosign.key even if the build failed mid-step.
 
 .docker:
-  # build-images push to the mirror registry (hort.kdp.kloni.cloud) with
+  # build-images push to the mirror registry configured via ${REGISTRY} with
   # credentials mounted only on the in-cluster Platform Runner at /secrets/zot;
   # off-cluster runners fall back to CI_REGISTRY_* (GitLab's own registry) and
   # fail `buildah login` with "invalid username/password". The `platform` tag
@@ -1361,7 +1783,7 @@ helm:sign-chart:
   # buildah-cosign tools image: Fedora + cosign v3 + curl + jq (the same image
   # the platform first-party oci component signs with). No helm needed — cosign
   # resolves the chart tag to its digest itself.
-  image: hort.kdp.kloni.cloud/ci/buildah-cosign:latest
+  image: ${CI_TOOLS_REGISTRY}/ci/buildah-cosign:latest
   needs:
     - job: helm:lint-and-publish
   rules:
@@ -1481,8 +1903,19 @@ release:sbom:
     # Vault-token + key fetch in cosign-setup.sh succeeds.
     - apt-get install -y -qq --no-install-recommends jq
     - *install-binstall
-    - cargo binstall --no-confirm --locked cargo-cyclonedx
-      || cargo install --locked cargo-cyclonedx || true
+    - |
+      # Skip when the image already ships the tool; otherwise install and
+      # FAIL if it is still missing. A swallowed install failure surfaces much
+      # later as "no such command", long after the cause has scrolled away.
+      if ! cargo cyclonedx --version >/dev/null 2>&1; then
+        ensure_binstall
+        cargo binstall --no-confirm --locked cargo-cyclonedx \
+          || cargo install --locked cargo-cyclonedx
+      fi
+      cargo cyclonedx --version >/dev/null 2>&1 || {
+        echo "cargo cyclonedx unavailable: binstall and cargo install both failed" >&2
+        exit 1
+      }
     # Trust the platform CA (internal PKI) BEFORE cosign-setup.sh runs: in
     # vault-key mode its HTTPS call to ${VAULT_ADDR} (OpenBao) must verify
     # against an internal CA not in the public bundle. No-op when

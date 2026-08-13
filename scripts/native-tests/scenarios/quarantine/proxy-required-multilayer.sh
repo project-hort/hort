@@ -1,0 +1,643 @@
+#!/usr/bin/env bash
+# requires: egress worker db compose
+# Proxy pull-through x provenance_mode:Required, multi-layer image — #115
+# Item 4 regression E2E for the defect Item 3 fixed.
+#
+# ---------------------------------------------------------------------------
+# THE DEFECT (issue #115, defect (b)) AND WHAT THIS PINS.
+# ---------------------------------------------------------------------------
+# Before Item 3, `Artifact::complete_provenance`'s NoAttestation x Required
+# arm only HELD (stayed Quarantined, no terminal decision) when the
+# artifact's own observation window was still open (`window_open`). A
+# referenced-tree descendant (#46 Item 2) gets a ZERO-length window by
+# design (anchor = ingested_at - duration), so for a proxy-pulled tree every
+# constituent — the platform-specific child manifest, its config blob, its
+# layer blobs — had `window_open == false` from the instant it was ingested,
+# and the OLD code TERMINALLY REJECTED it as `Unsigned` before the parent
+# index (the actual signable subject) ever got a chance to be signed. Item 3
+# widened the hold condition to `window_open || is_referenced_descendant`,
+# so a descendant now HOLDS unconditionally — independent of whether its
+# subject is ever signed — and clears later via cascade
+# (`cascade_provenance_clearance`, ADR 0039 §11) once the subject verifies.
+#
+# This scenario drives that composition for real: pull a genuine multi-layer
+# OCI image INDEX through a `provenance_mode: Required` PROXY repo, sign the
+# INDEX (the real subject), and assert:
+#   (a) the pull EVENTUALLY SUCCEEDS (subject verifies, cascade clears the
+#       child manifest + its config/layer blobs, the quarantine window
+#       elapses, the whole tree becomes anonymously pullable);
+#   (b) NONE of the constituents (child manifest, config blob, every layer
+#       blob) EVER emits `ProvenanceRejected` — the exact defect signature
+#       Item 3 fixed (pre-fix, each would have terminally rejected as
+#       Unsigned within moments of ingest, long before this scenario's
+#       later assertions even run).
+#
+# ---------------------------------------------------------------------------
+# MODEL SCENARIOS COMBINED, NOT REINVENTED.
+# ---------------------------------------------------------------------------
+# - Proxy pull-through mechanics (cold GET by tag -> resolve a linux/amd64
+#   child by digest -> GET the child -> content_references edge assertions
+#   -> quarantine_window_start differential) are
+#   scenarios/quarantine/proxy-multiarch-zero-window.sh's pattern.
+# - Keyed cosign signing mechanics (env-var contract, tool-availability
+#   self-skip, the committed test keypair, dual native-token/legacy auth,
+#   `cosign sign --key --registry-referrers-mode=oci-1-1`, the
+#   ProvenanceVerified poll) are
+#   scenarios/quarantine/provenance-push-then-sign.sh's pattern.
+# Unlike that script, this repo is PUBLIC (isPublic:true, like
+# oci-proxy-quarantine-e2e) — the private-repo visibility x hold interaction
+# (ADR 0045) is already covered there; this scenario stays focused on the
+# proxy x Required x descendant-hold composition. The FIRST-touch cold index
+# GET (Step 0) is the fetch that performs the ingest, and — mirroring
+# proxy-multiarch-zero-window.sh's own Step 0 — the designed proxy read path
+# never hands that fetch's caller the freshly-ingested, still-quarantined
+# manifest even though it is the one that populated it: an anonymous caller
+# gets 503 + Retry-After + an UNAVAILABLE body, not the manifest. Every
+# subsequent manifest READ (index re-GET, child GET) authenticates with the
+# credential already fetched below (PUSH_USER/PUSH_SECRET) and relies on the
+# write-authorized hold-read exemption (ADR 0039 §10) to see the held
+# content — the same exemption the cosign sign step's own subject-resolution
+# GET needs, so signing needs no separate credential dance.
+#
+# ---------------------------------------------------------------------------
+# WHY A NEW REPO+POLICY+SA, NOT A REUSE.
+# ---------------------------------------------------------------------------
+# ScanPolicy scope is 1:1 per-repository (see
+# oci-provenance-proxy-e2e-required.yaml's header): oci-provenance-e2e is
+# hosted-push-only (no upstream mapping — cannot proxy-pull), and
+# oci-proxy-quarantine-e2e's policy is provenanceMode:off and load-bearing
+# for the sibling zero-window scenario. So this item adds ONE new repository
+# + upstream mapping + policy + a per-repo service account + its
+# PermissionGrants (write, read) + a per-repo dev-user write grant — the same
+# fixture multiplication provenance-push-then-sign.sh's own repo needed,
+# mirrored rather than invented (see each new file's own header comment).
+#
+# ---------------------------------------------------------------------------
+# WHY redis:7-alpine, WHY LENGTH ASSERTED AT RUNTIME NOT HARDCODED.
+# ---------------------------------------------------------------------------
+# `redis:7-alpine` is a genuine Docker Hub multi-arch image INDEX with
+# multiple layers per platform child. The layer COUNT is never assumed —
+# `.layers | length` is asserted `>= 2` against the manifest hort actually
+# served, so a future upstream retag that collapses to a single layer fails
+# loudly instead of silently testing nothing (same discipline as the
+# zero-window scenario's digest-not-count assertions).
+#
+# ---------------------------------------------------------------------------
+# WHY THIS MAY SELF-SKIP — see provenance-push-then-sign.sh's identical note.
+# ---------------------------------------------------------------------------
+# Same three preconditions (cosign+buildah in the client image, a keyed
+# signing keypair, a required+cosign-key repo in the mounted gitops config) —
+# this item's gitops config supplies the third; the first two are a CI
+# provisioner concern this item's directive explicitly does not touch.
+
+# shellcheck source=../../lib/common.sh
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/common.sh"
+
+if [ "${HORT_TEST_DEBUG:-0}" = "1" ]; then
+    set -x
+fi
+
+# -----------------------------------------------------------------------------
+# Env contract (CI provisioner overrides; sensible defaults otherwise)
+# -----------------------------------------------------------------------------
+REPO_KEY="${PROVENANCE_PROXY_REPO_KEY:-oci-provenance-proxy-e2e}"
+COSIGN_KEY="${COSIGN_KEY:-${FIXTURES:-}/cosign/cosign.key}"
+export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
+IMAGE="${IMAGE:-redis:7-alpine}"
+RESOLVER_REFRESH_GUESS="${RESOLVER_REFRESH_GUESS:-8}"
+# Sized against the release path's real worst case, which is CADENCE-bound,
+# not window-bound: release happens on the first quarantine-release-sweep
+# pass after the observation window closes, and the compose sweep-ticker
+# enqueues that sweep every SWEEP_TICK_SECS (dev/CI default 15s — see
+# deploy/compose/docker-compose.yml; now parameterized, previously a
+# hardcoded 15s, NOT the 300s this budget used to assume — the old 420s
+# default over-provisioned against a cadence the ticker never actually ran
+# at). From the moment the wait starts (right after
+# ProvenanceVerified — typically landing around T+70s, once the constituent
+# pulls and the sign have run), the window itself doesn't close until T+120s
+# (the quarantineDuration), so the releasing tick can land up to
+# ~(120-70)=50s later for the window, plus one full SWEEP_TICK_SECS tick (15s
+# interval, plus job-claim/release/pull processing (~10-40s) on top:
+# default) — ~75-105s worst case. The 240s default keeps >2x margin; a
+# passing run still exits on the first poll hit.
+WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-240}"
+# Step 9b budget: after 9a has driven every foreign platform through cold
+# pull-through and each has self-cleared at its own quarantine commit, the
+# anonymous poll is waiting only on clearance + the release sweep tick — not
+# on any pull-through round-trip. ~2 sweep ticks (default SWEEP_TICK_SECS
+# 15s) plus job-claim/release/pull processing is the expected worst case; 90s
+# keeps a comfortable margin without reintroducing the unbounded serial-pull
+# wait 9a now absorbs.
+ANON_PULL_WAIT_SECS="${ANON_PULL_WAIT_SECS:-90}"
+
+REGISTRY_HOST="${HORT_URL#http://}"
+REGISTRY_HOST="${REGISTRY_HOST#https://}"
+
+OCI_INDEX_MEDIA="application/vnd.oci.image.index.v1+json"
+DOCKER_LIST_MEDIA="application/vnd.docker.distribution.manifest.list.v2+json"
+OCI_MANIFEST_MEDIA="application/vnd.oci.image.manifest.v1+json"
+DOCKER_MANIFEST_MEDIA="application/vnd.docker.distribution.manifest.v2+json"
+
+command -v jq >/dev/null 2>&1 || skip "jq not found"
+command -v curl >/dev/null 2>&1 || skip "curl not found"
+command -v skopeo >/dev/null 2>&1 || skip "skopeo not found in client image"
+command -v cosign >/dev/null 2>&1 || \
+    skip "cosign not in client image — provision cosign + a keyed key + this item's required/cosign-key repo, then re-run (see header)"
+[ -n "$COSIGN_KEY" ] || \
+    skip "COSIGN_KEY unset — no keyed cosign private key to sign with (its public half must be the worker's registered cosign-key)"
+[ -f "$COSIGN_KEY" ] || \
+    skip "keyed cosign private key '$COSIGN_KEY' not found (expected the committed fixture at \$FIXTURES/cosign/cosign.key, or a CI-provided COSIGN_KEY)"
+
+IMAGE_REPO="${IMAGE%%:*}"
+IMAGE_TAG="${IMAGE##*:}"
+case "$IMAGE_REPO" in
+    */*) IMAGE_PATH="${IMAGE_REPO}" ;;
+    *)   IMAGE_PATH="library/${IMAGE_REPO}" ;;
+esac
+BASE_URL="${HORT_URL}/v2/${REPO_KEY}/dockerhub/${IMAGE_PATH}"
+PULLED_ARCHIVE="/tmp/prov-proxy-pulled-$$.tar"
+WARM_ARCHIVE="/tmp/prov-proxy-warm-$$.tar"
+trap 'rm -f "$PULLED_ARCHIVE" "$WARM_ARCHIVE" "${ANON_HEADERS:-}" "${ANON_BODY:-}" "${INDEX_HEADERS:-}" "${INDEX_BODY:-}" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
+
+log "==> Proxy pull-through x provenance_mode:Required, multi-layer image (issue #115 Item 4)"
+log "Registry : ${HORT_URL}"
+log "Repo key : ${REPO_KEY} (expected: provenanceMode=required, provenanceBackends=[cosign-key])"
+log "Image    : ${IMAGE} (${IMAGE_PATH})"
+
+# -----------------------------------------------------------------------------
+# Credential mode for the authenticated manifest reads (Steps 1-2) and the
+# SIGN step (mirrors provenance-push-then-sign.sh's dual native-token/legacy
+# auth) — the repo is public, so only the write-authorized hold-read
+# exemption needs a credential at all; the cold-ingest GET (Step 0) stays
+# anonymous.
+# -----------------------------------------------------------------------------
+NATIVE_TOKENS=0
+case " ${HORT_COMPOSE_OVERLAYS:-} " in
+    *" native-tokens "*) NATIVE_TOKENS=1 ;;
+esac
+
+if [ "$NATIVE_TOKENS" = "1" ]; then
+    log "[auth] native-token mode: admin-minting an hort_svc_* token for service account provenance-proxy-ci"
+    SVC_TOKEN="$(mint_svc_token provenance-proxy-ci "$REPO_KEY" read,write)" || {
+        fail "admin-mint provenance-proxy-ci svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
+    PUSH_USER="provenance-proxy-ci"; PUSH_SECRET="$SVC_TOKEN"
+    log "[auth] svc token minted for the sign step"
+
+    # --- Negative regression pin (native mode only) -------------------------
+    # A deliberate GLOBAL mint (no repository_ids) for the same repo-scoped
+    # SA must be denied: `run_issuance_gates`'s `None` branch
+    # (crates/hort-app/src/use_cases/api_token_use_case.rs:2212-2223)
+    # requires each declared permission to be held GLOBALLY, and
+    # provenance-proxy-ci only ever holds a per-repo grant on REPO_KEY --
+    # "a per-repo-only grantee CANNOT mint a global token, only a per-repo
+    # one." This pins that invariant at the E2E tier: the admin-mint-without-
+    # scope path this scenario used to take (and which silently swallowed
+    # its own failure) is now the deliberately-tested negative case, not the
+    # happy path.
+    NEG_ADMIN_TOKEN="$(fetch_token admin admin)"
+    [ -n "$NEG_ADMIN_TOKEN" ] || fail "fetch admin token (negative-mint pin)" "empty response from Keycloak"
+    NEG_SA_UID="$(psql_one "SELECT id FROM users WHERE username='sa:provenance-proxy-ci';")"
+    [ -n "$NEG_SA_UID" ] || fail "resolve provenance-proxy-ci backing user (negative-mint pin)" \
+        "no users row 'sa:provenance-proxy-ci'"
+    if [ -n "$NEG_ADMIN_TOKEN" ] && [ -n "$NEG_SA_UID" ]; then
+        NEG_RESP="$(curl -sS -w '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer ${NEG_ADMIN_TOKEN}" -H 'Content-Type: application/json' \
+            -d "{\"name\":\"provenance-proxy-e2e-negative-$(date +%s)\",\"declared_permissions\":[\"read\",\"write\"],\"expires_in_days\":1}" \
+            "${HORT_URL}/api/v1/admin/users/${NEG_SA_UID}/tokens" 2>/dev/null)"
+        NEG_HTTP_CODE="${NEG_RESP##*$'\n'}"
+        NEG_BODY="${NEG_RESP%$'\n'*}"
+        NEG_ERROR="$(printf '%s' "$NEG_BODY" | jq -r '.error // empty' 2>/dev/null || true)"
+        if [ "$NEG_HTTP_CODE" = "403" ] && [ "$NEG_ERROR" = "cap_exceeds_authority" ]; then
+            pass "deliberate global mint for repo-scoped SA provenance-proxy-ci -> 403 cap_exceeds_authority (issuance invariant pinned)"
+        else
+            fail "negative global-mint pin for provenance-proxy-ci" \
+                "want HTTP 403 {\"error\":\"cap_exceeds_authority\",...}, got HTTP ${NEG_HTTP_CODE}: $(printf '%s' "$NEG_BODY" | head -c 300)"
+        fi
+    fi
+else
+    DEV_TOKEN="$(fetch_token dev-user dev)"
+    [ -n "$DEV_TOKEN" ] || fail "fetch dev-user token" "empty response from Keycloak"
+    [ -n "$DEV_TOKEN" ] || summary
+    PUSH_USER="dev-user"; PUSH_SECRET="$DEV_TOKEN"
+    log "[auth] legacy mode: fetched DEV_TOKEN from Keycloak (dev-user write-authorized for ${REPO_KEY})"
+fi
+
+# ---------------------------------------------------------------------
+# Preflight: the resolver cache picks up gitops-applied upstream mappings
+# on its own refresh cadence (mirrors proxy-multiarch-zero-window.sh).
+# ---------------------------------------------------------------------
+log ""
+log "--- Preflight: waiting up to ${RESOLVER_REFRESH_GUESS}s for the resolver cache"
+sleep "${RESOLVER_REFRESH_GUESS}"
+
+# ---------------------------------------------------------------------
+# Step 0: ANONYMOUS cold-pull of the INDEX by tag. This is the triggering
+# fetch — it performs the cold ingest — and the designed proxy read path
+# never hands an unprivileged caller the freshly-ingested, still-quarantined
+# manifest: the response is 503 with a Retry-After header and an
+# UNAVAILABLE error body, not the manifest itself (mirrors
+# proxy-multiarch-zero-window.sh's Step 0 — the regression pin for the hold).
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 0: ANONYMOUS GET the index by tag (cold ingest; must hold, not serve)"
+
+ANON_HEADERS="$(mktemp)"
+ANON_BODY="$(mktemp)"
+
+ANON_CODE="$(curl -sS -o "$ANON_BODY" -D "$ANON_HEADERS" -w '%{http_code}' \
+    -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
+    "${BASE_URL}/manifests/${IMAGE_TAG}" 2>/dev/null || echo 000)"
+if [ "$ANON_CODE" = "503" ]; then
+    pass "ANONYMOUS GET index by tag -> 503 (quarantined; cold ingest performed)"
+else
+    fail "ANONYMOUS GET index by tag -> 503" "got HTTP ${ANON_CODE} (egress? upstream reachable? gitops applied?)"
+    summary
+fi
+
+if grep -qi '^retry-after:' "$ANON_HEADERS"; then
+    pass "ANONYMOUS 503 carries a Retry-After header"
+else
+    fail "ANONYMOUS 503 carries a Retry-After header" "no Retry-After header in response"
+fi
+
+ANON_ERROR_CODE="$(jq -r '.errors[0].code // empty' "$ANON_BODY" 2>/dev/null)"
+if [ "$ANON_ERROR_CODE" = "UNAVAILABLE" ]; then
+    pass "ANONYMOUS 503 body errors[0].code == UNAVAILABLE"
+else
+    fail "ANONYMOUS 503 body errors[0].code == UNAVAILABLE" "got '${ANON_ERROR_CODE:-<empty>}'"
+fi
+
+# ---------------------------------------------------------------------
+# Step 1: AUTHENTICATED re-GET of the INDEX by tag — the write-authorized
+# hold-read exemption (ADR 0039 §10) serves the already-quarantined index to
+# the credential fetched above (PUSH_USER/PUSH_SECRET).
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 1: AUTHENTICATED GET the index by tag (write-authorized hold-read)"
+
+INDEX_HEADERS="$(mktemp)"
+INDEX_BODY="$(mktemp)"
+
+INDEX_CODE="$(curl -sS -o "$INDEX_BODY" -D "$INDEX_HEADERS" -w '%{http_code}' \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
+    -H "Accept: ${OCI_INDEX_MEDIA}, ${DOCKER_LIST_MEDIA}" \
+    "${BASE_URL}/manifests/${IMAGE_TAG}" 2>/dev/null || echo 000)"
+if [ "$INDEX_CODE" = "200" ]; then
+    pass "AUTHENTICATED GET index by tag -> 200 (write-authorized hold-read exemption)"
+else
+    fail "AUTHENTICATED GET index by tag -> 200" "got HTTP ${INDEX_CODE}"
+    summary
+fi
+
+INDEX_DIGEST="$(tr -d '\r' < "$INDEX_HEADERS" | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2; exit}')"
+if [ -n "$INDEX_DIGEST" ]; then
+    pass "index resolved: Docker-Content-Digest=${INDEX_DIGEST}"
+else
+    fail "index Docker-Content-Digest header present" "no header on the index response"
+    summary
+fi
+INDEX_HASH="${INDEX_DIGEST#sha256:}"
+
+CHILD_DIGEST="$(jq -r '.manifests[]? | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' "$INDEX_BODY" 2>/dev/null | head -1)"
+if [ -n "$CHILD_DIGEST" ]; then
+    pass "resolved linux/amd64 child manifest digest: ${CHILD_DIGEST}"
+else
+    fail "resolve linux/amd64 child digest from served index" \
+        "no .manifests[] entry with platform.architecture=amd64, platform.os=linux"
+    summary
+fi
+CHILD_HASH="${CHILD_DIGEST#sha256:}"
+
+# ---------------------------------------------------------------------
+# Step 2: AUTHENTICATED pull of the child manifest BY DIGEST — the
+# write-authorized hold-read exemption again (the child is also still
+# quarantined), and the leg that spawns #51's background config/layer blob
+# warming.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 2: AUTHENTICATED GET the child manifest by digest"
+
+CHILD_HEADERS="$(mktemp)"
+CHILD_BODY="$(mktemp)"
+
+CHILD_CODE="$(curl -sS -o "$CHILD_BODY" -D "$CHILD_HEADERS" -w '%{http_code}' \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
+    -H "Accept: ${OCI_MANIFEST_MEDIA}, ${DOCKER_MANIFEST_MEDIA}" \
+    "${BASE_URL}/manifests/${CHILD_DIGEST}" 2>/dev/null || echo 000)"
+if [ "$CHILD_CODE" = "200" ]; then
+    pass "AUTHENTICATED GET child manifest by digest -> 200 (write-authorized hold-read exemption)"
+else
+    fail "AUTHENTICATED GET child manifest by digest -> 200" "got HTTP ${CHILD_CODE}"
+    summary
+fi
+
+CONFIG_DIGEST="$(jq -r '.config.digest // empty' "$CHILD_BODY" 2>/dev/null)"
+LAYER_COUNT="$(jq -r '.layers | length' "$CHILD_BODY" 2>/dev/null || echo 0)"
+if [ -n "$CONFIG_DIGEST" ] && [ "$LAYER_COUNT" -ge 2 ] 2>/dev/null; then
+    pass "child manifest carries a config digest and ${LAYER_COUNT} layers (>= 2, verified at runtime — the item's multi-layer requirement)"
+else
+    fail "resolve child .config.digest and >= 2 .layers[]" \
+        "config='${CONFIG_DIGEST:-<empty>}' layers=${LAYER_COUNT:-0} (expected >= 2 — try a different IMAGE if the upstream tag changed shape)"
+    summary
+fi
+CONFIG_HASH="${CONFIG_DIGEST#sha256:}"
+mapfile -t LAYER_DIGESTS < <(jq -r '.layers[].digest' "$CHILD_BODY" 2>/dev/null)
+LAYER_HASHES=()
+for d in "${LAYER_DIGESTS[@]}"; do LAYER_HASHES+=("${d#sha256:}"); done
+log "  child config digest = ${CONFIG_DIGEST}"
+log "  child layer digests = ${LAYER_DIGESTS[*]}"
+
+# ---------------------------------------------------------------------
+# Step 3: force constituent ingest — explicit GET of the config blob and
+# every layer blob through the proxy, run BEFORE the sign (Step 4), never
+# after it. Two invariants converge on this ordering:
+#   (a) the verify cascade walks the signed subject's constituent digests
+#       ONCE, at verify time, and clears only rows that exist at that
+#       moment (a missing row is a warn-and-skip, best-effort). A
+#       constituent ingested AFTER the subject's verify never receives
+#       clearance — there is no parent-lookup self-clear, and the sweep's
+#       expiry backstop deliberately skips parent-gated constituents — so
+#       it strands Pending+held until a re-sign re-drives the cascade. The
+#       constituents must therefore already exist when the sign's verify
+#       runs: a direct blob GET performs the SAME synchronous cold-pull
+#       ingest as Step 0's index GET regardless of whether the response is
+#       200 or a designed hold-503, so by the time this loop returns every
+#       constituent row exists for the cascade to find;
+#   (b) everything placed between ingest and sign eats into the
+#       observation window, because under a required provenance policy the
+#       window's end IS the signing deadline. The window is sized (120s)
+#       to cover both these constituent pulls (~30-60s incl. docker.io)
+#       and the sign itself, with margin.
+# Statuses are deliberately NOT asserted beyond "curl completed" — this is a
+# forcing step, not an assertion; the 60s polls in Step 6/8 stay as a
+# backstop.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 3: force constituent ingest (config blob + every layer blob)"
+
+curl -sS -o /dev/null \
+    -H "Authorization: Bearer ${PUSH_SECRET}" \
+    "${BASE_URL}/blobs/sha256:${CONFIG_HASH}" 2>/dev/null || true
+for h in "${LAYER_HASHES[@]}"; do
+    curl -sS -o /dev/null \
+        -H "Authorization: Bearer ${PUSH_SECRET}" \
+        "${BASE_URL}/blobs/sha256:${h}" 2>/dev/null || true
+done
+log "  forcing GETs issued for config blob + ${#LAYER_HASHES[@]} layer blob(s)"
+
+# ---------------------------------------------------------------------
+# Step 4: SIGN the index (the real subject) — cosign sign --key
+# --registry-referrers-mode=oci-1-1 against the SAME repo namespace the
+# image was proxy-pulled into (confirmed: cosign-key verification resolves
+# referrers repo-scoped-first, landing an upstream-fetched referrer back
+# into the same local index — a directly-pushed referrer is found the same
+# way). Signing after the constituents are forced in (Step 3) satisfies
+# invariant (a) above — the verify cascade needs every constituent row to
+# already exist — while still giving the worker's cascade wall-clock ahead
+# of this scenario's later assertions.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 4: cosign sign --key ... --registry-referrers-mode=oci-1-1 ${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}"
+export COSIGN_DOCKER_MEDIA_TYPES=1
+export COSIGN_EXPERIMENTAL=1
+SIGN_OUT=""
+SIGN_RC=0
+SIGN_OUT="$(cosign sign --yes \
+    --key "$COSIGN_KEY" \
+    --registry-referrers-mode=oci-1-1 \
+    --registry-username="$PUSH_USER" \
+    --registry-password="$PUSH_SECRET" \
+    --allow-insecure-registry \
+    --allow-http-registry \
+    "${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}" 2>&1)" || SIGN_RC=$?
+if [ "$SIGN_RC" -eq 0 ]; then
+    pass "cosign sign (keyed, oci referrers) succeeded against the proxy-pulled subject"
+else
+    log "[cosign output]"; printf '%s\n' "$SIGN_OUT" | sed 's/^/    /'
+    if printf '%s' "$SIGN_OUT" | grep -Eqi 'GET .*/manifests/.*503|503 .*manifests'; then
+        fail "cosign sign hold-read exemption on a proxy-pulled subject" \
+             "cosign got a 503 on a manifest GET during signing -> the write-authorized manifest hold-read exemption (ADR 0039 §10) is not serving the held, proxy-pulled subject to the signer"
+    else
+        fail "cosign sign (keyed, oci referrers) against a proxy-pulled subject" \
+             "cosign exited ${SIGN_RC}; see output above"
+    fi
+    summary
+fi
+
+# ---------------------------------------------------------------------
+# Step 5: resolve repository + artifact ids via psql (defence-in-depth poll,
+# mirrors proxy-multiarch-zero-window.sh's find_artifact_id).
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 5: resolve repository + artifact ids via psql"
+
+REPO_ID="$(psql_one "SELECT id FROM repositories WHERE key = '${REPO_KEY}';")"
+if [ -z "$REPO_ID" ]; then
+    fail "resolve repository id for ${REPO_KEY}" \
+        "no row in repositories — is deploy/compose/example-config/repositories/oci-provenance-proxy-e2e.yaml mounted and gitops apply succeeding?"
+    summary
+fi
+pass "repository resolved (id=${REPO_ID})"
+
+find_artifact_id() {
+    local hash="$1" label="$2" id=""
+    bounded_poll "artifact ${label} (sha256:${hash}) ingested" 60 \
+        "[ -n \"\$(psql_one \"SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND checksum_sha256 = '${hash}';\")\" ]" \
+        2 || true
+    id="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND checksum_sha256 = '${hash}';")"
+    # defense in depth: a captured id must be UUID-shaped or downstream
+    # `[ -n ]`/WHERE-clause guards could be satisfied by garbage — never
+    # return anything else, even with the poll's own output routed away.
+    if [[ ! "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        id=""
+    fi
+    printf '%s' "$id"
+}
+
+INDEX_ID="$(find_artifact_id "$INDEX_HASH" "index")"
+CHILD_ID="$(find_artifact_id "$CHILD_HASH" "child manifest")"
+CONFIG_ID="$(find_artifact_id "$CONFIG_HASH" "config blob")"
+[ -n "$INDEX_ID" ] || { fail "resolve index artifact row" "no artifacts row for checksum_sha256='${INDEX_HASH}'"; summary; }
+[ -n "$CHILD_ID" ] || { fail "resolve child artifact row" "no artifacts row for checksum_sha256='${CHILD_HASH}'"; summary; }
+[ -n "$CONFIG_ID" ] || { fail "resolve config artifact row (background blob warming, #51)" "no artifacts row for checksum_sha256='${CONFIG_HASH}'"; summary; }
+pass "index artifact id=${INDEX_ID}, child artifact id=${CHILD_ID}, config artifact id=${CONFIG_ID}"
+
+LAYER_IDS=()
+for h in "${LAYER_HASHES[@]}"; do
+    lid="$(find_artifact_id "$h" "layer blob")"
+    [ -n "$lid" ] || { fail "resolve layer artifact row (background blob warming, #51)" "no artifacts row for checksum_sha256='${h}'"; summary; }
+    LAYER_IDS+=("$lid")
+done
+pass "all ${#LAYER_IDS[@]} layer artifact rows resolved"
+
+# ---------------------------------------------------------------------
+# Step 6: content_references edges — the pull-through edge-write half of the
+# composition this scenario exercises (targets specific digests, never a
+# count — #51 background warming means unrelated rows can appear).
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 6: content_references edges"
+
+assert_edge() {
+    local source_id="$1" target_hash="$2" kind="$3" label="$4" row
+    bounded_poll "content_references ${label}" 30 \
+        "[ \"\$(psql_one \"SELECT count(*) FROM content_references WHERE repository_id = '${REPO_ID}' AND source_artifact_id = '${source_id}' AND target_content_hash = '${target_hash}' AND kind = '${kind}';\")\" = '1' ]" \
+        2 || true
+    row="$(psql_one "SELECT count(*) FROM content_references WHERE repository_id = '${REPO_ID}' AND source_artifact_id = '${source_id}' AND target_content_hash = '${target_hash}' AND kind = '${kind}';")"
+    if [ "$row" = "1" ]; then
+        pass "content_references: ${label} (kind=${kind}) edge present"
+    else
+        fail "content_references ${label} (kind=${kind}) edge" "count=${row:-0}"
+    fi
+}
+
+assert_edge "$INDEX_ID" "$CHILD_HASH" "oci_index_member" "index -> child"
+assert_edge "$CHILD_ID" "$CONFIG_HASH" "oci_config" "child -> config blob"
+for i in "${!LAYER_HASHES[@]}"; do
+    assert_edge "$CHILD_ID" "${LAYER_HASHES[$i]}" "oci_layer" "child -> layer[$i] blob"
+done
+
+# ---------------------------------------------------------------------
+# Step 7: sanity — index (NOT a descendant) got the full window; every
+# constituent (a referenced-tree descendant) got the #46 Item 2 zero window
+# — the same mechanism that makes Item 3's hold observable without waiting
+# out a full-length window.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 7: quarantine_window_start — index full window, constituents zero window"
+
+index_full_window="$(psql_one "SELECT (quarantine_window_start = created_at) FROM artifacts WHERE id = '${INDEX_ID}';")"
+if [ "$index_full_window" = "t" ]; then
+    pass "index: quarantine_window_start == created_at (full window — not a content_references target)"
+else
+    fail "index quarantine_window_start == created_at" "got '${index_full_window}' (expected t)"
+fi
+
+# Duration is the literal `quarantineDuration: 120s` in
+# oci-provenance-proxy-e2e-required.yaml — hardcoded here rather than
+# resolved from `policy_projections` (mirrors proxy-multiarch-zero-window.sh,
+# which hardcodes its own policy's 24h for the identical reason: the
+# `scope` column is jsonb keyed by repository NAME, not a `repository_id`
+# foreign key, so a dynamic lookup would need the same scope-resolution
+# logic the application layer already owns — out of scope for a scenario
+# script to reimplement).
+QUARANTINE_DURATION_SQL="interval '120 seconds'"
+assert_zero_window() {
+    local id="$1" label="$2" got
+    got="$(psql_one "SELECT (quarantine_window_start = created_at - ${QUARANTINE_DURATION_SQL}) FROM artifacts WHERE id = '${id}';")"
+    if [ "$got" = "t" ]; then
+        pass "${label}: quarantine_window_start == created_at - duration (zero window — referenced-tree-descendant carve-out fired)"
+    else
+        fail "${label} quarantine_window_start == created_at - duration" "got '${got}' (expected t)"
+    fi
+}
+assert_zero_window "$CHILD_ID" "child manifest"
+assert_zero_window "$CONFIG_ID" "config blob"
+for i in "${!LAYER_IDS[@]}"; do
+    assert_zero_window "${LAYER_IDS[$i]}" "layer[$i] blob"
+done
+
+# ---------------------------------------------------------------------
+# Step 8: await ProvenanceVerified on the SIGNED SUBJECT (the index) — the
+# real-verifier clearance the whole chain hangs off.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 8: await ProvenanceVerified on the signed index"
+if bounded_poll \
+        "ProvenanceVerified for index sha256:${INDEX_HASH}" \
+        "$WINDOW_WAIT_SECS" \
+        "[ -n \"\$(psql_one \"SELECT 1 FROM events WHERE stream_id = 'artifact-${INDEX_ID}' AND event_type = 'ProvenanceVerified' LIMIT 1;\")\" ]" \
+        5; then
+    pass "ProvenanceVerified emitted for the signed index subject"
+else
+    fail "ProvenanceVerified for the signed index" \
+         "no ProvenanceVerified event for checksum ${INDEX_HASH} within ${WINDOW_WAIT_SECS}s (signature not linked — referrers mode? public key mismatch?)"
+fi
+
+# ---------------------------------------------------------------------
+# Step 9 — two-phase contract, split per backlog 093.
+#
+# `--all` forces every platform child of the index through pull-through.
+# This scenario ingests exactly one platform subtree before the sign, so
+# the verify-time cascade clears only that subtree; every OTHER platform
+# child is a LATE JOINER — it arrives after the subject was already
+# verified, and self-clears at its own quarantine commit against the
+# signed index's bytes (child manifests directly; their config/layer
+# blobs via the root behind their cascade-cleared parent).
+#
+# 9a is the ingest vehicle: an AUTHENTICATED `--all` warm pass. Write
+# authorization gives the hold-read exemption, so this pull can read
+# every held constituent as it lands and drives the full foreign-platform
+# tree through cold pull-through in one client-side pass.
+#
+# 9b proves the actual acceptance criterion: an ANONYMOUS `--all` pull
+# succeeds end-to-end once every constituent has cleared and released.
+# The anonymous poll cannot be the thing that DRIVES those cold pulls:
+# skopeo aborts the whole copy at the FIRST held (503) artifact, so an
+# anonymous-only poll advances the ingest frontier by ~one artifact per
+# retry — a serial crawl that is unbounded against any fixed budget, not
+# a slow-but-finite wait. 9a removes that dependency; 9b then only waits
+# on clearance + the release sweep tick.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 9a: authenticated warm pass (late-joiner ingest vehicle)"
+rm -f "$WARM_ARCHIVE"
+if bounded_poll \
+        "signed image pullable (authenticated warm pass)" \
+        120 \
+        "skopeo copy --all --insecure-policy --src-tls-verify=false --src-creds '${PUSH_USER}:${PUSH_SECRET}' 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${WARM_ARCHIVE}'" \
+        5; then
+    pass "authenticated --all warm pass ingested every foreign platform (hold-read exemption honored; each late joiner self-cleared at its own quarantine commit)"
+else
+    fail "authenticated warm pass ingests every foreign platform" \
+         "the signed index never became fully (--all) authenticated-pullable within 120s (hold-read exemption not honored, or a foreign platform failed to ingest/self-clear)"
+fi
+rm -f "$WARM_ARCHIVE"
+
+log ""
+log "--- Step 9b: await release + anonymous FULL-index pull (release acceptance after warm pass)"
+rm -f "$PULLED_ARCHIVE"
+if bounded_poll \
+        "signed image pullable (anonymous)" \
+        "$ANON_PULL_WAIT_SECS" \
+        "skopeo copy --all --insecure-policy --src-tls-verify=false 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${PULLED_ARCHIVE}'" \
+        5; then
+    pass "release acceptance after warm pass: the signed+cleared multi-arch index pulled anonymously in full (Cleared + timer gate satisfied for every platform, late joiners included)"
+else
+    fail "release acceptance after warm pass: signed index pulls anonymously with --all" \
+         "the signed index never became fully (--all) anonymously pullable within ${ANON_PULL_WAIT_SECS}s (window, cascade, LATE-JOINER clearance, or release-sweep gate not satisfied)"
+fi
+
+# ---------------------------------------------------------------------
+# Step 10 [Acceptance (b), THE regression pin]: no constituent — child
+# manifest, config blob, any layer blob — EVER emitted ProvenanceRejected.
+# By this point the full lifecycle (sign -> verify -> cascade -> release ->
+# pull) has completed or timed out, so if the pre-Item-3 defect were present
+# the terminal Rejected{Unsigned} decision would already have landed (it
+# fired within moments of ingest, well before this poll).
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 10: THE #115 Item 3 regression pin — no constituent ever rejected"
+
+# Queried by artifact id (stream_id = 'artifact-<id>'), not checksum —
+# checksum alone is not repository-scoped, and an unrelated fixture
+# elsewhere could in principle share a content-addressed digest.
+assert_never_rejected() {
+    local id="$1" label="$2" row
+    row="$(psql_one "SELECT 1 FROM events WHERE stream_id = 'artifact-${id}' AND event_type = 'ProvenanceRejected' LIMIT 1;")"
+    if [ -z "$row" ]; then
+        pass "${label}: no ProvenanceRejected ever emitted (#115 Item 3 hold-not-reject held)"
+    else
+        fail "${label}: no ProvenanceRejected ever emitted" \
+             "found a ProvenanceRejected event for artifact ${id} — the referenced-tree-descendant hold (#115 Item 3) did not fire; this constituent terminally rejected instead of holding for cascade clearance"
+    fi
+}
+assert_never_rejected "$INDEX_ID" "index (control — the signed subject itself must not reject)"
+assert_never_rejected "$CHILD_ID" "child manifest"
+assert_never_rejected "$CONFIG_ID" "config blob"
+for i in "${!LAYER_IDS[@]}"; do
+    assert_never_rejected "${LAYER_IDS[$i]}" "layer[$i] blob"
+done
+
+summary

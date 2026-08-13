@@ -298,16 +298,43 @@ impl RepositoryUpstreamMappingChanged {
 // Task kind allowlist
 // ---------------------------------------------------------------------------
 
-/// The v1 task-kind literals — mirrors the SQL CHECK constraint on
-/// `jobs.kind` (migration 009; all kinds defined in place there per
+/// The admin-task-invoke allowlist — the kinds an operator (or an
+/// operator-driven CronJob) may enqueue via the generic admin
+/// task-invoke path (`TaskUseCase::enqueue` → `enqueue_task`).
+///
+/// **Consumers:** `TaskUseCase::enqueue` gates the incoming `kind` string
+/// against this set before any I/O; `TaskInvoked::validate` and
+/// `TaskFailed::validate` reject any `kind` not in this set (the emitter
+/// inventory backing that choice: `TaskInvoked` is emitted only from the
+/// admin-invoke path, so it can only ever carry a kind already drawn from
+/// this list; `TaskFailed` has no production emitter today — the worker
+/// dispatcher records terminal failures via `JobsRepository::mark_failed`
+/// only, a DB-column update with no corresponding event-store append — so
+/// validating it against this same narrower set is a no-widening choice,
+/// not an observed constraint; see [`EVENT_TASK_KINDS`] for the superset
+/// this repo's SQL CHECK actually accepts).
+///
+/// This is **not** every `jobs.kind` the SQL CHECK constraint (migration
+/// 009; all kinds defined in place there per
 /// `feedback_pre_release_migrations`. The prior 012/014/015/016
 /// forward-ALTER chain was collapsed back into 009 once it stopped
 /// earning its keep — DB-wipe-per-alpha makes the in-place edit free
-/// and a single defining migration is easier to read than a chain).
-/// `TaskInvoked::validate` and `TaskFailed::validate` reject any kind not
-/// in this set.
-pub const VALID_TASK_KINDS: &[&str] = &[
-    "scan",
+/// and a single defining migration is easier to read than a chain)
+/// accepts — see [`EVENT_TASK_KINDS`] for that full mirror.
+pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
+    // NOTE — `"scan"` is deliberately ABSENT, exactly like
+    // `verify-event-chain`: it is a valid `jobs.kind` (it stays in the
+    // migration's CHECK list) but not an admin-invokable one. A scan row
+    // is only well-formed when it carries the four scan-typed columns
+    // (`artifact_id`, `repository_id`, `content_hash`, `format`), which
+    // ONLY `JobsRepository::enqueue_scan` writes. The generic admin
+    // enqueue path (`TaskUseCase::enqueue` → `enqueue_task`) writes none
+    // of them, so a bare `"scan"` invoke could only ever produce a row
+    // the claim's `decide_kind_fields` must reject — the row should
+    // never exist rather than be terminally resolved after the fact.
+    // Operator-driven rescans go through
+    // `POST /api/v1/artifacts/:id/rescan` (`ManualRescanUseCase`), which
+    // uses `enqueue_scan`.
     "cron-rescan-tick",
     "advisory-watch-tick",
     "retention-evaluate",
@@ -487,6 +514,53 @@ pub const VALID_TASK_KINDS: &[&str] = &[
     "policy-reevaluation",
 ];
 
+/// The full `jobs.kind` vocabulary — an exact mirror of migration 009's
+/// `kind IN (…)` SQL CHECK list, in the same order.
+///
+/// **Single consumer:** the DB-free lock-step structural guard
+/// (`crates/hort-adapters-postgres/tests/task_kind_check_lockstep_guard.rs`)
+/// that token-scans migration 009's `kind IN (…)` list and asserts it
+/// equals this constant exactly. Nothing else reads this constant —
+/// `TaskInvoked::validate` / `TaskFailed::validate` deliberately stay on
+/// the narrower [`ADMIN_INVOKABLE_TASK_KINDS`] (see that constant's doc
+/// for why: no current emitter of either event carries a kind outside the
+/// admin-invoke set, so validating against the wider SQL-CHECK set would
+/// be validation widening with no producing emitter).
+///
+/// This set is exactly [`ADMIN_INVOKABLE_TASK_KINDS`] plus the two
+/// DB-CHECK-only kinds that are valid `jobs.kind` values but never
+/// admin-invokable:
+/// - `"scan"` — only `JobsRepository::enqueue_scan` writes this kind,
+///   supplying the scan-typed columns the admin generic-enqueue path
+///   never does.
+/// - `"verify-event-chain"` — a liveness breadcrumb written directly by
+///   the `hort-server verify-event-chain` CLI subcommand, not by a
+///   worker-dispatched `TaskHandler`.
+pub const EVENT_TASK_KINDS: &[&str] = &[
+    "scan",
+    "cron-rescan-tick",
+    "advisory-watch-tick",
+    "retention-evaluate",
+    "retention-purge",
+    "eventstore-archive",
+    "staging-sweep",
+    "noop",
+    "service-account-rotation",
+    "eventstore-checkpoint",
+    "replay-seen-prune",
+    "quarantine-release-sweep",
+    "seed-import",
+    "prefetch-tick",
+    "prefetch",
+    "prefetch-dependencies",
+    "prefetch-row-retention-sweep",
+    "wheel-metadata-backfill",
+    "provenance-verify",
+    "scanner-registry-prune",
+    "verify-event-chain",
+    "policy-reevaluation",
+];
+
 // ---------------------------------------------------------------------------
 // Destructive task-kind tier (ADR 0028)
 // ---------------------------------------------------------------------------
@@ -537,7 +611,7 @@ pub const DESTRUCTIVE_TASK_CLAIM: &str = "task:destructive";
 /// `AdminTaskInvoke`-only gate, zero behaviour change).
 ///
 /// Pure, zero-I/O, total: an unknown / empty `kind` is **not**
-/// destructive (it is rejected upstream by the `VALID_TASK_KINDS`
+/// destructive (it is rejected upstream by the `ADMIN_INVOKABLE_TASK_KINDS`
 /// allowlist; the classifier must never over-claim authority for an
 /// input it does not recognise — fail-safe-by-construction).
 #[must_use]
@@ -581,7 +655,7 @@ pub fn task_kind_is_destructive(kind: &str) -> bool {
 pub struct TaskInvoked {
     /// `jobs.id` of the newly-inserted row.
     pub task_job_id: Uuid,
-    /// One of a v1 kind literal (see `VALID_TASK_KINDS`).
+    /// One of a v1 kind literal (see `ADMIN_INVOKABLE_TASK_KINDS`).
     pub kind: String,
     /// Lowercase-hex BLAKE3-256 hash of `serde_json::to_vec(&params)`.
     /// 64 hex chars (32 bytes).
@@ -613,10 +687,10 @@ impl TaskInvoked {
     /// - `kind` must be one of a v1 literal.
     /// - `params_digest` must be a 64-character lowercase hex string.
     pub fn validate(&self) -> DomainResult<()> {
-        if !VALID_TASK_KINDS.contains(&self.kind.as_str()) {
+        if !ADMIN_INVOKABLE_TASK_KINDS.contains(&self.kind.as_str()) {
             return Err(DomainError::Validation(format!(
                 "TaskInvoked: unknown task kind {:?}; expected one of {:?}",
-                self.kind, VALID_TASK_KINDS
+                self.kind, ADMIN_INVOKABLE_TASK_KINDS
             )));
         }
         validate_params_digest(&self.params_digest)
@@ -659,7 +733,7 @@ impl TaskInvoked {
 pub struct TaskFailed {
     /// `jobs.id` of the failed row.
     pub task_job_id: Uuid,
-    /// One of a v1 kind literal (see `VALID_TASK_KINDS`).
+    /// One of a v1 kind literal (see `ADMIN_INVOKABLE_TASK_KINDS`).
     pub kind: String,
     /// Human-readable failure description. ≤ 4,096 bytes.
     pub reason: String,
@@ -677,10 +751,10 @@ impl TaskFailed {
     /// - `reason` must be ≤ 4,096 bytes.
     /// - `final_attempt` is a boolean — no range validation required.
     pub fn validate(&self) -> DomainResult<()> {
-        if !VALID_TASK_KINDS.contains(&self.kind.as_str()) {
+        if !ADMIN_INVOKABLE_TASK_KINDS.contains(&self.kind.as_str()) {
             return Err(DomainError::Validation(format!(
                 "TaskFailed: unknown task kind {:?}; expected one of {:?}",
-                self.kind, VALID_TASK_KINDS
+                self.kind, ADMIN_INVOKABLE_TASK_KINDS
             )));
         }
         const MAX_REASON_BYTES: usize = 4096;
@@ -1095,7 +1169,7 @@ mod tests {
 
     #[test]
     fn task_invoked_validate_ok_each_valid_kind() {
-        for kind in VALID_TASK_KINDS {
+        for kind in ADMIN_INVOKABLE_TASK_KINDS {
             let e = TaskInvoked {
                 task_job_id: id(),
                 kind: kind.to_string(),
@@ -1241,7 +1315,7 @@ mod tests {
 
     #[test]
     fn task_failed_validate_ok_each_valid_kind() {
-        for kind in VALID_TASK_KINDS {
+        for kind in ADMIN_INVOKABLE_TASK_KINDS {
             let e = TaskFailed {
                 task_job_id: id(),
                 kind: kind.to_string(),
@@ -1374,7 +1448,7 @@ mod tests {
     // -- quarantine-release-sweep kind registration --------------------------
 
     /// The periodic release-sweep handler kind must be
-    /// registered in [`VALID_TASK_KINDS`] so the kind literal:
+    /// registered in [`ADMIN_INVOKABLE_TASK_KINDS`] so the kind literal:
     /// 1. validates on `TaskInvoked` / `TaskFailed` events,
     /// 2. is accepted by the `jobs.kind` CHECK constraint (defined in
     ///    migration 009 — all kinds live in place there per
@@ -1390,8 +1464,8 @@ mod tests {
     #[test]
     fn valid_task_kinds_contains_quarantine_release_sweep() {
         assert!(
-            VALID_TASK_KINDS.contains(&"quarantine-release-sweep"),
-            "`quarantine-release-sweep` MUST be in VALID_TASK_KINDS so the \
+            ADMIN_INVOKABLE_TASK_KINDS.contains(&"quarantine-release-sweep"),
+            "`quarantine-release-sweep` MUST be in ADMIN_INVOKABLE_TASK_KINDS so the \
              handler dispatches and the CHECK constraint (migration 009) lines up; if this fails \
              the keyspace registry and the SQL CHECK have drifted apart"
         );
@@ -1413,7 +1487,7 @@ mod tests {
     }
 
     /// The prefetch scheduled-tick handler kind must be
-    /// registered in [`VALID_TASK_KINDS`] so the kind literal:
+    /// registered in [`ADMIN_INVOKABLE_TASK_KINDS`] so the kind literal:
     /// 1. validates on `TaskInvoked` / `TaskFailed` events,
     /// 2. is accepted by the `jobs.kind` CHECK constraint (migration 009 —
     ///    in place per `feedback_pre_release_migrations`),
@@ -1422,8 +1496,8 @@ mod tests {
     #[test]
     fn valid_task_kinds_contains_prefetch_tick() {
         assert!(
-            VALID_TASK_KINDS.contains(&"prefetch-tick"),
-            "`prefetch-tick` MUST be in VALID_TASK_KINDS so the \
+            ADMIN_INVOKABLE_TASK_KINDS.contains(&"prefetch-tick"),
+            "`prefetch-tick` MUST be in ADMIN_INVOKABLE_TASK_KINDS so the \
              handler dispatches and the migration-009 CHECK constraint lines up; if this \
              fails the keyspace registry and the SQL CHECK have drifted apart"
         );
@@ -1444,12 +1518,12 @@ mod tests {
     }
 
     /// The three prefetch-cascade kinds MUST be registered
-    /// in [`VALID_TASK_KINDS`] so:
+    /// in [`ADMIN_INVOKABLE_TASK_KINDS`] so:
     /// 1. `TaskInvoked` / `TaskFailed` validate on these kinds (events fire
     ///    through the `TaskDispatcher` for terminal failures + audit),
     /// 2. the `jobs.kind` SQL CHECK accepts them (migration 009 — added in
     ///    lock-step with this allowlist per `feedback_pre_release_migrations`
-    ///    and the CLAUDE.md "VALID_TASK_KINDS + CHECK lock-step" mandate),
+    ///    and the CLAUDE.md "ADMIN_INVOKABLE_TASK_KINDS + CHECK lock-step" mandate),
     /// 3. they enqueue through `enqueue_task` (DB-backed walk over every
     ///    kind in `task_use_case_enqueue_real_db.rs`).
     #[test]
@@ -1460,8 +1534,8 @@ mod tests {
             "prefetch-row-retention-sweep",
         ] {
             assert!(
-                VALID_TASK_KINDS.contains(&kind),
-                "`{kind}` MUST be in VALID_TASK_KINDS so the \
+                ADMIN_INVOKABLE_TASK_KINDS.contains(&kind),
+                "`{kind}` MUST be in ADMIN_INVOKABLE_TASK_KINDS so the \
                  cascade handler dispatches and the migration-009 CHECK constraint \
                  lines up; if this fails the keyspace registry and the SQL CHECK \
                  have drifted apart"
@@ -1496,7 +1570,7 @@ mod tests {
     }
 
     /// The wheel-metadata-backfill task kind MUST be in
-    /// [`VALID_TASK_KINDS`] so the kind literal:
+    /// [`ADMIN_INVOKABLE_TASK_KINDS`] so the kind literal:
     /// 1. validates on `TaskInvoked` / `TaskFailed` events,
     /// 2. is accepted by the `jobs.kind` CHECK constraint (migration 009
     ///    — added in lock-step with this allowlist per
@@ -1507,8 +1581,8 @@ mod tests {
     #[test]
     fn valid_task_kinds_contains_wheel_metadata_backfill() {
         assert!(
-            VALID_TASK_KINDS.contains(&"wheel-metadata-backfill"),
-            "`wheel-metadata-backfill` MUST be in VALID_TASK_KINDS so \
+            ADMIN_INVOKABLE_TASK_KINDS.contains(&"wheel-metadata-backfill"),
+            "`wheel-metadata-backfill` MUST be in ADMIN_INVOKABLE_TASK_KINDS so \
              the handler dispatches and the migration-009 CHECK constraint lines up; if \
              this fails the keyspace registry and the SQL CHECK have drifted apart"
         );
@@ -1551,7 +1625,7 @@ mod tests {
     fn destructive_task_kinds_are_a_subset_of_valid_task_kinds() {
         for k in DESTRUCTIVE_TASK_KINDS {
             assert!(
-                VALID_TASK_KINDS.contains(k),
+                ADMIN_INVOKABLE_TASK_KINDS.contains(k),
                 "destructive kind {k:?} must also be a valid kind"
             );
         }
@@ -1559,9 +1633,9 @@ mod tests {
 
     #[test]
     fn task_kind_is_destructive_classifies_every_valid_kind() {
-        // Exhaustive over VALID_TASK_KINDS: each known kind is destructive
+        // Exhaustive over ADMIN_INVOKABLE_TASK_KINDS: each known kind is destructive
         // iff it is one of the audited three. No other kind reclassifies.
-        for kind in VALID_TASK_KINDS {
+        for kind in ADMIN_INVOKABLE_TASK_KINDS {
             let expected = matches!(
                 *kind,
                 "retention-purge" | "eventstore-archive" | "retention-evaluate"

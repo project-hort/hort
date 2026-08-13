@@ -1156,8 +1156,9 @@ mod tests {
 
     fn cli_session_rig() -> (Arc<CliSessionTokenSigner>, Arc<MockEphemeralStore>) {
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-        let sk = SigningKey::generate(&mut OsRng);
+        use rand::rand_core::UnwrapErr;
+        use rand::rngs::SysRng;
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let key = Arc::new(OciTokenSigningKey::new(sk, None));
         let signer = Arc::new(CliSessionTokenSigner::new(
             key,

@@ -212,7 +212,7 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                               AND target_content_hash = $2
                             ORDER BY recorded_at ASC, source_artifact_id ASC"#
                     );
-                    sqlx::query_as(&sql)
+                    sqlx::query_as(sqlx::AssertSqlSafe(sql))
                         .bind(repo)
                         .bind(&target_hex)
                         .fetch_all(&self.pool)
@@ -227,7 +227,7 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                               AND kind = $3
                             ORDER BY recorded_at ASC, source_artifact_id ASC"#
                     );
-                    sqlx::query_as(&sql)
+                    sqlx::query_as(sqlx::AssertSqlSafe(sql))
                         .bind(repo)
                         .bind(&target_hex)
                         .bind(kind)
@@ -293,7 +293,7 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                       AND source_artifact_id = $2
                       AND kind = $3"#
             );
-            let row: Option<ContentReferenceRow> = sqlx::query_as(&sql)
+            let row: Option<ContentReferenceRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(repo)
                 .bind(source)
                 .bind(&kind)
@@ -346,7 +346,7 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                       AND source_artifact_id = ANY($2)
                       AND kind = $3"#
             );
-            let rows: Vec<ContentReferenceRow> = sqlx::query_as(&sql)
+            let rows: Vec<ContentReferenceRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(repo)
                 .bind(&sources_owned)
                 .bind(&kind)

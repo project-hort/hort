@@ -20,8 +20,9 @@ hort-config     = { path = "../hort-config" }
 # advisory-osv pattern (`UpstreamErrorKind::CaUnknown`).
 hort-app        = { path = "../hort-app" }
 
-# HTTP client with rustls-tls-native-roots; explicit dep so the
-# `Client::builder` TLS discipline (ADR 0010) applies here.
+# HTTP client with rustls (platform-verifier-backed TLS, workspace 0.13
+# feature set); explicit dep so the `Client::builder` TLS discipline
+# (ADR 0010) applies here.
 reqwest    = { workspace = true }
 url        = { workspace = true }
 chrono     = { workspace = true }
@@ -64,4 +65,4 @@ hex = { workspace = true }
 # Same fixture pattern as upstream-http / advisory-osv: generate a
 # self-signed root in-process for the extra-CA regression test, no
 # committed PEM fixtures.
-rcgen = "0.13"
+rcgen = "0.14"

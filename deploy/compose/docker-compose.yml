@@ -8,7 +8,10 @@
 # This compose stack is for local development and the E2E smoke harness ONLY.
 # It ships intentionally-weak defaults that MUST NOT be used in production:
 #   - default DB / Keycloak-admin passwords (overridable — see below),
-#   - anonymous /metrics on 0.0.0.0 (HORT_METRICS_REQUIRE_AUTH=false),
+#   - /metrics bound to 0.0.0.0 so the host port-mapping can reach it (still
+#     requires a bearer carrying `read_metrics` — #113 item 3 removed the
+#     anonymous-scrape opt-out entirely, so this is reachability-only, not
+#     an auth downgrade),
 #   - plaintext HTTP, no TLS, ephemeral data.
 # Credentials are overridable via the environment (e.g. a gitignored
 # `.env.local`, see `.env.local.example`): `${POSTGRES_PASSWORD:-registry}` /
@@ -21,7 +24,7 @@ name: hort
 
 services:
   postgres:
-    image: postgres:15
+    image: postgres:17
     # Resource cap (B7/INFRA-6): bound postgres memory so the dev/CI host is
     # protected. Smoke data is tens-of-MB; 512m is comfortable.
     mem_limit: 512m
@@ -176,6 +179,14 @@ services:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+    # Named so a pre-built image (docker load) can satisfy this service without
+    # a rebuild — a `build:` block with no `image:` has no stable local tag to
+    # check for, so `up` (even without `--build`) always builds. Shared with
+    # hort-server and hort-sweep-ticker below: all three build the identical
+    # image from this same Dockerfile/context, so one tag covers all three.
+    # Default reproduces today's behaviour (an implicit compose-generated tag);
+    # override only alongside a matching pre-loaded image.
+    image: ${HORT_SERVER_IMAGE:-hort-server:dev}
     container_name: hort-migrate
     mem_limit: 512m
     cpus: "1.0"
@@ -223,6 +234,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+    # Same image as hort-server-migrate (see that service's comment) — built
+    # from the identical Dockerfile/context, so it shares the one tag.
+    image: ${HORT_SERVER_IMAGE:-hort-server:dev}
     depends_on:
       postgres:
         condition: service_healthy
@@ -238,9 +252,10 @@ services:
       HORT_STORAGE_FILESYSTEM_PATH: "/var/lib/hort-server/cas"
       HORT_API_BIND: "0.0.0.0:8080"
       HORT_METRICS_BIND: "0.0.0.0:9090"
-      # DANGER (dev/CI only): the next two flags expose /metrics on 0.0.0.0
-      # WITHOUT auth (repo names, error rates, traffic shape). Production MUST
-      # leave both UNSET (secure defaults: bind off / require auth).
+      # DANGER (dev/CI only): the next flag exposes the /metrics LISTENER on
+      # 0.0.0.0 (reachability, not authz — `/metrics` still unconditionally
+      # requires a bearer carrying `read_metrics`, #113 item 3). Production
+      # MUST leave it UNSET (secure default: bind off).
       # Explicit opt-in to bind /metrics on 0.0.0.0; hort-server
       # refuses the unspecified-address bind without this flag. The
       # compose network namespace requires 0.0.0.0 so the host
@@ -250,14 +265,14 @@ services:
       # and bind metrics on a dedicated internal interface or expose
       # the listener only on the proxy network.
       HORT_METRICS_PUBLIC_BIND: "true"
-      # Keep /metrics scrape anonymous in this example/dev compose so
-      # the e2e harness's readiness probe (`curl -sf $METRICS_URL`
-      # before any token is fetched) and any local Prometheus instance
-      # can scrape without bearer config. The startup WARN documents
-      # the deliberate downgrade. Production MUST leave this UNSET
-      # (defaults to true) and configure the scraper with a
-      # Keycloak-issued bearer.
-      HORT_METRICS_REQUIRE_AUTH: "false"
+      # `/metrics` has no anonymous-scrape opt-out — the e2e harness's
+      # metrics-content assertions (`assert_metric_ingest` in
+      # scripts/native-tests/lib/common.sh) probe it without a bearer and
+      # gracefully SKIP (not fail) when that returns non-2xx; readiness
+      # itself polls `/healthz` on the main listener instead (anonymous by
+      # design), not `/metrics`. A local Prometheus instance or a scenario
+      # that wants real scrape content needs a `read_metrics`-granted
+      # bearer — see docs/metrics-catalog.md (ADR 0017).
       METRICS_INCLUDE_REPOSITORY_LABEL: "true"
       HORT_LOG_FORMAT: "json"
       # E2E runs without a TLS-terminating proxy; clients hit hort-server
@@ -323,6 +338,13 @@ services:
     # Image is built locally from docker/Dockerfile.worker
     # (multi-stage Rust build + pinned trivy / osv-scanner binaries).
     # CI may override `image:` with a registry-published tag.
+    #
+    # Scan concurrency is 1 per replica BY DESIGN (composition.rs pins
+    # ScanTaskHandler to max_concurrency = 1 — Trivy is CPU/IO-heavy, so
+    # intra-process parallelism is deliberately not the axis); parallelism
+    # comes from running more replicas. The E2E runner scales this service
+    # (`--scale hort-worker=N`) so serial trivy runtime stays off the
+    # release critical path.
     profiles:
       - worker
     # Resource caps + least-capability hardening (B7/INFRA-6/11). The
@@ -337,8 +359,10 @@ services:
     build:
       context: ../..
       dockerfile: docker/Dockerfile.worker
-    image: hort-worker:dev
-    container_name: hort-worker
+    # Env-overridable so a pre-built image (docker load) can satisfy this
+    # service without a rebuild — mirrors HORT_SERVER_IMAGE above. Default
+    # reproduces today's hardcoded tag.
+    image: ${HORT_WORKER_IMAGE:-hort-worker:dev}
     depends_on:
       postgres:
         condition: service_healthy
@@ -413,20 +437,27 @@ services:
     # CronJob (native deploys: the `hort_timers` systemd timer). Production
     # schedules `hort-server enqueue-quarantine-release-sweep` every 5 minutes
     # (values.yaml `schedule: "*/5 * * * *"`); compose has no cron, so this
-    # sidecar loops the same DB-only enqueue subcommand every 15 seconds —
-    # tight enough that the E2E policies' short quarantine windows (30s)
-    # release/expire within a smoke run. The enqueued row drives BOTH
-    # release-gate decisions: releasing a window-elapsed Cleared artifact AND
-    # the terminal ProvenanceRejected{Unsigned} at expiry (release_expired
-    # enqueues the final window_open=false provenance-verify itself — no
-    # separate expiry tick exists in production either). Lives under the
-    # `worker` profile: only the worker consumes the enqueued rows, so ticking
-    # a workerless stack would just pile up pending jobs.
+    # sidecar loops the same DB-only enqueue subcommand every SWEEP_TICK_SECS
+    # (default 15s — the stack's long-standing cadence). SWEEP_TICK_SECS is a dev/CI cadence knob only —
+    # production deployments schedule their own ticker via the CronJob/timer
+    # above, never this variable. Tight enough that the E2E policies' short
+    # quarantine windows (seconds-to-minutes) release/expire within a smoke run, with
+    # release latency after eligibility bounded by ~SWEEP_TICK_SECS plus
+    # processing. The enqueued row drives BOTH release-gate decisions:
+    # releasing a window-elapsed Cleared artifact AND the terminal
+    # ProvenanceRejected{Unsigned} at expiry (release_expired enqueues the
+    # final window_open=false provenance-verify itself — no separate expiry
+    # tick exists in production either). Lives under the `worker` profile:
+    # only the worker consumes the enqueued rows, so ticking a workerless
+    # stack would just pile up pending jobs.
     profiles:
       - worker
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+    # Same image as hort-server-migrate (see that service's comment) — built
+    # from the identical Dockerfile/context, so it shares the one tag.
+    image: ${HORT_SERVER_IMAGE:-hort-server:dev}
     container_name: hort-sweep-ticker
     mem_limit: 256m
     cpus: "0.5"
@@ -447,7 +478,7 @@ services:
         while true; do
           /usr/local/bin/hort-server enqueue-quarantine-release-sweep \
             || echo "[sweep-ticker] enqueue failed; retrying next tick" >&2
-          sleep 15
+          sleep "${SWEEP_TICK_SECS:-15}"
         done
     environment:
       DATABASE_URL: "postgres://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/artifact_registry"

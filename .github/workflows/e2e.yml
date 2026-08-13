@@ -22,24 +22,157 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  run-e2e:
-    name: native-tests E2E (compose)
+  # Both lanes built the same three images from source, in parallel, so the
+  # cost was paid twice per run. This job builds them ONCE — buildx +
+  # actions/cache-backed GHA cache — and hands the results to both lanes as a
+  # single artifact (docker save/load): no registry credentials needed, unlike
+  # a ghcr push. Tags match exactly what deploy/compose/docker-compose.yml and
+  # scripts/native-tests/run.sh already default to, so neither lane needs to
+  # override HORT_SERVER_IMAGE/HORT_WORKER_IMAGE/HORT_TEST_CLIENT_IMAGE — the
+  # loaded tags are simply already the ones `up`/`docker run` look for.
+  build-images:
+    name: Build E2E images once
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Build hort-server image (deploy/compose/Dockerfile)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: deploy/compose/Dockerfile
+          tags: hort-server:dev
+          outputs: type=docker,dest=/tmp/e2e-images/hort-server.tar
+          cache-from: type=gha,scope=e2e-hort-server
+          cache-to: type=gha,scope=e2e-hort-server,mode=max
+
+      - name: Build hort-worker image (docker/Dockerfile.worker)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: docker/Dockerfile.worker
+          tags: hort-worker:dev
+          outputs: type=docker,dest=/tmp/e2e-images/hort-worker.tar
+          cache-from: type=gha,scope=e2e-hort-worker
+          cache-to: type=gha,scope=e2e-hort-worker,mode=max
+
+      - name: Build test-client image (scripts/native-tests/Dockerfile.client)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: scripts/native-tests/Dockerfile.client
+          tags: hort-test-client:dev
+          outputs: type=docker,dest=/tmp/e2e-images/hort-test-client.tar
+          cache-from: type=gha,scope=e2e-hort-test-client
+          cache-to: type=gha,scope=e2e-hort-test-client,mode=max
+
+      - name: Upload E2E images artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-images
+          path: /tmp/e2e-images/*.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # Two lanes, two jobs — not two steps in one job and not a matrix leg —
+  # so a failure names its posture directly in the checks list rather than
+  # requiring a log dive. Both run on the same triggers (the `on:` block
+  # above is workflow-scoped) and both are plain required jobs (no
+  # `continue-on-error`): this workflow's `workflow_call` caller waits on
+  # every job in the callee, so the release gate already covers both lanes
+  # with no change on the caller side. Each job cycles the compose stack
+  # exactly once, so the timeout is per-cycle and does not need doubling for
+  # running two lanes — that would only apply if a single job cycled both
+  # stacks sequentially.
+  #
+  # 40 minutes, not 20: a lane spends most of its wall-clock on two full Rust
+  # release builds (the client image builds hort-cli, `compose up --build`
+  # builds server + worker), which left a single lane at ~17.5 min and both
+  # lanes hitting the cap. Left unchanged here on purpose: the timeout only
+  # tightens once the shared-build cost is measured from a real run — a
+  # number this change cannot yet know, only claim.
+  run-e2e:
+    name: native-tests E2E (compose, base lane)
+    runs-on: ubuntu-latest
+    needs: build-images
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The runner already has docker + compose. Every client toolchain
       # (twine/build, cargo, npm, skopeo, psql, hort-cli) runs INSIDE the
-      # single test-client image the native-tests runner builds and spins up
-      # on the compose network — no host bootstrap needed.
+      # single test-client image — loaded below from build-images, not built
+      # in this job — spun up on the compose network. No host bootstrap needed.
       - name: Check docker
         run: |
           docker version
           docker compose version
 
-      # Builds the client image (incl. hort-cli), brings up deploy/compose,
-      # runs every available scenario in-network, tears down. Per-scenario
-      # PASS/FAIL/SKIP/QUARANTINED is in this step's log.
-      - name: Run native-tests E2E (compose)
+      - name: Download E2E images artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: e2e-images
+          path: /tmp/e2e-images
+
+      - name: Load E2E images
+        run: |
+          for f in /tmp/e2e-images/*.tar; do
+            echo "loading $f"
+            docker load -i "$f"
+          done
+
+      # Brings up deploy/compose against the images just loaded (the build
+      # opt-out below skips both the client-image build and `compose
+      # up --build`), runs every available scenario in-network, tears down.
+      # Per-scenario PASS/FAIL/SKIP/QUARANTINED is in this step's log, and the
+      # "images: ... prebuilt" lines prove no fallback rebuild happened.
+      # Legacy posture: metrics-content assertions are unarmed here (no
+      # native-token validator to consume a minted scraper bearer against) —
+      # the native-tokens lane below covers that surface.
+      - name: Run native-tests E2E (compose, base lane)
+        env:
+          HORT_E2E_SKIP_BUILD: "1"
         run: ./scripts/native-tests/run.sh --hort=compose
+
+  # Native-token posture: the shape registry.hort.rs actually runs in
+  # production — `/v2/auth` mints real capability JWTs, OCI clients run the
+  # full Distribution-Spec token dance, and metrics-content assertions arm
+  # (the runner admin-mints a `read_metrics` bearer once per run under this
+  # overlay). Marking this job required in branch protection is this
+  # workflow's design intent — it is gated on the human's overlay-lane
+  # acceptance run proving it green-capable before that branch-protection
+  # change lands, not on any uncertainty about the lane itself.
+  run-e2e-native-tokens:
+    name: native-tests E2E (compose, native-tokens lane)
+    runs-on: ubuntu-latest
+    needs: build-images
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check docker
+        run: |
+          docker version
+          docker compose version
+
+      - name: Download E2E images artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: e2e-images
+          path: /tmp/e2e-images
+
+      - name: Load E2E images
+        run: |
+          for f in /tmp/e2e-images/*.tar; do
+            echo "loading $f"
+            docker load -i "$f"
+          done
+
+      - name: Run native-tests E2E (compose, native-tokens lane)
+        env:
+          HORT_E2E_SKIP_BUILD: "1"
+        run: ./scripts/native-tests/run.sh --hort=compose --compose-overlay=native-tokens

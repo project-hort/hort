@@ -4,6 +4,17 @@
 #   ./run.sh [--hort=compose|external] [--group G]... [--scenario N]...
 #            [--compose-overlay O]... [--list] [--keep]
 # Env (external mode): HORT_URL, KEYCLOAK_URL[, METRICS_URL, HORT_DB_DSN].
+# Env (compose mode, worker-requiring scenarios only): HORT_E2E_WORKER_REPLICAS
+#   (default 4) — hort-worker replica count. Scan concurrency is 1 per replica
+#   by design; replicas are the scaling axis so serial trivy runtime stays off
+#   the release critical path.
+# Env (opt-out, default unset = build as today): HORT_E2E_SKIP_BUILD=1 skips
+#   building the test-client image and drops `--build` from `compose up`,
+#   for the case where HORT_SERVER_IMAGE / HORT_WORKER_IMAGE / the test-client
+#   tag were loaded beforehand (e.g. `docker load`). With the opt-out active,
+#   a required image that isn't already loaded is a hard failure naming that
+#   image — never a silent rebuild, which would restore the cost this exists
+#   to remove while looking like a cache hit.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -104,14 +115,90 @@ fi
 
 COMPOSE_FILE="$REPO_ROOT/deploy/compose/docker-compose.yml"
 COMPOSE_NETWORK="hort_default"
-IMAGE="hort-test-client:dev"
+IMAGE="${HORT_TEST_CLIENT_IMAGE:-hort-test-client:dev}"
+# Same variables docker-compose.yml interpolates for the server/worker
+# services — exporting them here (even at their defaults) means run.sh and
+# compose agree on exactly which tag a `docker load` needs to satisfy.
+HORT_SERVER_IMAGE="${HORT_SERVER_IMAGE:-hort-server:dev}"
+HORT_WORKER_IMAGE="${HORT_WORKER_IMAGE:-hort-worker:dev}"
+export HORT_SERVER_IMAGE HORT_WORKER_IMAGE
+SKIP_BUILD="${HORT_E2E_SKIP_BUILD:-0}"
 KC_DISCOVERY="http://localhost:25082/realms/hort/.well-known/openid-configuration"
-HOST_METRICS="http://localhost:25090/metrics"
+# Host-mapped Keycloak token endpoint + hort-server base — same realm/client
+# `lib/common.sh`'s `fetch_token` uses from inside a scenario container, just
+# reached from the HOST instead of the compose network. Used only by
+# `mint_metrics_token` below.
+HOST_KC_TOKEN_URL="http://localhost:25082/realms/hort/protocol/openid-connect/token"
+HOST_HORT="http://localhost:25080"
+# Readiness probe for hort-server itself. NOT `/metrics` — that endpoint
+# unconditionally requires a bearer carrying `read_metrics` (#113 item 3,
+# no anonymous-scrape opt-out), so an anonymous readiness curl against it
+# would 401 forever and never observe "up". `/healthz` on the main
+# listener is anonymous by design (kubelet-probe shape) and proves the
+# same thing: the binary finished booting and is accepting connections.
+HOST_HEALTHZ="${HOST_HORT}/healthz"
 
 # Context is the repo root: the Dockerfile's stage 1 builds hort-cli from the
 # workspace (.dockerignore keeps target/.git out, so the context stays small).
 build_image() { docker build -q -f "$SCRIPT_DIR/Dockerfile.client" -t "$IMAGE" "$REPO_ROOT" >/dev/null; }
+
+# require_image -> fail loudly (naming the tag) if $1 is not already loaded.
+# Only called under the build opt-out, where a miss must never fall through to
+# a silent rebuild.
+require_image() {
+  docker image inspect "$1" >/dev/null 2>&1 || {
+    echo "HORT_E2E_SKIP_BUILD=1 but image '$1' is not loaded locally — load it" \
+         "(e.g. docker load) before running, or unset HORT_E2E_SKIP_BUILD to build from source." >&2
+    exit 1
+  }
+}
+
+# maybe_build_client_image -> build the test-client image, unless the opt-out
+# is active, in which case the pre-loaded image must already be present.
+maybe_build_client_image() {
+  if [ "$SKIP_BUILD" = "1" ]; then
+    require_image "$IMAGE"
+    echo "images: test-client prebuilt ($IMAGE)"
+  else
+    build_image
+    echo "images: test-client built from source ($IMAGE)"
+  fi
+}
 now() { date +%s; }
+
+# mint_metrics_token -> prints a read_metrics-granted bearer for the
+# `metrics-scraper` ServiceAccount (deploy/compose/example-config/service-
+# accounts/metrics-scraper.yaml + the paired serviceAccount-subject
+# PermissionGrant in auth/metrics-scraper-read-metrics.yaml), or prints
+# nothing and returns non-zero on any failed step. Host-side (curl +
+# `compose exec postgres psql`) — mirrors
+# scenarios/quarantine/provenance-push-then-sign.sh's admin-mint pattern
+# for the provenance-ci SA, but runs ONCE per harness run (here) instead
+# of once per scenario, since every /metrics-scraping scenario needs the
+# SAME bearer. #113 item 5 — restores the assertion power the anon-hatch
+# retirement (#113 item 3) took away from every METRICS_URL call site.
+mint_metrics_token() {
+  local admin_token sa_uid token
+  admin_token="$(curl -sS -X POST "$HOST_KC_TOKEN_URL" \
+    -d grant_type=password -d client_id=hort-server \
+    -d client_secret=hort-server-secret-dev-only \
+    -d username=admin -d password=admin 2>/dev/null | jq -r '.access_token // empty')"
+  [ -n "$admin_token" ] || { echo "mint_metrics_token: could not fetch admin Keycloak token" >&2; return 1; }
+  sa_uid="$(docker compose "${CA[@]}" exec -T postgres \
+    psql -U registry -d artifact_registry -tAX \
+    -c "SELECT id FROM users WHERE username='sa:metrics-scraper';" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$sa_uid" ] || {
+    echo "mint_metrics_token: no users row 'sa:metrics-scraper' — " \
+         "deploy/compose/example-config/service-accounts/metrics-scraper.yaml not applied?" >&2
+    return 1
+  }
+  token="$(curl -sS -X POST \
+    -H "Authorization: Bearer ${admin_token}" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"metrics-scraper-e2e-$(date +%s)\",\"declared_permissions\":[\"read_metrics\"],\"expires_in_days\":1}" \
+    "${HOST_HORT}/api/v1/admin/users/${sa_uid}/tokens" 2>/dev/null | jq -r '.token // empty')"
+  [ -n "$token" ] || { echo "mint_metrics_token: admin-mint POST returned no token" >&2; return 1; }
+  printf '%s' "$token"
+}
 wait_url() { local u="$1" t="${2:-120}"; local d=$(( $(now)+t )); until curl -fsS -o /dev/null "$u" 2>/dev/null; do [ "$(now)" -ge "$d" ] && return 1; sleep 2; done; }
 
 # Base compose file + any `--compose-overlay=<o>` files (provenance/federation/wiremock).
@@ -127,6 +214,10 @@ while IFS=$'\t' read -r _g _n _p reqs; do
   for t in $reqs; do case "$t" in worker|scanner) NEED_WORKER=1;; esac; done
 done < <(selected)
 PROFILE_ARGS=(); [ "$NEED_WORKER" = 1 ] && PROFILE_ARGS=(--profile worker)
+# Scale hort-worker replicas so serial trivy scan throughput isn't the E2E
+# release-cadence floor (backlog 095). Only when the worker profile is on —
+# compose errors scaling a profile-inactive service.
+SCALE_ARGS=(); [ "$NEED_WORKER" = 1 ] && SCALE_ARGS=(--scale "hort-worker=${HORT_E2E_WORKER_REPLICAS:-4}")
 
 # The worker has no HTTP health/port, so readiness = compose reports it running.
 wait_running() { local svc="$1" t="${2:-180}"; local d=$(( $(now)+t )); until docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" ps --status running --services 2>/dev/null | grep -qx "$svc"; do [ "$(now)" -ge "$d" ] && return 1; sleep 2; done; }
@@ -138,23 +229,78 @@ cleanup() { [ "$STARTED" = 1 ] && [ "$KEEP" = 0 ] && docker compose "${CA[@]}" "
 trap cleanup EXIT
 
 if [ "$HORT_MODE" = "compose" ]; then
-  build_image
+  maybe_build_client_image
+  # UP_BUILD_ARGS: `--build` by default (today's behaviour — compose always
+  # rebuilds server/worker regardless of any cached image). Under the opt-out
+  # it's dropped so `up` uses the already-loaded HORT_SERVER_IMAGE /
+  # HORT_WORKER_IMAGE tags instead — but only once we've confirmed those tags
+  # actually exist locally; otherwise compose would build them anyway (silent
+  # rebuild) simply because the requested tag is missing.
+  UP_BUILD_ARGS=(--build)
+  if [ "$SKIP_BUILD" = "1" ]; then
+    UP_BUILD_ARGS=()
+    require_image "$HORT_SERVER_IMAGE"
+    if [ "$NEED_WORKER" = 1 ]; then
+      require_image "$HORT_WORKER_IMAGE"
+      echo "images: server/worker prebuilt (server=$HORT_SERVER_IMAGE worker=$HORT_WORKER_IMAGE)"
+    else
+      echo "images: server prebuilt (server=$HORT_SERVER_IMAGE); worker profile inactive"
+    fi
+  else
+    echo "images: server/worker building from source (server=$HORT_SERVER_IMAGE worker=$HORT_WORKER_IMAGE)"
+  fi
+  # E2E sweep cadence: for scan-less policies (scanBackends: []) the release
+  # sweep is the ONLY release engine, and the OCI cold-blob bounded await
+  # (default 10s) only catches a release when the tick fits inside its bound —
+  # tick <= await turns a cold `--all` tree pull into a single client pass
+  # instead of a 503-abort frontier crawl. Compose interpolates the ticker's
+  # ${SWEEP_TICK_SECS:-15} from THIS process env at `up` time.
+  export SWEEP_TICK_SECS="${SWEEP_TICK_SECS:-5}"
   docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" up -d --build
+  docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" up -d "${UP_BUILD_ARGS[@]}" "${SCALE_ARGS[@]}"
   STARTED=1
   wait_url "$KC_DISCOVERY" 120 || { echo "Keycloak not ready" >&2; exit 1; }
-  wait_url "$HOST_METRICS" 120 || { echo "hort-server not ready" >&2; exit 1; }
+  wait_url "$HOST_HEALTHZ" 120 || { echo "hort-server not ready" >&2; exit 1; }
   [ "$NEED_WORKER" = 1 ] && { wait_running hort-worker 180 || { echo "hort-worker not running" >&2; exit 1; }; }
   IN_HORT="http://hort-server:8080"; IN_KC="http://keycloak:8080/realms/hort"; IN_METRICS="http://hort-server:9090/metrics"
   NET_ARGS=(--network "$COMPOSE_NETWORK")
   DB_DSN="postgres://registry:registry@postgres:5432/artifact_registry"
+  # Harness setup: mint the read_metrics bearer ONCE for the whole run, but
+  # ONLY when the native-tokens overlay is active. PAT/token-exchange consume
+  # requires the native-token validator (HORT_NATIVE_TOKENS_ENABLED), which
+  # the legacy-posture base stack deliberately does not enable. Minting there
+  # would either boot-fail (no signing key) or produce a token the base
+  # stack can't validate, so the base lane instead leaves the token unset:
+  # every assert_metric_ingest call site takes its existing "METRICS_TOKEN
+  # unset" note-and-skip path rather than failing.
+  # Under the overlay, a mint failure is an infra problem, not a
+  # per-scenario skip condition — every scenario in the METRICS_URL
+  # call-site inventory needs this token to scrape anything, so fail the
+  # whole run loudly rather than let those scenarios silently degrade to
+  # "unauthenticated / always-skip".
+  NATIVE_TOKENS_OVERLAY=0
+  for o in "${OVERLAYS[@]:-}"; do [ "$o" = "native-tokens" ] && NATIVE_TOKENS_OVERLAY=1; done
+  if [ "$NATIVE_TOKENS_OVERLAY" = 1 ]; then
+    IN_METRICS_TOKEN="$(mint_metrics_token)" || { echo "could not mint the read_metrics scrape token" >&2; exit 1; }
+  else
+    IN_METRICS_TOKEN=""
+    echo "metrics-content assertions skip on the legacy-posture base stack" \
+         "(no native-token validator) — run with --compose-overlay=native-tokens" \
+         "to assert them" >&2
+  fi
 else
   : "${HORT_URL:?external mode needs HORT_URL}"; : "${KEYCLOAK_URL:?external mode needs KEYCLOAK_URL}"
-  build_image
+  maybe_build_client_image
   # External /metrics is usually an internal control-plane port, not on HORT_URL;
   # leave IN_METRICS empty unless the caller set METRICS_URL → assert_metric_ingest
-  # then skips rather than failing on a 404 (S2).
+  # then skips rather than failing on a 404 (S2). METRICS_TOKEN mirrors it:
+  # external mode has no gitops-managed metrics-scraper SA to admin-mint
+  # against, so the caller supplies a pre-minted read_metrics-granted
+  # bearer via the METRICS_TOKEN env var if they want the scrape
+  # assertions to run authenticated; unset means they stay skipped exactly
+  # like the METRICS_URL-unset case already did pre-#113.
   IN_HORT="$HORT_URL"; IN_KC="$KEYCLOAK_URL"; IN_METRICS="${METRICS_URL:-}"
+  IN_METRICS_TOKEN="${METRICS_TOKEN:-}"
   NET_ARGS=(); DB_DSN="${HORT_DB_DSN:-}"
 fi
 
@@ -170,6 +316,7 @@ run_one() {  # group name path
   # external stack's posture.
   docker run --rm --add-host=host.docker.internal:host-gateway "${NET_ARGS[@]}" \
     -e HORT_URL="$IN_HORT" -e KEYCLOAK_URL="$IN_KC" -e METRICS_URL="$IN_METRICS" \
+    -e METRICS_TOKEN="$IN_METRICS_TOKEN" \
     -e HORT_DB_DSN="$DB_DSN" \
     -e HORT_COMPOSE_OVERLAYS="${OVERLAYS[*]:-${HORT_COMPOSE_OVERLAYS:-}}" \
     -v "$SCRIPT_DIR":/work:ro -e FIXTURES=/work/fixtures \

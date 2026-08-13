@@ -11,6 +11,41 @@
 //! releases the artifact as soon as a clean scan lands — typically
 //! within minutes, not the full window.
 //!
+//! **This claim is now actually true (issue #115 defect (a)).** Before
+//! the fix, the backdated-anchor follow-on commit landed
+//! `ArtifactQuarantined` with **no scan enqueue** — there was no clean
+//! scan ever going to land, and no rescan-sweep candidate list could
+//! recover the artifact either (`select_eligible` requires
+//! `released`/`NULL`; `select_stranded` required a *failed* job row, and
+//! a never-enqueued artifact has no job row at all). Every seed-imported
+//! artifact under a scanning policy stranded `Quarantined` forever
+//! (`503`, `Retry-After: 1`, indefinitely). `register_by_hash_inner`'s
+//! `quarantine_anchor_override` branch now resolves the SAME
+//! `scan_will_run` / `provenance_will_run` enqueue gate `ingest_inner`
+//! computes and lands `ArtifactQuarantined` + the gated `ScanRequested`
+//! event + `Scan`/`ProvenanceVerify` job enqueues
+//! (`trigger_source: "seed-import"`) in ONE atomic
+//! `commit_transition_with_enqueues` — so a seed-imported artifact is
+//! never quarantined without also being scanned. (`select_stranded`
+//! additionally widens to recover any *already*-stranded rows from
+//! before this fix — issue #115 Item 2, a separate change.)
+//!
+//! **Consequence: seeding into a `provenance_mode: Required` repo.**
+//! Seed-import's anchor is backdated, so `window_open` is already
+//! `false` by the time the enqueued `provenance-verify` job runs, and a
+//! freshly seed-imported artifact is never a referenced-tree descendant
+//! (no other already-ingested artifact's `content_references` targets
+//! it) — so neither the zero-window nor the descendant hold carve-out
+//! applies. Seeding **unsigned** content into a repository with
+//! `provenance_mode: Required` and a provenance-capable format
+//! (`IngestUseCase::provenance_capable_formats`) therefore resolves to
+//! an **immediate terminal `Rejected{Unsigned}`** the moment the
+//! enqueued job runs — not a stranded hold, not a delayed release. This
+//! is the policy-consistent fail-closed outcome, not a defect:
+//! `Required` means unsigned content never releases, whether it arrived
+//! via seed-import or a live push. Operators seed unsigned content into
+//! repositories that are not `provenance_mode: Required`.
+//!
 //! **Critical invariant — the scan still gates.** Seed-import stamps
 //! the time anchor only. A dirty scan still transitions the artifact
 //! to `Rejected` via `Artifact::reject_from_scan` (fail-closed
@@ -26,9 +61,11 @@
 //! Wraps [`IngestUseCase::register_existing_cas_blob`] with the
 //! `RegisterExistingCasBlobRequest.seed_import_quarantine_anchor` field.
 //! That field, when `Some(anchor)`, drives the
-//! `register_by_hash_inner` path to emit `ArtifactQuarantined` on the
-//! same stream as the preceding `ArtifactIngested` (two transitions,
-//! mirroring `ingest_inner`'s strict-mode quarantine step).
+//! `register_by_hash_inner` path to emit `ArtifactQuarantined` (+ the
+//! gated `ScanRequested` event and `Scan`/`ProvenanceVerify` job
+//! enqueues, atomically — issue #115) on the same stream as the
+//! preceding `ArtifactIngested` (two transitions, mirroring
+//! `ingest_inner`'s strict-mode quarantine step).
 //!
 //! Idempotency is structural: `register_by_hash`'s same-path-same-hash
 //! dedup (`artifacts.find_by_path` + post-put SHA compare) returns the
@@ -393,6 +430,7 @@ mod tests {
     use hort_domain::entities::repository::Repository;
     use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
     use hort_domain::events::{DomainEvent, PolicyScope};
+    use hort_domain::ports::artifact_lifecycle::IngestEnqueue;
 
     use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
     use crate::use_cases::ingest_use_case::IngestUseCase;
@@ -448,6 +486,40 @@ mod tests {
         Arc<MockRepositoryRepository>,
         Arc<MockPolicyProjectionRepository>,
     ) {
+        build_use_case(Vec::new())
+    }
+
+    /// Same as [`make_use_case`], but wires
+    /// `IngestUseCase::with_provenance_capable_formats` with the given
+    /// set — needed by the #115 Item 1 provenance-enqueue-gate tests,
+    /// which must distinguish "format not capable" (empty set, the
+    /// `make_use_case` default) from "format capable" without changing
+    /// `make_use_case`'s signature and touching its 11 existing callers.
+    #[allow(clippy::type_complexity)]
+    fn make_use_case_with_provenance_formats(
+        formats: impl IntoIterator<Item = &'static str>,
+    ) -> (
+        SeedImportUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockStoragePort>,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+    ) {
+        build_use_case(formats.into_iter().map(str::to_string).collect())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_use_case(
+        provenance_capable_formats: Vec<String>,
+    ) -> (
+        SeedImportUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockStoragePort>,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+    ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
@@ -461,21 +533,24 @@ mod tests {
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 
-        let ingest = Arc::new(IngestUseCase::new(
-            storage.clone(),
-            lifecycle.clone(),
-            artifacts.clone(),
-            repos.clone(),
-            crate::event_store_publisher::wrap_for_test(events.clone()),
-            curation_rules,
-            group_use_case,
-            true,
-            HashMap::new(),
-            0,
-            content_references,
-            policies.clone(),
-            jobs,
-        ));
+        let ingest = Arc::new(
+            IngestUseCase::new(
+                storage.clone(),
+                lifecycle.clone(),
+                artifacts.clone(),
+                repos.clone(),
+                crate::event_store_publisher::wrap_for_test(events.clone()),
+                curation_rules,
+                group_use_case,
+                true,
+                HashMap::new(),
+                0,
+                content_references,
+                policies.clone(),
+                jobs,
+            )
+            .with_provenance_capable_formats(provenance_capable_formats),
+        );
 
         let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
         handlers.insert(
@@ -838,4 +913,244 @@ mod tests {
     // to `policy_resolution::tests` when the helper was extracted
     // (issue #76) — this file no longer owns a private copy to test in
     // isolation.
+
+    // -----------------------------------------------------------------------
+    // #115 Item 1 — seed branch mirrors `ingest_inner`'s atomic enqueue gate
+    // -----------------------------------------------------------------------
+
+    /// Build a `Global`-scoped `ScanPolicyProjection` with the given
+    /// `scan_backends` / `provenance_mode`, otherwise mirroring
+    /// [`sample_projection`].
+    fn policy_with(
+        scan_backends: Vec<&str>,
+        provenance_mode: ProvenanceMode,
+    ) -> ScanPolicyProjection {
+        let mut p = sample_projection();
+        p.scan_backends = scan_backends.into_iter().map(String::from).collect();
+        p.provenance_mode = provenance_mode;
+        p
+    }
+
+    /// Acceptance: scan enqueued under a scanning policy, atomically with
+    /// the quarantine commit. A global policy with `scan_backends:
+    /// ["trivy"]` must land `ArtifactQuarantined` + `ScanRequested` as
+    /// the SAME commit's `events` (atomicity — one
+    /// `commit_transition_with_enqueues` call, not two separate ones) and
+    /// must record exactly one `IngestEnqueue::Scan { trigger_source:
+    /// "seed-import", .. }` on the lifecycle mock.
+    #[tokio::test]
+    async fn seed_import_scan_enqueued_and_atomic_with_quarantine_under_scanning_policy() {
+        let (uc, _artifacts, lifecycle, storage, repos, policies) = make_use_case();
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(policy_with(vec!["trivy"], ProvenanceMode::Off));
+        let hash = put_blob(&storage, 0x10, 64);
+
+        let item = SeedImportItem {
+            repository_id: repo_id,
+            format: RepositoryFormat::Pypi,
+            name: "scanned-pkg".into(),
+            version: "1.0.0".into(),
+            content_hash: hash,
+        };
+        let summary = uc.run(vec![item], api_actor()).await.unwrap();
+        assert_eq!(summary.registered, 1, "{:?}", summary.errors);
+
+        // Atomicity: still exactly 2 commits total (ArtifactIngested,
+        // then ONE quarantine+scan follow-on) — not 3.
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 2, "{transitions:?}");
+        let quarantine_commit = &transitions[1].1;
+        assert_eq!(
+            quarantine_commit.events.len(),
+            2,
+            "ArtifactQuarantined + ScanRequested must land in the SAME commit: {:?}",
+            quarantine_commit.events
+        );
+        assert!(matches!(
+            quarantine_commit.events[0].event,
+            DomainEvent::ArtifactQuarantined(_)
+        ));
+        assert!(matches!(
+            quarantine_commit.events[1].event,
+            DomainEvent::ScanRequested(_)
+        ));
+
+        let enqueues = lifecycle.ingest_enqueues();
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert!(
+            enqueues[0].1.iter().any(
+                |e| matches!(e, IngestEnqueue::Scan { format, trigger_source, .. }
+                    if format == "pypi" && trigger_source == "seed-import")
+            ),
+            "expected a seed-import Scan enqueue: {:?}",
+            enqueues[0].1
+        );
+    }
+
+    /// Acceptance: `scan_backends: []` (ScanWaived) enqueues nothing —
+    /// no `ScanRequested` event, no `IngestEnqueue::Scan`. Release still
+    /// proceeds via the existing `ScanWaived` authority, unchanged by
+    /// this item.
+    #[tokio::test]
+    async fn seed_import_nothing_enqueued_under_scan_waived_policy() {
+        let (uc, _artifacts, lifecycle, storage, repos, policies) = make_use_case();
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(policy_with(vec![], ProvenanceMode::Off));
+        let hash = put_blob(&storage, 0x11, 64);
+
+        let item = SeedImportItem {
+            repository_id: repo_id,
+            format: RepositoryFormat::Pypi,
+            name: "waived-pkg".into(),
+            version: "1.0.0".into(),
+            content_hash: hash,
+        };
+        let summary = uc.run(vec![item], api_actor()).await.unwrap();
+        assert_eq!(summary.registered, 1, "{:?}", summary.errors);
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 2, "{transitions:?}");
+        let quarantine_commit = &transitions[1].1;
+        assert_eq!(
+            quarantine_commit.events.len(),
+            1,
+            "ONLY ArtifactQuarantined — no ScanRequested under scan_backends:[]: {:?}",
+            quarantine_commit.events
+        );
+        assert!(matches!(
+            quarantine_commit.events[0].event,
+            DomainEvent::ArtifactQuarantined(_)
+        ));
+
+        // `commit_transition_with_enqueues` still runs (and the mock
+        // still logs the call) — `enqueues` is the empty slice, not "no
+        // call happened". Assert the CALL's recorded enqueue Vec is
+        // empty, not that no call was logged.
+        let enqueues = lifecycle.ingest_enqueues();
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert!(
+            enqueues[0].1.is_empty(),
+            "scan_backends:[] must enqueue nothing: {:?}",
+            enqueues[0].1
+        );
+    }
+
+    /// Acceptance: provenance enqueued iff `mode != Off` AND the format is
+    /// in `provenance_capable_formats`. Positive case: `Required` +
+    /// `"pypi"` registered as capable.
+    #[tokio::test]
+    async fn seed_import_provenance_enqueued_when_required_and_format_capable() {
+        let (uc, _artifacts, lifecycle, storage, repos, policies) =
+            make_use_case_with_provenance_formats(["pypi"]);
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        repos.insert(repo);
+        // scan_backends:[] isolates this test to the provenance gate only
+        // (no ScanRequested noise in the enqueue-count assertion below).
+        policies.insert(policy_with(vec![], ProvenanceMode::Required));
+        let hash = put_blob(&storage, 0x12, 64);
+
+        let item = SeedImportItem {
+            repository_id: repo_id,
+            format: RepositoryFormat::Pypi,
+            name: "provenance-pkg".into(),
+            version: "1.0.0".into(),
+            content_hash: hash,
+        };
+        let summary = uc.run(vec![item], api_actor()).await.unwrap();
+        assert_eq!(summary.registered, 1, "{:?}", summary.errors);
+
+        let enqueues = lifecycle.ingest_enqueues();
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert!(
+            enqueues[0].1.iter().any(|e| matches!(
+                e,
+                IngestEnqueue::ProvenanceVerify { trigger_source, .. }
+                    if trigger_source == "seed-import"
+            )),
+            "expected a seed-import ProvenanceVerify enqueue: {:?}",
+            enqueues[0].1
+        );
+    }
+
+    /// Negative: `provenance_mode: Off` never enqueues provenance, even
+    /// when the format is capable.
+    #[tokio::test]
+    async fn seed_import_provenance_not_enqueued_when_mode_off() {
+        let (uc, _artifacts, lifecycle, storage, repos, policies) =
+            make_use_case_with_provenance_formats(["pypi"]);
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(policy_with(vec![], ProvenanceMode::Off));
+        let hash = put_blob(&storage, 0x13, 64);
+
+        let item = SeedImportItem {
+            repository_id: repo_id,
+            format: RepositoryFormat::Pypi,
+            name: "off-mode-pkg".into(),
+            version: "1.0.0".into(),
+            content_hash: hash,
+        };
+        let summary = uc.run(vec![item], api_actor()).await.unwrap();
+        assert_eq!(summary.registered, 1, "{:?}", summary.errors);
+
+        let enqueues = lifecycle.ingest_enqueues();
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert!(
+            enqueues[0].1.is_empty(),
+            "provenance_mode: Off must never enqueue ProvenanceVerify: {:?}",
+            enqueues[0].1
+        );
+    }
+
+    /// Negative: `Required` mode does NOT enqueue provenance for a format
+    /// that is not in `provenance_capable_formats` (the default
+    /// `make_use_case` — empty set — mirrors "no registered verifier acts
+    /// on this format").
+    #[tokio::test]
+    async fn seed_import_provenance_not_enqueued_when_format_not_capable() {
+        let (uc, _artifacts, lifecycle, storage, repos, policies) = make_use_case();
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(policy_with(vec![], ProvenanceMode::Required));
+        let hash = put_blob(&storage, 0x14, 64);
+
+        let item = SeedImportItem {
+            repository_id: repo_id,
+            format: RepositoryFormat::Pypi,
+            name: "not-capable-pkg".into(),
+            version: "1.0.0".into(),
+            content_hash: hash,
+        };
+        let summary = uc.run(vec![item], api_actor()).await.unwrap();
+        assert_eq!(summary.registered, 1, "{:?}", summary.errors);
+
+        let enqueues = lifecycle.ingest_enqueues();
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert!(
+            enqueues[0].1.is_empty(),
+            "pypi is not provenance-capable in this fixture — must enqueue nothing: {:?}",
+            enqueues[0].1
+        );
+    }
+
+    // The policy-projection-lookup-failure fail-open branch inside
+    // `register_by_hash_inner`'s seed cutover is tested in
+    // `ingest_use_case.rs` (`seed_cutover_policy_lookup_failure_falls_back_to_default_scan`),
+    // not here: `SeedImportUseCase::run_one` performs its OWN, EARLIER
+    // `resolve_active_policy_for_repo` call (for the backdated-anchor
+    // duration, module doc §"Backdated anchor — policy resolution")
+    // before ever reaching `register_by_hash_inner` — and
+    // `MockPolicyProjectionRepository::fail_next_list_active` is
+    // single-shot, so injecting a failure through `uc.run(...)` here
+    // would be consumed by that unrelated earlier call, never reaching
+    // the branch this item actually changed. Calling
+    // `IngestUseCase::register_existing_cas_blob` directly (bypassing
+    // `SeedImportUseCase`) isolates the ONE call this item's code makes.
 }

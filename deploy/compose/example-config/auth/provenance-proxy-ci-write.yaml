@@ -1,0 +1,16 @@
+# PermissionGrant: serviceAccount provenance-proxy-ci -> write
+# oci-provenance-proxy-e2e (native-token-mode cosign sign in
+# scenarios/quarantine/proxy-required-multilayer.sh). Mirrors
+# provenance-ci-write.yaml; per-repo, so a new instance is required rather
+# than reusing the sibling grant (see provenance-proxy-ci.yaml). Resolves at
+# apply to the SA's backing user (GrantSubject::User, ADR 0037).
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: provenance-proxy-ci-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: provenance-proxy-ci
+  permission: write
+  repository: oci-provenance-proxy-e2e

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
     EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage,
-    ScanJob, ScanKindFields, TriggerSource,
+    PendingKindBacklog, ScanJob, ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -111,14 +111,49 @@ pub(crate) async fn enqueue_provenance_verify_in_tx(
 /// `artifact_id is NULL in claim_pending_by_kinds result`; the
 /// regression is pinned by
 /// [`claim_pending_by_kinds_sql_returning_includes_scan_typed_columns`].
-const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH claimed AS (\n\
+///
+/// Reserved-oldest-slot fairness shape: `oldest` claims exactly one row —
+/// the single globally oldest eligible row across every registered kind,
+/// ordered by `created_at ASC` alone (priority-blind) — while `ranked`
+/// claims the remaining `batch_size - 1` slots by the pre-existing
+/// `priority DESC, created_at ASC` order, explicitly excluding whatever
+/// `oldest` already picked so the same row is never claimed twice. Without
+/// the reserved slot, a sustained high-priority stream of the same kind can
+/// starve an old low-priority row indefinitely; the reserved slot bounds
+/// that wait to roughly one batch-drain cycle regardless of priority.
+/// `oldest` is `MATERIALIZED` deliberately: it is referenced twice (by
+/// `ranked`'s exclusion and by `claimed`'s union), and the default
+/// multiply-referenced-CTE materialization is exactly what is wanted here —
+/// spelling it out guards against a future edit that drops a reference and
+/// silently flips the default to inlining, which would re-run the `FOR
+/// UPDATE SKIP LOCKED` select twice and risk locking two different rows
+/// instead of reusing the one already picked. `LEAST($2, 1)` /
+/// `GREATEST($2 - 1, 0)` degrade to claiming nothing when `batch_size` is
+/// 0, matching the pre-existing `LIMIT $2` behavior instead of always
+/// locking one row regardless of the caller's requested batch size.
+const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
                      SELECT id FROM public.jobs\n\
                      WHERE status = 'pending'\n\
                        AND kind = ANY($1::text[])\n\
                        AND (locked_until IS NULL OR locked_until < now())\n\
+                     ORDER BY created_at ASC, id ASC\n\
+                     FOR UPDATE SKIP LOCKED\n\
+                     LIMIT LEAST($2, 1)\n\
+                 ),\n\
+                 ranked AS (\n\
+                     SELECT id FROM public.jobs\n\
+                     WHERE status = 'pending'\n\
+                       AND kind = ANY($1::text[])\n\
+                       AND (locked_until IS NULL OR locked_until < now())\n\
+                       AND id NOT IN (SELECT id FROM oldest)\n\
                      ORDER BY priority DESC, created_at ASC\n\
                      FOR UPDATE SKIP LOCKED\n\
-                     LIMIT $2\n\
+                     LIMIT GREATEST($2 - 1, 0)\n\
+                 ),\n\
+                 claimed AS (\n\
+                     SELECT id FROM oldest\n\
+                     UNION ALL\n\
+                     SELECT id FROM ranked\n\
                  )\n\
                  UPDATE public.jobs SET\n\
                      status = 'running',\n\
@@ -202,6 +237,11 @@ impl PgJobsRepository {
         Ok(id_opt)
     }
 }
+
+/// Emitted once per claimed row that failed [`row_to_job_row`]
+/// projection and was resolved terminally instead of being stranded in
+/// `running`. See `docs/metrics-catalog.md`.
+const METRIC_CLAIM_UNMAPPABLE: &str = "hort_admin_tasks_claim_unmappable_total";
 
 /// PostgreSQL `unique_violation` SQLSTATE — surfaced when the partial
 /// unique on `(artifact_id) WHERE kind='scan'` rejects a duplicate
@@ -535,7 +575,7 @@ impl JobsRepository for PgJobsRepository {
                  WHERE id IN (SELECT id FROM claimed)\n\
                  RETURNING {RETURNING_COLS}"
             );
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(limit)
                 .bind(&worker_id)
                 .bind(interval)
@@ -920,7 +960,7 @@ impl JobsRepository for PgJobsRepository {
                  LIMIT ${bind_idx}"
             );
 
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             if let Some(c) = cursor {
                 q = q.bind(c);
             }
@@ -1011,12 +1051,105 @@ impl JobsRepository for PgJobsRepository {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Job", "claim_pending_by_kinds"))?;
-            let mut jobs: Vec<JobRow> = rows
-                .iter()
-                .map(row_to_job_row)
-                .collect::<DomainResult<_>>()?;
+            // Per-row projection, NOT `collect::<DomainResult<_>>()?`.
+            //
+            // The `?` form propagated the FIRST mapping error out of the
+            // function *after* the claiming UPDATE had already committed:
+            // every row in the batch was `running`, none was returned to
+            // the caller, and nothing ever moved them back — the claim
+            // predicate requires `status = 'pending'` and there is no
+            // stale-`running` reaper anywhere in the codebase. One
+            // unmappable row therefore permanently stranded up to
+            // `batch_size` healthy rows (invariant: a claimed-but-not-
+            // dispatched row is never permanently lost). The shape used to
+            // be production-reachable: `"scan"` was in
+            // `ADMIN_INVOKABLE_TASK_KINDS`, so the admin task-invoke
+            // path's `enqueue_task` wrote a `kind='scan'` row with the
+            // scan-typed columns NULL, which `decide_kind_fields` rejects.
+            // That source is now closed at the apply side (no admin
+            // route, and the kind is off the allow-list) — bare-`scan`
+            // rows lacking the scan-typed columns are legacy/poison only
+            // now, reachable solely via direct SQL, an older deployment's
+            // leftover row, or a future kind whose typed columns go
+            // missing; the `jobs` table still has no CHECK preventing the
+            // shape, so this per-row projection stays defence-in-depth.
+            //
+            // Now each row is projected independently: mappable rows are
+            // returned and dispatched; an unmappable row is resolved
+            // TERMINALLY (`mark_failed`, carrying the projection error as
+            // `last_error`) plus an ERROR log and a metric. Terminal
+            // rather than revert-to-`pending` on purpose — an unmappable
+            // row is unmappable on every subsequent claim too, so
+            // re-queueing it would swap silent loss for a hot loop that
+            // burns a batch slot every poll.
+            let mut jobs: Vec<JobRow> = Vec::with_capacity(rows.len());
+            let mut unmappable: Vec<(Uuid, String)> = Vec::new();
+            for row in &rows {
+                match row_to_job_row(row) {
+                    Ok(job) => jobs.push(job),
+                    Err(e) => match row.try_get::<Uuid, _>("id") {
+                        Ok(id) => unmappable.push((id, e.to_string())),
+                        Err(id_err) => {
+                            // The `id` column itself is unreadable, so the
+                            // row cannot even be addressed for a terminal
+                            // transition. Pinned as unreachable by
+                            // `claim_pending_by_kinds_sql_*` (the
+                            // RETURNING clause always projects `id`);
+                            // logged rather than silently dropped.
+                            tracing::error!(
+                                error = %e,
+                                id_error = %id_err,
+                                "claim_pending_by_kinds: claimed row is unmappable AND its id is \
+                                 unreadable; the row stays 'running' and cannot be re-claimed"
+                            );
+                        }
+                    },
+                }
+            }
+            for (id, reason) in unmappable {
+                tracing::error!(
+                    job_id = %id,
+                    reason = %reason,
+                    "claim_pending_by_kinds: claimed row failed projection; marking it failed so \
+                     it is not stranded in 'running' (the rest of the batch is dispatched)"
+                );
+                metrics::counter!(METRIC_CLAIM_UNMAPPABLE).increment(1);
+                if let Err(e) = JobsRepository::mark_failed(self, id, &reason).await {
+                    tracing::error!(
+                        job_id = %id,
+                        error = %e,
+                        "claim_pending_by_kinds: marking the unmappable row failed did not persist",
+                    );
+                }
+            }
             sort_claimed_jobs(&mut jobs);
             Ok(jobs)
+        })
+    }
+
+    fn eligible_pending_by_kind(&self) -> BoxFuture<'_, DomainResult<Vec<PendingKindBacklog>>> {
+        Box::pin(async move {
+            // Mirrors the claim query's eligibility predicates minus the
+            // `kind = ANY(...)` filter — see the port doc.
+            let rows = sqlx::query(
+                "SELECT kind, count(*) AS n, min(created_at) AS oldest \
+                 FROM public.jobs \
+                 WHERE status = 'pending' \
+                   AND (locked_until IS NULL OR locked_until < now()) \
+                 GROUP BY kind",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Job", "eligible_pending_by_kind"))?;
+            rows.iter()
+                .map(|row| {
+                    Ok(PendingKindBacklog {
+                        kind: row.try_get("kind").map_err(|e| invariant(&e))?,
+                        count: row.try_get("n").map_err(|e| invariant(&e))?,
+                        oldest_created_at: row.try_get("oldest").map_err(|e| invariant(&e))?,
+                    })
+                })
+                .collect()
         })
     }
 
@@ -1102,7 +1235,7 @@ impl JobsRepository for PgJobsRepository {
                      RETURNING id",
                     placeholders = placeholders.join(", "),
                 );
-                let mut q = sqlx::query_scalar::<_, Uuid>(&sql);
+                let mut q = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql));
                 for r in &kind_rows {
                     q = q
                         .bind(&r.kind)
@@ -1188,14 +1321,19 @@ mod tests {
         let sql = CLAIM_PENDING_BY_KINDS_SQL;
 
         // Positive shape: keyword pairs MUST be separated by whitespace.
-        // Each substring below was a token-mashing site in the bug.
+        // Each substring below was (or, for the reserved-oldest-slot CTEs,
+        // would be) a token-mashing site if a `\n` were dropped.
         let must_contain = [
             "FROM public.jobs",
             "public.jobs\n",
             "'pending'\n",
             "ANY($1::text[])\n",
             "now())\n",
-            "LIMIT $2\n",
+            "LIMIT LEAST($2, 1)\n",
+            "LIMIT GREATEST($2 - 1, 0)\n",
+            "FROM oldest\n",
+            "FROM ranked\n",
+            "NOT IN (SELECT id FROM oldest)\n",
             "UPDATE public.jobs SET\n",
             "now()\n",
             "FROM claimed)\n",
@@ -1210,9 +1348,9 @@ mod tests {
         }
 
         // Negative shape: explicit forbidden conjoined pairs that the
-        // bare-`\` bug produced. Listing them as substrings guards
-        // against any future regression that drops a `\n` before a
-        // continuation.
+        // bare-`\` bug produced (or would produce in the new CTEs).
+        // Listing them as substrings guards against any future regression
+        // that drops a `\n` before a continuation.
         let must_not_contain = [
             "jobsWHERE",
             "'pending'AND",
@@ -1220,6 +1358,7 @@ mod tests {
             "now())ORDER",
             "FOR UPDATE SKIP LOCKEDLIMIT",
             "now()WHERE",
+            "oldest)ORDER",
         ];
         for pat in &must_not_contain {
             assert!(
@@ -1229,6 +1368,64 @@ mod tests {
                  continuation. Full SQL:\n{sql}"
             );
         }
+    }
+
+    /// Regression guard for the reserved-oldest-slot fairness shape: one
+    /// slot per poll MUST be reserved for the single oldest eligible row
+    /// across kinds, priority-blind, and it MUST be excluded from the
+    /// priority-ordered slots so the same row is never double-claimed.
+    /// A prior bug class (see the token-mashing guard above) proved that
+    /// this query's shape is easy to silently corrupt during an edit; this
+    /// test pins the fairness-specific invariants the token-mashing guard
+    /// does not cover.
+    #[test]
+    fn claim_pending_by_kinds_sql_reserves_one_priority_blind_oldest_slot() {
+        let sql = CLAIM_PENDING_BY_KINDS_SQL;
+
+        // The reserved slot's ordering must NOT reference priority — it is
+        // the single globally oldest row regardless of priority.
+        let oldest_cte = sql
+            .split_once("ranked AS (")
+            .map(|(before, _)| before)
+            .expect("CLAIM_PENDING_BY_KINDS_SQL must contain a `ranked` CTE");
+        assert!(
+            oldest_cte.contains("ORDER BY created_at ASC, id ASC"),
+            "the `oldest` CTE must order by created_at alone (priority-blind). \
+             Full `oldest` CTE:\n{oldest_cte}"
+        );
+        assert!(
+            !oldest_cte.contains("priority"),
+            "the `oldest` CTE must not reference priority — it reserves a slot \
+             for the oldest row REGARDLESS of priority. Full `oldest` CTE:\n{oldest_cte}"
+        );
+
+        // The ranked (priority-ordered) slots must exclude whatever the
+        // oldest CTE already picked, and must keep the pre-existing
+        // priority-ordered contract for the remaining slots.
+        assert!(
+            sql.contains("ORDER BY priority DESC, created_at ASC"),
+            "the `ranked` CTE must keep the pre-existing priority DESC, \
+             created_at ASC order for the non-reserved slots. Full SQL:\n{sql}"
+        );
+
+        // Both CTEs preserve FOR UPDATE SKIP LOCKED semantics.
+        assert_eq!(
+            sql.matches("FOR UPDATE SKIP LOCKED").count(),
+            2,
+            "both the `oldest` and `ranked` CTEs must claim with FOR UPDATE \
+             SKIP LOCKED. Full SQL:\n{sql}"
+        );
+
+        // `oldest` is referenced twice (by `ranked`'s exclusion and by
+        // `claimed`'s union) — it must be MATERIALIZED so the FOR UPDATE
+        // SKIP LOCKED select runs once, not once per reference.
+        assert!(
+            sql.contains("WITH oldest AS MATERIALIZED ("),
+            "the `oldest` CTE must be explicitly MATERIALIZED — it is \
+             referenced twice, and relying on the default multiply-referenced \
+             materialization is exactly the kind of implicit contract this \
+             file pins explicitly. Full SQL:\n{sql}"
+        );
     }
 
     /// Regression guard for the bug that produced
@@ -1438,10 +1635,11 @@ mod tests {
     /// `claim_scan_jobs` and assert the in-memory `ScanJob` exposes
     /// both fields.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn row_to_scan_job_populates_trigger_source_cron_and_priority_10() {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
-        let pool = PgPool::connect(&db_url).await.expect("connect to Postgres");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
 
         let artifact_id = Uuid::new_v4();
         let repository_id = Uuid::new_v4();
@@ -1472,22 +1670,17 @@ mod tests {
             .expect("seeded row in claim batch");
         assert_eq!(job.trigger_source, TriggerSource::Cron);
         assert_eq!(job.priority, 10);
-
-        sqlx::query("DELETE FROM public.jobs WHERE id = $1")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
     }
 
     /// Ingest path inserts with the column default `priority=0` and an
     /// explicit `trigger_source='ingest'`. The mapper must round-trip
     /// both unchanged.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn row_to_scan_job_populates_default_ingest_trigger_source_and_priority_0() {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
-        let pool = PgPool::connect(&db_url).await.expect("connect to Postgres");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
 
         let artifact_id = Uuid::new_v4();
         let repository_id = Uuid::new_v4();
@@ -1518,12 +1711,6 @@ mod tests {
             .expect("seeded row in claim batch");
         assert_eq!(job.trigger_source, TriggerSource::Ingest);
         assert_eq!(job.priority, 0);
-
-        sqlx::query("DELETE FROM public.jobs WHERE id = $1")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
     }
 
     // ---- sort_claimed_jobs (cross-kind variant) --------------------------
@@ -1587,22 +1774,40 @@ mod tests {
 
     // -- Integration tests (gated on DATABASE_URL) ---------------------------
     //
-    // Run with:
-    //   DATABASE_URL=postgresql://... cargo test -p hort-adapters-postgres -- --ignored
+    // Runtime self-skip (issue #94): `maybe_pool()` returns `None` when
+    // `DATABASE_URL` is unset, and each test does
+    // `let Some(pool) = maybe_pool().await else { return; };` — a clean,
+    // fast no-op under plain `cargo test`, full execution when
+    // `DATABASE_URL` is wired:
+    //   DATABASE_URL=postgresql://... cargo test -p hort-adapters-postgres
 
     /// `PgJobsRepository::enqueue_task` inserts a row and returns a Uuid;
     /// the row exists in `jobs` with the expected columns.
+    ///
+    /// `trigger_source` must be one of the values
+    /// `migrations/009_scan_jobs_and_findings.sql`'s `jobs_trigger_source_check`
+    /// CHECK constraint allows (`manual`, `cron`, `advisory`, `ingest`,
+    /// `seed-import`, `prefetch`, `self_service`, `scheduled`) — a
+    /// deterministic failure on any correctly-migrated DB otherwise
+    /// (issue #94). `'manual'` is the operator-triggered case this
+    /// ad-hoc enqueue actually represents.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn enqueue_task_inserts_row_and_returns_uuid() {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
-        let pool = PgPool::connect(&db_url).await.expect("connect to Postgres");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = PgJobsRepository::new(pool.clone());
 
         let params = serde_json::json!({"dry_run": true});
-        let actor_id = Some(Uuid::new_v4());
+        // `actor_id` is a nullable FK to `users(id)` (issue #94: a random
+        // UUID here violates `jobs_actor_id_fkey` on any correctly-
+        // migrated DB — this test only asserts the row/columns, not
+        // actor attribution, so `None` (system-triggered) is the
+        // correct fixture, not a seeded user row).
+        let actor_id = None;
         let outcome = repo
-            .enqueue_task("noop", &params, actor_id, 0, "integration-test", None)
+            .enqueue_task("noop", &params, actor_id, 0, "manual", None)
             .await
             .expect("enqueue_task failed");
 
@@ -1624,13 +1829,6 @@ mod tests {
 
         assert_eq!(kind, "noop");
         assert_eq!(status, "pending");
-
-        // Clean up — remove the test row.
-        sqlx::query("DELETE FROM public.jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup failed");
     }
 
     // -----------------------------------------------------------------

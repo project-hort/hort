@@ -47,7 +47,7 @@ metadata).
 | Stack | runner cycles `deploy/compose` (`down -v` → `up -d --build` → readiness wait → tear down unless `--keep`) | you supply a running hort; runner manages nothing |
 | Client network | attached to the `hort_default` compose network (in-network DNS) | own container; reaches a host-published hort via `host.docker.internal` |
 | Endpoints | derived automatically | from `HORT_URL` / `KEYCLOAK_URL` (env) |
-| `/metrics` | `http://hort-server:9090/metrics` (fresh stack → metric assertions are meaningful) | only if you set `METRICS_URL`; otherwise metric assertions **skip**, never fail |
+| `/metrics` | `http://hort-server:9090/metrics`; metric assertions are armed only under `--compose-overlay=native-tokens`, where the runner admin-mints a `read_metrics` bearer once per run — the base (legacy-posture) stack has no native-token validator to consume one, so it skips those assertions with a note | only if you set BOTH `METRICS_URL` and `METRICS_TOKEN`; otherwise metric assertions **skip**, never fail |
 
 ### External-mode env
 
@@ -56,6 +56,13 @@ metadata).
   `/protocol/openid-connect/token`).
 - `METRICS_URL` (optional) — Prometheus `/metrics`; usually an internal
   control-plane port, so leave it unset and the ingest-metric assertions skip.
+- `METRICS_TOKEN` (optional) — a bearer carrying the `read_metrics` grant.
+  `/metrics` unconditionally requires one — no anonymous-scrape opt-out — so
+  if you set `METRICS_URL` you almost certainly also want this set, or every
+  scrape 401s. Compose mode mints its own under `--compose-overlay=native-tokens`
+  (see below); external mode has no gitops-managed scraper identity to mint
+  against, so supply a pre-minted token yourself (see
+  `docs/architecture/how-to/operate/metrics-scraper-service-account.md`).
 - `HORT_DB_DSN` (optional) — enables `requires: db` scenarios against an external
   hort.
 
@@ -91,9 +98,17 @@ Each scenario is `scenarios/<group>/<name>.sh`:
 - It `source`s `lib/common.sh` for the shared helpers: `fetch_token <user> <pass>`
   (Keycloak ROPC), `pass`/`fail`/`skip`/`log`, `summary`, `psql_one`/`psql_exec`
   (when `requires: db`), and `assert_metric_ingest <format>`.
-- The runner passes `HORT_URL`, `KEYCLOAK_URL`, `METRICS_URL`,
+- The runner passes `HORT_URL`, `KEYCLOAK_URL`, `METRICS_URL`, `METRICS_TOKEN`,
   `KEYCLOAK_CLIENT_ID`/`SECRET`, `FIXTURES=/work/fixtures`, and (when available)
-  `HORT_DB_DSN` via env.
+  `HORT_DB_DSN` via env. In compose mode under `--compose-overlay=native-tokens`,
+  `METRICS_TOKEN` is a `read_metrics`-granted bearer the runner admin-mints once
+  per run, against the `metrics-scraper` `ServiceAccount` + `PermissionGrant` in
+  `deploy/compose/example-config/` — `common.sh` exposes it pre-split into a
+  `METRICS_AUTH_HEADER` curl-args array so scenarios never handle the raw
+  bearer. Metrics-content assertions therefore run in the native-tokens
+  overlay lane; the legacy-posture base lane has no native-token validator to
+  consume a minted bearer, so it leaves `METRICS_TOKEN` unset and those
+  assertions skip with a note.
 - **Exit codes:** `0` all-pass, `1` some assertion failed, `77` self-skip (the
   `skip` helper — environment unmet). The runner maps `0`→pass, `77`→skip, and
   **anything else (including a tool that aborts with exit 2)** → fail, so a crashed

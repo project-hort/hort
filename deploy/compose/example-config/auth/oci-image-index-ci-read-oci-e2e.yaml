@@ -1,0 +1,16 @@
+# PermissionGrant: serviceAccount oci-image-index-ci -> read oci-e2e.
+# Granted alongside write (write does not imply read; permissions are flat):
+# Phase A's write-authorized HEAD/GET-by-index-digest checks are pull-scoped
+# `/v2/auth` requests, which the credentialed exchange path gates on this
+# grant regardless of oci-e2e's `isPublic` visibility (that shortcut is
+# legacy Basic-as-JWT-only). Mirrors provenance-ci-read.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-image-index-ci-read-oci-e2e
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-image-index-ci
+  permission: read
+  repository: oci-e2e

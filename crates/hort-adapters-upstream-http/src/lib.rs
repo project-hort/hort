@@ -820,19 +820,91 @@ impl HttpUpstreamProxy {
     }
 }
 
+/// Sanitised, path-fragment-free rejection message for
+/// [`reject_traversal_segments`]. Never echoes the attacker-controlled
+/// path — a `tracing::warn!` at the call site carries structured
+/// context instead.
+const TRAVERSAL_SEGMENT_MESSAGE: &str =
+    "upstream path contains a '.' or '..' segment (raw or percent-encoded)";
+
+/// Decode a single percent-encoded (`%XX`) escape sequence, case-insensitive
+/// hex, one pass — no recursive/double decoding. Bytes that are not part of
+/// a well-formed `%XX` triplet pass through unchanged (including a lone
+/// `%` not followed by two hex digits).
+///
+/// Operates on bytes, not `char`, because the decoded output is not
+/// necessarily valid UTF-8 in general; callers only compare the result
+/// against ASCII `.`/`..`/`/`, so byte-level decoding is sufficient and
+/// avoids a fallible UTF-8 re-validation step.
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Reject a relative upstream `path` whose `/`-delimited segments contain
+/// a traversal-shaped segment — `.` or `..`, raw or percent-encoded
+/// (including a percent-encoded `/` that splices two segments together,
+/// e.g. `..%2fx`). Decoding the WHOLE path once before splitting (rather
+/// than splitting first and decoding each piece) is what catches the
+/// spliced case: a percent-encoded `/` inside what looks like one raw
+/// segment reveals a real segment boundary only after decoding.
+///
+/// This is the shared, format-independent last hop before a credentialed
+/// upstream request — every format's serve-path validator is the first
+/// line of defence, but a future format crate that forgets its own gate
+/// must still be caught here before `compose_url` builds the request URL.
+fn reject_traversal_segments(path: &str) -> DomainResult<()> {
+    let decoded = percent_decode(path);
+    let has_traversal_segment = decoded
+        .split(|&b| b == b'/')
+        .any(|segment| segment == b".." || segment == b".");
+    if has_traversal_segment {
+        tracing::warn!(
+            path_len = path.len(),
+            "upstream path rejected: traversal-shaped segment before URL composition"
+        );
+        return Err(DomainError::Validation(
+            TRAVERSAL_SEGMENT_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Compose a request URL for `fetch_metadata`: trim a trailing slash
 /// from the upstream base, ensure exactly one slash between base and
 /// path. Caller-supplied `path` is a mapping-relative path (npm
 /// packument `/{pkg}`, Cargo sparse-index `/{prefix}/{name}`, PyPI
 /// `/pypi/{name}/{version}/json`).
-fn compose_url(base: &str, path: &str) -> String {
+///
+/// Rejects a `path` containing a traversal-shaped segment (see
+/// [`reject_traversal_segments`]) before composing — the caller-supplied
+/// path is attacker-controlled on every pull-through format, and raw
+/// string concatenation would otherwise let a `..` segment escape the
+/// mapping's base-path prefix on a credentialed upstream request.
+fn compose_url(base: &str, path: &str) -> DomainResult<String> {
+    reject_traversal_segments(path)?;
     let trimmed_base = base.trim_end_matches('/');
     let normalised_path = if path.starts_with('/') {
         path.to_string()
     } else {
         format!("/{path}")
     };
-    format!("{trimmed_base}{normalised_path}")
+    Ok(format!("{trimmed_base}{normalised_path}"))
 }
 
 /// True iff `path` begins with `https://` or `http://` (case-sensitive
@@ -1781,7 +1853,7 @@ impl HttpUpstreamProxy {
             check_ssrf_safe(path).await?;
             Ok(path.to_string())
         } else {
-            Ok(compose_url(upstream_base, path))
+            compose_url(upstream_base, path)
         }
     }
 
@@ -1833,7 +1905,7 @@ impl HttpUpstreamProxy {
         path: &str,
         accept: &[String],
     ) -> DomainResult<MetadataFetchOutcome> {
-        let url = compose_url(&mapping.upstream_url, path);
+        let url = compose_url(&mapping.upstream_url, path)?;
         tracing::debug!(
             upstream = %mapping.upstream_url,
             path = %path,
@@ -5098,6 +5170,37 @@ mod tests {
     // fetch_metadata
     // -------------------------------------------------------------------
 
+    /// Tripwire: a traversal-shaped `path` on `fetch_metadata` (which
+    /// drives `do_fetch_metadata` -> `compose_url`) must reject with
+    /// `Validation` and the wiremock upstream must record ZERO requests —
+    /// proving the reject fires before any network I/O, not merely before
+    /// a successful response.
+    #[tokio::test]
+    async fn fetch_metadata_rejects_traversal_path_before_any_request() {
+        let server = MockServer::start().await;
+        // Deliberately no `Mock::given(...).mount(...)` — any request that
+        // reaches the server at all is itself the tripwire failure (wiremock
+        // returns 501 for an unmatched request, which would also fail this
+        // test's error-kind assertion below).
+        let proxy = proxy_for(&server);
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        let err = proxy
+            .fetch_metadata(m, "/pypi/../../../etc/passwd".into(), Vec::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, DomainError::Validation(_)),
+            "traversal path must reject with Validation, got {err:?}"
+        );
+        let recorded = server.received_requests().await.unwrap();
+        assert_eq!(
+            recorded.len(),
+            0,
+            "no upstream request must fire when the path is rejected before composition"
+        );
+    }
+
     /// 200 with body and an empty `accept` list → adapter does not
     /// specify a concrete media type. reqwest defaults to `Accept:
     /// */*`, which per RFC 7231 §5.3.2 is identical to omitting the
@@ -5438,10 +5541,68 @@ mod tests {
     /// when base has a trailing slash and path lacks a leading one.
     #[test]
     fn compose_url_normalises_slashes() {
-        assert_eq!(compose_url("https://h", "/a/b"), "https://h/a/b");
-        assert_eq!(compose_url("https://h/", "/a/b"), "https://h/a/b");
-        assert_eq!(compose_url("https://h", "a/b"), "https://h/a/b");
-        assert_eq!(compose_url("https://h/", "a/b"), "https://h/a/b");
+        assert_eq!(compose_url("https://h", "/a/b").unwrap(), "https://h/a/b");
+        assert_eq!(compose_url("https://h/", "/a/b").unwrap(), "https://h/a/b");
+        assert_eq!(compose_url("https://h", "a/b").unwrap(), "https://h/a/b");
+        assert_eq!(compose_url("https://h/", "a/b").unwrap(), "https://h/a/b");
+    }
+
+    /// A `path` whose `/`-delimited segments contain a traversal-shaped
+    /// segment — raw `..`/`.`, percent-encoded (`%2e%2e`, mixed-case hex),
+    /// or spliced via a percent-encoded `/` — must reject before any URL
+    /// is composed.
+    #[test]
+    fn compose_url_rejects_traversal_segments() {
+        for bad in [
+            "..",
+            "../x",
+            "a/../b",
+            "a/..",
+            "%2e%2e",
+            "a/%2E%2e/b",
+            "..%2fx",
+        ] {
+            let err =
+                compose_url("https://h", bad).expect_err(&format!("{bad:?} must be rejected"));
+            assert!(
+                matches!(err, DomainError::Validation(_)),
+                "{bad:?} must reject with Validation, got {err:?}"
+            );
+        }
+    }
+
+    /// A legitimate dot embedded WITHIN a segment (not a whole segment by
+    /// itself) must not be rejected — the guard is per-segment equality,
+    /// not substring matching.
+    #[test]
+    fn compose_url_accepts_embedded_dots() {
+        assert_eq!(
+            compose_url("https://h", "requests-2.31.0.tar.gz").unwrap(),
+            "https://h/requests-2.31.0.tar.gz"
+        );
+        assert_eq!(
+            compose_url("https://h", ".well-known/x").unwrap(),
+            "https://h/.well-known/x"
+        );
+        assert_eq!(compose_url("https://h", "a..b").unwrap(), "https://h/a..b");
+    }
+
+    /// A `%` that is not part of a well-formed `%XX` escape (not enough
+    /// trailing bytes, or the trailing bytes are not hex digits) passes
+    /// through literally rather than being decoded or rejected — it can
+    /// never decode to a `.`/`..` segment, so there is nothing to guard
+    /// against, and a literal `%` in a filename is legitimate input.
+    #[test]
+    fn compose_url_leaves_malformed_percent_escapes_literal() {
+        assert_eq!(
+            compose_url("https://h", "50%off").unwrap(),
+            "https://h/50%off"
+        );
+        assert_eq!(compose_url("https://h", "abc%").unwrap(), "https://h/abc%");
+        assert_eq!(
+            compose_url("https://h", "%zzpkg").unwrap(),
+            "https://h/%zzpkg"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -6060,8 +6221,9 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "hort test leaf".to_string());
         let leaf_key = rcgen::KeyPair::generate().expect("generate leaf keypair");
+        let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
         let leaf = leaf_params
-            .signed_by(&leaf_key, &ca, &ca_key)
+            .signed_by(&leaf_key, &ca_issuer)
             .expect("CA-sign leaf cert");
 
         let ca_pem = ca.pem();
@@ -6117,6 +6279,7 @@ mod tests {
             axum::Router::new().fallback(|| async { (StatusCode::OK, "tls-ok") });
         tokio::spawn(async move {
             let _ = axum_server::from_tcp_rustls(std_listener, tls_config)
+                .expect("from_tcp_rustls with a non-blocking std listener")
                 .serve(app.into_make_service())
                 .await;
         });

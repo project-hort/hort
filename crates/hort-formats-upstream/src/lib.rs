@@ -451,6 +451,13 @@ fn map_pypi_helper_error(e: &pypi_helpers::IndexFetchError) -> UpstreamFetchErro
     use pypi_helpers::IndexFetchError;
     match e {
         IndexFetchError::NoUpstream => UpstreamFetchError::NotFound,
+        // A project name that fails `validate_pep_503_name` on the
+        // proxy-GET path (serve-path validation) is a parse/validation-class
+        // failure; map to `ParseError` with a sanitised constant (no name
+        // fragments). Mirrors `map_npm_helper_error`'s `InvalidName` arm.
+        IndexFetchError::InvalidName { .. } => {
+            UpstreamFetchError::ParseError("pypi project name invalid".into())
+        }
         IndexFetchError::UpstreamUnavailable => {
             UpstreamFetchError::NetworkError("upstream fetch failed".into())
         }
@@ -806,6 +813,19 @@ mod tests {
     fn map_pypi_helper_error_internal_to_parse_error() {
         let mapped = map_pypi_helper_error(&pypi_helpers::IndexFetchError::Internal("x".into()));
         assert!(matches!(mapped, UpstreamFetchError::ParseError(_)));
+    }
+
+    #[test]
+    fn map_pypi_helper_error_invalid_name_to_parse_error_sanitised() {
+        let mapped = map_pypi_helper_error(&pypi_helpers::IndexFetchError::InvalidName {
+            cause: "pypi.name: contains a byte outside [A-Za-z0-9_.-]".into(),
+        });
+        match mapped {
+            UpstreamFetchError::ParseError(s) => {
+                assert_eq!(s, "pypi project name invalid");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
     }
 
     #[test]

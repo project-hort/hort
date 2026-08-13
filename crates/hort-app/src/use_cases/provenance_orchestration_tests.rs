@@ -39,6 +39,7 @@ use hort_domain::types::ContentHash;
 use sha2::Digest;
 
 use super::*;
+use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 use crate::use_cases::test_support::*;
 
 // ---------------------------------------------------------------------------
@@ -831,6 +832,160 @@ async fn required_unsigned_window_closed_rejects_unsigned() {
     assert_eq!(ev.reason, ProvenanceRejectReason::Unsigned);
 }
 
+// ===========================================================================
+// Issue #115 defect (b) — referenced-tree descendants HOLD on
+// NoAttestation × Required, even with the window closed.
+//
+// The defect: OCI pull-through writes `oci_config`/`oci_layer` edges before
+// the blobs are pulled, so each layer ingests as a ZERO-WINDOW descendant
+// (#46: anchor = ingested_at − duration ⇒ window_open == false immediately).
+// Under `Required`, the ingest-enqueued verify found no bundle for the layer
+// digest (cosign signs only the top-level digest) and terminally rejected it
+// as `Unsigned` — BEFORE the subject's cascade could clear it. The cascade
+// then refuses the rejected constituent ("terminal is terminal"), so a
+// correctly-signed image became permanently unpullable.
+// ===========================================================================
+
+/// Seed an `oci_layer` content-reference edge making the fixture's subject
+/// artifact a referenced-tree descendant of some other artifact — the exact
+/// shape the OCI pull-through edge writer produces for a manifest's layer
+/// blob before the blob itself is pulled.
+fn seed_descendant_edge(f: &Fixture) {
+    futures::executor::block_on(async {
+        f.content_references
+            .insert(ContentReference {
+                source_artifact_id: Uuid::new_v4(), // the parent manifest
+                target_content_hash: f.content_hash.clone(),
+                kind: "oci_layer".to_string(),
+                metadata: serde_json::Value::Null,
+                repository_id: f.repository_id,
+                recorded_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("seed descendant content-reference edge");
+    });
+}
+
+/// **The regression test for #115 defect (b).** Identical setup to
+/// `required_unsigned_window_closed_rejects_unsigned` above (zero-width
+/// window ⇒ `window_open == false`) except the artifact carries an
+/// `oci_layer` edge making it a referenced-tree descendant. It must HOLD as
+/// `HeldPendingSignature` instead of terminally rejecting, so the parent's
+/// later cascade can still clear it.
+#[tokio::test]
+async fn required_unsigned_window_closed_descendant_holds_instead_of_rejecting() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0); // window CLOSED
+    seed_descendant_edge(&f); // …but it IS a descendant
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+        },
+        "a zero-window referenced-tree descendant must HOLD (issue #115 defect (b)), \
+         not terminally reject as Unsigned — and must report the existing \
+         HeldPendingSignature summary, not the allowed-unsigned NoAttestation no-op",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Quarantined,
+        "held descendant stays Quarantined so the parent's cascade can clear it",
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "the descendant hold appends NO provenance verdict event",
+    );
+}
+
+/// The carve-out is scoped to the unsigned arm: a descendant whose
+/// signature is genuinely BAD still rejects terminally. A blanket
+/// "descendants are never rejected" would let a tampered layer through.
+#[tokio::test]
+async fn required_descendant_with_bad_signature_still_rejects() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::rejected(ProvenanceRejectReason::UntrustedIdentity),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 24 * 3600); // even mid-window
+    seed_descendant_edge(&f);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::UntrustedIdentity),
+        },
+        "a BAD signature on a descendant is position-independent and still terminal",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+}
+
+/// **Error-direction regression (the load-bearing half).** A
+/// `content_references` lookup failure at VERDICT time must PROPAGATE —
+/// the job fails, the dispatcher retries, and the artifact stays
+/// `Quarantined`. Degrading to `false` (the correct default at INGEST,
+/// where it means "keep the full window") would here mean "no descendant
+/// hold" and fall straight into the terminal `Rejected{Unsigned}` arm,
+/// turning a transient read error into an unrecoverable rejection of a
+/// legitimately-signed image's layer.
+#[tokio::test]
+async fn verdict_time_descendant_lookup_failure_propagates_and_applies_no_verdict() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    // Window CLOSED — so a degrade-to-`false` bug would terminally reject.
+    seed_required_policy_with_duration(&f, 0);
+    f.content_references
+        .fail_next_find_by_target(DomainError::Invariant("content_references down".into()));
+
+    let err =
+        f.uc.verify_artifact(f.artifact_id)
+            .await
+            .expect_err("a verdict-time descendant-lookup failure must propagate, not degrade");
+    assert!(
+        format!("{err}").contains("content_references down"),
+        "the underlying lookup error must surface verbatim: {err}"
+    );
+
+    // The load-bearing assertions: NO verdict was applied.
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Quarantined,
+        "a propagated lookup failure must leave the artifact Quarantined — \
+         never terminally rejected on a read error",
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "no provenance verdict event may be appended when the lookup failed",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Required + unsigned + MISSING quarantine_window_start on an ALREADY
 // `Quarantined` artifact → window_open = false (defensive-only branch,
@@ -1015,42 +1170,59 @@ async fn required_young_none_status_forged_signature_still_rejects_immediately()
 }
 
 // ---------------------------------------------------------------------------
-// issue #90 facet 2 — a provenance-verdict commit built from a stale
-// in-memory `Artifact` snapshot (captured before a concurrently-committed
-// quarantine transition landed) must not clobber the anchor that other
-// transition just wrote. `commit_provenance_verdict` is column-scoped
-// (`quarantine_status` only); a full-row write-back (the pre-fix
-// `commit_transition` shape) would zero `quarantine_window_start` back out.
+// issue #90 facet 2, AMENDED BY issue #108 (H2b) — a provenance-verdict
+// commit built from a stale in-memory `Artifact` snapshot must not clobber
+// EITHER the anchor a concurrently-committed transition wrote (#90) NOR the
+// `quarantine_status` that transition wrote (#108).
+//
+// **This test previously asserted the opposite of what it asserts now, and
+// the flip is the point.** As written for #90 it ended with "the verdict's
+// own status change must land" — i.e. it CODIFIED the status clobber as the
+// contract, protecting only `quarantine_window_start`. #90 scoped the write
+// to the status column, which hardened every OTHER column against the stale
+// snapshot but left the security-load-bearing one written unconditionally
+// from it. The scenario is now oriented the way the real defect runs: the
+// CONCURRENT writer commits `Rejected` (a scan verdict), and the stale
+// provenance verdict resolves `Verified` — which leaves the status
+// `Quarantined`, exactly equal to what it loaded. Under the skip-unchanged
+// rule that is no status write at all, so the concurrent `Rejected`
+// survives. Pre-#108 the same commit wrote `Quarantined` back over
+// `Rejected`, resurrecting a rejected artifact into a timer-releasable
+// state. The #90 anchor-survival assertion is kept verbatim alongside it.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn provenance_verdict_commit_does_not_clobber_concurrently_written_anchor() {
+async fn provenance_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor() {
     let f = build(RepositoryFormat::Oci, None, vec![], vec![]);
 
     // A STALE in-memory snapshot — as if `verify_artifact` loaded the
-    // artifact BEFORE the concurrent quarantine transition below landed:
-    // `None` status, no anchor.
+    // artifact BEFORE the concurrent scan verdict below landed:
+    // `Quarantined`, no anchor yet.
     let mut stale = f.artifacts.get(f.artifact_id).unwrap();
-    stale.quarantine_status = QuarantineStatus::None;
+    stale.quarantine_status = QuarantineStatus::Quarantined;
     stale.quarantine_window_start = None;
+    // What the verify path loaded — the guard the conditional write keys on.
+    let prior_status = stale.quarantine_status;
 
-    // The concurrent quarantine transition commits, setting the anchor —
+    // The concurrent scan verdict commits `Rejected` AND sets the anchor —
     // AFTER the stale snapshot above was captured.
     let anchor = chrono::Utc::now();
     let mut current = f.artifacts.get(f.artifact_id).unwrap();
-    current.quarantine_status = QuarantineStatus::Quarantined;
+    current.quarantine_status = QuarantineStatus::Rejected;
     current.quarantine_window_start = Some(anchor);
     f.artifacts.insert(current);
 
-    // The (stale) verdict commit now runs, deciding Rejected from its OWN
-    // stale view — exactly the shape `Artifact::complete_provenance`'s
-    // `Rejected` arm would have produced on `stale`.
-    stale.quarantine_status = QuarantineStatus::Rejected;
-    let event = DomainEvent::ProvenanceRejected(hort_domain::events::ProvenanceRejected {
+    // The (stale) provenance verdict now commits `Verified`. Per
+    // `Artifact::complete_provenance`'s `Verified` arm the status is left
+    // untouched — still `Quarantined` on the stale snapshot, i.e. EQUAL to
+    // `prior_status`.
+    let event = DomainEvent::ProvenanceVerified(hort_domain::events::ProvenanceVerified {
         artifact_id: f.artifact_id,
         content_hash: f.content_hash.clone(),
-        backend: "(policy)".to_string(),
-        reason: ProvenanceRejectReason::Unsigned,
+        backend: "cosign".to_string(),
+        signer: sample_identity(),
+        predicate_type: None,
+        cascaded_from: None,
     });
     f.lifecycle
         .commit_provenance_verdict(
@@ -1063,6 +1235,7 @@ async fn provenance_verdict_commit_does_not_clobber_concurrently_written_anchor(
                 causation_id: None,
                 actor: system_actor(),
             },
+            prior_status,
         )
         .await
         .expect("commit_provenance_verdict");
@@ -1071,13 +1244,388 @@ async fn provenance_verdict_commit_does_not_clobber_concurrently_written_anchor(
     assert_eq!(
         saved.quarantine_status,
         QuarantineStatus::Rejected,
-        "the verdict's own status change must land"
+        "issue #108: the concurrently-committed Rejected must SURVIVE — a Verified verdict \
+         leaves the status unchanged from what it loaded, so it must write no status at all. \
+         Reverting it to Quarantined here is the resurrect-then-timer-release defect."
     );
     assert_eq!(
         saved.quarantine_window_start,
         Some(anchor),
         "the concurrently-committed anchor must survive — a column-scoped verdict commit must \
          not clobber it with the stale snapshot's None"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// issue #108 H2b, the OTHER arm — when the verdict DOES change the status
+// (a genuine `Rejected` decision, not the skip-unchanged `Verified` case)
+// and the persisted row has meanwhile moved off the loaded status, the
+// conditional write must fail `Conflict` rather than overwrite. This is the
+// defense-in-depth backstop behind the event-store OCC: it fires even on a
+// path whose append did not conflict (here, `ExpectedVersion::Any`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn provenance_verdict_commit_conflicts_when_status_moved_under_it() {
+    let f = build(RepositoryFormat::Oci, None, vec![], vec![]);
+
+    let mut stale = f.artifacts.get(f.artifact_id).unwrap();
+    stale.quarantine_status = QuarantineStatus::Quarantined;
+    let prior_status = stale.quarantine_status;
+
+    // Concurrent writer moves the row off `prior_status`.
+    let mut current = f.artifacts.get(f.artifact_id).unwrap();
+    current.quarantine_status = QuarantineStatus::Released;
+    f.artifacts.insert(current);
+
+    // The stale verdict decides `Rejected` — a real status CHANGE, so
+    // skip-unchanged does not apply and the conditional write is reached.
+    stale.quarantine_status = QuarantineStatus::Rejected;
+    let event = DomainEvent::ProvenanceRejected(hort_domain::events::ProvenanceRejected {
+        artifact_id: f.artifact_id,
+        content_hash: f.content_hash.clone(),
+        backend: "(policy)".to_string(),
+        reason: ProvenanceRejectReason::Unsigned,
+    });
+    let err = f
+        .lifecycle
+        .commit_provenance_verdict(
+            &stale,
+            AppendEvents {
+                stream_id: StreamId::artifact(f.artifact_id),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event)],
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+            },
+            prior_status,
+        )
+        .await
+        .expect_err("a status that moved under the verdict must Conflict, not be overwritten");
+    assert!(
+        matches!(err, DomainError::Conflict(_)),
+        "expected Conflict (distinct from NotFound, which stays reserved for an absent id); \
+         got {err:?}"
+    );
+    assert_eq!(
+        f.artifacts.get(f.artifact_id).unwrap().quarantine_status,
+        QuarantineStatus::Released,
+        "the concurrent writer's status must be left exactly as it was"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// issue #108 Item 4 — true-concurrency interleave regression pin.
+//
+// The two #90-lineage tests above (flipped by Item 1) call
+// `commit_provenance_verdict` DIRECTLY with a hand-built "stale" `Artifact`
+// and `ExpectedVersion::Any` — they never drive `verify_artifact`'s own
+// early-version-read code, and `ExpectedVersion::Any` means no OCC check is
+// even attempted. This test is the composed end-to-end proof: it drives the
+// REAL `verify_artifact` entry point (issue #108's actual production code
+// path, including Item 1's early `read_expected_version` call and #115
+// Item 3's descendant resolution — nothing here is hand-rolled), and injects
+// a concurrent scan-verdict commit exactly inside the H2a race window: after
+// `verify_artifact`'s own artifact load + early version read (both happen
+// at the very top of the function, before any bundle-fetch/verify round
+// trip), but before its own `commit_provenance_verdict` call at the end.
+//
+// The injection point is the `ProvenancePort::verify()` call itself —
+// `verify_artifact` awaits it well inside the H2a window (after the load +
+// early read, before the commit), so a verifier stub that performs the
+// "concurrent write" as a side effect of answering the verify request lands
+// it at exactly the right point in the REAL control flow, with no manual
+// pausing/resuming of `verify_artifact` and no direct call to any of its
+// private helper methods.
+//
+// **Documented mock limitation (per the directive's explicit fallback
+// clause):** `MockArtifactLifecycle::commit_provenance_verdict` does not
+// consult `self.event_store` for `expected_version` validation at all —
+// unlike `commit_scan_result_with_score`, which CAN be wired to a shared
+// `MockEventStore` via `with_scan_result_paired_mocks` and genuinely
+// `append`s through it, `commit_provenance_verdict`'s test double only ever
+// records into `self.transitions` / `self.artifacts`, so it can never
+// observe an event-store version conflict regardless of what
+// `expected_version` the real early-read computed. Item 1's event-store OCC
+// (layer 1) therefore cannot be exercised end-to-end through this mock; the
+// event-store-backed Postgres adapter tests already added in Item 1
+// (`save_verdict_status_in_tx_conflicts_when_prior_status_changed` and
+// siblings, run live against a real Postgres in that item's report) are
+// what actually proves layer 1 works. This test instead pins the STRONGEST
+// property reachable through `verify_artifact`'s real control flow: layer 2
+// (skip-unchanged). The interleaved verdict here is `Verified` — per
+// `Artifact::complete_provenance`'s `Verified` arm (ADR 0007: "a Verified
+// outcome does not release the artifact early"), the domain transition
+// leaves `quarantine_status` unchanged from what `verify_artifact` loaded,
+// so `prior_status == artifact.quarantine_status` always holds and the
+// status-column write is skipped ENTIRELY — not merely refused via a
+// conditional-write Conflict (layer 3). This is precisely the ORIGINAL H2
+// defect shape from the design doc's own Context section ("a signed image
+// that also trips a scan policy resurrects Rejected -> Quarantined") — the
+// composed proof the directive asks for.
+/// Test-only `ProvenancePort` whose `verify()` call injects the concurrent
+/// scan-rejection commit as a side effect of answering the verify request —
+/// see the regression pin below for why this lands the write genuinely
+/// inside `verify_artifact`'s real H2a race window (after its load + early
+/// version read, before its own commit), with no manual pausing of the
+/// function under test and no direct call to any of its private helpers.
+struct InterleavingProvenancePort {
+    artifacts: Arc<MockArtifactRepository>,
+    events: Arc<MockEventStore>,
+    artifact_id: Uuid,
+}
+
+impl ProvenancePort for InterleavingProvenancePort {
+    fn name(&self) -> &str {
+        "cosign"
+    }
+
+    fn applies_to(&self, format: &str) -> bool {
+        format == "oci"
+    }
+
+    fn verify<'a>(
+        &'a self,
+        _subject: &'a ProvenanceSubject<'a>,
+        _bundles: &'a [AttestationBundle],
+        _requirements: &'a ProvenanceRequirements<'a>,
+    ) -> BoxFuture<'a, DomainResult<ProvenanceVerdict>> {
+        Box::pin(async move {
+            // The concurrent writer's own load-modify-commit, via the SAME
+            // real domain transition `record_scan_result`'s reject branch
+            // uses — landing here, squarely inside `verify_artifact`'s
+            // window between its early version read (already executed by
+            // the time this runs) and its eventual `commit_provenance_verdict`
+            // call (not yet run).
+            let mut concurrent = self
+                .artifacts
+                .get(self.artifact_id)
+                .expect("artifact seeded before verify_artifact was called");
+            concurrent
+                .reject_from_scan("critical severity finding".into())
+                .expect("Quarantined -> Rejected is a valid domain transition");
+            self.artifacts.insert(concurrent);
+
+            // The matching stream tail a real `record_scan_result` reject
+            // commit appends: ScanCompleted (dirty, first in the batch)
+            // then ArtifactRejected — the exact shape issue #108 H3 (Item
+            // 3) reads to deny release authority.
+            let stream_id = StreamId::artifact(self.artifact_id);
+            let quarantined = dummy_persisted_event(&stream_id, self.artifact_id, 0);
+            let scan_completed = PersistedEvent {
+                event_id: Uuid::new_v4(),
+                stream_id: stream_id.clone(),
+                stream_position: 1,
+                global_position: 2,
+                event: DomainEvent::ScanCompleted(hort_domain::events::ScanCompleted {
+                    artifact_id: self.artifact_id,
+                    scanner: "trivy".into(),
+                    finding_count: 1,
+                    severity_summary: hort_domain::events::SeveritySummary {
+                        critical: 1,
+                        high: 0,
+                        medium: 0,
+                        low: 0,
+                        negligible: 0,
+                    },
+                    findings_blob: Some("f".repeat(64).parse().unwrap()),
+                }),
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+                event_version: 1,
+                stored_at: chrono::Utc::now(),
+            };
+            let rejected = PersistedEvent {
+                event_id: Uuid::new_v4(),
+                stream_id: stream_id.clone(),
+                stream_position: 2,
+                global_position: 3,
+                event: DomainEvent::ArtifactRejected(hort_domain::events::ArtifactRejected {
+                    artifact_id: self.artifact_id,
+                    rejected_by: hort_domain::events::RejectionReason::Scanner,
+                    reason: "critical severity finding".into(),
+                }),
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+                event_version: 1,
+                stored_at: chrono::Utc::now(),
+            };
+            self.events
+                .set_stream(&stream_id, vec![quarantined, scan_completed, rejected]);
+
+            Ok(ProvenanceVerdict::verified(sample_identity(), None))
+        })
+    }
+
+    fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_and_stays_unreleasable(
+) {
+    // Hand-built fixture (not `build()`/`build_with_payload()`): the
+    // interleaving port needs `Arc` handles to `artifacts` + `events`
+    // BEFORE the use case exists, and `build()` constructs both internally.
+    let artifacts = Arc::new(MockArtifactRepository::new());
+    let repositories = Arc::new(MockRepositoryRepository::new());
+    let projections = Arc::new(MockPolicyProjectionRepository::new());
+    let content_references = Arc::new(MockContentReferenceIndex::new());
+    let storage = Arc::new(MockStoragePort::new());
+    let events = Arc::new(MockEventStore::new());
+    let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+    let upstream_proxy = Arc::new(MockUpstreamProxy::new());
+    let upstream_resolver = Arc::new(MockUpstreamResolver::new());
+
+    let mut repo: Repository = sample_repository();
+    repo.format = RepositoryFormat::Oci;
+    let repository_id = repo.id;
+    repositories.insert(repo);
+
+    let payload = b"{\"schemaVersion\":2,\"manifest\":true}".to_vec();
+    let content_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(&payload))
+        .parse()
+        .expect("valid sha256");
+    let mut artifact: Artifact = sample_artifact(QuarantineStatus::Quarantined);
+    artifact.repository_id = repository_id;
+    artifact.sha256_checksum = content_hash.clone();
+    let artifact_id = artifact.id;
+    artifacts.insert(artifact);
+    storage.insert_content(content_hash, payload);
+
+    // `VerifyIfPresent`, deliberately NOT `Required`: verification is
+    // still ATTEMPTED either way (`dispatch_and_fold` calls every
+    // applicable port regardless of mode — only `complete_provenance`'s
+    // INTERPRETATION of the verdict is mode-dependent), so this does not
+    // weaken assertion (a) at all. It matters for assertion (b): under
+    // `Required`, `resolve_provenance_clearance` independently resolves
+    // `Pending` whenever no REAL `ProvenanceVerified` event exists on the
+    // stream (ADR 0027) — and the mock `commit_provenance_verdict` never
+    // actually appends one to `events` (documented above), so a `Required`
+    // policy would deny release via the UNRELATED provenance gate
+    // regardless of whether Item 3's scan-authority fix works at all,
+    // confounding assertion (b). `VerifyIfPresent` resolves provenance
+    // clearance to `NotRequired` (never gates release), isolating (b) to
+    // exactly the scan-authority derivation issue #108 Item 3 fixed.
+    let mut policy = projection(
+        PolicyScope::Repository(repository_id),
+        ProvenanceMode::VerifyIfPresent,
+        vec![sample_pattern()],
+    );
+    policy.scan_backends = vec!["trivy".to_string()];
+    projections.insert(policy);
+
+    // The artifact's OWN stream, as if freshly ingested — the state
+    // `verify_artifact`'s early version read observes BEFORE the
+    // interleave. `dummy_persisted_event` also seeds `f.artifacts`-style
+    // realism: a real ingest always has SOME event at position 0.
+    let stream_id = StreamId::artifact(artifact_id);
+    events.set_stream(
+        &stream_id,
+        vec![dummy_persisted_event(&stream_id, artifact_id, 0)],
+    );
+
+    let interleaving_port: Arc<dyn ProvenancePort> = Arc::new(InterleavingProvenancePort {
+        artifacts: artifacts.clone(),
+        events: events.clone(),
+        artifact_id,
+    });
+
+    let uc = ProvenanceOrchestrationUseCase::new(
+        artifacts.clone(),
+        repositories,
+        projections.clone(),
+        content_references,
+        storage,
+        lifecycle,
+        crate::event_store_publisher::wrap_for_test(events.clone()),
+        vec![interleaving_port],
+        upstream_proxy,
+        upstream_resolver,
+    );
+
+    let outcome = uc
+        .verify_artifact(artifact_id)
+        .await
+        .expect("verify_artifact must not itself error");
+    assert!(
+        matches!(
+            outcome,
+            ProvenanceRunOutcome::Applied {
+                verdict: ProvenanceVerdictSummary::Verified,
+                ..
+            }
+        ),
+        "the (stale) verdict is Verified — the interleave targets the commit's status \
+         write, not the verify dispatch itself; got {outcome:?}"
+    );
+
+    // (a) The final persisted status is the concurrently-committed
+    // Rejected — the provenance commit's stale Verified-from-Quarantined
+    // snapshot did NOT resurrect it.
+    assert_eq!(
+        artifacts.get(artifact_id).unwrap().quarantine_status,
+        QuarantineStatus::Rejected,
+        "issue #108: a signed subject's provenance commit, racing a concurrent scan \
+         rejection, must never resurrect Rejected back to Quarantined"
+    );
+
+    // (b) Not timer-releasable afterward — drives the REAL
+    // `QuarantineUseCase::release_expired`, sharing the SAME `artifacts` +
+    // `events` state this test just produced.
+    //
+    // **Verified by deliberately breaking each layer in isolation** (not
+    // left in the committed test — done by hand while writing this pin):
+    // reverting Item 1 alone makes assertion (a) fail (the status
+    // resurrects to `Quarantined`, exactly the pre-#108 defect). Reverting
+    // Item 3 alone (presence-only `resolve_release_authority`) does NOT
+    // make assertion (b) fail here — `released` stays empty regardless,
+    // because by the time `release_expired` runs, Item 1 has already left
+    // the persisted status at `Rejected`, and `Artifact::release`'s OWN
+    // pre-existing domain guard (`crates/hort-domain/src/entities/
+    // artifact.rs`, `source_state_ok`) refuses release from any status
+    // other than `Quarantined`/`ScanIndeterminate` — a SEPARATE,
+    // pre-#108 protection that also happens to cover this exact scenario.
+    // This is expected, not a gap: Item 3 was scoped as defense-in-depth
+    // for exactly the case "H2 is somehow still broken" (its own
+    // directive's framing) — in the scenario where H2 (Item 1) DOES hold,
+    // as it does here, Item 3's own independent contribution is
+    // legitimately redundant with the domain guard. Item 3's
+    // INDEPENDENTLY-isolated proof (the authority predicate denying while
+    // the candidate's PROJECTED status is still `Quarantined`, matching
+    // its own threat model) already lives in
+    // `quarantine_use_case.rs`'s `release_expired_denies_release_when_latest_scan_is_dirty`
+    // / `_when_clean_scan_followed_by_later_reject` — not duplicated
+    // here. This test's assertion (b) is the honest composed-stack
+    // property: after a real interleave, NOTHING in the stack (Item 1,
+    // Item 3, or the domain guard, whichever ends up load-bearing) lets
+    // the artifact through.
+    let quarantine_repositories = Arc::new(MockRepositoryRepository::new());
+    let mut quarantine_repo = sample_repository();
+    quarantine_repo.id = repository_id;
+    quarantine_repositories.insert(quarantine_repo);
+    let quarantine_uc = QuarantineUseCase::new(
+        artifacts.clone(),
+        crate::event_store_publisher::wrap_for_test(events.clone()),
+        Arc::new(MockArtifactLifecycle::new(artifacts.clone())),
+        quarantine_repositories,
+        projections,
+        Arc::new(MockContentReferenceIndex::new()),
+        Arc::new(MockStoragePort::new()),
+        Arc::new(MockJobsRepository::new()),
+    );
+    let released = quarantine_uc
+        .release_expired(vec![artifact_id])
+        .await
+        .expect("release_expired must not itself error");
+    assert!(
+        released.is_empty(),
+        "issue #108 Item 3: the artifact must NOT be timer-releasable — its latest \
+         ScanCompleted is dirty, so resolve_release_authority must deny; got {released:?}"
     );
 }
 
@@ -3719,6 +4267,76 @@ async fn cascade_verified_single_image_manifest_clears_config_and_layers() {
 }
 
 // ---------------------------------------------------------------------------
+// issue #108 H2c — `commit_cascade_event` must not clobber a concurrently-
+// written column on the constituent's stream, the same class of defect
+// Item 1 closed on the two primary verdict paths. The cascade's
+// `ProvenanceVerified` always leaves `quarantine_status` unchanged
+// (`Artifact::cascade_provenance_clearance` takes `&self`), so
+// skip-unchanged means the routed-through `commit_provenance_verdict` call
+// makes NO status-column write at all — proven here by calling
+// `commit_cascade_event` directly (mirrors
+// `provenance_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor`'s
+// stale-vs-concurrent construction) with a STALE constituent snapshot while
+// a "concurrently committed" DIFFERENT snapshot sits in the mock's queryable
+// projection. Pre-#108 (full-row `commit_transition`) the stale snapshot's
+// columns would have overwritten the concurrent write; post-#108 the
+// cascaded event still appends but the concurrent write survives untouched.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cascade_commit_does_not_clobber_concurrently_written_anchor() {
+    let f = build(RepositoryFormat::Oci, None, vec![], vec![]);
+    let subject_hash = f.content_hash.clone();
+    let config = hexhash('a');
+
+    // A STALE constituent snapshot — as if `cascade_one` had loaded it
+    // BEFORE a concurrent transition (e.g. the constituent's own ingest
+    // finishing its quarantine stamp) landed: no anchor yet.
+    let mut stale = sample_artifact(QuarantineStatus::Quarantined);
+    stale.repository_id = f.repository_id;
+    stale.sha256_checksum = config.clone();
+    stale.quarantine_window_start = None;
+    let constituent_id = stale.id;
+
+    // The event `cascade_provenance_clearance` would produce for this
+    // constituent — built from the SAME stale snapshot (its identity/hash
+    // never changes), matching what `cascade_one` passes to
+    // `commit_cascade_event`.
+    let event = stale
+        .cascade_provenance_clearance(subject_hash.clone(), sample_identity(), None, "cosign-key")
+        .expect("Quarantined constituent takes the cascaded clearance");
+
+    // The concurrent transition commits, setting the anchor — AFTER the
+    // stale snapshot above was captured.
+    let anchor = chrono::Utc::now();
+    let mut current = stale.clone();
+    current.quarantine_window_start = Some(anchor);
+    f.artifacts.insert(current);
+
+    f.uc.cascade
+        .commit_cascade_event(&stale, event, ExpectedVersion::Any)
+        .await
+        .expect("commit_cascade_event");
+
+    let cascaded = cascaded_events(&f);
+    assert_eq!(
+        cascaded.len(),
+        1,
+        "the cascaded ProvenanceVerified must still append"
+    );
+    assert_eq!(cascaded[0].0, constituent_id);
+
+    let saved = f.artifacts.get(constituent_id).unwrap();
+    assert_eq!(
+        saved.quarantine_window_start,
+        Some(anchor),
+        "issue #108 H2c: the concurrently-committed anchor must survive — commit_cascade_event \
+         must not clobber it with the stale snapshot's None. Routing through the full-row \
+         commit_transition (the pre-fix shape) is exactly the regression this pins."
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Terminal is terminal: an already-rejected constituent is NOT resurrected.
 // ---------------------------------------------------------------------------
 
@@ -4052,15 +4670,16 @@ async fn cascade_commit_failure_warns_and_continues_with_remaining() {
     f.lifecycle
         .fail_next_commit(DomainError::Invariant("injected commit failure".into()));
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     let cascaded = cascaded_events(&f);
     assert_eq!(
@@ -4104,15 +4723,16 @@ async fn cascade_version_conflict_retries_once_and_lands() {
     f.lifecycle
         .fail_next_commit(DomainError::Conflict("stream moved".into()));
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     let cascaded = cascaded_events(&f);
     assert_eq!(
@@ -4145,15 +4765,16 @@ async fn cascade_version_conflict_twice_warns_and_skips_remaining_still_cascade(
     f.lifecycle
         .fail_next_commit(DomainError::Conflict("stream moved again".into()));
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     let cascaded = cascaded_events(&f);
     assert_eq!(
@@ -4187,15 +4808,16 @@ async fn cascade_version_conflict_retry_observes_clearance_appeared_and_skips() 
         vec![persisted_verified(config_id, Some(hexhash('8')))],
     );
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &f.content_hash,
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign-key",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &f.content_hash,
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign-key",
+        )
+        .await;
 
     assert!(
         f.lifecycle.committed_transitions().is_empty(),
@@ -4351,15 +4973,16 @@ async fn cascade_skips_a_self_referencing_digest() {
     );
     seed_held_artifact(&f, f.repository_id, &selfhash);
 
-    f.uc.cascade_clearance(
-        f.repository_id,
-        &selfhash, // subject == the referenced digest
-        &payload,
-        &sample_identity(),
-        None,
-        "cosign",
-    )
-    .await;
+    f.uc.cascade
+        .cascade_clearance(
+            f.repository_id,
+            &selfhash, // subject == the referenced digest
+            &payload,
+            &sample_identity(),
+            None,
+            "cosign",
+        )
+        .await;
 
     assert!(
         f.lifecycle.committed_transitions().is_empty(),

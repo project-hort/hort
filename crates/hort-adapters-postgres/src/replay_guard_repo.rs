@@ -158,14 +158,21 @@ impl ReplayGuardPort for PgReplayGuardRepository {
 // Tests
 // ---------------------------------------------------------------------------
 //
-// DB-backed tests follow the crate's established Tier-2 pattern:
-// `#[ignore = "requires DATABASE_URL"]` + an explicit env read so
-// `cargo test --workspace --lib` stays green locally without a
-// database; CI/Tier-2 runs them with `-- --ignored`.
+// DB-backed tests follow the crate's established Tier-2 pattern: runtime
+// self-skip (issue #94) via `test_pool()` returning `None` when
+// `DATABASE_URL` is unset (each test does
+// `let Some(pool) = test_pool().await else { return; };`) — a clean,
+// fast no-op under plain `cargo test`, full execution when
+// `DATABASE_URL` is wired. `test_pool()` routes through
+// `test_support::shared_migrated_pool()`, which connects to and migrates
+// the shared `DATABASE_URL` target (not a per-test isolated database —
+// isolation here is per-test-unique `issuer_name` values plus explicit
+// cleanup DELETEs), so every test carries `#[serial(hort_pg_db)]`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn jti_key(issuer: &str, jti: &str) -> ReplayKey {
         ReplayKey::Jti {
@@ -185,15 +192,14 @@ mod tests {
     }
 
     async fn test_pool() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        PgPool::connect(&url).await.ok()
+        crate::test_support::shared_migrated_pool().await
     }
 
     /// First presentation of a `jti` ⇒ FirstSeen (row inserted);
     /// second presentation of the *same* `jti` ⇒ Replayed (no row).
     /// This is the centerpiece replay-detection invariant.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn jti_first_seen_then_replayed() {
         let Some(pool) = test_pool().await else {
             return;
@@ -223,7 +229,7 @@ mod tests {
     /// A different `jti` under the same issuer is independent ⇒
     /// FirstSeen (a genuinely-new JWT must still mint).
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn distinct_jti_is_independent_first_seen() {
         let Some(pool) = test_pool().await else {
             return;
@@ -253,7 +259,7 @@ mod tests {
     /// Replayed; a composite differing only in `iat` (a genuinely
     /// new token from the same subject) ⇒ FirstSeen.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn composite_replay_and_distinct_iat() {
         let Some(pool) = test_pool().await else {
             return;
@@ -295,7 +301,7 @@ mod tests {
     /// populated alongside `key_kind='jti'`). The adapter never builds
     /// such a row — this pins the DB-side defence-in-depth.
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn check_constraint_rejects_mixed_shape_row() {
         let Some(pool) = test_pool().await else {
             return;
@@ -324,7 +330,7 @@ mod tests {
     /// `prune_expired` deletes only rows past `expires_at` and leaves
     /// unexpired rows authoritative (cleanup degrades safe).
     #[tokio::test]
-    #[ignore = "requires DATABASE_URL"]
+    #[serial(hort_pg_db)]
     async fn prune_expired_removes_only_stale_rows() {
         let Some(pool) = test_pool().await else {
             return;

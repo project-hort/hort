@@ -19,7 +19,7 @@ hort-domain     = { path = "../hort-domain" }
 # decoding is the documented workaround. Same crate version as the rest
 # of the workspace (`hort-formats`, `hort-http-npm`, `hort-http-oci`,
 # `hort-adapters-upstream-http`).
-base64        = "0.22"
+base64        = "0.23"
 bytes         = { workspace = true }
 chrono        = { workspace = true }
 futures       = { workspace = true }
@@ -35,15 +35,18 @@ url           = { workspace = true }
 uuid          = { workspace = true }
 
 [dev-dependencies]
-tokio    = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
-wiremock = "0.6"
+tokio        = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+wiremock     = "0.6"
+# `DebuggingRecorder` + `with_local_recorder` for the kid-miss-cooldown
+# metric assertion (`hort_jwks_refresh_total{result="kid_miss_throttled"}`).
+metrics-util = { workspace = true }
 # Generate self-signed certs in-process for the extra-CA HTTPS JWKS
 # test (see `extra_ca_anchors_allows_tls_to_private_ca_jwks_server`).
 # `rcgen` is test-only; production paths never construct certificates.
-rcgen       = "0.13"
+rcgen       = "0.14"
 # `axum-server` provides `bind_rustls` for the in-process HTTPS JWKS test
 # server. wiremock does not speak TLS, so we stand up a minimal
 # TLS-aware listener for the extra-CA positive/negative test pair.
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 axum        = { workspace = true }
 rustls      = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }

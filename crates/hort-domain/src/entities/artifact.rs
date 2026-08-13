@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::entities::quarantine_transitions::{self, QuarantineEvent};
 use crate::entities::repository::RepositoryFormat;
 use crate::entities::scan_policy::ProvenanceMode;
 use crate::error::{DomainError, DomainResult};
@@ -330,7 +331,12 @@ impl Artifact {
     /// resolved policy duration via
     /// [`crate::policy::effective_quarantine_deadline`].
     pub fn quarantine(&mut self, window_start: DateTime<Utc>) -> DomainResult<ArtifactQuarantined> {
-        if self.quarantine_status != QuarantineStatus::None {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::Quarantine,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot quarantine artifact in state {}",
                 self.quarantine_status
@@ -360,11 +366,17 @@ impl Artifact {
     /// rejection. (This is the `quarantineDuration: 0` permissive-mode
     /// contract — see `docs/architecture/explanation/scanning-pipeline.md`.)
     pub fn record_clean_scan(&self) -> DomainResult<()> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::None => Ok(()),
-            other => Err(DomainError::Invariant(format!(
-                "cannot record clean scan for artifact in state {other}"
-            ))),
+        match quarantine_transitions::allowed_targets(
+            QuarantineEvent::RecordCleanScan,
+            self.quarantine_status,
+        ) {
+            Some(_) => Ok(()),
+            None => {
+                let other = self.quarantine_status;
+                Err(DomainError::Invariant(format!(
+                    "cannot record clean scan for artifact in state {other}"
+                )))
+            }
         }
     }
 
@@ -382,13 +394,16 @@ impl Artifact {
     /// permissive-mode contract — see
     /// `docs/architecture/explanation/scanning-pipeline.md`.)
     pub fn reject_from_scan(&mut self, reason: String) -> DomainResult<ArtifactRejected> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::None => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot reject artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::RejectFromScan,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot reject artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::Rejected;
         self.rejection_reason = Some(RejectionReason::Scanner);
@@ -411,13 +426,16 @@ impl Artifact {
         rule_id: Uuid,
         reason: String,
     ) -> DomainResult<ArtifactRejected> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::Released => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot retroactively-reject artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::RejectFromRetroactiveCuration,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot retroactively-reject artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::Rejected;
         self.rejection_reason = Some(RejectionReason::CurationRetroactive { rule_id });
@@ -481,13 +499,16 @@ impl Artifact {
         outcome: &ScanOutcome,
         reason: String,
     ) -> DomainResult<Option<ArtifactRejected>> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::Released => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot retroactively scan-re-hold artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::RejectFromScanPolicyRetroactive,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot retroactively scan-re-hold artifact in state {other}"
+            )));
         }
         match outcome {
             // Still-passing under the new policy — unchanged verdict, no-op
@@ -550,14 +571,16 @@ impl Artifact {
         curator_id: Uuid,
         reason: String,
     ) -> DomainResult<ArtifactRejected> {
-        match self.quarantine_status {
-            QuarantineStatus::None | QuarantineStatus::Quarantined | QuarantineStatus::Released => {
-            }
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot curator-block artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::BlockByCurator,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot curator-block artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::Rejected;
         self.rejection_reason = Some(RejectionReason::Curator { curator_id });
@@ -598,7 +621,12 @@ impl Artifact {
         computed_hash: ContentHash,
         now: DateTime<Utc>,
     ) -> DomainResult<ArtifactCorrupted> {
-        if self.quarantine_status == QuarantineStatus::Rejected {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::TombstoneFromCorruption,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot tombstone artifact in state {} (already rejected)",
                 self.quarantine_status
@@ -660,15 +688,15 @@ impl Artifact {
         // release accepts `Quarantined` ONLY. `ScanIndeterminate`
         // stays admin-only — clearing a stuck scanner requires the
         // broader admin authority.
-        let source_state_ok = match (&reason, authz) {
+        let release_event = match (&reason, authz) {
             (ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver) => {
-                matches!(self.quarantine_status, QuarantineStatus::Quarantined)
+                QuarantineEvent::ReleaseCuratorWaiver
             }
-            _ => matches!(
-                self.quarantine_status,
-                QuarantineStatus::Quarantined | QuarantineStatus::ScanIndeterminate
-            ),
+            _ => QuarantineEvent::ReleaseGeneral,
         };
+        let source_state_ok =
+            quarantine_transitions::allowed_targets(release_event, self.quarantine_status)
+                .is_some();
         if !source_state_ok {
             // Caller-reachable state precondition (an operator can POST
             // release/waive against an artifact in any state) → InvalidState
@@ -737,6 +765,15 @@ impl Artifact {
     /// Returns the domain event to append (if any) or
     /// `Ok(None)` for the no-op case.
     ///
+    /// **Not source-state-gated** — unlike every other method in this
+    /// state machine, there is no `match self.quarantine_status` guard
+    /// here; the caller (the provenance orchestrator) only ever invokes
+    /// this against a held artifact, but the method itself is total over
+    /// every [`QuarantineStatus`]. [`crate::entities::quarantine_transitions`]
+    /// represents it as `QuarantineEvent::CompleteProvenance`, unrestricted
+    /// (`Allowed` from every state) — there is no guard here for the table
+    /// to replace.
+    ///
     /// - [`ProvenanceOutcome::Verified`] → emit [`ProvenanceVerified`];
     ///   **status unchanged** (like `ScanCompleted(clean)`, a verified
     ///   attestation is a success record that does NOT release the
@@ -752,24 +789,58 @@ impl Artifact {
     ///     **held** over the same observation window quarantine already
     ///     provides rather than being collapsed into a terminal rejection at
     ///     the first verify:
-    ///     - `window_open == true` → `Ok(None)` (no event, status stays
-    ///       `Quarantined` → the release gate reads it as
-    ///       [`ProvenanceClearance::Pending`], fail-closed / held);
-    ///     - `window_open == false` → emit [`ProvenanceRejected`] with reason
+    ///     - `window_open == true` **OR** `is_referenced_descendant == true`
+    ///       → `Ok(None)` (no event, status stays `Quarantined` → the
+    ///       release gate reads it as [`ProvenanceClearance::Pending`],
+    ///       fail-closed / held);
+    ///     - both `false` → emit [`ProvenanceRejected`] with reason
     ///       [`ProvenanceRejectReason::Unsigned`]; status → `Rejected`
     ///       (unsigned-at-expiry IS a terminal rejection there).
     ///   - under [`ProvenanceMode::Off`] → `Ok(None)` (provenance is
     ///     inert; the orchestrator does not run a verifier in `Off`, but
     ///     the method is total over the mode for safety).
     ///
-    /// `window_open` gates **only** the `NoAttestation × Required` arm. A
-    /// *bad* signature is *time-independent* (already wrong), so the
-    /// [`ProvenanceOutcome::Verified`] and [`ProvenanceOutcome::Rejected`]
-    /// arms never consult `window_open` — a valid or a forged/untrusted/
-    /// digest-mismatch signature is decided immediately, even mid-window.
-    /// The domain stays I/O-free: the application layer computes
-    /// `window_open` (`effective_quarantine_deadline(window_start, duration)
-    /// > now`) and threads it in.
+    /// `window_open` and `is_referenced_descendant` gate **only** the
+    /// `NoAttestation × Required` arm. A *bad* signature is
+    /// *time-independent* (already wrong) and equally
+    /// *position-independent* (a forged signature on a layer blob is still
+    /// forged), so the [`ProvenanceOutcome::Verified`] and
+    /// [`ProvenanceOutcome::Rejected`] arms never consult either flag — a
+    /// valid or a forged/untrusted/digest-mismatch signature is decided
+    /// immediately, even mid-window and even on a descendant. The domain
+    /// stays I/O-free: the application layer computes `window_open`
+    /// (`effective_quarantine_deadline(window_start, duration) > now`) and
+    /// resolves `is_referenced_descendant`, then threads both in.
+    ///
+    /// # `is_referenced_descendant` — why a descendant NEVER
+    /// terminally-rejects as `Unsigned` (issue #115 defect (b))
+    ///
+    /// A **referenced-tree descendant** is an artifact that is already a
+    /// `content_references` target of some other, already-ingested
+    /// artifact: an index's child manifest, a manifest's config/layer
+    /// blob, a referrer's subject. Such artifacts get a **zero-length**
+    /// observation window by design (#46: anchor = `ingested_at −
+    /// duration`), so `window_open` is `false` for them from the instant
+    /// they are ingested.
+    ///
+    /// That interacts fatally with `Required`. cosign signs only the
+    /// top-level digest, so a layer blob has **no attestation of its own
+    /// and never will** — its provenance authority is its parent's
+    /// signature, delivered later by
+    /// [`Self::cascade_provenance_clearance`]. Before this carve-out, the
+    /// ingest-enqueued verify of a layer resolved
+    /// `NoAttestation × Required × window_open == false` → terminal
+    /// `Rejected{Unsigned}` *before* the subject's cascade could clear it,
+    /// and the cascade refuses a rejected constituent ("terminal is
+    /// terminal") — permanently bricking a correctly-signed image.
+    ///
+    /// Holding instead is the fail-closed outcome, not a relaxation: the
+    /// artifact stays `Quarantined` (503, not downloadable) until either
+    /// the cascade clears it or an admin releases it per ADR 0025. An
+    /// unsigned parent leaves its constituents held forever — correct,
+    /// and recoverable by signing the parent, unlike the terminal
+    /// rejection it replaces. See ADR 0007 (zero-window section) and
+    /// ADR 0039 (cascade section).
     ///
     /// `backend` is the id of the verifier that produced the verdict
     /// (`port.name()`, e.g. `"cosign"`) — recorded on the event for audit
@@ -786,6 +857,7 @@ impl Artifact {
         mode: ProvenanceMode,
         backend: &str,
         window_open: bool,
+        is_referenced_descendant: bool,
     ) -> DomainResult<Option<DomainEvent>> {
         match verdict.outcome {
             ProvenanceOutcome::Verified {
@@ -827,10 +899,20 @@ impl Artifact {
                 // signature is time-dependent: while the observation window
                 // is still open the artifact is HELD (no event, status stays
                 // Quarantined → Pending), exactly like an incomplete scan.
-                ProvenanceMode::Required if window_open => Ok(None),
+                //
+                // A referenced-tree descendant is held REGARDLESS of the
+                // window (issue #115 defect (b)): its window is zero-length
+                // by construction (#46) and it can never carry its own
+                // attestation — cosign signs only the top-level digest — so
+                // its provenance authority is its parent's signature,
+                // arriving later via `cascade_provenance_clearance`.
+                // Terminally rejecting it here would race ahead of that
+                // cascade and permanently brick a correctly-signed image.
+                // See the method doc for the full rationale.
+                ProvenanceMode::Required if window_open || is_referenced_descendant => Ok(None),
                 ProvenanceMode::Required => {
-                    // Window closed → unsigned-at-expiry IS a terminal
-                    // rejection under Required (ADR 0027).
+                    // Window closed on a non-descendant → unsigned-at-expiry
+                    // IS a terminal rejection under Required (ADR 0027).
                     self.quarantine_status = QuarantineStatus::Rejected;
                     // Not scan-clearable — see the `Rejected` arm above.
                     self.rejection_reason = None;
@@ -880,7 +962,12 @@ impl Artifact {
         predicate_type: Option<String>,
         backend: &str,
     ) -> DomainResult<ProvenanceVerified> {
-        if self.quarantine_status != QuarantineStatus::Quarantined {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::CascadeProvenanceClearance,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot cascade provenance clearance to artifact in state {}",
                 self.quarantine_status
@@ -917,13 +1004,16 @@ impl Artifact {
         reason: String,
         attempts: u32,
     ) -> DomainResult<ScanIndeterminate> {
-        match self.quarantine_status {
-            QuarantineStatus::Quarantined | QuarantineStatus::None => {}
-            other => {
-                return Err(DomainError::Invariant(format!(
-                    "cannot mark scan-indeterminate for artifact in state {other}"
-                )));
-            }
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::FailScanIndeterminate,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot mark scan-indeterminate for artifact in state {other}"
+            )));
         }
         self.quarantine_status = QuarantineStatus::ScanIndeterminate;
         Ok(ScanIndeterminate {
@@ -992,7 +1082,12 @@ impl Artifact {
         provenance: ProvenanceClearance,
         curation: CurationClearance,
     ) -> DomainResult<DomainEvent> {
-        if self.quarantine_status != QuarantineStatus::Rejected {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::ReEvaluate,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
             return Err(DomainError::Invariant(format!(
                 "cannot re-evaluate artifact in state {}",
                 self.quarantine_status
@@ -2148,7 +2243,12 @@ mod tests {
         // ScanCompleted(clean)) — status stays Quarantined and a
         // ProvenanceVerified event is emitted for the audit trail / the
         // release-sweep `Cleared` computation.
-        for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Required] {
+        for (mode, is_descendant) in [
+            (ProvenanceMode::VerifyIfPresent, false),
+            (ProvenanceMode::VerifyIfPresent, true),
+            (ProvenanceMode::Required, false),
+            (ProvenanceMode::Required, true),
+        ] {
             let mut a = quarantined_artifact();
             let signer = SignerIdentity {
                 issuer: "https://token.actions.githubusercontent.com".into(),
@@ -2164,8 +2264,10 @@ mod tests {
                 // threaded from the running verifier, not hardcoded
                 // (Tier-2 readiness). `window_open = true` proves a Verified
                 // verdict is decided immediately even mid-window (it never
-                // consults the window flag).
-                .complete_provenance(verdict, mode, "pgp", true)
+                // consults the window flag); `is_referenced_descendant`
+                // varies across the loop below for the same reason (#115 —
+                // the flag is inert on this arm).
+                .complete_provenance(verdict, mode, "pgp", true, is_descendant)
                 .expect("Ok")
                 .expect("Verified emits an event");
             assert_eq!(
@@ -2208,10 +2310,21 @@ mod tests {
             ProvenanceRejectReason::BundleMalformed,
         ];
         for reason in reasons {
-            for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Required] {
+            for (mode, is_descendant) in [
+                (ProvenanceMode::VerifyIfPresent, false),
+                (ProvenanceMode::VerifyIfPresent, true),
+                (ProvenanceMode::Required, false),
+                (ProvenanceMode::Required, true),
+            ] {
                 let mut a = quarantined_artifact();
                 let ev = a
-                    .complete_provenance(ProvenanceVerdict::rejected(reason), mode, "cosign", true)
+                    .complete_provenance(
+                        ProvenanceVerdict::rejected(reason),
+                        mode,
+                        "cosign",
+                        true,
+                        is_descendant,
+                    )
                     .expect("Ok")
                     .expect("Rejected emits an event");
                 assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
@@ -2239,9 +2352,10 @@ mod tests {
                 ProvenanceVerdict::no_attestation(),
                 ProvenanceMode::VerifyIfPresent,
                 "cosign",
-                // window_open is irrelevant to VerifyIfPresent (the flag gates
-                // only NoAttestation×Required); pass false to prove it never
-                // leaks into this arm.
+                // Neither flag is relevant to VerifyIfPresent (both gate only
+                // NoAttestation×Required); pass false for both to prove they
+                // never leak into this arm.
+                false,
                 false,
             )
             .expect("Ok");
@@ -2263,8 +2377,9 @@ mod tests {
                 ProvenanceVerdict::no_attestation(),
                 ProvenanceMode::Off,
                 "cosign",
-                // window_open is irrelevant to Off (inert mode); pass false to
-                // prove the flag never leaks into this arm.
+                // Neither flag is relevant to Off (inert mode); pass false for
+                // both to prove they never leak into this arm.
+                false,
                 false,
             )
             .expect("Ok");
@@ -2284,7 +2399,8 @@ mod tests {
                 ProvenanceVerdict::no_attestation(),
                 ProvenanceMode::Required,
                 "cosign",
-                true, // window still open → hold
+                true,  // window still open → hold
+                false, // not a descendant — the window alone holds it
             )
             .expect("Ok");
         assert!(
@@ -2314,7 +2430,8 @@ mod tests {
                 // Passed backend is intentionally ignored on the synthesized
                 // unsigned arm — the event records the "(policy)" sentinel.
                 "cosign",
-                false, // window closed → terminal rejection
+                false, // window closed
+                false, // and NOT a descendant → terminal rejection
             )
             .expect("Ok")
             .expect("Required NoAttestation at expiry emits a rejection");
@@ -2331,6 +2448,150 @@ mod tests {
                 assert_eq!(e.backend, "(policy)");
             }
             other => panic!("expected ProvenanceRejected, got {other:?}"),
+        }
+    }
+
+    // -- is_referenced_descendant carve-out (issue #115 defect (b)) ----------
+
+    /// **The defect this carve-out closes.** A referenced-tree descendant
+    /// (an index's child manifest, a manifest's config/layer blob) has a
+    /// ZERO-length observation window by construction (#46), so
+    /// `window_open` is `false` from the instant it is ingested. cosign
+    /// signs only the top-level digest, so the descendant has no
+    /// attestation of its own and never will — its provenance authority is
+    /// its parent's signature, arriving later via
+    /// `cascade_provenance_clearance`. Before this carve-out the pair
+    /// (`NoAttestation × Required × window_open == false`) resolved to a
+    /// terminal `Rejected{Unsigned}` BEFORE the cascade could clear it,
+    /// and the cascade refuses a rejected constituent — permanently
+    /// bricking a correctly-signed image. It must HOLD instead.
+    #[test]
+    fn complete_provenance_descendant_no_attestation_required_window_closed_holds() {
+        let mut a = quarantined_artifact();
+        let out = a
+            .complete_provenance(
+                ProvenanceVerdict::no_attestation(),
+                ProvenanceMode::Required,
+                "cosign",
+                false, // window CLOSED (zero-window descendant, by construction)
+                true,  // …but it IS a referenced-tree descendant → HOLD
+            )
+            .expect("Ok");
+        assert!(
+            out.is_none(),
+            "a zero-window descendant must HOLD, not emit a terminal rejection"
+        );
+        assert_eq!(
+            a.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "held descendant stays Quarantined (Pending) so the parent's \
+             cascade can still clear it — terminal is terminal, and a \
+             rejected constituent is unrecoverable"
+        );
+        // The hold must not touch rejection_reason (it is not a rejection).
+        assert_eq!(a.rejection_reason, None);
+    }
+
+    /// Truth table for the two hold flags on the `NoAttestation × Required`
+    /// arm: it holds iff `window_open || is_referenced_descendant`. Pins
+    /// the OR explicitly so a future refactor cannot silently narrow it to
+    /// an AND (which would re-open the defect) or widen it to
+    /// unconditional (which would remove the unsigned-at-expiry rejection).
+    #[test]
+    fn complete_provenance_required_no_attestation_holds_iff_window_open_or_descendant() {
+        for (window_open, is_descendant) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let mut a = quarantined_artifact();
+            let out = a
+                .complete_provenance(
+                    ProvenanceVerdict::no_attestation(),
+                    ProvenanceMode::Required,
+                    "cosign",
+                    window_open,
+                    is_descendant,
+                )
+                .expect("Ok");
+            let should_hold = window_open || is_descendant;
+            assert_eq!(
+                out.is_none(),
+                should_hold,
+                "window_open={window_open}, is_descendant={is_descendant}: \
+                 expected hold={should_hold}"
+            );
+            assert_eq!(
+                a.quarantine_status,
+                if should_hold {
+                    QuarantineStatus::Quarantined
+                } else {
+                    QuarantineStatus::Rejected
+                },
+                "window_open={window_open}, is_descendant={is_descendant}",
+            );
+        }
+    }
+
+    /// The flag is scoped to the unsigned arm ONLY: a forged / untrusted /
+    /// digest-mismatch signature on a descendant is *position-independent*
+    /// (it is already wrong, exactly like it is *time*-independent w.r.t.
+    /// `window_open`) and must still reject terminally. Without this, the
+    /// carve-out would become a blanket "descendants are never rejected",
+    /// which would let a tampered layer through.
+    #[test]
+    fn complete_provenance_descendant_still_rejects_a_bad_signature() {
+        for reason in [
+            ProvenanceRejectReason::Unsigned,
+            ProvenanceRejectReason::UntrustedIdentity,
+            ProvenanceRejectReason::RekorNotFound,
+            ProvenanceRejectReason::CertChainInvalid,
+            ProvenanceRejectReason::BundleMalformed,
+        ] {
+            let mut a = quarantined_artifact();
+            let ev = a
+                .complete_provenance(
+                    ProvenanceVerdict::rejected(reason),
+                    ProvenanceMode::Required,
+                    "cosign",
+                    false, // window closed
+                    true,  // descendant — must NOT rescue a bad signature
+                )
+                .expect("Ok")
+                .expect("a Rejected verdict always emits, descendant or not");
+            assert_eq!(
+                a.quarantine_status,
+                QuarantineStatus::Rejected,
+                "reason {reason:?}: a bad signature on a descendant is still terminal"
+            );
+            match ev {
+                DomainEvent::ProvenanceRejected(e) => assert_eq!(e.reason, reason),
+                other => panic!("expected ProvenanceRejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// The flag is inert outside `Required`: `VerifyIfPresent` / `Off`
+    /// treat `NoAttestation` as an allowed no-op whether or not the
+    /// artifact is a descendant (they have no hold semantics to gate).
+    #[test]
+    fn complete_provenance_descendant_flag_is_inert_outside_required() {
+        for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Off] {
+            for is_descendant in [true, false] {
+                let mut a = quarantined_artifact();
+                let out = a
+                    .complete_provenance(
+                        ProvenanceVerdict::no_attestation(),
+                        mode,
+                        "cosign",
+                        false,
+                        is_descendant,
+                    )
+                    .expect("Ok");
+                assert!(
+                    out.is_none(),
+                    "{mode:?} / descendant={is_descendant} must stay an allowed no-op"
+                );
+                assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+            }
         }
     }
 
@@ -2431,8 +2692,9 @@ mod tests {
                 ProvenanceVerdict::verified(signer, None),
                 ProvenanceMode::Required,
                 "cosign",
-                // Verified never consults window_open; false proves the arm
-                // decides regardless of the flag.
+                // Verified never consults either flag; false for both proves
+                // the arm decides regardless.
+                false,
                 false,
             )
             .expect("Ok")

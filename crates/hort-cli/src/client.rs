@@ -280,7 +280,7 @@ pub(crate) fn is_tls_cert_error(err: &anyhow::Error) -> bool {
 /// Apply `HORT_EXTRA_CA_BUNDLE` PEM file to the builder if the env var
 /// is set.
 ///
-/// `reqwest` 0.12 provides `Certificate::from_pem_bundle` which parses
+/// `reqwest` provides `Certificate::from_pem_bundle` which parses
 /// a concatenated PEM file and returns a `Vec<Certificate>`. This
 /// function iterates the returned vec and calls `add_root_certificate`
 /// once per cert — same TLS trust semantics as the server-side adapter
@@ -296,8 +296,8 @@ pub(crate) fn apply_extra_ca_bundle(builder: ClientBuilder) -> Result<ClientBuil
     let pem =
         std::fs::read(&path).with_context(|| format!("reading HORT_EXTRA_CA_BUNDLE at {path}"))?;
 
-    // `Certificate::from_pem_bundle` is available in reqwest 0.12.x
-    // (confirmed against 0.12.28 source — src/tls.rs line 193).
+    // `Certificate::from_pem_bundle` is available in reqwest 0.13.x
+    // (confirmed against 0.13.4 source — src/tls.rs line 217).
     let certs = reqwest::Certificate::from_pem_bundle(&pem)
         .context("parsing HORT_EXTRA_CA_BUNDLE as PEM certificate bundle")?;
 

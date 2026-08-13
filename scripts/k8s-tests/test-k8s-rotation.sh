@@ -51,7 +51,7 @@ ROTATION_TIMEOUT_SECS="${ROTATION_TIMEOUT_SECS:-90}"
 # Postgres image, pulled by the kind node (proven reachable). Override
 # only to pin a different tag; a host-only tag will not resolve since
 # the node pulls it itself.
-POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16-alpine}"
+POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:17-alpine}"
 # Readiness budget for the ephemeral postgres pod. The previous bare
 # 60s was tight on a machine that had just done a 5–15 min hort-worker
 # build (cold disk cache, busy CPU); raised + made overridable so a

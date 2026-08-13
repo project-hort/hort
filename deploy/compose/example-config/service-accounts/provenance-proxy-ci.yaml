@@ -1,0 +1,16 @@
+# ServiceAccount (e2e): the native-token-mode pusher/signer for
+# scripts/native-tests/scenarios/quarantine/proxy-required-multilayer.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation) — mirrors
+# provenance-ci.yaml exactly, one PER-REPO instance because the sibling SA's
+# PermissionGrants are scoped to oci-provenance-e2e (a different, HOSTED-push-
+# only repo) and grants cannot be repointed without affecting that scenario.
+# Under the native-tokens compose overlay the scenario admin-mints an
+# hort_svc_* token for this SA and runs the real OCI /v2/auth token dance with
+# it, exactly as provenance-ci does for the hosted-push scenario. Inert in
+# legacy (no-overlay) runs: the SA row exists, nothing mints for it.
+apiVersion: project-hort.de/v1
+kind: ServiceAccount
+metadata:
+  name: provenance-proxy-ci
+spec: {}

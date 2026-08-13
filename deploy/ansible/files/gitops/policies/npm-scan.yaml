@@ -6,7 +6,7 @@ spec:
   scope:
     repository: npm-proxy
   severityThreshold: high
-  quarantineDuration: 24h
+  quarantineDuration: 3d
   requireApproval: false
   provenanceMode: off
   scanBackends: ["osv"]

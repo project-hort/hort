@@ -54,7 +54,7 @@ jobs:
       # On `schedule`/`workflow_dispatch` the default ref is the default
       # branch (main); the lock we must warm is develop's — the next
       # release's lock (main's is a historical subset of it at promotion).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: develop
 
@@ -102,5 +102,5 @@ jobs:
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/json" \
             -d "{\"items\": ${items}}" \
-            | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"' \
+            | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")' \
             || echo "::warning::prefetch POST failed — proxy not warmed this run (non-fatal)"

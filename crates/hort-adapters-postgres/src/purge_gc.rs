@@ -590,11 +590,10 @@ mod tests {
     /// even when they have a pending `ArtifactExpired`.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn pending_set_excludes_protected_states() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
 
         let ok = seed_artifact(&pool, repo, "expired-ok", HASH_A, Some("released")).await;
@@ -649,11 +648,10 @@ mod tests {
     /// returned set carries one decision per distinct hash.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn primary_and_metadata_blob_both_walked() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let art = seed_artifact(&pool, repo, "two-kinds", HASH_A, Some("released")).await;
         seed_metadata_blob(&pool, art, HASH_B).await;
@@ -692,11 +690,10 @@ mod tests {
     /// refcount → 0 when nothing else references the hash.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn refcount_zero_when_unreferenced() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let art = seed_artifact(&pool, repo, "solo", HASH_A, Some("released")).await;
         sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
@@ -720,11 +717,10 @@ mod tests {
     /// blob alive: cross-`kind` count is > 0 after the purge.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn live_oci_subject_keeps_blob_refs_remaining_gt_zero() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let purged = seed_artifact(&pool, repo, "purged", HASH_A, Some("released")).await;
         let other = seed_artifact(&pool, repo, "oci-live", HASH_B, Some("released")).await;
@@ -765,11 +761,10 @@ mod tests {
     /// (now stable) cross-`kind` count is recomputed correctly.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn idempotent_reinvocation_after_rows_deleted() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let art = seed_artifact(&pool, repo, "retry", HASH_A, Some("released")).await;
         seed_metadata_blob(&pool, art, HASH_B).await;
@@ -823,11 +818,10 @@ mod tests {
     /// the index still points at it, then frees it once that row is gone.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn live_index_member_keeps_child_blob_then_frees_it() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         // Two child manifest artifacts (own blobs HASH_A, HASH_C) and the
         // image-index artifact that references both (its own blob HASH_B).
@@ -915,11 +909,10 @@ mod tests {
     /// index).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn live_manifest_blob_edges_keep_config_and_layer_blobs_then_free_them() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         // A config blob (own hash HASH_A), a layer blob (own hash
         // HASH_C), and the single-image manifest artifact (own blob
@@ -1030,11 +1023,10 @@ mod tests {
     /// purge never having been swept).
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn purge_manifest_sweeps_all_oci_kinds_and_frees_target_once_unreferenced() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let repo = seed_repo(&pool).await;
         let adapter = PgPurgeGcPort::new(pool.clone());
 
@@ -1153,11 +1145,10 @@ mod tests {
     /// is a clean no-op — nothing left to decrement.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    #[ignore = "requires DATABASE_URL"]
     async fn missing_artifact_row_is_a_noop() {
-        let pool = maybe_pool()
-            .await
-            .expect("DATABASE_URL required for this test");
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
         let adapter = PgPurgeGcPort::new(pool.clone());
         let refs = adapter.purge_artifact_refs(Uuid::new_v4()).await.unwrap();
         assert!(refs.is_empty(), "no artifact row → nothing to purge");

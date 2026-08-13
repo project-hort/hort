@@ -127,7 +127,7 @@ read_success_metric() {
     # `|| true` guards the curl half: a transient /metrics blip
     # shouldn't abort the test run. The empty input flows through
     # awk and prints 0.
-    curl -sf "$METRICS_URL" 2>/dev/null \
+    curl -sf "${METRICS_AUTH_HEADER[@]}" "$METRICS_URL" 2>/dev/null \
         | awk '/^hort_upstream_fetch_total\{[^}]*result="success"[^}]*\}/ { s += $NF } END { printf "%d\n", (s+0) }' \
         || true
 }
@@ -160,8 +160,25 @@ skopeo_pull() {
         "oci-archive:${dest}"
 }
 
-METRIC_BEFORE=$(read_success_metric)
-log "  hort_upstream_fetch_total{result=success} before = ${METRIC_BEFORE}"
+# ---------------------------------------------------------------------
+# Posture-aware (item 084): decide ONCE, before any pulls, whether the
+# before/after delta assertions below can mean anything. An empty
+# METRICS_TOKEN is a genuinely-absent input — note-and-skip, never flip
+# this scenario's overall result on it (the pulls themselves are still
+# exercised and asserted independently, below). A present token that
+# scrapes non-2xx stays a loud FAIL carrying the HTTP status — read_success_
+# metric's own `|| true` must never be mistaken for a legitimate zero.
+# ---------------------------------------------------------------------
+METRICS_DELTA_OK=0
+if metrics_scrape_preflight "upstream-fetch delta metrics"; then
+    METRICS_DELTA_OK=1
+fi
+
+METRIC_BEFORE=0
+if [ "$METRICS_DELTA_OK" = "1" ]; then
+    METRIC_BEFORE=$(read_success_metric)
+    log "  hort_upstream_fetch_total{result=success} before = ${METRIC_BEFORE}"
+fi
 
 if skopeo_pull "$DOCKERHUB_REF" "$DOCKERHUB_ARCHIVE"; then
     pass "first dockerhub pull-through succeeded"
@@ -178,13 +195,18 @@ fi
 # Abort if the pulls failed — the metric delta assertions are meaningless.
 if [ "$_FAIL" -gt 0 ]; then summary; fi
 
-METRIC_AFTER_FIRST=$(read_success_metric)
-DELTA_FIRST=$((METRIC_AFTER_FIRST - METRIC_BEFORE))
-log "  hort_upstream_fetch_total{result=success} after first pulls = ${METRIC_AFTER_FIRST} (Δ${DELTA_FIRST})"
-if [ "$DELTA_FIRST" -ge 2 ]; then
-    pass "upstream fetch fired on cache-miss pulls (Δ${DELTA_FIRST})"
+DELTA_FIRST=0
+if [ "$METRICS_DELTA_OK" = "1" ]; then
+    METRIC_AFTER_FIRST=$(read_success_metric)
+    DELTA_FIRST=$((METRIC_AFTER_FIRST - METRIC_BEFORE))
+    log "  hort_upstream_fetch_total{result=success} after first pulls = ${METRIC_AFTER_FIRST} (Δ${DELTA_FIRST})"
+    if [ "$DELTA_FIRST" -ge 2 ]; then
+        pass "upstream fetch fired on cache-miss pulls (Δ${DELTA_FIRST})"
+    else
+        fail "expected ≥2 upstream-fetch successes on first pulls" "got Δ${DELTA_FIRST}"
+    fi
 else
-    fail "expected ≥2 upstream-fetch successes on first pulls" "got Δ${DELTA_FIRST}"
+    log "  note: skip upstream-fetch delta assertion (first pulls) — see posture note above"
 fi
 
 # ---------------------------------------------------------------------
@@ -202,13 +224,17 @@ else
     fail "second dockerhub pull failed" ""
 fi
 
-METRIC_AFTER_SECOND=$(read_success_metric)
-DELTA_SECOND=$((METRIC_AFTER_SECOND - METRIC_AFTER_FIRST))
-log "  hort_upstream_fetch_total{result=success} after second pull = ${METRIC_AFTER_SECOND} (Δ${DELTA_SECOND})"
-if [ "$DELTA_SECOND" -lt "$DELTA_FIRST" ]; then
-    pass "second pull served partly/fully from cache (Δ${DELTA_SECOND} < Δ${DELTA_FIRST})"
+if [ "$METRICS_DELTA_OK" = "1" ]; then
+    METRIC_AFTER_SECOND=$(read_success_metric)
+    DELTA_SECOND=$((METRIC_AFTER_SECOND - METRIC_AFTER_FIRST))
+    log "  hort_upstream_fetch_total{result=success} after second pull = ${METRIC_AFTER_SECOND} (Δ${DELTA_SECOND})"
+    if [ "$DELTA_SECOND" -lt "$DELTA_FIRST" ]; then
+        pass "second pull served partly/fully from cache (Δ${DELTA_SECOND} < Δ${DELTA_FIRST})"
+    else
+        fail "expected second-pull delta < first-pull delta" "got Δ${DELTA_SECOND} >= Δ${DELTA_FIRST}"
+    fi
 else
-    fail "expected second-pull delta < first-pull delta" "got Δ${DELTA_SECOND} >= Δ${DELTA_FIRST}"
+    log "  note: skip upstream-fetch delta assertion (second pull) — see posture note above"
 fi
 
 rm -f "$DOCKERHUB_ARCHIVE" "$GHCR_ARCHIVE"

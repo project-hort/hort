@@ -114,6 +114,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
     /// `quarantine_window_start`) can be stale by the time this commits.
     /// A full-row write-back would clobber whatever a
     /// concurrently-committed transition wrote to those columns.
+    #[allow(clippy::too_many_arguments)] // trait-defined shape — see the port.
     fn commit_scan_result_with_score<'a>(
         &'a self,
         artifact: &'a Artifact,
@@ -122,6 +123,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         last_scan_at: DateTime<Utc>,
         score_delta: Option<(Uuid, ScoreDelta)>,
         sbom_components: Option<&'a [SbomComponent]>,
+        prior_status: QuarantineStatus,
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
         let artifact = artifact.clone();
         let rows = scan_findings_rows.to_vec();
@@ -130,14 +132,20 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
             let mut uow = self.event_store.begin_unit_of_work().await?;
 
             let result = self.event_store.append_in_tx(&mut uow, events).await?;
-            self.artifact_repo
-                .save_verdict_status_in_tx(
-                    &mut uow,
-                    artifact.id,
-                    artifact.quarantine_status,
-                    artifact.updated_at,
-                )
-                .await?;
+            // Skip-unchanged (issue #108 H2b): a transition that left the
+            // status where it was has no status write to make, so it
+            // cannot lose a race with a concurrent one. See the port doc.
+            if artifact.quarantine_status != prior_status {
+                self.artifact_repo
+                    .save_verdict_status_in_tx(
+                        &mut uow,
+                        artifact.id,
+                        artifact.quarantine_status,
+                        artifact.updated_at,
+                        prior_status,
+                    )
+                    .await?;
+            }
 
             sqlx::query("UPDATE artifacts SET last_scan_at = $1 WHERE id = $2")
                 .bind(last_scan_at)
@@ -250,6 +258,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         &'a self,
         artifact: &'a Artifact,
         events: AppendEvents,
+        prior_status: QuarantineStatus,
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
         let artifact_id = artifact.id;
         let quarantine_status: QuarantineStatus = artifact.quarantine_status;
@@ -258,9 +267,21 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
             let mut uow = self.event_store.begin_unit_of_work().await?;
 
             let result = self.event_store.append_in_tx(&mut uow, events).await?;
-            self.artifact_repo
-                .save_verdict_status_in_tx(&mut uow, artifact_id, quarantine_status, updated_at)
-                .await?;
+            // Skip-unchanged (issue #108 H2b) — the `ProvenanceVerified`
+            // case leaves the artifact `Quarantined`, so there is no
+            // status write to make and therefore no revert vector at all.
+            // See the port doc for the full contract.
+            if quarantine_status != prior_status {
+                self.artifact_repo
+                    .save_verdict_status_in_tx(
+                        &mut uow,
+                        artifact_id,
+                        quarantine_status,
+                        updated_at,
+                        prior_status,
+                    )
+                    .await?;
+            }
 
             uow.commit().await?;
             Ok(result)

@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
@@ -101,7 +101,7 @@ jobs:
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/json" \
             -d "{\"items\": ${items}}" \
-            | jq -r '"queued: \(.queued // "?")  already_present: \(.already_present // "?")  rejected: \((.rejected // []) | length)"' \
+            | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")' \
             || echo "::warning::prefetch POST failed — quarantine not pre-warmed this run (non-fatal)"
 
       # ── the feature-branch build itself: against UPSTREAM (crates.io) ───────

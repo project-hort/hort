@@ -54,6 +54,15 @@ pub enum Permission {
     /// gate exclusively. Granted via the existing audited gitops apply
     /// path — no new admin endpoint.
     Prefetch,
+    /// Gates the Prometheus scrape endpoint (`GET /metrics`). Global —
+    /// the exposition is process-wide, never repo-scoped. DB enum literal:
+    /// `'read_metrics'`. Granted via the audited `ApplyConfigUseCase` apply
+    /// path to a dedicated scraper `ServiceAccount` (non-admin). Orthogonal
+    /// to `Admin` — an admin caller does not implicitly hold this grant, and
+    /// a scraper does not implicitly hold admin authority. See issue #113
+    /// and `docs/adr/0052-scoped-metrics-read-capability.md`, the standing
+    /// decision record for this capability.
+    ReadMetrics,
 }
 
 impl fmt::Display for Permission {
@@ -66,6 +75,7 @@ impl fmt::Display for Permission {
             Self::AdminTaskInvoke => f.write_str("admin_task_invoke"),
             Self::Curate => f.write_str("curate"),
             Self::Prefetch => f.write_str("prefetch"),
+            Self::ReadMetrics => f.write_str("read_metrics"),
         }
     }
 }
@@ -86,6 +96,7 @@ impl FromStr for Permission {
             "admin_task_invoke" => Ok(Self::AdminTaskInvoke),
             "curate" => Ok(Self::Curate),
             "prefetch" => Ok(Self::Prefetch),
+            "read_metrics" => Ok(Self::ReadMetrics),
             _ => Err(DomainError::Validation(format!("unknown permission: {s}"))),
         }
     }
@@ -208,6 +219,7 @@ mod tests {
         assert_eq!(Permission::AdminTaskInvoke.to_string(), "admin_task_invoke");
         assert_eq!(Permission::Curate.to_string(), "curate");
         assert_eq!(Permission::Prefetch.to_string(), "prefetch");
+        assert_eq!(Permission::ReadMetrics.to_string(), "read_metrics");
     }
 
     #[test]
@@ -220,6 +232,7 @@ mod tests {
             "admin_task_invoke",
             "curate",
             "prefetch",
+            "read_metrics",
         ] {
             let parsed: Permission = name.parse().unwrap();
             assert_eq!(parsed.to_string(), *name);
@@ -244,6 +257,9 @@ mod tests {
             ("PREFETCH", Permission::Prefetch),
             ("Prefetch", Permission::Prefetch),
             ("prefetch", Permission::Prefetch),
+            ("READ_METRICS", Permission::ReadMetrics),
+            ("Read_Metrics", Permission::ReadMetrics),
+            ("read_metrics", Permission::ReadMetrics),
         ];
         for (input, expected) in cases {
             let parsed: Permission = input.parse().unwrap();
@@ -294,6 +310,20 @@ mod tests {
     }
 
     #[test]
+    fn permission_read_metrics_copy_and_eq() {
+        let a = Permission::ReadMetrics;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn permission_read_metrics_serde_round_trip() {
+        let json = serde_json::to_string(&Permission::ReadMetrics).expect("serialize");
+        let back: Permission = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, Permission::ReadMetrics);
+    }
+
+    #[test]
     fn permission_exhaustive_match() {
         // Force a compile error if a new variant is added without updating
         // this test. Update this test and the match arms above when adding
@@ -306,6 +336,7 @@ mod tests {
             Permission::AdminTaskInvoke,
             Permission::Curate,
             Permission::Prefetch,
+            Permission::ReadMetrics,
         ] {
             let _display = perm.to_string();
             let _roundtrip: Permission = _display.parse().unwrap();

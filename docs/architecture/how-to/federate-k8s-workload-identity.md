@@ -160,10 +160,13 @@ The `claims:` map is exact-match — every `(key, value)` in the map
 must equal the corresponding field in the JWT payload. The
 canonical k8s SA claim shape is
 `sub: system:serviceaccount:<namespace>:<name>`; that single claim
-is usually enough to pin the identity. Newer clusters also expose
+pins one principal — the example above is a validation-clean,
+complete `federatedIdentities[]` entry on its own, no additional
+claim required. Newer clusters also expose
 `kubernetes.io/serviceaccount/namespace` and `…/name` as separate
-claims — match on whichever subset gives you the desired
-specificity.
+claims; add either alongside `sub` if you want the entry to read
+more explicitly, but keep `sub` in the map — namespace/name alone
+are not enough (see the subject-identifying-claim rule below).
 
 Validation rules the apply pipeline enforces:
 
@@ -178,6 +181,16 @@ Validation rules the apply pipeline enforces:
   "any JWT from this issuer can assume me" — a
   privilege-escalation footgun on a misconfigured issuer. Hard
   reject.
+- `federatedIdentities[].claims` must contain at least one
+  subject-identifying claim — `sub`, `repository`, or
+  `project_path`. Every other claim key (including
+  `kubernetes.io/serviceaccount/namespace`/`…/name`) refines a
+  subject without identifying one; a claims map built only from such
+  claims is rejected the same way empty claims are — it would still
+  match every JWT the issuer signs matching that refinement, not one
+  workload identity. `sub` is the usual choice for k8s workload
+  identity, since it already carries both the namespace and the SA
+  name.
 
 See [`declare-gitops-config.md`](./declare-gitops-config.md)
 `kind: ServiceAccount` for the canonical reference.

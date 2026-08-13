@@ -1,0 +1,19 @@
+# PermissionGrant: serviceAccount provenance-proxy-ci -> read
+# oci-provenance-proxy-e2e. Granted alongside write (write does not imply
+# read; permissions are flat) — mirrors provenance-ci-read.yaml. The repo is
+# PUBLIC so anonymous reads already succeed without this grant, but the
+# /v2/auth capability mint for an AUTHENTICATED subject may still narrow a
+# requested `pull` scope to the held read authority (issue #5 shape); granting
+# it explicitly keeps this fixture's authority model identical to the proven
+# private-repo sibling rather than relying on an unverified public-visibility
+# short-circuit in the capability mint.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: provenance-proxy-ci-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: provenance-proxy-ci
+  permission: read
+  repository: oci-provenance-proxy-e2e

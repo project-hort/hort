@@ -42,7 +42,8 @@ pub mod extractors;
 pub mod write;
 
 pub use extractors::{
-    AdminPrincipal, CurateOrAdminPrincipal, DeleteRepoAccess, ReadRepoAccess, WriteRepoAccess,
+    AdminPrincipal, CurateOrAdminPrincipal, DeleteRepoAccess, MetricsReaderPrincipal,
+    ReadRepoAccess, WriteRepoAccess,
 };
 
 // ---------------------------------------------------------------------------
@@ -51,13 +52,14 @@ pub use extractors::{
 
 /// Catalog: `docs/metrics-catalog.md` — `hort_authz_decisions_total`.
 ///
-/// `permission` ∈ `{admin, read, write, delete, curate}`; `result` ∈
-/// `{allow, deny}`. Any other value is a programming error and must
-/// be caught in review. (`delete` lights up via `DeleteRepoAccess`'s
+/// `permission` ∈ `{admin, read, write, delete, curate, read_metrics}`;
+/// `result` ∈ `{allow, deny}`. Any other value is a programming error and
+/// must be caught in review. (`delete` lights up via `DeleteRepoAccess`'s
 /// live emission site; `curate` via the `CurateOrAdminPrincipal`
 /// extractor — each successful or denied curate-or-admin decision
 /// lights up `permission="curate"` so dashboards can watch the curator
-/// surface independently of the global admin gate.)
+/// surface independently of the global admin gate; `read_metrics` via
+/// `MetricsReaderPrincipal`, issue #113.)
 ///
 /// The metric carries NO `repository` label — deliberate
 /// cardinality-control decision. Per-repo

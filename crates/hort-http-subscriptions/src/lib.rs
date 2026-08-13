@@ -67,13 +67,16 @@ pub fn router() -> Router<Arc<AppContext>> {
             "/api/v1/subscriptions",
             get(handlers::list_own_subscriptions),
         )
-        .route("/api/v1/subscriptions/:id", get(handlers::get_subscription))
         .route(
-            "/api/v1/subscriptions/:id",
+            "/api/v1/subscriptions/{id}",
+            get(handlers::get_subscription),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}",
             patch(handlers::update_subscription),
         )
         .route(
-            "/api/v1/subscriptions/:id",
+            "/api/v1/subscriptions/{id}",
             delete(handlers::delete_subscription),
         )
         .route(

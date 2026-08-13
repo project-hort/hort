@@ -119,6 +119,29 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        // An upstream index/metadata parse failure (ADR 0006-adjacent
+        // sanitisation): the wire body is a FIXED constant, never the
+        // inner parse `cause` — that string comes straight out of the
+        // upstream response body and a compromised/misconfigured
+        // upstream must not be able to inject arbitrary text into a
+        // client-facing error. Mirrors the established
+        // `upstream_pull::map_upstream_pull_error` `ParseError` shape
+        // (502 + `X-Hort-Reason: upstream-metadata-malformed`) so the
+        // index/packument serve paths render the same envelope as the
+        // tarball/file download path for the same failure class.
+        // Early-return so the generic `{"error": message}` tail below
+        // never sees this variant.
+        if let AppError::Domain(DomainError::UpstreamMetadataInvalid) = &self.0 {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("X-Hort-Reason", "upstream-metadata-malformed")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"error": "upstream metadata invalid"}).to_string(),
+                ))
+                .unwrap();
+        }
+
         // `External` and `Scanner` are sanitised at the wire boundary:
         // the opaque body goes to the client; the raw error goes to
         // tracing so operators don't lose signal.
@@ -187,6 +210,21 @@ impl IntoResponse for ApiError {
                         false,
                         "UpstreamBodyTooLarge must be caught by the structured-body \
                          early-return (ADR 0026)"
+                    );
+                    (StatusCode::BAD_GATEWAY, domain_err.to_string())
+                }
+                // Caught by the early-return at the top of this
+                // function. Match arm exists so the inner match stays
+                // exhaustive — fail loudly if a future edit removes the
+                // early return without updating both sites. Mirrors
+                // `UpstreamBodyTooLarge`'s pattern. `domain_err.to_string()`
+                // is safe here too (the `#[error(...)]` text carries no
+                // upstream-derived content) — this arm is unreachable in
+                // practice.
+                DomainError::UpstreamMetadataInvalid => {
+                    debug_assert!(
+                        false,
+                        "UpstreamMetadataInvalid must be caught by the early-return"
                     );
                     (StatusCode::BAD_GATEWAY, domain_err.to_string())
                 }
@@ -776,5 +814,47 @@ mod tests {
         // envelope has neither.
         assert!(v.get("bytes_read").is_some());
         assert!(v.get("cap").is_some());
+    }
+
+    // -- UpstreamMetadataInvalid → 502 with a fixed body, no cause
+    //
+    // The typed boundary for upstream index/metadata parse failures:
+    // the variant itself carries no string, so there is
+    // nothing for this layer to leak even if a future edit dropped the
+    // early-return.
+
+    fn upstream_metadata_invalid_response() -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let resp =
+                ApiError(AppError::Domain(DomainError::UpstreamMetadataInvalid)).into_response();
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, headers, body)
+        })
+    }
+
+    #[test]
+    fn upstream_metadata_invalid_is_502_with_generic_body() {
+        let (status, headers, body) = upstream_metadata_invalid_response();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            headers.get("X-Hort-Reason").and_then(|v| v.to_str().ok()),
+            Some("upstream-metadata-malformed"),
+        );
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("Content-Type must be present");
+        assert_eq!(ct.to_str().unwrap(), "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "upstream metadata invalid");
+        // Mirrors `upstream_pull::map_upstream_pull_error`'s `ParseError`
+        // envelope shape exactly — the generic `error` message is the
+        // ONLY member, no upstream-derived fields.
+        assert_eq!(v.as_object().unwrap().len(), 1);
     }
 }

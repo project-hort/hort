@@ -77,6 +77,16 @@ pub const DEFAULT_BODY_MAX_BYTES: usize = 1024 * 1024;
 /// different leeway here" footguns.
 const FEDERATION_LEEWAY_SECONDS: u64 = 30;
 
+/// Per-issuer kid-miss refresh cooldown — same magnitude as the
+/// single-issuer path's default (`DEFAULT_EVICTION_BACKOFF`). A
+/// fresh-entry kid-miss (the cache entry is not `jwks_refresh_interval`-
+/// stale, but the requested kid is absent) within this window of the
+/// entry's last refresh is denied without a fetch. Federation has no
+/// resilience knob today, so this is a fixed constant rather than a
+/// per-issuer configurable value; a genuinely rotated key is still
+/// accepted within at most one cooldown window.
+const KID_MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // Validator
 // ---------------------------------------------------------------------------
@@ -96,8 +106,20 @@ pub struct MultiIssuerJwksValidator {
     issuers: Arc<dyn OidcIssuerRepository>,
     http: reqwest::Client,
     caches: RwLock<HashMap<String, JwksCacheEntry>>,
+    /// Per-issuer single-flight refresh gates. Each issuer gets its own
+    /// `Mutex<()>`, held for the full check → fetch → insert critical
+    /// section by whichever task wins the race to refresh that issuer;
+    /// concurrent misses for the SAME issuer queue behind it, while a
+    /// different issuer's refresh proceeds independently. This outer map
+    /// is only ever locked briefly to get-or-insert the per-issuer
+    /// `Arc<Mutex<()>>` — never held across a fetch `.await`.
+    refresh_mutexes: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     body_max_bytes: usize,
     leeway_seconds: u64,
+    /// Kid-miss refresh cooldown. Defaults to [`KID_MISS_REFRESH_COOLDOWN`];
+    /// overridable only in tests (see [`Self::with_kid_miss_cooldown`]) —
+    /// production has no config-surface knob for this today.
+    kid_miss_cooldown: Duration,
 }
 
 /// One JWKS cache entry per trusted issuer.
@@ -138,9 +160,39 @@ impl MultiIssuerJwksValidator {
             issuers,
             http,
             caches: RwLock::new(HashMap::new()),
+            refresh_mutexes: RwLock::new(HashMap::new()),
             body_max_bytes,
             leeway_seconds: FEDERATION_LEEWAY_SECONDS,
+            kid_miss_cooldown: KID_MISS_REFRESH_COOLDOWN,
         })
+    }
+
+    /// Test-only override of the kid-miss refresh cooldown, so tests can
+    /// exercise both the throttled and the past-the-window paths without
+    /// waiting out the real 10 s constant. Production always uses
+    /// [`KID_MISS_REFRESH_COOLDOWN`].
+    #[cfg(test)]
+    fn with_kid_miss_cooldown(mut self, cooldown: Duration) -> Self {
+        self.kid_miss_cooldown = cooldown;
+        self
+    }
+
+    /// Get or create the per-issuer refresh mutex. The outer map lock is
+    /// held only long enough to look up / insert the `Arc` — the caller
+    /// then locks the returned `Arc<Mutex<()>>` itself, outside this
+    /// function, for the actual refresh critical section.
+    async fn issuer_refresh_lock(&self, issuer_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let guard = self.refresh_mutexes.read().await;
+            if let Some(lock) = guard.get(issuer_name) {
+                return lock.clone();
+            }
+        }
+        let mut guard = self.refresh_mutexes.write().await;
+        guard
+            .entry(issuer_name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Core validation flow — broken out from the trait impl so tests
@@ -299,6 +351,12 @@ impl MultiIssuerJwksValidator {
 
     /// Resolve the JWK for `kid` under `issuer`, refreshing the JWKS
     /// cache when stale per `issuer.jwks_refresh_interval`.
+    ///
+    /// The global `caches` lock is NEVER held across the `.await` of
+    /// [`Self::fetch_jwks`] — a refresh is coordinated instead via a
+    /// per-issuer entry in `refresh_mutexes`, so validations against a
+    /// DIFFERENT issuer's cached kids proceed uncontended while one
+    /// issuer's refresh (up to ~20s worst case) is in flight.
     async fn resolve_jwk(
         &self,
         issuer: &OidcIssuer,
@@ -327,16 +385,61 @@ impl MultiIssuerJwksValidator {
             }
         }
 
-        // Slow path: write lock, double-check freshness, fetch.
-        let mut guard = self.caches.write().await;
-        if let Some(entry) = guard.get(&issuer.name) {
-            if !is_stale(entry, issuer.jwks_refresh_interval) {
-                if let Some(jwk) = entry.keys.get(kid) {
-                    return Ok(jwk.clone());
+        // Slow path: single-flight via this issuer's refresh mutex, held
+        // for the full check → fetch → insert section below. Concurrent
+        // misses for the SAME issuer queue here; once the leader
+        // releases the mutex, each waiter re-checks the cache
+        // (immediately below) and coalesces onto the leader's result
+        // instead of firing its own fetch. A different issuer's refresh
+        // uses a different mutex and is unaffected.
+        let refresh_lock = self.issuer_refresh_lock(&issuer.name).await;
+        let _refresh_permit = refresh_lock.lock().await;
+
+        let (is_fresh, cached, last_refreshed) = {
+            let guard = self.caches.read().await;
+            match guard.get(&issuer.name) {
+                Some(entry) => (
+                    !is_stale(entry, issuer.jwks_refresh_interval),
+                    entry.keys.get(kid).cloned(),
+                    Some(entry.last_refreshed),
+                ),
+                None => (false, None, None),
+            }
+        };
+        if is_fresh {
+            if let Some(jwk) = cached {
+                // Another task refreshed this issuer while we waited for
+                // the mutex.
+                return Ok(jwk);
+            }
+        }
+
+        // Kid-miss refresh cooldown: gates ONLY the fresh-entry-miss
+        // trigger (the entry itself is not `jwks_refresh_interval`-stale,
+        // but this particular kid never showed up in it). A random-kid
+        // flood never repeats a kid, so a per-kid negative map would be
+        // useless; a single last-refresh timestamp throttles the whole
+        // class instead. Interval-driven staleness is NOT gated — it is
+        // time-driven (at most one refresh per interval) and must stay
+        // live for legitimate rotation.
+        if is_fresh {
+            if let Some(last) = last_refreshed {
+                if is_within_cooldown(last, self.kid_miss_cooldown) {
+                    warn!(
+                        issuer = %issuer.name,
+                        %kid,
+                        "federation jwks kid-miss refresh denied by cooldown"
+                    );
+                    emit_jwks_refresh(issuer.name.as_str(), JwksRefreshResult::KidMissThrottled);
+                    return Err(FederationDenyReason::UnknownKid);
                 }
             }
         }
 
+        // Kid not in cache (or entry stale) — benign first-seen OR
+        // legitimate key rotation past the cooldown. Fetch with NO cache
+        // lock held so validations against other issuers' cached kids
+        // proceed while this refresh is in flight.
         let fresh_keys = self
             .fetch_jwks(issuer, RefreshContext::RuntimeValidate)
             .await?;
@@ -345,6 +448,7 @@ impl MultiIssuerJwksValidator {
             last_refreshed: Utc::now(),
         };
         let resolved = new_entry.keys.get(kid).cloned();
+        let mut guard = self.caches.write().await;
         guard.insert(issuer.name.clone(), new_entry);
         drop(guard);
 
@@ -611,6 +715,20 @@ fn is_stale(entry: &JwksCacheEntry, refresh_interval: Duration) -> bool {
     }
 }
 
+/// Whether `last_refreshed` is within `cooldown` of now — the kid-miss
+/// refresh cooldown gate. Mirrors [`is_stale`]'s clock-skew handling: a
+/// negative elapsed duration (wall clock jumped backwards) is treated as
+/// "not within cooldown" so a clock jump cannot wedge every fresh-entry
+/// kid-miss into permanent denial.
+fn is_within_cooldown(last_refreshed: DateTime<Utc>, cooldown: Duration) -> bool {
+    let now = Utc::now();
+    let elapsed = now.signed_duration_since(last_refreshed);
+    match elapsed.to_std() {
+        Ok(d) => d < cooldown,
+        Err(_) => false,
+    }
+}
+
 fn algorithm_allowed(alg: Algorithm, allowed: &[JwtAlg]) -> bool {
     allowed.iter().any(|a| jwt_alg_matches_algorithm(*a, alg))
 }
@@ -620,16 +738,6 @@ fn algorithm_allowed(alg: Algorithm, allowed: &[JwtAlg]) -> bool {
 /// `JwtAlg` carries trust semantics (RS*/ES* only — no `HS*`) and lives
 /// in `hort-domain`; `Algorithm` is the wire-form enum from the JWT
 /// library and carries no trust intent.
-///
-/// Note: [`JwtAlg::Es512`] has no counterpart in `jsonwebtoken` 10.x —
-/// the JWT library exposes ES256 and ES384 but not ES512 (jsonwebtoken
-/// 10.3.0 `algorithms.rs`). An operator declaring `ES512` in
-/// `OidcIssuer.allowed_algorithms` cannot have any incoming JWT
-/// match it, because `decode_header` will surface the wire algorithm
-/// as a different `Algorithm` variant. The function returns `false`
-/// for that pair — the JWT is denied at the algorithm gate with
-/// `AlgorithmNotAllowed`. Promoting ES512 support is a follow-on once
-/// jsonwebtoken adds the variant.
 fn jwt_alg_matches_algorithm(domain: JwtAlg, wire: Algorithm) -> bool {
     matches!(
         (domain, wire),
@@ -1547,6 +1655,360 @@ FtBmFfStik03XAfEPVCRWBMc
         assert_eq!(jwks_hits, 1, "fresh cache must not re-fetch JWKS");
     }
 
+    // -- Refetch-throttle: fetch-outside-lock, per-issuer single-flight,
+    // kid-miss cooldown -----------------------------------------------------
+
+    #[tokio::test]
+    async fn cached_kid_validation_for_other_issuer_does_not_wait_for_concurrent_refresh() {
+        // Liveness: the global `caches` lock must never be held across a
+        // per-issuer `fetch_jwks().await`. Prove it by putting a
+        // deliberately slow mock behind issuer A's NEXT (kid-miss-
+        // triggered) fetch and asserting a concurrent validation of
+        // issuer B's already-cached kid completes promptly instead of
+        // queueing behind issuer A's slow fetch.
+        use std::time::Instant;
+
+        let server_a = MockServer::start().await;
+        let base_a = server_a.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base_a,
+                "jwks_uri": format!("{base_a}/jwks"),
+            })))
+            .mount(&server_a)
+            .await;
+        let warm_a = Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body()))
+            .up_to_n_times(1)
+            .mount_as_scoped(&server_a)
+            .await;
+
+        let (_server_b, base_b) = start_fed_idp().await;
+
+        let iss_a = issuer("idp-a", &base_a, vec!["hort-server"], vec![JwtAlg::Rs256]);
+        let iss_b = issuer("idp-b", &base_b, vec!["hort-server"], vec![JwtAlg::Rs256]);
+        let repo = StaticIssuerRepo::new(vec![iss_a.clone(), iss_b.clone()]);
+        // Zero cooldown — this test isolates cross-issuer lock liveness,
+        // not the cooldown gate (covered by the dedicated
+        // `kid_miss_cooldown_*` tests below).
+        let v = Arc::new(validator(repo).with_kid_miss_cooldown(Duration::ZERO));
+
+        let claims_a = FederationTestClaims::defaults(&base_a, "hort-server");
+        let token_a = sign_rs256(&claims_a, DEFAULT_KID, TEST_PRIV_PEM);
+        v.validate_impl(&token_a).await.expect("issuer A warmup ok");
+
+        let claims_b = FederationTestClaims::defaults(&base_b, "hort-server");
+        let token_b = sign_rs256(&claims_b, DEFAULT_KID, TEST_PRIV_PEM);
+        v.validate_impl(&token_b).await.expect("issuer B warmup ok");
+
+        drop(warm_a);
+        // Every subsequent /jwks hit on issuer A's server is slow — this
+        // is the refresh the background unknown-kid validation below
+        // will trigger.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(jwks_body())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server_a)
+            .await;
+
+        let unknown_token_a = sign_rs256(&claims_a, "unknown-kid", TEST_PRIV_PEM);
+        let v_bg = v.clone();
+        let refresh_task = tokio::spawn(async move { v_bg.validate_impl(&unknown_token_a).await });
+
+        // Let the background task enter the slow fetch (acquire issuer
+        // A's refresh mutex, drop the cache lock, start the `.await`).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = Instant::now();
+        let cached_result = tokio::time::timeout(Duration::from_secs(1), v.validate_impl(&token_b))
+            .await
+            .expect("issuer B validation must not wait for issuer A's concurrent slow refresh");
+        assert!(cached_result.is_ok(), "{cached_result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "issuer B validation took too long: {:?}",
+            start.elapsed()
+        );
+
+        refresh_task.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_kid_validations_for_one_issuer_single_flight_one_fetch() {
+        // N concurrent first-ever validations (same never-seen kid, same
+        // issuer) must produce exactly one discovery+JWKS fetch pair —
+        // the rest coalesce onto the leader's refresh via the per-issuer
+        // refresh mutex.
+        let (server, base) = start_fed_idp().await;
+        let iss = issuer("test-idp", &base, vec!["hort-server"], vec![JwtAlg::Rs256]);
+        let repo = StaticIssuerRepo::new(vec![iss]);
+        let v = Arc::new(validator(repo).with_kid_miss_cooldown(Duration::ZERO));
+
+        let claims = FederationTestClaims::defaults(&base, "hort-server");
+        let token = sign_rs256(&claims, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let v = v.clone();
+                let token = token.clone();
+                tokio::spawn(async move { v.validate_impl(&token).await })
+            })
+            .collect();
+        for task in tasks {
+            let out = task.await.expect("task must not panic");
+            assert!(
+                out.is_ok(),
+                "every concurrent validation should succeed: {out:?}"
+            );
+        }
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let discovery_hits = requests
+            .iter()
+            .filter(|r| r.url.path() == "/.well-known/openid-configuration")
+            .count();
+        let jwks_hits = requests.iter().filter(|r| r.url.path() == "/jwks").count();
+        assert_eq!(
+            discovery_hits, 1,
+            "single-flight must produce exactly one discovery fetch"
+        );
+        assert_eq!(
+            jwks_hits, 1,
+            "single-flight must produce exactly one jwks fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn kid_miss_cooldown_denies_within_window_then_refreshes_after() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body()))
+            .mount(&server)
+            .await;
+
+        let iss = issuer("test-idp", &base, vec!["hort-server"], vec![JwtAlg::Rs256]);
+        let repo = StaticIssuerRepo::new(vec![iss]);
+        let backoff = Duration::from_millis(60);
+        let v = validator(repo).with_kid_miss_cooldown(backoff);
+
+        let claims = FederationTestClaims::defaults(&base, "hort-server");
+        let token = sign_rs256(&claims, DEFAULT_KID, TEST_PRIV_PEM);
+        v.validate_impl(&token)
+            .await
+            .expect("warmup should succeed");
+        let after_warmup = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/jwks")
+            .count();
+        assert_eq!(after_warmup, 1);
+
+        // Within the window: denied, zero additional upstream requests.
+        let unknown_token = sign_rs256(&claims, "unknown-kid", TEST_PRIV_PEM);
+        let denied = v.validate_impl(&unknown_token).await;
+        assert_eq!(
+            denied,
+            Err(FederationDenyReason::UnknownKid),
+            "kid-miss within the cooldown window must be denied: {denied:?}"
+        );
+        let after_denied = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/jwks")
+            .count();
+        assert_eq!(
+            after_denied, after_warmup,
+            "cooldown denial must not fire an additional jwks request"
+        );
+
+        // Past the window: exactly one new refresh (the JWKS still lacks
+        // "unknown-kid", so the outcome is still a deny — but now it's
+        // the post-refresh unknown-kid path, not the cooldown; the
+        // request count proves the fetch actually happened).
+        tokio::time::sleep(backoff * 3).await;
+        let out = v.validate_impl(&unknown_token).await;
+        assert_eq!(out, Err(FederationDenyReason::UnknownKid));
+        let after_window = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/jwks")
+            .count();
+        assert_eq!(
+            after_window,
+            after_warmup + 1,
+            "exactly one new jwks fetch after the cooldown window elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn kid_miss_cooldown_does_not_block_interval_stale_refresh() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body()))
+            .mount(&server)
+            .await;
+
+        // Short refresh interval, long cooldown — the interval expires
+        // well inside the cooldown window, isolating "interval-stale" as
+        // the only trigger.
+        let mut iss = issuer("test-idp", &base, vec!["hort-server"], vec![JwtAlg::Rs256]);
+        iss.jwks_refresh_interval = Duration::from_millis(30);
+        let repo = StaticIssuerRepo::new(vec![iss]);
+        let v = validator(repo).with_kid_miss_cooldown(Duration::from_secs(600));
+
+        let claims = FederationTestClaims::defaults(&base, "hort-server");
+        let token = sign_rs256(&claims, DEFAULT_KID, TEST_PRIV_PEM);
+        v.validate_impl(&token)
+            .await
+            .expect("warmup should succeed");
+        let after_warmup = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/jwks")
+            .count();
+        assert_eq!(after_warmup, 1);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Same kid, but the entry is now interval-stale — must refetch
+        // even though we are far inside the (10 min) cooldown window.
+        let out = v.validate_impl(&token).await;
+        assert!(
+            out.is_ok(),
+            "interval-stale refresh must not be blocked by the cooldown: {out:?}"
+        );
+        let after_stale = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/jwks")
+            .count();
+        assert_eq!(
+            after_stale,
+            after_warmup + 1,
+            "interval-stale validation must trigger exactly one new jwks fetch"
+        );
+    }
+
+    #[test]
+    fn kid_miss_cooldown_denial_emits_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+        use std::collections::HashMap;
+
+        fn counter_value(
+            snap: &[(
+                CompositeKey,
+                Option<::metrics::Unit>,
+                Option<::metrics::SharedString>,
+                DebugValue,
+            )],
+            metric_name: &str,
+            label_kvs: &[(&str, &str)],
+        ) -> u64 {
+            for (key, _u, _d, value) in snap {
+                if key.kind() != MetricKind::Counter {
+                    continue;
+                }
+                if key.key().name() != metric_name {
+                    continue;
+                }
+                let got: HashMap<String, String> = key
+                    .key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                let labels_match = label_kvs
+                    .iter()
+                    .all(|(k, v)| got.get(*k).is_some_and(|g| g == v))
+                    && got.len() == label_kvs.len();
+                if labels_match {
+                    if let DebugValue::Counter(v) = value {
+                        return *v;
+                    }
+                }
+            }
+            0
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        ::metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (_server, base) = start_fed_idp().await;
+                    let iss = issuer("test-idp", &base, vec!["hort-server"], vec![JwtAlg::Rs256]);
+                    let repo = StaticIssuerRepo::new(vec![iss]);
+                    // Long cooldown — never expires mid-test.
+                    let v = validator(repo).with_kid_miss_cooldown(Duration::from_secs(600));
+
+                    let claims = FederationTestClaims::defaults(&base, "hort-server");
+                    let token = sign_rs256(&claims, DEFAULT_KID, TEST_PRIV_PEM);
+                    v.validate_impl(&token)
+                        .await
+                        .expect("warmup should succeed");
+
+                    let unknown_token = sign_rs256(&claims, "unknown-kid", TEST_PRIV_PEM);
+                    let out = v.validate_impl(&unknown_token).await;
+                    assert_eq!(
+                        out,
+                        Err(FederationDenyReason::UnknownKid),
+                        "cooldown-denied kid-miss must surface UnknownKid: {out:?}"
+                    );
+                });
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        let denied = counter_value(
+            &snap,
+            "hort_jwks_refresh_total",
+            &[("issuer", "test-idp"), ("result", "kid_miss_throttled")],
+        );
+        assert_eq!(
+            denied, 1,
+            "cooldown denial must emit kid_miss_throttled exactly once"
+        );
+    }
+
     // -- Algorithm gate ordering -------------------------------------------
 
     #[tokio::test]
@@ -1611,29 +2073,6 @@ FtBmFfStik03XAfEPVCRWBMc
             (JwtAlg::Es384, Algorithm::ES384),
         ] {
             assert!(algorithm_allowed(wire, &[domain]));
-        }
-    }
-
-    #[test]
-    fn algorithm_allowed_es512_has_no_jsonwebtoken_match() {
-        // `Algorithm::ES512` does not exist in jsonwebtoken 10.x —
-        // operators may declare `JwtAlg::Es512` but no incoming JWT
-        // can match it. Document this gap explicitly so a future
-        // jsonwebtoken upgrade that adds `ES512` produces a test
-        // failure here, forcing the match arm to be added.
-        for wire in [
-            Algorithm::RS256,
-            Algorithm::RS384,
-            Algorithm::RS512,
-            Algorithm::ES256,
-            Algorithm::ES384,
-        ] {
-            assert!(
-                !algorithm_allowed(wire, &[JwtAlg::Es512]),
-                "JwtAlg::Es512 must not match any wire algorithm currently \
-                 exposed by jsonwebtoken — promoting ES512 requires extending \
-                 jwt_alg_matches_algorithm"
-            );
         }
     }
 

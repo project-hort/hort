@@ -16,17 +16,35 @@
 //! `docs/architecture/explanation/scanning-pipeline.md`.
 //!
 //! [`RescanCandidatesRepository::select_stranded`] is a companion
-//! eligibility query (issue #6 / ADR 0007) for a *different* predicate:
-//! `quarantine_status='quarantined'` artifacts whose scan could not even
-//! **run** (every configured scanner backend failed) and exhausted
-//! `HORT_SCANNER_MAX_ATTEMPTS` retries. That failure mode is
-//! transient/infrastructure, not a genuinely-ambiguous scan result, so it
-//! does NOT transition the artifact to the terminal `scan_indeterminate`
-//! status (ADR 0007 unchanged) — the artifact simply stays `quarantined`
-//! with a persisted "last scan errored" fact (`jobs.status='failed'` on
-//! its most recent `kind='scan'` row). `select_stranded` finds exactly
-//! those artifacts (with no in-flight scan job) so the sweep can give the
-//! scan another chance once the scanner recovers. See
+//! eligibility query (issue #6 / ADR 0007; widened by issue #115 defect
+//! (a) cure) for a *different* predicate: `quarantine_status='quarantined'`
+//! artifacts whose scan either could not even **run** (every configured
+//! scanner backend failed and exhausted `HORT_SCANNER_MAX_ATTEMPTS`
+//! retries — the artifact's most recent `kind='scan'` job landed
+//! `status='failed'`) **or was never even requested** (no `kind='scan'`
+//! job row exists at all for the artifact — the #115 seed-import
+//! stranding gap: `IngestUseCase::register_by_hash_inner`'s
+//! `quarantine_anchor_override` branch used to quarantine an artifact
+//! without enqueueing a scan; that inflow is stopped at the source
+//! (#115 item1), but artifacts already stranded that way in deployed
+//! environments before that fix need this sweep — there is no manual
+//! per-artifact rescan surface, so widening this query IS the
+//! remediation for them, not an alternative to one). Both failure modes
+//! are transient/infrastructure or missed-enqueue, not a
+//! genuinely-ambiguous scan result, so neither transitions the artifact
+//! to the terminal `scan_indeterminate` status (ADR 0007 unchanged) —
+//! the artifact simply stays `quarantined`.
+//!
+//! A candidate under either failure mode is stranded ONLY when its
+//! resolved policy (repo-scoped-else-global-else-`DefaultPolicy`, the
+//! same resolution [`Self::select_eligible`] uses) actually scans:
+//! `scan_backends: []` (ScanWaived) is an explicit operator opt-out, and
+//! such an artifact is not stranded — it releases via the existing
+//! `ScanWaived` release authority — so `select_stranded` must never
+//! enqueue a scan that contradicts that policy. `select_stranded` finds
+//! exactly the (job-status-failed OR job-absent) ∧ (resolved-policy-scans)
+//! artifacts (with no in-flight scan job) so the sweep can give the scan
+//! a chance once the scanner recovers, or a first chance at all. See
 //! `docs/architecture/how-to/recover-stranded-artifacts.md`.
 
 use chrono::{DateTime, Utc};

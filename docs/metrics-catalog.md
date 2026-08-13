@@ -230,7 +230,7 @@ attached to the router in that mode.
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|-----------------|
-| `hort_authz_decisions_total` | counter | `result`, `permission` | — | `result` ∈ `allow`, `deny` / `permission` ∈ `read`, `write`, `delete`, `admin`, `curate` |
+| `hort_authz_decisions_total` | counter | `result`, `permission` | — | `result` ∈ `allow`, `deny` / `permission` ∈ `read`, `write`, `delete`, `admin`, `curate`, `read_metrics` |
 | `hort_http_404_repo_lookups_total` | counter | `format` | — | `format` ∈ known [`RepositoryFormat`](../crates/hort-domain/src/entities/repository.rs) values + sentinel `unknown` |
 
 Emission of `hort_authz_decisions_total` moved from per-handler helpers
@@ -248,7 +248,7 @@ call's inputs + decision:
   suppressed on deny — it is the audit trail and complements this
   metric.
 - `permission` mirrors the [`Permission`](../crates/hort-domain/src/entities/rbac.rs)
-  enum's lowercase spelling. Values are `{read, write, delete, admin, curate}`.
+  enum's lowercase spelling. Values are `{read, write, delete, admin, curate, read_metrics}`.
   `delete` is emitted via the `DeleteRepoAccess` extractor; the OCI
   `DELETE /v2/<name>/manifests/<reference>` endpoint is currently the
   only production path that emits `permission="delete"`. Cancel/finalize
@@ -430,7 +430,7 @@ in the `AdminStatusChanged` event payload.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_jwks_refresh_total` | counter | `issuer`, `result` | — | `success`, `throttled`, `fetch_failed`, `body_too_large`, `parse_error`, `apply_warmup_failed` |
+| `hort_jwks_refresh_total` | counter | `issuer`, `result` | — | `success`, `throttled`, `kid_miss_throttled`, `fetch_failed`, `body_too_large`, `parse_error`, `apply_warmup_failed` |
 
 Emitted by `hort-adapters-oidc` on every JWKS refresh attempt + every
 signature-mismatch eviction decision. Covers the forged-kid-flood DoS
@@ -471,6 +471,24 @@ under any plausible operator scale.
   implement per-kid eviction backoff (the forged-kid threat model
   does not apply because the federation path mints short-lived bearers,
   not session tokens).
+- `kid_miss_throttled` — a fresh-cache (or fresh-entry, federation path)
+  kid-miss (the requested `kid` is absent from an otherwise-still-fresh
+  cache/entry) arrived within the kid-miss refresh cooldown. No upstream
+  request fires; the request is denied immediately. Distinct from
+  `throttled` — that one gates repeat *signature-mismatch* evictions of
+  a kid already in the cache, while this one gates an *unknown* kid, the
+  shape of an unauthenticated flood of syntactically-valid JWTs each
+  carrying a fresh, never-seen `kid` (reflected IdP-amplification DoS).
+  TTL/interval-staleness-driven refreshes are never gated by this
+  cooldown — a genuinely rotated key is still picked up within one
+  cooldown window. Fires on BOTH paths, with different cooldown
+  durations: single-issuer user-login (`OidcProvider`) reuses
+  `HORT_JWKS_EVICTION_BACKOFF_SECS` (default 10 s, dual-role with the
+  `throttled` backoff above); the multi-issuer federation validator
+  (`MultiIssuerJwksValidator`) uses a fixed 10 s constant, per issuer —
+  no config-surface knob on either the per-issuer refresh serialisation
+  or this cooldown. Log level: `warn!` with `issuer` + `kid` in span
+  attrs.
 - `fetch_failed` — discovery or JWKS HTTP request failed (transport
   error, non-2xx status, stream read error). Cache stays stale; the
   triggering request 401s (user-login path) or denies with `unknown_kid`
@@ -3056,16 +3074,33 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 |--------|------|--------|------|--------------|
 | `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `requeued_no_anchor` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
+| `hort_provenance_late_joiner_cleared_total` | counter | `backend` | — | one increment per constituent that self-cleared against an already-verified subject at its own quarantine commit |
 
-Both counters are emitted at exactly **one layer** — the orchestration
-use case
+The first two counters are emitted at exactly **one layer** — the
+orchestration use case
 [`ProvenanceOrchestrationUseCase::verify_artifact`](../crates/hort-app/src/use_cases/provenance_orchestration.rs)
 (the domain stays metrics-free; the verdict + resolved mode are surfaced
 to this layer at the emission site). One increment per **applied
 provenance verdict**. Standing decisions: ADR 0027
 (`docs/adr/0027-artifact-provenance-verification.md`).
 
-**Scrape target — the worker `/metrics` listener.** These
+**`hort_provenance_late_joiner_cleared_total`** (ADR 0039 §11,
+late-joiner end). Emitted at exactly one layer —
+[`ProvenanceCascade::resolve_late_joiner_clearance`](../crates/hort-app/src/use_cases/provenance_cascade.rs)
+— one increment per constituent that arrived AFTER its subject was
+verified and self-cleared against that subject's signed bytes at its own
+quarantine commit. Unlike the two counters above, this one runs on the
+**ingest path**, so it is served by the **`hort-server`** `/metrics`
+endpoint, not the worker listener. A steady non-zero rate is the normal
+signature of pulling further platforms of an already-verified multi-arch
+image; a rate of zero on a scope where such pulls happen means the
+constituents are stranding instead (check for `Pending` clearances on
+`Required`-mode repos). `backend` is the verifier recorded on the
+subject's clearance — same bounded value space as everywhere else. No
+per-artifact labels (same forbidden-label rule below); `artifact_id`,
+`subject`, and `constituent` ride the accompanying `info!` line.
+
+**Scrape target — the worker `/metrics` listener.** The two verdict
 counters run in **`hort-worker`** (the `provenance-verify` job), which
 serves an opt-in `GET /metrics` listener — bound via `HORT_WORKER_METRICS_BIND`
 (disabled by default; set a pod-reachable address to enable) — making
@@ -3175,8 +3210,9 @@ accompanying `info!` audit line on the `ProvenanceVerified` /
 not `err`).
 
 Cardinality: `hort_provenance_verify_total` ≤ `backend` (~few) × `mode`
-(3) × `result` (4); `hort_provenance_reject_total` ≤ `backend` × `reason`
-(5). Both are tiny in Tier 1 (one backend).
+(3) × `result` (5); `hort_provenance_reject_total` ≤ `backend` × `reason`
+(5); `hort_provenance_late_joiner_cleared_total` ≤ `backend`. All three
+are tiny in Tier 1 (one backend).
 
 ### Admin task dispatcher
 
@@ -3191,6 +3227,45 @@ deployment the only registered kind is `"scan"`.
 | `hort_admin_tasks_completed_total` | counter | `kind`, `result` | — | `result ∈ {completed, failed_retry, failed_terminal}` |
 | `hort_admin_tasks_duration_seconds` | histogram | `kind` | seconds | wall-clock time from claim to outcome recording, wrapping `TaskHandler::run` |
 | `hort_admin_tasks_in_flight` | gauge | `kind` | tasks | incremented before `TaskHandler::run`, decremented after; 0 when idle |
+| `hort_admin_tasks_pending_eligible` | gauge | `kind` | jobs | claim-eligible pending rows per kind (`status='pending'` and the lock free/expired), set once per starvation audit (every 60 s). Covers **every** kind present in `jobs`, including kinds this worker does not claim |
+| `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed, oldest_row_stalled}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
+| `hort_admin_tasks_claim_unmappable_total` | counter | (none) | — | emitted by the Postgres jobs adapter: one increment per claimed row that failed `JobRow` projection and was resolved terminally instead of being stranded in `running` |
+
+**Starvation semantics** (issue #131). A `provenance-verify` backlog once
+grew to ~1450 rows over 33 minutes while the same dispatcher claimed and
+completed `quarantine-release-sweep` rows every tick — with no panic, no
+`ERROR`, and no metric anywhere. The mechanism: the kind was absent from
+the dispatcher's registered-kind array (the composition root's
+provenance-backend gate logs a single `info!` and registers nothing), so
+`claim_pending_by_kinds`'s `kind = ANY($1)` filtered it out and every
+subsequent signal was silent by construction. `hort_admin_tasks_starved_total`
+closes that hole:
+
+- `reason="unregistered"` — the kind has eligible pending rows and **no
+  handler is registered for it in this worker**. Expected transiently in a
+  mixed fleet (a sibling replica registers it); sustained non-zero means
+  the kind is running nowhere. For `provenance-verify` this is
+  security-relevant: `provenance_mode: required` artifacts stay `Pending`
+  (fail-closed) and never release.
+- `reason="not_claimed"` — the kind IS registered but lost the
+  `priority DESC, created_at ASC` claim race on every poll for the whole
+  window (a higher-priority tier, or an older same-priority backlog,
+  saturating `batch_size` at every poll instant).
+- `reason="oldest_row_stalled"` — the kind's single oldest eligible row has
+  aged past the threshold, **independent of `last_claimed`**. This axis
+  catches a shape the two above cannot: the kind IS registered and IS being
+  claimed every poll (so `not_claimed`/`unregistered` stay silent), but a
+  sustained higher-priority stream of the SAME kind claims only fresh rows
+  every time, leaving one old low-priority row to rot indefinitely behind
+  them. The claim query's reserved-oldest-slot fairness shape (one claim
+  slot per poll reserved for the single oldest eligible row across kinds,
+  regardless of priority) bounds this in the common case; this metric is
+  the backstop that still fires if a kind is starved by some other means
+  (e.g. it is excluded from `claim_pending_by_kinds`'s `kind = ANY($1)`
+  filter for a different reason than being fully unregistered).
+
+Operators alarm on `increase(hort_admin_tasks_starved_total[15m]) > 0`.
+`hort_admin_tasks_pending_eligible` is the accompanying depth signal.
 
 **`hort_admin_tasks_enqueued_total` result semantics** (implemented in `hort-http-admin-tasks`):
 

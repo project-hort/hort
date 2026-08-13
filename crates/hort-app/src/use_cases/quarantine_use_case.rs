@@ -28,6 +28,7 @@ use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInva
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::ingest_use_case::CLEARANCE_VERIFY_PRIORITY;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
@@ -183,7 +184,9 @@ pub struct QuarantineUseCase {
     /// best-effort, non-gating (warn-and-continue) and idempotent per
     /// tick via [`JobsRepository::find_active_provenance_for_artifact`] —
     /// it never blocks the sweep and never releases a `Pending`
-    /// candidate.
+    /// candidate. Parent-gated blob constituents are skipped entirely
+    /// (see the call site) — for them the enqueued verify is
+    /// state-neutral by construction.
     jobs: Arc<dyn JobsRepository>,
 }
 
@@ -385,6 +388,32 @@ impl QuarantineUseCase {
 
         // Step 3 — load artifact + resolve policy + exclusions + coords.
         let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
+
+        // Read the expected stream version HERE — paired with the load
+        // above, BEFORE the policy/exclusion resolution, prior-scan
+        // hydration and findings-blob CAS write below (issue #108 H2a).
+        // It used to be read at step 7, after all of that: a concurrent
+        // verdict committing in that window was already in the version we
+        // then read, so this append did NOT conflict and the paired
+        // projection write happily overwrote the newer status. Anchored
+        // to the load, that append now fails `Conflict` instead.
+        //
+        // Mirrors `policy_use_case.rs`'s early-read shape (warn on read
+        // error), but PROPAGATES rather than skipping: that is a bulk
+        // re-evaluation pass where one artifact is skippable, whereas
+        // this is a single-artifact job — `Err` fails the job so the
+        // dispatcher retries, rather than silently dropping a scan result.
+        let expected_version = read_expected_version(&*self.events, &stream_id, false)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "record_scan_result: expected-version read failed; aborting this artifact \
+                     (job retries)",
+                );
+            })?;
+
         let policy =
             resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
                 .await?;
@@ -422,9 +451,8 @@ impl QuarantineUseCase {
         };
         scan_event.validate()?;
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
-
-        // Step 8 — drive the per-outcome path.
+        // Step 8 — drive the per-outcome path. (`expected_version` was
+        // read up front at step 3 — issue #108 H2a.)
         let scan_id = Uuid::new_v4();
         let scan_findings_rows = build_scan_findings_rows(&findings, artifact_id, scan_id, now);
         // Capture the prior status BEFORE mutation so
@@ -627,6 +655,7 @@ impl QuarantineUseCase {
                         Some((repository_id, score_delta))
                     },
                     sbom_components_owned.as_deref(),
+                    prior_status,
                 )
                 .await?;
 
@@ -771,6 +800,7 @@ impl QuarantineUseCase {
                     now,
                     score_update,
                     sbom_components_owned.as_deref(),
+                    prior_status,
                 )
                 .await?;
 
@@ -1015,6 +1045,15 @@ impl QuarantineUseCase {
     /// default that produced that string is gone, every impl now
     /// implements `commit_scan_result_with_score` directly, and this
     /// dispatch is a single method call.
+    ///
+    /// `prior_status` is the artifact's `quarantine_status` as LOADED at
+    /// the top of [`Self::record_scan_result`], before the domain
+    /// transition mutated it. The lifecycle port uses it to skip the
+    /// status write entirely when the verdict left the status unchanged,
+    /// and to make it conditional otherwise (issue #108 H2b) — see
+    /// `ArtifactLifecyclePort::commit_provenance_verdict`'s doc for the
+    /// shared contract.
+    #[allow(clippy::too_many_arguments)] // trait-defined shape — see the port.
     async fn commit_scan_result_dual_write(
         &self,
         artifact: &Artifact,
@@ -1023,6 +1062,7 @@ impl QuarantineUseCase {
         last_scan_at: DateTime<Utc>,
         score_delta: Option<(Uuid, ScoreDelta)>,
         sbom_components: Option<&[hort_domain::types::sbom::SbomComponent]>,
+        prior_status: QuarantineStatus,
     ) -> AppResult<()> {
         self.lifecycle
             .commit_scan_result_with_score(
@@ -1032,6 +1072,7 @@ impl QuarantineUseCase {
                 last_scan_at,
                 score_delta,
                 sbom_components,
+                prior_status,
             )
             .await
             .map(|_| ())
@@ -1098,6 +1139,34 @@ impl QuarantineUseCase {
         Ok(deadline <= Utc::now())
     }
 
+    /// `true` iff the effective policy for `artifact`'s repository gates
+    /// release on provenance (`Required`) AND the artifact's provenance
+    /// clearance is still `Pending` — i.e. a release-authority-satisfied
+    /// `Quarantined` artifact would STILL be denied release purely on the
+    /// provenance leg. Delegates to [`Self::resolve_provenance_clearance`],
+    /// the SAME resolution the inline fast-path release suppression in
+    /// `record_scan_result` (the `"fast-path release suppressed:
+    /// provenance gate not cleared"` arm) and the `release_expired` sweep
+    /// both call, so this answer and theirs can never drift — `Pending`
+    /// can only ever be produced by `Required` mode (see
+    /// [`crate::use_cases::release_clearance::resolve_provenance_clearance`]),
+    /// so checking the clearance alone is equivalent to the mode+clearance
+    /// conjunction.
+    ///
+    /// Read-only candidacy check — consults no release authority and
+    /// mutates nothing; never itself an authorization to release (ADR
+    /// 0007), mirroring [`Self::is_window_elapsed`]'s posture. Intended
+    /// caller: the `hort-http-oci` bounded-await guard (backlog 094) — a
+    /// candidate that fails this check would burn the full await bound
+    /// and 503 anyway, since sign + verify + cascade cannot land inside
+    /// it.
+    pub async fn release_blocked_on_provenance(&self, artifact: &Artifact) -> AppResult<bool> {
+        let clearance = self
+            .resolve_provenance_clearance(artifact.id, artifact.repository_id)
+            .await?;
+        Ok(matches!(clearance, ProvenanceClearance::Pending))
+    }
+
     /// Timer-release authority resolution (ADR 0007).
     ///
     /// Construct the timer-release authority for a candidate, **fail
@@ -1107,11 +1176,23 @@ impl QuarantineUseCase {
     /// so expiry can never become a release authority.
     ///
     /// Order:
-    /// 1. A successful [`DomainEvent::ScanCompleted`] anywhere on the
-    ///    artifact stream ⇒ [`ReleaseAuthorization::ScanSucceeded`].
-    ///    Terminal scan *failure* emits `ScanIndeterminate`, not
-    ///    `ScanCompleted`, so the mere presence of a
-    ///    `ScanCompleted` is exactly "a successful scan exists".
+    /// 1. A **successful** [`DomainEvent::ScanCompleted`] on the artifact
+    ///    stream ⇒ [`ReleaseAuthorization::ScanSucceeded`]. "Successful"
+    ///    (issue #108 H3 / ADR 0007) means: the LATEST `ScanCompleted` on
+    ///    the stream carries `finding_count == 0`, AND no
+    ///    `ArtifactRejected` appears LATER on the stream than that
+    ///    `ScanCompleted`. Mere *presence* of a `ScanCompleted` is NOT
+    ///    sufficient — the rejecting-scan branch of `record_scan_result`
+    ///    ALSO emits `ScanCompleted` (with `finding_count > 0`), first in
+    ///    its batch, immediately before the `ArtifactRejected` that makes
+    ///    the verdict terminal. A presence-only check would treat that
+    ///    dirty scan's own rejection record as a release authority for
+    ///    the very artifact it just condemned. (Terminal scanner
+    ///    *execution* failure is a different event, `ScanIndeterminate`
+    ///    — that one genuinely never satisfies this predicate, since it
+    ///    isn't a `ScanCompleted` at all; the conflation this comment
+    ///    used to make was between "the scanner ran" and "the artifact
+    ///    passed", not between execution failure and success.)
     /// 2. Else, resolve the artifact's `ScanPolicy`; if it exists AND
     ///    `scan_backends == []` (operator declared this scope unscanned)
     ///    ⇒ [`ReleaseAuthorization::ScanWaived`].
@@ -1130,11 +1211,26 @@ impl QuarantineUseCase {
             .events
             .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
             .await?;
-        if persisted
-            .iter()
-            .any(|e| matches!(e.event, DomainEvent::ScanCompleted(_)))
-        {
-            return Ok(Some(ReleaseAuthorization::ScanSucceeded));
+
+        // The LATEST ScanCompleted's index (stream order — `read_stream`
+        // returns ascending `stream_position`), so "no ArtifactRejected
+        // later than it" can be checked over exactly the suffix after it.
+        let latest_scan_completed =
+            persisted
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, e)| match &e.event {
+                    DomainEvent::ScanCompleted(sc) => Some((idx, sc)),
+                    _ => None,
+                });
+        if let Some((idx, scan_completed)) = latest_scan_completed {
+            let rejected_after = persisted[idx + 1..]
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)));
+            if scan_completed.finding_count == 0 && !rejected_after {
+                return Ok(Some(ReleaseAuthorization::ScanSucceeded));
+            }
         }
 
         let policy =
@@ -1319,35 +1415,24 @@ impl QuarantineUseCase {
             let prior_status = artifact.quarantine_status;
             let repository_id = artifact.repository_id;
 
-            // Construct the real release
-            // authority, fail-closed (ADR 0007). No authority ⇒ skip; the
-            // artifact stays quarantined. quarantine_until is
-            // candidacy-only and is never consulted here.
-            let Some(authz) = self
-                .resolve_release_authority(artifact_id, repository_id)
-                .await?
-            else {
-                tracing::debug!(
-                    artifact_id = %artifact_id,
-                    status = %artifact.quarantine_status,
-                    "skipping: no release authority (no successful scan, scanning not waived)"
-                );
-                continue;
-            };
-            let authority_kind = release_authority_label(authz);
-
             // Compute the provenance side of
-            // the gate per candidate (ADR 0027).
-            // `NotRequired` for Off/VerifyIfPresent; `Required` →
-            // `Cleared` iff a `ProvenanceVerified` event exists, else
-            // `Pending` (fail-closed — denies the timer arm). The scan gate
-            // (`authz`) is unchanged; provenance is an AND-precondition on
-            // the timer arm only.
+            // the gate per candidate (ADR 0027), BEFORE the release-authority
+            // guard below. `NotRequired` for Off/VerifyIfPresent; `Required`
+            // → `Cleared` iff a `ProvenanceVerified` event exists, else
+            // `Pending` (fail-closed — denies the timer arm). This
+            // computation does not depend on release authority.
             let provenance = self
                 .resolve_provenance_clearance(artifact_id, repository_id)
                 .await?;
 
             // S4 — terminal decision at window expiry (design §2 S4).
+            //
+            // Hoisted ahead of the release-authority guard: a candidate
+            // whose release authority is not constructible must still
+            // receive its terminal provenance decision — the two are
+            // independent gates (ADR 0007 scan authority vs ADR 0027
+            // provenance clearance), and the provenance side cannot be
+            // allowed to depend on scan-authority constructibility.
             //
             // The candidates handed to this sweep are already past their
             // computed deadline (the adapter's candidacy filter). A
@@ -1367,9 +1452,75 @@ impl QuarantineUseCase {
             // already-in-flight `provenance-verify` job for this
             // artifact), so repeated ticks between the enqueue and the
             // worker running it do not pile up duplicate open rows.
+            //
+            // **Parent-gated blob constituents are skipped.** A config /
+            // layer blob bound by a parent manifest can never carry an
+            // attestation of its own (the OCI referrers `subject` is a
+            // manifest descriptor; cosign signs manifest digests), so the
+            // verify this would enqueue has exactly two reachable
+            // outcomes: the referenced-tree-descendant HOLD — which
+            // changes no state at all, and which every subsequent tick
+            // would re-enqueue forever — or, on a proxy scope whose
+            // upstream referrer fetch errors, the fail-closed
+            // `Rejected{RekorNotFound}` that `apply_fetch_failure`
+            // produces regardless of the descendant flag. The first is
+            // waste; the second is a terminal rejection of a held blob
+            // caused by infra flakiness on a fetch that had nothing to
+            // find. Neither is a backstop. The blob's terminal state
+            // comes from its parent instead: the cascade clears it when
+            // the parent verifies (ADR 0039), and if the parent goes away
+            // (purge / manifest DELETE both sweep EVERY kind of the
+            // source's edges) the predicate below stops firing on the very
+            // next tick and the backstop resumes — so a blob whose parent
+            // no longer exists still settles terminally.
+            //
+            // The skip set is deliberately narrower than the hold arm's
+            // `is_referenced_descendant`: an artifact an attestation
+            // points at (`oci_subject`) or a child *manifest*
+            // (`oci_index_member`) can still be cleared by a verify, so
+            // it keeps the backstop.
             if matches!(provenance, ProvenanceClearance::Pending) {
-                self.enqueue_final_provenance_verify(artifact_id).await;
+                // INVARIANT: this lookup PROPAGATES its error, matching
+                // the verdict-side resolve in
+                // `ProvenanceOrchestrationUseCase::verify_artifact`.
+                // Neither degraded default is safe here: `false` (assume
+                // "not a parent-gated blob") re-creates the per-tick
+                // enqueue flood this skip exists to remove, and `true`
+                // (assume "skip") would suppress the backstop for a
+                // candidate that may have no parent at all — the strand
+                // direction. A failed read aborts this sweep tick; the
+                // sweep is re-driven on the next one.
+                let refs = self
+                    .content_references
+                    .find_by_target(repository_id, &artifact.sha256_checksum, None)
+                    .await?;
+                if is_parent_gated_blob_constituent(&refs) {
+                    tracing::debug!(
+                        artifact_id = %artifact_id,
+                        "expiry backstop: parent-gated blob constituent; no verify enqueued \
+                         (its clearance comes from the parent's cascade)"
+                    );
+                } else {
+                    self.enqueue_final_provenance_verify(artifact_id).await;
+                }
             }
+
+            // Construct the real release
+            // authority, fail-closed (ADR 0007). No authority ⇒ skip; the
+            // artifact stays quarantined. quarantine_until is
+            // candidacy-only and is never consulted here.
+            let Some(authz) = self
+                .resolve_release_authority(artifact_id, repository_id)
+                .await?
+            else {
+                tracing::debug!(
+                    artifact_id = %artifact_id,
+                    status = %artifact.quarantine_status,
+                    "skipping: no release authority (no successful scan, scanning not waived)"
+                );
+                continue;
+            };
+            let authority_kind = release_authority_label(authz);
 
             match artifact.release(ReleaseReason::Timer, authz, provenance) {
                 Ok(event_payload) => {
@@ -1675,6 +1826,7 @@ mod tests {
         system_actor, Actor, DomainEvent, PersistedEvent, PolicyResult, PolicyScope, ReleaseReason,
         SeveritySummary, StreamId,
     };
+    use hort_domain::ports::content_reference_index::ContentReference;
     use hort_domain::ports::event_store::ExpectedVersion;
     use uuid::Uuid;
 
@@ -1844,6 +1996,34 @@ mod tests {
         Arc<MockPolicyProjectionRepository>,
         Arc<MockJobsRepository>,
     ) {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs, _refs) =
+            make_use_case_with_jobs_and_refs();
+        (
+            uc,
+            artifacts,
+            events,
+            lifecycle,
+            repositories,
+            projections,
+            jobs,
+        )
+    }
+
+    /// [`make_use_case_with_jobs`] plus the
+    /// [`MockContentReferenceIndex`] handle, so the expiry-backstop
+    /// skip tests can seed the inbound edge set the S4 site reads (and
+    /// arm a lookup failure on it).
+    #[allow(clippy::type_complexity)]
+    fn make_use_case_with_jobs_and_refs() -> (
+        QuarantineUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockEventStore>,
+        Arc<MockArtifactLifecycle>,
+        Arc<MockRepositoryRepository>,
+        Arc<MockPolicyProjectionRepository>,
+        Arc<MockJobsRepository>,
+        Arc<MockContentReferenceIndex>,
+    ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let scan_findings = Arc::new(MockScanFindingsRepository::new());
@@ -1875,6 +2055,7 @@ mod tests {
             repositories,
             projections,
             jobs,
+            content_references,
         )
     }
 
@@ -2004,6 +2185,72 @@ mod tests {
         events.set_stream(&stream_id, vec![quarantined, scan_completed]);
     }
 
+    /// Build a `ScanCompleted` [`PersistedEvent`] at `position` —
+    /// `finding_count == 0` is the clean/successful shape,
+    /// `finding_count > 0` is the dirty shape a rejecting scan ALSO
+    /// emits (first in its batch, before the paired `ArtifactRejected`).
+    /// Shared by the issue #108 H3 authority-derivation matrix tests
+    /// below, which (unlike [`seed_stream_with_scan_completed`]) need
+    /// full control over which events land at which position.
+    fn scan_completed_event(
+        artifact_id: Uuid,
+        position: u64,
+        finding_count: u32,
+    ) -> PersistedEvent {
+        let stream_id = StreamId::artifact(artifact_id);
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id,
+            stream_position: position,
+            global_position: position + 1,
+            event: DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "trivy".into(),
+                finding_count,
+                severity_summary: SeveritySummary {
+                    critical: u32::from(finding_count > 0),
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                    negligible: 0,
+                },
+                findings_blob: if finding_count > 0 {
+                    Some("f".repeat(64).parse().unwrap())
+                } else {
+                    None
+                },
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    /// Build an `ArtifactRejected{rejected_by: Scanner}`
+    /// [`PersistedEvent`] at `position` — the event a dirty-verdict scan
+    /// appends immediately after its own `ScanCompleted`.
+    fn rejected_event(artifact_id: Uuid, position: u64) -> PersistedEvent {
+        let stream_id = StreamId::artifact(artifact_id);
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id,
+            stream_position: position,
+            global_position: position + 1,
+            event: DomainEvent::ArtifactRejected(hort_domain::events::ArtifactRejected {
+                artifact_id,
+                rejected_by: hort_domain::events::RejectionReason::Scanner,
+                reason: "critical severity finding".into(),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
     /// Seed an active repo-scoped policy whose
     /// `scan_backends` is empty: the operator declared this repo
     /// un-scanned by design. `release_expired` resolves this policy and
@@ -2058,47 +2305,60 @@ mod tests {
 
     // -- Tests ----------------------------------------------------------------
 
-    /// issue #90 facet 2 — a scan-verdict commit built from a stale
-    /// in-memory `Artifact` snapshot (captured before a concurrently-
-    /// committed quarantine transition landed) must not clobber the anchor
-    /// that other transition just wrote. `commit_scan_result_with_score`'s
-    /// artifact-state write is column-scoped (`quarantine_status` only);
-    /// a full-row write-back (the pre-fix `save_in_tx` shape) would zero
-    /// `quarantine_window_start` back out. Mirrors
-    /// `provenance_verdict_commit_does_not_clobber_concurrently_written_anchor`
-    /// in `provenance_orchestration_tests.rs` for the scan-verdict path.
+    /// issue #90 facet 2, AMENDED BY issue #108 (H2b) — the scan-path
+    /// mirror of
+    /// `provenance_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor`
+    /// in `provenance_orchestration_tests.rs`.
+    ///
+    /// **This test previously asserted the opposite of what it asserts
+    /// now, and the flip is the point.** As written for #90 it ended with
+    /// "the verdict's own status change must land" — codifying the status
+    /// clobber as the contract, protecting only `quarantine_window_start`.
+    /// #90 scoped the write to the status column, hardening every OTHER
+    /// column against the stale snapshot but leaving the
+    /// security-load-bearing one written unconditionally from it. The
+    /// scenario is now oriented the way the real defect runs: the
+    /// concurrent writer commits `Rejected`, and the stale scan verdict is
+    /// a CLEAN mid-window scan, which leaves the status `Quarantined` —
+    /// exactly equal to what it loaded. Under skip-unchanged that is no
+    /// status write at all, so the concurrent `Rejected` survives. The #90
+    /// anchor-survival assertion is kept verbatim alongside it.
     #[tokio::test]
-    async fn scan_verdict_commit_does_not_clobber_concurrently_written_anchor() {
+    async fn scan_verdict_commit_does_not_clobber_concurrently_written_status_or_anchor() {
         let (_uc, artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
 
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &_repositories, QuarantineStatus::Quarantined);
 
         // A STALE in-memory snapshot — as if `record_scan_result` loaded
-        // the artifact BEFORE the concurrent quarantine transition below
-        // landed: `None` status, no anchor.
+        // the artifact BEFORE the concurrent verdict below landed:
+        // `Quarantined`, no anchor yet.
         let mut stale = artifacts.get(artifact_id).unwrap();
-        stale.quarantine_status = QuarantineStatus::None;
+        stale.quarantine_status = QuarantineStatus::Quarantined;
         stale.quarantine_window_start = None;
+        // What the scan path loaded — the guard the conditional write
+        // keys on (`record_scan_result` captures exactly this, before the
+        // domain transition mutates the artifact).
+        let prior_status = stale.quarantine_status;
 
-        // The concurrent quarantine transition commits, setting the
-        // anchor — AFTER the stale snapshot above was captured.
+        // The concurrent verdict commits `Rejected` AND sets the anchor —
+        // AFTER the stale snapshot above was captured.
         let anchor = Utc::now();
         let mut current = artifacts.get(artifact_id).unwrap();
-        current.quarantine_status = QuarantineStatus::Quarantined;
+        current.quarantine_status = QuarantineStatus::Rejected;
         current.quarantine_window_start = Some(anchor);
         artifacts.insert(current);
 
-        // The (stale) scan-verdict commit now runs, deciding Rejected
-        // from its OWN stale view — exactly the shape
-        // `Artifact::reject_from_scan` would have produced on `stale`.
-        stale.quarantine_status = QuarantineStatus::Rejected;
+        // The (stale) scan-verdict commit now runs with a CLEAN result
+        // mid-window: `ScanCompleted{finding_count: 0}` and the artifact
+        // stays `Quarantined` (the timer, not this scan, releases it), so
+        // the status is unchanged from `prior_status`.
         let event = DomainEvent::ScanCompleted(ScanCompleted {
             artifact_id,
             scanner: "trivy".to_string(),
-            finding_count: 1,
+            finding_count: 0,
             severity_summary: SeveritySummary {
-                critical: 1,
+                critical: 0,
                 high: 0,
                 medium: 0,
                 low: 0,
@@ -2121,6 +2381,7 @@ mod tests {
                 Utc::now(),
                 None,
                 None,
+                prior_status,
             )
             .await
             .expect("commit_scan_result_with_score");
@@ -2129,13 +2390,83 @@ mod tests {
         assert_eq!(
             saved.quarantine_status,
             QuarantineStatus::Rejected,
-            "the verdict's own status change must land"
+            "issue #108: the concurrently-committed Rejected must SURVIVE — a clean mid-window \
+             scan leaves the status unchanged from what it loaded, so it must write no status \
+             at all. Reverting it to Quarantined here is the resurrect-then-timer-release defect."
         );
         assert_eq!(
             saved.quarantine_window_start,
             Some(anchor),
             "the concurrently-committed anchor must survive — a column-scoped verdict commit \
              must not clobber it with the stale snapshot's None"
+        );
+    }
+
+    /// issue #108 H2b, the OTHER arm on the scan path — when the scan
+    /// verdict DOES change the status (a dirty scan rejecting) and the
+    /// persisted row has meanwhile moved off the loaded status, the
+    /// conditional write must fail `Conflict` rather than overwrite.
+    /// Mirrors `provenance_verdict_commit_conflicts_when_status_moved_under_it`.
+    #[tokio::test]
+    async fn scan_verdict_commit_conflicts_when_status_moved_under_it() {
+        let (_uc, artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
+
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &_repositories, QuarantineStatus::Quarantined);
+
+        let mut stale = artifacts.get(artifact_id).unwrap();
+        stale.quarantine_status = QuarantineStatus::Quarantined;
+        let prior_status = stale.quarantine_status;
+
+        // Concurrent writer moves the row off `prior_status`.
+        let mut current = artifacts.get(artifact_id).unwrap();
+        current.quarantine_status = QuarantineStatus::Released;
+        artifacts.insert(current);
+
+        // The stale verdict decides `Rejected` — a real status CHANGE, so
+        // skip-unchanged does not apply and the conditional write fires.
+        stale.quarantine_status = QuarantineStatus::Rejected;
+        let event = DomainEvent::ScanCompleted(ScanCompleted {
+            artifact_id,
+            scanner: "trivy".to_string(),
+            finding_count: 1,
+            severity_summary: SeveritySummary {
+                critical: 1,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: None,
+        });
+        let err = lifecycle
+            .commit_scan_result_with_score(
+                &stale,
+                AppendEvents {
+                    stream_id: StreamId::artifact(artifact_id),
+                    expected_version: ExpectedVersion::Any,
+                    events: vec![EventToAppend::new(event)],
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: system_actor(),
+                },
+                &[],
+                Utc::now(),
+                None,
+                None,
+                prior_status,
+            )
+            .await
+            .expect_err("a status that moved under the verdict must Conflict, not be overwritten");
+        assert!(
+            matches!(err, DomainError::Conflict(_)),
+            "expected Conflict (distinct from NotFound, which stays reserved for an absent id); \
+             got {err:?}"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released,
+            "the concurrent writer's status must be left exactly as it was"
         );
     }
 
@@ -3841,6 +4172,109 @@ mod tests {
         assert_eq!(batch.actor, timer_actor());
     }
 
+    // -----------------------------------------------------------------
+    // issue #108 H3 — release authority derives from the LATEST verdict,
+    // not the mere presence of a ScanCompleted. The rejecting-scan branch
+    // of `record_scan_result` ALSO emits `ScanCompleted` (finding_count >
+    // 0), immediately before the `ArtifactRejected` that makes the
+    // verdict terminal; a presence-only check treated that record as a
+    // release authority for the very artifact it just condemned.
+    // -----------------------------------------------------------------
+
+    /// The latest (and only) `ScanCompleted` is DIRTY (`finding_count >
+    /// 0`), immediately followed by `ArtifactRejected` — exactly the
+    /// batch shape `record_scan_result`'s reject branch commits. Must NOT
+    /// construct `ScanSucceeded`: no authority is resolvable (no waiver
+    /// policy seeded either), so the candidate stays quarantined.
+    #[tokio::test]
+    async fn release_expired_denies_release_when_latest_scan_is_dirty() {
+        let (uc, artifacts, events, _lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(artifact_id, 1, 3),
+                rejected_event(artifact_id, 2),
+            ],
+        );
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "a dirty latest ScanCompleted must never authorize release, even though a \
+             ScanCompleted IS present on the stream — issue #108 H3"
+        );
+    }
+
+    /// The latest `ScanCompleted` is CLEAN, but an `ArtifactRejected`
+    /// appears LATER on the stream than it (e.g. an admin/curation reject
+    /// landed after a clean scan). Must NOT construct `ScanSucceeded` —
+    /// the clean scan is stale with respect to the subsequent rejection.
+    #[tokio::test]
+    async fn release_expired_denies_release_when_clean_scan_followed_by_later_reject() {
+        let (uc, artifacts, events, _lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(artifact_id, 1, 0),
+                rejected_event(artifact_id, 2),
+            ],
+        );
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "a clean ScanCompleted followed by a LATER ArtifactRejected must not authorize \
+             release — issue #108 H3"
+        );
+    }
+
+    /// An EARLIER dirty scan + reject, then a LATER clean rescan with no
+    /// further reject after it: the latest `ScanCompleted` (clean) has no
+    /// `ArtifactRejected` after it on the stream, so `ScanSucceeded` DOES
+    /// apply — the predicate is about the latest verdict, not "was there
+    /// ever a rejection anywhere on the stream".
+    #[tokio::test]
+    async fn release_expired_releases_via_scan_succeeded_after_a_later_clean_rescan() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(artifact_id, 1, 3),
+                rejected_event(artifact_id, 2),
+                scan_completed_event(artifact_id, 3, 0),
+            ],
+        );
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "the LATEST ScanCompleted is clean and nothing rejects after it — issue #108 H3 \
+             looks at the latest verdict, not stream-wide presence of any rejection"
+        );
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Released
+        );
+    }
+
     /// A candidate whose resolved `ScanPolicy` has
     /// `scan_backends == []` (scanning waived by operator policy) is
     /// released via `ReleaseAuthorization::ScanWaived` even with **no**
@@ -3948,6 +4382,18 @@ mod tests {
         events: &Arc<MockEventStore>,
         artifact_id: Uuid,
     ) {
+        seed_stream_scanned_and_cleared(events, artifact_id, None);
+    }
+
+    /// [`seed_stream_scanned_and_provenance_verified`] with the clearance's
+    /// attribution parameterized: `Some(subject)` models a CASCADED
+    /// clearance — the shape a late-joining constituent carries after it
+    /// self-clears against an already-verified subject at ingest.
+    fn seed_stream_scanned_and_cleared(
+        events: &Arc<MockEventStore>,
+        artifact_id: Uuid,
+        cascaded_from: Option<ContentHash>,
+    ) {
         let stream_id = StreamId::artifact(artifact_id);
         let quarantined = dummy_persisted_event(&stream_id, artifact_id, 0);
         let scan_completed = PersistedEvent {
@@ -3992,7 +4438,7 @@ mod tests {
                             .into(),
                 },
                 predicate_type: None,
-                cascaded_from: None,
+                cascaded_from,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -4061,6 +4507,118 @@ mod tests {
             panic!("ArtifactReleased expected");
         };
         assert_eq!(ev.released_by, ReleaseReason::Timer);
+    }
+
+    // =====================================================================
+    // `release_blocked_on_provenance` (backlog 094) — the bounded-await
+    // guard's predicate. Reuses `resolve_provenance_clearance`, so these
+    // tests pin the same arms the `release_expired` Required-mode tests
+    // above already cover, but through the new public entry point.
+    // =====================================================================
+
+    /// `Required` + no `ProvenanceVerified` on the stream ⇒ `Pending` ⇒
+    /// blocked. This is the exact case the bounded-await guard exists to
+    /// short-circuit: the fast-path release is suppressed for it, so
+    /// awaiting the bound would only ever end in a 503.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_required_pending_returns_true() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        seed_required_provenance_policy(&projections, artifact.repository_id);
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(
+            blocked,
+            "Required + no ProvenanceVerified ⇒ Pending ⇒ blocked"
+        );
+    }
+
+    /// `Required` + a `ProvenanceVerified` event on the stream ⇒ `Cleared`
+    /// ⇒ NOT blocked — the provenance leg is satisfied, so a bounded await
+    /// is worth attempting (subject to the scan leg, which this predicate
+    /// does not evaluate).
+    #[tokio::test]
+    async fn release_blocked_on_provenance_required_cleared_returns_false() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        seed_required_provenance_policy(&projections, artifact.repository_id);
+        seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(
+            !blocked,
+            "Required + ProvenanceVerified ⇒ Cleared ⇒ not blocked"
+        );
+    }
+
+    /// `provenance_mode == VerifyIfPresent` (the default) never gates
+    /// release ⇒ `NotRequired` ⇒ NOT blocked, regardless of stream
+    /// contents.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_verify_if_present_returns_false() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        let repo_id = artifact.repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(
+            !blocked,
+            "VerifyIfPresent never gates release ⇒ not blocked"
+        );
+    }
+
+    /// `provenance_mode == Off` ⇒ `NotRequired` ⇒ NOT blocked.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_off_returns_false() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        let repo_id = artifact.repository_id;
+        let mut p = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        p.provenance_mode = ProvenanceMode::Off;
+        projections.insert(p);
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let blocked = uc.release_blocked_on_provenance(&artifact).await.unwrap();
+
+        assert!(!blocked, "Off never gates release ⇒ not blocked");
+    }
+
+    /// A policy-resolution failure (the same failure mode
+    /// `is_window_elapsed` and `resolve_release_authority` can hit)
+    /// propagates as `Err` rather than being swallowed into `false`. The
+    /// caller (`maybe_bounded_await_release`) owns the fail-safe
+    /// (`unwrap_or(false)`), not this predicate.
+    #[tokio::test]
+    async fn release_blocked_on_provenance_propagates_resolution_error() {
+        let (uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let artifact = artifacts.get(artifact_id).unwrap();
+        projections.fail_next_list_active(DomainError::Invariant("policy read failed".into()));
+
+        let result = uc.release_blocked_on_provenance(&artifact).await;
+
+        assert!(result.is_err(), "policy resolution failure must propagate");
     }
 
     // =====================================================================
@@ -4202,6 +4760,358 @@ mod tests {
         assert!(
             jobs.enqueue_calls().is_empty(),
             "VerifyIfPresent (NotRequired) never triggers the S4 backstop"
+        );
+    }
+
+    // =====================================================================
+    // S4 skip — parent-gated blob constituents. The final verify is
+    // enqueued for every Required + Pending candidate EXCEPT a config /
+    // layer blob whose only inbound edges are its parent manifest's:
+    // for those the job is state-neutral by construction (the verdict is
+    // the descendant hold), so re-enqueueing it every tick is pure churn.
+    // The skip is decided per tick against the LIVE edge set, which is
+    // what keeps it from stranding anything.
+    // =====================================================================
+
+    /// Seed one inbound `content_references` edge of `kind` targeting
+    /// `artifact_id`'s content hash — i.e. "some other artifact
+    /// references this one this way".
+    async fn seed_inbound_edge(
+        refs: &Arc<MockContentReferenceIndex>,
+        artifacts: &Arc<MockArtifactRepository>,
+        artifact_id: Uuid,
+        kind: &str,
+    ) {
+        let artifact = artifacts.get(artifact_id).expect("seeded artifact");
+        let reference = ContentReference {
+            source_artifact_id: Uuid::new_v4(),
+            target_content_hash: artifact.sha256_checksum.clone(),
+            kind: kind.to_string(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            repository_id: artifact.repository_id,
+            recorded_at: Utc::now(),
+        };
+        refs.insert(reference).await.expect("seed inbound edge");
+    }
+
+    /// Build the standard `Required` + `Pending` + past-deadline S4
+    /// candidate and return `(fixture handles, artifact_id)`.
+    #[allow(clippy::type_complexity)]
+    fn s4_pending_candidate() -> (
+        QuarantineUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockJobsRepository>,
+        Arc<MockContentReferenceIndex>,
+        Uuid,
+    ) {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, jobs, refs) =
+            make_use_case_with_jobs_and_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        (uc, artifacts, jobs, refs, artifact_id)
+    }
+
+    /// The churn close: a layer blob bound by a parent manifest gets NO
+    /// final verify. The job it would enqueue always completes as the
+    /// referenced-tree-descendant hold, so every tick re-enqueued a
+    /// job that could not change the artifact's state.
+    #[tokio::test]
+    async fn release_expired_skips_the_backstop_for_a_parent_gated_layer_blob() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "primary_content").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(released.is_empty(), "a Pending candidate is never released");
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "a parent-gated layer blob must not re-enqueue a verify that can only hold"
+        );
+    }
+
+    /// Same for a config blob — the other manifest→blob edge kind.
+    #[tokio::test]
+    async fn release_expired_skips_the_backstop_for_a_parent_gated_config_blob() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_config").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(jobs.enqueue_calls().is_empty());
+    }
+
+    /// Mixed tree, shared blob: two parent manifests reference the same
+    /// layer. Held is correct while ANY live parent is unresolved, and
+    /// the skip holds regardless of how many parents there are.
+    #[tokio::test]
+    async fn release_expired_skips_the_backstop_for_a_blob_shared_by_two_parents() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(jobs.enqueue_calls().is_empty());
+    }
+
+    /// The purged-parent fallback, pinned. Purge and manifest DELETE
+    /// both sweep EVERY kind of the source artifact's edges, so once the
+    /// parent is gone the candidate's inbound set is its own refcount
+    /// rows only — the skip stops applying on the very next tick and the
+    /// backstop resumes, which is what lets the orphan settle terminally
+    /// instead of stranding as `Pending` forever.
+    #[tokio::test]
+    async fn release_expired_reenqueues_the_backstop_once_the_parent_edges_are_gone() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        // Only the artifact's own refcount row survives the parent's purge.
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "primary_content").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            jobs.enqueue_calls().len(),
+            1,
+            "with no live parent edge the candidate must get its terminal verify"
+        );
+        assert_eq!(jobs.enqueue_calls()[0].0, "provenance-verify");
+    }
+
+    /// The strand case the narrow skip set exists to prevent: an
+    /// artifact an attestation points at is one verify away from being
+    /// CLEARED, so it keeps the backstop even though the hold arm's
+    /// broader descendant predicate also fires for it. Skipping here
+    /// would brick a signed image whose signature-arrival enqueue was
+    /// lost — exactly the failure S4 exists to backstop.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_an_attestation_subject() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "primary_content").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_subject").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            jobs.enqueue_calls().len(),
+            1,
+            "an artifact with attestation material must still get its final verify"
+        );
+    }
+
+    /// A blob that is ALSO an attestation subject keeps the backstop —
+    /// one attestation-bearing edge disqualifies the whole skip.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_a_blob_that_is_also_a_subject() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_subject").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(jobs.enqueue_calls().len(), 1);
+    }
+
+    /// A child manifest of an index is a manifest: it can be signed in
+    /// its own right, and on a proxy scope its verify is what fetches
+    /// upstream referrers. It keeps the backstop.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_a_child_manifest() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_index_member").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(jobs.enqueue_calls().len(), 1);
+    }
+
+    /// **Churn quiescing (ADR 0039 §11, late-joiner end).** A child
+    /// manifest that self-cleared at ingest — a CASCADED
+    /// `ProvenanceVerified` on its stream — resolves `Cleared`, so the
+    /// expiry backstop stops enqueueing a verify for it on every tick.
+    ///
+    /// This is the shape the backstop churned on before the late-joiner
+    /// end existed: `release_expired_keeps_the_backstop_for_a_child_manifest`
+    /// pins the identical edge set STILL enqueueing while the constituent
+    /// is `Pending` — the only difference here is the clearance, so this
+    /// pair isolates exactly what quiesced the churn.
+    #[tokio::test]
+    async fn release_expired_stops_re_enqueueing_a_late_joiner_cleared_manifest() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, jobs, refs) =
+            make_use_case_with_jobs_and_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_required_provenance_policy(&projections, repo_id);
+        // The late-joiner clearance: cascaded, attributed to the signed
+        // index. A child manifest is NOT a parent-gated blob, so the
+        // backstop's own skip does not apply — only the clearance can
+        // quiesce it.
+        seed_stream_scanned_and_cleared(
+            &events,
+            artifact_id,
+            Some(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .parse()
+                    .unwrap(),
+            ),
+        );
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_index_member").await;
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        // A second tick: the backstop is driven per tick, so quiescing
+        // must hold across ticks, not just on the first one.
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "Cleared + scan authority ⇒ the constituent releases instead of stranding"
+        );
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "a late-joiner-cleared manifest must not be re-enqueued by the expiry backstop"
+        );
+    }
+
+    /// An unknown/future edge kind disqualifies the skip — the inverse
+    /// conservatism to the hold arm, where an unknown kind counts AS a
+    /// descendant. Both directions refuse to terminally decide.
+    #[tokio::test]
+    async fn release_expired_keeps_the_backstop_for_an_unknown_edge_kind() {
+        let (uc, artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "future_kind").await;
+
+        uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(jobs.enqueue_calls().len(), 1);
+    }
+
+    /// Error direction: the edge lookup PROPAGATES. Degrading to
+    /// "not parent-gated" would re-create the churn; degrading to
+    /// "parent-gated" would suppress the backstop for a candidate that
+    /// may have no parent at all. The tick aborts and is re-driven.
+    #[tokio::test]
+    async fn release_expired_propagates_a_failed_backstop_edge_lookup() {
+        let (uc, _artifacts, jobs, refs, artifact_id) = s4_pending_candidate();
+        refs.fail_next_find_by_target(DomainError::Invariant("content_references down".into()));
+
+        let result = uc.release_expired(vec![artifact_id]).await;
+
+        assert!(
+            result.is_err(),
+            "a failed edge lookup must fail the sweep tick, not pick a default"
+        );
+        assert!(
+            jobs.enqueue_calls().is_empty(),
+            "no enqueue decision may be made on an unreadable edge set"
+        );
+    }
+
+    /// The skip is scoped to the S4 arm only: a `Cleared` candidate
+    /// never reaches the edge lookup, so a blob whose parent already
+    /// cascaded still releases normally.
+    #[tokio::test]
+    async fn release_expired_releases_a_cascade_cleared_blob_constituent() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs, refs) =
+            make_use_case_with_jobs_and_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "a cascade-cleared blob constituent releases exactly as before"
+        );
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+        assert!(jobs.enqueue_calls().is_empty());
+    }
+
+    // =====================================================================
+    // S4 hoisted ahead of the release-authority guard: the terminal
+    // provenance decision must not depend on release-authority
+    // constructibility (design §2 S4 + ADR 0007/ADR 0027 independence).
+    // =====================================================================
+
+    /// A `Required` + `Pending` candidate with NO constructible release
+    /// `provenance-verify` enqueued — the S4 arm fires before the
+    /// authority-guard `continue`, not after it. The candidate is (as
+    /// always) not released, for the authority reason this time rather
+    /// than the provenance one.
+    #[tokio::test]
+    async fn release_expired_s4_fires_even_when_release_authority_is_unconstructible() {
+        let (uc, artifacts, _events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // Deliberately NOT seeding ScanCompleted: no release authority is
+        // constructible. Required provenance policy, no ProvenanceVerified
+        // either: provenance clearance is Pending.
+        seed_required_provenance_policy(&projections, repo_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "no release authority ⇒ never released, regardless of provenance"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no release transition committed when authority is unconstructible"
+        );
+        let calls = jobs.enqueue_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "S4 must enqueue the final provenance-verify even though release \
+             authority could not be constructed — the terminal provenance \
+             decision does not depend on scan authority"
+        );
+        let (kind, params, _actor_id) = &calls[0];
+        assert_eq!(kind, "provenance-verify");
+        assert_eq!(
+            params.get("artifact_id").and_then(|v| v.as_str()),
+            Some(artifact_id.to_string().as_str())
+        );
+    }
+
+    /// Unchanged-behavior pin: when release authority IS
+    /// constructible, S4 behavior is exactly as before the hoist — a
+    /// `Required` + `Pending` candidate with a passing scan gate still
+    /// enqueues exactly one final verify and is not released. Guards
+    /// against the hoist accidentally double-firing S4 or changing the
+    /// authority-present path.
+    #[tokio::test]
+    async fn release_expired_s4_unchanged_when_release_authority_is_constructible() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+
+        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            released.is_empty(),
+            "Pending provenance still denies the timer arm even with authority present"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+        assert_eq!(
+            jobs.enqueue_calls().len(),
+            1,
+            "authority-present path enqueues exactly one final verify, unchanged by the hoist"
         );
     }
 

@@ -11,10 +11,13 @@ Requires >= 85% coverage.
 ## Responsibility
 
 Serves the admin-task invoke/list/get REST surface for every registered
-task kind: `noop`, `scan`, `cron-rescan-tick`, `advisory-watch-tick`,
+task kind: `noop`, `cron-rescan-tick`, `advisory-watch-tick`,
 `retention-evaluate`/`retention-purge`, `eventstore-archive`/
 `eventstore-checkpoint`, `staging-sweep`, `service-account-rotation`,
-`replay-seen-prune`, `scanner-registry-prune`.
+`replay-seen-prune`, `scanner-registry-prune`. `scan` is NOT among
+them: a scan row is only well-formed with its scan-typed columns, which
+only `JobsRepository::enqueue_scan` writes — operator-driven rescans go
+through `POST /api/v1/artifacts/:id/rescan`.
 
 ## Ports
 
@@ -25,8 +28,8 @@ task kind: `noop`, `scan`, `cron-rescan-tick`, `advisory-watch-tick`,
 ## Key types
 
 - `router()` — mounted at `/api/v1/admin/tasks`.
-- Per-kind param types: `NoopParams`, `ScanRawParams`,
-  `CronRescanTickRawParams`, and the rest of the task-kind family.
+- Per-kind param types: `NoopParams`, `CronRescanTickRawParams`, and
+  the rest of the task-kind family.
 - `dto`, `handlers`, `params` — public modules.
 
 ## Rules

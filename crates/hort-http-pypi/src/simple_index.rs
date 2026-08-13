@@ -286,6 +286,15 @@ pub(crate) type CachedPypiProjection = CachedProjection<PypiSimpleIndexProjectio
 pub enum IndexFetchError {
     #[error("no upstream mapping configured")]
     NoUpstream,
+    /// The requested project name failed `validate_pep_503_name`
+    /// (serve-path parity): a `..` / `..%2f`-shaped name that the bare
+    /// `normalize_name` URL-decode would otherwise pass through into the
+    /// cache key, the mirror key, AND the composed upstream URL. Fail-closed
+    /// BEFORE any key construction. Carries the validator's message;
+    /// consumers surface it as `Validation` → 400 (a client fault, NOT the
+    /// `UpstreamUnavailable` network bucket).
+    #[error("invalid project name: {cause}")]
+    InvalidName { cause: String },
     #[error("upstream unavailable")]
     UpstreamUnavailable,
     /// Upstream metadata body exceeded the configured storage backstop;
@@ -421,6 +430,21 @@ pub async fn fetch_raw_with_cache(
         tracing::warn!("PyPI proxy repository has no upstream mapping configured");
         return Err(IndexFetchError::NoUpstream);
     };
+
+    // ---- Project-name validation (serve-path parity) ------------------
+    // The publish path validates the project name via `validate_pep_503_name`
+    // before any storage write; the proxy-GET serve path historically only
+    // ran the bare `normalize_name` URL-decode, so a `..` / `..%2f`-shaped
+    // name would flow unvalidated into the cache key, the mirror key, AND
+    // the composed upstream URL below. Reject here, BEFORE any key /
+    // upstream-URL construction, returning the SAME `pypi.name`
+    // `DomainError::Validation` the publish path emits.
+    if let Err(e) = hort_formats::pypi::validate_pep_503_name(project) {
+        tracing::warn!("PyPI proxy project name failed validation; refusing to construct keys");
+        return Err(IndexFetchError::InvalidName {
+            cause: e.to_string(),
+        });
+    }
 
     // Normalise the project name once — both the upstream path and the
     // cache key key on PEP 503's normalised form so `Foo`, `foo`, and
@@ -1413,6 +1437,75 @@ mod tests {
             unreachable!()
         };
         assert_eq!(payload.files.len(), 2, "wheel + sdist");
+    }
+
+    /// A `..` / `..%2f`-shaped project name must reject with `InvalidName`
+    /// BEFORE any cache/mirror key or upstream URL is constructed. The
+    /// one-shot `fail_next_metadata_with` proves it: if the validation gate
+    /// were bypassed, the fetch would reach the upstream leg and consume
+    /// this failure instead of rejecting on the name.
+    #[tokio::test]
+    async fn fetch_rejects_traversal_project_name_before_key_construction() {
+        for bad in ["..", "../etc", "..%2fetc", "..%2f"] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_pypi_repo("pypi-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(&mocks, repo.id);
+            mocks
+                .upstream_proxy
+                .fail_next_metadata_with(DomainError::Invariant(
+                    "MARKER:fetch_metadata_must_not_be_called".into(),
+                ));
+
+            let err = fetch_raw_with_cache(
+                ctx.upstream_resolver.as_ref(),
+                ctx.ephemeral_evictable.as_ref(),
+                ctx.upstream_proxy.as_ref(),
+                ctx.pull_dedup.as_ref(),
+                Some(ctx.metadata_mirror.as_ref()),
+                cap(),
+                &repo,
+                bad,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(err, IndexFetchError::InvalidName { .. }),
+                "traversal project name {bad:?} must reject with InvalidName, got {err:?}"
+            );
+            assert!(
+                mocks.metadata_mirror.keys().is_empty(),
+                "rejecting {bad:?} must not have written the mirror"
+            );
+        }
+    }
+
+    /// The validation gate must not regress the happy path: a normal
+    /// project name still flows through to a served projection.
+    #[tokio::test]
+    async fn fetch_accepts_valid_project_name_past_validation_gate() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_pypi_repo("pypi-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+        mocks
+            .upstream_proxy
+            .insert_metadata("", "/simple/flask/", JSON_BODY.to_vec());
+
+        let projection = fetch_raw_with_cache(
+            ctx.upstream_resolver.as_ref(),
+            ctx.ephemeral_evictable.as_ref(),
+            ctx.upstream_proxy.as_ref(),
+            ctx.pull_dedup.as_ref(),
+            Some(ctx.metadata_mirror.as_ref()),
+            cap(),
+            &repo,
+            "flask",
+        )
+        .await
+        .expect("valid project name must pass the validation gate");
+        assert_eq!(projection.files.len(), 2);
     }
 
     /// A malformed JSON upstream body fails closed: rejects with

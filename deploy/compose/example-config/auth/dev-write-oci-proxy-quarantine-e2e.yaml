@@ -1,0 +1,16 @@
+# PermissionGrant: [developer, ci-pusher] -> write oci-proxy-quarantine-e2e
+# (dev-user, scenarios/quarantine/proxy-multiarch-zero-window.sh). Mirror of
+# dev-write-oci-quarantine-e2e.yaml — per-repo + two-claim subject passes the
+# allowlist linter. Rationale: the zero-window scenario reads held manifests
+# via the write-authorized hold-read exemption (ADR 0039 §10), which keys on
+# granted Write authority — this repo had no dev-write grant until now.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-write-oci-proxy-quarantine-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: oci-proxy-quarantine-e2e

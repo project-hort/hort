@@ -124,6 +124,12 @@ UNSIGNED_SOURCE_IMAGE="${UNSIGNED_SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:6.5
 # priority-10 release-sweep then releases on its next tick. This window is
 # just margin, not the fix.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-300}"
+# [6/6]'s negative leg observes a terminal decision that only fires on the
+# expiry backstop (the release sweep's window_open=false pass), so its bound
+# must clear one full sweep-ticker interval (compose ticker: 5min) plus job
+# latency — anything tighter can time out on phase offset alone against a
+# healthy stack, not a real regression.
+NEGATIVE_WINDOW_WAIT_SECS="${PROVENANCE_NEGATIVE_WINDOW_WAIT_SECS:-450}"
 
 # Strip scheme so skopeo/cosign's docker:// transport gets host:port only.
 REGISTRY_HOST="${HORT_URL#http://}"
@@ -221,17 +227,8 @@ sys.stdout.write(base64.urlsafe_b64decode(seg).decode("utf-8"))
 
 if [ "$NATIVE_TOKENS" = "1" ]; then
     log "[auth] native-token mode: admin-minting an hort_svc_* token for service account provenance-ci"
-    ADMIN_TOKEN="$(fetch_token admin admin)"
-    [ -n "$ADMIN_TOKEN" ] || { fail "fetch admin token" "empty response from Keycloak"; summary; }
-    SA_UID="$(psql_one "SELECT id FROM users WHERE username='sa:provenance-ci';")"
-    [ -n "$SA_UID" ] || { fail "resolve provenance-ci backing user" \
-        "no users row 'sa:provenance-ci' — gitops service-accounts/provenance-ci.yaml not applied?"; summary; }
-    SVC_TOKEN="$(curl -sS -X POST \
-        -H "Authorization: Bearer ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
-        -d "{\"name\":\"provenance-e2e-$(date +%s)\",\"declared_permissions\":[\"read\",\"write\"],\"expires_in_days\":1}" \
-        "${HORT_URL}/api/v1/admin/users/${SA_UID}/tokens" 2>/dev/null | jq -r '.token // empty')"
-    [ -n "$SVC_TOKEN" ] || { fail "admin-mint provenance-ci svc token" \
-        "POST /api/v1/admin/users/${SA_UID}/tokens returned no token"; summary; }
+    SVC_TOKEN="$(mint_svc_token provenance-ci "$REPO_KEY" read,write)" || {
+        fail "admin-mint provenance-ci svc token" "mint_svc_token failed -- see stderr diagnostics above"; summary; }
     PUSH_USER="provenance-ci"; PUSH_SECRET="$SVC_TOKEN"
     # The hold probes ([2/6]) ride a PULL-scoped capability JWT — the
     # issue-#13 shape: read-only cap, write-granted identity.
@@ -547,13 +544,13 @@ fi
 # anonymous 503->404 transition to watch on a private repo).
 if bounded_poll \
         "never-signed manifest -> terminal ProvenanceRejected{Unsigned}" \
-        "$WINDOW_WAIT_SECS" \
+        "$NEGATIVE_WINDOW_WAIT_SECS" \
         "[ -n \"\$(psql_one \"SELECT 1 FROM events e JOIN artifacts a ON e.stream_id = 'artifact-' || a.id::text WHERE a.checksum_sha256 = '${UNSIGNED_DIGEST_HEX}' AND e.event_type = 'ProvenanceRejected' LIMIT 1;\")\" ]" \
         5; then
     pass "never-signed image is terminally Rejected{Unsigned} at window expiry (ProvenanceRejected event emitted, not released)"
 else
     fail "never-signed image -> terminal Rejected{Unsigned}" \
-         "no ProvenanceRejected event for checksum ${UNSIGNED_DIGEST_HEX} within ${WINDOW_WAIT_SECS}s (the expiry backstop should have made the terminal Unsigned decision)"
+         "no ProvenanceRejected event for checksum ${UNSIGNED_DIGEST_HEX} within ${NEGATIVE_WINDOW_WAIT_SECS}s (the expiry backstop should have made the terminal Unsigned decision)"
 fi
 
 summary

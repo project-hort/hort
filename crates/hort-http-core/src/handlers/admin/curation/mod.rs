@@ -64,8 +64,8 @@ pub mod waive;
 /// error rather than a 403 at runtime).
 pub fn curation_routes() -> Router<Arc<AppContext>> {
     Router::new()
-        .route("/quarantine/:artifact_id/waive", post(waive::post_waive))
-        .route("/quarantine/:artifact_id/block", post(block::post_block))
+        .route("/quarantine/{artifact_id}/waive", post(waive::post_waive))
+        .route("/quarantine/{artifact_id}/block", post(block::post_block))
         .route("/block-versions", post(block_versions::post_block_versions))
         .route("/queue", get(queue::get_queue))
         .route("/decisions", get(decisions::get_decisions))

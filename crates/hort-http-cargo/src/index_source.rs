@@ -271,14 +271,24 @@ impl IndexSource for ProxyCargoSource {
                     "cargo upstream unavailable; no cached fallback".to_string(),
                 ));
             }
-            Err(IndexFetchError::MetadataMalformed { cause }) => {
+            Err(IndexFetchError::MetadataMalformed { cause: _ }) => {
                 // A malformed upstream NDJSON body surfaces as
-                // `result=parse_error` (a 4xx via the `Validation` →
-                // 400 mapping), NEVER the network /
-                // `upstream_unavailable` bucket. Fail-closed: nothing
-                // was cached or mirrored.
+                // `result=parse_error` (502 via the typed
+                // `UpstreamMetadataInvalid` mapping — mirrors the
+                // established `upstream_pull::map_upstream_pull_error`
+                // `ParseError` wire shape), NEVER the network /
+                // `upstream_unavailable` bucket, and NEVER the raw
+                // upstream-derived `cause` (already logged server-side at
+                // the construction site in `index_cache.rs`). Fail-closed:
+                // nothing was cached or mirrored.
+                let repo_label = if ctx.include_repository_label {
+                    repo.key.as_str()
+                } else {
+                    hort_app::metrics::values::REPOSITORY_ALL
+                };
+                hort_app::metrics::emit_upstream_parse_error("cargo", repo_label);
                 return Err(AppError::Domain(
-                    hort_domain::error::DomainError::Validation(cause),
+                    hort_domain::error::DomainError::UpstreamMetadataInvalid,
                 ));
             }
             Err(IndexFetchError::Internal(msg)) => {

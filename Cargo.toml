@@ -107,7 +107,7 @@ members = [
 exclude = ["tools/*"]
 
 [workspace.package]
-version = "0.9.15"
+version = "0.10.0"
 edition = "2021"
 # MSRV — kept in sync with `.clippy.toml` (`msrv = "1.94.0"`) and with
 # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` default (asserted
@@ -139,15 +139,16 @@ unused_qualifications = "warn"
 tokio = { version = "1.50", features = ["full"] }
 
 # Web framework
-axum = { version = "0.7", features = ["multipart", "tokio"] }
+axum = { version = "0.8", features = ["multipart", "tokio"] }
 # `axum_extra::extract::Query` (serde_html_form backend) for query strings
 # with repeated keys — the OCI `/v2/auth` `scope=…&scope=…` multi-value
 # parameter that plain axum `Query` (serde_urlencoded) cannot deserialize
-# into a `Vec`. Pinned to the 0.9 line: 0.9.x pairs with axum 0.7, 0.10.x
-# pairs with axum 0.8 — taking 0.10 would drag a second axum into the graph.
-axum-extra = { version = "0.9", features = ["query"] }
+# into a `Vec`. Pinned to the 0.12 line, which pairs with axum 0.8 (issue
+# #95) — the 0.9 line paired with axum 0.7; taking a mismatched line would
+# drag a second axum into the graph.
+axum-extra = { version = "0.12", features = ["query"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "timeout"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "timeout"] }
 # Explicit hyper-util Builder for the `axum::serve` replacement. We need
 # `http1_header_read_timeout` (the slowloris defence) plus the HTTP/1+H2
 # auto-negotiation; the `server-graceful` feature gives us a
@@ -158,12 +159,20 @@ hyper       = { version = "1.8", features = ["http1", "http2", "server"] }
 hyper-util  = { version = "0.1", features = ["http1", "http2", "server", "server-auto", "server-graceful", "tokio"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
+#
+# `tls-rustls` (0.8) is NOT carried forward as-is: 0.9 restructured the TLS
+# feature into explicit crypto-backend variants (`tls-rustls-aws-lc-rs`,
+# `tls-rustls-ring`, ...) — plain `tls-rustls` now defaults to the `ring`
+# backend. `tls-rustls-aws-lc-rs` is the explicit pick, matching the
+# workspace-standard `aws_lc_rs` provider (same as `jsonwebtoken`'s
+# `aws_lc_rs` feature, and the rustls blocks in hort-adapters-upstream-http /
+# hort-notifier-webhook).
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls-aws-lc-rs"] }
 
 # Testing — serialises tests that share global DB state (the gitops
 # `permission_grants` partition full-replace). See the hort-adapters-postgres
 # permission_grant_repo `save_managed_*` tests.
-serial_test = "3"
+serial_test = "4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -172,7 +181,7 @@ serde_json = "1.0"
 # v0.3 bundle carries (keyed provenance, ADR 0039 §8), and the pagination
 # cursor. Workspace-pinned so hort-domain (pure signature-material extraction)
 # and hort-app (orchestration) resolve one version.
-base64 = "0.22"
+base64 = "0.23"
 # YAML — active community fork of the archived `serde_yaml`. Swapped
 # `serde_yml` → `serde_yaml_ng` to drop the transitive `libyml` advisories
 # RUSTSEC-2025-0067 / RUSTSEC-2025-0068. Promoted to workspace level so
@@ -180,7 +189,7 @@ base64 = "0.22"
 serde_yaml_ng = "0.10"
 
 # Authentication
-jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # Argon2id replaces bcrypt for both password and PAT hashing. `bcrypt` is
 # removed from the workspace entirely; a CI grep gate (`no_bcrypt` guard)
 # keeps it out. `password-hash` ships with `argon2` and provides the PHC
@@ -192,7 +201,7 @@ password-hash = { version = "0.5", features = ["alloc"] }
 # composition can load the secret from a Kubernetes-mounted file without a
 # separate PEM parser. `rand_core` enables generating a fresh keypair in
 # tests.
-ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "pem"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "rand_core", "pem"] }
 
 # Checksums
 sha2 = "0.10"
@@ -211,7 +220,7 @@ hex = "0.4"
 blake3 = "1"
 
 # S3 storage using Apache object_store crate (supports custom CA certs for TLS)
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 
 # HTTP types (used for presigned URL methods)
 http = "1"
@@ -237,12 +246,11 @@ uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-cron = "0.15"
 # ZIP archive parsing — the advisory-watch handler streams OSV
 # per-ecosystem `all.zip` bulk feeds. `default-features = false` +
 # `deflate` keeps the dep minimal (no AES/zstd we don't need); the OSV
 # archives use deflate exclusively.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # gzip (de)compression. `flate2`'s `GzDecoder` decompresses npm `.tgz` /
 # cargo `.crate` archives inside
 # `hort-formats::archive_bounds::read_tar_gz_entry`. `deny.toml:183-189`
@@ -264,16 +272,18 @@ humantime = "2"
 
 # HTTP client (for proxy repos).
 #
-# Pinned to 0.12 to align with the transitive `reqwest` brought in by
-# `object_store`. As of 2026-Q1 the latest released
-# `object_store` (0.13.2) still depends on `reqwest ^0.12`; pulling in our
-# direct `reqwest = "0.13"` resulted in two `reqwest` versions in the binary
-# with two different TLS verifier paths (`rustls-platform-verifier` for 0.13
-# vs `rustls-native-certs` for the 0.12 transitive). That made TLS-trust
-# debugging materially harder and forced audit tooling to scan two
-# transitive trees. Re-bump to `0.13` once `object_store` releases a
-# `reqwest 0.13` line.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls-native-roots"] }
+# Bumped to 0.13 (batch 7, #102) in lockstep with `object_store` 0.14 (which
+# requires `reqwest ^0.13`), unifying the graph onto a single `reqwest`
+# version and TLS verifier path — resolving the dual-reqwest state the
+# previous 0.12 pin (see git history) was deliberately holding to avoid.
+# `rustls-tls-native-roots` doesn't exist as a feature in 0.13: 0.13 collapsed
+# the native-roots/webpki-roots choice into a single `rustls` feature backed
+# by `rustls-platform-verifier` (OS-native trust store, same "system roots +
+# `HORT_EXTRA_CA_BUNDLE`" guarantee ADR 0010 requires — verified against the
+# 0.13.4 source: `add_root_certificate` calls route into
+# `rustls_platform_verifier::Verifier::new_with_extra_roots`, which layers
+# extra roots on top of the platform store rather than replacing it).
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls"] }
 
 # URL encoding
 serde_urlencoded = "0.7"
@@ -321,7 +331,7 @@ async-trait = "0.1"
 # Randomness (scrub sampling). Kept workspace-level because the scrubber is
 # the only current consumer; adding per-crate avoids a version skew when a
 # future feature needs the same source.
-rand = "0.8"
+rand = "0.10"
 
 # LRU cache for the PAT validation cache. `PatCache` wraps
 # `lru::LruCache<CacheKey, CachedEntry>` plus a `HashMap<Uuid, CacheKey>`
@@ -349,16 +359,6 @@ url = "2.5"
 
 # IP CIDR parsing (HORT_TRUSTED_PROXY_CIDRS allowlist)
 ipnet = "2.11"
-
-# XML Digital Signatures (SAML signature verification).
-# Pinned to 0.3.x: 0.4.0 pulls in `kryptering 0.1.0` (HSM/PKCS11 support),
-# which fails to cross-compile on Windows because it does u64.into() on
-# `cryptoki::types::Ulong`, but `Ulong: From<u32>` only on Windows targets
-# where CK_ULONG = u32. Unblock once kryptering ships a Windows-portable fix.
-bergshamra = "=0.3.1"
-
-# SMTP email delivery
-lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
 # Recursive directory walk — gitops boot scans `$HORT_CONFIG_DIR/**/*.yaml`.
 # Promoted to workspace deps so any future caller shares the version pin.
 walkdir = "2"
@@ -403,19 +403,24 @@ mockito = "1"
 #     `Api::<T>::namespaced`, `PatchParams::apply`, etc. — the surface this
 #     adapter touches. The default `runtime` (controller / watcher) feature
 #     is excluded because the CronJob + admin-task model was chosen over a
-#     controller-runtime reconciler.
+#     controller-runtime reconciler. `default-features = false` also drops
+#     kube 4's new default `ring` rustls-crypto-provider feature — fine,
+#     since the workspace installs the `aws-lc-rs` default `CryptoProvider`
+#     process-wide (ADR 0010) before any TLS connection is made, and kube's
+#     `rustls-tls` feature itself does not hard-require `ring`/`aws-lc-rs`
+#     at compile time (only `hyper-rustls`'s own already-resolved provider).
 #   - `gzip` is excluded — kube-rs's optional gzip is for very large watch
 #     streams; we do single Secret reads + writes.
-# Pinned to the latest 3.x crates.io line (3.1.0 as of 2026-03).
-kube = { version = "3.1", default-features = false, features = ["client", "rustls-tls"] }
+# Pinned to the latest 4.x crates.io line (4.2.0 as of 2026-08).
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls"] }
 #
 # `k8s-openapi` is the generated Kubernetes API type registry. The
 # `latest` feature selects the newest Kubernetes API version supported
-# by the chosen `k8s-openapi` release (currently `v1_34` — a Kubernetes
+# by the chosen `k8s-openapi` release (currently `v1_36` — a Kubernetes
 # server >= 1.27 honours the `core/v1` Secret shape unchanged, so the
 # adapter does not bind us to a specific cluster minor). Pinned to
-# 0.27.x (the major used by kube 3.1.x).
-k8s-openapi = { version = "0.27", features = ["latest"] }
+# 0.28.x (the major used by kube 4.2.x).
+k8s-openapi = { version = "0.28", features = ["latest"] }
 
 # Masked terminal input for `hort-cli auth login`. Reads the token without
 # echoing it to the terminal (uses platform `termios` / `ReadConsole`

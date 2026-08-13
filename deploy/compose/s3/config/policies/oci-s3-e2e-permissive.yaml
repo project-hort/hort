@@ -1,0 +1,18 @@
+# Mirrors example-config/policies/oci-e2e-permissive.yaml — the s3-overlay
+# multipart scenario pushes a blob and immediately pulls it back
+# (scripts/native-tests/scenarios/storage/s3-multipart-blob.sh); the only
+# mechanism that would block the immediate pull is the quarantine 503
+# (Retry-After), so quarantine-by-default is opted out for this repo.
+apiVersion: project-hort.de/v1beta1
+kind: ScanPolicy
+metadata:
+  name: oci-s3-e2e-permissive
+spec:
+  scope:
+    repository: oci-s3-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

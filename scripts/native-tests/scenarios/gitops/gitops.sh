@@ -3,9 +3,10 @@
 # Gitops boot-apply smoke against the deploy/compose example-config tree.
 #
 # Asserts:
-#  - metrics endpoint is reachable.
-#  - Boot apply fired with result="ok" (hort_gitops_apply_total).
-#  - At least one per-object outcome counter (hort_gitops_objects_total) fired.
+#  - metrics endpoint is reachable, boot apply fired with result="ok"
+#    (hort_gitops_apply_total), and at least one per-object outcome counter
+#    (hort_gitops_objects_total) fired — posture-aware: note-and-skip when no
+#    read_metrics bearer is available for this lane, never a scenario FAIL.
 #  - Each managed repo from deploy/compose/example-config/repositories/ resolves
 #    via GET /api/v1/admin/repositories/<key> and reports managed_by="gitops".
 #
@@ -21,50 +22,53 @@ log "Registry: ${HORT_URL}"
 log "Metrics:  ${METRICS_URL}"
 
 # ---------------------------------------------------------------------
-# 1. Metrics endpoint is reachable.
+# 1. Metrics endpoint is reachable, and the boot-apply metrics fired.
+#
+# Posture-aware (item 084): an empty METRICS_TOKEN is a genuinely-absent
+# input (no read_metrics bearer minted for this lane) — note-and-skip,
+# same wording family as assert_metric_ingest's unset branch, and must
+# not flip this scenario's overall result. A present token that scrapes
+# non-2xx stays a loud FAIL carrying the HTTP status
+# (metrics_scrape_preflight, lib/common.sh).
 # ---------------------------------------------------------------------
 log ""
-log "--> hort-server is reachable on the metrics port"
-if curl -sSf -o /dev/null "${METRICS_URL}" 2>/dev/null; then
+log "--> hort-server metrics are scrapeable"
+if metrics_scrape_preflight "gitops boot-apply metrics"; then
     pass "metrics endpoint responds"
-else
-    fail "metrics endpoint responds" "${METRICS_URL} unreachable"
+
+    # issue #79 sibling sweep: same shape as assert_metric_ingest's
+    # completion-vs-scrape race (a single point-in-time scrape of a metric
+    # whose emission the scenario doesn't otherwise directly synchronise
+    # with) — bounded_poll instead of one scrape. The boot-apply normally
+    # completes long before this scenario container even starts (the
+    # compose runner guarantees the stack is up first), so a real run
+    # should hit on the first poll attempt; the bound is just headroom for
+    # exporter-registration lag, not an expected wait.
+    log ""
+    log '--> hort_gitops_apply_total{result="ok"} fired during boot'
+    if bounded_poll "gitops apply_total(result=ok)" 15 \
+        "curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_apply_total\{[^}]*result=\"ok\"[^}]*\} +[1-9]'"; then
+        pass 'hort_gitops_apply_total{result=ok} >= 1'
+    else
+        fail 'hort_gitops_apply_total{result=ok} >= 1' \
+            "metric absent or zero after 15s poll — gitops boot may have skipped or failed silently -- last scrape: $(metrics_scrape_diag "${METRICS_URL}")"
+    fi
+
+    if bounded_poll "gitops objects_total emitted" 15 \
+        "curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_objects_total\{'"; then
+        pass "hort_gitops_objects_total emitted at least once"
+    else
+        fail "hort_gitops_objects_total emitted" \
+            "metric absent in scrape after 15s poll -- last scrape: $(metrics_scrape_diag "${METRICS_URL}")"
+    fi
 fi
 
-# Abort early — nothing else is testable if metrics is down.
+# Abort early only on a genuine metrics failure above (never on a posture
+# skip) — nothing else is testable if the stack itself is down.
 if [ "${_FAIL}" -gt 0 ]; then summary; fi
 
 # ---------------------------------------------------------------------
-# 2. Boot-apply metric fired with result=ok.
-#
-# issue #79 sibling sweep: same shape as assert_metric_ingest's
-# completion-vs-scrape race (a single point-in-time scrape of a metric
-# whose emission the scenario doesn't otherwise directly synchronise
-# with) — bounded_poll instead of one scrape. The boot-apply normally
-# completes long before this scenario container even starts (the
-# compose runner guarantees the stack is up first), so a real run
-# should hit on the first poll attempt; the bound is just headroom for
-# exporter-registration lag, not an expected wait.
-# ---------------------------------------------------------------------
-log ""
-log '--> hort_gitops_apply_total{result="ok"} fired during boot'
-if bounded_poll "gitops apply_total(result=ok)" 15 \
-    "curl -sSf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_apply_total\{[^}]*result=\"ok\"[^}]*\} +[1-9]'"; then
-    pass 'hort_gitops_apply_total{result=ok} >= 1'
-else
-    fail 'hort_gitops_apply_total{result=ok} >= 1' \
-        "metric absent or zero after 15s poll — gitops boot may have skipped or failed silently"
-fi
-
-if bounded_poll "gitops objects_total emitted" 15 \
-    "curl -sSf \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_objects_total\{'"; then
-    pass "hort_gitops_objects_total emitted at least once"
-else
-    fail "hort_gitops_objects_total emitted" "metric absent in scrape after 15s poll"
-fi
-
-# ---------------------------------------------------------------------
-# 3. Every declared repo resolves via the admin lookup endpoint and
+# 2. Every declared repo resolves via the admin lookup endpoint and
 #    reports managed_by="gitops".
 # ---------------------------------------------------------------------
 log ""

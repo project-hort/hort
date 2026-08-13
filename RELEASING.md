@@ -58,6 +58,26 @@ git push -u origin chore/open-X.Y.Z-dev
 # open an MR into develop (squash); auto-merge on green is fine
 ```
 
+## When a cycle becomes a new minor (dependency waves)
+
+A behavior-relevant dependency wave ships as a new **minor** version, not a
+patch: crate majors, TLS/auth-stack changes, and runtime-baseline moves (e.g.
+a shift of the tested Postgres window) are minor-bump material. Routine
+lockfile-compatible bumps are not — they ride whatever release ships next.
+
+- Open the cycle at the next minor (`X.(Y+1).0-dev`) as soon as the wave's
+  scope is clear. The wave then soaks on staging as a unit, and the previous
+  minor line (`release/X.Y.x`) stays a dep-stable rollback/maintenance
+  boundary — a fix that must ship while the wave soaks is cherry-picked to
+  the maintenance branch and tagged there.
+- **No standing integration branch for dependency work**: each batch reaches
+  `develop` through its own gated feature-branch MR, which already provides
+  the isolation a dedicated trunk would promise — without the recurring
+  `Cargo.lock` merge conflicts, doubled CI, and staging ambiguity a parallel
+  trunk costs. Exception: a coupled multi-batch migration that cannot land
+  green per batch may use a short-lived integration branch, deleted after
+  its merge.
+
 ## Alpha pre-release — `vX.Y.Z-alpha.N` (pushed, throwaway `test/*` branch)
 
 **Internal-only**: staging + the local hort registry, never the public
@@ -186,6 +206,28 @@ git push github-public vX.Y.Z                        # tag → ghcr publish + Gi
 This mirrors the `github-public` sync already documented for the beta track
 above. `:latest` moves here, and only here, because only a stable tag clears
 `docker-publish.yml`'s `!contains(github.ref, '-')` guard.
+
+## Crates publish: warm the vetted index before tagging
+
+`hort-publish` (`release.yml`) fires on any `v*` tag pushed to
+**`github-public`** (beta or final) and resolves the whole workspace graph
+through `cargo-virtual`, which is `released_only`: a locked dep hort has
+never ingested, or is still inside its quarantine window, reads to cargo as
+"version does not exist". The job's preflight step checks the FULL locked
+set against the served index before publishing and fails closed with the
+complete cold list in one shot — but it can only *report* a cold set, not
+shrink the quarantine window, so the choreography still matters:
+
+**The `github-public` sync (or a manual `prefetch-warm.yml` `workflow_dispatch`)
+must lead the tag push by at least one crates-proxy quarantine window (24h, or
+3d once #126's playbook run is applied).** `prefetch-warm.yml` already warms
+`cargo-virtual` on every push to `develop` and nightly on schedule, so a
+routine release cut is usually already covered — but a dependency landed just
+before cutting has not necessarily cleared quarantine yet. If the preflight
+fails, it has already kicked off a warm for the whole cold set (same batched
+`/prefetch` call `prefetch-warm.yml` uses); wait out the window before
+re-running the release rather than retrying immediately — the immediate
+retry will just report the same list again.
 
 ## Docker tags (`docker-publish.yml`, on `v*` tags)
 

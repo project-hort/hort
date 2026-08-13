@@ -15,10 +15,16 @@
 //! terminal state. Excluding it would leave every out-of-the-box
 //! deployment's artifacts un-rescanned.
 //!
-//! Also implements `select_stranded` (issue #6) — a companion
-//! eligibility query for `quarantine_status='quarantined'` artifacts
-//! whose scan could not run at all (every backend errored) and exhausted
-//! retries. See the port's module doc and this impl's `select_stranded`
+//! Also implements `select_stranded` (issue #6; widened by issue #115
+//! defect (a) cure) — a companion eligibility query for
+//! `quarantine_status='quarantined'` artifacts whose scan either could
+//! not run at all (every backend errored, exhausted retries) OR was
+//! never even requested (no `kind='scan'` job row exists — the
+//! seed-import stranding gap item1 of #115 stops at the source; this
+//! sweep recovers artifacts already stranded that way before that fix),
+//! gated by the same resolved-policy-scans guard `select_eligible` uses
+//! so a `scan_backends: []` (ScanWaived) artifact is never treated as
+//! stranded. See the port's module doc and this impl's `select_stranded`
 //! doc comment.
 //!
 //! # Repo→policy resolution
@@ -175,20 +181,46 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
     ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
         Box::pin(async move {
             tracing::debug!(batch_size, "select_stranded");
-            // The `LATERAL` subquery picks the artifact's single
+            // The first `LATERAL` subquery picks the artifact's single
             // most-recent `kind='scan'` job row (any status), ordered by
             // `created_at DESC` — `idx_jobs_scan_artifact_created_at`
-            // (migration 015) covers this as a direct index scan. Only
-            // rows whose most-recent scan attempt landed in `'failed'`
-            // (retry-exhausted scanner-execution failure —
-            // `ScanOrchestrationUseCase::record_outcome`) are stranded.
+            // (migration 015) covers this as a direct index scan. It is a
+            // `LEFT JOIN LATERAL` (not `JOIN`, issue #115 defect (a) —
+            // widened from the original issue #6 shape): an artifact with
+            // NO `kind='scan'` job at all yields `last_job.status IS
+            // NULL`, which the widened predicate below now admits
+            // alongside `'failed'`. That is the seed-import-stranding
+            // recovery case — item1 of #115 stops NEW artifacts from
+            // stranding job-less, but artifacts already quarantined
+            // job-less in deployed environments before that fix need
+            // this widened sweep to recover; there is no manual
+            // per-artifact rescan surface, so this IS the remediation for
+            // them, not an alternative to one.
+            //
+            // The second `LATERAL` subquery mirrors `select_eligible`'s
+            // repo-scoped-else-global policy resolution exactly (see this
+            // impl's `select_eligible` for the full resolution-order
+            // comment) but selects `scan_backends` instead of
+            // `rescan_interval_hours`. A job-less (or failed-job)
+            // quarantined artifact is stranded ONLY when its resolved
+            // policy actually scans: `scan_backends: []` (ScanWaived) is
+            // an explicit operator opt-out of scanning, and such an
+            // artifact is NOT stranded — it releases via the existing
+            // `ScanWaived` release authority (ADR 0007), and enqueueing a
+            // scan for it would contradict the operator's own policy. No
+            // resolved policy row (`p.scan_backends IS NULL`) falls back
+            // to `DefaultPolicy::block_on_critical_default_backends()`
+            // (`["trivy"]`, non-empty) via `COALESCE(cardinality(..), $2)`
+            // — out-of-the-box deployments with zero `ScanPolicy` rows
+            // still get stranded artifacts recovered.
+            //
             // `quarantine_status = 'quarantined'` (NOT `'released'`/`NULL`
             // — that's `select_eligible`'s predicate, and NOT
             // `'scan_indeterminate'`/`'rejected'` — those are terminal,
-            // ADR 0007, never auto-rescanned). The in-flight exclusion
-            // reuses the same shape as `select_eligible` and is covered by
-            // the existing `jobs_scan_unique` partial unique index
-            // (migration 009).
+            // ADR 0007, never auto-rescanned — nor `is_deleted`). The
+            // in-flight exclusion reuses the same shape as
+            // `select_eligible` and is covered by the existing
+            // `jobs_scan_unique` partial unique index (migration 009).
             let sql = r#"
                 SELECT a.id            AS artifact_id,
                        a.repository_id AS repository_id,
@@ -196,7 +228,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                        r.format::text  AS format
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
-                JOIN LATERAL (
+                LEFT JOIN LATERAL (
                     SELECT j.status
                     FROM jobs j
                     WHERE j.kind = 'scan'
@@ -204,9 +236,28 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     ORDER BY j.created_at DESC
                     LIMIT 1
                 ) last_job ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT pp.scan_backends
+                    FROM policy_projections pp
+                    WHERE pp.archived = false
+                      AND (
+                            (pp.scope ? 'Repository'
+                              AND (pp.scope->>'Repository')::uuid = a.repository_id)
+                         OR (pp.scope ? 'Global'
+                              AND NOT EXISTS (
+                                SELECT 1 FROM policy_projections pp2
+                                WHERE pp2.archived = false
+                                  AND pp2.scope ? 'Repository'
+                                  AND (pp2.scope->>'Repository')::uuid = a.repository_id
+                              ))
+                          )
+                    ORDER BY (pp.scope ? 'Repository') DESC
+                    LIMIT 1
+                ) p ON TRUE
                 WHERE a.quarantine_status = 'quarantined'
                   AND a.is_deleted = false
-                  AND last_job.status = 'failed'
+                  AND (last_job.status = 'failed' OR last_job.status IS NULL)
+                  AND COALESCE(cardinality(p.scan_backends), $2) > 0
                   AND NOT EXISTS (
                         SELECT 1 FROM jobs j2
                         WHERE j2.kind = 'scan'
@@ -218,6 +269,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
 
             let rows = sqlx::query(sql)
                 .bind(i64::from(batch_size))
+                .bind(DefaultPolicy::block_on_critical_default_backends().len() as i32)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "RescanCandidate", "select_stranded"))?;

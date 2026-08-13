@@ -74,6 +74,16 @@ pub enum DomainError {
         bytes_read: u64,
         cap: u64,
     },
+
+    /// An upstream index/metadata body failed to parse or project (a
+    /// content fault, not a network failure). Carries no upstream-
+    /// derived text — the parse cause is attacker-influenced (it comes
+    /// straight out of the upstream response body) and is logged
+    /// server-side by the caller instead. Mirrors the sanitisation
+    /// discipline `UpstreamBodyTooLarge` established: the wire layer
+    /// renders a fixed message, never the inner cause.
+    #[error("upstream metadata invalid")]
+    UpstreamMetadataInvalid,
 }
 
 /// Fetch-class discriminator for
@@ -186,6 +196,12 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("block-event-stream"));
         assert!(rendered.contains("compromised maintainer"));
+    }
+
+    #[test]
+    fn upstream_metadata_invalid_display_carries_no_cause() {
+        let err = DomainError::UpstreamMetadataInvalid;
+        assert_eq!(err.to_string(), "upstream metadata invalid");
     }
 
     #[test]

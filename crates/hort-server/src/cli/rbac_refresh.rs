@@ -51,7 +51,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use rand::Rng;
+use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -258,7 +258,7 @@ async fn run_loop(
 /// unit tests — the rest of the loop is harder to drive without a
 /// runtime harness.
 fn initial_jitter() -> Duration {
-    let ms = rand::thread_rng().gen_range(0..JITTER_MAX_MS);
+    let ms = rand::rng().random_range(0..JITTER_MAX_MS);
     Duration::from_millis(ms)
 }
 

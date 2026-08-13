@@ -1,0 +1,15 @@
+# PermissionGrant: [developer, ci-pusher] -> write oci-provenance-proxy-e2e
+# (dev-user cosign sign via --registry-username/--registry-password, legacy
+# credential mode, scenarios/quarantine/proxy-required-multilayer.sh). Mirror
+# of dev-write-oci-provenance-e2e.yaml — per-repo + two-claim subject passes
+# the allowlist linter. Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-write-oci-provenance-proxy-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: oci-provenance-proxy-e2e

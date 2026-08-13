@@ -35,7 +35,7 @@
 //!    HTTP route — `hort-cli admin task invoke wheel-metadata-backfill
 //!    --params-file /tmp/p.json`. The `hort-cli` machinery accepts
 //!    arbitrary kinds; the kind is gated server-side against
-//!    `VALID_TASK_KINDS`.
+//!    `ADMIN_INVOKABLE_TASK_KINDS`.
 //!
 //! # Params
 //!
@@ -1149,20 +1149,20 @@ mod tests {
     }
 
     // =====================================================================
-    // Test 9: kind() returns the exact literal that's in VALID_TASK_KINDS
+    // Test 9: kind() returns the exact literal that's in ADMIN_INVOKABLE_TASK_KINDS
     // — guards against a rename drift.
     // =====================================================================
 
     #[test]
     fn kind_matches_valid_task_kinds_entry() {
-        use hort_domain::events::VALID_TASK_KINDS;
+        use hort_domain::events::ADMIN_INVOKABLE_TASK_KINDS;
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
         let storage = Arc::new(MockStoragePort::new());
         let handler = make_handler_with(artifacts, refs, storage, WheelMetadataStubBehaviour::None);
         assert!(
-            VALID_TASK_KINDS.contains(&handler.kind()),
-            "Handler kind() {:?} MUST appear in VALID_TASK_KINDS — \
+            ADMIN_INVOKABLE_TASK_KINDS.contains(&handler.kind()),
+            "Handler kind() {:?} MUST appear in ADMIN_INVOKABLE_TASK_KINDS — \
              a rename in only one place silently breaks dispatch + the SQL CHECK",
             handler.kind()
         );

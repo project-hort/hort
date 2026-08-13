@@ -906,7 +906,13 @@ impl PolicyProjectionRepository for MockPolicyProjectionRepository {
         if let Some(e) = self.next_list_active_error.lock().unwrap().take() {
             return Box::pin(async move { Err(e) });
         }
-        let res: Vec<_> = self
+        // Honour the port's ordering contract (ascending `(created_at,
+        // policy_id)`) rather than the backing `HashMap`'s unspecified
+        // iteration order — callers that rely on the contract (e.g. the
+        // defense-in-depth "earliest wins" fallback in
+        // `resolve_active_policy_for_repo`) get the same behaviour
+        // against this mock as against the real adapter.
+        let mut res: Vec<_> = self
             .by_id
             .lock()
             .unwrap()
@@ -914,6 +920,7 @@ impl PolicyProjectionRepository for MockPolicyProjectionRepository {
             .filter(|p| !p.archived)
             .cloned()
             .collect();
+        res.sort_by(|a, b| (a.created_at, a.policy_id).cmp(&(b.created_at, b.policy_id)));
         Box::pin(async move { Ok(res) })
     }
 
@@ -2318,25 +2325,59 @@ impl MockArtifactLifecycle {
         self.next_error.lock().unwrap().push_back(err);
     }
 
-    /// Merge only `quarantine_status` (+ `updated_at`) from `verdict` onto
-    /// whatever the mock repo currently holds for this id, falling back to
-    /// `verdict` itself when the id is unseeded. Mirrors the Postgres
-    /// adapter's column-scoped verdict UPDATE (issue #90): a verdict
-    /// commit (`commit_provenance_verdict` / `commit_scan_result_with_score`)
-    /// must never clobber a column a concurrently-recorded transition
-    /// wrote in the meantime — most critically `quarantine_window_start`.
-    /// Used to populate `self.artifacts` (the queryable "persisted
-    /// projection" simulation); `self.transitions` still records the
-    /// caller's verbatim snapshot so existing assertions on "what the use
-    /// case decided to commit" are unaffected.
-    fn merge_verdict_status(&self, verdict: &Artifact) -> Artifact {
-        let mut current = self
-            .artifacts
-            .get(verdict.id)
-            .unwrap_or_else(|| verdict.clone());
+    /// Apply a verdict's status write to the queryable mock projection
+    /// with the SAME semantics as the Postgres adapter's
+    /// `save_verdict_status_in_tx`, so app-layer pins built on this
+    /// double are real rather than vacuous.
+    ///
+    /// Three behaviours, mirroring the adapter exactly:
+    ///
+    /// - **Column-scoped (issue #90).** Only `quarantine_status` +
+    ///   `updated_at` are merged onto whatever the mock repo currently
+    ///   holds; every other column of the caller's (possibly stale)
+    ///   snapshot is discarded, so a concurrently-recorded transition's
+    ///   `quarantine_window_start` survives.
+    /// - **Skip-unchanged (issue #108 H2b).** When the transition left
+    ///   the status equal to `prior_status`, NOTHING is written —
+    ///   `Ok(None)`. The `ProvenanceVerified` case takes this arm.
+    /// - **Conditional (issue #108 H2b).** Otherwise the write requires
+    ///   the persisted row to still hold `prior_status`; a row whose
+    ///   status moved under us yields `Err(Conflict)` — the stale verdict
+    ///   must not overwrite the newer status.
+    ///
+    /// An UNSEEDED id falls back to the caller's snapshot and writes
+    /// (mirroring the pre-existing mock behaviour rather than the
+    /// adapter's `NotFound`): the mock repo is seeded lazily by most
+    /// tests, so treating "absent" as an error here would fail dozens of
+    /// unrelated pins that never populate `self.artifacts`. The
+    /// absent-id → `NotFound` split is pinned against the real adapter in
+    /// `hort-adapters-postgres` instead.
+    ///
+    /// `self.transitions` still records the caller's verbatim snapshot,
+    /// so existing assertions on "what the use case decided to commit"
+    /// are unaffected — only the queryable `self.artifacts` projection
+    /// gets these semantics.
+    fn merge_verdict_status(
+        &self,
+        verdict: &Artifact,
+        prior_status: QuarantineStatus,
+    ) -> DomainResult<Option<Artifact>> {
+        if verdict.quarantine_status == prior_status {
+            return Ok(None);
+        }
+        let Some(mut current) = self.artifacts.get(verdict.id) else {
+            return Ok(Some(verdict.clone()));
+        };
+        if current.quarantine_status != prior_status {
+            return Err(DomainError::Conflict(format!(
+                "artifact {} quarantine_status changed concurrently (expected {prior_status}); \
+                 verdict not applied",
+                verdict.id
+            )));
+        }
         current.quarantine_status = verdict.quarantine_status;
         current.updated_at = verdict.updated_at;
-        current
+        Ok(Some(current))
     }
 }
 
@@ -2389,16 +2430,27 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         &'a self,
         artifact: &'a Artifact,
         events: AppendEvents,
+        prior_status: QuarantineStatus,
     ) -> BoxFut<'a, DomainResult<AppendResult>> {
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
+        // The conditional status write is resolved BEFORE the transition
+        // is recorded, so a `Conflict` leaves no stray entry behind —
+        // same ordering as the failure-injection guard above, and same
+        // all-or-nothing shape as the adapter's single transaction.
+        let merged = match self.merge_verdict_status(artifact, prior_status) {
+            Ok(m) => m,
+            Err(e) => return Box::pin(async move { Err(e) }),
+        };
         let count = events.events.len() as u64;
         self.transitions
             .lock()
             .unwrap()
             .push((artifact.clone(), events, None));
-        self.artifacts.insert(self.merge_verdict_status(artifact));
+        if let Some(m) = merged {
+            self.artifacts.insert(m);
+        }
         Box::pin(async move {
             Ok(AppendResult {
                 stream_position: count.saturating_sub(1),
@@ -2499,6 +2551,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         last_scan_at: DateTime<Utc>,
         score_delta: Option<(Uuid, ScoreDelta)>,
         sbom_components: Option<&'a [SbomComponent]>,
+        prior_status: QuarantineStatus,
     ) -> BoxFut<'a, DomainResult<AppendResult>> {
         // Same shape as the with_score variant of
         // commit_transition, but for the scan-result dual-write path.
@@ -2514,6 +2567,13 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
+
+        // Conditional status write resolved before ANY state is recorded
+        // (same rationale as the injection guard directly above).
+        let merged = match self.merge_verdict_status(&artifact_clone, prior_status) {
+            Ok(m) => m,
+            Err(e) => return Box::pin(async move { Err(e) }),
+        };
 
         if let Some((repo_id, delta)) = score_delta {
             self.score_deltas.lock().unwrap().push((repo_id, delta));
@@ -2534,12 +2594,12 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             .lock()
             .unwrap()
             .push((artifact_clone.clone(), events_clone.clone(), None));
-        // Column-scoped merge (issue #90) — see `merge_verdict_status`:
-        // this is a verdict commit, so only `quarantine_status` +
-        // `updated_at` land on the queryable mock repo, never a full-row
-        // overwrite of a possibly-stale snapshot.
-        self.artifacts
-            .insert(self.merge_verdict_status(&artifact_clone));
+        // Column-scoped / skip-unchanged / conditional merge (issues #90
+        // and #108) — see `merge_verdict_status`. `None` means the
+        // transition left the status where it was, so nothing is written.
+        if let Some(m) = merged {
+            self.artifacts.insert(m);
+        }
 
         let event_store = self.event_store.lock().unwrap().clone();
         let scan_findings = self.scan_findings.lock().unwrap().clone();

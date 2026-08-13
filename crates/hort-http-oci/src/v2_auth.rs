@@ -41,7 +41,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Extension, State};
 use axum::http::{header, HeaderMap, StatusCode};
 // NOT `axum::extract::Query`: that extractor is backed by
 // `serde_urlencoded`, which has no sequence support and errors
@@ -135,7 +135,15 @@ struct V2AuthResponseBody {
 pub async fn handle_v2_auth(
     State(ctx): State<Arc<AppContext>>,
     Query(query): Query<V2AuthQuery>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    // `Option<ConnectInfo<SocketAddr>>` (axum 0.7) no longer compiles under
+    // axum 0.8: `Option<T>`'s blanket `FromRequestParts` impl now requires
+    // `T: OptionalFromRequestParts`, which `ConnectInfo` does not implement.
+    // `ConnectInfo::from_request_parts` is itself just an `Extension<Self>`
+    // read (see axum's `connect_info.rs`), and `Extension` DOES implement
+    // `OptionalFromRequestParts` — so extracting through the `Extension`
+    // wrapper reproduces the exact same "None when the
+    // `into_make_service_with_connect_info` layer wasn't used" behavior.
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     let exchange = match &ctx.oci_token_exchange {
@@ -169,7 +177,7 @@ pub async fn handle_v2_auth(
     // never anonymously granted (see
     // `OciTokenExchangeUseCase::exchange_anonymous`). A malformed / empty
     // `Basic` header is treated as absent → anonymous, exactly as before.
-    let client_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
+    let client_ip = connect_info.map(|Extension(ConnectInfo(addr))| addr.ip());
 
     let result = match extract_basic_password(&headers) {
         Some(plaintext) => {
