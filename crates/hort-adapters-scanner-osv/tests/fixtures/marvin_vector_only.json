@@ -1,0 +1,49 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "/tmp/sbom.cdx.json",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "rsa",
+            "ecosystem": "crates.io",
+            "version": "0.9.6"
+          },
+          "vulnerabilities": [
+            {
+              "id": "RUSTSEC-2023-0071",
+              "aliases": ["CVE-2023-49092"],
+              "summary": "Marvin Attack: potential key recovery through timing sidechannels",
+              "severity": [
+                {
+                  "type": "CVSS_V3",
+                  "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"
+                }
+              ],
+              "affected": [
+                {
+                  "ranges": [
+                    {
+                      "events": [
+                        {"introduced": "0"}
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "references": [
+                {"type": "ADVISORY", "url": "https://rustsec.org/advisories/RUSTSEC-2023-0071"}
+              ]
+            }
+          ],
+          "groups": [
+            {"ids": ["RUSTSEC-2023-0071"], "max_severity": ""}
+          ]
+        }
+      ]
+    }
+  ]
+}

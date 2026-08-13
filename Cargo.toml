@@ -444,6 +444,15 @@ async-nats = { version = "0.50", default-features = false }
 # (e.g. a future Kafka relay) share the version.
 testcontainers = "0.27"
 
+# RustSec-maintained CVSS v3.x vector parser/scorer. Consumers:
+# `hort-adapters-scanner-osv` and `hort-adapters-advisory-osv` compute a
+# base score from an OSV `severity[].score` vector when no pre-computed
+# numeric severity is present. All three default features (`std`, `v3`,
+# `v4`) must stay enabled — `cvss` 2.2.0's `v3` module references the `v4`
+# module unconditionally regardless of feature selection, so disabling
+# `v4` fails to compile even though only `v3::Base` is used here.
+cvss = "2.2.0"
+
 # Strip release binaries to shrink the container image. The unstripped
 # `hort-server` binary carries debug symbols (~80 MB); stripping symbols
 # drops it to ~25 MB to meet the distroless image size budget. Backtraces

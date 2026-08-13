@@ -344,26 +344,37 @@ impl OsvAdvisoryAdapter {
             .as_deref()
             .is_some_and(is_informational_class);
 
-        // Severity precedence: numeric `database_specific.severity`
-        // (highest signal); else string label there; else fail-closed
-        // fallback to the HIGHEST tier `Critical` (SUP-4). The
-        // `severity[].score` (CVSS vector) requires a calculator we
-        // deliberately do not ship; v1 falls back to the
-        // `database_specific` shape. A finding whose severity we cannot
-        // determine must still block under the default Critical threshold
-        // rather than slip under it — unified with the scanner-osv and
-        // trivy adapters.
+        // Severity precedence: the computed CVSS v3.0/v3.1 base score of
+        // any `severity[].score` vector that parses as a full Base Metric
+        // Group (highest signal — a direct spec computation); else the
+        // numeric or label string in `database_specific.severity`; else
+        // fail-closed fallback to the HIGHEST tier `Critical` (SUP-4). A
+        // vector the `cvss` crate cannot parse (CVSS v2/v4, Temporal
+        // metrics mixed into the Base group, or the array simply absent —
+        // `querybatch` does not always return one) contributes nothing and
+        // the mapper falls through to `database_specific`. A finding whose
+        // severity we cannot determine must still block under the default
+        // Critical threshold rather than slip under it — unified with the
+        // scanner-osv and trivy adapters.
         //
         // An informational advisory carries no score by design and rides
         // the non-enforcing negligible lane (keyed on
         // `Finding::is_informational`, not on `severity`). Its `severity` is
         // cosmetic, so map it to the lowest tier rather than the SUP-4
         // Critical fail-closed fallback.
-        let severity = vuln
-            .database_specific
-            .as_ref()
-            .and_then(|ds| ds.severity.as_deref())
-            .and_then(severity::label_to_severity)
+        let cvss_score = vuln
+            .severity
+            .iter()
+            .filter_map(|sv| sv.score.as_deref())
+            .find_map(severity::cvss_vector_base_score);
+        let severity = cvss_score
+            .and_then(severity::cvss_score_to_severity)
+            .or_else(|| {
+                vuln.database_specific
+                    .as_ref()
+                    .and_then(|ds| ds.severity.as_deref())
+                    .and_then(severity::label_to_severity)
+            })
             .or(if informational {
                 Some(SeverityThreshold::Low)
             } else {
@@ -465,7 +476,7 @@ impl OsvAdvisoryAdapter {
             purl: component.purl.to_string(),
             vulnerability_id: vuln.id,
             severity,
-            cvss_score: None,
+            cvss_score,
             title,
             fixed_versions,
             source_scanner: "osv".to_string(),
@@ -781,6 +792,147 @@ mod tests {
             .references
             .iter()
             .any(|r| r.contains("osv.dev/vulnerability/GHSA-xxxx")));
+    }
+
+    #[test]
+    fn vuln_to_finding_computes_marvin_vector_to_medium() {
+        // Real OSV record for RUSTSEC-2023-0071 (the Marvin timing-oracle
+        // advisory on the `rsa` crate), verified against api.osv.dev: no
+        // `database_specific.severity`, only the CVSS vector. The base
+        // score (5.9) must be computed from it, banding to Medium.
+        let prepared = PreparedComponent {
+            name: "rsa",
+            version: Some("0.9.6"),
+            osv_eco: "crates.io",
+            purl: "pkg:cargo/rsa@0.9.6",
+        };
+        let vuln = OsvVuln {
+            id: "RUSTSEC-2023-0071".to_string(),
+            severity: vec![osv_types::OsvSeverity {
+                score: Some("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N".to_string()),
+                kind: Some("CVSS_V3".to_string()),
+            }],
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
+        assert_eq!(finding.cvss_score, Some(5.9));
+        assert_eq!(finding.severity, SeverityThreshold::Medium);
+    }
+
+    #[test]
+    fn vuln_to_finding_cvss_vector_bands_boundaries() {
+        let prepared = PreparedComponent {
+            name: "x",
+            version: Some("1"),
+            osv_eco: "npm",
+            purl: "pkg:npm/x@1",
+        };
+
+        let critical_vuln = OsvVuln {
+            id: "OSV-C".to_string(),
+            severity: vec![osv_types::OsvSeverity {
+                score: Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H".to_string()),
+                kind: Some("CVSS_V3".to_string()),
+            }],
+            ..Default::default()
+        };
+        let f = OsvAdvisoryAdapter::vuln_to_finding(&prepared, critical_vuln);
+        assert_eq!(f.cvss_score, Some(10.0));
+        assert_eq!(f.severity, SeverityThreshold::Critical);
+
+        let low_vuln = OsvVuln {
+            id: "OSV-L".to_string(),
+            severity: vec![osv_types::OsvSeverity {
+                score: Some("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N".to_string()),
+                kind: Some("CVSS_V3".to_string()),
+            }],
+            ..Default::default()
+        };
+        let f = OsvAdvisoryAdapter::vuln_to_finding(&prepared, low_vuln);
+        assert_eq!(f.cvss_score, Some(1.8));
+        assert_eq!(f.severity, SeverityThreshold::Low);
+    }
+
+    #[test]
+    fn vuln_to_finding_prefers_cvss_vector_over_database_specific_label() {
+        // The computed vector score is the highest-signal source: it must
+        // win over a (deliberately contradictory) `database_specific`
+        // label.
+        let prepared = PreparedComponent {
+            name: "x",
+            version: Some("1"),
+            osv_eco: "npm",
+            purl: "pkg:npm/x@1",
+        };
+        let vuln = OsvVuln {
+            id: "OSV-1".to_string(),
+            severity: vec![osv_types::OsvSeverity {
+                score: Some("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N".to_string()),
+                kind: Some("CVSS_V3".to_string()),
+            }],
+            database_specific: Some(osv_types::OsvDatabaseSpecific {
+                severity: Some("CRITICAL".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
+        assert_eq!(finding.cvss_score, Some(5.9));
+        assert_eq!(finding.severity, SeverityThreshold::Medium);
+    }
+
+    #[test]
+    fn vuln_to_finding_falls_back_to_label_when_vector_unparseable() {
+        // A vector the `cvss` crate cannot parse as a Base Metric Group
+        // (here: malformed) contributes nothing; the mapper falls through
+        // to `database_specific.severity`.
+        let prepared = PreparedComponent {
+            name: "x",
+            version: Some("1"),
+            osv_eco: "npm",
+            purl: "pkg:npm/x@1",
+        };
+        let vuln = OsvVuln {
+            id: "OSV-1".to_string(),
+            severity: vec![osv_types::OsvSeverity {
+                score: Some("CVSS:3.1/GARBAGE".to_string()),
+                kind: Some("CVSS_V3".to_string()),
+            }],
+            database_specific: Some(osv_types::OsvDatabaseSpecific {
+                severity: Some("HIGH".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
+        assert_eq!(finding.cvss_score, None);
+        assert_eq!(finding.severity, SeverityThreshold::High);
+    }
+
+    #[test]
+    fn vuln_to_finding_malformed_vector_and_no_label_still_critical_fail_closed() {
+        // SUP-4 pinned alongside the pre-existing fail-closed test: a
+        // malformed CVSS vector with no `database_specific.severity` to
+        // fall back to must still fail CLOSED to Critical, not silently
+        // read as "unscored" in a way that could be mistaken for a lower
+        // tier.
+        let prepared = PreparedComponent {
+            name: "x",
+            version: Some("1"),
+            osv_eco: "npm",
+            purl: "pkg:npm/x@1",
+        };
+        let vuln = OsvVuln {
+            id: "OSV-1".to_string(),
+            severity: vec![osv_types::OsvSeverity {
+                score: Some("CVSS:3.1/GARBAGE".to_string()),
+                kind: Some("CVSS_V3".to_string()),
+            }],
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, vuln);
+        assert_eq!(finding.cvss_score, None);
+        assert_eq!(finding.severity, SeverityThreshold::Critical);
     }
 
     #[test]

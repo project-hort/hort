@@ -80,11 +80,12 @@ pub(crate) struct OsvVuln {
     pub aliases: Vec<String>,
 
     /// CVSS / severity vectors. May be absent on `querybatch`; when
-    /// present, each entry has a `score` field which is the textual
-    /// CVSS vector (NOT the numeric base score). v1 falls back to
-    /// `database_specific.severity` instead of decoding the vector.
+    /// present, each entry has a `score` field which is the textual CVSS
+    /// vector. `severity::cvss_vector_base_score` computes the numeric
+    /// base score from it when the vector parses as a CVSS v3.0/v3.1
+    /// Base Metric Group; otherwise the mapper falls back to
+    /// `database_specific.severity`.
     #[serde(default)]
-    #[allow(dead_code)]
     pub severity: Vec<OsvSeverity>,
 
     /// `database_specific.severity` is the most reliable source of a
@@ -104,12 +105,9 @@ pub(crate) struct OsvVuln {
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub(crate) struct OsvSeverity {
-    /// CVSS vector string, e.g. `"CVSS:3.1/AV:N/AC:L/..."`. The base
-    /// score is encoded inside the vector; computing it requires a
-    /// CVSS calculator. v1 falls back to `database_specific.severity`
-    /// instead.
+    /// CVSS vector string, e.g. `"CVSS:3.1/AV:N/AC:L/..."`. Parsed by
+    /// `severity::cvss_vector_base_score` when present.
     #[serde(default)]
-    #[allow(dead_code)] // captured for forward-compat; not used by v1 mapper.
     pub score: Option<String>,
 
     /// Vector type — `"CVSS_V3"`, `"CVSS_V4"`, etc. Tracked for

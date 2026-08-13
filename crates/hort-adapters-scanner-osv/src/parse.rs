@@ -41,7 +41,8 @@ use serde::Deserialize;
 
 use crate::ecosystem::osv_ecosystem_to_purl_type;
 use crate::severity::{
-    cvss_score_to_severity, extract_score_from_cvss_vector, label_to_severity, parse_max_severity,
+    cvss_score_to_severity, cvss_vector_base_score, extract_score_from_cvss_vector,
+    label_to_severity, parse_max_severity,
 };
 
 // ---------------------------------------------------------------------------
@@ -266,11 +267,19 @@ fn max_severity_for(groups: &[OsvGroup], vuln_id: &str) -> Option<f32> {
 
 /// Pick the best-effort numeric score for `vuln`. Precedence:
 /// 1. `groups[].max_severity` matching this vuln's id.
-/// 2. The first parseable trailing-numeric segment in any
-///    `vuln.severity[].score` CVSS vector.
+/// 2. The computed CVSS v3.0/v3.1 base score of any `vuln.severity[].score`
+///    vector that parses as a full Base Metric Group.
+/// 3. The first parseable trailing-numeric segment in any
+///    `vuln.severity[].score` CVSS vector (a vector the `cvss` crate could
+///    not parse, e.g. one carrying Temporal metrics).
 fn pick_cvss_score(groups: &[OsvGroup], vuln: &OsvVulnerability) -> Option<f32> {
     if let Some(s) = max_severity_for(groups, &vuln.id) {
         return Some(s);
+    }
+    for sv in &vuln.severity {
+        if let Some(s) = cvss_vector_base_score(&sv.score) {
+            return Some(s);
+        }
     }
     for sv in &vuln.severity {
         if let Some(s) = extract_score_from_cvss_vector(&sv.score) {
@@ -583,6 +592,55 @@ mod tests {
         let groups: Vec<OsvGroup> = Vec::new();
         let v = vuln_skeleton();
         assert_eq!(pick_cvss_score(&groups, &v), None);
+    }
+
+    #[test]
+    fn pick_cvss_score_computes_vector_base_score_when_group_absent() {
+        // RUSTSEC-2023-0071 (Marvin) — a real vector-only OSV record with no
+        // `groups[].max_severity`. The CVSS 3.1 base score (5.9) must be
+        // computed rather than left unscored.
+        let groups: Vec<OsvGroup> = Vec::new();
+        let mut v = vuln_skeleton();
+        v.severity = vec![OsvSeverity {
+            score: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N".into(),
+            kind: "CVSS_V3".into(),
+        }];
+        assert_eq!(pick_cvss_score(&groups, &v), Some(5.9));
+    }
+
+    #[test]
+    fn pick_cvss_score_prefers_vector_base_score_over_trailing_float_heuristic() {
+        // The vector branch is tried BEFORE the trailing-numeric-segment
+        // fallback: a well-formed Base Metric Group vector must win even
+        // when a (different, wrong) trailing float is also present in a
+        // sibling severity entry.
+        let groups: Vec<OsvGroup> = Vec::new();
+        let mut v = vuln_skeleton();
+        v.severity = vec![
+            OsvSeverity {
+                score: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N".into(),
+                kind: "CVSS_V3".into(),
+            },
+            OsvSeverity {
+                score: "CVSS:3.1/AV:N/AC:L/.../7.2".into(),
+                kind: "CVSS_V3".into(),
+            },
+        ];
+        assert_eq!(pick_cvss_score(&groups, &v), Some(5.9));
+    }
+
+    #[test]
+    fn pick_cvss_score_falls_back_to_trailing_float_when_vector_unparseable() {
+        // A vector the `cvss` crate rejects (here: Temporal metrics mixed
+        // into the Base group) falls through to the trailing-numeric-segment
+        // heuristic, preserving pre-existing behaviour for such feeds.
+        let groups: Vec<OsvGroup> = Vec::new();
+        let mut v = vuln_skeleton();
+        v.severity = vec![OsvSeverity {
+            score: "CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H/E:H/RL:O/RC:C/7.2".into(),
+            kind: "CVSS_V3".into(),
+        }];
+        assert_eq!(pick_cvss_score(&groups, &v), Some(7.2));
     }
 
     // ----- vuln_to_finding ---------------------------------------------------
