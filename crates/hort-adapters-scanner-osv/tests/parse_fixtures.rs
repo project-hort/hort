@@ -15,6 +15,7 @@ const MIXED: &[u8] = include_bytes!("fixtures/mixed_severities.json");
 const NO_MAX_SEVERITY: &[u8] = include_bytes!("fixtures/no_max_severity_with_inline_score.json");
 const MANY_FIXED: &[u8] = include_bytes!("fixtures/many_fixed_versions.json");
 const INFORMATIONAL: &[u8] = include_bytes!("fixtures/informational_unmaintained.json");
+const MARVIN_VECTOR_ONLY: &[u8] = include_bytes!("fixtures/marvin_vector_only.json");
 
 #[test]
 fn clean_scan_returns_empty_findings() {
@@ -64,6 +65,24 @@ fn vulnerability_with_no_max_severity_falls_back_to_severity_array_score() {
     assert_eq!(f.cvss_score, Some(8.1));
     assert_eq!(f.severity, SeverityThreshold::High);
     assert_eq!(f.purl, "pkg:pypi/requests@2.20.0");
+}
+
+#[test]
+fn marvin_vector_only_advisory_computes_cvss_v3_base_score_to_medium() {
+    // Real OSV record for RUSTSEC-2023-0071 (the Marvin timing-oracle
+    // advisory on the `rsa` crate), verified against api.osv.dev:
+    // `groups[].max_severity` is empty and the only score is the CVSS
+    // vector itself — no pre-computed numeric severity anywhere in the
+    // record. The base score (5.9) must be computed from the vector,
+    // banding to Medium, rather than falling through to the SUP-4
+    // Critical fail-closed fallback.
+    let findings = parse_findings_from_json(MARVIN_VECTOR_ONLY).expect("parse");
+    assert_eq!(findings.len(), 1, "got {findings:#?}");
+    let f = &findings[0];
+    assert_eq!(f.vulnerability_id, "RUSTSEC-2023-0071");
+    assert_eq!(f.purl, "pkg:cargo/rsa@0.9.6");
+    assert_eq!(f.cvss_score, Some(5.9));
+    assert_eq!(f.severity, SeverityThreshold::Medium);
 }
 
 #[test]

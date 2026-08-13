@@ -1230,6 +1230,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cvss"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7fb220d3ce1b565af39cee5b89e47fd8dd1dab162900ee4363c8ee4169ee8a2"
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2306,6 +2312,7 @@ version = "0.11.0-dev"
 dependencies = [
  "bytes",
  "chrono",
+ "cvss",
  "futures",
  "hort-adapters-ephemeral-memory",
  "hort-app",
@@ -2485,6 +2492,7 @@ name = "hort-adapters-scanner-osv"
 version = "0.11.0-dev"
 dependencies = [
  "bytes",
+ "cvss",
  "futures",
  "hort-domain",
  "serde",

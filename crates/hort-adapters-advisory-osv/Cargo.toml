@@ -30,6 +30,7 @@ thiserror  = { workspace = true }
 chrono     = { workspace = true }
 tempfile   = { workspace = true }
 tokio-util = { workspace = true }
+cvss       = { workspace = true }
 
 [dev-dependencies]
 tokio        = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
