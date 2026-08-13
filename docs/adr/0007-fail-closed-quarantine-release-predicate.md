@@ -80,6 +80,33 @@ That is a real, reachable failure: OCI pull-through writes `oci_config`/`oci_lay
 
 The carve-out is automatic (derived from the reference graph), not an operator opt-in, so it adds no ADR 0016 cross-opt-in matrix row — it is recorded here as a prose interaction between two existing mechanisms.
 
+### `register_by_hash` is gated for every caller, not only the ingest path (issue #107, amended 2026-08-09; human-approved via `workflow::ready`)
+
+The quarantine gate was applied by the ingest path, while `register_by_hash`
+— the path that registers a blob already present in CAS — reached the same
+artifact table without it. Two callers exercised that gap: the OCI cross-repo
+blob **mount**, and a **pull-dedup follower** registering the leader's fetched
+bytes. Both produced a target-repository row that had never been held and
+never been scanned, and served it.
+
+**The gate belongs to the artifact row, not to the code path that created
+it.** `register_by_hash` resolves the target repository's active policy and,
+for a non-zero effective duration, commits the `None → Quarantined`
+transition together with its scan and provenance enqueues in one transition —
+the same shape the ingest path uses. A freshly mounted or follower-registered
+blob is therefore held for the target repository's window and scanned before
+it serves. `quarantineDuration: 0` remains the single honoured permissive
+opt-out, exactly as on the ingest path.
+
+**Source-status refusal is anti-enumeration-shaped.** When registration names
+a source row, a source in a terminal state (`Rejected` / `ScanIndeterminate`)
+is refused **as `NotFound`**, so a caller cannot distinguish "no such blob"
+from "terminally blocked blob"; the OCI handler then falls through to a
+regular upload per the spec, with no handler-level special case. A
+`Quarantined` source stays mountable on purpose: the target copy is itself
+quarantined and scanned under the rule above, so no unscanned bytes serve,
+and refusing it would break legitimate mid-window mounts for no gain.
+
 ### Read-path bounded-await pattern (issue #65, amended 2026-07-20)
 
 The zero-window carve-out above still leaves a **read-side** race: a cold pull-through blob GET resolves the just-ingested, still-`Quarantined` artifact and would 503 before that artifact's own async scan lands the `ScanSucceeded` that (per the carve-out) releases it almost immediately once it runs — the gap is the scan's own turnaround (~1–5s observed), not an observation window. `hort-http-oci::blobs::maybe_bounded_await_release` closes this by polling the artifact for up to a tunable bound (`HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`, default 10s, `0` = off) before falling through to the existing `check_quarantine` 503 decision.

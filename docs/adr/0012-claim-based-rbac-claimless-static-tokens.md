@@ -16,6 +16,21 @@ Authority is granted by **`PermissionGrant` rows whose subject is one of exactly
 
 Token-kind discriminators (`cli_session`, `service_account`, `refresh`) are facts on the typed `CallerPrincipal.token_kind`, never folded into the claim set.
 
+### An authorization gate keys on the RBAC accessor, never on one `AuthContext` variant (issue #109, amended 2026-08-09; human-approved via `workflow::ready`)
+
+A gate written as `if let AuthContext::Enabled { rbac, .. }` silently stops
+gating the moment a caller arrives under a *different* auth-enabled variant.
+That is not hypothetical: the Events API's admin-category check was written
+that way and was therefore skipped entirely for `AuthContext::BearerOnly`,
+exposing audit streams to any authenticated token.
+
+**Gates consult the accessor** (`ctx.auth.rbac()`), whose `Some(_)` arm covers
+every auth-enabled variant and whose `None` arm is exactly the
+auth-disabled case where the every-extractor-grants contract applies. The
+distinction a reviewer must see is "is authorization on?", not "which
+enabled variant is this?" — pattern-matching a single variant hides a new
+variant's arrival behind a silent bypass rather than a compile error.
+
 ## Consequences
 
 - A leaked PAT cannot carry broad mapped-claim authority — it was claimless by construction.
