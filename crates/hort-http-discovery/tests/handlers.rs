@@ -71,6 +71,7 @@ fn ctx_with_rbac(rbac: RbacEvaluator) -> (Arc<AppContext>, MockPorts) {
         mocks.upstream_metadata.clone(),
         mocks.jobs.clone(),
         rbac_arc.clone(),
+        base_ctx.virtual_resolution_use_case.clone(),
     ));
     let ctx = with_discovery_use_cases(&base_ctx, discovery, self_service);
     (ctx, mocks)

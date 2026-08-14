@@ -1247,6 +1247,11 @@ pub enum PrefetchSelfServiceResult {
     /// faults (e.g. a `jobs_trigger_source_check` constraint violation)
     /// from genuine upstream egress problems.
     Internal,
+    /// The target repo (or, for a virtual, every member) has no catch-all
+    /// upstream mapping capable of proxying this format (per-item tick).
+    /// Rejected at POST time rather than silently absorbed by the leaf
+    /// handler at execution time.
+    NoUpstreamMapping,
 }
 
 impl PrefetchSelfServiceResult {
@@ -1268,6 +1273,7 @@ impl PrefetchSelfServiceResult {
             Self::OciUnsupported => "oci_unsupported",
             Self::RejectedVersion => "rejected_version",
             Self::Internal => "internal",
+            Self::NoUpstreamMapping => "no_upstream_mapping",
         }
     }
 
@@ -1337,6 +1343,7 @@ pub fn prefetch_self_service_result_from_item_error(
         E::Timeout => PrefetchSelfServiceResult::Timeout,
         E::ParseError => PrefetchSelfServiceResult::ParseError,
         E::Internal => PrefetchSelfServiceResult::Internal,
+        E::NoUpstreamMapping => PrefetchSelfServiceResult::NoUpstreamMapping,
     }
 }
 

@@ -2304,6 +2304,7 @@ pub async fn build_app_context(
         upstream_metadata.clone(),
         jobs_repo.clone(),
         discovery_rbac.clone(),
+        virtual_resolution_use_case.clone(),
     ));
 
     // `EffectivePermissionsUseCase` backing

@@ -2045,7 +2045,7 @@ values. Well under any per-metric ceiling.
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
 | `hort_discovery_list_versions_total` | counter | `format`, `repository`, `result` | — | `result` ∈ `success`, `not_found`, `unauthorized`, `rate_limited`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `parse_error`, `permission_denied`, `token_kind_denied`, `oci_unsupported` |
-| `hort_prefetch_self_service_total` | counter | `format`, `repository`, `result` | — | `result` ∈ `success`, `not_found`, `unauthorized`, `rate_limited`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `parse_error`, `permission_denied`, `token_kind_denied`, `oci_unsupported`, `rejected_version`, `internal` |
+| `hort_prefetch_self_service_total` | counter | `format`, `repository`, `result` | — | `result` ∈ `success`, `not_found`, `unauthorized`, `rate_limited`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `parse_error`, `permission_denied`, `token_kind_denied`, `oci_unsupported`, `rejected_version`, `internal`, `no_upstream_mapping` |
 
 `hort_discovery_list_versions_total {format, repository, result}`
 — counter. One tick per discovery-endpoint HTTP call.
@@ -2064,7 +2064,8 @@ per-item ticks for everything else.
 `result ∈ {success, not_found, unauthorized, rate_limited,
 upstream_4xx, upstream_5xx, network_error, timeout,
 parse_error, permission_denied, token_kind_denied,
-oci_unsupported, rejected_version, internal}`. Emitted exclusively from
+oci_unsupported, rejected_version, internal, no_upstream_mapping}`.
+Emitted exclusively from
 `hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase::enqueue_self_service`.
 
 #### `UpstreamErrorKind` taxonomy alignment
@@ -2135,6 +2136,13 @@ fetch port is called:
   error, including a `jobs_trigger_source_check` constraint violation.
   Per-item tick. Distinct from `network_error` so operators don't chase
   upstream egress / DNS for a server-side fault.
+- `no_upstream_mapping` (`hort_prefetch_self_service_total` ONLY) —
+  the target repo (a direct hosted repo, or every member of a virtual
+  repo) has no catch-all (`path_prefix=""`) upstream mapping for the
+  format. Rejected at POST time — the item can never be fulfilled
+  without an operator config change, so it is refused before enqueue
+  rather than silently absorbed by the `prefetch` leaf handler at
+  execution time. Per-item tick.
 
 #### Tick semantics
 
@@ -2187,11 +2195,11 @@ collapses to `_all`. Never pass a raw UUID.
 #### Cardinality envelope
 
 `format` × `repository` × `result` =
-~10 × N_repos × 12 (discovery) / 13 (prefetch). For a 1k-repo
+~10 × N_repos × 12 (discovery) / 15 (prefetch). For a 1k-repo
 deployment with `METRICS_INCLUDE_REPOSITORY_LABEL=true`, the worst-
-case series count is ~120k discovery + ~130k prefetch; with the knob
+case series count is ~120k discovery + ~150k prefetch; with the knob
 disabled (default at scale) the `repository` label collapses to
-`_all` and the bound is ~120 + ~130 series.
+`_all` and the bound is ~120 + ~150 series.
 
 #### Forbidden labels
 

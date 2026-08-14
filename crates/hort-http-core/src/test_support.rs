@@ -1291,6 +1291,11 @@ pub fn build_mock_ctx_with_label_flag(
         discovery_rbac.clone(),
         policy_projections.clone(),
     ));
+    let virtual_resolution_use_case = Arc::new(VirtualResolutionUseCase::new(
+        repositories.clone(),
+        repository_access_use_case.clone(),
+    ));
+
     let self_service_prefetch_use_case = Arc::new(SelfServicePrefetchUseCase::new(
         repositories.clone(),
         artifacts.clone(),
@@ -1298,11 +1303,7 @@ pub fn build_mock_ctx_with_label_flag(
         upstream_metadata.clone(),
         jobs.clone(),
         discovery_rbac.clone(),
-    ));
-
-    let virtual_resolution_use_case = Arc::new(VirtualResolutionUseCase::new(
-        repositories.clone(),
-        repository_access_use_case.clone(),
+        virtual_resolution_use_case.clone(),
     ));
 
     let mut ctx_inner = AppContext {
