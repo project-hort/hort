@@ -2,9 +2,14 @@
 Service-account RBAC for the svc-token bootstrap Job.
 
 Creates a dedicated ServiceAccount + Role + RoleBinding that grants the
-bootstrap Job exactly the permissions needed to write the
-{{ release }}-svc-token Secret. The Role is intentionally minimal:
-  - get/patch/update on the named secret (for idempotent re-runs)
+bootstrap Job exactly the permissions needed to write every Secret
+named by `scheduledTasks.svcTokens`. The Role is intentionally minimal:
+  - get/patch/update on the named secrets (for idempotent re-runs) —
+    resourceNames enumerates one entry per `svcTokens` list item, using
+    the SAME default-resolution helper
+    (`hort-server.svcTokenSecretName` in `_helpers.tpl`) the bootstrap
+    Job resolves each entry's Secret name with, so the two templates
+    can never name a different set of Secrets.
   - create on secrets (cannot be scoped by resourceName in k8s RBAC — see
     inline comment; a separate rule is the standard workaround)
 
@@ -33,7 +38,9 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames:
-      - {{ include "hort-server.fullname" . }}-svc-token
+      {{- range $i, $tok := .Values.scheduledTasks.svcTokens }}
+      - {{ include "hort-server.svcTokenSecretName" (dict "root" $ "tok" $tok "index" $i) }}
+      {{- end }}
     verbs: ["get", "patch", "update"]
   # "create" cannot be scoped by resourceName in k8s RBAC (the API server
   # rejects such rules with a validation error). A separate rule without

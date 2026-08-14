@@ -2,22 +2,35 @@
 Service-account token bootstrap Job.
 
 Runs as a Helm post-install / post-upgrade hook to mint the `hort_svc_*`
-token that CronJob pods mount as a k8s Secret. Idempotent: if the token
-already exists in the database (same name, same service-account user) the
-`issue-svc-token` command exits 0 without rotation.
+tokens that CronJob pods mount as k8s Secrets, one per entry in
+`scheduledTasks.svcTokens`. Idempotent per entry: if an entry's token
+already exists in the database (same name, same service-account user)
+the corresponding `issue-svc-token` invocation exits 0 without rotation.
 
 Two-container design (no Dockerfile change required):
-  - init-container: `hort-server admin issue-svc-token --output=file:/run/bootstrap/token`
-    Writes the plaintext token to a shared emptyDir volume (mode 0600).
-    Uses the admin DSN (same Secret as the migrate Job) so it can INSERT
-    into `users` and `api_tokens`.
-  - main container: `bitnamilegacy/kubectl` (includes bash) reads the file and runs
-    `kubectl create secret generic … --dry-run=client -o yaml | kubectl apply -f -`
-    The idempotent apply pattern avoids conflicts on re-runs.
+  - init containers, one per `svcTokens` entry: `hort-server admin
+    issue-svc-token --output=file:<path>` writes the plaintext token to
+    the shared Memory-medium emptyDir (mode 0600), one file per entry so
+    concurrent entries never clobber each other.
+  - main container (`bitnamilegacy/kubectl`, includes bash) reads each
+    entry's file and runs `kubectl create secret … --dry-run=client -o
+    yaml | kubectl apply -f -` per entry. The idempotent apply pattern
+    avoids conflicts on re-runs.
 
 The bootstrap ServiceAccount (from svc-bootstrap-rbac.yaml) grants the
-main container exactly the permissions needed to create/update the
-`{{ release }}-svc-token` Secret in the release namespace.
+main container exactly the permissions needed to create/update every
+configured entry's Secret in the release namespace — the RBAC Role's
+`resourceNames` enumerates the same set this template resolves per
+entry (`hort-server.svcTokenSecretName` in `_helpers.tpl` is the single
+source of truth both templates call).
+
+Per-identity state machine (see the `scheduledTasks.svcTokens` values
+comment for the full table): DB row + Secret both present → skip; DB
+row absent → mint (creating or overwriting the Secret as needed); DB
+row present with the Secret absent → the plaintext is unrecoverable, so
+the write-secret container fails loud naming the entry UNLESS that
+entry's `rotate` (or the blanket `rotateSvcToken`) is set, in which case
+`issue-svc-token --rotate` revokes the stale row and mints a fresh one.
 
 Hook annotations:
   - post-install,post-upgrade  — runs after the Deployment is rolled out so
@@ -78,27 +91,32 @@ spec:
         - name: tmp
           emptyDir: {}
       initContainers:
-        - name: issue-token
-          image: {{ include "hort-server.image" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+        {{- range $i, $tok := .Values.scheduledTasks.svcTokens }}
+        {{- $tokenPath := include "hort-server.svcTokenFilePath" (dict "tok" $tok "index" $i) }}
+        - name: issue-token{{ if ne $i 0 }}-{{ $tok.name }}{{ end }}
+          image: {{ include "hort-server.image" $ | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
           # Write the plaintext token to the shared emptyDir.
           # --output=file:<path> creates the file with mode 0600.
           args:
             - admin
             - issue-svc-token
-            - --name=cronjob-tasks
-            - --permission=admin_task_invoke
-            - --output=file:/run/bootstrap/token
-            # Fail the hook loudly if the `cronjob-tasks` SA has no live
-            # `admin_task_invoke` grant, instead of minting a token that
+            - --name={{ $tok.name }}
+            {{- range $tok.permissions }}
+            - --permission={{ . }}
+            {{- end }}
+            - --output=file:{{ $tokenPath }}
+            # Fail the hook loudly if the `{{ $tok.name }}` SA has no live
+            # `{{ join "/" $tok.permissions }}` grant, instead of minting a token that
             # every admin-task CronJob then 403s on at run time. The grant
             # is operator-declared gitops (see the `adminTasksEnabled`
             # comment in values.yaml) — this chart never provisions it.
             - --require-authority
-            {{- if .Values.scheduledTasks.rotateSvcToken }}
-            # scheduledTasks.rotateSvcToken=true: operator requested
-            # rotation. issue-svc-token revokes the existing token +
-            # mints a new one + writes the plaintext to the output file.
+            {{- if or $tok.rotate $.Values.scheduledTasks.rotateSvcToken }}
+            # scheduledTasks.svcTokens[].rotate (or the blanket
+            # scheduledTasks.rotateSvcToken) requested rotation for this
+            # entry. issue-svc-token revokes the existing token + mints
+            # a new one + writes the plaintext to the output file.
             # write-secret then updates the cluster Secret with the
             # fresh value. Routine upgrades leave this off and rely on
             # the write-secret idempotent path.
@@ -111,15 +129,16 @@ spec:
             - name: HORT_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.postgres.admin.existingSecret | quote }}
-                  key: {{ .Values.postgres.admin.secretKey | quote }}
+                  name: {{ $.Values.postgres.admin.existingSecret | quote }}
+                  key: {{ $.Values.postgres.admin.secretKey | quote }}
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
           volumeMounts:
             - name: bootstrap-token
               mountPath: /run/bootstrap
             - name: tmp
               mountPath: /tmp
+        {{- end }}
       containers:
         - name: write-secret
           # bitnamilegacy/kubectl includes bash, making the idempotent apply
@@ -146,7 +165,9 @@ spec:
               # Without this branch, the post-upgrade hook fails on every
               # subsequent upgrade with "no such file or directory".
               set -eu
-              SECRET={{ include "hort-server.fullname" . }}-svc-token
+              {{- if eq (len .Values.scheduledTasks.svcTokens) 1 }}
+              {{- $tok := index .Values.scheduledTasks.svcTokens 0 }}
+              SECRET={{ include "hort-server.svcTokenSecretName" (dict "root" $ "tok" $tok "index" 0) }}
               if [ ! -f /run/bootstrap/token ]; then
                 if kubectl get secret "$SECRET" >/dev/null 2>&1; then
                   echo "info: token row exists in DB and Secret '$SECRET' exists in cluster; nothing to do"
@@ -161,6 +182,37 @@ spec:
               kubectl create secret generic "$SECRET" \
                 --from-file=token=/run/bootstrap/token \
                 --dry-run=client -o yaml | kubectl apply -f -
+              {{- else }}
+              # Every entry is evaluated independently and failures
+              # accumulate — one misconfigured identity fails the Job
+              # (and therefore the upgrade) without blocking a sibling
+              # identity's mint.
+              failed=0
+              {{- range $i, $tok := .Values.scheduledTasks.svcTokens }}
+              {{- $secret := include "hort-server.svcTokenSecretName" (dict "root" $ "tok" $tok "index" $i) }}
+              {{- $file := include "hort-server.svcTokenFilePath" (dict "tok" $tok "index" $i) }}
+              SECRET={{ $secret }}
+              if [ ! -f {{ $file }} ]; then
+                if kubectl get secret "$SECRET" >/dev/null 2>&1; then
+                  echo "info: token row exists in DB and Secret '$SECRET' exists in cluster for '{{ $tok.name }}'; nothing to do"
+                else
+                  echo "error: token row exists in DB but no token file was written AND Secret '$SECRET' does not exist in cluster for '{{ $tok.name }}'" >&2
+                  echo "       The plaintext is lost (hashed in DB). Recover via:" >&2
+                  echo "         helm upgrade ... --set 'scheduledTasks.svcTokens[{{ $i }}].rotate=true'" >&2
+                  echo "       (or --set scheduledTasks.rotateSvcToken=true to rotate every entry)" >&2
+                  echo "       which forces issue-svc-token to revoke the old row + mint a new one." >&2
+                  failed=1
+                fi
+              else
+                kubectl create secret generic "$SECRET" \
+                  --from-file=token={{ $file }} \
+                  --dry-run=client -o yaml | kubectl apply -f -
+              fi
+              {{- end }}
+              if [ "$failed" -ne 0 ]; then
+                exit 1
+              fi
+              {{- end }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           volumeMounts:

@@ -1,0 +1,48 @@
+# Test fixture: two-entry scheduledTasks.svcTokens list.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values-svc-tokens-multi.yaml
+#
+# Exercises:
+#   - both identities minted in the rendered Job spec (two init
+#     containers, each with its own --name / --permission set)
+#   - the first entry's empty secretName resolves to the backward
+#     -compatible bare `<fullname>-svc-token`
+#   - the second entry's EXPLICIT secretName is respected verbatim
+#   - the bootstrap RBAC Role's resourceNames carries both Secret names
+#
+# This file is strictly for local helm lint/template smoke tests — it
+# is not a production values file.
+
+scheduledTasks:
+  adminTasksEnabled: true
+  svcTokens:
+    - name: cronjob-tasks
+      permissions:
+        - admin_task_invoke
+    - name: uat-smoke
+      permissions:
+        - admin_task_invoke
+        - repo_read
+      secretName: "uat-smoke-svc-token"
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

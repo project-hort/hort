@@ -87,6 +87,47 @@ PVC name — stable identifier for the filesystem-backend storage volume.
 {{- end -}}
 
 {{/*
+Secret name for one `scheduledTasks.svcTokens[]` entry. Shared between
+the bootstrap Job (which writes the Secret) and the bootstrap RBAC Role
+(whose `resourceNames` must anchor to the exact same string) so the two
+templates can never drift apart.
+
+Takes a dict: `root` (the chart's root context), `tok` (the list entry),
+`index` (its zero-based position in the list). An explicit `tok.secretName`
+always wins. Otherwise: the FIRST entry (index 0) resolves to
+`<fullname>-svc-token` — the pre-list single Secret name, kept for
+backward compatibility — and every later entry resolves to
+`<fullname>-svc-token-<name>`.
+*/}}
+{{- define "hort-server.svcTokenSecretName" -}}
+{{- if .tok.secretName -}}
+{{- .tok.secretName -}}
+{{- else if eq .index 0 -}}
+{{- printf "%s-svc-token" (include "hort-server.fullname" .root) -}}
+{{- else -}}
+{{- printf "%s-svc-token-%s" (include "hort-server.fullname" .root) .tok.name -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Plaintext-token output path for one `scheduledTasks.svcTokens[]` entry,
+shared between the bootstrap Job's init container (which writes it) and
+its write-secret container (which reads it). The first entry (index 0)
+keeps the pre-list flat path for backward compatibility; every later
+entry gets its own file so N init containers never clobber each other
+on the shared emptyDir.
+
+Takes a dict: `tok` (the list entry), `index` (its zero-based position).
+*/}}
+{{- define "hort-server.svcTokenFilePath" -}}
+{{- if eq .index 0 -}}
+/run/bootstrap/token
+{{- else -}}
+{{- printf "/run/bootstrap/%s.token" .tok.name -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Worker ServiceAccount name.
 
 Operators may override via `worker.serviceAccount.name`; default

@@ -121,6 +121,29 @@ test-values-dex.yaml|/etc/dex/config.yaml|1|the Dex Deployment serves the mounte
 test-values-dex.yaml|value: "https://registry.example.com/dex"|3|auth.dex.enabled overrides HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl on the server Deployment AND the two DSN-direct runtimeEnv CronJobs (scrub + quarantineReleaseSweep)
 test-values-dex.yaml|^ +value: "hort-cli"$|3|auth.dex.enabled overrides HORT_OIDC_AUDIENCE to auth.dex.cliClientId (Dex mints the cli-flow token; its aud is the Dex client id, NOT auth.oidc.audience) — on the server Deployment AND the two DSN-direct runtimeEnv CronJobs; mirrors the issuer override and the Ansible flavor
 test-values-token-exchange-happy.yaml|hort-server.io/component: dex|0|auth.dex.enabled default false ⇒ NO Dex sidecar renders (negative counterpart to test-values-dex.yaml)
+test-values-svc-tokens-multi.yaml|name: issue-token$|1|two-entry svcTokens: exactly one bare `issue-token` init container (the first, backward-compatible entry)
+test-values-svc-tokens-multi.yaml|name: issue-token-uat-smoke$|1|two-entry svcTokens: the second entry gets its own suffixed init container
+test-values-svc-tokens-multi.yaml|^            - --name=cronjob-tasks$|1|two-entry svcTokens: first entry's identity name reaches issue-svc-token
+test-values-svc-tokens-multi.yaml|^            - --name=uat-smoke$|1|two-entry svcTokens: second entry's identity name reaches issue-svc-token
+test-values-svc-tokens-multi.yaml|^            - --output=file:/run/bootstrap/token$|1|two-entry svcTokens: first entry keeps the pre-list flat output path
+test-values-svc-tokens-multi.yaml|^            - --output=file:/run/bootstrap/uat-smoke.token$|1|two-entry svcTokens: second entry gets its own output path (no clobbering on the shared emptyDir)
+test-values-svc-tokens-multi.yaml|^      - hort-server-svc-token$|1|two-entry svcTokens: first entry's EMPTY secretName defaults correctly to the backward-compatible bare name, and the RBAC Role's resourceNames carries it
+test-values-svc-tokens-multi.yaml|^      - uat-smoke-svc-token$|1|two-entry svcTokens: second entry's EXPLICIT secretName is respected verbatim, and the RBAC Role's resourceNames carries it
+test-values-svc-tokens-rotate-entry.yaml|^            - --rotate$|1|per-entry rotate:true on only the second entry reaches ONLY that entry's init container as --rotate
+test-values-svc-tokens-rotate-global.yaml|^            - --rotate$|2|blanket scheduledTasks.rotateSvcToken=true reaches EVERY entry's init container as --rotate, even with no per-entry rotate set
+EOF
+}
+
+# Byte-equivalence pin: rendering `scheduledTasks.svcTokens` at its
+# DEFAULT (the single pre-list `cronjob-tasks` identity) must be
+# byte-for-byte identical to the golden fixtures captured from the
+# chart BEFORE the list refactor — an explicit acceptance criterion,
+# not a best-effort match. Format:
+# `<fixture>|<template path, relative to the chart dir>|<golden file, relative to the chart dir>|<human label>`.
+golden_checks() {
+    cat <<'EOF'
+test-values-cronjobs.yaml|templates/svc-token-bootstrap-job.yaml|testdata/svc-token-bootstrap-job.golden.yaml|default single-identity svc-token-bootstrap Job renders byte-identical to the pre-list golden fixture
+test-values-cronjobs.yaml|templates/svc-bootstrap-rbac.yaml|testdata/svc-bootstrap-rbac.golden.yaml|default single-identity svc-bootstrap RBAC renders byte-identical to the pre-list golden fixture
 EOF
 }
 
@@ -218,6 +241,40 @@ while IFS='|' read -r fixture pattern label; do
         checked_fixtures+=("${fixture}")
     fi
 done < <(expect_render_failure)
+
+# Process golden-file byte-equivalence checks (see golden_checks() above).
+while IFS='|' read -r fixture tmpl golden label; do
+    [[ -z "${fixture}" ]] && continue
+    fixture_path="${chart_dir}/${fixture}"
+    golden_path="${chart_dir}/${golden}"
+
+    if [[ ! -f "${fixture_path}" ]]; then
+        echo "FAIL: golden-check fixture missing: ${fixture}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+    if [[ ! -f "${golden_path}" ]]; then
+        echo "FAIL: golden-check golden file missing: ${golden}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if ! rendered=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+        echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
+        echo "${rendered}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if diff_out=$(diff -u "${golden_path}" <(printf '%s\n' "${rendered}")); then
+        echo "PASS: ${fixture} → ${label}"
+    else
+        echo "FAIL: ${fixture} → ${label}" >&2
+        echo "    rendered ${tmpl} does not byte-match ${golden}:" >&2
+        printf '%s\n' "${diff_out}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+    fi
+done < <(golden_checks)
 
 # Catch fixtures that have no expectations row — silently rendering
 # without any assertion is a regression magnet (someone adds a fixture,

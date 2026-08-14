@@ -1,0 +1,45 @@
+# Test fixture: per-entry scheduledTasks.svcTokens[].rotate.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values-svc-tokens-rotate-entry.yaml
+#
+# Exercises: `rotate: true` on ONLY the second entry reaches ONLY that
+# entry's init container as `--rotate` — the first entry's mint stays
+# un-rotated. Negative counterpart to
+# test-values-svc-tokens-rotate-global.yaml, where the blanket switch
+# reaches every entry.
+#
+# This file is strictly for local helm lint/template smoke tests — it
+# is not a production values file.
+
+scheduledTasks:
+  adminTasksEnabled: true
+  svcTokens:
+    - name: cronjob-tasks
+      permissions:
+        - admin_task_invoke
+    - name: uat-smoke
+      permissions:
+        - admin_task_invoke
+      rotate: true
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

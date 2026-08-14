@@ -1,0 +1,62 @@
+---
+# Source: hort-server/templates/svc-bootstrap-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hort-server-svc-bootstrap
+  labels:
+    helm.sh/chart: hort-server-0.11.0-dev
+    app.kubernetes.io/name: hort-server
+    app.kubernetes.io/instance: hort-server
+    app.kubernetes.io/version: "0.11.0-dev"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: hort-server
+---
+# Source: hort-server/templates/svc-bootstrap-rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hort-server-svc-bootstrap
+  labels:
+    helm.sh/chart: hort-server-0.11.0-dev
+    app.kubernetes.io/name: hort-server
+    app.kubernetes.io/instance: hort-server
+    app.kubernetes.io/version: "0.11.0-dev"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: hort-server
+rules:
+  # get/patch/update the specific Secret. resourceNames scoping is supported
+  # for these verbs, so we lock them down to the exact secret name.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - hort-server-svc-token
+    verbs: ["get", "patch", "update"]
+  # "create" cannot be scoped by resourceName in k8s RBAC (the API server
+  # rejects such rules with a validation error). A separate rule without
+  # resourceNames is the standard workaround — see
+  # https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+# Source: hort-server/templates/svc-bootstrap-rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hort-server-svc-bootstrap
+  labels:
+    helm.sh/chart: hort-server-0.11.0-dev
+    app.kubernetes.io/name: hort-server
+    app.kubernetes.io/instance: hort-server
+    app.kubernetes.io/version: "0.11.0-dev"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: hort-server
+subjects:
+  - kind: ServiceAccount
+    name: hort-server-svc-bootstrap
+    namespace: default
+roleRef:
+  kind: Role
+  name: hort-server-svc-bootstrap
+  apiGroup: rbac.authorization.k8s.io
