@@ -242,6 +242,20 @@ while IFS='|' read -r fixture pattern label; do
     fi
 done < <(expect_render_failure)
 
+# Every version-bearing byte in these manifests derives from Chart.yaml's
+# `version`/`appVersion` (chart label, app-version label, and the default
+# image tag, which falls back to appVersion when image.tag is unset) — none
+# of it is structural. Golden files pin rendering STRUCTURE, not the release
+# number in flight when they were captured, so both sides of the diff go
+# through this same substitution before comparing. Every other byte stays
+# pinned verbatim.
+normalize_chart_version() {
+    sed -E \
+        -e 's/(helm\.sh\/chart: hort-server-)[0-9][^ ]*/\1VERSION/' \
+        -e 's/(app\.kubernetes\.io\/version: ")[^"]*/\1VERSION/' \
+        -e 's#(image: "[^"]*/hort-server:)[^"]*#\1VERSION#'
+}
+
 # Process golden-file byte-equivalence checks (see golden_checks() above).
 while IFS='|' read -r fixture tmpl golden label; do
     [[ -z "${fixture}" ]] && continue
@@ -266,7 +280,9 @@ while IFS='|' read -r fixture tmpl golden label; do
         continue
     fi
 
-    if diff_out=$(diff -u "${golden_path}" <(printf '%s\n' "${rendered}")); then
+    if diff_out=$(diff -u --label "${golden}" --label "rendered:${tmpl}" \
+        <(normalize_chart_version <"${golden_path}") \
+        <(printf '%s\n' "${rendered}" | normalize_chart_version)); then
         echo "PASS: ${fixture} → ${label}"
     else
         echo "FAIL: ${fixture} → ${label}" >&2
