@@ -134,6 +134,20 @@ test-values-svc-tokens-rotate-global.yaml|^            - --rotate$|2|blanket sch
 EOF
 }
 
+# Template-scoped expectations — like expectations() but rendered via
+# `--show-only` so the assertion targets one template's output instead
+# of the whole multi-template render. Use this when the full-render grep
+# would also match an unrelated `readOnly`/pattern hit in a different
+# template (e.g. the worker Deployment's CAS mount vs. the scrub
+# CronJob's own readOnly mounts). Format:
+# `<fixture>|<template path, relative to the chart dir>|<grep -cE pattern>|<expected count>|<human label>`.
+scoped_expectations() {
+    cat <<'EOF'
+test-values-cronjobs.yaml|templates/worker-deployment.yaml|readOnly: true|0|worker's CAS data mount renders WITHOUT readOnly (the worker writes scan-finding + prefetch-ingest blobs)
+test-values-cronjobs.yaml|templates/worker-deployment.yaml|mountPath: /var/lib/hort-server/cas|1|worker's CAS data mount still renders (filesystem backend)
+EOF
+}
+
 # Byte-equivalence pin: rendering `scheduledTasks.svcTokens` at its
 # DEFAULT (the single pre-list `cronjob-tasks` identity) must be
 # byte-for-byte identical to the golden fixtures captured from the
@@ -205,6 +219,41 @@ while IFS='|' read -r fixture pattern expected_count label; do
         echo "PASS: ${fixture} → ${label} (${actual_count} match(es))"
     fi
 done < <(expectations)
+
+# Process scoped expectations (see scoped_expectations() above) — each
+# row renders only the named template via `--show-only` and asserts a
+# pattern's match count within that template alone.
+while IFS='|' read -r fixture tmpl pattern expected_count label; do
+    [[ -z "${fixture}" ]] && continue
+    fixture_path="${chart_dir}/${fixture}"
+
+    if [[ ! -f "${fixture_path}" ]]; then
+        echo "FAIL: fixture missing: ${fixture}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if ! rendered=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+        echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
+        echo "${rendered}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+        checked_fixtures+=("${fixture}")
+        continue
+    fi
+    checked_fixtures+=("${fixture}")
+
+    actual_count=$(printf '%s\n' "${rendered}" | grep -cE "${pattern}" || true)
+
+    if [[ "${actual_count}" -ne "${expected_count}" ]]; then
+        echo "FAIL: ${fixture} (${tmpl}) → ${label}" >&2
+        echo "    pattern: ${pattern}" >&2
+        echo "    expected: ${expected_count} match(es)" >&2
+        echo "    actual:   ${actual_count} match(es)" >&2
+        failed=$((failed + 1))
+    else
+        echo "PASS: ${fixture} (${tmpl}) → ${label} (${actual_count} match(es))"
+    fi
+done < <(scoped_expectations)
 
 # Process render-failure expectations — fixtures that MUST fail to
 # render (typically because they exercise an install-block schema

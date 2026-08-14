@@ -333,15 +333,21 @@ spec:
             {{- if eq .Values.storage.backend "filesystem" }}
             - name: data
               mountPath: /var/lib/hort-server/cas
-              # Workers SHARE the server's CAS volume — they read
-              # bytes the server wrote at ingest time. RWX volume
-              # required when the worker runs as a separate Pod from
-              # the server. `readOnly: true` enforces the
-              # consume-only contract: the worker never writes to the
-              # CAS, only the server's ingest path does. Mirrors the
-              # `cas:/var/lib/hort-server/cas:ro` mount on the v2
-              # docker-compose `hort-worker` service.
-              readOnly: true
+              # Workers SHARE the server's CAS volume and WRITE to it:
+              # ScanOrchestrationUseCase::record_outcome persists
+              # per-finding blobs (findings are hash-referenced CAS
+              # objects; the ScanCompleted event carries the hash, not
+              # the bytes), and worker-side leaf prefetch ingest
+              # (ingest_verified) writes the blob it verified. Mirrors
+              # the writable `cas:/var/lib/hort-server/cas` mount on the
+              # `hort-worker` docker-compose service. Write safety is
+              # adapter-level, not mount-level: a temp file under
+              # `.staging/` on the same filesystem plus atomic rename,
+              # with content-addressed dedup
+              # (hort-adapters-storage/src/filesystem.rs). RWO suffices
+              # while the server and worker co-schedule on one node
+              # (a node-attach constraint); multi-node needs RWX or the
+              # object-store backend instead.
             {{- end }}
             {{- if include "hort-server.extraCaBundle.autoMounted" . }}
             {{- /* Symmetric with the server Deployment: configMapName OR
