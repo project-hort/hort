@@ -234,25 +234,33 @@ impl TaskHandler for PrefetchIngestHandler {
             };
 
             // ----- Step 3: resolve format handler ---------------------
+            //
+            // No registered handler for the repo's format can never
+            // succeed on retry — the input itself can never be
+            // fulfilled. `Failed`, non-retryable: a leaf-ingest that
+            // reports success while ingesting nothing must never
+            // masquerade as `Completed` again (the four-day member-
+            // aware-prefetch outage this closes).
             let format_key = repo.format.to_string();
             let Some(handler) = self.format_handlers.get(&format_key).cloned() else {
-                tracing::warn!(
-                    repository = %repo.key,
-                    format = %format_key,
-                    "prefetch: no FormatHandler registered for repo's format — \
-                     completing as a no-op",
-                );
-                summary.short_circuited = true;
-                return Ok(TaskOutcome::Completed {
-                    result_summary: summary.to_json(
-                        parsed.repository_id,
-                        &parsed.package,
-                        &parsed.version,
+                return Ok(TaskOutcome::fail(
+                    format!(
+                        "prefetch: no FormatHandler registered for repository {}'s format {}",
+                        repo.key, format_key
                     ),
-                });
+                    false,
+                ));
             };
 
             // ----- Step 4: resolve catch-all upstream mapping ---------
+            //
+            // Same reasoning as Step 3: a repo with no catch-all
+            // (`path_prefix == ""`) upstream mapping can never complete
+            // this leaf — the self-service prefetch use case and the
+            // enqueue-time hosted-repo guard now both reject before
+            // enqueue, so a row reaching here with no mapping can only
+            // mean a broken enqueue path or a manually-inserted row.
+            // `Failed`, non-retryable.
             let mappings = match self.upstream_mappings.list_for_repository(repo.id).await {
                 Ok(m) => m,
                 Err(err) => {
@@ -263,19 +271,14 @@ impl TaskHandler for PrefetchIngestHandler {
                 }
             };
             let Some(mapping) = mappings.into_iter().find(|m| m.path_prefix.is_empty()) else {
-                tracing::warn!(
-                    repository = %repo.key,
-                    "prefetch: no catch-all upstream mapping (path_prefix=\"\") for repo \
-                     — completing as a no-op",
-                );
-                summary.short_circuited = true;
-                return Ok(TaskOutcome::Completed {
-                    result_summary: summary.to_json(
-                        parsed.repository_id,
-                        &parsed.package,
-                        &parsed.version,
+                return Ok(TaskOutcome::fail(
+                    format!(
+                        "prefetch: no catch-all upstream mapping (path_prefix=\"\") for \
+                         repository {}",
+                        repo.key
                     ),
-                });
+                    false,
+                ));
             };
 
             // ----- Step 5: dispatch per-format ------------------------
@@ -2101,6 +2104,90 @@ mod tests {
         json!({ "repository_id": repo_id, "package": package, "version": version })
     }
 
+    /// A leaf row whose repo's format has no registered `FormatHandler`
+    /// can never succeed — retrying it re-derives the identical miss.
+    /// `Failed`, non-retryable — NOT `Completed`+`short_circuited`, which
+    /// used to let this masquerade as success (the four-day member-aware-
+    /// prefetch outage this closes).
+    #[tokio::test]
+    async fn no_format_handler_registered_fails_non_retryable() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Cargo);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        // Register the stub handler under an UNRELATED key ("npm") so the
+        // repo's actual format ("cargo") has no entry in `format_handlers`.
+        let handler = build_dispatch_handler(
+            repos,
+            proxy,
+            mappings,
+            "npm",
+            Arc::new(CargoDispatchStub {
+                cksum_hex: sha256_hex(b"x"),
+            }),
+        );
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "serde", "1.0.0"), make_context())
+            .await
+            .expect("Ok");
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(
+                    !retry,
+                    "no registered FormatHandler can never succeed on retry: {reason}"
+                );
+                assert!(reason.contains("FormatHandler"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A leaf row whose repo has no catch-all (`path_prefix == ""`)
+    /// upstream mapping can never complete — the self-service use case
+    /// and the direct-POST guard both reject this shape before enqueue,
+    /// so a row reaching here can only mean a broken enqueue path or a
+    /// manually-inserted row. `Failed`, non-retryable.
+    #[tokio::test]
+    async fn no_catchall_mapping_fails_non_retryable() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Cargo);
+        repos.insert(repo.clone());
+        // Deliberately no `seed_catchall` — mapping-less repo.
+
+        let handler = build_dispatch_handler(
+            repos,
+            proxy,
+            mappings,
+            "cargo",
+            Arc::new(CargoDispatchStub {
+                cksum_hex: sha256_hex(b"x"),
+            }),
+        );
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "serde", "1.0.0"), make_context())
+            .await
+            .expect("Ok");
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(
+                    !retry,
+                    "a mapping-less repo can never complete this leaf: {reason}"
+                );
+                assert!(reason.contains("catch-all"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn cargo_arm_composes_dl_based_url_not_index_host() {
         let repos = Arc::new(MockRepositoryRepository::new());
@@ -2506,7 +2593,7 @@ mod tests {
         assert_eq!(summary["urls_attempted"], 0, "{summary}");
     }
 
-    // -- Maven arm (backlog 106) ----------------------------------------
+    // -- Maven arm -------------------------------------------------------
 
     /// Seed a Maven POM + jar checksum sidecar (default: `.sha256`) and the
     /// artifact bodies at the layout paths the dispatch arm composes, for a

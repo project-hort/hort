@@ -126,6 +126,7 @@ fn build_router_with_rbac(
         mocks.upstream_metadata.clone(),
         mocks.jobs.clone(),
         rbac_arc.clone(),
+        base.virtual_resolution_use_case.clone(),
     ));
     let ctx: Arc<AppContext> = with_discovery_use_cases(&base, discovery, self_service);
     let router = axum::Router::new()

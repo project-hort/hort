@@ -85,12 +85,14 @@ use hort_app::use_cases::api_token_use_case::{
 };
 use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
 use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
+use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
 use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase;
 use hort_app::use_cases::test_support::{
     sample_repository, MockApiTokenRepository, MockArtifactRepository, MockEventStore,
     MockJobsRepository, MockPolicyProjectionRepository, MockRepositoryRepository,
     MockRepositoryUpstreamMappingRepository, MockUpstreamMetadataPort, MockUserRepository,
 };
+use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 use hort_domain::entities::api_token::TokenKind;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::discovery::PrefetchRequestItem;
@@ -330,6 +332,15 @@ async fn drive_chain(
     let upstream = Arc::new(MockUpstreamMetadataPort::new());
     upstream.insert_versions("npm", "left-pad", Ok(vec!["1.0.0".into()]));
     let jobs = Arc::new(MockJobsRepository::new());
+    let repository_access = Arc::new(RepositoryAccessUseCase::new(
+        repositories.clone() as Arc<dyn RepositoryRepository>,
+        RbacAccess::Disabled,
+        true,
+    ));
+    let virtual_resolution = Arc::new(VirtualResolutionUseCase::new(
+        repositories.clone() as Arc<dyn RepositoryRepository>,
+        repository_access,
+    ));
 
     let prefetch_uc = SelfServicePrefetchUseCase::new(
         repositories.clone() as Arc<dyn RepositoryRepository>,
@@ -338,6 +349,7 @@ async fn drive_chain(
         upstream.clone() as Arc<dyn UpstreamMetadataPort>,
         jobs.clone() as Arc<dyn JobsRepository>,
         rbac.clone(),
+        virtual_resolution,
     );
 
     let outcome = prefetch_uc
