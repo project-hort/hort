@@ -1277,20 +1277,115 @@ scheduledTasks:
   # so the chart's `command: [/bin/sh, -c, ...]` shape continues to work.
   svcTokenKubectlImage: "bitnamilegacy/kubectl:1.33"
 
-  # When `true`, force-rotate the cronjob-tasks svc-token on the next
-  # helm upgrade. The bootstrap Job's init container passes `--rotate`
-  # to `issue-svc-token`, which revokes the existing token and mints a
-  # new one. Admin-task CronJob pods using the prior token will fail auth
+  # When `true`, force-rotate EVERY entry in `svcTokens` below on the
+  # next helm upgrade (OR'd with each entry's own `rotate` flag). The
+  # bootstrap Job's init container(s) pass `--rotate` to
+  # `issue-svc-token`, which revokes the existing token and mints a new
+  # one. Admin-task CronJob pods using a prior token will fail auth
   # until their next pod reschedule pulls the updated Secret.
   #
   # Default `false` — routine helm upgrades are idempotent (the
   # bootstrap Job's main container detects "token row exists in DB AND
-  # Secret already exists in cluster" and exits 0 without writing
-  # anything). Set true once to rotate, then back to false.
+  # Secret already exists in cluster" and does nothing for that entry).
+  # Set true once to rotate everything, then back to false.
+  #
+  # Prefer the per-entry `svcTokens[].rotate` below once there is more
+  # than one identity: this global switch rotates ALL of them to
+  # recover ONE lost Secret, invalidating every other identity's cached
+  # token in the process.
   #
   # Recovery from "DB row exists, plaintext lost (no Secret in
-  # cluster)": set `rotateSvcToken: true` and re-run helm upgrade.
+  # cluster)" for a single identity: set that entry's `rotate: true`
+  # (or this global switch to rotate all) and re-run helm upgrade.
   rotateSvcToken: false
+
+  # List of service-account identities the svc-token-bootstrap Job mints
+  # and mounts as Secrets. Default ships exactly the single pre-list
+  # identity, so an untouched install renders byte-identical to before
+  # this list existed. Add entries to bootstrap additional identities
+  # (e.g. a staging smoke-test account) with no manual cluster access.
+  #
+  # Each entry:
+  #   name        — logical identity name, passed to
+  #                 `issue-svc-token --name`. Derives the gitops-created
+  #                 `sa:<name>` backing user.
+  #   permissions — ALL of these are minted via repeated `--permission`
+  #                 flags. Every one of them must be backed by a live
+  #                 GLOBAL `PermissionGrant` for this identity (no
+  #                 `repository:` scope — `issue-svc-token`'s preflight
+  #                 in admin.rs rejects repo-scoped backing). A partial
+  #                 declaration strands the sibling grants: effective
+  #                 authority is capability ∩ grants, so an unbacked
+  #                 permission here is dead weight even if minted.
+  #                 `--require-authority` makes the mint (and therefore
+  #                 the hook Job, and therefore the helm upgrade) FAIL
+  #                 LOUD when a listed permission has no backing grant,
+  #                 rather than silently minting a token that 403s at
+  #                 CronJob run time.
+  #   secretName  — the cluster Secret this identity's token is written
+  #                 to. `secretName` IS AN RBAC ANCHOR: the bootstrap
+  #                 Role's `resourceNames` binds to it by literal
+  #                 string — renaming it here without also giving the
+  #                 Role a chance to re-render (i.e. without an
+  #                 intervening `helm upgrade`) locks the Job out of
+  #                 writing under the new name, and any consumer that
+  #                 mounts the Secret by name breaks the same way.
+  #                 Empty (default) resolves to `<fullname>-svc-token`
+  #                 for the FIRST list entry (backward-compatible with
+  #                 the pre-list single Secret name) and to
+  #                 `<fullname>-svc-token-<name>` for every later entry.
+  #   rotate      — force-rotate JUST this entry on the next upgrade.
+  #                 Default false. OR'd with the global
+  #                 `rotateSvcToken` switch above.
+  #
+  # Per-identity bootstrap state machine, evaluated at every upgrade:
+  #   token row exists AND Secret exists     -> skip, no rotation
+  #                                              (today's idempotent
+  #                                              steady state).
+  #   no token row     AND no Secret exists  -> mint + create Secret
+  #                                              (fresh install).
+  #   no token row     AND Secret exists     -> mint + overwrite Secret.
+  #                                              Expected routine after
+  #                                              a DB wipe that leaves a
+  #                                              Secret pointing at a now
+  #                                              -dead identity; correct
+  #                                              and documented, not
+  #                                              accidental.
+  #   token row exists AND no Secret exists  -> the plaintext is
+  #                                              unrecoverable (only the
+  #                                              hash survives in the
+  #                                              DB). WITHOUT this
+  #                                              entry's `rotate: true`
+  #                                              (or the global switch)
+  #                                              the Job FAILS LOUD,
+  #                                              naming the affected
+  #                                              Secret and the fix —
+  #                                              this state is never
+  #                                              silently skipped, since
+  #                                              a consumer expecting
+  #                                              the Secret would then
+  #                                              fail far from the
+  #                                              cause. WITH `rotate:
+  #                                              true`, it rotates and
+  #                                              creates.
+  #
+  # Removing an entry from this list is documented-inert, NOT a
+  # revocation: the token row and its Secret both stay live with no
+  # owner left in configuration (this chart only ever acts on entries
+  # it is currently told about — it never diffs desired-vs-existing
+  # identities or deletes a Secret unprompted). To actually revoke a
+  # removed identity's token, run the same rotate-and-discard path the
+  # bootstrap Job itself uses, by hand, against the removed name, and
+  # do not apply the resulting Secret:
+  #   hort-server admin issue-svc-token --name=<removed-name> --rotate \
+  #     --output=file:/tmp/discard
+  #   kubectl delete secret <its secretName>   # cluster-side, manual
+  svcTokens:
+    - name: cronjob-tasks
+      permissions:
+        - admin_task_invoke
+      secretName: ""
+      rotate: false
 
   # ======================================================================
   # executionPath: dsn-direct — DSN-only CronJobs (no svc-token, not gated
