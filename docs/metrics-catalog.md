@@ -3419,9 +3419,9 @@ per-policy drill-down.
 
 Curator-driven decision counter — emitted from two use cases:
 
-- `CurationUseCase::{waive, block}` in
+- `CurationUseCase::{waive, block, reevaluate}` in
   `crates/hort-app/src/use_cases/curation_use_case.rs` — the `waive` /
-  `block` decision arms.
+  `block` / `reevaluate` decision arms.
 - `PolicyUseCase::{add_exclusion, remove_exclusion}` in
   `crates/hort-app/src/use_cases/policy_use_case.rs` — the
   `exclude_finding` / `unexclude_finding` decision arms.
@@ -3436,7 +3436,7 @@ chokepoint.
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_curation_decisions_total` | counter | `decision`, `repository`, `result` | events | `decision ∈ {waive, block, exclude_finding, unexclude_finding}`; `repository ∈ {"_all", <key>, "unknown"}`; `result ∈ {ok, denied, invalid, conflict, error}`. Full closed taxonomies below. |
+| `hort_curation_decisions_total` | counter | `decision`, `repository`, `result` | events | `decision ∈ {waive, block, reevaluate, exclude_finding, unexclude_finding}`; `repository ∈ {"_all", <key>, "unknown"}`; `result ∈ {ok, denied, invalid, conflict, error}`. Full closed taxonomies below. |
 
 Source of truth for the enums:
 - `hort_app::metrics::CurationDecisionLabel` for `decision`.
@@ -3446,7 +3446,7 @@ Source of truth for the enums:
 Adding a variant to either enum requires updating this catalog in the
 same change (architect anti-pattern checklist).
 
-**`decision` semantics** (closed taxonomy of 4):
+**`decision` semantics** (closed taxonomy of 5):
 
 - `waive` — `CurationUseCase::waive`. Curator-driven release
   of a quarantined or held artifact, mirroring `admin_release`. One
@@ -3456,6 +3456,12 @@ same change (architect anti-pattern checklist).
   `BlockTarget::VersionList` (continue-on-error)
   emits **one tick per attempted append** so operators can dashboard
   per-append error rates on bulk operations.
+- `reevaluate` — `CurationUseCase::reevaluate`. Curator-invoked
+  per-artifact recompute of a `Rejected` artifact's verdict from
+  stored findings under the active policy. One tick per call; `ok`
+  covers every successful recompute outcome (`StillRejected` /
+  `ResetToQuarantined` / `ResetToReleased`), since each is a completed
+  decision, not a failure.
 - `exclude_finding` — `PolicyUseCase::add_exclusion` from the curator
   path. Emitted at every terminal outcome.
 - `unexclude_finding` — `PolicyUseCase::remove_exclusion` from the

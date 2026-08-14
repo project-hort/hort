@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use hort_domain::events::{DomainEvent, ScanCompleted, SeveritySummary, StreamId};
+use hort_domain::events::{DomainEvent, RejectionReason, ScanCompleted, SeveritySummary, StreamId};
 use hort_domain::ports::event_store::{EventStore, ReadFrom};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{ContentHash, Finding};
@@ -91,6 +91,32 @@ pub(crate) async fn read_last_scan_completed(
         }
     }
     Ok(None)
+}
+
+/// Scan the artifact's stream in reverse and return the most recent
+/// `ArtifactRejected.rejected_by` reason, `Ok(None)` if the artifact has
+/// never been rejected (or the rejecting event fell outside
+/// [`READ_LIMIT`]).
+///
+/// Shared by every caller that re-derives a `Rejected` artifact's
+/// verdict — the eligibility guard downstream
+/// ([`hort_domain::entities::artifact::is_scan_clearable`]) reads this
+/// value, and the artifact entity loaded via
+/// `ArtifactRepository::find_by_id` does not carry it (rejection reason
+/// is not a stored column; it is reconstructed from the event log on
+/// demand).
+pub(crate) async fn read_last_rejection_reason(
+    events: &dyn EventStore,
+    artifact_id: Uuid,
+) -> AppResult<Option<RejectionReason>> {
+    let stream_id = StreamId::artifact(artifact_id);
+    let persisted = events
+        .read_stream(&stream_id, ReadFrom::Start, READ_LIMIT)
+        .await?;
+    Ok(persisted.iter().rev().find_map(|e| match &e.event {
+        DomainEvent::ArtifactRejected(r) => Some(r.rejected_by.clone()),
+        _ => None,
+    }))
 }
 
 /// Resolve the artifact's most recent `ScanCompleted.findings_blob` to
@@ -174,8 +200,8 @@ mod tests {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::SeverityThreshold;
     use hort_domain::events::{
-        Actor, ApprovalDecided, ApprovalDecision, ArtifactQuarantined, DomainEvent, PersistedEvent,
-        ScanCompleted, SeveritySummary, StreamId,
+        Actor, ApprovalDecided, ApprovalDecision, ArtifactQuarantined, ArtifactRejected,
+        DomainEvent, PersistedEvent, RejectionReason, ScanCompleted, SeveritySummary, StreamId,
     };
     use hort_domain::ports::storage::StoragePort;
     use hort_domain::types::{ContentHash, Finding};
@@ -268,6 +294,82 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    // -- read_last_rejection_reason ------------------------------------------
+
+    #[tokio::test]
+    async fn read_last_rejection_reason_none_when_stream_has_no_rejection() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![persisted(
+                &stream_id,
+                0,
+                DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+                    artifact_id,
+                    quarantine_window_start: Utc::now(),
+                }),
+            )],
+        );
+
+        let result = read_last_rejection_reason(&*events, artifact_id)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_last_rejection_reason_returns_most_recent() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                persisted(
+                    &stream_id,
+                    0,
+                    DomainEvent::ArtifactRejected(ArtifactRejected {
+                        artifact_id,
+                        rejected_by: RejectionReason::Curator {
+                            curator_id: Uuid::new_v4(),
+                        },
+                        reason: "stale".into(),
+                    }),
+                ),
+                persisted(
+                    &stream_id,
+                    1,
+                    DomainEvent::ArtifactRejected(ArtifactRejected {
+                        artifact_id,
+                        rejected_by: RejectionReason::Scanner,
+                        reason: "current".into(),
+                    }),
+                ),
+            ],
+        );
+
+        let result = read_last_rejection_reason(&*events, artifact_id)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(RejectionReason::Scanner));
+    }
+
+    #[tokio::test]
+    async fn read_last_rejection_reason_propagates_read_error() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        events.fail_next_read_stream(hort_domain::error::DomainError::Invariant(
+            "event store down".into(),
+        ));
+
+        let err = read_last_rejection_reason(&*events, artifact_id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event store down"));
     }
 
     #[tokio::test]

@@ -94,6 +94,7 @@ pub mod promotion_use_case;
 // the refcount-reconcile gate reports convergence.
 pub mod purge_use_case;
 pub mod quarantine_use_case;
+pub(crate) mod rejected_reevaluation;
 // `RbacResolveUseCase` backing
 // `POST /api/v1/admin/rbac/resolve` (the admin what-if resolver:
 // IdP groups → claims → effective `(repo, permission)` grants). No IdP

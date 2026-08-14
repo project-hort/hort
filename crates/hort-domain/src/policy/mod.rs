@@ -46,7 +46,7 @@ pub use primitives::{
     escalate_action_by_policy, escalate_action_by_severity, PolicyAction, ViolationsAccumulator,
 };
 pub use promotion::{evaluate_promotion, PromotionOutcome};
-pub use re_evaluation::{re_evaluate_after_exclusion, ReEvaluationOutcome};
+pub use re_evaluation::{decide_rejected_transition, ReEvaluationOutcome};
 pub use scan::{effective_quarantine_deadline, evaluate_scan_result, DefaultPolicy, ScanOutcome};
 pub use scan_delta::compute_added_findings;
 pub use staging_sweep_liveness::{evaluate_staging_sweep_liveness, StagingSweepLiveness};

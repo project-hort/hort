@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Curator-invokable per-artifact re-evaluation.**
+  `POST /api/v1/admin/curation/quarantine/:artifact_id/reevaluate` and
+  `hort-cli curation reevaluate <artifact-id>` let a curator recompute a
+  `Rejected` artifact's verdict from its stored findings under the
+  currently active policy — no policy mutation, no forced outcome. (#152)
+
 ## [0.10.0] - 2026-08-09
 
 ### Security

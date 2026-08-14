@@ -191,7 +191,7 @@ fn matches_coords(ex: &ExclusionProjection, coords: &ArtifactCoords) -> bool {
 /// Aggregate-summary exclusion filter — used by the
 /// promotion and post-exclusion-add re-evaluation paths
 /// ([`crate::policy::evaluate_promotion`],
-/// [`crate::policy::re_evaluate_after_exclusion`]) which receive a
+/// [`crate::policy::decide_rejected_transition`]) which receive a
 /// historical [`SeveritySummary`] reconstructed from the artifact's
 /// most recent `ScanCompleted` event rather than per-finding rows.
 ///

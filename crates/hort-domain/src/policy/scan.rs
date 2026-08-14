@@ -293,7 +293,7 @@ pub fn evaluate_scan_result(
 /// Feeds the `negligible_action` enforcement step into a shared
 /// [`ViolationsAccumulator`]. Single source of the negligible-lane
 /// decision for both [`evaluate_scan_result`] (initial scan) and
-/// [`crate::policy::re_evaluate_after_exclusion`] (exclusion-triggered
+/// [`crate::policy::decide_rejected_transition`] (exclusion-triggered
 /// re-evaluation) so the two paths cannot diverge.
 ///
 /// Keyed on the resolved `negligible_action`:
