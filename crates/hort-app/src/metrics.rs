@@ -2888,6 +2888,13 @@ pub enum CurationDecisionLabel {
     /// Repository label follows the same `PolicyScope` resolution
     /// shape as `ExcludeFinding`.
     UnexcludeFinding,
+    /// `CurationUseCase::reevaluate` — curator-invoked per-artifact
+    /// re-evaluation of a `Rejected` artifact's verdict from stored
+    /// findings under the active policy. Emitted at every terminal
+    /// outcome (ok covers all three transition outcomes — `StillRejected`
+    /// / `ResetToQuarantined` / `ResetToReleased` — since each is a
+    /// successful recompute, not a failure).
+    Reevaluate,
 }
 
 impl CurationDecisionLabel {
@@ -2899,6 +2906,7 @@ impl CurationDecisionLabel {
             Self::Block => "block",
             Self::ExcludeFinding => "exclude_finding",
             Self::UnexcludeFinding => "unexclude_finding",
+            Self::Reevaluate => "reevaluate",
         }
     }
 }

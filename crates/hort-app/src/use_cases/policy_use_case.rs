@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{
-    is_scan_clearable, Artifact, CurationClearance, ProvenanceClearance, QuarantineStatus,
+    Artifact, CurationClearance, ProvenanceClearance, QuarantineStatus,
 };
 use hort_domain::entities::scan_policy::{
     ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
@@ -37,12 +37,9 @@ use hort_domain::error::DomainError;
 use hort_domain::events::{
     Actor, ArtifactReEvaluated, ArtifactRejected, DomainEvent, ExclusionAdded, ExclusionRemoved,
     PolicyArchived, PolicyCreated, PolicyField, PolicyReactivated, PolicyScope, PolicyUpdated,
-    ReEvaluationTrigger, RejectionReason, StreamId,
+    ReEvaluationTrigger, StreamId,
 };
-use hort_domain::policy::{
-    effective_quarantine_deadline, evaluate_curation, evaluate_scan_result,
-    re_evaluate_after_exclusion, CurationOutcome, ReEvaluationOutcome,
-};
+use hort_domain::policy::{evaluate_scan_result, ReEvaluationOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
@@ -61,9 +58,9 @@ use crate::metrics::{
     PolicyEvaluationResult, PolicyReEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
-use crate::use_cases::release_clearance::resolve_provenance_clearance;
+use crate::use_cases::release_clearance::{self, resolve_provenance_clearance};
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
-use crate::use_cases::{read_expected_version, scan_history};
+use crate::use_cases::{read_expected_version, rejected_reevaluation, scan_history};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -1159,82 +1156,6 @@ impl PolicyUseCase {
         Ok(exclusion_id)
     }
 
-    /// Re-hydrate the artifact's structured rejection reason from its
-    /// stored `ArtifactRejected` event (ADR 0041 invariant #6 (a)).
-    ///
-    /// The `artifacts` projection does not persist the reason — it lives
-    /// on the artifact's event stream. Scans the stream in reverse for the
-    /// most recent [`DomainEvent::ArtifactRejected`] and returns its
-    /// `rejected_by`. `Ok(None)` when no rejection event is present (an
-    /// unknown reason — ineligible by default). Infrastructure read
-    /// failures surface as `Err` so the caller can skip the artifact
-    /// rather than treat an unknown reason as scan-clearable.
-    async fn hydrate_rejection_reason(
-        &self,
-        artifact_id: Uuid,
-    ) -> AppResult<Option<RejectionReason>> {
-        let stream_id = StreamId::artifact(artifact_id);
-        // The same 200-event reverse-scan bound the scan-history helper
-        // uses; an artifact stream begins well within it.
-        let persisted = self
-            .events
-            .read_stream(
-                &stream_id,
-                hort_domain::ports::event_store::ReadFrom::Start,
-                200,
-            )
-            .await?;
-        Ok(persisted.iter().rev().find_map(|e| match &e.event {
-            DomainEvent::ArtifactRejected(r) => Some(r.rejected_by.clone()),
-            _ => None,
-        }))
-    }
-
-    /// Compute the **active curation precondition** of the cross-axis
-    /// release conjunction (ADR 0041 invariant #6 (c)) for one artifact.
-    ///
-    /// Lists the artifact's repository's live curation rules
-    /// (`list_for_repo`) and runs the pure `evaluate_curation` over coords
-    /// built from the artifact (format resolved from the repository — the
-    /// format gate input). Returns [`CurationClearance::Blocked`] iff a
-    /// currently-active rule yields `CurationOutcome::Block`; `Warn` /
-    /// `Allow` / no-match all resolve to [`CurationClearance::Cleared`].
-    async fn resolve_curation_clearance(
-        &self,
-        artifact: &Artifact,
-    ) -> AppResult<CurationClearance> {
-        let rules = self
-            .curation_rules
-            .list_for_repo(artifact.repository_id)
-            .await?;
-        if rules.is_empty() {
-            // Fast path: no rules → cleared, no format lookup needed.
-            return Ok(CurationClearance::Cleared);
-        }
-        // The curation format gate needs the repository's format; every
-        // artifact in a repo shares it. A missing repo row resolves to the
-        // `Generic` format (the curation evaluator's `any`-format rules
-        // still apply; a format-specific rule simply won't match a Generic
-        // coord — the same no-match→Cleared path).
-        let format = self
-            .repository_access
-            .repository_format(artifact.repository_id)
-            .await?
-            .unwrap_or(hort_domain::entities::repository::RepositoryFormat::Generic);
-        let coords = ArtifactCoords {
-            name: artifact.name.clone(),
-            name_as_published: artifact.name_as_published.clone(),
-            version: artifact.version.clone(),
-            path: artifact.path.clone(),
-            format,
-            metadata: serde_json::Value::Null,
-        };
-        Ok(match evaluate_curation(&coords, &rules) {
-            CurationOutcome::Block { .. } => CurationClearance::Blocked,
-            CurationOutcome::Warn { .. } | CurationOutcome::Allow => CurationClearance::Cleared,
-        })
-    }
-
     /// Generalised both-directions re-evaluation pass over the **whole**
     /// in-scope population of a policy (ADR 0041 §3). Run async off the
     /// policy-mutation request path: every gate-affecting mutation
@@ -1728,126 +1649,73 @@ impl PolicyUseCase {
     ) {
         let artifact_id = artifact.id;
 
-        // (a) Eligibility guard: re-hydrate the rejection reason from
-        // the stream and skip any non-scan-clearable rejection — a
-        // provenance- / curation- / admin-rejected artifact is NOT a
-        // candidate for a scan re-judgement (the pre-ADR-0041 pass
-        // released it irrespective of reason — the live fail-open).
-        // An infrastructure read failure skips the artifact.
-        let reason = match self.hydrate_rejection_reason(artifact_id).await {
-            Ok(r) => r,
+        let derivation = match rejected_reevaluation::derive_rejected_outcome(
+            &*self.events,
+            &self.storage,
+            &artifact,
+            Some(policy),
+            updated_exclusions,
+            now,
+        )
+        .await
+        {
+            Ok(d) => d,
             Err(e) => {
                 tracing::error!(
                     artifact_id = %artifact_id,
                     policy_id = %policy_id,
                     trigger = ?trigger,
                     error = %e,
-                    "re-evaluation (loosen): failed to read rejection reason; \
+                    "re-evaluation (loosen): failed to load re-evaluation evidence; \
                      skipping artifact",
                 );
                 return;
             }
         };
-        artifact.rejection_reason = reason.clone();
-        if !is_scan_clearable(reason.as_ref()) {
-            tallies.held_cross_axis += 1;
-            tracing::info!(
-                artifact_id = %artifact_id,
-                policy_id = %policy_id,
-                reason = ?reason,
-                outcome = "ineligible_non_scanner",
-                "artifact re-evaluation held: rejection reason is not scan-clearable \
-                 (ADR 0041 invariant #6)",
-            );
-            emit_policy_evaluation(
-                policy_decision_point::RE_EVALUATION,
-                PolicyEvaluationResult::StillRejected,
-            );
-            return;
-        }
 
-        let last_snapshot =
-            match scan_history::read_last_scan_completed(&*self.events, artifact_id).await {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    tracing::error!(
-                        artifact_id = %artifact_id,
-                        policy_id = %policy_id,
-                        trigger = ?trigger,
-                        "re-evaluation (loosen): no ScanCompleted on artifact stream; \
-                         skipping artifact",
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        artifact_id = %artifact_id,
-                        policy_id = %policy_id,
-                        trigger = ?trigger,
-                        error = %e,
-                        "re-evaluation (loosen): failed to read artifact stream; \
-                         skipping artifact",
-                    );
-                    return;
-                }
-            };
-
-        // Prefer per-finding matching by
-        // hydrating the `findings_blob` from CAS. Best-effort: a
-        // missing or malformed blob logs a `warn!` inside
-        // `read_last_findings` and returns `None` so the
-        // re-evaluator falls back to the aggregate-summary
-        // path. Genuine event-store read failures are infrastructure
-        // errors and surface as `Err` here; we skip the artifact in
-        // that case (mirrors the `read_last_scan_completed` error
-        // arm above).
-        let last_findings =
-            match scan_history::read_last_findings(&*self.events, &self.storage, artifact_id).await
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!(
-                        artifact_id = %artifact_id,
-                        policy_id = %policy_id,
-                        trigger = ?trigger,
-                        error = %e,
-                        "re-evaluation (loosen): failed to hydrate findings_blob; \
-                         skipping artifact",
-                    );
-                    return;
-                }
-            };
-
-        // Correctness landmine: `re_evaluate_after_exclusion`
-        // branches on the **computed deadline**, never the stored
-        // anchor. The artifact stores only `quarantine_window_start`
-        // (the anchor — always in the past); pass
-        // `effective_quarantine_deadline(anchor, duration)` resolved
-        // from the matched policy's `quarantineDuration`. Passing the
-        // bare anchor type-checks (both are `Option<DateTime<Utc>>`)
-        // but releases re-evaluated `rejected` artifacts ~`duration`
-        // early.
-        let quarantine_deadline = artifact.quarantine_window_start.map(|anchor| {
-            effective_quarantine_deadline(
-                anchor,
-                chrono::Duration::seconds(policy.quarantine_duration_secs),
-            )
-        });
-        // Hydrate the transient computed deadline onto the artifact
-        // so `Artifact::re_evaluate` (invoked inside
-        // `commit_re_evaluation`) branches on the same computed
-        // deadline as the pure helper below — the two MUST agree on
-        // boundary semantics.
+        let (outcome, quarantine_deadline, reason) = match derivation {
+            // (a) Eligibility guard: a provenance- / curation- / admin-
+            // rejected artifact is NOT a candidate for a scan
+            // re-judgement (the pre-ADR-0041 pass released it
+            // irrespective of reason — the live fail-open).
+            rejected_reevaluation::RejectedDerivation::Ineligible { reason } => {
+                tallies.held_cross_axis += 1;
+                tracing::info!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    reason = ?reason,
+                    outcome = "ineligible_non_scanner",
+                    "artifact re-evaluation held: rejection reason is not scan-clearable \
+                     (ADR 0041 invariant #6)",
+                );
+                emit_policy_evaluation(
+                    policy_decision_point::RE_EVALUATION,
+                    PolicyEvaluationResult::StillRejected,
+                );
+                return;
+            }
+            rejected_reevaluation::RejectedDerivation::NoScanCompleted => {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    trigger = ?trigger,
+                    "re-evaluation (loosen): no ScanCompleted on artifact stream; \
+                     skipping artifact",
+                );
+                return;
+            }
+            rejected_reevaluation::RejectedDerivation::Determined {
+                outcome,
+                quarantine_deadline,
+                rejection_reason,
+            } => (outcome, quarantine_deadline, rejection_reason),
+        };
+        artifact.rejection_reason = reason;
+        // Hydrate the transient computed deadline onto the artifact so
+        // `Artifact::re_evaluate` (invoked inside `commit_re_evaluation`)
+        // branches on the same computed deadline the pure helper decided
+        // against — the two MUST agree on boundary semantics.
         artifact.quarantine_deadline = quarantine_deadline;
-        let outcome = re_evaluate_after_exclusion(
-            &artifact,
-            &last_snapshot.summary,
-            last_findings.as_deref(),
-            Some(policy),
-            updated_exclusions,
-            quarantine_deadline,
-            now,
-        );
 
         match outcome {
             ReEvaluationOutcome::StillRejected => {
@@ -1919,7 +1787,13 @@ impl PolicyUseCase {
                         return;
                     }
                 };
-                let curation = match self.resolve_curation_clearance(&artifact).await {
+                let curation = match release_clearance::resolve_curation_clearance(
+                    &*self.curation_rules,
+                    &self.repository_access,
+                    &artifact,
+                )
+                .await
+                {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(
@@ -2451,9 +2325,11 @@ fn optional_i64_to_value(v: Option<i64>) -> serde_json::Value {
 mod tests {
     use std::sync::Mutex;
 
-    use hort_domain::events::{ApiActor, PersistedEvent};
+    use hort_domain::events::{ApiActor, PersistedEvent, RejectionReason};
     use hort_domain::ports::event_store::{AppendResult, ReadFrom, SubscribeFrom};
     use hort_domain::ports::BoxFuture;
+
+    use crate::use_cases::test_support::{persisted_artifact_rejected, persisted_scan_completed};
 
     use super::*;
 
@@ -4121,45 +3997,6 @@ mod tests {
         }
     }
 
-    fn persisted_scan_completed(
-        artifact_id: Uuid,
-        critical: u32,
-        stream_position: u64,
-    ) -> PersistedEvent {
-        // Invariant: blob iff non-empty findings.
-        let findings_blob = if critical > 0 {
-            Some(VALID_SHA256.parse::<ContentHash>().unwrap())
-        } else {
-            None
-        };
-        PersistedEvent {
-            event_id: Uuid::new_v4(),
-            stream_id: StreamId::artifact(artifact_id),
-            stream_position,
-            global_position: stream_position,
-            event: DomainEvent::ScanCompleted(ScanCompleted {
-                artifact_id,
-                scanner: "trivy".into(),
-                finding_count: critical,
-                severity_summary: SeveritySummary {
-                    critical,
-                    high: 0,
-                    medium: 0,
-                    low: 0,
-                    negligible: 0,
-                },
-                findings_blob,
-            }),
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: Actor::Api(ApiActor {
-                user_id: Uuid::new_v4(),
-            }),
-            event_version: 1,
-            stored_at: Utc::now(),
-        }
-    }
-
     /// Build an `ArtifactIngested` PersistedEvent — used to seed the
     /// "no ScanCompleted on artifact stream" path so the pass takes
     /// the best-effort skip.
@@ -4205,35 +4042,6 @@ mod tests {
             scope: PolicyScope::Global,
             reason: "matches the rejected artifact's only finding".into(),
             expires_at: None,
-        }
-    }
-
-    /// Build an `ArtifactRejected` PersistedEvent carrying `rejected_by`.
-    /// The post-exclusion re-evaluation pass re-hydrates the rejection
-    /// reason from this event (ADR 0041 invariant #6 (a)); a rejected
-    /// artifact in production always has one on its stream.
-    fn persisted_artifact_rejected(
-        artifact_id: Uuid,
-        rejected_by: RejectionReason,
-        stream_position: u64,
-    ) -> PersistedEvent {
-        PersistedEvent {
-            event_id: Uuid::new_v4(),
-            stream_id: StreamId::artifact(artifact_id),
-            stream_position,
-            global_position: stream_position,
-            event: DomainEvent::ArtifactRejected(ArtifactRejected {
-                artifact_id,
-                rejected_by,
-                reason: "seeded rejection".into(),
-            }),
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: Actor::Api(ApiActor {
-                user_id: Uuid::new_v4(),
-            }),
-            event_version: 1,
-            stored_at: Utc::now(),
         }
     }
 

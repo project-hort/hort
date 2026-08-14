@@ -1231,6 +1231,8 @@ pub fn build_mock_ctx_with_label_flag(
         // curation emission sites can resolve repository keys for the
         // `hort_curation_decisions_total{repository}` label.
         repository_access_use_case.clone(),
+        curation_rules.clone(),
+        storage.clone(),
     ));
 
     // `PolicyUseCase` wired with the same ports

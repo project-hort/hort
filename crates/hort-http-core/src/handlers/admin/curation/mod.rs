@@ -15,6 +15,8 @@
 //!     ([`waive::post_waive`])
 //!   - `POST /api/v1/admin/curation/quarantine/:artifact_id/block`
 //!     ([`block::post_block`])
+//!   - `POST /api/v1/admin/curation/quarantine/:artifact_id/reevaluate`
+//!     ([`reevaluate::post_reevaluate`])
 //!   - `POST /api/v1/admin/curation/block-versions`
 //!     ([`block_versions::post_block_versions`])
 //! - **Read endpoints:**
@@ -50,6 +52,7 @@ pub mod block_versions;
 pub mod decisions;
 pub mod exclusions;
 pub mod queue;
+pub mod reevaluate;
 pub mod waive;
 
 /// Build the curation sub-router.
@@ -66,6 +69,10 @@ pub fn curation_routes() -> Router<Arc<AppContext>> {
     Router::new()
         .route("/quarantine/{artifact_id}/waive", post(waive::post_waive))
         .route("/quarantine/{artifact_id}/block", post(block::post_block))
+        .route(
+            "/quarantine/{artifact_id}/reevaluate",
+            post(reevaluate::post_reevaluate),
+        )
         .route("/block-versions", post(block_versions::post_block_versions))
         .route("/queue", get(queue::get_queue))
         .route("/decisions", get(decisions::get_decisions))

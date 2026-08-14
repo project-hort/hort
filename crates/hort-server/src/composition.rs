@@ -2602,6 +2602,11 @@ pub async fn build_app_context(
             // `METRICS_INCLUDE_REPOSITORY_LABEL=false` collapse and the
             // resolve-failure `unknown` sentinel.
             repository_access_use_case.clone(),
+            // `reevaluate`'s cross-axis release-clearance check (ADR 0041
+            // invariant #6(c)) reads the same live curation-rule set the
+            // policy-mutation pass consults.
+            curation_rules.clone(),
+            storage.clone(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`block_one` hook calls it best-effort

@@ -502,6 +502,17 @@ pub enum ReEvaluationTrigger {
     /// single multi-field policy update coalesces to one re-evaluation
     /// pass, so this is policy-scoped, not per-field.
     PolicyUpdated { policy_id: Uuid },
+    /// A curator explicitly invoked a single-artifact re-evaluation
+    /// (no policy mutation, no forced outcome) — distinct from the
+    /// three policy-change-driven variants above: those name *what
+    /// changed on the policy*; this one has no policy-side change to
+    /// name, since nothing about the policy or its exclusions moved.
+    /// The curator's identity rides the append envelope's `actor`
+    /// field (mirrors every other curator-attributed write in this
+    /// crate), not this trigger — the trigger only needs to say
+    /// "an operator asked for this," which the loosen-direction
+    /// population pass can never say about itself.
+    CuratorRequested,
 }
 
 /// Audit record for a re-evaluation pass decision (ADR 0041).

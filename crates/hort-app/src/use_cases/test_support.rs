@@ -27,8 +27,8 @@ use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjecti
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
-    Actor, ApiActor, ArtifactQuarantined, DomainEvent, PersistedEvent, RejectionReason,
-    StreamCategory, StreamId,
+    Actor, ApiActor, ArtifactQuarantined, ArtifactRejected, DomainEvent, PersistedEvent,
+    RejectionReason, ScanCompleted, SeveritySummary, StreamCategory, StreamId,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -3332,6 +3332,76 @@ pub fn dummy_persisted_event(
         event: DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
             artifact_id,
             quarantine_window_start: Utc::now(),
+        }),
+        correlation_id: Uuid::new_v4(),
+        causation_id: None,
+        actor: Actor::Api(api_actor()),
+        event_version: 1,
+        stored_at: Utc::now(),
+    }
+}
+
+/// Build a `ScanCompleted` `PersistedEvent` carrying `critical` critical
+/// findings (and nothing else). Follows the `finding_count == 0 ⇔
+/// findings_blob.is_none()` invariant: a non-zero count gets a
+/// (placeholder) blob hash, a zero count gets `None`. Shared by every
+/// `Rejected`-artifact re-evaluation test — the policy-mutation pass and
+/// the curator-invoked `CurationUseCase::reevaluate` both read this
+/// event shape via `scan_history::read_last_scan_completed`.
+pub fn persisted_scan_completed(
+    artifact_id: Uuid,
+    critical: u32,
+    stream_position: u64,
+) -> PersistedEvent {
+    let findings_blob = if critical > 0 {
+        Some(VALID_SHA256.parse::<ContentHash>().unwrap())
+    } else {
+        None
+    };
+    PersistedEvent {
+        event_id: Uuid::new_v4(),
+        stream_id: StreamId::artifact(artifact_id),
+        stream_position,
+        global_position: stream_position,
+        event: DomainEvent::ScanCompleted(ScanCompleted {
+            artifact_id,
+            scanner: "trivy".into(),
+            finding_count: critical,
+            severity_summary: SeveritySummary {
+                critical,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob,
+        }),
+        correlation_id: Uuid::new_v4(),
+        causation_id: None,
+        actor: Actor::Api(api_actor()),
+        event_version: 1,
+        stored_at: Utc::now(),
+    }
+}
+
+/// Build an `ArtifactRejected` `PersistedEvent` carrying `rejected_by`.
+/// Every `Rejected`-artifact re-evaluation caller re-hydrates the
+/// rejection reason from this event shape (ADR 0041 invariant #6(a)) via
+/// `scan_history::read_last_rejection_reason`.
+pub fn persisted_artifact_rejected(
+    artifact_id: Uuid,
+    rejected_by: RejectionReason,
+    stream_position: u64,
+) -> PersistedEvent {
+    PersistedEvent {
+        event_id: Uuid::new_v4(),
+        stream_id: StreamId::artifact(artifact_id),
+        stream_position,
+        global_position: stream_position,
+        event: DomainEvent::ArtifactRejected(ArtifactRejected {
+            artifact_id,
+            rejected_by,
+            reason: "seeded rejection".into(),
         }),
         correlation_id: Uuid::new_v4(),
         causation_id: None,

@@ -6,25 +6,38 @@
 //!
 //! - [`QuarantineUseCase::resolve_provenance_clearance`](crate::use_cases::quarantine_use_case)
 //!   — the timer-sweep release path (ADR 0027); and
-//! - the post-exclusion scan re-evaluation pass in
-//!   [`PolicyUseCase`](crate::use_cases::policy_use_case) — the cross-axis
-//!   conjunction `scan ∧ curation ∧ provenance` (ADR 0041, invariant #6).
+//! - the `Rejected`-artifact re-evaluation callers (the policy-mutation
+//!   population pass's loosen direction in
+//!   [`PolicyUseCase`](crate::use_cases::policy_use_case), and the
+//!   curator-invoked single-artifact endpoint in
+//!   [`CurationUseCase`](crate::use_cases::curation_use_case)) — the
+//!   cross-axis conjunction `scan ∧ curation ∧ provenance` (ADR 0041,
+//!   invariant #6).
 //!
 //! Two independent release-gating provenance computations is exactly the
 //! drift that produced the MR !39 `negligible_action` HIGH finding; this
-//! module is the structural close.
+//! module is the structural close. [`resolve_curation_clearance`] closes
+//! the same drift risk for the curation side of the conjunction — both
+//! `Rejected`-re-evaluation callers above call it rather than each
+//! resolving the active curation-rule verdict themselves.
 //!
-//! Pure orchestration — wraps an [`EventStore`] read with the same
-//! predicate the timer sweep uses. No state mutation, no metric emission.
+//! Pure orchestration — wraps an [`EventStore`] read (provenance) or a
+//! [`CurationRuleRepository`] + repository-format read (curation) with
+//! the same predicate the timer sweep uses. No state mutation, no metric
+//! emission.
 
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::ProvenanceClearance;
+use hort_domain::entities::artifact::{Artifact, CurationClearance, ProvenanceClearance};
 use hort_domain::entities::scan_policy::ProvenanceMode;
 use hort_domain::events::{DomainEvent, StreamId};
+use hort_domain::policy::{evaluate_curation, CurationOutcome};
+use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{EventStore, ReadFrom};
+use hort_domain::types::ArtifactCoords;
 
 use crate::error::AppResult;
+use crate::use_cases::repository_access::RepositoryAccessUseCase;
 
 /// Cap on the number of events read when scanning an artifact stream for
 /// a `ProvenanceVerified` event. Mirrors the `STREAM_READ_LIMIT` /
@@ -77,6 +90,48 @@ pub(crate) async fn resolve_provenance_clearance(
             })
         }
     }
+}
+
+/// Compute the **active curation precondition** of the cross-axis
+/// release conjunction (ADR 0041 invariant #6 (c)) for one artifact.
+///
+/// Lists the artifact's repository's live curation rules
+/// (`list_for_repo`) and runs the pure `evaluate_curation` over coords
+/// built from the artifact (format resolved from the repository — the
+/// format gate input). Returns [`CurationClearance::Blocked`] iff a
+/// currently-active rule yields `CurationOutcome::Block`; `Warn` /
+/// `Allow` / no-match all resolve to [`CurationClearance::Cleared`].
+pub(crate) async fn resolve_curation_clearance(
+    curation_rules: &dyn CurationRuleRepository,
+    repository_access: &RepositoryAccessUseCase,
+    artifact: &Artifact,
+) -> AppResult<CurationClearance> {
+    let rules = curation_rules.list_for_repo(artifact.repository_id).await?;
+    if rules.is_empty() {
+        // Fast path: no rules → cleared, no format lookup needed.
+        return Ok(CurationClearance::Cleared);
+    }
+    // The curation format gate needs the repository's format; every
+    // artifact in a repo shares it. A missing repo row resolves to the
+    // `Generic` format (the curation evaluator's `any`-format rules
+    // still apply; a format-specific rule simply won't match a Generic
+    // coord — the same no-match→Cleared path).
+    let format = repository_access
+        .repository_format(artifact.repository_id)
+        .await?
+        .unwrap_or(hort_domain::entities::repository::RepositoryFormat::Generic);
+    let coords = ArtifactCoords {
+        name: artifact.name.clone(),
+        name_as_published: artifact.name_as_published.clone(),
+        version: artifact.version.clone(),
+        path: artifact.path.clone(),
+        format,
+        metadata: serde_json::Value::Null,
+    };
+    Ok(match evaluate_curation(&coords, &rules) {
+        CurationOutcome::Block { .. } => CurationClearance::Blocked,
+        CurationOutcome::Warn { .. } | CurationOutcome::Allow => CurationClearance::Cleared,
+    })
 }
 
 #[cfg(test)]

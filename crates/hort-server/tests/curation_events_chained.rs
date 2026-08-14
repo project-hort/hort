@@ -289,6 +289,8 @@ fn build_curation_use_case(
         decisions_repo,
         exclusions_repo,
         default_repository_access(),
+        Arc::new(MockCurationRuleRepository::new()),
+        Arc::new(MockStoragePort::new()),
     )
 }
 
