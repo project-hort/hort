@@ -872,11 +872,16 @@
                 "minLength": 1
               },
               "permissions": {
-                "description": "Permissions minted via repeated `--permission` flags. Each must be backed by a live GLOBAL PermissionGrant for this identity or the mint fails loud (`--require-authority`).",
+                "description": "Permissions minted via repeated `--permission` flags. Each must be backed by a live PermissionGrant for this identity AT THIS ENTRY'S SCOPE (global grant when `repository` is unset, matching-repository or global grant when it is set) or the mint fails loud (`--require-authority`).",
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
                 "minItems": 1,
                 "default": ["admin_task_invoke"]
+              },
+              "repository": {
+                "description": "Optional: scope the minted token to a single repository by its `key`. The cap carries `repository_ids: [<repo_id>]` instead of the default global `null`, and `--require-authority` (if set) checks the declared permissions at this repository (a global grant also satisfies it). Omit for a global-scope identity — unchanged, byte-compatible default.",
+                "type": "string",
+                "minLength": 1
               },
               "secretName": {
                 "description": "Cluster Secret this identity's token is written to; also the bootstrap Role's `resourceNames` anchor. Empty resolves to `<fullname>-svc-token` for the first list entry, `<fullname>-svc-token-<name>` for later entries.",

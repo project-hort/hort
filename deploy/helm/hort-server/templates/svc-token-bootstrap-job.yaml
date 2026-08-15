@@ -105,6 +105,13 @@ spec:
             {{- range $tok.permissions }}
             - --permission={{ . }}
             {{- end }}
+            {{- if $tok.repository }}
+            # scheduledTasks.svcTokens[].repository scopes this identity's
+            # mint to a single repository — the token's cap AND (with
+            # --require-authority below) the preflight both check this
+            # scope instead of global.
+            - --repository={{ $tok.repository }}
+            {{- end }}
             - --output=file:{{ $tokenPath }}
             # Fail the hook loudly if the `{{ $tok.name }}` SA has no live
             # `{{ join "/" $tok.permissions }}` grant, instead of minting a token that
