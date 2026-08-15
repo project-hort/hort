@@ -1,9 +1,10 @@
 # Glossary
 
-Definitional terms used across hort's release, branch, and workflow docs.
-Each entry links to [ADR 0048](adr/0048-release-branch-staging-strategy.md),
-which is the authority for the release/branch/staging model these terms
-describe.
+Definitional terms used across hort's release, branch, workflow, and auth
+docs. Most entries link to [ADR 0048](adr/0048-release-branch-staging-strategy.md),
+the authority for the release/branch/staging model those terms describe;
+the auth-domain entries link to the ADR or how-to that is authoritative for
+them instead.
 
 ### Alpha build (`test/*` branch)
 
@@ -21,6 +22,15 @@ The terminal state of an issue. Issues auto-close only on merge to the
 default branch (`main`) — a final release's promotion MR closes every
 issue whose fix already rested in `ready-for-staging` or `in-uat`, often
 many at once. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
+
+### Global grant
+
+A `PermissionGrant` whose `spec.repository` field is omitted, so it
+authorizes its `permission` across every repository the deployment
+serves rather than one named repository — the RBAC evaluator treats a
+grant with no repository scope as matching every scope checked against
+it. See [declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
+`kind: PermissionGrant`.
 
 ### In-UAT
 
@@ -43,6 +53,17 @@ all deployable to staging independently of release cadence. See
 suffix. A single promotion can batch-close many issues that had been
 resting in `ready-for-staging` / `in-uat`. See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D1, D5.
+
+### Session-gated
+
+Describes an endpoint whose authorization requires a caller to present
+a specific *kind* of token, independent of the permissions that token
+carries. The self-service prefetch trigger is the canonical example:
+it accepts a `CliSession` or `ServiceAccount` token but rejects a `Pat`
+outright, before its `Permission::Read ∧ Permission::Prefetch` check
+ever runs. See
+[mint-operator-tokens-without-idp.md](architecture/how-to/mint-operator-tokens-without-idp.md)
+and [ADR 0013](adr/0013-idp-authoritative-cli-sessions.md).
 
 ### Staging
 
