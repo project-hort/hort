@@ -137,6 +137,8 @@ test-values-svc-tokens-multi.yaml|^      - hort-server-svc-token$|1|two-entry sv
 test-values-svc-tokens-multi.yaml|^      - uat-smoke-svc-token$|1|two-entry svcTokens: second entry's EXPLICIT secretName is respected verbatim, and the RBAC Role's resourceNames carries it
 test-values-svc-tokens-rotate-entry.yaml|^            - --rotate$|1|per-entry rotate:true on only the second entry reaches ONLY that entry's init container as --rotate
 test-values-svc-tokens-rotate-global.yaml|^            - --rotate$|2|blanket scheduledTasks.rotateSvcToken=true reaches EVERY entry's init container as --rotate, even with no per-entry rotate set
+test-values-svc-tokens-repository.yaml|^            - --repository=maven-proxy$|1|per-entry repository:maven-proxy on only the second entry reaches ONLY that entry's init container as --repository
+test-values-svc-tokens-repository.yaml|repository=maven-proxy|1|exactly one entry declares repository — the first (unscoped) entry renders NO --repository flag at all
 EOF
 }
 
@@ -182,6 +184,7 @@ test-values-extra-ca-both-sources.yaml|extraCaBundle|configMapName AND secretNam
 test-values-strict-schema-typo.yaml|[Aa]dditional propert|the strict schema (additionalProperties:false on the top-level + every nested block) must REJECT mistyped / retired keys (replicaCountt, apiBindAddr, http.ociUploadTimeoutSeconds, worker.scanner.osvScanner, worker.scanner.osvv) at helm template instead of silently ignoring them
 test-values-worker-metrics-no-scrapers.yaml|scrapeFrom|worker.metrics.enabled=true with an empty scrapeFrom must be rejected — an empty NetworkPolicy `from: []` means ALL sources (fail-OPEN) per the k8s spec, so the schema's `if enabled then scrapeFrom minItems 1` rule must fail the render rather than open the metrics port cluster-wide
 test-values-dex-broken.yaml|auth.dex.issuerUrl|auth.dex.enabled=true with an empty auth.dex.issuerUrl must fail schema validation — the chart points HORT_OIDC_ISSUER_URL at Dex so an empty issuer is rejected at render time
+test-values-svc-tokens-repository-typo.yaml|[Aa]dditional propert|a mistyped scheduledTasks.svcTokens[].repository key (repositroy) must fail schema validation — additionalProperties:false on the svcTokens item schema, mirroring the top-level strict-schema typo fixture
 EOF
 }
 

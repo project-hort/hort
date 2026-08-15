@@ -4055,6 +4055,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn issue_for_service_account_system_scopes_the_cap_to_the_requested_repository() {
+        // Backlog 112: `hort-server admin issue-svc-token --repository
+        // <name>` threads the resolved repo id through as
+        // `repository_ids: Some(vec![id])` — the system-mint path never
+        // derives the cap from grants (unlike `issue_for_service_account`),
+        // so the request's `repository_ids` is what lands on the row
+        // verbatim.
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(true));
+        let repo = Uuid::from_u128(0xB0);
+        let request = IssueTokenRequest {
+            repository_ids: Some(vec![repo]),
+            ..make_request_system()
+        };
+        uc.issue_for_service_account_system(Uuid::from_u128(0xACE), request)
+            .await
+            .expect("system mint must succeed with a scoped repository_ids");
+        let inserts = tokens.inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].repository_ids, Some(vec![repo]));
+    }
+
+    #[tokio::test]
+    async fn issue_for_service_account_system_cap_is_global_without_a_repository() {
+        // Regression pin: the flagless mint stays byte-compatible with
+        // today — `repository_ids = None` (global cap), not an empty vec.
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(true));
+        uc.issue_for_service_account_system(Uuid::from_u128(0xACE), make_request_system())
+            .await
+            .expect("system mint must succeed with the default (global) request");
+        let inserts = tokens.inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].repository_ids, None);
+    }
+
+    #[tokio::test]
+    async fn issue_for_service_account_system_rejects_empty_repository_ids() {
+        // `repository_ids = Some(vec![])` is invalid on every issuance
+        // path — locking a token to zero repos is nonsensical, so this
+        // is the SAME `InvalidRepositorySet` reject `issue_self_token`
+        // and `issue_for_service_account` apply, mirrored on the
+        // system-mint path.
+        let (uc, tokens, users, _events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(user(true));
+        let request = IssueTokenRequest {
+            repository_ids: Some(vec![]),
+            ..make_request_system()
+        };
+        let err = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), request)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiTokenError::InvalidRepositorySet));
+        assert!(tokens.inserts().is_empty());
+    }
+
     // ---------- issue_for_bootstrap_admin_system ----------
 
     /// The reserved `bootstrap-admin` user: `is_admin = true`,

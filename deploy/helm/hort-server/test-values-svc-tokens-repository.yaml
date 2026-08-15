@@ -1,0 +1,49 @@
+# Test fixture: per-entry scheduledTasks.svcTokens[].repository.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ -f deploy/helm/hort-server/test-values-svc-tokens-repository.yaml
+#
+# Exercises: the SECOND entry's `repository: maven-proxy` renders
+# `--repository=maven-proxy` on ONLY that entry's init container — the
+# first entry (no `repository`) renders no `--repository` flag at all.
+# Negative/positive pair in one fixture, mirroring
+# test-values-svc-tokens-rotate-entry.yaml's per-entry-flag shape. The
+# default single-entry render (no `repository`) is separately pinned
+# byte-identical by the `golden_checks` bootstrap-Job fixture — this
+# file only exercises the flag threading, not the golden bytes.
+#
+# This file is strictly for local helm lint/template smoke tests — it
+# is not a production values file.
+
+scheduledTasks:
+  adminTasksEnabled: true
+  svcTokens:
+    - name: cronjob-tasks
+      permissions:
+        - admin_task_invoke
+    - name: uat-smoke
+      permissions:
+        - read
+        - prefetch
+      repository: maven-proxy
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"
