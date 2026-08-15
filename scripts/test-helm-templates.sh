@@ -2,6 +2,12 @@
 #
 # scripts/test-helm-templates.sh — Helm chart render-assertion suite.
 #
+# Every render pins `--namespace default`: `helm template` otherwise
+# inherits the kube-context/HELM_NAMESPACE namespace, and
+# `.Release.Namespace` reaches rendered output (the svc-bootstrap
+# RoleBinding subject), so an unpinned render is environment-dependent —
+# byte-assertions and goldens must never depend on where the suite runs.
+#
 # Renders every `test-values-*.yaml` fixture in `deploy/helm/hort-server/`
 # via `helm template` and asserts that each fixture produces the
 # expected presence / absence of feature-gated lines in the rendered
@@ -196,7 +202,7 @@ while IFS='|' read -r fixture pattern expected_count label; do
     # assertions on the same fixture).
     rendered_var="rendered_$(echo "${fixture}" | tr '.-' '__')"
     if [[ -z "${!rendered_var:-}" ]]; then
-        if ! rendered=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" 2>&1); then
+        if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" 2>&1); then
             echo "FAIL: helm template failed for ${fixture}:" >&2
             echo "${rendered}" | sed 's/^/    /' >&2
             failed=$((failed + 1))
@@ -233,7 +239,7 @@ while IFS='|' read -r fixture tmpl pattern expected_count label; do
         continue
     fi
 
-    if ! rendered=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+    if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
         echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
         echo "${rendered}" | sed 's/^/    /' >&2
         failed=$((failed + 1))
@@ -269,7 +275,7 @@ while IFS='|' read -r fixture pattern label; do
         continue
     fi
 
-    if rendered_ok=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" 2>&1); then
+    if rendered_ok=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" 2>&1); then
         echo "FAIL: ${fixture} → ${label}" >&2
         echo "    expected helm template to FAIL (install-block) but it rendered successfully" >&2
         failed=$((failed + 1))
@@ -322,7 +328,7 @@ while IFS='|' read -r fixture tmpl golden label; do
         continue
     fi
 
-    if ! rendered=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+    if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
         echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
         echo "${rendered}" | sed 's/^/    /' >&2
         failed=$((failed + 1))
