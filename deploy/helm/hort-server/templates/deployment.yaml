@@ -13,15 +13,18 @@ spec:
   selector:
     matchLabels:
       {{- include "hort-server.selectorLabels" . | nindent 6 }}
+      # Selectors are immutable post-create; each Deployment's selector
+      # must match only its own pods. Identical to the component label
+      # the pod template below already renders.
+      app.kubernetes.io/component: server
   template:
     metadata:
       labels:
         {{- include "hort-server.labels" . | nindent 8 }}
-        # Server-only Service discriminator. Added to the pod template
-        # (mutable) NOT spec.selector.matchLabels (immutable);
-        # matchLabels ⊆ pod labels still holds. Pairs with the matching
-        # selector key in service.yaml so the hort-server Service stops
-        # also selecting the worker + Job/CronJob pods.
+        # Server-only discriminator, identical to spec.selector.matchLabels
+        # above (matchLabels ⊆ pod labels must hold). Pairs with the
+        # matching selector key in service.yaml so the hort-server Service
+        # stops also selecting the worker + Job/CronJob pods.
         app.kubernetes.io/component: server
       annotations:
         # Roll pods when the gitops ConfigMap changes.

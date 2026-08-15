@@ -59,6 +59,39 @@ multi-attach; in-process ephemeral state cannot survive across pods.
 | `docs/architecture/how-to/wire-secrets.md` | Secret-mount conventions (used by `secrets.mounts`) |
 | `docs/architecture/how-to/declare-gitops-config.md` | Gitops config layout (used by `gitopsConfig`) |
 
+## Upgrading — Deployment selector change (one-time, per existing install)
+
+The server and worker Deployments' `spec.selector.matchLabels` now each
+carry an `app.kubernetes.io/component` discriminator, matching the label
+their own pod template already renders. `matchLabels` is immutable
+post-create, so `helm upgrade` fails against an existing release with
+`spec.selector` is immutable-shaped errors. This is a one-time step per
+install; a fresh install needs no action.
+
+Pick one of:
+
+- **Delete-then-upgrade** (brief downtime; pods are recreated):
+  ```sh
+  kubectl delete deploy <fullname> <fullname>-worker
+  helm upgrade hort-server oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server ...
+  ```
+- **`--cascade=orphan` + re-adoption** (zero-downtime-sensitive installs —
+  the orphaned pods keep serving while the new Deployments adopt them):
+  ```sh
+  kubectl delete deploy <fullname> <fullname>-worker --cascade=orphan
+  helm upgrade hort-server oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server ...
+  ```
+- **Flux-managed installs**: suspend the reconciliation, delete the two
+  Deployments, then resume:
+  ```sh
+  flux suspend helmrelease hort-server
+  kubectl delete deploy <fullname> <fullname>-worker
+  flux resume helmrelease hort-server
+  ```
+
+`<fullname>` is the release's `hort-server.fullname` (defaults to the
+release name); the worker Deployment is always `<fullname>-worker`.
+
 ## Versioning
 
 Chart version and app version are coupled — they advance together. The
