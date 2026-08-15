@@ -153,6 +153,9 @@ scoped_expectations() {
     cat <<'EOF'
 test-values-cronjobs.yaml|templates/worker-deployment.yaml|readOnly: true|0|worker's CAS data mount renders WITHOUT readOnly (the worker writes scan-finding + prefetch-ingest blobs)
 test-values-cronjobs.yaml|templates/worker-deployment.yaml|mountPath: /var/lib/hort-server/cas|1|worker's CAS data mount still renders (filesystem backend)
+test-values-ha.yaml|templates/deployment.yaml|app.kubernetes.io/component: server|2|server Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the existing pod-template label (1) — matchLabels stays a subset of the pod labels
+test-values-ha.yaml|templates/worker-deployment.yaml|app.kubernetes.io/component: worker|3|worker Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the Deployment metadata label (1) + pod-template label (1)
+test-values-ha.yaml|templates/pdb.yaml|app.kubernetes.io/component: server|1|the server-only PDB's selector.matchLabels carries the component discriminator so it no longer also matches worker pods, which have no PDB of their own
 EOF
 }
 
