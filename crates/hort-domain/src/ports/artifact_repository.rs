@@ -275,6 +275,17 @@ pub trait ArtifactRepository: Send + Sync {
     /// Note: this query must not select any `quarantine_deadline` column
     /// (none exists); the schema stores only the anchor
     /// (`quarantine_window_start`), never a precomputed deadline.
+    ///
+    /// Contract any adapter implementing this method must honour: a
+    /// returned row always asserts locally-ingested content, regardless
+    /// of its `quarantine_status` — including `None`. This holds because
+    /// the row is sourced from `artifacts`, whose `checksum_sha256` and
+    /// `storage_key` columns are NOT NULL; there is no representable
+    /// "known upstream, not ingested" row. Callers that need to
+    /// distinguish "ingested, no quarantine lifecycle" (status `None`)
+    /// from "never ingested" must do so by row PRESENCE, not by status
+    /// value — the absence of a `(version, _, _)` entry for a queried
+    /// version is the only "not locally ingested" signal.
     fn package_version_status(
         &self,
         repository_id: Uuid,
