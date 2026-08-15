@@ -672,20 +672,25 @@ impl SelfServicePrefetchUseCase {
 
         if let Some(status) = held_match {
             match status {
-                // `Released` and `Quarantined` (incl. the read-time
+                // `Released`, `Quarantined` (incl. the read-time
                 // `QuarantinedAwaitingRelease` derivation, which the
-                // projection returns as plain `Quarantined`) mean the
-                // artifact is locally ingested and already covered →
-                // `skipped_already_held`.
-                //
-                // `None` is deliberately NOT folded here. For a PROXY,
-                // `package_version_status` returns `None` for versions
-                // that are known upstream but NOT locally ingested — those
-                // are exactly what self-service prefetch must warm, so
-                // `None` falls through to the enqueue below. (The old code
-                // mistook proxy `None` for an un-quarantined *hosted*
-                // upload and skipped every upstream version.)
-                QuarantineStatus::Released | QuarantineStatus::Quarantined => {
+                // projection returns as plain `Quarantined`), and `None`
+                // all fold here: `package_version_status` reads only the
+                // `artifacts` table, whose `checksum_sha256` /
+                // `storage_key` columns are NOT NULL, so ANY row this
+                // projection returns — regardless of `quarantine_status`
+                // — asserts locally-ingested content. Ingested-or-not and
+                // quarantine-lifecycle are two different dimensions:
+                // row-presence answers the former, `status` only the
+                // latter. A `None` row is content with no quarantine
+                // lifecycle (a pure Sigstore-bundle referrer, or an
+                // ingest with no matching scan policy) — already held,
+                // never re-pulled. "Known upstream, not yet ingested" is
+                // the row-ABSENT case (`held_match` is `None` at the
+                // caller, handled below the match, not here).
+                QuarantineStatus::Released
+                | QuarantineStatus::Quarantined
+                | QuarantineStatus::None => {
                     outcome.skipped_already_held.push(coords_resolved);
                     // Skipped items do NOT tick a per-item result —
                     // the `result` label set does not have a `skipped`
@@ -694,9 +699,6 @@ impl SelfServicePrefetchUseCase {
                     // not in the metric.)
                     return;
                 }
-                // Known upstream, not locally held → fall through to the
-                // enqueue below (H6).
-                QuarantineStatus::None => {}
                 QuarantineStatus::Rejected => {
                     outcome.rejected_packages.push(RejectedItem {
                         coords: coords_resolved,
@@ -1842,7 +1844,7 @@ mod tests {
     }
 
     // ============================================================
-    // Already-held buckets (three states fold together)
+    // Already-held buckets (Released / Quarantined / None fold together)
     // ============================================================
 
     #[test]
@@ -1947,16 +1949,58 @@ mod tests {
     }
 
     #[test]
-    fn none_status_known_upstream_is_enqueued_not_skipped() {
-        // H6 (secondary): for a PROXY, `package_version_status` returns
-        // `QuarantineStatus::None` for versions that are known upstream
-        // but NOT locally ingested (the same projection that backs the
-        // packument serve — discovery reads this `None` as "unknown").
-        // Self-service prefetch must ENQUEUE these (that is the whole
-        // point — warm them), NOT bucket them as `skipped_already_held`.
-        // The old behaviour mistook proxy `None` for an un-quarantined
-        // *hosted* upload. Only Released / Quarantined (actually locally
-        // held) skip.
+    fn absent_row_known_upstream_is_enqueued_not_skipped() {
+        // `package_version_status` returns a row ONLY for locally
+        // ingested content (the adapter reads `artifacts`, whose
+        // `checksum_sha256` / `storage_key` columns are NOT NULL — a
+        // returned row asserts ingested content, regardless of its
+        // `quarantine_status`). "Known upstream, not yet ingested" is
+        // therefore the row-ABSENT case, not any particular status
+        // value: seed no row at all for this version. Self-service
+        // prefetch must ENQUEUE it (that is the whole point — warm real
+        // upstream versions that have never been pulled), not bucket it
+        // as `skipped_already_held`.
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                // Deliberately no `seed_package_version_status` call —
+                // the mock's default is an empty projection, i.e. no
+                // row for this (package, version) coordinate.
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&key, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(
+                    outcome.enqueued_job_ids.len(),
+                    1,
+                    "row-absent (known-upstream, never ingested) must enqueue"
+                );
+                assert!(outcome.skipped_already_held.is_empty());
+                assert!(outcome.rejected_packages.is_empty());
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn none_status_row_is_ingested_content_and_skips() {
+        // `package_version_status`'s adapter reads only `artifacts`
+        // rows, whose content columns (`checksum_sha256`,
+        // `storage_key`) are NOT NULL — so ANY returned row, including
+        // one with `QuarantineStatus::None` (a pure Sigstore-bundle
+        // referrer, or an ingest with no matching scan policy), is
+        // locally-ingested content with no quarantine lifecycle. It
+        // must classify held (`skipped_already_held`), the same as
+        // Released/Quarantined, and must NOT be re-pulled from upstream
+        // on every re-POST.
         let snap = capture(|| {
             Box::pin(async {
                 let repo = npm_repo();
@@ -1974,19 +2018,14 @@ mod tests {
                     h.uc.enqueue_self_service(&key, vec![item("p", Some("1.0.0"))], &actor)
                         .await
                         .expect("ok");
-                assert_eq!(
-                    outcome.enqueued_job_ids.len(),
-                    1,
-                    "proxy None (known-upstream, not locally held) must enqueue"
-                );
-                assert!(outcome.skipped_already_held.is_empty());
+                assert!(outcome.enqueued_job_ids.is_empty());
+                assert_eq!(outcome.skipped_already_held.len(), 1);
+                assert_eq!(outcome.skipped_already_held[0].package, "p");
                 assert!(outcome.rejected_packages.is_empty());
+                assert!(h.jobs.enqueue_calls().is_empty());
             })
         });
-        assert_eq!(
-            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
-            Some(1)
-        );
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
     }
 
     #[test]
@@ -2442,6 +2481,78 @@ mod tests {
         );
         assert_eq!(
             counter_value(&snap, "hort_prefetch_self_service_total", "timeout"),
+            Some(1)
+        );
+    }
+
+    /// Envelope truthfulness across the two "not enqueued" shapes that
+    /// share no visible status distinction from the caller's point of
+    /// view: a held `None`-row and a rejected row. Paired with a
+    /// genuinely absent row to pin that ONLY absence enqueues.
+    #[test]
+    fn mixed_batch_none_row_absent_and_rejected_partition_correctly() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                // p_held_none: a row exists with status None → skip.
+                h.artifacts.seed_package_version_status(
+                    repo_id,
+                    "p_held_none",
+                    vec![("1.0.0".into(), QuarantineStatus::None)],
+                );
+                // p_absent: deliberately no row at all → enqueue.
+                // p_rejected: a row exists with status Rejected → reject.
+                h.artifacts.seed_package_version_status(
+                    repo_id,
+                    "p_rejected",
+                    vec![("1.0.0".into(), QuarantineStatus::Rejected)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(
+                        &key,
+                        vec![
+                            item("p_held_none", Some("1.0.0")),
+                            item("p_absent", Some("1.0.0")),
+                            item("p_rejected", Some("1.0.0")),
+                        ],
+                        &actor,
+                    )
+                    .await
+                    .expect("ok");
+                assert_eq!(
+                    outcome.enqueued_job_ids.len(),
+                    1,
+                    "only the absent row enqueues"
+                );
+                assert_eq!(
+                    outcome.skipped_already_held.len(),
+                    1,
+                    "the None-row classifies held"
+                );
+                assert_eq!(outcome.rejected_packages.len(), 1, "1 rejected");
+                assert_eq!(outcome.failed.len(), 0);
+                assert_eq!(outcome.skipped_already_held[0].package, "p_held_none");
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::ScanRejected
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
             Some(1)
         );
     }
@@ -3184,13 +3295,15 @@ mod tests {
 
     /// Member precedence (ADR 0031 aggregation order): the first-ordered
     /// member's row — even a `QuarantineStatus::None` one — wins
-    /// classification outright over a lower-ordered member's `Released`.
-    /// A naive "first non-empty status wins" implementation would
-    /// incorrectly skip here; the correct implementation enqueues,
-    /// because the higher-priority member's record (a proxy's "known
-    /// upstream, not locally held") is authoritative.
+    /// classification outright over a lower-ordered member's absence. A
+    /// naive "walk until any member has a row, else enqueue" implementation
+    /// might keep walking past the primary's `None`-row looking for a
+    /// "real" status and land on the secondary's absence; the correct
+    /// implementation stops at the first row it finds — a row is content,
+    /// regardless of which member holds it or what its status is — and
+    /// classifies held.
     #[test]
-    fn virtual_member_precedence_first_ordered_member_wins_over_lower_priority_status() {
+    fn virtual_member_precedence_first_ordered_member_none_row_wins_over_lower_priority_absence() {
         let snap = capture(|| {
             Box::pin(async {
                 let vroot = virtual_repo();
@@ -3207,39 +3320,33 @@ mod tests {
                 // Priority order: primary first, secondary second.
                 h.repositories.seed_virtual_member(vroot_id, primary_id);
                 h.repositories.seed_virtual_member(vroot_id, secondary_id);
-                h.mappings.upsert(mapping(primary_id)).await.unwrap();
+                // No upstream mapping seeded on either member: irrelevant
+                // here — the held-check short-circuits before the enqueue
+                // path would need one.
                 // Primary (higher priority) has a row for this version with
-                // status None ("known upstream, not locally held").
+                // status None — ingested content with no quarantine
+                // lifecycle.
                 h.artifacts.seed_package_version_status(
                     primary_id,
                     "p",
                     vec![("1.0.0".into(), QuarantineStatus::None)],
                 );
-                // Secondary (lower priority) has the SAME version as
-                // Released — must NOT override the primary's record.
-                h.artifacts.seed_package_version_status(
-                    secondary_id,
-                    "p",
-                    vec![("1.0.0".into(), QuarantineStatus::Released)],
-                );
+                // Secondary (lower priority) has NO row at all for this
+                // version — deliberately not seeded.
                 let actor = caller_cli_session(&["dev"]);
                 let outcome =
                     h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
                         .await
                         .expect("ok");
-                assert_eq!(
-                    outcome.enqueued_job_ids.len(),
-                    1,
-                    "the primary member's record wins outright; the secondary's Released \
-                     must not retroactively skip the item"
+                assert!(
+                    outcome.enqueued_job_ids.is_empty(),
+                    "the primary member's None-row wins outright; the secondary's absence \
+                     must not retroactively enqueue the item"
                 );
-                assert!(outcome.skipped_already_held.is_empty());
+                assert_eq!(outcome.skipped_already_held.len(), 1);
             })
         });
-        assert_eq!(
-            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
-            Some(1)
-        );
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
     }
 
     /// Complement of the precedence test above: the first-ordered member
