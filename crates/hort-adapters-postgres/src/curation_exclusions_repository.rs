@@ -14,10 +14,12 @@
 //!   time so the projector remains envelope-naive about the moment
 //!   of attribution.
 //!
-//! Both columns are edited in place into the original
-//! `005_policy.sql` `CREATE TABLE` statement (pre-1.0 migration
-//! edit-in-place rule). Existing DBs must be re-migrated when the
-//! file's checksum changes.
+//! Both columns live in the original `005_policy.sql` `CREATE TABLE`
+//! statement, added there while the schema could still be wiped. That
+//! is history, not a pattern to follow: an applied migration must never
+//! be edited — sqlx validates the checksums of applied migrations, so an
+//! edit reaches only fresh installs and stops every migrated database
+//! from booting. Schema changes are new numbered migrations (ADR 0022).
 //!
 //! ## Filters
 //!
