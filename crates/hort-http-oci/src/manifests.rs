@@ -91,6 +91,18 @@ use hort_http_core::context::AppContext;
 /// Docker clients expect for single-image manifests.
 const DEFAULT_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
+/// Ceiling on the CAS re-read that re-derives a coalesced follower's
+/// membership edges (see [`register_follower_membership_edges`]).
+///
+/// Matches the default upstream manifest-body cap
+/// (`HORT_UPSTREAM_MANIFEST_CACHE_MAX_SIZE`, 16 MiB), so every manifest
+/// hort accepted through pull-through under the default configuration
+/// can be re-read here. An operator who raises that cap above this
+/// ceiling does not get an unbounded buffer: the re-read is refused and
+/// the edges are logged as skipped, the same fail-safe posture the rest
+/// of this best-effort registration takes.
+const MANIFEST_PROJECTION_READ_CAP_BYTES: usize = 16 * 1024 * 1024;
+
 /// Serve an OCI manifest by `(repo_key, name, reference)`.
 ///
 /// `reference` is a tag (no `:`) or a digest (`sha256:<hex>`). The
@@ -1468,7 +1480,11 @@ async fn follower_media_type_for_hash(ctx: &Arc<AppContext>, content_hash: &Cont
 /// idempotently registers its OWN per-repo manifest row via
 /// `register_existing_cas_blob` rather than failing closed. Coords are
 /// reconstructed deterministically from `(name, content_hash)` —
-/// `oci_manifest_coords` is exactly what the leader's closure used.
+/// `oci_manifest_coords` is exactly what the leader's closure used, and
+/// [`register_follower_membership_edges`] then gives that row the same
+/// `content_references` membership edges the ingesting leg writes, so a
+/// row minted here is never structurally weaker than one minted by the
+/// leg that fetched the bytes.
 ///
 /// The follower's content_type is resolved via
 /// [`follower_media_type_for_hash`] — the leader's cross-repo row carries
@@ -1530,10 +1546,20 @@ async fn finalise_manifest_pull(
                 )
                 .await
             {
-                Ok(outcome) => UpstreamManifestPullOutcome::Ingested {
-                    hash: outcome.artifact.sha256_checksum.clone(),
-                    artifact: Box::new(outcome.artifact),
-                },
+                Ok(outcome) => {
+                    register_follower_membership_edges(
+                        ctx,
+                        repo,
+                        reference,
+                        outcome.artifact.id,
+                        &media_type,
+                    )
+                    .await;
+                    UpstreamManifestPullOutcome::Ingested {
+                        hash: outcome.artifact.sha256_checksum.clone(),
+                        artifact: Box::new(outcome.artifact),
+                    }
+                }
                 Err(err) => {
                     tracing::error!(
                         repo_key = %repo.key,
@@ -1555,6 +1581,72 @@ async fn finalise_manifest_pull(
                 "OCI upstream manifest: post-coalesce artifact lookup failed"
             );
             UpstreamManifestPullOutcome::Internal
+        }
+    }
+}
+
+/// Register the `content_references` membership edges for a manifest row
+/// that a **coalesced follower** just minted from an already-CAS-resident
+/// hash, re-deriving them from the CAS bytes.
+///
+/// # The invariant this closes
+///
+/// A served manifest's membership edges must exist for EVERY leg that
+/// creates its per-repo row, not only for the leg that fetched it from
+/// upstream. Those edges are what the referenced-tree-descendant
+/// target-check reads, so a row without them silently loses the
+/// descendant carve-out (its constituents get a full observation window
+/// instead of inheriting the parent's) and loses the GC keepalive on
+/// every blob it references.
+///
+/// The pull-through's fetch closure runs at most once per coalescing
+/// window, and that window is keyed by content hash alone — it is
+/// cross-repository by design, so the closure (and with it the leader's
+/// edge registration) runs against the LEADER's repository. Every other
+/// caller in the window is a follower, and a follower whose target
+/// repository differs from the leader's has no row to inherit: it mints
+/// its own via `register_existing_cas_blob`. Without this call that row
+/// is structurally incomplete — the artifact is served 200 and its
+/// membership edges never exist. Registration is idempotent (upsert on
+/// the `content_references` PK), so re-deriving here can only converge
+/// on what the ingesting leg would have written for identical bytes.
+///
+/// **Non-fatal**, exactly like the ingesting leg's own registration: the
+/// row is already committed and the manifest is already serveable by the
+/// time this runs, so a CAS re-read or parse failure is logged and
+/// skipped rather than failing the pull.
+async fn register_follower_membership_edges(
+    ctx: &Arc<AppContext>,
+    repo: &Repository,
+    reference: &str,
+    manifest_artifact_id: Uuid,
+    media_type: &str,
+) {
+    match ctx
+        .artifact_use_case
+        .read_content_for_projection(manifest_artifact_id, MANIFEST_PROJECTION_READ_CAP_BYTES)
+        .await
+    {
+        Ok(manifest_bytes) => {
+            crate::manifests_write::register_membership_edges_from_pull(
+                ctx,
+                repo.id,
+                manifest_artifact_id,
+                media_type,
+                &manifest_bytes,
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo_key = %repo.key,
+                reference = %reference,
+                artifact_id = %manifest_artifact_id,
+                error = %e,
+                "OCI pull-through: CAS re-read for the coalesced follower's membership-edge \
+                 registration failed; edges not registered (non-fatal, the row is committed \
+                 and serveable)"
+            );
         }
     }
 }
@@ -3890,6 +3982,148 @@ mod tests {
         );
         assert_eq!(config_rows[0].source_artifact_id, manifest_artifact_id);
         assert_eq!(layer_rows[0].source_artifact_id, manifest_artifact_id);
+    }
+
+    /// The membership edges of a digest-ref manifest pull must exist for
+    /// EVERY repository whose row the pull creates — not only for the
+    /// one that happened to win the coalescing race.
+    ///
+    /// `try_upstream_manifest_pull_by_digest` keys its single-flight
+    /// window on `DedupKey::blob_by_hash`, which is keyed purely by
+    /// content hash and is therefore CROSS-REPOSITORY: exactly one of
+    /// two concurrent callers asking for the same manifest digest in two
+    /// different repositories runs the fetch closure — and that closure
+    /// is where the edges are registered, against the LEADER's repo. The
+    /// loser lands in `finalise_manifest_pull`'s `Ok(None)` arm (no row
+    /// in its own repo) and mints one via `register_existing_cas_blob`.
+    ///
+    /// Before the follower-side registration existed, that minted row
+    /// was served 200 with NO `oci_config` / `oci_layer` edges at all —
+    /// so its config and layer blobs lost both the
+    /// referenced-tree-descendant carve-out that anchors their
+    /// quarantine window and the GC keepalive those edges provide. The
+    /// assertion below is deliberately race-winner-agnostic (BOTH repos
+    /// must carry both edges), which is what distinguishes the fixed
+    /// behaviour from the broken one no matter which caller wins.
+    #[test]
+    fn cross_repo_coalesced_follower_registers_oci_config_and_layer_edges() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let config_hex = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8";
+        let layer_hex = "6b51d431df5d7f141cbececcf79edf3dd861c3b4069f0b11661a3eefacbba918";
+        let single_image_media = "application/vnd.oci.image.manifest.v1+json";
+        let content = format!(
+            "{{\"schemaVersion\":2,\
+             \"mediaType\":\"{single_image_media}\",\
+             \"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\
+             \"digest\":\"sha256:{config_hex}\",\"size\":0}},\
+             \"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\
+             \"digest\":\"sha256:{layer_hex}\",\"size\":0}}]}}"
+        )
+        .into_bytes();
+        let hex = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let per_repo = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo_a = oci_repo("repo-a");
+            let repo_b = oci_repo("repo-b");
+            mocks.repositories.insert(repo_a.clone());
+            mocks.repositories.insert(repo_b.clone());
+            seed_upstream_mapping(&mocks, repo_a.id);
+            seed_upstream_mapping(&mocks, repo_b.id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: single_image_media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let name = format!("{UP_PREFIX}{UP_NAME}");
+            let accept = vec![single_image_media.to_string()];
+
+            let ctx_a = ctx.clone();
+            let repo_a2 = repo_a.clone();
+            let name_a = name.clone();
+            let ref_a = digest_ref.clone();
+            let accept_a = accept.clone();
+            let h1 = tokio::spawn(async move {
+                try_upstream_manifest_pull(&ctx_a, &repo_a2, &name_a, &ref_a, accept_a).await
+            });
+            let ctx_b = ctx.clone();
+            let repo_b2 = repo_b.clone();
+            let name_b = name.clone();
+            let ref_b = digest_ref.clone();
+            let h2 = tokio::spawn(async move {
+                try_upstream_manifest_pull(&ctx_b, &repo_b2, &name_b, &ref_b, accept).await
+            });
+            let (o1, o2) = (h1.await.unwrap(), h2.await.unwrap());
+            for (label, outcome) in [("repo-a", &o1), ("repo-b", &o2)] {
+                assert!(
+                    matches!(outcome, UpstreamManifestPullOutcome::Ingested { .. }),
+                    "{label}'s digest-ref pull must succeed (leader or follower alike)"
+                );
+            }
+
+            let config_hash: ContentHash = config_hex.parse().unwrap();
+            let layer_hash: ContentHash = layer_hex.parse().unwrap();
+            let mut out = Vec::new();
+            for (label, repo) in [("repo-a", &repo_a), ("repo-b", &repo_b)] {
+                let manifest_id = mocks
+                    .artifacts
+                    .find_by_path(repo.id, &format!("manifests/sha256:{hex}"))
+                    .await
+                    .unwrap()
+                    .expect("each repo gets its own manifest row")
+                    .id;
+                let config_rows = mocks
+                    .content_references
+                    .find_by_target(repo.id, &config_hash, Some("oci_config"))
+                    .await
+                    .unwrap();
+                let layer_rows = mocks
+                    .content_references
+                    .find_by_target(repo.id, &layer_hash, Some("oci_layer"))
+                    .await
+                    .unwrap();
+                out.push((label, manifest_id, config_rows, layer_rows));
+            }
+            out
+        });
+
+        for (label, manifest_id, config_rows, layer_rows) in per_repo {
+            assert_eq!(
+                config_rows.len(),
+                1,
+                "{label} must carry exactly one oci_config edge whether it led the \
+                 cross-repo coalesce or followed it"
+            );
+            assert_eq!(
+                layer_rows.len(),
+                1,
+                "{label} must carry exactly one oci_layer edge whether it led the \
+                 cross-repo coalesce or followed it"
+            );
+            assert_eq!(
+                config_rows[0].source_artifact_id, manifest_id,
+                "{label}'s oci_config edge must be sourced from ITS OWN manifest row, \
+                 not the leader's"
+            );
+            assert_eq!(
+                layer_rows[0].source_artifact_id, manifest_id,
+                "{label}'s oci_layer edge must be sourced from ITS OWN manifest row, \
+                 not the leader's"
+            );
+        }
     }
 
     /// Manifest pull-through threads `ManifestFetch.last_modified`
