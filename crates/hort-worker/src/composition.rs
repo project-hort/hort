@@ -44,6 +44,7 @@ use hort_adapters_postgres::artifact_repo::PgArtifactRepository;
 // `SeedImportUseCase` depends on `IngestUseCase` which depends on the
 // curation-rule projection (the pre-storage gate). Same adapter
 // `hort-server` wires (`build_app_context`).
+use hort_adapters_postgres::content_first_seen::PgContentFirstSeen;
 use hort_adapters_postgres::curation_rule_repo::PgCurationRuleRepository;
 use hort_adapters_postgres::event_chain_head_reader::PgEventChainHeadReader;
 use hort_adapters_postgres::event_store::PgEventStore;
@@ -103,6 +104,7 @@ use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::content_first_seen::ContentFirstSeenPort;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 // IngestUseCase's pre-storage curation gate port.
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
@@ -298,6 +300,13 @@ pub async fn build_app_context(
 
     let content_references: Arc<dyn ContentReferenceIndex> =
         Arc::new(PgContentReferenceRepo::new(pool.clone()));
+
+    // Content-level `first_seen_at` age projection (ADR 0054). The
+    // worker's `IngestUseCase` serves seed-import and prefetch ingests,
+    // which mint artifacts exactly as the server's does and so must
+    // contribute the same observations.
+    let content_first_seen: Arc<dyn ContentFirstSeenPort> =
+        Arc::new(PgContentFirstSeen::new(pool.clone()));
 
     let jobs: Arc<dyn JobsRepository> = Arc::new(PgJobsRepository::new(pool.clone()));
 
@@ -993,6 +1002,7 @@ pub async fn build_app_context(
         // `hort-server` default (10 MB); inert on the seed-import path.
         10 * 1024 * 1024,
         content_references.clone(),
+        content_first_seen.clone(),
         policy_projections.clone(),
         jobs.clone(),
     ));
