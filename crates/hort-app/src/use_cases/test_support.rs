@@ -119,6 +119,10 @@ pub struct MockArtifactRepository {
     /// candidates" (used to model the NOT-EXISTS exclusion the SQL
     /// adapter enforces against `content_references`).
     pypi_wheels_without_kind_filter: Mutex<Option<std::collections::HashSet<Uuid>>>,
+    /// Allowlist for
+    /// [`find_oci_image_manifests_without_kind`](ArtifactRepository::find_oci_image_manifests_without_kind).
+    /// Mirrors [`Self::pypi_wheels_without_kind_filter`] one-for-one.
+    oci_image_manifests_without_kind_filter: Mutex<Option<std::collections::HashSet<Uuid>>>,
 }
 
 impl MockArtifactRepository {
@@ -128,6 +132,7 @@ impl MockArtifactRepository {
             rejected_policy_filter: Mutex::new(HashMap::new()),
             active_policy_filter: Mutex::new(HashMap::new()),
             pypi_wheels_without_kind_filter: Mutex::new(None),
+            oci_image_manifests_without_kind_filter: Mutex::new(None),
         }
     }
 
@@ -143,6 +148,21 @@ impl MockArtifactRepository {
         allowed: Option<std::collections::HashSet<Uuid>>,
     ) {
         *self.pypi_wheels_without_kind_filter.lock().unwrap() = allowed;
+    }
+
+    /// Pin the allowlist that
+    /// [`ArtifactRepository::find_oci_image_manifests_without_kind`]
+    /// returns. `None` (the default) returns every OCI manifest-shaped
+    /// artifact; `Some(set)` restricts to ids in the set — used by
+    /// `OciMembershipEdgeBackfillHandler` tests to model "these manifests
+    /// have no `oci_config` ContentReference" against a separately-seeded
+    /// [`MockContentReferenceIndex`]. Mirrors
+    /// [`Self::set_pypi_wheels_without_kind_filter`].
+    pub fn set_oci_image_manifests_without_kind_filter(
+        &self,
+        allowed: Option<std::collections::HashSet<Uuid>>,
+    ) {
+        *self.oci_image_manifests_without_kind_filter.lock().unwrap() = allowed;
     }
 
     pub fn insert(&self, artifact: Artifact) {
@@ -685,6 +705,43 @@ impl ArtifactRepository for MockArtifactRepository {
             .collect();
         // Stable order for test assertions — sort by id so repeated
         // invocations on the same seeded state return the same prefix.
+        items.sort_by_key(|a| a.id);
+        items.truncate(limit as usize);
+        Box::pin(async move { Ok(items) })
+    }
+
+    /// Mock for the OCI membership-edge-backfill candidacy query. Mirrors
+    /// [`Self::find_pypi_wheels_without_kind`]'s shape: the SQL adapter's
+    /// `path LIKE '%.whl'` becomes `path LIKE 'manifests/sha256:%'`, and
+    /// the media-type / index-exclusion join has no mock-side equivalent
+    /// (this mock has no `artifact_metadata` table) — tests that need to
+    /// model an index-shaped row simply do not insert it as a candidate
+    /// via [`Self::set_oci_image_manifests_without_kind_filter`].
+    fn find_oci_image_manifests_without_kind(
+        &self,
+        _kind: &str,
+        limit: u32,
+    ) -> BoxFut<'_, DomainResult<Vec<Artifact>>> {
+        let filter = self
+            .oci_image_manifests_without_kind_filter
+            .lock()
+            .unwrap()
+            .clone();
+        let mut items: Vec<Artifact> = self
+            .artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| {
+                a.path.starts_with("manifests/sha256:")
+                    && !a.is_deleted
+                    && match &filter {
+                        None => true,
+                        Some(allowed) => allowed.contains(&a.id),
+                    }
+            })
+            .cloned()
+            .collect();
         items.sort_by_key(|a| a.id);
         items.truncate(limit as usize);
         Box::pin(async move { Ok(items) })
@@ -3486,6 +3543,12 @@ pub struct StubFormatHandler {
     /// hook tests override via [`WheelMetadataStubBehaviour`] to drive
     /// every branch of the post-`ArtifactIngested` extraction hook.
     pub wheel_metadata: Option<WheelMetadataStubBehaviour>,
+    /// Canned return value for `extract_oci_manifest_blob_refs`. When
+    /// `None` the trait default (`Ok(Vec::new())`) is preserved;
+    /// `OciMembershipEdgeBackfillHandler` tests override via
+    /// [`OciMembershipEdgesStubBehaviour`] to drive every branch of the
+    /// per-manifest repair sequence.
+    pub oci_membership_edges: Option<OciMembershipEdgesStubBehaviour>,
     /// Spec 075 — when `true`, `collision_key` returns the cargo-style fold
     /// (`Some(lower + _→-)`) so the `ingest_direct` registration-collision
     /// gate engages; when `false` (default) it inherits the trait default
@@ -3522,6 +3585,21 @@ pub enum WheelMetadataStubBehaviour {
     Validation(&'static str),
 }
 
+/// Canned response shapes for the
+/// [`StubFormatHandler`]'s `extract_oci_manifest_blob_refs` override.
+/// Mirrors [`WheelMetadataStubBehaviour`]'s shape for the
+/// `oci-membership-edge-backfill` handler tests.
+#[derive(Debug, Clone)]
+pub enum OciMembershipEdgesStubBehaviour {
+    /// Return `Ok(refs)` — happy path (possibly empty, e.g. a
+    /// config-only manifest with zero layers).
+    Edges(Vec<hort_domain::oci::ManifestBlobRef>),
+    /// Return `Err(DomainError::Validation(reason))` — the manifest bytes
+    /// did not parse (corrupt CAS content, or an index that slipped past
+    /// the candidacy filter).
+    Validation(&'static str),
+}
+
 impl StubFormatHandler {
     /// Build a stub with default `max_bytes = 64 KB` (matches the trait
     /// default). Callers that need a specific cap set the field directly.
@@ -3534,6 +3612,7 @@ impl StubFormatHandler {
             summary: None,
             group_membership: None,
             wheel_metadata: None,
+            oci_membership_edges: None,
             collision_fold: false,
         }
     }
@@ -3593,6 +3672,14 @@ impl StubFormatHandler {
         self.wheel_metadata = Some(behaviour);
         self
     }
+
+    /// Pin the canned response shape for
+    /// [`FormatHandler::extract_oci_manifest_blob_refs`]. See
+    /// [`OciMembershipEdgesStubBehaviour`] for the per-variant semantics.
+    pub fn with_oci_membership_edges(mut self, behaviour: OciMembershipEdgesStubBehaviour) -> Self {
+        self.oci_membership_edges = Some(behaviour);
+        self
+    }
 }
 
 impl FormatHandler for StubFormatHandler {
@@ -3645,6 +3732,19 @@ impl FormatHandler for StubFormatHandler {
             }
             Some(WheelMetadataStubBehaviour::None) => Ok(None),
             Some(WheelMetadataStubBehaviour::Validation(reason)) => {
+                Err(DomainError::Validation((*reason).to_string()))
+            }
+        }
+    }
+    fn extract_oci_manifest_blob_refs(
+        &self,
+        _coords: &ArtifactCoords,
+        _content: &mut dyn std::io::Read,
+    ) -> DomainResult<Vec<hort_domain::oci::ManifestBlobRef>> {
+        match &self.oci_membership_edges {
+            None => Ok(Vec::new()),
+            Some(OciMembershipEdgesStubBehaviour::Edges(refs)) => Ok(refs.clone()),
+            Some(OciMembershipEdgesStubBehaviour::Validation(reason)) => {
                 Err(DomainError::Validation((*reason).to_string()))
             }
         }

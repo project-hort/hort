@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OCI membership-edge backfill.** The `oci-membership-edge-backfill`
+  admin task repairs OCI image-manifest rows ingested before the
+  pull-through path registered their `content_references` config/layer
+  edges, restoring GC keepalive for blobs referenced only by such a row.
+  One-shot, manually invoked, idempotent; reports rows scanned/repaired,
+  edges written, and skips by reason. (#162)
+
 - **Curator-invokable per-artifact re-evaluation.**
   `POST /api/v1/admin/curation/quarantine/:artifact_id/reevaluate` and
   `hort-cli curation reevaluate <artifact-id>` let a curator recompute a

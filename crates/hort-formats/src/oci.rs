@@ -1,9 +1,20 @@
 // OCI manifest streaming projector (see ADR 0026).
 pub mod projection;
 
+use std::io::Read;
+
 use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::oci::ManifestBlobRef;
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership};
 use hort_domain::types::ArtifactCoords;
+
+/// Upper bound on the manifest bytes [`OciFormatHandler::extract_oci_manifest_blob_refs`]
+/// reads from the caller's stream before parsing. Mirrors the write path's
+/// `MANIFEST_BODY_MAX_BYTES` (`hort-http-oci::manifests_write`) — every
+/// manifest already in CAS passed that same cap at ingest (push or
+/// pull-through), so this is defence-in-depth against a corrupted stored
+/// row, not a limit real manifests ever approach.
+const MANIFEST_BLOB_REFS_MAX_BYTES: u64 = 1024 * 1024;
 
 /// OCI format handler.
 ///
@@ -73,6 +84,24 @@ impl FormatHandler for OciFormatHandler {
     /// which stays at its default `None` (see ADR 0006 §9).
     fn protocol_native_integrity(&self) -> bool {
         true
+    }
+
+    /// Reads `content` under [`MANIFEST_BLOB_REFS_MAX_BYTES`] and delegates
+    /// the parse to [`hort_domain::oci::manifest_blob_refs`] — the pure
+    /// domain helper is the single source of truth for the single-image
+    /// manifest shape, shared with the provenance cascade's
+    /// `manifest_blob_digests`.
+    fn extract_oci_manifest_blob_refs(
+        &self,
+        _coords: &ArtifactCoords,
+        content: &mut dyn Read,
+    ) -> DomainResult<Vec<ManifestBlobRef>> {
+        let mut buf = Vec::new();
+        content
+            .take(MANIFEST_BLOB_REFS_MAX_BYTES)
+            .read_to_end(&mut buf)
+            .map_err(|e| DomainError::Invariant(format!("manifest re-read failed: {e}")))?;
+        hort_domain::oci::manifest_blob_refs(&buf)
     }
 }
 
@@ -176,5 +205,76 @@ mod tests {
     #[test]
     fn does_not_implement_version_discovery() {
         assert!(handler().version_discovery().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // extract_oci_manifest_blob_refs (oci-membership-edge-backfill)
+    // ------------------------------------------------------------------
+
+    fn manifest_coords() -> ArtifactCoords {
+        ArtifactCoords {
+            name: "library/nginx".into(),
+            name_as_published: "library/nginx".into(),
+            version: None,
+            path: "manifests/sha256:abc".into(),
+            format: RepositoryFormat::Oci,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn extract_oci_manifest_blob_refs_parses_config_and_layers() {
+        let hc = "c".repeat(64);
+        let ha = "a".repeat(64);
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": format!("sha256:{hc}") },
+            "layers": [ { "digest": format!("sha256:{ha}") } ],
+        })
+        .to_string();
+        let mut reader = body.as_bytes();
+        let refs = handler()
+            .extract_oci_manifest_blob_refs(&manifest_coords(), &mut reader)
+            .expect("valid manifest parses");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].role, hort_domain::oci::ManifestBlobRole::Config);
+        assert_eq!(refs[0].hash.as_ref(), hc.as_str());
+        assert_eq!(refs[1].role, hort_domain::oci::ManifestBlobRole::Layer);
+        assert_eq!(refs[1].hash.as_ref(), ha.as_str());
+    }
+
+    #[test]
+    fn extract_oci_manifest_blob_refs_rejects_malformed_json() {
+        let mut reader: &[u8] = b"not json";
+        let err = handler()
+            .extract_oci_manifest_blob_refs(&manifest_coords(), &mut reader)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn extract_oci_manifest_blob_refs_bounds_the_read() {
+        // A body larger than the cap must not be fully buffered — the
+        // truncated (and therefore invalid) JSON surfaces as a
+        // Validation error, never an unbounded read.
+        let oversized = vec![b'a'; (MANIFEST_BLOB_REFS_MAX_BYTES as usize) + 1024];
+        let mut reader: &[u8] = &oversized;
+        let err = handler()
+            .extract_oci_manifest_blob_refs(&manifest_coords(), &mut reader)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    /// Every non-OCI-shaped call still parses through the trait's
+    /// default-free OCI override (OCI is the only implementer that
+    /// overrides this method) — an empty manifest (an index, or a
+    /// config-less/layer-less object) yields `Ok(vec![])`, not an error.
+    #[test]
+    fn extract_oci_manifest_blob_refs_empty_object_is_empty() {
+        let mut reader: &[u8] = b"{}";
+        let refs = handler()
+            .extract_oci_manifest_blob_refs(&manifest_coords(), &mut reader)
+            .expect("empty object is a valid (empty) manifest");
+        assert!(refs.is_empty());
     }
 }

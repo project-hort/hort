@@ -141,17 +141,19 @@ async fn migration_009_creates_jobs_table_with_all_kinds() {
     );
 
     // Insert one row per v1 kind. Every kind must succeed under
-    // `status='pending'`. Hyphen-separated literals are the spec. The full
-    // allow-list is defined inline in 009's `jobs.kind` CHECK; pre-1.0 a
-    // new kind is added to that IN-list in place (ADR 0022). This test is
-    // the SQL-CHECK side of the `EVENT_TASK_KINDS` lock-step (the full
-    // CHECK mirror); the DB-free structural guard pinning the two in
-    // lock-step is `task_kind_check_lockstep_guard.rs`. The narrower
+    // `status='pending'`. Hyphen-separated literals are the spec. The
+    // allow-list below is 009's own inline `jobs.kind` CHECK — the set a
+    // fresh install starts from. It is deliberately NOT the full accepted
+    // set: the pool this test runs against has applied the whole chain,
+    // and a later migration can redefine the constraint over a superset
+    // (kinds added after 009 reach an already-migrated database only that
+    // way — see `018_jobs_kind_oci_edge_backfill.sql`). Those later kinds
+    // are proved by their own DB-gated enqueue tests; the DB-free
+    // structural guard pinning the effective list against
+    // `EVENT_TASK_KINDS` is `task_kind_check_lockstep_guard.rs`. The narrower
     // admin-invoke side is `crates/hort-server/tests/task_use_case_enqueue_real_db.rs`
     // (which walks `ADMIN_INVOKABLE_TASK_KINDS` directly through the real
     // use case → adapter → DB path — a strict subset of the kinds below).
-    // The in-place-edited 009 file IS the source of truth and this
-    // fixture follows it.
     let all_kinds = [
         // Written only by `enqueue_scan` (which supplies the scan-typed
         // columns), so it is intentionally absent from

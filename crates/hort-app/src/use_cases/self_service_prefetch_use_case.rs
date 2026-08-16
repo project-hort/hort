@@ -2719,6 +2719,16 @@ mod tests {
         > {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn find_oci_image_manifests_without_kind(
+            &self,
+            _k: &str,
+            _l: u32,
+        ) -> hort_domain::ports::BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<Vec<hort_domain::entities::artifact::Artifact>>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[test]

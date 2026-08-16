@@ -348,6 +348,51 @@ pub trait ArtifactRepository: Send + Sync {
         kind: &str,
         limit: u32,
     ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>>;
+
+    /// Find OCI **single-image manifest** artifacts (`path LIKE
+    /// 'manifests/sha256:%'`) that have no `content_references` row of the
+    /// given `kind` (in practice `"oci_config"`), bounded by `limit`.
+    /// Mirrors [`Self::find_pypi_wheels_without_kind`]'s shape and posture
+    /// one-for-one — same candidacy-query contract, same resumability, same
+    /// consumer (an admin-task backfill: `oci-membership-edge-backfill`
+    /// here vs. `wheel-metadata-backfill` there).
+    ///
+    /// **Image manifests only — an index must never be returned.** An OCI
+    /// image index legitimately carries no `config`/`layers` (it carries
+    /// `oci_index_member` children instead), so it would always match the
+    /// NOT-EXISTS-`oci_config` predicate despite having nothing to repair.
+    /// The adapter discriminates on the manifest's stored media type
+    /// (`artifact_metadata.metadata->>'oci_media_type'`, the same field the
+    /// OCI read path resolves via `resolve_media_type` —
+    /// `hort-http-oci::manifests::resolve_media_type`): a row whose stored
+    /// media type is one of the two index types
+    /// ([`crate::oci::OCI_IMAGE_INDEX_MEDIA_TYPE`] /
+    /// [`crate::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE`]) is excluded. A row
+    /// with **no** `artifact_metadata` row, or one whose `oci_media_type`
+    /// field is absent, is treated as an image manifest — this mirrors
+    /// `resolve_media_type`'s own fallback (`DEFAULT_MEDIA_TYPE`, the
+    /// single-image type) for exactly the pre-metadata-migration rows this
+    /// backfill exists to repair.
+    ///
+    /// SQL contract: `SELECT … FROM artifacts WHERE path LIKE
+    /// 'manifests/sha256:%' AND is_deleted = false AND NOT EXISTS (SELECT 1
+    /// FROM content_references WHERE source_artifact_id = artifacts.id AND
+    /// kind = $1) AND NOT EXISTS (SELECT 1 FROM artifact_metadata WHERE
+    /// artifact_id = artifacts.id AND metadata->>'oci_media_type' IN
+    /// (<index media types>)) ORDER BY id LIMIT $2`.
+    ///
+    /// **Resumable by construction** — stateless candidacy query, no
+    /// cursor. A failed batch leaves the candidate set unchanged; the next
+    /// invocation re-derives the same work minus whatever the previous run
+    /// completed. Idempotent for the same reason
+    /// [`Self::find_pypi_wheels_without_kind`] is: the upsert-on-PK
+    /// semantics of `ContentReferenceIndex::insert` absorb duplicate work
+    /// from overlapping runs.
+    fn find_oci_image_manifests_without_kind(
+        &self,
+        kind: &str,
+        limit: u32,
+    ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>>;
 }
 
 #[cfg(test)]
@@ -480,6 +525,13 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
                 Box::pin(async { Ok(Vec::new()) })
             }
+            fn find_oci_image_manifests_without_kind(
+                &self,
+                _kind: &str,
+                _limit: u32,
+            ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
         }
         let stub: Arc<dyn ArtifactRepository> = Arc::new(Stub);
         let fut = stub.package_version_status(Uuid::nil(), "left-pad");
@@ -600,9 +652,135 @@ mod tests {
                 assert!(limit <= 1_000, "handler-side cap is 1000");
                 Box::pin(async { Ok(Vec::new()) })
             }
+            fn find_oci_image_manifests_without_kind(
+                &self,
+                _kind: &str,
+                _limit: u32,
+            ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
         }
         let stub: Arc<dyn ArtifactRepository> = Arc::new(Stub);
         let fut = stub.find_pypi_wheels_without_kind("wheel_metadata", 100);
+        let result = futures::executor::block_on(fut).expect("stub returns Ok");
+        assert!(result.is_empty());
+    }
+
+    /// The `find_oci_image_manifests_without_kind` method exists on the
+    /// trait with the documented shape: `(kind: &str, limit: u32) ->
+    /// BoxFuture<DomainResult<Vec<Artifact>>>`. Shape-pin guards against a
+    /// rename/retype that would silently break the
+    /// `oci-membership-edge-backfill` task handler — mirrors
+    /// `find_pypi_wheels_without_kind_has_documented_shape` above.
+    #[test]
+    fn find_oci_image_manifests_without_kind_has_documented_shape() {
+        use std::sync::Arc;
+        struct Stub;
+        impl ArtifactRepository for Stub {
+            fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
+                unimplemented!()
+            }
+            fn find_by_checksum(
+                &self,
+                _sha256: &ContentHash,
+            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn find_by_repo_and_checksum(
+                &self,
+                _r: Uuid,
+                _s: &ContentHash,
+            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn list_by_repository(
+                &self,
+                _r: Uuid,
+                _p: PageRequest,
+            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+                Box::pin(async { Ok(Page::empty()) })
+            }
+            fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn find_by_path(
+                &self,
+                _r: Uuid,
+                _p: &str,
+            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn list_distinct_names(
+                &self,
+                _r: Uuid,
+                _p: PageRequest,
+            ) -> BoxFuture<'_, DomainResult<Page<String>>> {
+                Box::pin(async { Ok(Page::empty()) })
+            }
+            fn find_by_name_in_repo(
+                &self,
+                _r: Uuid,
+                _n: &str,
+                _p: PageRequest,
+            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+                Box::pin(async { Ok(Page::empty()) })
+            }
+            fn find_by_name_as_published(
+                &self,
+                _r: Uuid,
+                _n: &str,
+                _p: PageRequest,
+            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+                Box::pin(async { Ok(Page::empty()) })
+            }
+            fn list_active_for_repo(
+                &self,
+                _r: Uuid,
+            ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
+                Box::pin(async { Ok(LimitedList::empty()) })
+            }
+            fn list_rejected_for_policy(
+                &self,
+                _p: Uuid,
+            ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
+                Box::pin(async { Ok(LimitedList::empty()) })
+            }
+            fn list_active_for_policy(
+                &self,
+                _p: Uuid,
+                _page: PageRequest,
+            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+                Box::pin(async { Ok(Page::empty()) })
+            }
+            fn package_version_status(
+                &self,
+                _r: Uuid,
+                _p: &str,
+            ) -> BoxFuture<'_, DomainResult<Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)>>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn find_pypi_wheels_without_kind(
+                &self,
+                _kind: &str,
+                _limit: u32,
+            ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn find_oci_image_manifests_without_kind(
+                &self,
+                kind: &str,
+                limit: u32,
+            ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+                // Pin the input shape: the stub accepts the documented
+                // kind/limit without panicking.
+                assert_eq!(kind, "oci_config");
+                assert!(limit <= 1_000, "handler-side cap is 1000");
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+        let stub: Arc<dyn ArtifactRepository> = Arc::new(Stub);
+        let fut = stub.find_oci_image_manifests_without_kind("oci_config", 100);
         let result = futures::executor::block_on(fut).expect("stub returns Ok");
         assert!(result.is_empty());
     }

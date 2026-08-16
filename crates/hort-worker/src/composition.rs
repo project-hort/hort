@@ -76,12 +76,12 @@ use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
     AdvisoryWatchTickHandler, CronRescanTickHandler, EventStoreArchiveHandler,
-    EventstoreCheckpointHandler, NoopTaskHandler, PrefetchDependenciesHandler,
-    PrefetchIngestHandler, PrefetchRowRetentionSweepHandler, PrefetchTickHandler,
-    ProvenanceVerifyHandler, QuarantineReleaseSweepHandler, ReplaySeenPruneHandler,
-    RetentionEvaluateHandler, RetentionPurgeHandler, ScanTaskHandler, ScannerRegistryPruneHandler,
-    SeedImportHandler, ServiceAccountRotationHandler, StagingSweepHandler,
-    WheelMetadataBackfillHandler,
+    EventstoreCheckpointHandler, NoopTaskHandler, OciMembershipEdgeBackfillHandler,
+    PrefetchDependenciesHandler, PrefetchIngestHandler, PrefetchRowRetentionSweepHandler,
+    PrefetchTickHandler, ProvenanceVerifyHandler, QuarantineReleaseSweepHandler,
+    ReplaySeenPruneHandler, RetentionEvaluateHandler, RetentionPurgeHandler, ScanTaskHandler,
+    ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
+    StagingSweepHandler, WheelMetadataBackfillHandler,
 };
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
 // IngestUseCase + ArtifactGroupUseCase are the dep subtree the worker
@@ -863,6 +863,48 @@ pub async fn build_app_context(
             content_references.clone(),
             storage.clone(),
             pypi_handler_for_backfill,
+        )),
+        1, // single-active — see rationale above
+    );
+
+    // -----------------------------------------------------------------
+    // 12.e.quater Register the OciMembershipEdgeBackfillHandler (kind
+    //             `oci-membership-edge-backfill`).
+    //
+    //             One-shot retrofit for OCI single-image manifest rows
+    //             minted before the write path registered
+    //             `content_references` membership edges on every
+    //             manifest PUT/pull-through. Walks
+    //             `artifacts.path LIKE 'manifests/sha256:%'` (image-
+    //             typed only) with no `oci_config` row; per row: stream
+    //             the manifest from CAS → invoke
+    //             `extract_oci_manifest_blob_refs` → insert the missing
+    //             `oci_config`/`oci_layer` edges. Resumable by
+    //             construction.
+    //
+    //             Unconditional registration: the handler only needs
+    //             ports already wired (artifacts, storage,
+    //             content_references, OCI FormatHandler). No CronJob —
+    //             deliberately (see the handler's module doc); manual
+    //             admin-tasks invocation only.
+    //
+    //             Concurrency = 1 — single-active. Mirrors
+    //             `wheel-metadata-backfill` posture.
+    // -----------------------------------------------------------------
+    let oci_handler_for_backfill: Arc<dyn FormatHandler> = handlers
+        .get("oci")
+        .expect(
+            "hort-worker composition: `oci` FormatHandler must be registered for \
+             OciMembershipEdgeBackfillHandler (it is the only format that produces \
+             OCI manifest membership edges)",
+        )
+        .clone();
+    dispatcher.register(
+        Arc::new(OciMembershipEdgeBackfillHandler::new(
+            artifacts.clone(),
+            content_references.clone(),
+            storage.clone(),
+            oci_handler_for_backfill,
         )),
         1, // single-active — see rationale above
     );

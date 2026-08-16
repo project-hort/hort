@@ -1122,6 +1122,13 @@ mod tests {
                 ))
             })
         }
+        fn find_oci_image_manifests_without_kind(
+            &self,
+            _kind: &str,
+            _limit: u32,
+        ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::artifact::Artifact>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[tokio::test]

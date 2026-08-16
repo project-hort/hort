@@ -75,6 +75,12 @@ pub mod prefetch_row_retention_sweep;
 // ships default-enabled.
 pub mod scanner_registry_prune;
 pub mod staging_sweep;
+// OCI membership-edge backfill (kind
+// `oci-membership-edge-backfill`). One-shot retrofit: walks OCI
+// single-image manifest rows without an `oci_config` ContentReference
+// and re-derives + writes the missing membership edges. No CronJob —
+// see the module doc for why. Manual admin-tasks invocation only.
+pub mod oci_membership_edge_backfill;
 // PEP 658 wheel-metadata backfill (kind
 // `wheel-metadata-backfill`). Operator-opt-in retrofit: walks PyPI
 // wheels without a `wheel_metadata` ContentReference and runs the
@@ -90,6 +96,7 @@ pub use eventstore_checkpoint::{
     CheckpointEmissionHook, CheckpointEmitterHookAdapter, EventstoreCheckpointHandler,
 };
 pub use noop::NoopTaskHandler;
+pub use oci_membership_edge_backfill::OciMembershipEdgeBackfillHandler;
 pub use policy_reevaluation::PolicyReEvaluationHandler;
 pub use prefetch_dependencies::{target_key as prefetch_target_key, PrefetchDependenciesHandler};
 pub use prefetch_ingest::PrefetchIngestHandler;

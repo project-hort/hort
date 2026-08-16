@@ -639,6 +639,67 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
+    fn find_oci_image_manifests_without_kind(
+        &self,
+        kind: &str,
+        limit: u32,
+    ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+        let kind = kind.to_owned();
+        let limit = limit as i64;
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %kind,
+                %limit,
+                "find_oci_image_manifests_without_kind"
+            );
+            // Backfill candidacy. Manifest-shaped rows only (`path LIKE
+            // 'manifests/sha256:%'`, the coords convention
+            // `hort-http-oci::coords` writes) AND no `content_references`
+            // row of the given kind (in practice `oci_config`) AND NOT an
+            // image index — discriminated on the stored media type
+            // (`artifact_metadata.metadata->>'oci_media_type'`, mirroring
+            // `hort-http-oci::manifests::resolve_media_type`'s read). A
+            // row with no `artifact_metadata` row at all, or one whose
+            // `oci_media_type` field is absent, is NOT excluded — that
+            // mirrors `resolve_media_type`'s own fallback to the
+            // single-image default and is exactly the pre-metadata-
+            // migration shape this backfill targets.
+            let sql = format!(
+                "SELECT {SELECT_COLS} FROM artifacts \
+                 WHERE path LIKE 'manifests/sha256:%' \
+                   AND is_deleted = false \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM content_references \
+                       WHERE source_artifact_id = artifacts.id \
+                         AND kind = $1 \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM artifact_metadata \
+                       WHERE artifact_id = artifacts.id \
+                         AND metadata->>'oci_media_type' IN ($3, $4) \
+                   ) \
+                 ORDER BY id \
+                 LIMIT $2"
+            );
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
+                .bind(&kind)
+                .bind(limit)
+                .bind(hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE)
+                .bind(hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "Artifact", "find_oci_image_manifests_without_kind")
+                })?;
+            let items: Vec<Artifact> = rows
+                .into_iter()
+                .map(Artifact::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(items)
+        })
+    }
+
     fn list_rejected_for_policy(
         &self,
         policy_id: Uuid,
@@ -2030,6 +2091,285 @@ mod tests {
             got_ids,
             [live].into_iter().collect(),
             "soft-deleted wheel MUST be excluded — got {got_ids:?}"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    // ---------------------------------------------------------------------
+    // find_oci_image_manifests_without_kind PG SQL pin
+    // ---------------------------------------------------------------------
+
+    /// Seed an `artifact_metadata` row carrying `oci_media_type` in its
+    /// JSONB `metadata` column, for the media-type-discrimination tests
+    /// below. Mirrors the shape `hort-http-oci`'s manifest write path
+    /// stores it in.
+    async fn seed_oci_media_type(pool: &PgPool, artifact_id: Uuid, media_type: &str) {
+        sqlx::query(
+            r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
+               VALUES ($1, 'oci', jsonb_build_object('oci_media_type', $2::text))"#,
+        )
+        .bind(artifact_id)
+        .bind(media_type)
+        .execute(pool)
+        .await
+        .expect("seed artifact_metadata oci_media_type");
+    }
+
+    /// Insert an `oci_config` ContentReference row pointing the given
+    /// source artifact at an arbitrary content hash — models "this
+    /// manifest has already been repaired."
+    async fn seed_oci_config_ref(
+        pool: &PgPool,
+        repo_id: Uuid,
+        source_artifact_id: Uuid,
+        seed: usize,
+    ) {
+        let target_hash = deterministic_hex64(seed ^ 0xFACE_FEED_usize);
+        sqlx::query(
+            r#"INSERT INTO content_references (
+                   repository_id, source_artifact_id, target_content_hash,
+                   kind, metadata, recorded_at
+               ) VALUES (
+                   $1, $2, $3, 'oci_config', '{}'::jsonb, now()
+               )"#,
+        )
+        .bind(repo_id)
+        .bind(source_artifact_id)
+        .bind(&target_hash)
+        .execute(pool)
+        .await
+        .expect("seed oci_config content_reference");
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_returns_empty_when_no_manifests_exist() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        assert!(got.is_empty(), "no manifests seeded → empty candidate set");
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Mixed seed: an un-backfilled image manifest (candidate), a manifest
+    /// that already has an `oci_config` row (NOT a candidate — NOT EXISTS
+    /// prunes it), and a blob row under `blobs/sha256:…` (path filter
+    /// excludes it regardless of content_references). The query MUST
+    /// return exactly the one un-backfilled image manifest.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_excludes_repaired_and_blobs() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let candidate = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
+            400,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            candidate,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .await;
+
+        let repaired = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:bbbb000000000000000000000000000000000000000000000000000000000000",
+            401,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            repaired,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .await;
+        seed_oci_config_ref(&pool, repo, repaired, 401).await;
+
+        let _blob = seed_artifact_at_path(
+            &pool,
+            repo,
+            "blobs/sha256:cccc000000000000000000000000000000000000000000000000000000000000",
+            402,
+        )
+        .await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
+        assert_eq!(
+            got_ids,
+            [candidate].into_iter().collect(),
+            "candidate set MUST be exactly the un-repaired image manifest: {got_ids:?}"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// An image index (`oci_media_type` = the index or manifest-list
+    /// media type) MUST NEVER be returned — it legitimately has no
+    /// `config`/`layers` edges (it carries `oci_index_member` children
+    /// instead), so it would otherwise always match NOT EXISTS
+    /// `oci_config` despite having nothing to repair.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_excludes_indexes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let index_artifact = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:dddd000000000000000000000000000000000000000000000000000000000000",
+            410,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            index_artifact,
+            hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        )
+        .await;
+
+        let docker_list_artifact = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:eeee000000000000000000000000000000000000000000000000000000000000",
+            411,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            docker_list_artifact,
+            hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE,
+        )
+        .await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        assert!(
+            got.is_empty(),
+            "both index-shaped manifests must be excluded, got {got:?}"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// A manifest row with NO `artifact_metadata` row at all (the
+    /// pre-metadata-migration shape this backfill exists for) is treated
+    /// as an image manifest — mirroring `resolve_media_type`'s own
+    /// fallback to the single-image default — and MUST be returned.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_includes_rows_with_no_metadata_row() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let legacy = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:ffff000000000000000000000000000000000000000000000000000000000000",
+            420,
+        )
+        .await;
+        // Deliberately no `seed_oci_media_type` call — models a row that
+        // predates the metadata-write path entirely.
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
+        assert_eq!(
+            got_ids,
+            [legacy].into_iter().collect(),
+            "a manifest with no artifact_metadata row must be treated as an image manifest"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `limit` is honoured — mirrors `find_pypi_wheels_without_kind_honours_limit`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_honours_limit() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        for seed in 430..435 {
+            let hex = deterministic_hex64(seed);
+            let _ =
+                seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{hex}"), seed).await;
+        }
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 3)
+            .await
+            .expect("query");
+        assert_eq!(got.len(), 3, "LIMIT 3 must yield exactly 3 candidates");
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Soft-deleted manifests are excluded — mirrors
+    /// `find_pypi_wheels_without_kind_excludes_soft_deleted_wheels`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_excludes_soft_deleted() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let live_hex = deterministic_hex64(440);
+        let live =
+            seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{live_hex}"), 440).await;
+        let dead_hex = deterministic_hex64(441);
+        let deleted =
+            seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{dead_hex}"), 441).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .expect("soft-delete update");
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
+        assert_eq!(
+            got_ids,
+            [live].into_iter().collect(),
+            "soft-deleted manifest MUST be excluded — got {got_ids:?}"
         );
 
         cleanup_repo(&pool, repo).await;

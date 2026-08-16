@@ -314,13 +314,9 @@ impl RepositoryUpstreamMappingChanged {
 /// not an observed constraint; see [`EVENT_TASK_KINDS`] for the superset
 /// this repo's SQL CHECK actually accepts).
 ///
-/// This is **not** every `jobs.kind` the SQL CHECK constraint (migration
-/// 009; all kinds defined in place there per
-/// `feedback_pre_release_migrations`. The prior 012/014/015/016
-/// forward-ALTER chain was collapsed back into 009 once it stopped
-/// earning its keep — DB-wipe-per-alpha makes the in-place edit free
-/// and a single defining migration is easier to read than a chain)
-/// accepts — see [`EVENT_TASK_KINDS`] for that full mirror.
+/// This is **not** every `jobs.kind` the SQL CHECK constraint accepts —
+/// see [`EVENT_TASK_KINDS`] for that full mirror, and for which migration
+/// defines the accepted set.
 pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // NOTE — `"scan"` is deliberately ABSENT, exactly like
     // `verify-event-chain`: it is a valid `jobs.kind` (it stays in the
@@ -512,14 +508,41 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // still_rejected, held_cross_axis, tighten_population, re_held,
     // tighten_unchanged }`.
     "policy-reevaluation",
+    // OCI membership-edge backfill — consumed by
+    // `OciMembershipEdgeBackfillHandler` in the worker. One-shot retrofit
+    // for OCI single-image manifest rows minted before the write path
+    // registered `content_references` membership edges on every manifest
+    // PUT/pull-through; a row with no `oci_config`/`oci_layer` edges gives
+    // its config/layer blobs no GC keepalive. Walks
+    // `artifacts.path LIKE 'manifests/sha256:%'` rows (image-typed only —
+    // an index is excluded via its stored media type) with no
+    // `content_references` row of kind `oci_config`; per row: stream the
+    // manifest from CAS, re-derive its blob set via
+    // `FormatHandler::extract_oci_manifest_blob_refs`, insert the missing
+    // edges (layers first, config last — see the handler's module doc for
+    // why the ordering matters for resumability). Non-destructive — only
+    // derived-projection rows are added. **No CronJob**: unlike
+    // `wheel-metadata-backfill`, this repairs a defect the ingest path can
+    // no longer produce, so a recurring schedule would be permanent
+    // scaffolding; operators invoke it once via the admin-tasks route.
+    // Params: `{"batch_size": <int>}` (default 100, capped at 1000). Run
+    // summary in `result_summary`: `{ rows_scanned, rows_repaired,
+    // edges_written, skipped_cas_missing, skipped_unparseable, errors }`.
+    "oci-membership-edge-backfill",
 ];
 
-/// The full `jobs.kind` vocabulary — an exact mirror of migration 009's
-/// `kind IN (…)` SQL CHECK list, in the same order.
+/// The full `jobs.kind` vocabulary — an exact mirror, in the same order,
+/// of the `kind IN (…)` SQL CHECK list **in force**: the one defined by
+/// the newest migration that defines it (a database applies the whole
+/// chain, so a later redefinition, not `009_scan_jobs_and_findings.sql`'s
+/// inline list, is what it ends up enforcing). Widening the set means
+/// appending a new numbered migration that redefines `jobs_kind_check`
+/// over the full list — an applied migration can never be edited in place
+/// (`sqlx::migrate!` rejects the changed checksum).
 ///
 /// **Single consumer:** the DB-free lock-step structural guard
 /// (`crates/hort-adapters-postgres/tests/task_kind_check_lockstep_guard.rs`)
-/// that token-scans migration 009's `kind IN (…)` list and asserts it
+/// that token-scans that migration's `kind IN (…)` list and asserts it
 /// equals this constant exactly. Nothing else reads this constant —
 /// `TaskInvoked::validate` / `TaskFailed::validate` deliberately stay on
 /// the narrower [`ADMIN_INVOKABLE_TASK_KINDS`] (see that constant's doc
@@ -559,6 +582,7 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
     "scanner-registry-prune",
     "verify-event-chain",
     "policy-reevaluation",
+    "oci-membership-edge-backfill",
 ];
 
 // ---------------------------------------------------------------------------

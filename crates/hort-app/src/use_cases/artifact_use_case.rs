@@ -1821,6 +1821,13 @@ mod tests {
         ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn find_oci_image_manifests_without_kind(
+            &self,
+            _kind: &str,
+            _limit: u32,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     /// `download`'s `find_by_id` error classification has two arms:
@@ -3160,6 +3167,14 @@ mod visibility_extension_tests {
                 Box::pin(async { Ok(Vec::new()) })
             }
             fn find_pypi_wheels_without_kind(
+                &self,
+                _kind: &str,
+                _limit: u32,
+            ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<Vec<Artifact>>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn find_oci_image_manifests_without_kind(
                 &self,
                 _kind: &str,
                 _limit: u32,
