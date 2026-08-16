@@ -42,7 +42,7 @@ use crate::use_cases::multi_hash::{
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
-use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
+use crate::use_cases::referenced_descendant::resolve_referenced_tree_descendant_fail_safe;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_expected_version,
     EVENT_APPEND_RETRY_ATTEMPTS,
@@ -2917,41 +2917,22 @@ impl IngestUseCase {
             // — shared verbatim with the provenance orchestrator's
             // `NoAttestation × Required` hold (issue #115 item 3) so the
             // two can never drift; see that module for why the
-            // self-referential kinds are excluded. This lookup does NOT
+            // self-referential kinds are excluded. The lookup + its
+            // fail-safe-on-error posture are shared with
+            // `register_by_hash_inner`'s identical carve-out through
+            // `resolve_referenced_tree_descendant_fail_safe`, so the two
+            // minting paths cannot drift either. This lookup does NOT
             // depend on this ingest's OWN `content_references` rows
             // (written post-commit, below) — it only ever matches rows
             // written by OTHER, already-ingested artifacts, so resolving
             // it before this ingest's own commit is safe.
-            let is_referenced_descendant = match self
-                .content_references
-                .find_by_target(repository_id, &artifact.sha256_checksum, None)
-                .await
-            {
-                Ok(refs) => is_referenced_tree_descendant(&refs),
-                Err(e) => {
-                    // Fail-safe, not fail-closed-on-scan: a lookup error
-                    // degrades to "not a descendant", i.e. the artifact
-                    // keeps its normal full window — the MORE
-                    // conservative outcome, never the zero-window one.
-                    //
-                    // NOTE the deliberate asymmetry with the provenance
-                    // orchestrator's use of the SAME predicate, which
-                    // PROPAGATES its lookup error instead: there `false`
-                    // means "no descendant hold" and falls toward TERMINAL
-                    // rejection (the unsafe direction). Here `false` falls
-                    // toward a longer hold. Same predicate, opposite
-                    // safe-default — see `referenced_descendant`'s module
-                    // doc.
-                    tracing::warn!(
-                        artifact_id = %artifact.id,
-                        %repository_id,
-                        error = %e,
-                        "content_references target lookup failed; treating as non-descendant \
-                         (full window, fail-safe)"
-                    );
-                    false
-                }
-            };
+            let is_referenced_descendant = resolve_referenced_tree_descendant_fail_safe(
+                &*self.content_references,
+                repository_id,
+                artifact.id,
+                &artifact.sha256_checksum,
+            )
+            .await;
 
             // Resolve the quarantine-window anchor
             // (`quarantine_window_start`). Three cases:
@@ -4182,15 +4163,37 @@ impl IngestUseCase {
         //    `effective_duration_secs` — EXACT same derivations as
         //    `ingest_inner` (~lines 2739, 2787, 2826).
         // 3. `effective_duration_secs > 0`: transition `None ->
-        //    Quarantined` with anchor = `quarantine_anchor_override
-        //    .unwrap_or(now)` (the seed caller's backdated anchor is
-        //    preserved verbatim; every other caller anchors at `now`).
-        //    Unlike `ingest_inner`, no referenced-tree-descendant
-        //    zero-window carve-out or `trust_upstream_publish_time` clamp
-        //    applies here — `register_by_hash` mints a fresh per-repo row
-        //    over content that already exists elsewhere in CAS, not a
-        //    fresh upstream fetch; that carve-out stays scoped to
-        //    `ingest_inner` (out of scope for this item).
+        //    Quarantined`. The anchor resolves in strict precedence
+        //    order:
+        //
+        //    a. `quarantine_anchor_override` — the seed-import cutover's
+        //       backdated anchor — wins absolutely. An explicit anchor is
+        //       never overridden by the carve-out below.
+        //    b. Otherwise the SAME referenced-tree-descendant zero-window
+        //       carve-out `ingest_inner` applies: same shared predicate
+        //       and lookup (`resolve_referenced_tree_descendant_fail_safe`),
+        //       same fail-safe-on-lookup-error posture (a failed lookup
+        //       degrades to "not a descendant" = the full window, never
+        //       the zero window), same back-dating by
+        //       `effective_duration_secs` so the live-computed deadline
+        //       equals the registration instant.
+        //    c. Otherwise `now`.
+        //
+        //    The carve-out is TOPOLOGY-based — "is this content already a
+        //    `content_references` target of some other already-ingested
+        //    artifact in THIS repo" — and therefore caller-independent by
+        //    construction. That is the invariant: one artifact in one
+        //    repository gets ONE quarantine window, whether its row was
+        //    minted by `ingest_inner` (the leader of a pull-through
+        //    coalesce), by a coalesced follower re-registering here, or by
+        //    a cross-repo mount. Anything caller-dependent would make a
+        //    descendant's hold depend on which racer won the dedup.
+        //
+        //    The `trust_upstream_publish_time` clamp deliberately does NOT
+        //    apply on this path: it mints a per-repo row over content
+        //    already in CAS with no upstream fetch, so there is no
+        //    publish-time hint to clamp (`upstream_published_at` is `None`
+        //    on both the row and the event, above).
         //    `effective_duration_secs == 0` (operator permissive
         //    opt-out): skip the quarantine transition — the artifact
         //    stays `None`/downloadable — but `ScanRequested` +
@@ -4269,9 +4272,37 @@ impl IngestUseCase {
             .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
 
         let quarantined = effective_duration_secs > 0;
+        // Threaded to the gate log below so an operator can tell a
+        // zero-window descendant registration from a full-window one
+        // without reconstructing the reference set.
+        let mut is_referenced_descendant = false;
         let mut events: Vec<EventToAppend> = Vec::new();
         if quarantined {
-            let anchor = quarantine_anchor_override.unwrap_or(now);
+            let anchor = match quarantine_anchor_override {
+                // (a) explicit seed anchor — absolute precedence.
+                Some(seed_anchor) => seed_anchor,
+                None => {
+                    // (b) the descendant carve-out, evaluated exactly as
+                    // `ingest_inner` evaluates it. Like there, the lookup
+                    // cannot match this registration's OWN
+                    // `primary_content` row — that is written post-commit,
+                    // below — so it only ever sees edges written by OTHER,
+                    // already-ingested artifacts.
+                    is_referenced_descendant = resolve_referenced_tree_descendant_fail_safe(
+                        &*self.content_references,
+                        repository_id,
+                        artifact_id,
+                        &artifact.sha256_checksum,
+                    )
+                    .await;
+                    if is_referenced_descendant {
+                        now - chrono::Duration::seconds(effective_duration_secs)
+                    } else {
+                        // (c) the ordinary registration anchor.
+                        now
+                    }
+                }
+            };
             let quarantine_event =
                 artifact
                     .quarantine(anchor)
@@ -4347,6 +4378,7 @@ impl IngestUseCase {
                 %artifact_id,
                 trigger_source,
                 quarantined,
+                is_referenced_descendant,
                 scan_will_run,
                 provenance_will_run,
                 "register_by_hash: quarantine/scan/provenance gate resolved"
@@ -13188,6 +13220,226 @@ mod tests {
                 lifecycle.ingest_enqueues().is_empty(),
                 "{:?}",
                 lifecycle.ingest_enqueues()
+            );
+        });
+    }
+
+    // =====================================================================
+    // Referenced-tree-descendant zero-window carve-out on the REGISTRATION
+    // path — parity with `ingest_inner`'s carve-out (the
+    // `ingest_direct_referenced_target_*` quartet above).
+    //
+    // The carve-out is topology-based, so the window a descendant receives
+    // must not depend on which minting path created its row: a coalesced
+    // pull-through follower re-registering here has to reach the same
+    // anchor the leader's `ingest_inner` would have. These four pin the
+    // registration half of that matrix — descendant → zero window, seed
+    // anchor override wins, lookup failure → full window (fail-safe),
+    // non-descendant → full window.
+    // =====================================================================
+
+    /// A `content_references` target (an already-ingested parent index in
+    /// THIS repo references the hash) registered through
+    /// `register_by_hash` gets the SAME zero-length window `ingest_inner`
+    /// gives it: the anchor is backdated so `anchor + effective_duration`
+    /// equals the registration instant. Fails pre-fix, where every
+    /// non-seed caller anchored at `now`.
+    #[test]
+    fn register_by_hash_referenced_target_gets_zero_length_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            let policy = global_scan_policy(); // duration = 24h
+            let duration = chrono::Duration::seconds(policy.quarantine_duration_secs);
+            policies.insert(policy);
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"child manifest bytes".to_vec());
+
+            // Exactly the shape the OCI manifest-PUT path writes for an
+            // index's children, and the one the coalesced-follower leg
+            // then registers against.
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: hash.clone(),
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("registering a referenced-tree descendant must succeed");
+            let after = Utc::now();
+
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::Quarantined,
+                "the zero window removes the timer wait only — it never releases anything \
+                 by itself"
+            );
+            let anchor = outcome
+                .artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set for a referenced-tree descendant");
+            let deadline = anchor + duration;
+            assert!(
+                deadline >= before && deadline <= after,
+                "deadline (anchor + duration) {deadline:?} must equal the registration \
+                 instant (between {before:?} and {after:?}) — the same zero-length window \
+                 ingest_inner would have given this artifact"
+            );
+        });
+    }
+
+    /// The seed-import cutover's explicit backdated anchor keeps absolute
+    /// precedence: a descendant edge must NOT displace it, in either
+    /// direction. Pins the `Some(seed_anchor)` arm of the precedence
+    /// ladder.
+    #[test]
+    fn register_by_hash_seed_anchor_override_wins_over_descendant_carve_out() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy());
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"seeded child manifest".to_vec());
+
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: hash.clone(),
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            // A seed anchor deliberately FARTHER back than the carve-out
+            // would produce, so "the override won" is observable rather
+            // than coincidentally equal.
+            let seed_anchor = Utc::now() - chrono::Duration::days(30);
+            let mut req = req_legacy(repo_id);
+            req.quarantine_anchor_override = Some(seed_anchor);
+
+            let outcome = uc
+                .register_by_hash(req, hash, None, &test_handler())
+                .await
+                .expect("seed-import registration must succeed");
+
+            assert_eq!(
+                outcome.artifact.quarantine_window_start,
+                Some(seed_anchor),
+                "an explicit seed anchor is preserved verbatim — the descendant carve-out \
+                 must never override it"
+            );
+        });
+    }
+
+    /// A `find_by_target` port error on the registration path degrades to
+    /// "not a descendant" — full window, fail-safe — exactly as it does in
+    /// `ingest_inner`. Never fail-open into a zero window from an infra
+    /// hiccup.
+    #[test]
+    fn register_by_hash_target_lookup_failure_degrades_to_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy());
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+            content_refs.fail_next_find_by_target(DomainError::Invariant(
+                "simulated content_references lookup failure (test fixture)".into(),
+            ));
+
+            let before = Utc::now();
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("a lookup failure must not fail the registration");
+            let after = Utc::now();
+
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::Quarantined
+            );
+            let anchor = outcome
+                .artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under a duration>0 policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a lookup failure must degrade to the full window (fail-safe), not the \
+                 zero window: {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
+    /// A non-target registration keeps the full window, unchanged. A
+    /// reference row exists, but for a DIFFERENT hash — proves the
+    /// carve-out discriminates by hash rather than firing whenever the
+    /// index is non-empty.
+    #[test]
+    fn register_by_hash_non_target_keeps_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy());
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            let other_hash: ContentHash = EMPTY_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"standalone mounted bytes".to_vec());
+
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: other_hash,
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("non-descendant registration must succeed");
+            let after = Utc::now();
+
+            let anchor = outcome
+                .artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under a duration>0 policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a hash no other artifact references must keep the full window — anchor \
+                 must be the registration instant, not backdated: {anchor:?} not in \
+                 [{before:?}, {after:?}]"
             );
         });
     }

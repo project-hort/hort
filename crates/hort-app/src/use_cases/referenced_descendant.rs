@@ -15,13 +15,16 @@
 //!
 //! # Ingest vs. verdict: the error-direction asymmetry
 //!
-//! The predicate itself is pure. What differs between the two callers is
+//! The predicate itself is pure. What differs between the callers is
 //! how a FAILED `content_references` lookup is handled, and the
 //! difference is load-bearing — see each call site's comment:
 //!
-//! - **Ingest** (`ingest_inner`) degrades to `false` on a lookup error.
-//!   `false` there means "not a descendant" ⇒ the artifact keeps its
-//!   normal FULL observation window — the more conservative outcome.
+//! - **Quarantine-anchor resolution** — `ingest_inner` and
+//!   `register_by_hash_inner`, both through
+//!   [`resolve_referenced_tree_descendant_fail_safe`] — degrades to
+//!   `false` on a lookup error. `false` there means "not a descendant"
+//!   ⇒ the artifact keeps its normal FULL observation window — the more
+//!   conservative outcome.
 //! - **Verdict** (`ProvenanceOrchestrationUseCase::verify_artifact`)
 //!   PROPAGATES the error. `false` there means "no descendant hold" ⇒
 //!   under `Required` with a closed window the artifact is TERMINALLY
@@ -35,7 +38,10 @@
 //! It also propagates a lookup failure: `false` there re-creates the
 //! churn the skip exists to remove, `true` would strand the candidate.
 
-use hort_domain::ports::content_reference_index::ContentReference;
+use uuid::Uuid;
+
+use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
+use hort_domain::types::ContentHash;
 
 /// `content_references.kind` values that are an artifact's OWN
 /// bookkeeping rather than "some other artifact references me".
@@ -63,6 +69,53 @@ const SELF_REFERENTIAL_KINDS: [&str; 2] = ["primary_content", "metadata_blob"];
 pub(crate) fn is_referenced_tree_descendant(refs: &[ContentReference]) -> bool {
     refs.iter()
         .any(|r| !SELF_REFERENTIAL_KINDS.contains(&r.kind.as_str()))
+}
+
+/// Look the artifact's inbound reference set up and answer
+/// [`is_referenced_tree_descendant`] for it, degrading to `false` when
+/// the lookup itself fails.
+///
+/// This is the QUARANTINE-ANCHOR resolution shared by both artifact-
+/// minting paths — `IngestUseCase::ingest_inner` (streamed upstream
+/// fetch / direct upload) and `IngestUseCase::register_by_hash_inner`
+/// (cross-repo mount, coalesced pull-through follower, seed-import
+/// cutover). Sharing it is what makes the zero-window carve-out
+/// caller-independent: the predicate is topology-based ("is this content
+/// already a `content_references` target of another already-ingested
+/// artifact in THIS repo"), so the window a descendant receives must not
+/// depend on which minting path — or which racer in a dedup coalesce —
+/// created its row.
+///
+/// The `false`-on-error degradation is FAIL-SAFE, not fail-open: `false`
+/// means "not a descendant", which yields the artifact's normal FULL
+/// observation window. It is never the zero-window direction. The
+/// provenance orchestrator deliberately does NOT use this helper — there
+/// `false` falls toward terminal rejection, so it must propagate the
+/// error instead (see the module doc).
+pub(crate) async fn resolve_referenced_tree_descendant_fail_safe(
+    content_references: &dyn ContentReferenceIndex,
+    repository_id: Uuid,
+    artifact_id: Uuid,
+    hash: &ContentHash,
+) -> bool {
+    // The UNFILTERED kind set — `is_referenced_tree_descendant`'s
+    // contract; filtering at the port would silently narrow it.
+    match content_references
+        .find_by_target(repository_id, hash, None)
+        .await
+    {
+        Ok(refs) => is_referenced_tree_descendant(&refs),
+        Err(e) => {
+            tracing::warn!(
+                %artifact_id,
+                %repository_id,
+                error = %e,
+                "content_references target lookup failed; treating as non-descendant \
+                 (full window, fail-safe)"
+            );
+            false
+        }
+    }
 }
 
 /// `content_references.kind` values whose TARGET is an OCI **blob** — a
