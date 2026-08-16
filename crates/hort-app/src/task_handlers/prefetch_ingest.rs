@@ -1704,8 +1704,8 @@ mod tests {
     use crate::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
     use crate::use_cases::test_support::{
         sample_repository, MockArtifactGroupLifecyclePort, MockArtifactGroupRepository,
-        MockArtifactLifecycle, MockArtifactRepository, MockContentReferenceIndex,
-        MockCurationRuleRepository, MockEventStore, MockJobsRepository,
+        MockArtifactLifecycle, MockArtifactRepository, MockContentFirstSeen,
+        MockContentReferenceIndex, MockCurationRuleRepository, MockEventStore, MockJobsRepository,
         MockPolicyProjectionRepository, MockRepositoryRepository,
         MockRepositoryUpstreamMappingRepository, MockStoragePort, MockUpstreamProxy,
     };
@@ -2084,6 +2084,7 @@ mod tests {
             StdHashMap::new(),
             0,
             content_refs,
+            Arc::new(MockContentFirstSeen::new()),
             policies,
             jobs,
         ));

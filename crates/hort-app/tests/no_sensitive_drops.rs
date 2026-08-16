@@ -152,6 +152,24 @@ const SENSITIVE_TABLES: &[&str] = &[
     "repository_upstream_mappings",
     // Task queue.
     "jobs",
+    // Content-level age evidence (ADR 0054). Holds, per content hash,
+    // the minimum over this instance's own ingest observations — the
+    // primary source the quarantine window is anchored on. It earns a
+    // place here on the same grounds as the event store: the
+    // observations are the ONLY record that they happened. Every other
+    // projection in the schema has an authoritative source to rebuild
+    // from (`content_references` is rebuilt from `artifacts` by the
+    // refcount-reconcile sweep); this one does not, because the fact it
+    // records — that hort held these bytes at time T — is destroyed
+    // along with the row. A DROP is therefore irrecoverable, and it is
+    // a security weakening rather than a mere data loss: with the
+    // unforgeable observation gone, a repository that opted into
+    // `trust_upstream_publish_time` is left with only the
+    // attacker-assertable upstream claim as an alternative to the
+    // row's own mint time, and an ancient forged claim collapses the
+    // window. Displacing exactly that dependency is why ADR 0054 makes
+    // the observation the primary source.
+    "content_first_seen",
     // Event store ledger. The event-store table itself is `events`
     // (handled as an exact + `events_` prefix match in `is_sensitive_table`);
     // `_sqlx_migrations` is the sqlx applied-migration ledger.
@@ -781,6 +799,21 @@ fn self_check_events_prefix_family_trips() {
 }
 
 #[test]
+fn self_check_content_first_seen_drop_trips() {
+    // The content-level age record (ADR 0054) is on the sensitive list:
+    // it has no authoritative source to rebuild from, so a drop is
+    // irrecoverable and hands the quarantine anchor back to the
+    // attacker-assertable upstream publish time.
+    assert!(trips("DROP TABLE content_first_seen;"));
+    assert!(trips(
+        "DROP TABLE IF EXISTS public.content_first_seen CASCADE;"
+    ));
+    assert!(trips(
+        "ALTER TABLE content_first_seen DROP CONSTRAINT content_first_seen_pkey;"
+    ));
+}
+
+#[test]
 fn self_check_alter_table_with_if_exists_and_only_trips() {
     // Optional `IF EXISTS` / `ONLY` qualifiers between TABLE and the name
     // must not hide the sensitive table.
@@ -971,6 +1004,12 @@ fn self_check_is_sensitive_table_membership() {
     assert!(is_sensitive_table("events"));
     assert!(is_sensitive_table("events_archive"));
     assert!(is_sensitive_table("_sqlx_migrations"));
+    assert!(is_sensitive_table("content_first_seen"));
+    // `content_references` is NOT sensitive: the refcount-reconcile
+    // sweep rebuilds it from the authoritative `artifacts` rows, so a
+    // drop is recoverable. The two tables are one character apart in
+    // spirit and worlds apart in recoverability.
+    assert!(!is_sensitive_table("content_references"));
     assert!(!is_sensitive_table("repositories_backup_2026")); // not exact
     assert!(!is_sensitive_table("repo_security_scores"));
     assert!(!is_sensitive_table("scan_findings"));

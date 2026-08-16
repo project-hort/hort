@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Content-level `first_seen_at` age projection.** Hort now records, per
+  content hash, the earliest instant it ingested those bytes in any of its
+  repositories — an observation it generates itself rather than an
+  upstream assertion. The record is held at the content level (not on the
+  per-repository artifact row), so it survives retention purge and blob GC,
+  and the minimum is computed by the upsert's SQL so concurrent ingests of
+  the same content across repositories cannot lose the race. Both artifact-
+  minting paths write it. The migration also **seeds the projection from
+  the history the instance already holds** — `min(created_at)` per checksum
+  over existing artifact rows — so an upgrading deployment anchors its
+  existing content at its true first sighting rather than at the next time
+  that content happens to be registered. Foundation only — nothing reads
+  the projection yet, so there is no behaviour change; anchor derivation
+  follows. (ADR 0054, #163)
+
 - **OCI membership-edge backfill.** The `oci-membership-edge-backfill`
   admin task repairs OCI image-manifest rows ingested before the
   pull-through path registered their `content_references` config/layer

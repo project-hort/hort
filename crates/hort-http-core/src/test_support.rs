@@ -68,8 +68,8 @@ use hort_app::use_cases::task_use_case::TaskUseCase;
 use hort_app::use_cases::test_support::{
     MockApiTokenRepository, MockArtifactGroupLifecyclePort, MockArtifactGroupRepository,
     MockArtifactLifecycle, MockArtifactMetadataRepository, MockArtifactRepository,
-    MockClaimMappingRepository, MockContentReferenceIndex, MockCurationRuleRepository,
-    MockEventStore, MockJobsRepository, MockPermissionGrantRepository,
+    MockClaimMappingRepository, MockContentFirstSeen, MockContentReferenceIndex,
+    MockCurationRuleRepository, MockEventStore, MockJobsRepository, MockPermissionGrantRepository,
     MockPolicyProjectionRepository, MockRefLifecyclePort, MockRefRegistryPort,
     MockRepoSecurityScoreRepository, MockRepositoryRepository,
     MockRepositoryUpstreamMappingRepository, MockStatefulUploadStagingPort, MockStoragePort,
@@ -728,6 +728,13 @@ pub struct MockPorts {
     /// Content-reference projection mock.
     /// Tests seeding cross-artifact references drive this handle.
     pub content_references: Arc<MockContentReferenceIndex>,
+    /// Content-level `first_seen_at` age projection mock (ADR 0054).
+    /// Held here — not on [`AppContext`] — because no handler reads the
+    /// projection; only `IngestUseCase` writes it. `with_storage`
+    /// threads this SAME handle into the replacement use case, so a
+    /// test that ingests before and after the storage swap sees one
+    /// accumulating record rather than two independent mocks.
+    pub content_first_seen: Arc<MockContentFirstSeen>,
     /// In-memory upstream-mapping CRUD mock.
     /// Tests seeding multi-upstream OCI mirrors drive this handle.
     pub repository_upstream_mappings: Arc<MockRepositoryUpstreamMappingRepository>,
@@ -968,6 +975,7 @@ pub fn build_mock_ctx_with_label_flag(
     // threads into both `IngestUseCase::new` (refcount writes) and
     // `ContentReferenceUseCase::new` (below).
     let content_references = Arc::new(MockContentReferenceIndex::new());
+    let content_first_seen = Arc::new(MockContentFirstSeen::new());
     // Same `policy_projections` Arc threads into
     // both `IngestUseCase::new` (ingest-time scan auto-enqueue) and
     // `QuarantineUseCase::new` below. Hoisted ahead of ingest for the
@@ -994,6 +1002,7 @@ pub fn build_mock_ctx_with_label_flag(
         HashMap::new(),
         0,
         content_references.clone(),
+        content_first_seen.clone(),
         policy_projections.clone(),
         jobs.clone(),
     ));
@@ -1480,6 +1489,7 @@ pub fn build_mock_ctx_with_label_flag(
         ephemeral_durable,
         stateful_upload_staging,
         content_references,
+        content_first_seen,
         repository_upstream_mappings,
         upstream_resolver,
         upstream_proxy,
@@ -2043,6 +2053,7 @@ pub fn with_storage(
             HashMap::new(),
             0,
             ctx.content_references.clone(),
+            mocks.content_first_seen.clone(),
             // Thread the same policy_projections +
             // jobs Arcs that the initial IngestUseCase build received,
             // so any policy seeded by the test (or any enqueue

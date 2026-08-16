@@ -41,6 +41,7 @@ use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::content_first_seen::ContentFirstSeenPort;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{
@@ -4713,6 +4714,95 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
             }
         }
         Box::pin(async move { Ok(out) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockContentFirstSeen — in-memory mock for the content-level
+// `first_seen_at` age projection (ADR 0054).
+//
+// Keyed by content hash, holding the running minimum. The mock keeps
+// the min in the `observe` body rather than letting the last write win,
+// because that IS the port's contract — a mock that overwrote would let
+// a use-case test pass while the real adapter's `LEAST` upsert
+// disagreed. `observe_count` records total calls (including no-op later
+// observations) so a test can assert that BOTH minting paths write, not
+// just that the value ended up right.
+// ---------------------------------------------------------------------------
+
+/// In-memory mock for [`ContentFirstSeenPort`]. `observe` keeps the
+/// earlier of the stored and incoming instants; `first_seen` reads the
+/// stored value. `fail_next_observe` arms a one-shot failure so tests
+/// can branch-cover `IngestUseCase::record_first_seen`'s warn-and-
+/// continue arm.
+pub struct MockContentFirstSeen {
+    entries: Mutex<HashMap<String, DateTime<Utc>>>,
+    next_observe_error: Mutex<Option<DomainError>>,
+    observe_count: AtomicUsize,
+}
+
+impl MockContentFirstSeen {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            next_observe_error: Mutex::new(None),
+            observe_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of `observe` calls since construction, counting the ones
+    /// armed to fail — the count is of write ATTEMPTS, which is what a
+    /// "this minting path records an observation" assertion needs.
+    pub fn observe_count(&self) -> usize {
+        self.observe_count.load(Ordering::SeqCst)
+    }
+
+    /// The stored instant for `hash`, or `None` if never observed.
+    /// Synchronous convenience for assertions; the port's own
+    /// `first_seen` is the async equivalent.
+    pub fn stored(&self, hash: &str) -> Option<DateTime<Utc>> {
+        self.entries.lock().unwrap().get(hash).copied()
+    }
+
+    /// Number of distinct content hashes with a record — asserts the
+    /// "two ingests leave ONE record" property.
+    pub fn entry_count(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    /// Arm a one-shot failure on the **next**
+    /// [`ContentFirstSeenPort::observe`] call. Consumed by that call;
+    /// later calls succeed unless re-armed.
+    pub fn fail_next_observe(&self, err: DomainError) {
+        *self.next_observe_error.lock().unwrap() = Some(err);
+    }
+}
+
+impl ContentFirstSeenPort for MockContentFirstSeen {
+    fn observe(
+        &self,
+        content_hash: &ContentHash,
+        observed_at: DateTime<Utc>,
+    ) -> BoxFuture<'_, DomainResult<()>> {
+        self.observe_count.fetch_add(1, Ordering::SeqCst);
+        if let Some(err) = self.next_observe_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(err) });
+        }
+        let key = content_hash.as_ref().to_string();
+        let mut entries = self.entries.lock().unwrap();
+        let slot = entries.entry(key).or_insert(observed_at);
+        if observed_at < *slot {
+            *slot = observed_at;
+        }
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn first_seen(
+        &self,
+        content_hash: &ContentHash,
+    ) -> BoxFuture<'_, DomainResult<Option<DateTime<Utc>>>> {
+        let stored = self.stored(content_hash.as_ref());
+        Box::pin(async move { Ok(stored) })
     }
 }
 
