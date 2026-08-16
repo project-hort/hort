@@ -46,10 +46,12 @@
 //! PostgreSQL has no in-place `CHECK` alter, so the only way to extend an
 //! allowed-value set (e.g. adding a task kind to `jobs.kind`) is to drop and
 //! re-add the same named constraint over a superset of values, and
-//! PostgreSQL auto-names such a constraint `<table>_<col>_check`. Pre-1.0
-//! this widening is done in place in the defining CREATE (ADR 0022), so no
-//! migration currently exercises the exemption; it is retained for when
-//! ALTER-as-new-numbered-migration resumes post-1.0.
+//! PostgreSQL auto-names such a constraint `<table>_<col>_check`.
+//! `018_jobs_kind_oci_edge_backfill.sql` exercises exactly this shape on
+//! `jobs_kind_check`: once a database exists that cannot be wiped, an
+//! applied migration's inline CHECK can no longer be edited in place
+//! (the changed checksum makes `sqlx::migrate!` reject that database), so
+//! a redefining ALTER is the only delivery mechanism left.
 //!
 //! The exemption is therefore an **allow-list restricted to constraint
 //! names ending in `_check`** (case-insensitive — see

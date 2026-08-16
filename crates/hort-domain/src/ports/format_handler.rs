@@ -648,6 +648,41 @@ pub trait FormatHandler: Send + Sync {
         Ok(None)
     }
 
+    /// Re-derive an already-ingested OCI **single-image manifest**'s
+    /// `config`/`layers[*]` blob references from its stored bytes, for the
+    /// `oci-membership-edge-backfill` admin task — the retrofit that writes
+    /// the `content_references` membership edges a legacy manifest row (one
+    /// minted before the write path registered them on every PUT/pull) is
+    /// permanently missing.
+    ///
+    /// **Image manifests only.** The caller (the backfill's candidacy query)
+    /// already filters to image-manifest rows — an index has no
+    /// `config`/`layers` to derive and is never handed to this method.
+    ///
+    /// `content` streams the manifest's own stored bytes (read from CAS by
+    /// the caller); implementations read it under an internal bound (OCI
+    /// manifests are capped at push time — see
+    /// `hort-http-oci::manifests_write::MANIFEST_BODY_MAX_BYTES` — so
+    /// re-reading an already-stored manifest is bounded work, not an
+    /// unbounded buffer).
+    ///
+    /// Returns [`DomainError::Validation`] for a manifest that no longer
+    /// parses as a well-formed single-image manifest (corrupt CAS content,
+    /// or a row whose stored bytes turn out to be an index despite the
+    /// candidacy filter) — the caller treats this as a non-fatal per-row
+    /// skip, not a batch abort.
+    ///
+    /// Default returns `Ok(Vec::new())` — every non-OCI format has no
+    /// manifest concept and inherits the inert default; only OCI overrides.
+    fn extract_oci_manifest_blob_refs(
+        &self,
+        coords: &ArtifactCoords,
+        content: &mut dyn std::io::Read,
+    ) -> DomainResult<Vec<crate::oci::ManifestBlobRef>> {
+        let _ = (coords, content);
+        Ok(Vec::new())
+    }
+
     /// Resolve a mutable (re-deployable) version request to the concrete,
     /// immutable stored path among `available_paths`. Maven SNAPSHOT is the
     /// only v1 implementer: a request for the base
@@ -1028,6 +1063,38 @@ mod tests {
         let payload = PayloadAccess::Bytes(b"PK\x03\x04sentinel");
         let result = DefaultsOnlyHandler.extract_wheel_metadata_bytes(&coords, payload);
         assert!(matches!(result, Ok(None)));
+    }
+
+    // -------------------------------------------------------------------
+    // `extract_oci_manifest_blob_refs` default impl
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn default_extract_oci_manifest_blob_refs_returns_empty_vec() {
+        // Opaque-format default: a handler that does not override
+        // `extract_oci_manifest_blob_refs` returns `Ok(vec![])` — only
+        // OCI overrides; every other format inherits the inert default.
+        // Regression guard: changing the default to a non-empty value or
+        // an `Err` would silently start producing (or blocking)
+        // `oci-membership-edge-backfill` behaviour for non-OCI formats,
+        // which never reach this method in production (the candidacy
+        // query is OCI-manifest-path-shaped).
+        let coords = sbom_test_coords();
+        let mut reader: &[u8] = b"";
+        let result = DefaultsOnlyHandler.extract_oci_manifest_blob_refs(&coords, &mut reader);
+        assert!(matches!(result, Ok(refs) if refs.is_empty()));
+    }
+
+    #[test]
+    fn default_extract_oci_manifest_blob_refs_ignores_content() {
+        // The default does not inspect `content` — well-formed-looking
+        // manifest JSON still yields `Ok(vec![])`. Pins the
+        // no-inspection contract for reviewers.
+        let coords = sbom_test_coords();
+        let body = br#"{"config":{"digest":"sha256:aa"},"layers":[]}"#;
+        let mut reader: &[u8] = body;
+        let result = DefaultsOnlyHandler.extract_oci_manifest_blob_refs(&coords, &mut reader);
+        assert!(matches!(result, Ok(refs) if refs.is_empty()));
     }
 
     // -------------------------------------------------------------------
