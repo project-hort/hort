@@ -156,6 +156,34 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
+    fn first_seen_for_checksum(
+        &self,
+        sha256: &ContentHash,
+    ) -> BoxFuture<'_, DomainResult<Option<DateTime<Utc>>>> {
+        let sha256 = sha256.as_ref().to_string();
+        Box::pin(async move {
+            tracing::debug!(entity = "Artifact", sha256 = %sha256, "first_seen_for_checksum");
+            // Unscoped by repository AND unfiltered by `is_deleted`, both
+            // deliberately: the question is "when did hort first hold
+            // these bytes, anywhere", and a soft-delete withdraws a row
+            // from service without un-observing the bytes. `MIN` over the
+            // `idx_artifacts_checksum` equality range — no new index, no
+            // stored projection to keep in step.
+            //
+            // `fetch_one` (not `fetch_optional`): an aggregate over an
+            // empty range still returns exactly one row, carrying SQL
+            // NULL, which maps to the `None` the caller reads as
+            // "no evidence".
+            let (first_seen,): (Option<DateTime<Utc>>,) =
+                sqlx::query_as("SELECT MIN(created_at) FROM artifacts WHERE checksum_sha256 = $1")
+                    .bind(&sha256)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| map_sqlx_error(&e, "Artifact", &sha256))?;
+            Ok(first_seen)
+        })
+    }
+
     fn list_by_repository(
         &self,
         repository_id: Uuid,
@@ -2639,5 +2667,140 @@ mod tests {
         cleanup_repo(&pool, plain_repo).await;
         cleanup_policy(&pool, global_policy).await;
         cleanup_policy(&pool, scoped_policy).await;
+    }
+
+    // -----------------------------------------------------------------
+    // `first_seen_for_checksum` — the live content-level age evidence
+    // behind the quarantine anchor (ADR 0054).
+    // -----------------------------------------------------------------
+
+    /// Seed one artifact row carrying an explicit observation instant.
+    /// `created_at` is written explicitly (rather than left to the
+    /// column default) precisely because it IS the value under test.
+    async fn seed_observation(
+        pool: &PgPool,
+        repo: Uuid,
+        sha256: &str,
+        created_at: DateTime<Utc>,
+        is_deleted: bool,
+    ) {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO artifacts (
+                   id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, content_type, storage_key,
+                   is_deleted, created_at
+               ) VALUES (
+                   $1, $2, 'obs-pkg', 'obs-pkg', '1.0.0', $3,
+                   0, $4, 'application/octet-stream', $4,
+                   $5, $6
+               )"#,
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(format!("obs-pkg/1.0.0/{id}.tar.gz"))
+        .bind(sha256)
+        .bind(is_deleted)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed observation row");
+    }
+
+    /// No row carries the hash ⇒ `None`. The aggregate returns one row
+    /// holding SQL NULL, so this pins that the adapter maps that to
+    /// "no evidence" rather than erroring on a missing row — the caller
+    /// reads `None` as "fall back on the mint instant".
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn first_seen_for_checksum_reports_no_evidence_for_an_unknown_hash() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let r = PgArtifactRepository::new(pool.clone());
+        let unknown: ContentHash = deterministic_hex64(0xF145_7BAD).parse().unwrap();
+
+        let seen = r
+            .first_seen_for_checksum(&unknown)
+            .await
+            .expect("aggregate read");
+
+        assert_eq!(seen, None, "unknown hash has no observation");
+    }
+
+    /// The evidence is the minimum over EVERY repository's rows for that
+    /// hash — the property that dissolves the leader/follower asymmetry:
+    /// whichever repository observed the content first supplies the age
+    /// fact for all of them. Rows carrying a different hash must not
+    /// contribute, however early they are.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn first_seen_for_checksum_is_the_minimum_across_repositories() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_a = seed_repo(&pool).await;
+        let repo_b = seed_repo(&pool).await;
+        let subject = deterministic_hex64(0x0B5E_4ED0);
+        let other = deterministic_hex64(0x07E4_0000);
+
+        let earliest: DateTime<Utc> = "2025-01-02T03:04:05Z".parse().unwrap();
+        let later: DateTime<Utc> = "2026-07-08T09:10:11Z".parse().unwrap();
+        let decoy: DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
+
+        seed_observation(&pool, repo_b, &subject, later, false).await;
+        seed_observation(&pool, repo_a, &subject, earliest, false).await;
+        // A far earlier row for DIFFERENT content — must not leak in.
+        seed_observation(&pool, repo_a, &other, decoy, false).await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let seen = r
+            .first_seen_for_checksum(&subject.parse().unwrap())
+            .await
+            .expect("aggregate read");
+
+        assert_eq!(
+            seen,
+            Some(earliest),
+            "the earliest observation of THIS hash, in any repository"
+        );
+
+        cleanup_repo(&pool, repo_a).await;
+        cleanup_repo(&pool, repo_b).await;
+    }
+
+    /// A soft-deleted row still counts. Withdrawing a row from service
+    /// does not un-observe the bytes, and the observation is exactly what
+    /// this read reports — only a hard purge (which removes the row)
+    /// retires the evidence. This is the one place the port deviates from
+    /// the `is_deleted = false` filter the rest of the read path applies,
+    /// so it is pinned rather than left to the SQL's shape.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn first_seen_for_checksum_counts_soft_deleted_observations() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let subject = deterministic_hex64(0x50F7_DEAD);
+
+        let soft_deleted_at: DateTime<Utc> = "2024-03-04T05:06:07Z".parse().unwrap();
+        let live_at: DateTime<Utc> = "2026-03-04T05:06:07Z".parse().unwrap();
+        seed_observation(&pool, repo_id, &subject, soft_deleted_at, true).await;
+        seed_observation(&pool, repo_id, &subject, live_at, false).await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let seen = r
+            .first_seen_for_checksum(&subject.parse().unwrap())
+            .await
+            .expect("aggregate read");
+
+        assert_eq!(
+            seen,
+            Some(soft_deleted_at),
+            "a soft-deleted row is a withdrawn service row, not a retracted observation"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
     }
 }

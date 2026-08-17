@@ -280,10 +280,16 @@ spec:
   # apply time; omit the field entirely instead.
   auth:
     type: anonymous
-  # Opt-in publish-time anchoring. When true, the
-  # quarantine window is anchored on the upstream's Last-Modified
-  # rather than hort's ingest time. Useful for high-latency mirrors of
-  # already-aged images.
+  # Opt-in second source for the quarantine-window anchor. The anchor
+  # is always the EARLIEST of the applicable age sources; the primary
+  # one — hort's own first observation of the content — needs no opt-in.
+  # When true, this upstream's asserted Last-Modified joins that
+  # minimum, so it can only shorten the window, never lengthen it. It
+  # is opt-in because an upstream can claim an ancient publish time:
+  # enable it only where you are willing to treat this upstream's
+  # metadata as true (a high-latency mirror of already-aged images is
+  # the case it exists for). See the "trustUpstreamPublishTime" section
+  # of declare-gitops-config.md.
   trustUpstreamPublishTime: false
 ```
 

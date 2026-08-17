@@ -9,7 +9,11 @@
 //! `provenance_mode` trio + `ProvenancePort`; see ADR 0027.)
 //! The decision-point entry points composing them are `scan`,
 //! `re_evaluation` (the post-exclusion-add pass), `curation`,
-//! and `promotion`.
+//! and `promotion`. `quarantine_anchor` is the other pure decision
+//! point: it resolves the observation-window *anchor* from the
+//! applicable age sources (ADR 0054) — the timer, never the release
+//! authority, which stays with `scan` and the entity's release
+//! predicate.
 //!
 //! The reshaped event payload [`crate::events::PolicyViolation`] —
 //! `{ rule, severity, message, details }` — is the shared violation
@@ -24,6 +28,7 @@ pub mod exclusion;
 pub mod license;
 pub mod primitives;
 pub mod promotion;
+pub mod quarantine_anchor;
 pub mod re_evaluation;
 pub mod scan;
 pub mod scan_delta;
@@ -46,6 +51,9 @@ pub use primitives::{
     escalate_action_by_policy, escalate_action_by_severity, PolicyAction, ViolationsAccumulator,
 };
 pub use promotion::{evaluate_promotion, PromotionOutcome};
+pub use quarantine_anchor::{
+    derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
+};
 pub use re_evaluation::{decide_rejected_transition, ReEvaluationOutcome};
 pub use scan::{effective_quarantine_deadline, evaluate_scan_result, DefaultPolicy, ScanOutcome};
 pub use scan_delta::compute_added_findings;

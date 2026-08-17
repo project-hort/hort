@@ -742,6 +742,72 @@ URL-rewriting sidecars): when one registry mounts another's content
 under a path prefix, the prefix belongs in declarative config, not in
 a proxy rewrite layer.
 
+### `kind: UpstreamMapping` — `spec.trustUpstreamPublishTime`
+
+`spec.trustUpstreamPublishTime: bool` (default `false`) admits this
+upstream's asserted publish time as an **optional second source** for
+the quarantine-window anchor.
+
+The quarantine window is a proxy for elapsed *ecosystem exposure* — the
+assumption that content available in the world for the window's
+duration has had the ecosystem's scanners, advisories and researchers
+looking at it. So the anchor is the **earliest defensible evidence of
+the content's age**: the minimum over the applicable sources
+([ADR 0054](../../adr/0054-content-level-age-evidence-anchors-quarantine.md)).
+
+**The primary source needs no opt-in and is always in play**: the
+earliest moment hort itself observed those exact bytes, in any of its
+own repositories. That is an observation hort generates, not a claim by
+a third party, so it cannot be backdated — the most an attacker
+achieves by influencing it is making hort see the content *earlier*,
+which requires the content to genuinely have existed that much earlier,
+during which the ecosystem had precisely the exposure the window stands
+in for. It is also structurally conservative: hort cannot observe
+content before it is published, so first-seen is always a *late*
+estimate of real publication.
+
+Two operator-visible consequences of the primary source, both intended:
+
+- Content hort saw long ago and is now registering into a **second**
+  repository can land with a zero-length window. It has already had its
+  ecosystem exposure; holding it another full window adds no observation
+  the world has not already had.
+- Content whose last row is purged and which is later re-fetched loses
+  its original age evidence and re-anchors at the new ingest — the
+  evidence is derived from the artifact rows, not stored separately. The
+  resulting window is *longer* than the truth requires, never shorter.
+
+**What this flag adds** is `upstream_published_at` — an *assertion by
+the upstream* — to that same minimum. It can therefore only move the
+anchor earlier, never later, and a claimed publish time after the
+ingest instant is clamped away (physically impossible). It is opt-in
+because it is the one attacker-influenceable input: a claimed *ancient*
+publish time is bounded nowhere and collapses the window immediately.
+Freshly uploaded malware carrying forged old metadata is exactly the
+case the opt-in exists to bound — enable it only for upstreams whose
+metadata you are willing to treat as true. The case it exists for is a
+high-latency mirror of already-aged content, where hort's own first
+observation is far later than real publication.
+
+**It is per-mapping, and it does not transit repositories.** A value
+observed through one repository's mapping never shortens another
+repository's window. Without that scoping, a repository proxying an
+untrusted mirror could shorten the window of one proxying the genuine
+upstream — the collapse pattern
+[ADR 0016](../../adr/0016-cross-opt-in-interaction-matrix.md) exists to
+prevent.
+
+**Cross-opt-in constraint.** Combining `trustUpstreamPublishTime: true`
+with an empty `scanBackends` is rejected at apply time
+(`trust_upstream_publish_time_requires_scan_backends`): together they
+collapse the observation window to sweep-tick latency with no scan
+behind it. `hort-server validate-config` catches this offline.
+
+The window is a **timer, never an authority**: release still requires
+this artifact's own `ScanSucceeded` / `ScanWaived`
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)),
+whatever the anchor resolves to.
+
 ---
 
 ## 4b. The two machine-identity kinds

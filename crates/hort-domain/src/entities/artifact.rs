@@ -137,10 +137,15 @@ pub struct Artifact {
     /// derived `Serialize`/`Deserialize`).
     #[serde(default)]
     pub rejection_reason: Option<RejectionReason>,
-    /// Immutable observation-window **anchor** (ADR 0007). The
-    /// resolved window start — `ingested_at` by default, or
-    /// `min(upstream_published_at, ingested_at)` under the per-upstream
-    /// publish-anchoring opt-in. `None` ⇒ not quarantined.
+    /// Immutable observation-window **anchor** (ADR 0007). The resolved
+    /// window start: the earliest defensible evidence of the content's
+    /// age, computed by
+    /// [`derive_quarantine_anchor`](crate::policy::derive_quarantine_anchor)
+    /// as the minimum over the applicable sources — the mint instant, the
+    /// earliest moment hort observed this content in any of its
+    /// repositories, a trusted upstream publish time from this
+    /// repository's own mapping, and the referenced-tree-descendant
+    /// carve-out (ADR 0054). `None` ⇒ not quarantined.
     ///
     /// The window *deadline* is **not stored** — it is computed live as
     /// `quarantine_window_start + duration` (the duration resolved from

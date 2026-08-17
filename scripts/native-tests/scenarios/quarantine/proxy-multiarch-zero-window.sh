@@ -24,7 +24,7 @@
 #
 #   | Artifact                         | Expected quarantine_window_start |
 #   |-----------------------------------|-----------------------------------|
-#   | the INDEX (not a content_references TARGET of anything) | == created_at (full 24h window) |
+#   | the INDEX (not a content_references TARGET of anything) | == the earliest observation of its OWN bytes, `MIN(created_at)` over every `artifacts` row sharing its checksum (ADR 0054) |
 #   | a CHILD MANIFEST (a referenced descendant — the index's `oci_index_member` target) | == created_at - 24h (zero window, #46 Item 2 carve-out) |
 #
 # This proves the #46 Item 2 carve-out fires for PROXY-PULLED trees
@@ -32,6 +32,44 @@
 # push path `quarantine/oci-image-index.sh` already covers), needs no worker,
 # and — per the hollowness trap below — cannot pass no matter what the code
 # does.
+#
+# ---------------------------------------------------------------------------
+# WHY THE INDEX'S EXPECTED ANCHOR IS NOT `created_at` — CROSS-REPOSITORY AGE
+# EVIDENCE IS THE MECHANISM UNDER TEST HERE, NOT AN EXCEPTION TO IT.
+# ---------------------------------------------------------------------------
+# ADR 0054 anchors a non-descendant's window on the earliest DEFENSIBLE
+# EVIDENCE of the content's age, and its primary source is hort's own
+# earliest observation of those exact bytes in ANY of its repositories —
+# `first_seen_for_checksum`, a live `MIN(created_at)` over the `artifacts`
+# rows sharing the checksum, unscoped by repository and unfiltered by
+# `is_deleted` (crates/hort-adapters-postgres/src/artifact_repo.rs). The
+# per-row `created_at` is only the answer when hort holds NO earlier
+# observation.
+#
+# In this suite it does hold one. `scenarios/proxy/oci-mirror.sh` sorts
+# before this file (run.sh walks `find … | sort`, and `proxy/` precedes
+# `quarantine/`) and pulls the SAME alpine:3.19 index through a DIFFERENT
+# repository minutes earlier. So by the time this scenario mints its own
+# row, hort has genuinely observed these bytes already, and the derivation
+# correctly takes that earlier instant — the world has had exactly that much
+# longer to look at them, which is the entire proposition the window proxies.
+# An `== created_at` assertion here encodes the pre-0054 model, in which a
+# fresh row always anchored at `now` unless the descendant carve-out applied;
+# it fails on a correct build the moment another scenario shares the content.
+#
+# The assertion below is therefore stated as the invariant itself: anchor ==
+# `MIN(created_at)` over the index's own checksum. For genuinely cold content
+# that reduces to `created_at` and asserts exactly what the old form did, so
+# nothing is weakened; here it matches the `proxy/oci-mirror.sh` row, and the
+# scenario LOGS which of the two cases it observed. The differential's other
+# half is unaffected: the child's carve-out contributes `minted_at - 24h`,
+# which is the minimum against any observation made minutes ago, so a warm
+# child still anchors at exactly `created_at - 24h`. (Only an observation
+# older than the full 24h window could beat the carve-out — impossible
+# within one compose run, and Step 7 names it if a long-lived stack ever
+# produces one.) That the index did NOT take the carve-out is proven by
+# Step 7: a carve-out anchor is immediately release-eligible, and Step 7
+# asserts the index is not.
 #
 # ---------------------------------------------------------------------------
 # THE HOLLOWNESS TRAP — DO NOT "SIMPLIFY" THIS ONTO oci-mirror-e2e.
@@ -365,15 +403,39 @@ fi
 # non-zero-duration policy to mean anything.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 6: quarantine_window_start differential (the #46 Item 2 gate)"
+log "--- Step 6: quarantine_window_start differential (the #46 Item 2 gate) — index anchored on ADR 0054 age evidence, child on the descendant carve-out"
 
-index_full_window="$(psql_one "SELECT (quarantine_window_start = created_at) FROM artifacts WHERE id = '${INDEX_ID}';")"
-if [ "$index_full_window" = "t" ]; then
-    pass "index: quarantine_window_start == created_at (full 24h window — the index is NOT a content_references target)"
+# The index is not a content_references target, so no carve-out applies and
+# its anchor is ADR 0054's age evidence: the earliest observation of its own
+# bytes anywhere in this hort. Same predicate the server derives from —
+# `MIN(created_at)` over the rows sharing the checksum, no repository scope,
+# no `is_deleted` filter — so a build that scoped the evidence per-repository
+# (or dropped it and fell back to `now`) fails here.
+INDEX_FIRST_SEEN="$(psql_one "SELECT replace(MIN(created_at)::text, ' ', 'T') FROM artifacts WHERE checksum_sha256 = '${INDEX_HASH}';")"
+INDEX_OWN_CREATED="$(psql_one "SELECT replace(created_at::text, ' ', 'T') FROM artifacts WHERE id = '${INDEX_ID}';")"
+INDEX_OBSERVATIONS="$(psql_one "SELECT count(*) FROM artifacts WHERE checksum_sha256 = '${INDEX_HASH}';")"
+log "  index bytes are held by ${INDEX_OBSERVATIONS} artifact row(s) across all repositories"
+log "  earliest observation (first_seen) = ${INDEX_FIRST_SEEN}; this row's created_at = ${INDEX_OWN_CREATED}"
+
+index_anchored_on_evidence="$(psql_one "SELECT (quarantine_window_start = \
+    (SELECT MIN(created_at) FROM artifacts WHERE checksum_sha256 = '${INDEX_HASH}')) \
+    FROM artifacts WHERE id = '${INDEX_ID}';")"
+if [ "$index_anchored_on_evidence" = "t" ]; then
+    if [ "$INDEX_FIRST_SEEN" = "$INDEX_OWN_CREATED" ]; then
+        pass "index: quarantine_window_start == earliest observation of its own bytes — no earlier observation exists, so it reduces to created_at (a full 24h window)"
+    else
+        pass "index: quarantine_window_start == earliest observation of its own bytes, made in ANOTHER repository (ADR 0054 cross-repository age evidence applied — proxy/oci-mirror.sh pulled this same index earlier in the suite)"
+    fi
 else
-    fail "index quarantine_window_start == created_at" "got '${index_full_window}' (expected t)"
+    index_window_start="$(psql_one "SELECT replace(quarantine_window_start::text, ' ', 'T') FROM artifacts WHERE id = '${INDEX_ID}';")"
+    fail "index quarantine_window_start == MIN(created_at) over artifacts sharing checksum ${INDEX_HASH}" \
+        "got '${index_anchored_on_evidence}' (expected t): window_start=${index_window_start} first_seen=${INDEX_FIRST_SEEN} own created_at=${INDEX_OWN_CREATED}"
 fi
 
+# Unchanged by ADR 0054 and deliberately still exact: the carve-out
+# contributes `minted_at - 24h`, which is the minimum against any observation
+# hort could have made during this run, so the child's anchor is that value
+# whether or not its bytes were seen earlier.
 child_zero_window="$(psql_one "SELECT (quarantine_window_start = created_at - interval '24 hours') FROM artifacts WHERE id = '${CHILD_ID}';")"
 if [ "$child_zero_window" = "t" ]; then
     pass "child: quarantine_window_start == created_at - 24h (zero window — the #46 Item 2 referenced-tree-descendant carve-out fired)"
@@ -403,11 +465,20 @@ else
         "got status='${child_status_now}' window_elapsed='${child_window_elapsed}' (expected quarantined+elapsed or released)"
 fi
 
+# Still strict, and it is also what proves the index did not take the
+# descendant carve-out: a carve-out anchor is release-eligible the instant it
+# is stamped. Its anchor is the age evidence Step 6 pinned, which in this
+# suite is minutes old against a 24h window — so the only way this flips is a
+# stack that has held these exact bytes for more than 24h (a long-lived DB
+# volume reused across days), which is a stale-fixture condition, not a
+# regression.
 index_eligible="$(psql_one "SELECT (quarantine_status = 'quarantined' AND quarantine_window_start <= now() - interval '24 hours') FROM artifacts WHERE id = '${INDEX_ID}';")"
 if [ "$index_eligible" = "f" ]; then
     pass "index does NOT satisfy the release-sweep selection predicate (still mid-window)"
 else
-    fail "index does NOT satisfy the release-sweep selection predicate" "got '${index_eligible}' (expected f)"
+    index_anchor_age="$(psql_one "SELECT (now() - quarantine_window_start)::text FROM artifacts WHERE id = '${INDEX_ID}';")"
+    fail "index does NOT satisfy the release-sweep selection predicate" \
+        "got '${index_eligible}' (expected f): its age-evidence anchor is already ${index_anchor_age} old, i.e. hort has held these exact bytes for over 24h — a database volume carried over from an earlier run, not a code defect"
 fi
 
 summary

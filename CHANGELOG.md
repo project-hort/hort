@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The quarantine window is now anchored on the earliest defensible
+  evidence of the content's age**, not on whichever code path happened
+  to mint the repository row. The anchor is the minimum over the ingest
+  instant, hort's own earliest observation of that exact content in any
+  of its repositories (derived live, no new schema), a trusted upstream
+  publish time from *this* repository's own mapping, and the
+  referenced-tree-descendant carve-out. Both minting paths share one
+  derivation, so a pull-through coalesce no longer yields different
+  windows depending on which caller won the dedup race, and content hort
+  has already held for a while is no longer re-held for a full window on
+  registration into a second repository. An upstream claim observed
+  through another repository's mapping never shortens this repository's
+  window. Release authority is unchanged — an artifact still needs its
+  own `ScanSucceeded` / `ScanWaived` (ADR 0054, ADR 0007). (#163)
+
 ### Added
 
 - **OCI membership-edge backfill.** The `oci-membership-edge-backfill`
