@@ -30,12 +30,6 @@ pub mod artifact_lifecycle;
 pub mod artifact_metadata_repo;
 pub mod artifact_repo;
 pub mod claim_mapping_repo;
-// PostgreSQL adapter for the content-level `first_seen_at` age
-// projection (`ContentFirstSeenPort`, ADR 0054). One row per SHA-256
-// content hash holding the minimum over this instance's own ingest
-// observations; the minimum is computed by the upsert's SQL, never by a
-// read-modify-write.
-pub mod content_first_seen;
 // PostgreSQL adapter for the curation decisions listing
 // (`CurationDecisionsRepository`). Event-log scan over the `events`
 // table with per-event-type curator-actor discrimination

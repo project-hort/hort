@@ -17,7 +17,6 @@ pub mod artifact_repository;
 pub mod checkpoint_anchor;
 pub mod checkpoint_emitter;
 pub mod claim_mapping_repository;
-pub mod content_first_seen;
 pub mod content_reference_index;
 // Three curation read-surface ports that `CurationUseCase` holds as
 // `Arc<dyn _>` from construction; the Postgres adapter implements the

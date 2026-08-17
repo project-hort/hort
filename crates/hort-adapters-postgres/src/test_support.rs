@@ -123,19 +123,13 @@ fn now_unix_secs() -> u64 {
 
 /// Create a uniquely-named database (derived from `base_url`: same
 /// host/user/password, fresh dbname) and return a pool connected to it.
-/// The database is **empty**: no migration has been applied to it.
+/// The DB is **empty** — the caller runs its own
+/// `sqlx::migrate!().run()` on the returned pool.
 ///
-/// For tests that must observe a database in a state the full chain
-/// would have already moved past — a migration's own data step, for
-/// instance, which needs pre-migration rows in place before the file it
-/// tests is applied. Such a caller drives the chain itself (typically
-/// by running a version-filtered `Migrator`, seeding, then running the
-/// full set). Every other caller wants [`isolated_db_from`], which is
-/// this function plus the migration run.
-///
-/// Returns `None` on any failure, matching [`isolated_db_from`]'s
-/// self-skip semantics.
-pub async fn isolated_unmigrated_db_from(base_url: &str) -> Option<PgPool> {
+/// Returns `None` on any failure (mirrors the prior
+/// `PgPool::connect(&url).await.ok()?` semantics so the suite stays
+/// green when `DATABASE_URL` is unset / the DB is unreachable).
+pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
     let opts: PgConnectOptions = base_url.parse().ok()?;
     // The epoch segment is load-bearing: `sweep_stale_databases` reads
     // it to age-gate candidates. Keep the `hort_test_<epoch>_<uuid>`
@@ -161,18 +155,7 @@ pub async fn isolated_unmigrated_db_from(base_url: &str) -> Option<PgPool> {
         .ok()?;
     let _ = admin.close().await;
 
-    PgPool::connect_with(opts.database(&db)).await.ok()
-}
-
-/// Create a uniquely-named database (derived from `base_url`: same
-/// host/user/password, fresh dbname), migrate it, and return a pool
-/// connected to it.
-///
-/// Returns `None` on any failure (mirrors the prior
-/// `PgPool::connect(&url).await.ok()?` semantics so the suite stays
-/// green when `DATABASE_URL` is unset / the DB is unreachable).
-pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
-    let pool = isolated_unmigrated_db_from(base_url).await?;
+    let pool = PgPool::connect_with(opts.database(&db)).await.ok()?;
 
     // Migrate here, with a bounded retry. Per-test DB isolation means
     // ~80+ test binaries each `CREATE DATABASE` + run the full

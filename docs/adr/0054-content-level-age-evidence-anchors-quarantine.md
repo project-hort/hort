@@ -100,10 +100,13 @@ outcome of the model, not a weakening of it.
   rather than being patched at each call site.
 - **`min` is order-insensitive**, so the anchor is race-independent by
   construction: observation order cannot change the result.
-- **`first_seen_at` must survive per-row deletion.** Retention and GC remove
-  per-repository rows; the content-level fact must not be derived from live rows
-  or an artifact would lose its age to routine cleanup. It is a projection over
-  ingest observations, in the ADR 0026 sense.
+- **`first_seen_at` is derived, not stored** (amended 2026-08-16 — see the
+  amendment below). It is `MIN(created_at)` over the artifact rows that share the
+  content hash, served by the existing `idx_artifacts_checksum`. The accepted
+  cost is that the evidence does not outlive the rows: once retention purges the
+  last row for a hash, a later re-ingest of the same bytes anchors at that
+  ingest. That direction is conservative — a lost observation can only lengthen a
+  window, never shorten one.
 - **ADR 0016 matrix entry required.** The two-source rule is a new
   operator-influenced input to the release-gate computation and must be
   registered in the cross-opt-in interaction matrix, including its interaction
@@ -113,6 +116,34 @@ outcome of the model, not a weakening of it.
 - **The first-seen source needs no such rejection rule**, because it introduces
   no attacker-asserted input; this asymmetry between the two sources is the
   point of separating them.
+
+## Amendment (2026-08-16) — derive the evidence, do not materialise it
+
+The decision above is unchanged in substance: the anchor is still the earliest
+defensible evidence of the content's age, still the minimum of the applicable
+sources, and the primary source is still hort's own unforgeable observation.
+Only the **mechanism** changed.
+
+The first implementation materialised the fact in a dedicated content-level
+table so it would outlive the per-repository rows. Reviewing what that bought,
+the answer was exactly one property — survival of retention/purge — because
+everything else is available from a live `MIN(created_at)` over the artifact
+rows sharing the hash, on an index that already exists. The materialised form
+additionally required a write path on both minting paths, a `LEAST` upsert whose
+whole purpose was to make concurrent observers converge (a live aggregate has no
+such race), a one-time seed to recover existing history, and a permanently
+growing table.
+
+The maintainer's decision (2026-08-16): the purge-then-re-ingest case does not
+justify a standing table and further migrations. Derive it.
+
+**What is given up, stated plainly.** Content that hort purged and later fetches
+again loses its original age evidence and re-anchors at the new ingest. The
+window it then serves is longer than the truth would require, never shorter, so
+the failure direction is safe; and no attacker gains anything, since the
+alternative sources are unchanged. If that case ever becomes load-bearing, the
+materialised form is the known answer and this amendment is the record of why it
+was not taken now.
 
 ## Alternatives considered
 

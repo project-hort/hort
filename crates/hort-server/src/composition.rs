@@ -16,7 +16,6 @@ use hort_adapters_postgres::artifact_group_repo::PgArtifactGroupRepository;
 use hort_adapters_postgres::artifact_lifecycle::PgArtifactLifecycle;
 use hort_adapters_postgres::artifact_metadata_repo::PgArtifactMetadataRepository;
 use hort_adapters_postgres::artifact_repo::PgArtifactRepository;
-use hort_adapters_postgres::content_first_seen::PgContentFirstSeen;
 use hort_adapters_postgres::curation_decisions_repository::PgCurationDecisionsRepository;
 use hort_adapters_postgres::curation_exclusions_repository::PgCurationExclusionsRepository;
 use hort_adapters_postgres::curation_queue_repository::PgCurationQueueRepository;
@@ -95,7 +94,6 @@ use hort_domain::ports::api_token_cache_invalidator::ApiTokenCacheInvalidator;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::ports::artifact_group_lifecycle::ArtifactGroupLifecyclePort;
 use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
-use hort_domain::ports::content_first_seen::ContentFirstSeenPort;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::ephemeral_store::EphemeralStore;
@@ -1325,12 +1323,6 @@ pub async fn build_app_context(
     let content_references: Arc<dyn ContentReferenceIndex> =
         Arc::new(PgContentReferenceRepo::new(db.clone()));
 
-    // Content-level `first_seen_at` age projection (ADR 0054). Written
-    // by both of `IngestUseCase`'s minting paths; keyed by content hash,
-    // owned by no repository, so the fact outlives every per-repo row.
-    let content_first_seen: Arc<dyn ContentFirstSeenPort> =
-        Arc::new(PgContentFirstSeen::new(db.clone()));
-
     // Per-repo upstream mapping CRUD. Generic;
     // first consumer is OCI multi-upstream mirroring.
     let repository_upstream_mappings: Arc<dyn RepositoryUpstreamMappingRepository> =
@@ -1537,9 +1529,6 @@ pub async fn build_app_context(
             // post-commit projection writes (the artifact lifecycle has
             // already authorised the ingest itself).
             content_references.clone(),
-            // Content-level age projection (ADR 0054) — the post-commit
-            // observation write on both minting paths.
-            content_first_seen.clone(),
             // `policy_projections` (already wired
             // above for `QuarantineUseCase`) drives the ingest-time policy
             // match; `jobs_repo` performs the actual `kind='scan'` insert.

@@ -262,10 +262,9 @@ mod tests {
         use crate::use_cases::ingest_use_case::IngestUseCase;
         use crate::use_cases::test_support::{
             MockArtifactGroupLifecyclePort, MockArtifactGroupRepository, MockArtifactLifecycle,
-            MockArtifactRepository, MockContentFirstSeen, MockContentReferenceIndex,
-            MockCurationRuleRepository, MockEventStore, MockJobsRepository,
-            MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
-            StubFormatHandler,
+            MockArtifactRepository, MockContentReferenceIndex, MockCurationRuleRepository,
+            MockEventStore, MockJobsRepository, MockPolicyProjectionRepository,
+            MockRepositoryRepository, MockStoragePort, StubFormatHandler,
         };
 
         let artifacts = Arc::new(MockArtifactRepository::new());
@@ -293,7 +292,6 @@ mod tests {
             HashMap::new(),
             0,
             content_refs,
-            Arc::new(MockContentFirstSeen::new()),
             policies.clone(),
             jobs,
         ));

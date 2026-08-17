@@ -17,7 +17,6 @@ use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::content_first_seen::ContentFirstSeenPort;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
@@ -524,26 +523,6 @@ pub struct IngestUseCase {
     /// side reconcile sweep catches divergence. We
     /// do NOT abort the ingest on insert failure.
     content_references: Arc<dyn ContentReferenceIndex>,
-    /// Content-level age projection writer (ADR 0054). Both minting
-    /// paths — the full ingest and the by-hash registration — record
-    /// one observation of the artifact's content hash at the instant
-    /// the per-repo row was minted. The port keeps the minimum, so a
-    /// coalesced follower registering already-resident content cannot
-    /// move the instance's age evidence forward, and observation order
-    /// cannot change the stored value.
-    ///
-    /// Held as the raw port handle for the same reason
-    /// [`Self::content_references`] is: this is an unauthorised
-    /// post-commit projection write, and the ingest itself has already
-    /// been authorised by the artifact lifecycle.
-    ///
-    /// Failure here is recoverable and fail-safe in the conservative
-    /// direction: a missing observation can only leave the projected
-    /// first-seen instant LATER than the truth, which lengthens a
-    /// derived quarantine window, never shortens it. Aborting an ingest
-    /// whose `ArtifactIngested` is already durable would be strictly
-    /// worse, so the write warns and continues.
-    first_seen: Arc<dyn ContentFirstSeenPort>,
     /// Ingest-time scan auto-enqueue. When the
     /// inbound artifact's repository matches an active `ScanPolicy`
     /// (repo-scoped takes precedence over `Global`), the ingest path
@@ -624,7 +603,6 @@ impl IngestUseCase {
         metadata_caps: HashMap<String, usize>,
         metadata_blob_max_bytes: usize,
         content_references: Arc<dyn ContentReferenceIndex>,
-        first_seen: Arc<dyn ContentFirstSeenPort>,
         policy_projections: Arc<dyn PolicyProjectionRepository>,
         jobs: Arc<dyn JobsRepository>,
     ) -> Self {
@@ -647,7 +625,6 @@ impl IngestUseCase {
             metadata_caps,
             metadata_blob_max_bytes,
             content_references,
-            first_seen,
             policy_projections,
             jobs,
             // Default empty; the composition root wires the real set via
@@ -686,43 +663,6 @@ impl IngestUseCase {
             values::REPOSITORY_ALL.to_string()
         } else {
             repo_key.unwrap_or(values::REPOSITORY_UNKNOWN).to_string()
-        }
-    }
-
-    /// Record one content-level ingest observation for `artifact`
-    /// (ADR 0054) — the post-commit hook BOTH minting paths run.
-    ///
-    /// The observed instant is `artifact.created_at`, the moment this
-    /// per-repo row was minted, which is precisely "when hort held
-    /// these bytes". The port keeps the minimum across every
-    /// repository of the instance, so the two paths need no ordering
-    /// guarantee between them and a coalesced follower contributes the
-    /// same kind of evidence a leader does.
-    ///
-    /// Shared by both call sites so the fail-safe posture is stated —
-    /// and can only be changed — in one place.
-    ///
-    /// Runs AFTER the artifact transition is durable. A failure is
-    /// logged and swallowed: the artifact is already persisted and
-    /// downloadable, and a missing observation can only make the
-    /// projected first-seen instant LATER than the truth, which
-    /// lengthens a derived quarantine window rather than shortening
-    /// one. Aborting here would trade a conservative gap for a failed
-    /// ingest of already-committed content.
-    async fn record_first_seen(&self, artifact: &Artifact) {
-        if let Err(e) = self
-            .first_seen
-            .observe(&artifact.sha256_checksum, artifact.created_at)
-            .await
-        {
-            tracing::warn!(
-                artifact_id = %artifact.id,
-                content_hash = %artifact.sha256_checksum,
-                error = %e,
-                stage = "content_first_seen_observe",
-                "first-seen observation failed; age evidence may read later than the truth \
-                 (conservative — a derived quarantine window can only lengthen)"
-            );
         }
     }
 
@@ -3185,11 +3125,6 @@ impl IngestUseCase {
             }
         }
 
-        // Content-level age projection write (ADR 0054). Same
-        // post-commit position and same warn-and-continue posture as the
-        // refcount writes above; see `record_first_seen`.
-        self.record_first_seen(&artifact).await;
-
         // PEP 658 wheel-metadata extraction hook.
         //
         // After `ArtifactIngested` lands and the refcount rows are
@@ -4490,15 +4425,6 @@ impl IngestUseCase {
             );
         }
 
-        // Content-level age projection write (ADR 0054). This path
-        // mints a per-repo row over content already resident in CAS, so
-        // its observation is by construction no earlier than the one the
-        // path that first stored the bytes recorded — the port's
-        // minimum keeps that earlier evidence. Recording it anyway is
-        // what makes the two paths symmetric: content whose original
-        // ingest predates this projection gets its first record here.
-        self.record_first_seen(&artifact).await;
-
         tracing::info!(
             %artifact_id,
             %repository_id,
@@ -4888,7 +4814,6 @@ mod tests {
             metadata_caps,
             metadata_blob_max_bytes,
             content_references,
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections,
             jobs,
         );
@@ -4953,7 +4878,6 @@ mod tests {
             HashMap::new(),
             0,
             content_references,
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections,
             jobs,
         );
@@ -5019,7 +4943,6 @@ mod tests {
             HashMap::new(),
             0,
             content_references.clone(),
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections,
             jobs,
         );
@@ -5033,59 +4956,6 @@ mod tests {
             repos,
             content_references,
         )
-    }
-
-    /// Extended helper that hands the [`MockContentFirstSeen`] back so
-    /// tests can assert on the content-level age observations both
-    /// minting paths write (ADR 0054). Mirrors
-    /// [`make_use_case_with_content_refs`] with the first-seen mock in
-    /// the trailing slot, and additionally returns the
-    /// `MockArtifactRepository` because the `register_by_hash` leg needs
-    /// to seed a source artifact.
-    #[allow(clippy::type_complexity)]
-    fn make_use_case_with_first_seen() -> (
-        IngestUseCase,
-        Arc<MockArtifactRepository>,
-        Arc<MockArtifactLifecycle>,
-        Arc<MockRepositoryRepository>,
-        Arc<MockContentFirstSeen>,
-    ) {
-        let artifacts = Arc::new(MockArtifactRepository::new());
-        let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
-        let storage = Arc::new(MockStoragePort::new());
-        let repos = Arc::new(MockRepositoryRepository::new());
-        let groups = Arc::new(MockArtifactGroupRepository::new());
-        let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
-        let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
-        let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
-        let first_seen = Arc::new(MockContentFirstSeen::new());
-
-        // Permissive global policy seed; mirrors
-        // `make_use_case_with_content_refs`.
-        let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
-        seed_permissive_global_policy(&policy_projections);
-        let jobs = Arc::new(MockJobsRepository::default());
-
-        let uc = IngestUseCase::new(
-            storage,
-            lifecycle.clone(),
-            artifacts.clone(),
-            repos.clone(),
-            crate::event_store_publisher::wrap_for_test(events),
-            curation_rules,
-            group_use_case,
-            true,
-            HashMap::new(),
-            0,
-            content_references,
-            first_seen.clone(),
-            policy_projections,
-            jobs,
-        );
-
-        (uc, artifacts, lifecycle, repos, first_seen)
     }
 
     /// Shared `FormatHandler` instance used by all ingest tests that don't
@@ -6208,7 +6078,6 @@ mod tests {
                     HashMap::new(),
                     0,
                     content_references,
-                    Arc::new(MockContentFirstSeen::new()),
                     policy_projections,
                     jobs,
                 );
@@ -6966,205 +6835,6 @@ mod tests {
         });
     }
 
-    // -- content-level first-seen observations (ADR 0054) ---------------------
-    //
-    // Both minting paths record ONE observation of the artifact's
-    // content hash at `artifact.created_at`. The port keeps the minimum,
-    // so the projection holds the earliest instant this instance ever
-    // held those bytes regardless of which path saw them first. Nothing
-    // reads the projection yet — these tests pin the WRITE contract, and
-    // the fail-safe posture of its failure arm.
-
-    /// The full-ingest minting path records an observation at the
-    /// artifact's own mint instant.
-    #[test]
-    fn ingest_records_a_first_seen_observation() {
-        let repo = pypi_repository();
-        let repo_id = repo.id;
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, lifecycle, repos, first_seen) = make_use_case_with_first_seen();
-            repos.insert(repo);
-
-            uc.ingest_direct(
-                req(repo_id),
-                content_stream(b"first-seen-ingest"),
-                &test_handler(),
-            )
-            .await
-            .expect("ingest_direct must succeed");
-
-            let transitions = lifecycle.committed_transitions();
-            let artifact = &transitions[0].0;
-
-            assert_eq!(first_seen.observe_count(), 1, "exactly one observation");
-            assert_eq!(first_seen.entry_count(), 1, "one record per content hash");
-            assert_eq!(
-                first_seen.stored(artifact.sha256_checksum.as_ref()),
-                Some(artifact.created_at),
-                "the observation is the instant the per-repo row was minted"
-            );
-        });
-    }
-
-    /// The by-hash registration path — the coalesced-follower leg —
-    /// records an observation too. This symmetry is the point of the
-    /// decision: a follower minting a row over already-resident CAS
-    /// content must contribute the same kind of evidence a leader does,
-    /// or content whose original ingest predates the projection would
-    /// never acquire a record.
-    #[test]
-    fn register_by_hash_records_a_first_seen_observation() {
-        let target = pypi_repository();
-        let target_id = target.id;
-        let src_id = Uuid::new_v4();
-        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, artifacts, _lifecycle, repos, first_seen) = make_use_case_with_first_seen();
-            repos.insert(target);
-            seed_source_artifact(&artifacts, src_id, EMPTY_HASH, 4242);
-
-            let outcome = uc
-                .register_by_hash(
-                    req_legacy(target_id),
-                    hash.clone(),
-                    Some(src_id),
-                    &test_handler(),
-                )
-                .await
-                .expect("register_by_hash must succeed");
-
-            assert_eq!(first_seen.observe_count(), 1, "exactly one observation");
-            assert_eq!(
-                first_seen.stored(hash.as_ref()),
-                Some(outcome.artifact.created_at),
-                "the observation is the instant the per-repo row was minted"
-            );
-        });
-    }
-
-    /// The acceptance criterion at the use-case layer: the same content
-    /// minted into two repositories through the two DIFFERENT paths
-    /// leaves ONE record, holding the EARLIER of the two observations.
-    /// The later observation must not move it forward.
-    #[test]
-    fn two_minting_paths_leave_one_record_at_the_earlier_instant() {
-        let first_repo = pypi_repository();
-        let first_repo_id = first_repo.id;
-        let second_repo = {
-            let mut r = pypi_repository();
-            r.id = Uuid::new_v4();
-            r.key = format!("second-{}", r.id.simple());
-            r
-        };
-        let second_repo_id = second_repo.id;
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, artifacts, lifecycle, repos, first_seen) = make_use_case_with_first_seen();
-            repos.insert(first_repo);
-            repos.insert(second_repo);
-
-            // Leg 1 — the full ingest that stores the bytes.
-            uc.ingest_direct(
-                req(first_repo_id),
-                content_stream(b"shared-content"),
-                &test_handler(),
-            )
-            .await
-            .expect("ingest_direct must succeed");
-            let hash = lifecycle.committed_transitions()[0]
-                .0
-                .sha256_checksum
-                .clone();
-            let first_instant = first_seen
-                .stored(hash.as_ref())
-                .expect("the first ingest recorded an observation");
-
-            // Leg 2 — a later registration of the SAME bytes into a
-            // different repository. Its own observation is by
-            // construction no earlier than leg 1's.
-            seed_source_artifact(&artifacts, first_repo_id, hash.as_ref(), 14);
-            let second = uc
-                .register_by_hash(
-                    req_legacy(second_repo_id),
-                    hash.clone(),
-                    Some(first_repo_id),
-                    &test_handler(),
-                )
-                .await
-                .expect("register_by_hash must succeed");
-
-            assert_eq!(first_seen.observe_count(), 2, "both paths wrote");
-            assert_eq!(
-                first_seen.entry_count(),
-                1,
-                "one record per content hash, not one per repository"
-            );
-            assert_eq!(
-                first_seen.stored(hash.as_ref()),
-                Some(first_instant),
-                "the later observation must not move the record forward"
-            );
-            assert!(
-                first_instant <= second.artifact.created_at,
-                "sanity: leg 2 observed no earlier than leg 1"
-            );
-        });
-    }
-
-    /// A failed observation on the ingest path is logged and swallowed:
-    /// the `ArtifactIngested` is already durable, and a missing record
-    /// can only make a derived first-seen instant LATER than the truth
-    /// — which lengthens a quarantine window rather than shortening one.
-    /// Aborting here would fail an ingest of already-committed content
-    /// to avoid a conservative gap.
-    #[test]
-    fn first_seen_failure_does_not_abort_the_ingest() {
-        let repo = pypi_repository();
-        let repo_id = repo.id;
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, lifecycle, repos, first_seen) = make_use_case_with_first_seen();
-            repos.insert(repo);
-            first_seen.fail_next_observe(DomainError::Invariant("projection down".into()));
-
-            uc.ingest_direct(
-                req(repo_id),
-                content_stream(b"first-seen-failure"),
-                &test_handler(),
-            )
-            .await
-            .expect("a failed age observation must not fail the ingest");
-
-            assert_eq!(first_seen.observe_count(), 1, "the write was attempted");
-            assert_eq!(first_seen.entry_count(), 0, "and it did not land");
-            // The artifact itself committed regardless.
-            assert!(!lifecycle.committed_transitions().is_empty());
-        });
-    }
-
-    /// Same fail-safe posture on the by-hash registration path.
-    #[test]
-    fn first_seen_failure_does_not_abort_register_by_hash() {
-        let target = pypi_repository();
-        let target_id = target.id;
-        let src_id = Uuid::new_v4();
-        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, artifacts, _lifecycle, repos, first_seen) = make_use_case_with_first_seen();
-            repos.insert(target);
-            seed_source_artifact(&artifacts, src_id, EMPTY_HASH, 4242);
-            first_seen.fail_next_observe(DomainError::Invariant("projection down".into()));
-
-            uc.register_by_hash(req_legacy(target_id), hash, Some(src_id), &test_handler())
-                .await
-                .expect("a failed age observation must not fail the registration");
-
-            assert_eq!(first_seen.observe_count(), 1, "the write was attempted");
-            assert_eq!(first_seen.entry_count(), 0, "and it did not land");
-        });
-    }
-
     // -- content_references refcount writes -----------------------------------
     //
     // Every successful `ArtifactIngested` writes one `kind =
@@ -7729,7 +7399,6 @@ mod tests {
                     HashMap::new(),
                     0,
                     content_references,
-                    Arc::new(MockContentFirstSeen::new()),
                     policy_projections,
                     jobs,
                 );
@@ -12684,7 +12353,6 @@ mod tests {
             HashMap::new(),
             0,
             content_references.clone(),
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections.clone(),
             jobs.clone(),
         );
@@ -13254,7 +12922,6 @@ mod tests {
             HashMap::new(),
             0,
             content_references,
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections.clone(),
             jobs.clone(),
         )
@@ -13304,7 +12971,6 @@ mod tests {
             HashMap::new(),
             0,
             content_references,
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections.clone(),
             jobs.clone(),
         )
@@ -14056,7 +13722,6 @@ mod tests {
             HashMap::new(),
             0,
             content_references.clone(),
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections.clone(),
             jobs,
         )
@@ -14797,7 +14462,6 @@ mod tests {
             HashMap::new(),
             0,
             content_references,
-            Arc::new(MockContentFirstSeen::new()),
             policy_projections.clone(),
             jobs.clone(),
         )
