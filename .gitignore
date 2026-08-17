@@ -107,3 +107,8 @@ docs/superpowers/
 
 # Alpha-testing local environment (see scripts/alpha-fixtures/setup-alpha-env.sh)
 .alpha-venv/
+
+# Agent coordination channel — directives, reports, state. Never committed:
+# it is scratch, and a bulk untracked-file operation (git clean -fd) must not
+# be able to delete it, which ignoring it also prevents.
+handover/
