@@ -123,6 +123,13 @@ pub struct MockArtifactRepository {
     /// [`find_oci_image_manifests_without_kind`](ArtifactRepository::find_oci_image_manifests_without_kind).
     /// Mirrors [`Self::pypi_wheels_without_kind_filter`] one-for-one.
     oci_image_manifests_without_kind_filter: Mutex<Option<std::collections::HashSet<Uuid>>>,
+    /// FIFO of injected errors for
+    /// [`first_seen_for_checksum`](ArtifactRepository::first_seen_for_checksum).
+    /// Each call pops the front and returns it verbatim. Used to pin the
+    /// fail-safe posture of the quarantine-anchor derivation: a failed
+    /// age-evidence read must fall back on the mint instant (a full
+    /// window), never on an invented earlier instant.
+    first_seen_errors: Mutex<std::collections::VecDeque<DomainError>>,
 }
 
 impl MockArtifactRepository {
@@ -133,7 +140,16 @@ impl MockArtifactRepository {
             active_policy_filter: Mutex::new(HashMap::new()),
             pypi_wheels_without_kind_filter: Mutex::new(None),
             oci_image_manifests_without_kind_filter: Mutex::new(None),
+            first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Arm the next
+    /// [`first_seen_for_checksum`](ArtifactRepository::first_seen_for_checksum)
+    /// call to fail with `err`. Queued, so a test can arm several
+    /// consecutive failures.
+    pub fn fail_next_first_seen(&self, err: DomainError) {
+        self.first_seen_errors.lock().unwrap().push_back(err);
     }
 
     /// Pin the allowlist that
@@ -320,6 +336,30 @@ impl ArtifactRepository for MockArtifactRepository {
             .values()
             .find(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
             .cloned();
+        Box::pin(async move { Ok(result) })
+    }
+
+    /// Mirrors the adapter's `MIN(created_at) WHERE checksum_sha256 = $1`
+    /// faithfully: unscoped by repository, and **including soft-deleted
+    /// rows** — a soft-delete withdraws a row from service without
+    /// un-observing the bytes. Tests that need "hort has never seen this
+    /// content" simply do not seed a row for the hash.
+    fn first_seen_for_checksum(
+        &self,
+        sha256: &ContentHash,
+    ) -> BoxFut<'_, DomainResult<Option<DateTime<Utc>>>> {
+        if let Some(err) = self.first_seen_errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        let sha = sha256.as_ref().to_string();
+        let result = self
+            .artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.sha256_checksum.as_ref() == sha)
+            .map(|a| a.created_at)
+            .min();
         Box::pin(async move { Ok(result) })
     }
 

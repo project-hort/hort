@@ -507,9 +507,30 @@ done
 log ""
 log "--- Step 7: quarantine_window_start — index full window, constituents zero window"
 
+# `== created_at` is the FULL-window expectation only while these bytes are
+# COLD to this hort. ADR 0054 anchors a non-descendant on the earliest
+# observation of its own content across ALL repositories
+# (`first_seen_for_checksum`, a live `MIN(created_at)` over the rows sharing
+# the checksum), and `created_at` is that minimum only when no earlier
+# observation exists. redis:7-alpine is this suite's only user of this image
+# — no other scenario pulls it, and this repository is its own fixture — so
+# the precondition holds; it is asserted rather than assumed, because a
+# future scenario pulling redis:7-alpine would otherwise turn a correct
+# derivation into an unexplained failure of the line below. (The
+# cross-repository warm case is covered deliberately, by
+# quarantine/proxy-multiarch-zero-window.sh's index, whose bytes proxy/
+# oci-mirror.sh pulls earlier in the same run.)
+index_is_cold="$(psql_one "SELECT (created_at = (SELECT MIN(created_at) FROM artifacts WHERE checksum_sha256 = '${INDEX_HASH}')) FROM artifacts WHERE id = '${INDEX_ID}';")"
+if [ "$index_is_cold" = "t" ]; then
+    pass "index bytes are cold: this row IS hort's earliest observation of checksum ${INDEX_HASH} (so a full window anchors at created_at)"
+else
+    fail "index bytes are cold (this row is the earliest observation of its checksum)" \
+        "got '${index_is_cold}' (expected t) — another repository already held ${IMAGE}'s index, so ADR 0054 correctly anchors this row on that earlier observation; this scenario needs cold content, so give it a fixture image no other scenario pulls"
+fi
+
 index_full_window="$(psql_one "SELECT (quarantine_window_start = created_at) FROM artifacts WHERE id = '${INDEX_ID}';")"
 if [ "$index_full_window" = "t" ]; then
-    pass "index: quarantine_window_start == created_at (full window — not a content_references target)"
+    pass "index: quarantine_window_start == created_at (full window — not a content_references target, and no earlier observation to anchor on)"
 else
     fail "index quarantine_window_start == created_at" "got '${index_full_window}' (expected t)"
 fi
@@ -523,6 +544,10 @@ fi
 # logic the application layer already owns — out of scope for a scenario
 # script to reimplement).
 QUARANTINE_DURATION_SQL="interval '120 seconds'"
+# Exact, not a bound: the carve-out contributes `minted_at - duration`, and
+# ADR 0054's other sources cannot beat it here — the constituents are pulled
+# seconds before this step, so any age evidence for them is far younger than
+# the 120s window.
 assert_zero_window() {
     local id="$1" label="$2" got
     got="$(psql_one "SELECT (quarantine_window_start = created_at - ${QUARANTINE_DURATION_SQL}) FROM artifacts WHERE id = '${id}';")"

@@ -14,6 +14,9 @@ use hort_domain::events::{
     IngestSource, ScanRequested, StreamId,
 };
 use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
+use hort_domain::policy::quarantine_anchor::{
+    derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
+};
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -91,6 +94,10 @@ pub struct IngestRequest {
     /// `ScanPolicy.quarantineDuration` or
     /// [`DefaultPolicy::quarantine_duration_secs`]). The override is
     /// scoped to `register_by_hash`'s seed-import cutover only.
+    ///
+    /// Precedence is **absolute**: an explicit anchor short-circuits the
+    /// derived minimum entirely and is never overridden by a derived
+    /// value, in either direction (ADR 0054).
     ///
     /// `None` for every non-seed-import caller (OCI cross-mount,
     /// `ingest_verified_sha256_published`,
@@ -382,6 +389,37 @@ fn actor_to_uploaded_by(actor: &ApiActor) -> Option<Uuid> {
         None
     } else {
         Some(actor.user_id)
+    }
+}
+
+/// Read the live content-level age evidence for `sha256` — the earliest
+/// moment hort itself observed these bytes in any of its own repositories
+/// (ADR 0054). One indexed `MIN(created_at)` per quarantining mint; both
+/// minting paths call it so they cannot derive different anchors for the
+/// same content.
+///
+/// **Fail-safe**: a port error resolves to `None`, exactly as "hort holds
+/// no such observation" does. The two are deliberately indistinguishable
+/// to the caller, because they warrant the same answer — the derivation
+/// falls back on the mint instant and holds the content for a full window.
+/// Inventing an earlier instant for content whose age hort cannot vouch
+/// for would shorten a security window on no evidence; standing on the
+/// mint instant can only hold content longer than the truth justifies.
+async fn read_content_age_evidence(
+    artifacts: &dyn ArtifactRepository,
+    sha256: &ContentHash,
+) -> Option<DateTime<Utc>> {
+    match artifacts.first_seen_for_checksum(sha256).await {
+        Ok(evidence) => evidence,
+        Err(e) => {
+            tracing::warn!(
+                sha256 = %sha256,
+                error = %e,
+                "content age-evidence read failed; anchoring the quarantine window on \
+                 the mint instant (a full window, never a shorter one)"
+            );
+            None
+        }
     }
 }
 
@@ -1868,15 +1906,16 @@ impl IngestUseCase {
         // verified-ingest call sites that constructed `IngestRequest`
         // pass the value extracted from `VerifiedIngestRequest` here.
         // `ingest_inner` writes it onto `Artifact.upstream_published_at`
-        // before `commit_transition`. `None` ⇒ ingest-anchored
-        // (publish-anchoring is gated on the per-
-        // upstream opt-in flag).
+        // before `commit_transition`, unconditionally and audit-only.
+        // Whether it also becomes a candidate in the quarantine-anchor
+        // minimum is gated on the per-upstream opt-in flag below.
         upstream_published_at: Option<DateTime<Utc>>,
         // Serving `RepositoryUpstreamMapping`'s
         // `trust_upstream_publish_time` flag. Threaded into
-        // `ingest_inner` which gates the publish-anchored quarantine
-        // resolution on it. Direct uploads pass `false`; pull-through
-        // paths pass the mapping's value.
+        // `ingest_inner`, which admits `upstream_published_at` into the
+        // quarantine-anchor derivation only when it is `true`. Direct
+        // uploads pass `false`; pull-through paths pass the mapping's
+        // value.
         trust_upstream_publish_time: bool,
     ) -> AppResult<IngestOutcome> {
         let IngestRequest {
@@ -2319,27 +2358,34 @@ impl IngestUseCase {
         verification: Option<VerificationContext>,
         // Best-effort upstream publish timestamp.
         // Stamped onto `Artifact.upstream_published_at` (audit only)
-        // before `commit_transition`; recorded
-        // unconditionally. The quarantine-window anchor stays
-        // `ingested_at` unless
-        // the anchor flips to `min(upstream_published_at, ingested_at)`
-        // when the serving mapping's `trust_upstream_publish_time`
-        // opt-in (`trust_upstream_publish_time` below) is `true`.
+        // before `commit_transition`; recorded unconditionally —
+        // recording an untrusted, clearly-labelled value is not trusting
+        // it. Whether it also enters the quarantine-anchor derivation is
+        // gated on `trust_upstream_publish_time` below.
         upstream_published_at: Option<DateTime<Utc>>,
         // Serving `RepositoryUpstreamMapping`'s
-        // `trust_upstream_publish_time` opt-in. Gates the
-        // publish-anchored quarantine resolution below:
+        // `trust_upstream_publish_time` opt-in — THIS repository's own
+        // mapping. Gates whether `upstream_published_at` becomes a
+        // candidate in the quarantine-anchor minimum below (ADR 0054):
         //
         // - `false` (direct upload OR pull-through with the flag off):
-        //   `quarantine_window_start = ingested_at`.
-        // - `true` AND `upstream_published_at.is_some()`:
-        //   `quarantine_window_start = min(upstream_published_at, ingested_at)`
-        //   — the `min` is the future-skew clamp: a claimed
-        //   publish time *after* ingest is physically impossible, so a
-        //   buggy/malicious upstream cannot extend its own quarantine
-        //   into the future via the opt-in.
-        // - `true` AND `upstream_published_at.is_none()`: best-effort
-        //   degrades to `ingested_at` (no hint, no anchor flip).
+        //   the upstream assertion is not a candidate at all. The
+        //   anchor still derives from the remaining sources — notably
+        //   hort's own earlier observation of this content, which needs
+        //   no opt-in.
+        // - `true` AND `upstream_published_at.is_some()`: the value
+        //   joins the minimum, future-skew-clamped to the ingest instant
+        //   first (a claimed publish time *after* ingest is physically
+        //   impossible, so a buggy/malicious upstream cannot extend its
+        //   own quarantine into the future via the opt-in). It can move
+        //   the anchor earlier, never later.
+        // - `true` AND `upstream_published_at.is_none()`: nothing to
+        //   contribute; best-effort, no candidate.
+        //
+        // Passing `None` when the flag is off is the WHOLE of the
+        // "does not transit repositories" rule — the derivation has no
+        // other channel for an upstream assertion, and takes no
+        // repository identity with which to reach for one.
         //
         // Direct uploads always pass `false` from the inbound HTTP
         // adapter (no serving mapping in scope), so this single flag
@@ -2894,12 +2940,11 @@ impl IngestUseCase {
             .map(|p| p.quarantine_duration_secs)
             .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
 
-        // `Some((anchor, anchor_clamp_fired, is_referenced_descendant,
-        // publish_anchored))` iff this ingest quarantines. Threaded to the
-        // post-commit observability block further down — the transition
-        // itself lands atomically with `ArtifactIngested` in the single
-        // commit below; only the logs/metrics fire late.
-        let mut quarantine_fired: Option<(DateTime<Utc>, bool, bool, bool)> = None;
+        // `Some(derived_anchor)` iff this ingest quarantines. Threaded to
+        // the post-commit observability block further down — the
+        // transition itself lands atomically with `ArtifactIngested` in
+        // the single commit below; only the logs/metrics fire late.
+        let mut quarantine_fired: Option<DerivedAnchor> = None;
 
         if effective_duration_secs > 0 {
             // Referenced-tree descendant zero-window carve-out (#46 Item
@@ -2935,13 +2980,42 @@ impl IngestUseCase {
             .await;
 
             // Resolve the quarantine-window anchor
-            // (`quarantine_window_start`). Three cases:
+            // (`quarantine_window_start`) as the MINIMUM of the
+            // applicable age sources (ADR 0054), in the one shared pure
+            // function `register_by_hash_inner` also calls — which is
+            // what makes the two minting paths derive identically. Every
+            // source is a "the world has already had this long to look"
+            // argument, so the honest composition is the earliest
+            // deadline any applicable rule would set on its own; see
+            // `hort_domain::policy::quarantine_anchor` for the full
+            // rationale, including why the descendant carve-out composes
+            // rather than overrides.
             //
-            // - **Referenced-tree descendant** (checked first —
-            //   supersedes the opt-in below) — anchor = `ingested_at -
-            //   effective_duration`, so the live-computed deadline
-            //   (`anchor + duration`) equals `ingested_at` exactly: a
-            //   zero-length window. The RELEASE PREDICATE is completely
+            // The sources assembled here:
+            //
+            // - The ingest instant, unconditional — so a missing or
+            //   unreadable source degrades to a FULL window, never a
+            //   shorter one.
+            // - The live content-level age evidence: the earliest moment
+            //   hort observed these bytes in ANY of its own repositories.
+            //   An observation hort generates itself, so it needs no
+            //   operator opt-in — an upstream claim can be backdated, an
+            //   observation cannot.
+            // - The upstream publish hint, but ONLY when the serving
+            //   `RepositoryUpstreamMapping` — THIS repository's own
+            //   mapping — has `trust_upstream_publish_time` enabled. The
+            //   opt-in is a per-mapping trust statement and does not
+            //   transit repositories: passing `None` when the flag is off
+            //   is the whole of that rule, because the derivation has no
+            //   other channel for an upstream assertion. An unfiltered
+            //   minimum over every repository's claims would let a
+            //   repository proxying an untrusted mirror shorten the
+            //   window of one proxying the genuine upstream — the ADR
+            //   0016 cross-opt-in collapse pattern, in the weakening
+            //   direction.
+            // - The referenced-tree-descendant carve-out's
+            //   `ingested_at - effective_duration`, i.e. a window that is
+            //   already over. The RELEASE PREDICATE is completely
             //   unchanged (`Artifact::release` still requires its own
             //   `ScanSucceeded`/`ScanWaived` authority — ADR 0007's two
             //   impossible failure modes stay impossible); this only
@@ -2952,18 +3026,6 @@ impl IngestUseCase {
             //   observation (§4a: no in-window rescan exists, so the
             //   window is pure latency for every artifact, not
             //   protection).
-            // - **Opt-in fired** — the serving `RepositoryUpstreamMapping`
-            //   has `trust_upstream_publish_time = true` AND the format
-            //   adapter extracted a non-`None` `upstream_published_at`:
-            //   anchor = `min(upstream_published_at, ingested_at)`. The
-            //   `min` is the **future-skew clamp** — a claimed
-            //   publish time *after* ingest is physically impossible, so
-            //   a buggy/malicious upstream cannot extend its own
-            //   quarantine into the future via the opt-in.
-            // - **Default** — anchor = `ingested_at` (the ingest anchor).
-            //   Covers: opt-in `false`, direct upload (always passes
-            //   `false`), pull-through with no extractable publish
-            //   hint, and a `None` payload value.
             //
             // Invariant: store the **anchor**, never a precomputed
             // deadline. The release sweep and the proxy-503 read
@@ -2972,33 +3034,24 @@ impl IngestUseCase {
             // later policy edit of `quarantineDuration` takes effect on
             // the existing artifact's window without a backfill
             // migration.
-            let (anchor, anchor_clamp_fired): (DateTime<Utc>, bool) = if is_referenced_descendant {
-                (
-                    now - chrono::Duration::seconds(effective_duration_secs),
-                    false,
+            let derived = derive_quarantine_anchor(&AnchorEvidence {
+                minted_at: now,
+                window: chrono::Duration::seconds(effective_duration_secs),
+                // `ingest_inner` never carries the seed-import override
+                // (the request field is destructured away above and
+                // threaded to `register_by_hash` instead).
+                explicit_override: None,
+                first_seen_at: read_content_age_evidence(
+                    &*self.artifacts,
+                    &artifact.sha256_checksum,
                 )
-            } else if trust_upstream_publish_time {
-                match upstream_published_at {
-                    Some(upstream_ts) => {
-                        let clamped = std::cmp::min(upstream_ts, now);
-                        (clamped, upstream_ts > now)
-                    }
-                    // Opt-in is on, but the format couldn't extract a
-                    // hint for this artifact — best-effort degrades
-                    // to the ingest anchor.
-                    None => (now, false),
-                }
-            } else {
-                (now, false)
-            };
-
-            // `is_referenced_descendant` supersedes the opt-in above, so
-            // it must also supersede this flag — the anchor did not come
-            // from `upstream_published_at` on that path, even if the
-            // opt-in happens to also be configured for this repo.
-            let publish_anchored = !is_referenced_descendant
-                && trust_upstream_publish_time
-                && upstream_published_at.is_some();
+                .await,
+                trusted_upstream_published_at: trust_upstream_publish_time
+                    .then_some(upstream_published_at)
+                    .flatten(),
+                is_referenced_descendant,
+            });
+            let anchor = derived.anchor;
 
             let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
                 (
@@ -3011,12 +3064,7 @@ impl IngestUseCase {
                 quarantine_event,
             )));
 
-            quarantine_fired = Some((
-                anchor,
-                anchor_clamp_fired,
-                is_referenced_descendant,
-                publish_anchored,
-            ));
+            quarantine_fired = Some(derived);
         }
 
         let mut enqueues: Vec<IngestEnqueue> = Vec::new();
@@ -3359,8 +3407,11 @@ impl IngestUseCase {
         // quarantine-decision block before that commit (issue #90). Only
         // the logs/metrics fire here, gated on whether that decision
         // actually quarantined (`Some`).
-        if let Some((anchor, anchor_clamp_fired, is_referenced_descendant, publish_anchored)) =
-            quarantine_fired
+        if let Some(DerivedAnchor {
+            anchor,
+            source: anchor_source,
+            upstream_clamp_fired,
+        }) = quarantine_fired
         {
             // Observability for the default-policy fire.
             // Operator-policy-driven quarantines retain their existing
@@ -3392,38 +3443,48 @@ impl IngestUseCase {
                 );
             }
 
-            // Distinct log line on the publish-anchored
-            // fire (`trust_upstream_publish_time = true` + a non-`None`
-            // `upstream_published_at` consumed). Emitted at `debug!` —
-            // the value is rare per-artifact but can be high-volume on
-            // busy upstreams; the policy-source log lines above already
-            // carry the (resolved) `anchor` for the default observability
-            // dashboard. `anchor_source = "upstream_published"` reserves
-            // the anchor-source axis; the unchanged ingest-anchored
-            // path emits no such log (anchor_source = "ingest"
-            // implicitly).
-            if publish_anchored {
-                tracing::debug!(
+            // Distinct log line whenever a source OTHER than the ingest
+            // instant won the minimum. Emitted at `debug!` — the value is
+            // rare per-artifact but can be high-volume on busy upstreams;
+            // the policy-source log lines above already carry the
+            // (resolved) `anchor` for the default observability
+            // dashboard. `anchor_source` is the axis: the ingest-anchored
+            // path stays silent (`anchor_source = "ingest"` implicitly),
+            // and each competing source reserves a value on it.
+            //
+            // The axis now reports which source WON the minimum, not
+            // merely which one was applicable — with a minimum, several
+            // can apply at once and only one decides. `upstream_clamp_fired`
+            // is reported independently, because a claimed publish time
+            // after the ingest instant is an operator signal about the
+            // upstream whether or not the clamped value went on to win.
+            match anchor_source {
+                AnchorSource::Mint | AnchorSource::Override => {}
+                AnchorSource::FirstSeen => tracing::debug!(
+                    %artifact_id,
+                    %repository_id,
+                    ingested_at = %now,
+                    chosen_anchor = %anchor,
+                    anchor_source = "content_first_seen",
+                    "quarantine anchor resolved via hort's own earlier observation of this \
+                     content (release still requires this artifact's own \
+                     ScanSucceeded/ScanWaived)"
+                ),
+                AnchorSource::TrustedUpstreamPublish => tracing::debug!(
                     %artifact_id,
                     %repository_id,
                     upstream_published_at = ?upstream_published_at,
                     ingested_at = %now,
                     chosen_anchor = %anchor,
-                    clamp_fired = anchor_clamp_fired,
+                    clamp_fired = upstream_clamp_fired,
                     anchor_source = "upstream_published",
                     "quarantine anchor resolved via upstream publish time \
                      (trust_upstream_publish_time opt-in)"
-                );
-            }
-
-            // Distinct log line on the referenced-tree-descendant
-            // zero-window fire (#46 Item 2). `anchor_source =
-            // "referenced_descendant"` reserves a third value on the
-            // same axis as `"upstream_published"` / implicit `"ingest"`.
-            // The release predicate is untouched — this only records
-            // that the *window*, not the *release authority*, collapsed.
-            if is_referenced_descendant {
-                tracing::debug!(
+                ),
+                // The referenced-tree-descendant zero-window fire. The
+                // release predicate is untouched — this only records that
+                // the *window*, not the *release authority*, collapsed.
+                AnchorSource::ReferencedDescendant => tracing::debug!(
                     %artifact_id,
                     %repository_id,
                     ingested_at = %now,
@@ -3433,6 +3494,20 @@ impl IngestUseCase {
                     "quarantine window collapsed to zero: artifact is a content_references \
                      target of an already-ingested manifest/index (#46 Item 2 scoped carve-out; \
                      release still requires this artifact's own ScanSucceeded/ScanWaived)"
+                ),
+            }
+
+            // A future-dated upstream claim is worth surfacing on its own
+            // axis: it says the upstream's clock or its metadata is wrong,
+            // regardless of which source ended up anchoring the window.
+            if upstream_clamp_fired {
+                tracing::debug!(
+                    %artifact_id,
+                    %repository_id,
+                    upstream_published_at = ?upstream_published_at,
+                    ingested_at = %now,
+                    "trusted upstream publish time claimed an instant after ingest and was \
+                     clamped; it cannot extend this artifact's quarantine into the future"
                 );
             }
 
@@ -4163,37 +4238,39 @@ impl IngestUseCase {
         //    `effective_duration_secs` — EXACT same derivations as
         //    `ingest_inner` (~lines 2739, 2787, 2826).
         // 3. `effective_duration_secs > 0`: transition `None ->
-        //    Quarantined`. The anchor resolves in strict precedence
-        //    order:
+        //    Quarantined`, anchoring the window through the SAME shared
+        //    `derive_quarantine_anchor` `ingest_inner` calls, over the
+        //    same sources (ADR 0054). An explicit
+        //    `quarantine_anchor_override` — the seed-import cutover's
+        //    backdated anchor — short-circuits it and wins absolutely;
+        //    otherwise the anchor is the minimum of the registration
+        //    instant, the live content-level age evidence, and the
+        //    referenced-tree-descendant carve-out's `now -
+        //    effective_duration`. The carve-out uses the same shared
+        //    predicate and lookup
+        //    (`resolve_referenced_tree_descendant_fail_safe`) with the
+        //    same fail-safe-on-lookup-error posture (a failed lookup
+        //    degrades to "not a descendant" = the full window, never the
+        //    zero window).
         //
-        //    a. `quarantine_anchor_override` — the seed-import cutover's
-        //       backdated anchor — wins absolutely. An explicit anchor is
-        //       never overridden by the carve-out below.
-        //    b. Otherwise the SAME referenced-tree-descendant zero-window
-        //       carve-out `ingest_inner` applies: same shared predicate
-        //       and lookup (`resolve_referenced_tree_descendant_fail_safe`),
-        //       same fail-safe-on-lookup-error posture (a failed lookup
-        //       degrades to "not a descendant" = the full window, never
-        //       the zero window), same back-dating by
-        //       `effective_duration_secs` so the live-computed deadline
-        //       equals the registration instant.
-        //    c. Otherwise `now`.
+        //    Sharing the derivation is what makes the invariant hold:
+        //    one artifact in one repository gets ONE quarantine window,
+        //    whether its row was minted by `ingest_inner` (the leader of
+        //    a pull-through coalesce), by a coalesced follower
+        //    re-registering here, or by a cross-repo mount. Both inputs
+        //    are caller-independent — the carve-out is TOPOLOGY-based
+        //    ("is this content already a `content_references` target of
+        //    some other already-ingested artifact in THIS repo") and the
+        //    age evidence is content-level. Anything caller-dependent
+        //    would make the hold depend on which racer won the dedup.
         //
-        //    The carve-out is TOPOLOGY-based — "is this content already a
-        //    `content_references` target of some other already-ingested
-        //    artifact in THIS repo" — and therefore caller-independent by
-        //    construction. That is the invariant: one artifact in one
-        //    repository gets ONE quarantine window, whether its row was
-        //    minted by `ingest_inner` (the leader of a pull-through
-        //    coalesce), by a coalesced follower re-registering here, or by
-        //    a cross-repo mount. Anything caller-dependent would make a
-        //    descendant's hold depend on which racer won the dedup.
-        //
-        //    The `trust_upstream_publish_time` clamp deliberately does NOT
-        //    apply on this path: it mints a per-repo row over content
-        //    already in CAS with no upstream fetch, so there is no
-        //    publish-time hint to clamp (`upstream_published_at` is `None`
-        //    on both the row and the event, above).
+        //    The trusted-upstream source is absent on this path: it mints
+        //    a per-repo row over content already in CAS with no upstream
+        //    fetch, so there is no publish-time hint in scope
+        //    (`upstream_published_at` is `None` on both the row and the
+        //    event, above). Reaching for the value the LEADER observed
+        //    through ITS mapping is exactly the cross-repository transit
+        //    the model forbids.
         //    `effective_duration_secs == 0` (operator permissive
         //    opt-out): skip the quarantine transition — the artifact
         //    stays `None`/downloadable — but `ScanRequested` +
@@ -4272,37 +4349,64 @@ impl IngestUseCase {
             .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
 
         let quarantined = effective_duration_secs > 0;
-        // Threaded to the gate log below so an operator can tell a
-        // zero-window descendant registration from a full-window one
-        // without reconstructing the reference set.
-        let mut is_referenced_descendant = false;
+        // Threaded to the gate log below so an operator can tell WHICH
+        // source anchored the window without reconstructing the evidence.
+        let mut anchor_source = AnchorSource::Mint;
         let mut events: Vec<EventToAppend> = Vec::new();
         if quarantined {
-            let anchor = match quarantine_anchor_override {
-                // (a) explicit seed anchor — absolute precedence.
-                Some(seed_anchor) => seed_anchor,
-                None => {
-                    // (b) the descendant carve-out, evaluated exactly as
-                    // `ingest_inner` evaluates it. Like there, the lookup
-                    // cannot match this registration's OWN
-                    // `primary_content` row — that is written post-commit,
-                    // below — so it only ever sees edges written by OTHER,
-                    // already-ingested artifacts.
-                    is_referenced_descendant = resolve_referenced_tree_descendant_fail_safe(
+            // The descendant carve-out, evaluated exactly as
+            // `ingest_inner` evaluates it. Like there, the lookup cannot
+            // match this registration's OWN `primary_content` row — that
+            // is written post-commit, below — so it only ever sees edges
+            // written by OTHER, already-ingested artifacts.
+            //
+            // Both probes are skipped entirely when an explicit anchor is
+            // supplied: the override wins absolutely, so they could only
+            // spend two round-trips on values nothing reads.
+            let (is_referenced_descendant, first_seen_at) = match quarantine_anchor_override {
+                Some(_) => (false, None),
+                None => (
+                    resolve_referenced_tree_descendant_fail_safe(
                         &*self.content_references,
                         repository_id,
                         artifact_id,
                         &artifact.sha256_checksum,
                     )
-                    .await;
-                    if is_referenced_descendant {
-                        now - chrono::Duration::seconds(effective_duration_secs)
-                    } else {
-                        // (c) the ordinary registration anchor.
-                        now
-                    }
-                }
+                    .await,
+                    read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum).await,
+                ),
             };
+
+            // The SAME derivation `ingest_inner` runs, over the same
+            // sources — which is what makes the leader/follower asymmetry
+            // disappear as a property of the model rather than as a patch
+            // at each call site. A follower minting its row over
+            // already-resident CAS content reads the same content-level
+            // age evidence the leader read, so the two agree on the
+            // anchor whichever of them won the dedup race.
+            //
+            // `trusted_upstream_published_at` is unconditionally `None`
+            // here: this path mints a per-repo row over content already
+            // in CAS with no upstream fetch, so there is no publish-time
+            // hint in scope (`upstream_published_at` is `None` on both
+            // the row and the event, above). Reaching for the value the
+            // LEADER observed through ITS repository's mapping is exactly
+            // the transit this model forbids — the opt-in is a per-mapping
+            // trust statement, and an untrusted mirror's claim must not
+            // shorten a repository proxying the genuine upstream.
+            let derived = derive_quarantine_anchor(&AnchorEvidence {
+                minted_at: now,
+                window: chrono::Duration::seconds(effective_duration_secs),
+                // The seed-import cutover's backdated anchor. Absolute
+                // precedence: an explicit anchor is never overridden by a
+                // derived one, in either direction.
+                explicit_override: quarantine_anchor_override,
+                first_seen_at,
+                trusted_upstream_published_at: None,
+                is_referenced_descendant,
+            });
+            let anchor = derived.anchor;
+            anchor_source = derived.source;
             let quarantine_event =
                 artifact
                     .quarantine(anchor)
@@ -4378,7 +4482,7 @@ impl IngestUseCase {
                 %artifact_id,
                 trigger_source,
                 quarantined,
-                is_referenced_descendant,
+                anchor_source = ?anchor_source,
                 scan_will_run,
                 provenance_will_run,
                 "register_by_hash: quarantine/scan/provenance gate resolved"
@@ -11032,6 +11136,389 @@ mod tests {
                 })
                 .expect("ArtifactQuarantined must be on the stream");
             assert_eq!(q_event.quarantine_window_start, anchor);
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR 0054 — the anchor is the minimum over the applicable age
+    // sources, derived live
+    //
+    // The primary source is hort's own earliest observation of the
+    // content (`MIN(created_at)` over the artifact rows sharing the hash,
+    // read through `ArtifactRepository::first_seen_for_checksum`). These
+    // tests pin the properties the model rests on: that the observation
+    // moves the anchor, that BOTH minting paths derive the same anchor
+    // from it, that a trusted upstream claim never transits repositories,
+    // that a seed-import anchor still wins absolutely, and that missing
+    // or unreadable evidence lengthens the window rather than shortening
+    // it. The pure composition rules (clamping, tie-breaks, `min`
+    // ordering) are pinned exhaustively in
+    // `hort_domain::policy::quarantine_anchor`; these are the wiring.
+    // ---------------------------------------------------------------------
+
+    /// Seed one PRIOR observation of `sha256_hex` — an artifact row in
+    /// some OTHER repository, created at `observed_at`, optionally
+    /// carrying the upstream publish time that repository recorded.
+    ///
+    /// `upstream_published_at` is the load-bearing parameter for the
+    /// non-transit test below: it models a repository whose own mapping
+    /// had `trust_upstream_publish_time` enabled and which therefore
+    /// stored an upstream-asserted (hence attacker-influenceable) value
+    /// on its row.
+    fn seed_prior_observation(
+        artifacts: &MockArtifactRepository,
+        sha256_hex: &str,
+        observed_at: DateTime<Utc>,
+        upstream_published_at: Option<DateTime<Utc>>,
+    ) {
+        let mut a = sample_artifact(QuarantineStatus::Released);
+        a.repository_id = Uuid::new_v4();
+        a.path = format!("elsewhere/{}.tar.gz", a.id);
+        a.sha256_checksum = sha256_hex.parse().unwrap();
+        a.created_at = observed_at;
+        a.upstream_published_at = upstream_published_at;
+        artifacts.insert(a);
+    }
+
+    /// Build the ProtocolNative request the tests below ingest through,
+    /// varying only the two publish-time knobs.
+    fn native_req(
+        repo_id: Uuid,
+        upstream_digest: ContentHash,
+        upstream_published_at: Option<DateTime<Utc>>,
+        trust_upstream_publish_time: bool,
+    ) -> VerifiedIngestRequest {
+        VerifiedIngestRequest::ProtocolNative {
+            repository_id: repo_id,
+            coords: sample_coords(),
+            content_type: "application/octet-stream".into(),
+            actor: api_actor(),
+            payload_metadata: serde_json::Value::Null,
+            upstream_digest,
+            upstream_published_at,
+            trust_upstream_publish_time,
+        }
+    }
+
+    /// hort saw these exact bytes 30 days ago in another repository, so
+    /// the ecosystem has already had 30 days to look at them: the anchor
+    /// is that observation, not this ingest instant. No opt-in is
+    /// involved — the evidence is hort's own, and an observation cannot
+    /// be backdated the way an upstream claim can.
+    #[test]
+    fn ingest_anchors_on_horts_own_earlier_observation_of_the_content() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"already-seen-bytes";
+        let hash_hex = sha256_of(content);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, lifecycle, _storage, repos, _policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+
+            let observed_at = Utc::now() - chrono::Duration::days(30);
+            seed_prior_observation(&artifacts, &hash_hex, observed_at, None);
+
+            let artifact = uc
+                .ingest_verified(
+                    native_req(repo_id, hash_hex.parse().unwrap(), None, false),
+                    content_stream(content),
+                    &test_handler(),
+                )
+                .await
+                .expect("verified ingest must succeed")
+                .artifact;
+
+            assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+            assert_eq!(
+                artifact.quarantine_window_start,
+                Some(observed_at),
+                "the anchor is hort's own earliest observation of this content"
+            );
+
+            // The persisted event carries the same anchor — that is what
+            // the release sweep and the scan fast-path actually read.
+            let transitions = lifecycle.committed_transitions();
+            let q_event = transitions
+                .iter()
+                .flat_map(|(_a, batch, _m)| batch.events.iter())
+                .find_map(|e| match &e.event {
+                    DomainEvent::ArtifactQuarantined(q) => Some(q),
+                    _ => None,
+                })
+                .expect("ArtifactQuarantined must be on the stream");
+            assert_eq!(q_event.quarantine_window_start, observed_at);
+        });
+    }
+
+    /// **The second source never transits repositories.**
+    ///
+    /// Another repository proxying an untrusted mirror recorded an
+    /// upstream-asserted publish time five years in the past on its row
+    /// for this content — the forged-old-metadata case
+    /// `trust_upstream_publish_time` is a per-mapping opt-in to bound in
+    /// the first place. That claim must not reach THIS repository's
+    /// anchor, whatever this repository's own opt-in says: the anchor
+    /// here is hort's own observation of the content, which is 30 days
+    /// old, not five years.
+    ///
+    /// Both settings of this repository's own flag are asserted. With it
+    /// off the rule is obvious; with it ON is the sharp case — an
+    /// implementation that reached for "any trusted upstream value known
+    /// for this hash" instead of "the value THIS request's own mapping
+    /// supplied" would pass the off-case and fail here. That collapse is
+    /// the ADR 0016 cross-opt-in pattern in the weakening direction: a
+    /// repository proxying an untrusted mirror would shorten the window
+    /// of one proxying the genuine upstream.
+    #[test]
+    fn another_repositorys_upstream_claim_never_reaches_this_repositorys_anchor() {
+        let content: &[u8] = b"claimed-ancient-bytes";
+        let hash_hex = sha256_of(content);
+
+        for own_opt_in in [false, true] {
+            let repo = pypi_repository();
+            let repo_id = repo.id;
+
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, artifacts, _lifecycle, _storage, repos, _policies, _jobs) =
+                    make_scan_gated_use_case();
+                repos.insert(repo);
+
+                let observed_at = Utc::now() - chrono::Duration::days(30);
+                let forged_publish_time = Utc::now() - chrono::Duration::days(365 * 5);
+                seed_prior_observation(
+                    &artifacts,
+                    &hash_hex,
+                    observed_at,
+                    Some(forged_publish_time),
+                );
+
+                let artifact = uc
+                    .ingest_verified(
+                        // This request supplies NO publish-time hint of
+                        // its own — the only such value anywhere in the
+                        // instance is the other repository's.
+                        native_req(repo_id, hash_hex.parse().unwrap(), None, own_opt_in),
+                        content_stream(content),
+                        &test_handler(),
+                    )
+                    .await
+                    .expect("verified ingest must succeed")
+                    .artifact;
+
+                assert_eq!(
+                    artifact.quarantine_window_start,
+                    Some(observed_at),
+                    "own opt-in = {own_opt_in}: the anchor is hort's own observation, \
+                     never another repository's upstream claim"
+                );
+            });
+        }
+    }
+
+    /// **Both minting paths derive one anchor.** The leader ingests the
+    /// bytes into one repository; a follower registers the very same CAS
+    /// content into another. They read the same age evidence through the
+    /// same derivation, so they agree — the leader/follower asymmetry
+    /// disappears as a property of the model rather than being patched at
+    /// each call site.
+    #[test]
+    fn both_minting_paths_derive_the_same_anchor_for_the_same_content() {
+        let leader_repo = pypi_repository();
+        let leader_repo_id = leader_repo.id;
+        let follower_repo = pypi_repository();
+        let follower_repo_id = follower_repo.id;
+        let content: &[u8] = b"coalesced-content-bytes";
+        let hash_hex = sha256_of(content);
+        let hash: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _lifecycle, _storage, repos, _policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(leader_repo);
+            repos.insert(follower_repo);
+
+            let observed_at = Utc::now() - chrono::Duration::days(30);
+            seed_prior_observation(&artifacts, &hash_hex, observed_at, None);
+
+            // Leg 1: `ingest_inner`, via the pull-through verified path.
+            let leader = uc
+                .ingest_verified(
+                    native_req(leader_repo_id, hash.clone(), None, false),
+                    content_stream(content),
+                    &test_handler(),
+                )
+                .await
+                .expect("leader ingest must succeed")
+                .artifact;
+
+            // Leg 2: `register_by_hash_inner`, over the CAS content the
+            // leader just stored.
+            let follower = uc
+                .register_existing_cas_blob(recb_req(follower_repo_id, hash), &test_handler())
+                .await
+                .expect("follower registration must succeed")
+                .artifact;
+
+            assert_eq!(
+                leader.quarantine_window_start, follower.quarantine_window_start,
+                "one content, one anchor — whichever path minted the row"
+            );
+            assert_eq!(
+                follower.quarantine_window_start,
+                Some(observed_at),
+                "and that anchor is the shared age evidence, not either path's mint instant"
+            );
+        });
+    }
+
+    /// **Seed-import precedence is absolute.** The cutover supplies an
+    /// explicit backdated anchor; age evidence five years older exists
+    /// for the same content. The explicit anchor stands — a derived
+    /// value never overrides it, in either direction.
+    #[test]
+    fn a_seed_import_anchor_is_never_overridden_by_derived_age_evidence() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _lifecycle, storage, repos, _policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            storage.insert_content(hash.clone(), b"seed-bytes".to_vec());
+            seed_prior_observation(
+                &artifacts,
+                hash.as_ref(),
+                Utc::now() - chrono::Duration::days(365 * 5),
+                None,
+            );
+
+            let seed_anchor = Utc::now() - chrono::Duration::seconds(90_000);
+            let artifact = uc
+                .register_existing_cas_blob(
+                    RegisterExistingCasBlobRequest {
+                        seed_import_quarantine_anchor: Some(seed_anchor),
+                        ..recb_req(repo_id, hash)
+                    },
+                    &test_handler(),
+                )
+                .await
+                .expect("seed cutover must succeed")
+                .artifact;
+
+            assert_eq!(
+                artifact.quarantine_window_start,
+                Some(seed_anchor),
+                "an explicit seed anchor wins absolutely over any derived value"
+            );
+        });
+    }
+
+    /// **A failed age-evidence read lengthens the window, never shortens
+    /// it.** The port errors; the derivation falls back on the ingest
+    /// instant and holds the content for a full window, even though
+    /// evidence of a 30-day-old observation exists and would have
+    /// collapsed it. "The read failed" and "hort has no such
+    /// observation" resolve identically on purpose — inventing an
+    /// earlier instant for content whose age hort cannot vouch for would
+    /// shorten a security window on no evidence.
+    #[test]
+    fn a_failed_age_evidence_read_falls_back_on_the_ingest_instant() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"unreadable-evidence-bytes";
+        let hash_hex = sha256_of(content);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _lifecycle, _storage, repos, _policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            seed_prior_observation(
+                &artifacts,
+                &hash_hex,
+                Utc::now() - chrono::Duration::days(30),
+                None,
+            );
+            artifacts.fail_next_first_seen(DomainError::Invariant("db timeout".into()));
+
+            let before = Utc::now();
+            let artifact = uc
+                .ingest_verified(
+                    native_req(repo_id, hash_hex.parse().unwrap(), None, false),
+                    content_stream(content),
+                    &test_handler(),
+                )
+                .await
+                .expect("an evidence-read failure must never abort the ingest")
+                .artifact;
+            let after = Utc::now();
+
+            let anchor = artifact
+                .quarantine_window_start
+                .expect("the artifact still quarantines");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a failed evidence read must anchor on the ingest instant \
+                 ({before:?} .. {after:?}) — a FULL window; got {anchor:?}"
+            );
+        });
+    }
+
+    /// **The descendant carve-out composes by `min`, it does not
+    /// override.** This artifact is both a referenced-tree descendant
+    /// (which alone would set a zero-length window, i.e. an anchor one
+    /// full duration back) and content hort observed far earlier still.
+    /// The earlier source keeps its earlier deadline: both are "shorten
+    /// the window" arguments, so the honest composition is the earliest
+    /// deadline any applicable rule would set on its own. An override
+    /// model would silently LENGTHEN the window relative to a rule that
+    /// already applied.
+    #[test]
+    fn an_earlier_observation_composes_with_the_descendant_carve_out() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"descendant-and-long-known-bytes";
+        let hash_hex = sha256_of(content);
+        let target_hash: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+
+            // An already-ingested parent references this hash — the
+            // carve-out applies.
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: Uuid::new_v4(),
+                    target_content_hash: target_hash,
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            // …and hort saw the content 30 days ago, far earlier than the
+            // carve-out's one-duration backdate (the default window is
+            // 24h).
+            let observed_at = Utc::now() - chrono::Duration::days(30);
+            seed_prior_observation(&artifacts, &hash_hex, observed_at, None);
+
+            let artifact = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("direct ingest must succeed")
+                .artifact;
+
+            assert_eq!(
+                artifact.quarantine_window_start,
+                Some(observed_at),
+                "the earliest applicable rule wins; the carve-out does not override it"
+            );
         });
     }
 

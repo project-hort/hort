@@ -1,12 +1,19 @@
 # 0054 — Content-level age evidence anchors the quarantine window
 
-- **Status:** Proposed
-- **Enforced by:** not yet mechanised — this ADR records the decision; the
-  `first_seen_at` projection, the anchor derivation, and the second-source rule
-  are implemented under the issue this ADR governs. Until that lands, the
-  implemented behaviour is the one this ADR replaces (per-row anchoring at
-  ingest time, optional upstream publish time under
-  `RepositoryUpstreamMapping.trust_upstream_publish_time`).
+- **Status:** Accepted
+- **Enforced by:** `hort_domain::policy::quarantine_anchor::derive_quarantine_anchor`
+  — the pure minimum over the applicable age sources, called by BOTH minting
+  paths (`IngestUseCase::ingest_inner` and
+  `IngestUseCase::register_by_hash_inner`), which is what makes the
+  leader/follower asymmetry a property of the model rather than a per-call-site
+  patch. The age evidence is read live through
+  `ArtifactRepository::first_seen_for_checksum` (`MIN(created_at)` over the
+  artifact rows sharing the hash, on the pre-existing `idx_artifacts_checksum`);
+  there is no projection table and no migration. The second-source scoping rule
+  is structural: `derive_quarantine_anchor` takes no repository identity and
+  holds no mapping table, so a trusted upstream value can only enter through the
+  caller that owns this repository's own mapping. Its cross-opt-in entry is in
+  [0016](0016-cross-opt-in-interaction-matrix.md).
 - **Supersedes:** —
 - **Relates:** [0007](0007-fail-closed-quarantine-release-predicate.md) (the
   quarantine window and the fail-closed release predicate this anchors),
