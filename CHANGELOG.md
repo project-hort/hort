@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (operators): the server and worker Deployment selectors now
+  carry an `app.kubernetes.io/component` discriminator.** Previously both
+  Deployments' `spec.selector.matchLabels` matched each other's pods, so
+  the `hort-server` Service could route to worker pods and a PodDisruption
+  Budget could count the wrong workload. `spec.selector` is immutable
+  after create, so **`helm upgrade` fails against an existing release**
+  with a `spec.selector is immutable` error. This is a one-time step per
+  install; a fresh install needs no action. The chart README documents
+  three migration paths — delete-then-upgrade, `--cascade=orphan`
+  re-adoption for zero-downtime-sensitive installs, and a suspend/resume
+  sequence for Flux-managed installs. (#159)
+
 - **The quarantine window is now anchored on the earliest defensible
   evidence of the content's age**, not on whichever code path happened
   to mint the repository row. The anchor is the minimum over the ingest
@@ -47,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through another repository's mapping never shortens this repository's
   window. Release authority is unchanged — an artifact still needs its
   own `ScanSucceeded` / `ScanWaived` (ADR 0054, ADR 0007). (#163)
+
+- **The zero-window quarantine carve-out now applies on the registration
+  path as well as on ingest.** A referenced-tree descendant registered by
+  content hash previously got a full quarantine window even though its
+  parent's carve-out already applied to the same content, so the two
+  minting paths disagreed about the same artifact. Both paths now share
+  the carve-out decision. (#161)
 
 ### Added
 
