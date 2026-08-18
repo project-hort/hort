@@ -1,0 +1,29 @@
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  # Dedicated to scripts/native-tests/scenarios/proxy/pull-dedup.sh, which
+  # needs BOTH legs of a cross-repository blob coalesce to start cold. Reusing
+  # npm-public would couple the scenario to whatever other scenarios already
+  # pulled through that mirror: a package already resident in the repo is
+  # served straight from CAS and never enters PullDedup at all, so the
+  # leader leg would silently stop being a leader.
+  name: npm-dedup-leader-e2e
+spec:
+  name: "npm pull-dedup — leader repository"
+  description: "Proxy npm repo that takes the LEADER leg of the cross-repository blob coalesce in scripts/native-tests/scenarios/proxy/pull-dedup.sh. Pairs with npm-dedup-follower-e2e; both proxy registry.npmjs.org so the same tarball's `dist.integrity` SRI yields the same cross-repository DedupKey::blob_by_hash."
+  format: npm
+  type: proxy
+  # Serve never-ingested upstream versions in the index so a cold repo can
+  # bootstrap its first pull-through (same rationale as npm-public).
+  indexMode: include_pending
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/npm-dedup-leader-e2e
+  proxy:
+    # Validator-only field; the runtime resolves the upstream through the
+    # standalone UpstreamMapping envelope in ../upstreams/.
+    upstreamUrl: "https://registry.npmjs.org"
+  isPublic: true
+  # local_only: the scenario asserts exact upstream-fetch deltas, so this
+  # repo must never generate background replication traffic of its own.
+  replicationPriority: local_only

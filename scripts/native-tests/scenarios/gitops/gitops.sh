@@ -77,7 +77,8 @@ log "--> example-config repos resolve via GET /api/v1/admin/repositories/<key> w
 ADMIN_TOKEN="$(fetch_token admin admin)"
 [ -n "$ADMIN_TOKEN" ] || fail "fetch admin token" "empty response from Keycloak"
 
-EXPECTED_KEYS=("npm-public" "pypi-internal" "all-npm" "pypi-e2e" "cargo-e2e" "npm-e2e" "oci-e2e" "oci-mirror-e2e")
+EXPECTED_KEYS=("npm-public" "pypi-internal" "all-npm" "pypi-e2e" "cargo-e2e" "npm-e2e" "oci-e2e" "oci-mirror-e2e"
+               "npm-dedup-leader-e2e" "npm-dedup-follower-e2e")
 for key in "${EXPECTED_KEYS[@]}"; do
     body=$(mktemp)
     status=$(curl -sS -o "$body" -w '%{http_code}' \

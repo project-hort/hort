@@ -50,8 +50,10 @@ scenario_requires() { sed -n 's/^# requires:[[:space:]]*//p' "$1" | head -1; }
 
 # quarantine reason -> the `# quarantine:` line if present. A quarantined scenario
 # is reported QUARANTINED and NOT run, and does NOT fail the gate — for a scenario
-# whose own assertions are known-wrong/under-rework so it can't gate CI yet (e.g.
-# proxy/pull-dedup). Remove the header once the scenario is fixed.
+# whose own assertions are known-wrong/under-rework so it can't gate CI yet.
+# It is a temporary state with a named owner, never a resting place: an
+# unexpiring quarantine means that scenario's coverage silently does not exist.
+# Remove the header once the scenario is fixed.
 scenario_quarantine() { sed -n 's/^# quarantine:[[:space:]]*//p' "$1" | head -1; }
 
 # What the chosen mode provides (egress probed at run time in Task 5).
@@ -359,10 +361,17 @@ run_one() {  # group name path
   # provenance scenario switches to the /v2/auth token dance under
   # `native-tokens`). External mode: set it in the environment to match the
   # external stack's posture.
+  # HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS: forwarded verbatim (empty when the
+  # operator has not set it, so the scenario falls back to the same default the
+  # server parses). The coalescing scenario times its drive against that
+  # window; forwarding the variable under its real name means an operator who
+  # retunes the server can point the scenario at the same value instead of
+  # editing an assertion.
   docker run --rm --add-host=host.docker.internal:host-gateway "${NET_ARGS[@]}" \
     -e HORT_URL="$IN_HORT" -e KEYCLOAK_URL="$IN_KC" -e METRICS_URL="$IN_METRICS" \
     -e METRICS_TOKEN="$IN_METRICS_TOKEN" \
     -e HORT_DB_DSN="$DB_DSN" \
+    -e HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS="${HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS:-}" \
     -e HORT_COMPOSE_OVERLAYS="${OVERLAYS[*]:-${HORT_COMPOSE_OVERLAYS:-}}" \
     -v "$SCRIPT_DIR":/work:ro -e FIXTURES=/work/fixtures \
     "$IMAGE" bash "/work/$rel"

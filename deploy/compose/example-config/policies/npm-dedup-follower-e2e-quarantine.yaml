@@ -1,0 +1,19 @@
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: npm-dedup-follower-e2e-quarantine
+spec:
+  # The follower half of the matched pair — see
+  # npm-dedup-leader-e2e-quarantine.yaml for the full rationale. Every field
+  # below must stay identical to that file's: the scenario compares the two
+  # repositories' quarantine anchors against each other, and a divergence
+  # here would turn a real parity assertion into a comparison of unlike
+  # policies.
+  scope:
+    repository: npm-dedup-follower-e2e
+  severityThreshold: critical
+  quarantineDuration: 24h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}
