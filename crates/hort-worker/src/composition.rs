@@ -340,6 +340,7 @@ pub async fn build_app_context(
         // — see `OsvAdvisoryConfig::default`).
         let mut acfg = OsvAdvisoryConfig {
             osv_batch_url: cfg.advisory_osv_url.clone(),
+            osv_vulns_url: cfg.advisory_osv_vulns_url.clone(),
             bulk_url: cfg.advisory_osv_bulk_url.clone(),
             ..OsvAdvisoryConfig::default()
         };

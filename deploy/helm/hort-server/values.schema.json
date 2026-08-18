@@ -1149,7 +1149,12 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "osvUrl": {"type": "string", "minLength": 1}
+            "osvUrl": {"type": "string", "minLength": 1},
+            "osvVulnsUrl": {
+              "description": "OSV.dev single-record endpoint, source of the CVSS vector severity derivation reads. Mirror-coupled with osvUrl: pointing osvUrl at an internal mirror while this stays on the public default makes severity derivation depend on egress to api.osv.dev, and without that egress every advisory degrades to Critical.",
+              "type": "string",
+              "minLength": 1
+            }
           }
         },
         "provenance": {

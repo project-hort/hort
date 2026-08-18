@@ -219,6 +219,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "hort-server.fullname" . }}-worker-config
                   key: HORT_ADVISORY_OSV_API_URL
+            - name: HORT_ADVISORY_OSV_VULNS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "hort-server.fullname" . }}-worker-config
+                  key: HORT_ADVISORY_OSV_VULNS_URL
             - name: HORT_SCANNER_POLL_INTERVAL_SECS
               valueFrom:
                 configMapKeyRef:

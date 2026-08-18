@@ -54,6 +54,24 @@ as pre-scan enrichment. `pull_diff_since` pulls the per-ecosystem OSV
 bulk archives and powers the advisory watch (below); it never runs
 inside a scan.
 
+`querybatch` answers only *which* advisories affect a package: every
+entry it returns carries an `id` and a `modified` timestamp and nothing
+else — no CVSS vector, no severity label, no affected ranges. Deriving
+severity straight off that record finds no signal and lands on the
+fail-closed `Critical` with a NULL score for every advisory, which both
+defeats `severityThreshold` filtering and lets the enrichment finding
+outrank a correctly-scored scanner finding in the dedup merge. `query`
+therefore resolves each **distinct** advisory id to its full
+`/v1/vulns/{id}` record before building findings
+(`crates/hort-adapters-advisory-osv/src/hydrate.rs`,
+`HORT_ADVISORY_OSV_VULNS_URL`). Hydrated records are cached on
+`(id, modified)` — `modified` is exactly the invalidation signal
+`querybatch` hands back, so a record is re-fetched only when OSV changed
+it. Hydration is best-effort like the enrichment around it: a failure
+degrades that one advisory to unscored (hence `Critical`, per SUP-4) and
+ticks `hort_advisory_hydration_total{result="failed"}` rather than
+failing the scan.
+
 Backend selection is policy data, not deployment config. The
 orchestrator resolves the active `ScanPolicy` (repository-scoped wins
 over global) and reads its `scan_backends` list

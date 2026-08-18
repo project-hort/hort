@@ -2574,6 +2574,55 @@ pub fn emit_advisory_query(result: AdvisoryQueryResult) {
     .increment(1);
 }
 
+/// Outcome label of `hort_advisory_hydration_total`.
+/// Closed taxonomy of 3 — every distinct outcome of resolving one
+/// advisory id to its full OSV record maps to exactly one variant.
+///
+/// This counter is deliberately separate from
+/// [`AdvisoryQueryResult`]: that one is per *component*, this one is
+/// per *advisory id*. Folding them together would make the cache-hit
+/// ratio on either dimension unreadable.
+///
+/// String values are normative — they appear verbatim in
+/// `docs/metrics-catalog.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryHydrationResult {
+    /// The `(id, modified)` pair was already in the `EphemeralStore`
+    /// cache — no `/v1/vulns/{id}` request fired.
+    CacheHit,
+    /// The full record was fetched from `/v1/vulns/{id}` and parsed.
+    Fetched,
+    /// Hydration failed (network, non-2xx, malformed body, or an id
+    /// whose shape is unsafe to interpolate into a URL). The finding
+    /// falls back to the abbreviated `querybatch` record, which carries
+    /// no severity and therefore fails closed to `Critical`. A
+    /// sustained non-zero rate here means severity derivation is
+    /// degraded, not that scans are failing.
+    Failed,
+}
+
+impl AdvisoryHydrationResult {
+    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
+    /// exactly.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::Fetched => "fetched",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Emit `hort_advisory_hydration_total{result}` once per distinct
+/// advisory id resolved (or attempted) during one advisory query.
+pub fn emit_advisory_hydration(result: AdvisoryHydrationResult) {
+    metrics::counter!(
+        "hort_advisory_hydration_total",
+        labels::RESULT => result.as_str(),
+    )
+    .increment(1);
+}
+
 /// Outcome label of `hort_sbom_extraction_total`. Closed
 /// taxonomy of 3 — `FormatHandler::extract_sbom` lands on exactly one
 /// per dispatch.
@@ -5879,6 +5928,58 @@ mod tests {
             .map(super::AdvisoryQueryResult::as_str)
             .collect();
         assert_eq!(set.len(), variants.len());
+    }
+
+    // -- AdvisoryHydrationResult ------------------------------------------
+
+    #[test]
+    fn advisory_hydration_result_as_str_values() {
+        assert_eq!(
+            super::AdvisoryHydrationResult::CacheHit.as_str(),
+            "cache_hit"
+        );
+        assert_eq!(super::AdvisoryHydrationResult::Fetched.as_str(), "fetched");
+        assert_eq!(super::AdvisoryHydrationResult::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn advisory_hydration_result_values_are_unique() {
+        let variants = [
+            super::AdvisoryHydrationResult::CacheHit,
+            super::AdvisoryHydrationResult::Fetched,
+            super::AdvisoryHydrationResult::Failed,
+        ];
+        let set: HashSet<&'static str> = variants
+            .iter()
+            .map(super::AdvisoryHydrationResult::as_str)
+            .collect();
+        assert_eq!(set.len(), variants.len());
+    }
+
+    #[test]
+    fn emit_advisory_hydration_increments_counter_with_result_label() {
+        let snap = capture_metrics(|| {
+            super::emit_advisory_hydration(super::AdvisoryHydrationResult::Failed);
+        });
+        let entries = snap.into_vec();
+        let (key, _, _, value) = entries
+            .iter()
+            .find(|(k, _, _, _)| k.key().name() == "hort_advisory_hydration_total")
+            .expect("hort_advisory_hydration_total must fire");
+        let labels: std::collections::HashMap<&str, &str> =
+            key.key().labels().map(|l| (l.key(), l.value())).collect();
+        assert_eq!(labels.get("result"), Some(&"failed"));
+        match value {
+            metrics_util::debugging::DebugValue::Counter(v) => assert_eq!(*v, 1),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+        // Per-advisory identifiers must never become labels.
+        for forbidden in ["vulnerability_id", "purl", "artifact_id"] {
+            assert!(
+                !labels.contains_key(forbidden),
+                "forbidden label `{forbidden}` must not appear"
+            );
+        }
     }
 
     #[test]

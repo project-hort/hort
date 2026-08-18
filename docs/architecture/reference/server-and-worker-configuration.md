@@ -624,6 +624,7 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 | `HORT_SCANNER_OSV_BIN` | path | `osv-scanner` | No | osv-scanner binary path/name. |
 | `HORT_ADVISORY_OSV_API_URL` | URL | `https://api.osv.dev/v1/querybatch` | No | OSV per-component `querybatch` endpoint. |
 | `HORT_ADVISORY_OSV_BULK_URL` | URL | `https://osv-vulnerabilities.storage.googleapis.com` | No | Base URL for per-ecosystem OSV bulk archives (advisory-watch tick). |
+| `HORT_ADVISORY_OSV_VULNS_URL` | URL | `https://api.osv.dev/v1/vulns` | No | Base URL of the OSV single-record endpoint. `querybatch` returns only `id` + `modified`, so each advisory id is resolved against `<this>/<id>` to recover the CVSS vector before severity is derived; a failure degrades that advisory to unscored (hence `Critical`) and ticks `hort_advisory_hydration_total{result="failed"}`. Point it at the same mirror as `HORT_ADVISORY_OSV_API_URL`. |
 | `HORT_ADVISORY_WATCH_ECOSYSTEMS` | CSV | _unset → built-in 8: `npm, PyPI, crates.io, Maven, Go, RubyGems, NuGet, Packagist`_ | No | Per-tick ecosystem labels for the advisory watch. |
 | `HORT_REDIS_URL_EVICTABLE` | string | _unset → in-memory cache (warn; single-process)_ | No | Evictable Redis URL for the OSV advisory cache. |
 
