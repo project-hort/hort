@@ -170,7 +170,7 @@ the result instead.
 | stringprep | 0.1.5 | MIT | https://github.com/sfackler/rust-stringprep |
 | arc-swap | 1.9.2 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
-| h2 | 0.4.14 | MIT | https://github.com/hyperium/h2 |
+| h2 | 0.4.16 | MIT | https://github.com/hyperium/h2 |
 | http | 1.5.0 | MIT | https://github.com/hyperium/http |
 | tokio-rustls | 0.26.4 | MIT | https://github.com/rustls/tokio-rustls |
 | signal-hook-registry | 1.4.8 | MIT | https://github.com/vorner/signal-hook |
@@ -8083,7 +8083,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### h2 0.4.14 — MIT
+### h2 0.4.16 — MIT
 
 Repository: https://github.com/hyperium/h2
 
