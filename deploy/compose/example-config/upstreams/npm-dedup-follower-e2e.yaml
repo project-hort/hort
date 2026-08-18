@@ -1,0 +1,15 @@
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  # Separate mapping from npm-dedup-leader-e2e's even though the upstream URL
+  # is identical: metadata coalescing (DedupKey::metadata) and the packument
+  # projection cache are BOTH keyed per repository/mapping, so each repo
+  # fetches its own packument. Only the blob keyspace
+  # (DedupKey::blob_by_hash) is shared, which is exactly the leg under test.
+  name: npm-dedup-follower-e2e
+spec:
+  repository: npm-dedup-follower-e2e
+  pathPrefix: ""
+  upstreamUrl: https://registry.npmjs.org
+  auth:
+    type: anonymous

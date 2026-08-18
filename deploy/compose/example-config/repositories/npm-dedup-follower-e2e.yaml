@@ -1,0 +1,23 @@
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  # Second repository of the cross-repository coalesce pair — see
+  # npm-dedup-leader-e2e.yaml for why the pair is dedicated rather than
+  # reusing npm-public.
+  name: npm-dedup-follower-e2e
+spec:
+  name: "npm pull-dedup — follower repository"
+  description: "Proxy npm repo that takes the FOLLOWER leg of the cross-repository blob coalesce in scripts/native-tests/scenarios/proxy/pull-dedup.sh. Its tarball pull finds the leader's terminal success record on the shared DedupKey::blob_by_hash keyspace and mints its own per-repo row via register_existing_cas_blob instead of re-fetching upstream."
+  format: npm
+  type: proxy
+  indexMode: include_pending
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/npm-dedup-follower-e2e
+  proxy:
+    # Same upstream as npm-dedup-leader-e2e: identical bytes, hence an
+    # identical `dist.integrity` SRI, hence the SAME cross-repository
+    # blob-coalescing key. That shared key is the whole point of the pair.
+    upstreamUrl: "https://registry.npmjs.org"
+  isPublic: true
+  replicationPriority: local_only
