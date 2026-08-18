@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CVSS-vector severity scoring is no longer inert on advisory
+  enrichment.** The pre-scan enrichment queried OSV `/v1/querybatch`,
+  which returns only each advisory's `id` and `modified` — no `severity`
+  array, no `database_specific`. Every enrichment finding therefore fell
+  through to the fail-closed `Critical` with a NULL CVSS score, which
+  both made `severityThreshold` non-discriminating on affected
+  repositories and let the manufactured `Critical` outrank the
+  osv-scanner backend's correctly-scored finding in the dedup merge (the
+  Marvin advisory RUSTSEC-2023-0071 scores 5.9 → `Medium`, but was
+  recorded as `Critical`/unscored). Each distinct advisory id is now
+  hydrated from `GET /v1/vulns/{id}` before severity is derived, cached
+  on `(id, modified)` in the evictable `advisory:osv:vuln:` keyspace, one
+  request per distinct id per scan. Hydration is fail-soft: a failure
+  degrades that one advisory to the pre-existing unscored `Critical` and
+  ticks the new `hort_advisory_hydration_total{result="failed"}` counter
+  rather than failing the scan. New knob
+  `HORT_ADVISORY_OSV_VULNS_URL` (default `https://api.osv.dev/v1/vulns`,
+  Helm `worker.advisory.osvVulnsUrl`) — operators running an internal OSV
+  mirror must point it there alongside `HORT_ADVISORY_OSV_API_URL`. The
+  SUP-4 fail-closed default for genuinely unscored advisories is
+  unchanged. (#172)
+
 ### Changed
 
 - **The quarantine window is now anchored on the earliest defensible

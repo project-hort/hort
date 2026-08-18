@@ -960,6 +960,14 @@ worker:
     # HORT_ADVISORY_OSV_API_URL — OSV.dev batch endpoint. Override only
     # when the operator runs an internal OSV mirror.
     osvUrl: https://api.osv.dev/v1/querybatch
+    # HORT_ADVISORY_OSV_VULNS_URL — OSV.dev single-record endpoint. The
+    # batch endpoint returns only advisory ids + their `modified`
+    # timestamp; the CVSS vector that decides a finding's severity is
+    # only on the full record. Override alongside osvUrl when pointing
+    # at an internal mirror — leaving this at the public default while
+    # osvUrl points inward means severity derivation depends on egress
+    # to api.osv.dev and degrades every advisory to Critical without it.
+    osvVulnsUrl: https://api.osv.dev/v1/vulns
   # -------------------- Provenance verification --------------
   # Sigstore/cosign supply-chain provenance verification (OCI cosign
   # signatures/attestations). Activates the `provenance-verify` worker

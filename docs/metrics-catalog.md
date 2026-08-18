@@ -2534,6 +2534,7 @@ intentionally NOT operator-tunable.
 | `hort_scan_duration_seconds` | histogram | `scanner` | seconds | — |
 | `hort_scan_queue_depth` | gauge | (none) | rows | — |
 | `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout` |
+| `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error}` |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
 | `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
@@ -2544,6 +2545,8 @@ Source of truth for the result enums:
   `hort_scan_record_outcome_failures_total.result`.
 - `hort_app::metrics::AdvisoryQueryResult` for
   `hort_advisory_query_total.result`.
+- `hort_app::metrics::AdvisoryHydrationResult` for
+  `hort_advisory_hydration_total.result`.
 - `hort_app::metrics::SbomExtractionResult` for
   `hort_sbom_extraction_total.result`.
 
@@ -2617,6 +2620,33 @@ emitted by `OsvAdvisoryAdapter`):
   status code was observed (DNS, TCP, TLS). One tick per failed batch.
 - `timeout` — the per-request deadline elapsed before the batch
   responded. One tick per timed-out batch.
+
+**`hort_advisory_hydration_total.result` semantics** (closed taxonomy of
+3; emitted by `OsvAdvisoryAdapter`, one tick per **distinct advisory
+id** resolved during one `AdvisoryPort::query`):
+
+`/v1/querybatch` returns only `id` + `modified` per advisory — no CVSS
+vector, no severity label. Each id is therefore resolved against
+`/v1/vulns/{id}` before severity is derived. This counter reports that
+resolution; it is per-advisory, whereas `hort_advisory_query_total` is
+per-component.
+
+- `cache_hit` — the `(id, modified)` pair was already cached; no
+  `/v1/vulns/{id}` request fired.
+- `fetched` — the full record was fetched from `/v1/vulns/{id}` and
+  parsed.
+- `failed` — hydration failed (network, non-2xx, malformed body, or an
+  id whose shape is unsafe to interpolate into a URL). The scan does not
+  fail: the finding falls back to the abbreviated record, which is
+  unscored and therefore fails closed to `Critical` (SUP-4).
+
+**Alert spec:** a sustained non-zero `failed` rate means severity
+derivation is degraded — findings are being reported at `Critical` with
+a NULL score regardless of their real CVSS band, so `severityThreshold`
+policies stop discriminating. Operators SHOULD alert on
+`rate(hort_advisory_hydration_total{result="failed"}[15m]) > 0`
+sustained. Note the failure mode is fail-*closed* (over-blocking), not
+fail-open.
 
 `upstream_4xx`, `upstream_5xx`, `network_error`, and `timeout` are
 mutually exclusive at one batch boundary; they may co-emit with
@@ -2720,6 +2750,7 @@ Cardinality:
   additional backends extend the axis.
 - `hort_scan_queue_depth`: 1 series (no labels).
 - `hort_advisory_query_total`: 6 result values → 6 series.
+- `hort_advisory_hydration_total`: 3 result values → 3 series.
 - `hort_sbom_extraction_total`: ~15 formats × 3 results → 45 series.
 - `hort_artifact_became_vulnerable_total`: ≤10k repositories × 4
   severities × 2 ingest_source → 80k series ceiling. Honours the

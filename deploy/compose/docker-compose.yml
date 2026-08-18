@@ -393,6 +393,11 @@ services:
       # fixture-validation step in the test confirms the upstream is
       # reachable before declaring a fixture-drift failure.
       HORT_ADVISORY_OSV_API_URL: "https://api.osv.dev/v1/querybatch"
+      # OSV.dev single-record endpoint. querybatch answers only "which
+      # advisory ids affect this package"; the CVSS vector lives behind
+      # this endpoint, so severity derivation depends on it being
+      # reachable.
+      HORT_ADVISORY_OSV_VULNS_URL: "https://api.osv.dev/v1/vulns"
       # Worker tunables: keep the smoke fast (5s poll, batch 4) but
       # leave generous lock duration + retry headroom so a slow
       # Trivy invocation doesn't get reaped mid-scan. (The #44 sign→release

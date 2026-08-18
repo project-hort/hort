@@ -1,6 +1,16 @@
-//! Wire types for the OSV.dev `/v1/querybatch` endpoint.
+//! Wire types for the OSV.dev `/v1/querybatch` and `/v1/vulns/{id}`
+//! endpoints.
 //!
-//! Reference: <https://google.github.io/osv.dev/post-v1-querybatch/>.
+//! Reference: <https://google.github.io/osv.dev/post-v1-querybatch/>
+//! and <https://google.github.io/osv.dev/get-v1-vulns/>.
+//!
+//! The two endpoints return the **same** `Vulnerability` schema but
+//! populate different subsets of it: `querybatch` returns an
+//! abbreviated record carrying only `id` + `modified`, while
+//! `/v1/vulns/{id}` returns the full record (severity vectors,
+//! `affected[]`, references, aliases). One [`OsvVuln`] type models both
+//! because every field is optional-or-defaulted; which fields are
+//! actually populated is a property of the endpoint, not of the type.
 //!
 //! Only the subset of fields we consume is modelled; OSV's response
 //! carries additional fields (e.g. `next_page_token`) that are
@@ -49,10 +59,16 @@ pub(crate) struct OsvResult {
     pub vulns: Vec<OsvVuln>,
 }
 
-/// One vulnerability entry from `querybatch`. Note that `querybatch`
-/// returns *abbreviated* records — the full vulnerability detail
-/// (severity score, references) requires a follow-up `/v1/vulns/{id}`
-/// call which we deliberately skip in v1.
+/// One vulnerability record.
+///
+/// `querybatch` populates only [`id`](Self::id) and
+/// [`modified`](Self::modified) — it carries no `severity`, no
+/// `affected[]`, no `references`. Severity derivation therefore reads
+/// nothing from a raw querybatch record and would fail closed to
+/// `Critical` for every advisory; the hydration step in
+/// [`crate::hydrate`] replaces each abbreviated record with the full
+/// `/v1/vulns/{id}` record before `vuln_to_finding` runs, so the
+/// severity fields below are populated in the common case.
 #[derive(Debug, Deserialize, Default, Clone)]
 pub(crate) struct OsvVuln {
     /// Canonical vulnerability id (e.g. `GHSA-…`, `OSV-…`,
@@ -61,6 +77,15 @@ pub(crate) struct OsvVuln {
     /// `Finding::validate()` rather than panicking.
     #[serde(default)]
     pub id: String,
+
+    /// RFC 3339 timestamp of the last modification OSV made to this
+    /// record. `querybatch` returns it alongside `id` precisely so a
+    /// client can tell whether its cached copy of the full record is
+    /// stale, which is why the hydration cache is keyed on
+    /// `(id, modified)` rather than on `id` alone. Absent only on
+    /// out-of-spec payloads.
+    #[serde(default)]
+    pub modified: Option<String>,
 
     /// One-line summary (often present on `querybatch` responses).
     #[serde(default)]
@@ -136,6 +161,14 @@ pub(crate) struct OsvDatabaseSpecific {
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub(crate) struct OsvAffected {
+    /// The package this `affected[]` entry describes. A single OSV
+    /// record may cover several packages (and several ecosystems), so
+    /// this is what lets a per-component finding attribute only the
+    /// ranges that belong to *its* package. Absent on records that
+    /// describe an ecosystem-less artifact.
+    #[serde(default)]
+    pub package: Option<OsvAffectedPackage>,
+
     #[serde(default)]
     pub ranges: Vec<OsvRange>,
 
@@ -143,13 +176,24 @@ pub(crate) struct OsvAffected {
     /// records place the `informational` discriminator
     /// (`unmaintained` / `unsound` / `notice`) here, NOT on the
     /// vulnerability-level `database_specific`. Present only on full
-    /// records (the bulk-archive path); `/v1/querybatch` returns
-    /// abbreviated records without `affected[].database_specific`, so
-    /// this field is `None` on querybatch responses by design — that is
-    /// an inherent querybatch limitation, not a bug. See
+    /// records — `/v1/querybatch` returns abbreviated records with no
+    /// `affected[]` at all, so reaching this field at all implies the
+    /// record came from the bulk archive or from `/v1/vulns/{id}`
+    /// hydration. See
     /// `crates/hort-adapters-scanner-osv/tests/fixtures/informational_unmaintained.json`.
     #[serde(default)]
     pub database_specific: Option<OsvDatabaseSpecific>,
+}
+
+/// `affected[].package` — the (ecosystem, name) pair an `affected[]`
+/// entry applies to. Both fields are optional so a partial record
+/// deserialises rather than failing the whole hydration.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub(crate) struct OsvAffectedPackage {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub ecosystem: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

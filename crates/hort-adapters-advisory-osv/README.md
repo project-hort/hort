@@ -14,13 +14,22 @@ separate bulk-diff ingestion path (`pull_diff_since`) that pulls
 per-ecosystem `osv-vulnerabilities` zip archives for the periodic
 advisory-refresh tick.
 
+`querybatch` returns abbreviated records — `id` and `modified` only — so
+the query path resolves each distinct id to its full `/v1/vulns/{id}`
+record (`hydrate.rs`) before deriving severity, otherwise the CVSS
+scorer never sees a vector and every finding fails closed to `Critical`.
+Hydrated records are cached on `(id, modified)`; hydration failure is
+fail-soft, degrading that advisory to unscored rather than failing the
+scan.
+
 ## Ports
 
 - **Implements:** `AdvisoryPort` (`OsvAdvisoryAdapter`).
 - **Consumes:** `hort_app::metrics::{emit_advisory_diff,
-  emit_advisory_query, observe_advisory_diff_duration,
-  AdvisoryDiffResult, AdvisoryQueryResult, UpstreamErrorKind}` — metric
-  emission and error classification, not a use case.
+  emit_advisory_hydration, emit_advisory_query,
+  observe_advisory_diff_duration, AdvisoryDiffResult,
+  AdvisoryHydrationResult, AdvisoryQueryResult, UpstreamErrorKind}` —
+  metric emission and error classification, not a use case.
 
 ## Key types
 
