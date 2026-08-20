@@ -1295,6 +1295,50 @@ mod tests {
         assert!(res.headers().get("Retry-After").is_some());
     }
 
+    /// The boundary the index hold-read is built to preserve: the
+    /// exemption is metadata-only. A write-granted publisher resolves a
+    /// held sibling's *index entry*, but the `.crate` BYTES stay behind
+    /// the quarantine gate for that same principal. The gate is
+    /// status-only by construction — it never consults the caller — and
+    /// this pins that it stays so.
+    #[tokio::test]
+    async fn download_quarantined_stays_503_for_a_write_granted_caller() {
+        use chrono::Utc;
+        use hort_domain::entities::caller::CallerPrincipal;
+
+        let h = harness();
+        let repo = insert_repo(&h, "cargo-test");
+        let artifact = insert_crate_artifact(
+            &h,
+            repo.id,
+            "hort-domain",
+            "0.11.0",
+            b"held payload",
+            QuarantineStatus::Quarantined,
+        );
+        let publisher = CallerPrincipal {
+            user_id: Uuid::new_v4(),
+            external_id: "test:ci-publisher".into(),
+            username: "ci-publisher".into(),
+            email: "ci-publisher@example.com".into(),
+            claims: vec!["ci-publisher".into(), "admin".into()],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        };
+
+        let Ok(res) = render_cargo_crate_response(&h.ctx, artifact, Some(&publisher)).await else {
+            panic!("the quarantine gate renders a response, not an error");
+        };
+        assert_eq!(
+            res.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "held bytes must stay unserved to EVERY caller — the index hold-read is \
+             metadata-only, and a downloadable held crate would break the invariant \
+             the whole exemption exists to preserve"
+        );
+    }
+
     #[tokio::test]
     async fn download_rejected_returns_403() {
         let h = harness();

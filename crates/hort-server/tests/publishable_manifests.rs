@@ -31,9 +31,10 @@
 //! ## What it asserts
 //!
 //! 1. Every `hort-*` entry in the root `[workspace.dependencies]` carries
-//!    both a `path` and a `version`, the `path` resolves to the
-//!    identically-named member directory, and the version requirement is
-//!    an exact pin (`=`) equal to `[workspace.package] version`.
+//!    a `path`, a `version` and a `registry`; the `path` resolves to the
+//!    identically-named member directory, the version requirement is an
+//!    exact pin (`=`) equal to `[workspace.package] version`, and the
+//!    registry is the one the published members allow.
 //! 2. Every `hort-*` entry in a member's `[dependencies]` /
 //!    `[build-dependencies]` (including target-specific tables) inherits
 //!    from the workspace (`workspace = true`) and declares no `path` or
@@ -91,6 +92,25 @@
 //! uploaded and can never be withdrawn, only yanked. Asserting it here
 //! moves the failure to the commit that introduces the edge.
 //!
+//! ## Why the intra-workspace requirement names its registry
+//!
+//! Without a `registry` key an intra-workspace dependency is a
+//! *crates.io* dependency, and the release job runs under
+//! `[source.crates-io] replace-with = "hort"` — the read-only
+//! aggregation index. Cargo then searches for the just-uploaded sibling
+//! in a repository the release identity holds no write grant on, and the
+//! chain fails at the second crate with the earlier ones already
+//! uploaded and only yankable. `--registry` on the command line does not
+//! change this: source replacement is decided per dependency, from the
+//! manifest. An explicit-registry dependency is exempt from replacement,
+//! so it resolves where the identity can actually publish.
+//!
+//! The key is load-bearing in the other direction too: cargo refuses to
+//! parse a manifest naming a registry it has no index configuration for,
+//! so `.cargo/config.toml` must declare it or nothing in the workspace
+//! builds. Assertion 1 checks both halves together — a `registry` key
+//! and the declaration it depends on.
+//!
 //! ## Why the published set is an allow-list, not an absent key
 //!
 //! An absent `publish` key means "publish anywhere" — including
@@ -120,6 +140,10 @@ const INTRA_WORKSPACE_PREFIX: &str = "hort-";
 /// Dependency tables whose entries end up in the published manifest with
 /// their `path` stripped, and therefore require a version requirement.
 const PUBLISHED_DEP_TABLES: [&str; 2] = ["dependencies", "build-dependencies"];
+
+/// The first-party registry every intra-workspace requirement names and
+/// every published member allows.
+const HORT_REGISTRY: &str = "hort-crates";
 
 /// The workspace root. `CARGO_MANIFEST_DIR` is `<root>/crates/hort-server`,
 /// so two levels up is the root. Mirrors how the sibling guards resolve
@@ -270,9 +294,59 @@ fn workspace_dependency_block_pins_every_intra_workspace_crate_to_the_workspace_
                  build would resolve the crate through the registry instead of the local source"
             )),
         }
+
+        match spec.get("registry").and_then(Value::as_str) {
+            Some(registry) if registry == HORT_REGISTRY => {}
+            Some(registry) => failures.push(format!(
+                "[workspace.dependencies] `{name}` names registry `{registry}` — expected \
+                 `{HORT_REGISTRY}`, the registry the published members allow"
+            )),
+            None => failures.push(format!(
+                "[workspace.dependencies] `{name}` has no `registry` — without it the \
+                 requirement is a crates.io one, and the release job's \
+                 `[source.crates-io] replace-with` sends it to the read-only aggregation \
+                 index instead of the registry it was published to. Expected \
+                 `registry = \"{HORT_REGISTRY}\"`"
+            )),
+        }
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// 1b. The registry those requirements name is configured.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_named_registry_is_declared_in_the_cargo_configuration() {
+    let config = workspace_root().join(".cargo").join("config.toml");
+    assert!(
+        config.is_file(),
+        "{config:?} is missing — it declares the `{HORT_REGISTRY}` index that every \
+         intra-workspace requirement names"
+    );
+
+    let index = parse_manifest(&config)
+        .get("registries")
+        .and_then(|r| r.get(HORT_REGISTRY))
+        .and_then(|r| r.get("index"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let Some(index) = index else {
+        panic!(
+            ".cargo/config.toml declares no `[registries.{HORT_REGISTRY}] index` — cargo \
+             refuses to parse a manifest naming a registry it has no index for, so every \
+             workspace command fails with `registry index was not found in any \
+             configuration`"
+        )
+    };
+    assert!(
+        index.starts_with("sparse+"),
+        "`[registries.{HORT_REGISTRY}] index` is `{index}` — hort serves a cargo SPARSE \
+         index (RFC 2789), so the URL carries the `sparse+` scheme prefix"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -506,8 +580,45 @@ fn every_member_declares_publish_explicitly() {
             violations.push(format!(
                 "{} — `{name}` has no `[package] publish` key. An absent key defaults to \
                  published (to any registry, crates.io included) and joins the release set \
-                 silently. Add `publish = false`, or `publish = [\"hort-crates\"]` if this \
-                 crate is meant to ship",
+                 silently. Add `publish = false`, or `publish = [\"{HORT_REGISTRY}\"]` if \
+                 this crate is meant to ship",
+                relative(&path)
+            ));
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// 7. A published member allows exactly the registry its requirements name.
+// ---------------------------------------------------------------------------
+
+/// The `publish` allow-list and the `registry` key on the intra-workspace
+/// requirements have to agree. They fail in opposite directions if they
+/// drift: cargo rejects an upload to a registry outside the allow-list,
+/// and a requirement naming a registry the sibling never shipped to
+/// resolves nothing.
+#[test]
+fn every_published_member_allows_exactly_the_registry_its_requirements_name() {
+    let mut violations = Vec::new();
+    for path in member_manifests() {
+        let manifest = parse_manifest(&path);
+        if !is_published(&manifest) {
+            continue;
+        }
+        let name = package_name(&manifest);
+        let allowed: Vec<String> = match manifest.get("package").and_then(|p| p.get("publish")) {
+            Some(Value::Array(registries)) => registries
+                .iter()
+                .map(|r| r.as_str().unwrap_or("<not-a-string>").to_string())
+                .collect(),
+            // `publish = true` publishes anywhere, crates.io included.
+            _ => Vec::new(),
+        };
+        if allowed != [HORT_REGISTRY] {
+            violations.push(format!(
+                "{} — `{name}` allows {allowed:?}; the intra-workspace requirements name \
+                 `{HORT_REGISTRY}`, so it must be exactly `publish = [\"{HORT_REGISTRY}\"]`",
                 relative(&path)
             ));
         }
