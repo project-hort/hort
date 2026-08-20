@@ -405,8 +405,12 @@ fn dockerfiles(root: &Path) -> Vec<String> {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if path.is_dir() {
-                // Build outputs and VCS metadata carry no build contexts.
-                if matches!(name.as_str(), "target" | ".git" | "node_modules") {
+                // Hidden directories and build outputs carry no build contexts
+                // of ours. `.cargo` matters most: CI sets `CARGO_HOME` inside
+                // the workspace, so the whole crates.io registry lands under
+                // `.cargo/registry/src/` — and third-party crates ship their own
+                // Dockerfiles, which of course do not copy our configuration.
+                if name.starts_with('.') || matches!(name.as_str(), "target" | "node_modules") {
                     continue;
                 }
                 walk(&path, root, out);
