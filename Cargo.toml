@@ -155,7 +155,10 @@ unused_qualifications = "warn"
 # sorts BELOW `0.11.0-dev` and a beta build would fail to satisfy its own
 # workspace requirement. A release cut therefore rewrites the marker above
 # and these requirements together — the two carry the identical version
-# literal, so one global substitution over this file covers both.
+# literal, so one substitution over this file covers both. It must skip
+# comment lines (`sed -i '/^#/!s/…/…/g'`): this block quotes the current
+# version twice for illustration, and a global rewrite would silently
+# rewrite the example and the quoted error message too.
 #
 # The exact pin is also what makes that lockstep structural rather than
 # procedural. Bump `[workspace.package] version` alone and cargo refuses

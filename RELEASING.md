@@ -2,9 +2,9 @@
 
 Two release shapes: **pre-releases** and **final** releases. Pre-releases
 split into an **internal** track (`-alpha.N`, staging + local registry
-only) that staging deploys continuously, and reserved naming room for a
-possible future **public** track (`-beta.N` / `-rc.N`, not in use today —
-see *Beta pre-release* below). See
+only) that staging deploys continuously, and a **public** track (`-beta.N`,
+internal + ghcr; `-rc.N` reserved for the same shape if ever needed — see
+*Beta pre-release* below). See
 [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) and
 [the glossary](docs/glossary.md) for the full model. One rule drives
 everything:
@@ -41,12 +41,24 @@ A version bump touches exactly these three files:
   2. every `version = "=X.Y.Z-…"` requirement in the `hort-*` block of
      `[workspace.dependencies]`
 
-  Both carry the identical version literal, so one global substitution over
-  the file does both at once:
+  Both carry the identical version literal, so one substitution over the
+  file does both at once — but it **must skip comment lines**:
 
   ```bash
-  sed -i 's/<old-version>/<new-version>/g' Cargo.toml
+  sed -i '/^#/!s/<old-version>/<new-version>/g' Cargo.toml
   ```
+
+  The `/^#/!` guard is load-bearing, not defensive. The `[workspace.dependencies]`
+  block's own commentary quotes the current version twice — once as a worked
+  example of pre-release ordering, once as a verbatim `cargo` error message —
+  and a global substitution rewrites both. That turns the ordering example into
+  a different (and pointless) claim and the quoted error into one cargo never
+  emitted, silently, at every cut.
+
+  Verify the count rather than trusting the command: after the substitution
+  `grep -c '<old-version>' Cargo.toml` must report exactly the number of
+  comment occurrences (2 today), and `grep -c '<new-version>'` the number of
+  value sites (35 today — one marker plus 34 requirements).
 
   The published form of a crate has no `path` — `cargo publish` strips it and
   resolves intra-workspace dependencies through the registry — so those
@@ -140,17 +152,35 @@ alpha, but published **both** to the internal registry **and** publicly to
 ghcr + a GitHub pre-release. (semver orders `alpha < beta < rc`; `rc` stays
 reserved for the same shape if ever needed.)
 
-**Cut the beta from the LAST ALPHA TAG (`vX.Y.Z-alpha.N`), not from develop** —
-the beta promotes to public *exactly the code the alpha validated*; develop may
-have moved past it. Fall back to `origin/develop` **only** if this cycle has no
-alpha tag. (The `X.Y.Z-dev → X.Y.Z-beta.N` bump is the same either way, since the
-alpha tag already carries an `X.Y.Z-alpha.N` bump on its own throwaway commit —
-you are re-bumping that one commit's version, not develop's.)
+**The first beta ends the alpha phase.** Cutting `vX.Y.Z-beta.1` closes the
+internal track for that cycle: from then until the final release there are
+**only betas**, never another alpha. The two rules below follow from that, and
+they differ — check which one you are doing before you pick a base.
+
+**`beta.1` is cut from the LAST ALPHA TAG (`vX.Y.Z-alpha.N`), not from
+develop** — it promotes to public *exactly the code the alpha validated*, and
+develop may have moved past it. Fall back to `origin/develop` only if this cycle
+has no alpha tag at all. (The `X.Y.Z-dev → X.Y.Z-beta.1` bump is the same either
+way: the alpha tag already carries an `X.Y.Z-alpha.N` bump on its own throwaway
+commit, so you are re-bumping that one commit's version, not develop's.)
+
+**Every later beta (`beta.2`, `beta.3`, …) is cut directly from
+`origin/develop`.** There is no alpha to promote from — the alpha track is
+closed — and what a later beta ships is whatever has landed on develop since the
+previous beta. Its validation is staging plus the `test/*` deployment, not a
+preceding alpha.
+
+Cutting a later beta from the last alpha would ship a beta that is *older* than
+the work it exists to test — the alpha predates everything merged since
+`beta.1`. If you find yourself reaching for an alpha tag on a `beta.N>1` cut,
+that is the mistake.
 
 ```bash
 git fetch origin
 # From the last alpha tag (preferred); use `origin/develop` only if no alpha exists.
-git checkout -b test/vX.Y.Z-beta.N vX.Y.Z-alpha.<N>
+# beta.1 → base is the last alpha tag; beta.2+ → base is origin/develop.
+git checkout -b test/vX.Y.Z-beta.N vX.Y.Z-alpha.<N>    # beta.1 only
+git checkout -b test/vX.Y.Z-beta.N origin/develop      # every later beta
 # bump Cargo.toml (BOTH sites — see "Versioned files") + Chart.yaml
 # (version + appVersion) → X.Y.Z-beta.N
 cargo check --workspace                     # rewrites Cargo.lock member versions
