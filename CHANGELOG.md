@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CVSS v3.x base scores are now computed from OSV severity vectors.**
+  OSV frequently delivers severity as a bare vector with no
+  pre-computed number — RustSec advisories almost always do. Severity
+  extraction tried numeric `groups[].max_severity`, then a
+  trailing-`/<float>` heuristic, then a text label; a pure vector
+  survived none of them, so the advisory landed unscored and the SUP-4
+  fail-closed rule recorded it as `Critical`. Fully-scored `Medium`
+  advisories therefore tripped `severityThreshold: high` policies —
+  concretely, `rsa 0.9.10` sat terminally `rejected` on `crates-proxy`
+  and structurally blocked the vetted crates publish. Vectors are now
+  parsed and scored per the CVSS specification, which is authoritative
+  over the previous heuristics. Genuinely unscored advisories still
+  fail closed to `Critical`. (#151)
+
 - **CVSS-vector severity scoring is no longer inert on advisory
   enrichment.** The pre-scan enrichment queried OSV `/v1/querybatch`,
   which returns only each advisory's `id` and `modified` — no `severity`
@@ -30,6 +44,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirror must point it there alongside `HORT_ADVISORY_OSV_API_URL`. The
   SUP-4 fail-closed default for genuinely unscored advisories is
   unchanged. (#172)
+
+- **The worker's CAS volume is no longer mounted read-only on
+  Kubernetes.** The chart mounted the shared CAS with `readOnly: true`
+  on the worker Deployment, enforcing a consume-only contract that had
+  already stopped being true: scan outcomes persist per-finding blobs as
+  hash-referenced CAS objects, and worker-side prefetch ingest writes
+  the blob it verified. Every worker-driven CAS write failed with
+  `Read-only file system (os error 30)`. Compose had already dropped
+  `:ro` for the same reason; the chart never followed. Operators on the
+  filesystem backend need no action beyond the upgrade — the mount is
+  now writable. (#157)
+
+- **A just-ingested artifact is no longer re-pulled upstream on a
+  prefetch re-POST.** The held-check treated a row with no quarantine
+  lifecycle (`QuarantineStatus::None`) as "known upstream but not
+  ingested" and re-enqueued it. That premise was structurally false:
+  the query reads only `artifacts` rows, and every such row is ingested
+  content — "known upstream, not ingested" manifests as the row being
+  absent. `None` actually means ingested with no quarantine lifecycle,
+  which is stamped by design for pure Sigstore-bundle referrers and for
+  ingests matching no scan policy. Such rows are now classified held.
+  Ingested-or-not and quarantine status are two dimensions and are no
+  longer conflated. (#160)
+
+- **Self-service prefetch against a virtual repository can see held
+  state.** The held-check pre-flighted each item against the id of the
+  repository named in the URL. A virtual repository owns no artifact
+  rows — those are keyed by the member repository — so every warm
+  reported `already_held: 0` and re-enqueued the full set, however much
+  of it was already served. The check now walks the virtual's members in
+  the ADR 0031 priority order. (#146)
+
+- **`issue-svc-token --require-authority` is now scope-aware.** The
+  preflight checked every declared permission against global-scope
+  grants only, while runtime authorization checks the actual repository
+  scope. A repository-scoped grant therefore satisfied runtime but
+  failed the preflight, and the error text told the operator to create
+  *global* grants — steering toward privilege widening exactly where
+  narrow scoping was the point, and making repository-scoped bootstrap
+  identities impossible without over-granting. The new optional
+  `--repository <name>` checks each permission against that exact
+  scope; omitting it keeps today's global check. (#156)
 
 ### Changed
 
@@ -81,6 +137,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hort-cli curation reevaluate <artifact-id>` let a curator recompute a
   `Rejected` artifact's verdict from its stored findings under the
   currently active policy — no policy mutation, no forced outcome. (#152)
+
+- **Maven artifacts can be prefetch-warmed.** The per-format prefetch
+  dispatch implemented leaf pulls for PyPI, Cargo and npm and
+  short-circuited everything else as "no compose-style download URL".
+  For Maven that rationale was inverted — its layout
+  (`{group-path}/{artifact}/{version}/{filename}`) is the most
+  composable download URL in the system — so the only way to start a
+  Maven quarantine clock was a build failing on first contact. Maven
+  GAVs now warm through the same verified two-leg pull as the other
+  leaf formats. (#153)
+
+- **Chart: bootstrap service-account identities are a values-driven
+  list.** The `svc-token-bootstrap` Job was hardwired to one identity
+  (`cronjob-tasks`, `admin_task_invoke`) writing one Secret, so any
+  further bootstrap identity needed a manual in-pod mint plus a
+  hand-created Secret — unreproducible on rebuild, and dependent on a
+  Secret name that RBAC `resourceNames` rules bind to. The Job now
+  iterates `scheduledTasks.svcTokens`, minting every listed permission
+  per identity (effective authority is cap ∩ grants, so a
+  one-permission mint silently strands sibling grants) and writing each
+  to its declared `secretName`. Per-identity idempotence keeps today's
+  semantics, and an empty `secretName` resolves to the existing default
+  — existing installs need no values change. (#155)
 
 ## [0.10.0] - 2026-08-09
 
