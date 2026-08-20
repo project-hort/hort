@@ -367,12 +367,21 @@ run_one() {  # group name path
   # window; forwarding the variable under its real name means an operator who
   # retunes the server can point the scenario at the same value instead of
   # editing an assertion.
+  # HORT_E2E_MODE: the runner's own --hort selector, forwarded verbatim.
+  # General capability, not a one-scenario hack: any scenario whose fixture
+  # premise only holds on a stack the runner owns (a coldness assertion, a
+  # row-count expectation) can read this to fail hard under compose — where a
+  # violation means a dirty fixture `compose down -v` clears — but skip with a
+  # diagnostic under external, where the same violation is a permanent red on
+  # someone else's long-lived instance. A scenario that does not read it is
+  # unaffected.
   docker run --rm --add-host=host.docker.internal:host-gateway "${NET_ARGS[@]}" \
     -e HORT_URL="$IN_HORT" -e KEYCLOAK_URL="$IN_KC" -e METRICS_URL="$IN_METRICS" \
     -e METRICS_TOKEN="$IN_METRICS_TOKEN" \
     -e HORT_DB_DSN="$DB_DSN" \
     -e HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS="${HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS:-}" \
     -e HORT_COMPOSE_OVERLAYS="${OVERLAYS[*]:-${HORT_COMPOSE_OVERLAYS:-}}" \
+    -e HORT_E2E_MODE="$HORT_MODE" \
     -v "$SCRIPT_DIR":/work:ro -e FIXTURES=/work/fixtures \
     "$IMAGE" bash "/work/$rel"
 }
