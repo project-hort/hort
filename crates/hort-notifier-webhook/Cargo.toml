@@ -4,21 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort webhook EventNotifier adapter — best-effort HMAC-signed POSTs"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 # Outbound port traits + value types this adapter implements.
-hort-domain     = { path = "../hort-domain" }
+hort-domain     = { workspace = true }
 # SSRF predicate (`is_routable`) at the create-time guard.
-hort-net-egress = { path = "../hort-net-egress" }
+hort-net-egress = { workspace = true }
 # Composition hands the trust bundle through; mirrors the upstream-http
 # pattern.
-hort-config     = { path = "../hort-config" }
+hort-config     = { workspace = true }
 # Use-case error classification helpers — match upstream-http /
 # advisory-osv pattern (`UpstreamErrorKind::CaUnknown`).
-hort-app        = { path = "../hort-app" }
+hort-app        = { workspace = true }
 
 # HTTP client with rustls (platform-verifier-backed TLS, workspace 0.13
 # feature set); explicit dep so the `Client::builder` TLS discipline

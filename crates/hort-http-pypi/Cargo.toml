@@ -4,15 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort inbound HTTP adapter for the PyPI Simple Repository API (PEP 503)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain    = { path = "../hort-domain" }
-hort-app       = { path = "../hort-app" }
-hort-formats   = { path = "../hort-formats" }
-hort-http-core = { path = "../hort-http-core" }
+hort-domain    = { workspace = true }
+hort-app       = { workspace = true }
+hort-formats   = { workspace = true }
+hort-http-core = { workspace = true }
 
 axum         = { workspace = true }
 tokio        = { workspace = true }

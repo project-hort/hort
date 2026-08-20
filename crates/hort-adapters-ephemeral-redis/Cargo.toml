@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Redis adapter for the EphemeralStore port — fred-based, Lua EVAL for CAS"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
@@ -17,12 +19,12 @@ workspace = true
 redis-integration-tests = []
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 # `MeteredEphemeralStore::new` takes `EphemeralKeyspaceClass`
 # (defined in `hort-app::ephemeral_keyspace`) so every metric series
 # carries the `class={evictable|durable}` label. Pure data import —
 # no I/O brought in.
-hort-app    = { path = "../hort-app" }
+hort-app    = { workspace = true }
 
 async-trait = { workspace = true }
 bytes       = { workspace = true }

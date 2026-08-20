@@ -135,6 +135,84 @@ unsafe_code = "forbid"
 unused_qualifications = "warn"
 
 [workspace.dependencies]
+# ── Intra-workspace crates ─────────────────────────────────────────────────
+#
+# Every intra-workspace dependency is declared here once with BOTH `path`
+# and `version`; members inherit it (`hort-domain = { workspace = true }`).
+# `cargo package` / `cargo publish` strip `path` from the manifest they
+# upload and resolve the dependency through the registry instead, so a
+# path-only declaration is rejected outright:
+#
+#     all dependencies must have a version requirement specified when
+#     packaging. dependency `hort-domain` does not specify a version
+#
+# The requirement is an EXACT pin (`=`) equal to `[workspace.package]
+# version` above. Every crate here carries that single version and is
+# released in lockstep, so a caret range would advertise a cross-version
+# compatibility that is never built or tested. A static requirement does
+# not work either: semver orders pre-releases lexically, so `0.11.0-beta.4`
+# sorts BELOW `0.11.0-dev` and a beta build would fail to satisfy its own
+# workspace requirement. A release cut therefore rewrites the marker above
+# and these requirements together — the two carry the identical version
+# literal, so one global substitution over this file covers both.
+#
+# The exact pin is also what makes that lockstep structural rather than
+# procedural. Bump `[workspace.package] version` alone and cargo refuses
+# to resolve the workspace at all ("failed to select a version for the
+# requirement `hort-config = \"=0.11.0-dev\"`"), so a half-applied bump
+# cannot build, let alone reach a tag. A caret requirement would keep
+# resolving happily against the stale lower bound and publish manifests
+# pointing at the previous release.
+# `crates/hort-server/tests/publishable_manifests.rs` covers what cargo
+# does not: a requirement edited to some other still-satisfiable form, and
+# a member that reintroduces a path-only declaration.
+#
+# `[dev-dependencies]` are the deliberate exception and must stay path-only
+# — never `workspace = true` here. Cargo DROPS a path-only dev dependency
+# from the published manifest entirely, but KEEPS one that carries a
+# version and then requires it to resolve on the registry. Inheriting a
+# version would turn every test-only edge into a publish-time dependency,
+# including edges onto crates that are not published at all. The same guard
+# test asserts that direction too.
+hort-domain = { path = "crates/hort-domain", version = "=0.11.0-dev" }
+hort-config = { path = "crates/hort-config", version = "=0.11.0-dev" }
+hort-app = { path = "crates/hort-app", version = "=0.11.0-dev" }
+hort-attribution = { path = "crates/hort-attribution", version = "=0.11.0-dev" }
+hort-net-egress = { path = "crates/hort-net-egress", version = "=0.11.0-dev" }
+# Format handling
+hort-formats = { path = "crates/hort-formats", version = "=0.11.0-dev" }
+hort-formats-upstream = { path = "crates/hort-formats-upstream", version = "=0.11.0-dev" }
+# Inbound HTTP
+hort-http-core = { path = "crates/hort-http-core", version = "=0.11.0-dev" }
+hort-http-cargo = { path = "crates/hort-http-cargo", version = "=0.11.0-dev" }
+hort-http-npm = { path = "crates/hort-http-npm", version = "=0.11.0-dev" }
+hort-http-pypi = { path = "crates/hort-http-pypi", version = "=0.11.0-dev" }
+hort-http-oci = { path = "crates/hort-http-oci", version = "=0.11.0-dev" }
+hort-http-maven = { path = "crates/hort-http-maven", version = "=0.11.0-dev" }
+hort-http-admin-security = { path = "crates/hort-http-admin-security", version = "=0.11.0-dev" }
+hort-http-admin-tasks = { path = "crates/hort-http-admin-tasks", version = "=0.11.0-dev" }
+hort-http-subscriptions = { path = "crates/hort-http-subscriptions", version = "=0.11.0-dev" }
+hort-http-discovery = { path = "crates/hort-http-discovery", version = "=0.11.0-dev" }
+hort-http-events = { path = "crates/hort-http-events", version = "=0.11.0-dev" }
+# Outbound adapters
+hort-adapters-advisory-osv = { path = "crates/hort-adapters-advisory-osv", version = "=0.11.0-dev" }
+hort-adapters-checkpoint-anchor = { path = "crates/hort-adapters-checkpoint-anchor", version = "=0.11.0-dev" }
+hort-adapters-ephemeral-memory = { path = "crates/hort-adapters-ephemeral-memory", version = "=0.11.0-dev" }
+hort-adapters-ephemeral-redis = { path = "crates/hort-adapters-ephemeral-redis", version = "=0.11.0-dev" }
+hort-adapters-kubernetes = { path = "crates/hort-adapters-kubernetes", version = "=0.11.0-dev" }
+hort-adapters-oidc = { path = "crates/hort-adapters-oidc", version = "=0.11.0-dev" }
+hort-adapters-postgres = { path = "crates/hort-adapters-postgres", version = "=0.11.0-dev" }
+hort-adapters-provenance-cosign-key = { path = "crates/hort-adapters-provenance-cosign-key", version = "=0.11.0-dev" }
+hort-adapters-provenance-sigstore = { path = "crates/hort-adapters-provenance-sigstore", version = "=0.11.0-dev" }
+hort-adapters-scanner-osv = { path = "crates/hort-adapters-scanner-osv", version = "=0.11.0-dev" }
+hort-adapters-scanner-trivy = { path = "crates/hort-adapters-scanner-trivy", version = "=0.11.0-dev" }
+hort-adapters-secrets = { path = "crates/hort-adapters-secrets", version = "=0.11.0-dev" }
+hort-adapters-storage = { path = "crates/hort-adapters-storage", version = "=0.11.0-dev" }
+hort-adapters-upstream-http = { path = "crates/hort-adapters-upstream-http", version = "=0.11.0-dev" }
+# Event notifiers
+hort-notifier-nats = { path = "crates/hort-notifier-nats", version = "=0.11.0-dev" }
+hort-notifier-webhook = { path = "crates/hort-notifier-webhook", version = "=0.11.0-dev" }
+
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
 
