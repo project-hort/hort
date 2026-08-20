@@ -129,6 +129,22 @@ PKG_VERSION="${PKG_VERSION:-4.17.21}"
 LEADER_LOCK_TTL_SECS="${HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS:-90}"
 DRIVE_BUDGET_SECS=$((LEADER_LOCK_TTL_SECS / 2))
 
+# Both coldness gates below (the per-repository preflight and the
+# content-level quarantine-anchor assertion) hold only on a stack this runner
+# owns: compose resets between runs, so a violation there is a dirty fixture
+# and `fail` is right. Under `--hort=external` a long-lived instance nobody
+# resets can carry the same content already, and that violation is a fact
+# about someone else's instance, not a bug in this run — `skip` is right.
+# `HORT_E2E_MODE` is run.sh's own --hort selector, forwarded verbatim; unset
+# or anything other than exactly "external" MUST behave as compose, so a
+# scenario invoked by hand (no runner forward) fails loudly on a broken
+# premise instead of silently taking the lenient branch and reporting a green
+# run that asserted nothing.
+case "${HORT_E2E_MODE:-}" in
+    external) MODE_STRICT=0 ;;
+    *)        MODE_STRICT=1 ;;
+esac
+
 # Best-effort Layer-A probe (never gates — see its section).
 PROBE_CONCURRENCY="${PROBE_CONCURRENCY:-6}"
 PROBE_PKG="${PROBE_PKG:-is-number}"
@@ -203,10 +219,12 @@ for repo in "leader:${LEADER_REPO_ID}" "follower:${FOLLOWER_REPO_ID}"; do
     resident="$(psql_one "SELECT count(*) FROM artifacts WHERE repository_id = '${repo_id}' AND path = '${ARTIFACT_PATH}';")"
     if [ "${resident:-0}" = "0" ]; then
         log "  ${repo_label} repo is cold for ${PKG_NAME}@${PKG_VERSION}"
-    else
+    elif [ "$MODE_STRICT" = "1" ]; then
         fail "${repo_label} repository is cold for ${PKG_NAME}@${PKG_VERSION}" \
             "${resident} row(s) already present — this repository pair is dedicated to this scenario and must start empty (a re-run against a kept stack needs \`compose down -v\`)"
         summary
+    else
+        skip "${repo_label} repository is not cold for ${PKG_NAME}@${PKG_VERSION} — ${resident} row(s) already present; this repository pair's coldness premise is unenforceable on a long-lived external hort (needs a fresh runner-owned stack)"
     fi
 done
 
@@ -224,10 +242,12 @@ done
 content_elsewhere="$(psql_one "SELECT count(*) FROM artifacts WHERE path = '${ARTIFACT_PATH}';")"
 if [ "${content_elsewhere:-0}" = "0" ]; then
     log "  no repository in this instance has ever held ${ARTIFACT_PATH}"
-else
+elif [ "$MODE_STRICT" = "1" ]; then
     fail "these bytes are new to this hort instance" \
         "${content_elsewhere} artifacts row(s) outside the dedicated pair already carry path ${ARTIFACT_PATH} — the content-level anchor minimum would predate this run's leader row (a re-run against a kept stack needs \`compose down -v\`; against an external hort this scenario needs a package that instance has never proxied)"
     summary
+else
+    skip "${PKG_NAME}@${PKG_VERSION}: ${content_elsewhere} artifacts row(s) outside the dedicated pair already carry path ${ARTIFACT_PATH} — the content-level anchor minimum would predate this run's leader row; this scenario's coldness premise is unenforceable on a long-lived external hort that has already proxied this package"
 fi
 
 # ---------------------------------------------------------------------
@@ -554,9 +574,15 @@ log "  content-level MIN(created_at) = ${content_min} (over ${content_rows:-?} r
 leader_full_window="$(psql_one "SELECT (quarantine_window_start = created_at) FROM artifacts WHERE id = '${LEADER_ARTIFACT_ID}';")"
 if [ "$leader_full_window" = "t" ]; then
     pass "leader row: quarantine_window_start == created_at — leg 1 is the first observation of these bytes, so the content-level minimum is its own mint instant (full 24h window)"
-else
+elif [ "$MODE_STRICT" = "1" ]; then
     fail "leader quarantine_window_start == created_at" \
         "got '${leader_full_window:-<null>}' (expected t) — anchor=${leader_anchor}, content minimum=${content_min} over ${content_rows:-?} row(s). A minimum older than leg 1 means these bytes were already resident somewhere in this instance despite the preflight, so the checks below are not measuring this run; an anchor older than the minimum means some other source moved leg 1's window earlier"
+else
+    # Exits here (skip -> exit 77): the remaining assertions below anchor
+    # against this same content-level minimum, so once it is known to predate
+    # this run, letting them print PASS would be measuring stale state, not
+    # this drive.
+    skip "${PKG_NAME}@${PKG_VERSION}: content-level coldness premise violated — quarantine_window_start != created_at on the leader row (got '${leader_full_window:-<null>}', expected t; content minimum=${content_min} over ${content_rows:-?} row(s) sharing sha256=${LEADER_HASH}). These bytes are already resident somewhere else in this instance despite the preflight, so the remaining checks would not measure this run; unenforceable on a long-lived external hort"
 fi
 
 # 1. Both rows carry the SAME anchor, and it is not NULL. `x = y` is NULL

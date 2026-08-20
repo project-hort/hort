@@ -99,7 +99,8 @@ Each scenario is `scenarios/<group>/<name>.sh`:
   (Keycloak ROPC), `pass`/`fail`/`skip`/`log`, `summary`, `psql_one`/`psql_exec`
   (when `requires: db`), and `assert_metric_ingest <format>`.
 - The runner passes `HORT_URL`, `KEYCLOAK_URL`, `METRICS_URL`, `METRICS_TOKEN`,
-  `KEYCLOAK_CLIENT_ID`/`SECRET`, `FIXTURES=/work/fixtures`, and (when available)
+  `KEYCLOAK_CLIENT_ID`/`SECRET`, `FIXTURES=/work/fixtures`, `HORT_E2E_MODE`
+  (the active `--hort` selector, verbatim — see below), and (when available)
   `HORT_DB_DSN` via env. In compose mode under `--compose-overlay=native-tokens`,
   `METRICS_TOKEN` is a `read_metrics`-granted bearer the runner admin-mints once
   per run, against the `metrics-scraper` `ServiceAccount` + `PermissionGrant` in
@@ -127,6 +128,25 @@ Each scenario is `scenarios/<group>/<name>.sh`:
 
 A scenario whose `requires` aren't all provided is reported **SKIP (needs: …)**,
 never a failure.
+
+### Mode-aware fixture premises
+
+Some scenarios assert a premise that only the runner itself can guarantee —
+e.g. "this repository starts with zero rows" — because it manages the stack's
+lifecycle (`compose down -v` between runs). Under `--hort=external` the same
+premise can be violated by a long-lived instance nobody resets, and a fixture
+violation there is not a bug in the run; it is a fact about a stack this
+runner does not own. A scenario that hard-fails on it anyway becomes
+permanently red under external, which is how a real signal gets ignored.
+
+`HORT_E2E_MODE` (forwarded verbatim from `--hort`) lets a scenario tell the two
+apart: violate the premise under `compose` and it's a dirty fixture — `fail`.
+Violate it under `external` and it's an unenforceable assumption about someone
+else's instance — `skip` (exit 77) with a message naming what was violated and
+why. **Unset or any value other than `external` must behave as `compose`** (fail
+hard): a scenario invoked by hand, without the runner's forward, must not
+silently take the lenient branch and report a green run that asserted nothing.
+`scenarios/proxy/pull-dedup.sh`'s two coldness gates are the canonical example.
 
 ### Adding a scenario
 
