@@ -148,7 +148,7 @@ service accounts plus their standalone `serviceAccount`-subject
 
 | ServiceAccount | Authority | Token destination |
 |---|---|---|
-| `maintainer-dev` | global `read` | `/run/secrets/hort-dev.token` (minted by the gitops role) |
+| `maintainer-dev` | global `read`, `prefetch`, `write` | `/run/secrets/hort-dev.token` (minted by the gitops role) |
 | `maintainer-curator` | global `curate` | `/run/secrets/hort-curator.token` (minted by the gitops role) |
 | `cronjob-tasks` | global `admin_task_invoke` | minted out-of-band for scheduled tasks (see *Scheduled tasks & destructive jobs*) |
 

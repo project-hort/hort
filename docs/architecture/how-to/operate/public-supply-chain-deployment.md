@@ -59,7 +59,8 @@ and stick with it; mixing the two on one host is not supported.
    ```
 
    The gitops role mints the two operator `hort_svc_*` tokens
-   (`maintainer-dev` read, `maintainer-curator` curate) on first run and
+   (`maintainer-dev` read + prefetch + write, `maintainer-curator` curate)
+   on first run and
    writes them to `/run/secrets/` (tmpfs — cleared on reboot). Retrieve
    them from there and store them in Ansible Vault / your secret store
    immediately after provisioning; they are **not** written to Vault
