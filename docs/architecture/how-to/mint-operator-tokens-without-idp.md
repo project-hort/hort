@@ -96,6 +96,24 @@ deployment declares two operator SAs:
 `--permission=admin` (service accounts are strictly non-admin —
 [ADR 0038](../../adr/0038-admin-identity-model.md)).
 
+**Upgrading a host provisioned before `maintainer-dev` carried `write`:**
+the Ansible gitops role's mint task is idempotent by name (§5) — it only
+reaches the SA's full authority on a host where no `maintainer-dev` token
+exists yet. A host provisioned before this table's grant set widened to
+include `write` keeps its narrower token forever; the playbook keeps
+reporting success because idempotent-skip and freshly-issued are the same
+exit code. Bring such a host's token up to date once, by hand:
+
+```sh
+hort-server admin issue-svc-token --name=maintainer-dev \
+  --permission=read --permission=prefetch --permission=write \
+  --rotate --output=file:/run/secrets/hort-dev.token
+```
+
+(Podman flavor: prefix with `podman exec hort-server`.) Confirm it worked
+with `hort-cli admin rescan <artifact-id>` against the refreshed token —
+`202` means the upgrade landed, `403` means the old token is still live.
+
 ## 4. The authority preflight: `--require-authority`
 
 A bare mint performs **no** grant check — it happily mints a token for
