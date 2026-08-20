@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "`UpstreamMetadataPort` composition crate. Dispatches per-format `fetch_raw_with_cache` helpers + `FormatHandler::extract_upstream_versions` parsers."
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
@@ -17,12 +19,12 @@ workspace = true
 # caller breaks the dep-graph rationale documented in the crate-level
 # module comment (see `docs/architecture/explanation/format-handlers.md`).
 [dependencies]
-hort-domain      = { path = "../hort-domain" }
-hort-app         = { path = "../hort-app" }
-hort-formats     = { path = "../hort-formats" }
-hort-http-npm    = { path = "../hort-http-npm" }
-hort-http-pypi   = { path = "../hort-http-pypi" }
-hort-http-cargo  = { path = "../hort-http-cargo" }
+hort-domain      = { workspace = true }
+hort-app         = { workspace = true }
+hort-formats     = { workspace = true }
+hort-http-npm    = { workspace = true }
+hort-http-pypi   = { workspace = true }
+hort-http-cargo  = { workspace = true }
 
 bytes          = { workspace = true }
 tracing        = { workspace = true }

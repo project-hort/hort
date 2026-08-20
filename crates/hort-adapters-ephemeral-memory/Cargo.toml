@@ -4,17 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "In-memory adapter for the EphemeralStore port — dashmap-backed, background TTL evictor"
+# Published to the hort-crates registry. The allow-list is affirmative on
+# purpose: an absent `publish` key means "any registry", which would let a
+# new member join the published set silently and would let a stray
+# `cargo publish` push this crate to crates.io.
+publish = ["hort-crates"]
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 # `MeteredEphemeralStore::new` takes `EphemeralKeyspaceClass`
 # (defined in `hort-app::ephemeral_keyspace`) so every metric series
 # carries the `class={evictable|durable}` label. Pure data import —
 # no I/O brought in.
-hort-app    = { path = "../hort-app" }
+hort-app    = { workspace = true }
 
 tokio       = { workspace = true, features = ["sync", "time", "rt"] }
 bytes       = { workspace = true }

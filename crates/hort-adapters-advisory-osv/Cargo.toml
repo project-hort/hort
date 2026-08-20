@@ -4,15 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort outbound adapter — OSV.dev advisory feed (AdvisoryPort impl)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain   = { path = "../hort-domain" }
-hort-config   = { path = "../hort-config" }
-hort-app      = { path = "../hort-app" }
-hort-formats  = { path = "../hort-formats" }
+hort-domain   = { workspace = true }
+hort-config   = { workspace = true }
+hort-app      = { workspace = true }
+hort-formats  = { workspace = true }
 
 reqwest    = { workspace = true }
 tokio      = { workspace = true }

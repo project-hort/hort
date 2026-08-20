@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort shared HTTP inbound primitives"
+# Published to the hort-crates registry. The allow-list is affirmative on
+# purpose: an absent `publish` key means "any registry", which would let a
+# new member join the published set silently and would let a stray
+# `cargo publish` push this crate to crates.io.
+publish = ["hort-crates"]
 
 [lints]
 workspace = true
@@ -20,18 +25,18 @@ workspace = true
 test-support = ["hort-app/test-support", "dep:hort-adapters-ephemeral-memory"]
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
-hort-app    = { path = "../hort-app" }
+hort-domain = { workspace = true }
+hort-app    = { workspace = true }
 # `AppContext.extra_trust_anchors` holds the process-wide extra CA
 # trust bundle parsed at composition time (ADR 0010).
 # `hort-config` is zero-I/O so this dep does not widen the runtime
 # footprint of `hort-http-core`.
-hort-config = { path = "../hort-config" }
+hort-config = { workspace = true }
 
 # Optional — enabled by the `test-support` feature so `build_mock_ctx`
 # can wire an in-memory `EphemeralStore` into the mock AppContext.
 # Never on the production dependency edge.
-hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory", optional = true }
+hort-adapters-ephemeral-memory = { workspace = true, optional = true }
 
 axum                        = { workspace = true }
 tower                       = { workspace = true }

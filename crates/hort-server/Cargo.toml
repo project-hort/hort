@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort v2 service binary — env-driven composition root for the axum stack"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
@@ -25,36 +27,36 @@ name = "hort-server"
 path = "src/main.rs"
 
 [dependencies]
-hort-domain            = { path = "../hort-domain" }
-hort-http-core         = { path = "../hort-http-core" }
+hort-domain            = { workspace = true }
+hort-http-core         = { workspace = true }
 # hort's license text + generated third-party attribution, embedded at
 # compile time. Backs the `license` / `attribution` subcommands
 # (`src/cli/license.rs`, `src/cli/attribution.rs`).
-hort-attribution       = { path = "../hort-attribution" }
+hort-attribution       = { workspace = true }
 # The per-format HTTP adapter crates (ADR 0008). Each one
 # depends only on hort-domain + hort-app + hort-formats + hort-http-core and
 # carries no adapter deps. hort-server is the only crate that lists all
 # four, because it is the only place that assembles the top-level
 # router (see `crate::http::build_router_with_oci_config`).
-hort-http-cargo        = { path = "../hort-http-cargo" }
-hort-http-npm          = { path = "../hort-http-npm" }
-hort-http-pypi         = { path = "../hort-http-pypi" }
-hort-http-oci          = { path = "../hort-http-oci" }
-hort-http-maven        = { path = "../hort-http-maven" }
+hort-http-cargo        = { workspace = true }
+hort-http-npm          = { workspace = true }
+hort-http-pypi         = { workspace = true }
+hort-http-oci          = { workspace = true }
+hort-http-maven        = { workspace = true }
 # Admin security-score REST surface
 # (`/api/v1/repositories/:name/security-score` + `/api/v1/security-score`).
 # Same adapter-free invariant as the per-format crates above.
-hort-http-admin-security = { path = "../hort-http-admin-security" }
+hort-http-admin-security = { workspace = true }
 # Admin-task REST surface
 # (`POST /api/v1/admin/tasks/{kind}`, `GET /api/v1/admin/tasks`,
 #  `GET /api/v1/admin/tasks/:id`). No hort-adapters-* in dep graph.
-hort-http-admin-tasks = { path = "../hort-http-admin-tasks" }
+hort-http-admin-tasks = { workspace = true }
 # JWT-only discovery + self-service prefetch
 # REST surface. Composition wiring is the router mount +
 # UpstreamMetadataPort wire-up; the integration tests in
 # `tests/*_jwt_only.rs` fire requests against the inner router
 # fragment (the production mount lives in `crate::http`).
-hort-http-discovery   = { path = "../hort-http-discovery" }
+hort-http-discovery   = { workspace = true }
 # Composition adapter implementing
 # `UpstreamMetadataPort` (the dispatch table over npm / pypi / cargo
 # `fetch_raw_with_cache` helpers + `FormatHandler::extract_upstream_versions`
@@ -63,7 +65,7 @@ hort-http-discovery   = { path = "../hort-http-discovery" }
 # ONLY production crate other than `hort-formats-upstream` itself that
 # imports multiple per-format inbound crates; the composition seam is
 # load-bearing.
-hort-formats-upstream = { path = "../hort-formats-upstream" }
+hort-formats-upstream = { workspace = true }
 # Event-notification surfaces
 # (see `docs/architecture/explanation/event-notifications.md`).
 # `hort-http-subscriptions` mounts `/api/v1/subscriptions` +
@@ -74,58 +76,58 @@ hort-formats-upstream = { path = "../hort-formats-upstream" }
 # dispatcher's notifier registry. hort-server is the only crate that
 # imports both inbound HTTP and outbound notifier types (anti-patterns
 # checklist — composition root has the entanglement license).
-hort-http-subscriptions = { path = "../hort-http-subscriptions" }
-hort-http-events       = { path = "../hort-http-events" }
-hort-notifier-webhook  = { path = "../hort-notifier-webhook" }
-hort-notifier-nats     = { path = "../hort-notifier-nats" }
+hort-http-subscriptions = { workspace = true }
+hort-http-events       = { workspace = true }
+hort-notifier-webhook  = { workspace = true }
+hort-notifier-nats     = { workspace = true }
 # Needed by `cli::admin::bootstrap` to call into
 # `UserUseCase::create_or_rotate_admin` — the CLI is an inbound adapter
 # over the application layer, never direct SQL.
-hort-app               = { path = "../hort-app" }
-hort-adapters-storage  = { path = "../hort-adapters-storage" }
+hort-app               = { workspace = true }
+hort-adapters-storage  = { workspace = true }
 # The `verify-event-chain` subcommand (ADR 0002) composes
 # this CheckpointAnchorPort read adapter at the composition root. It
 # reuses `hort-adapters-storage`'s vetted object-store/TLS build path; no
 # new outbound TLS client is introduced here.
-hort-adapters-checkpoint-anchor = { path = "../hort-adapters-checkpoint-anchor" }
+hort-adapters-checkpoint-anchor = { workspace = true }
 # Composition root wires one of these two
 # `EphemeralStore` adapters into `AppContext.ephemeral` per
 # `HORT_EPHEMERAL_STORE_BACKEND`. The adapter-free guarantee on the
 # per-format HTTP crates (ADR 0008) still holds: those crates
 # depend on `EphemeralStore` via `hort-domain`, not on these adapters.
-hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
-hort-adapters-ephemeral-redis  = { path = "../hort-adapters-ephemeral-redis" }
+hort-adapters-ephemeral-memory = { workspace = true }
+hort-adapters-ephemeral-redis  = { workspace = true }
 # Needed at the composition root to build the OIDC provider when
 # `HORT_AUTH_PROVIDER=oidc`. Only pulled in by the binary crate — library
 # crates stay free of a concrete IdP implementation.
-hort-adapters-oidc     = { path = "../hort-adapters-oidc" }
+hort-adapters-oidc     = { workspace = true }
 # Needed at the composition root to build `PgRoleRepository` and hand it
 # to `build_app_context` for the RbacEvaluator snapshot.
-hort-adapters-postgres = { path = "../hort-adapters-postgres" }
+hort-adapters-postgres = { workspace = true }
 # Composition root wires `DispatchSecretPort` (env-var
 # + mounted-file adapters always wired together) onto the
 # `HttpUpstreamProxy`. Both sources are built unconditionally; the
 # `SecretRef::source` field selects per-resolve. No process-wide
 # HORT_SECRETS_PROVIDER selector — operators wire ESO/Vault Agent/CSI
 # to env vars or mounted files.
-hort-adapters-secrets = { path = "../hort-adapters-secrets" }
+hort-adapters-secrets = { workspace = true }
 # Fallback-PAT rotation reconciler's k8s
 # Secret writer (ADR 0018). Composition root constructs the impl when the
 # operator sets `HORT_K8S_SECRET_WRITER_ENABLED=true`; otherwise the
 # AppContext slot is `None` and the rotation handler refuses
 # to register. Adapter-free guarantee on the per-format crates still
 # holds — only this composition root depends on `hort-adapters-kubernetes`.
-hort-adapters-kubernetes = { path = "../hort-adapters-kubernetes" }
+hort-adapters-kubernetes = { workspace = true }
 # Composition root constructs
 # `HttpUpstreamProxy` and wires it onto `AppContext.upstream_proxy`.
 # The adapter lives in its own crate so `reqwest` does not leak into
 # the inbound-HTTP edge.
-hort-adapters-upstream-http = { path = "../hort-adapters-upstream-http" }
+hort-adapters-upstream-http = { workspace = true }
 # Needed by `cli::reconcile_groups` to wire the
 # three compiled-in FormatHandler instances (PyPI / cargo / npm) into
 # the reconciliation sweep's handler registry. No other hort-server
 # subcommand constructs format handlers today.
-hort-formats           = { path = "../hort-formats" }
+hort-formats           = { workspace = true }
 
 anyhow                       = { workspace = true }
 axum                         = { workspace = true }
@@ -191,7 +193,7 @@ metrics                      = { workspace = true }
 # Gitops boot apply. Reads
 # $HORT_CONFIG_DIR/**/*.yaml, builds DesiredState, runs
 # ApplyConfigUseCase before build_app_context.
-hort-config                    = { path = "../hort-config" }
+hort-config                    = { workspace = true }
 walkdir                      = { workspace = true }
 # `axum::serve` lacks `http1_header_read_timeout`
 # and HTTP/2 keep-alive knobs. We replace it with a hand-rolled accept loop
@@ -205,6 +207,12 @@ tower                        = { workspace = true }
 
 [dev-dependencies]
 temp-env = "0.3"
+# `tests/publishable_manifests.rs` parses the root manifest and every
+# member manifest to assert the intra-workspace dependency declarations
+# stay publishable. A hand-rolled line scanner would be fail-open — a
+# dependency written as a `[dependencies.hort-x]` sub-table would slip
+# past it silently — so the guard parses real TOML.
+toml = { workspace = true }
 # Captures `tracing` output so the
 # deprecation warning for `HORT_GROUP_MAPPINGS_PATH` can be asserted on
 # directly (env_var field + one-shot emission). This is the first

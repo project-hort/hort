@@ -4,17 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort application layer — orchestrates domain and outbound ports"
+# Published to the hort-crates registry. The allow-list is affirmative on
+# purpose: an absent `publish` key means "any registry", which would let a
+# new member join the published set silently and would let a stray
+# `cargo publish` push this crate to crates.io.
+publish = ["hort-crates"]
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 # `ApplyConfigUseCase` consumes `DesiredState`, computes the
 # `ApplyPlan` via `diff`, and orchestrates the managed-write port
 # methods. `hort-config` is zero-I/O so it doesn't pull new
 # infrastructure into `hort-app`.
-hort-config = { path = "../hort-config" }
+hort-config = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 chrono = { workspace = true }
 tokio = { workspace = true }

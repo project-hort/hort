@@ -4,19 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort NATS JetStream EventNotifier adapter — best-effort publish with explicit ack"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 # Outbound port trait + value types this adapter implements.
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 
 # The process-wide extra-CA trust bundle (`HORT_EXTRA_CA_BUNDLE`).
 # `ExtraTrustAnchors` is the cross-crate value object that hands out DER
 # bytes without leaking the rustls type — the same source
 # `hort-adapters-upstream-http` / `-oidc` / `-storage` consume.
-hort-config = { path = "../hort-config" }
+hort-config = { workspace = true }
 
 # JetStream client. `default-features = false` keeps the dep lean — we
 # don't need the optional `kv`, `object-store`, `service`, or

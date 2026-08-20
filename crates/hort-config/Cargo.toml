@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort gitops configuration — zero-I/O YAML parsing, validation, diff"
+# Published to the hort-crates registry. The allow-list is affirmative on
+# purpose: an absent `publish` key means "any registry", which would let a
+# new member join the published set silently and would let a stray
+# `cargo publish` push this crate to crates.io.
+publish = ["hort-crates"]
 
 [lints]
 workspace = true
@@ -14,7 +19,7 @@ workspace = true
 # persisted shape with no parallel enum surface to maintain. Domain layer
 # is pure Rust + zero I/O, so importing it here doesn't break the
 # zero-runtime guarantee on `hort-config`.
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 
 # The envelope structs and per-kind specs derive `Serialize`/`Deserialize`;
 # error variants derive `thiserror::Error`.

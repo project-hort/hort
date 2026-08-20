@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort PostgreSQL implementations of outbound port traits"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
-hort-app    = { path = "../hort-app" }
+hort-domain = { workspace = true }
+hort-app    = { workspace = true }
 
 sqlx   = { workspace = true }
 tokio  = { workspace = true }

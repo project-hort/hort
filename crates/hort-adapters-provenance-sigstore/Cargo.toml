@@ -4,14 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort outbound adapter — Sigstore/cosign offline-bundle provenance verifier (ProvenancePort impl)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
-hort-config = { path = "../hort-config" }
-hort-app    = { path = "../hort-app" }
+hort-domain = { workspace = true }
+hort-config = { workspace = true }
+hort-app    = { workspace = true }
 
 # `reqwest` is the workspace-pinned 0.13 (batch 7, #102 — unified with the
 # `sigstore` crate's own transitive `reqwest 0.13`; before that bump this was
