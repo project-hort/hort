@@ -349,6 +349,80 @@ fn the_named_registry_is_declared_in_the_cargo_configuration() {
     );
 }
 
+/// Every Dockerfile that builds the workspace must copy `.cargo` into its
+/// build context.
+///
+/// The declaration asserted above only helps where cargo can see it. A
+/// container build starts from an empty context and gets exactly what its
+/// `COPY` lines put there, so a Dockerfile that copies `Cargo.toml`,
+/// `Cargo.lock` and `crates/` but not `.cargo/` fails at manifest parse —
+/// `registry index was not found in any configuration` — before compiling a
+/// line. Every image build breaks at once: the compose stack, both published
+/// images, and the E2E client.
+#[test]
+fn every_workspace_building_dockerfile_copies_the_cargo_configuration() {
+    let root = workspace_root();
+    let mut checked = 0usize;
+
+    for rel in dockerfiles(&root) {
+        let body =
+            fs::read_to_string(root.join(&rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+
+        // Only the ones that actually invoke cargo over this workspace.
+        if !body.contains("cargo build") && !body.contains("cargo install") {
+            continue;
+        }
+        checked += 1;
+
+        assert!(
+            body.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("COPY") && l.contains(".cargo")
+            }),
+            "{rel} runs cargo over the workspace but never copies `.cargo` into its \
+             build context. Every intra-workspace dependency names the `{HORT_REGISTRY}` \
+             registry, and cargo refuses to parse a manifest naming a registry it has no \
+             index declaration for — the build fails before compiling anything. Add \
+             `COPY .cargo ./.cargo` alongside the `COPY Cargo.toml Cargo.lock` line."
+        );
+    }
+
+    assert!(
+        checked >= 4,
+        "expected at least 4 workspace-building Dockerfiles, found {checked} — if one was \
+         renamed or removed, update this guard rather than letting its coverage lapse"
+    );
+}
+
+/// Every `Dockerfile*` tracked in the repository, as paths relative to the
+/// workspace root.
+fn dockerfiles(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                // Build outputs and VCS metadata carry no build contexts.
+                if matches!(name.as_str(), "target" | ".git" | "node_modules") {
+                    continue;
+                }
+                walk(&path, root, out);
+            } else if name.starts_with("Dockerfile") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
 // ---------------------------------------------------------------------------
 // 2. Member production dependency tables inherit from the workspace.
 // ---------------------------------------------------------------------------
